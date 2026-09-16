@@ -300,14 +300,20 @@ async def test_sessions_send_same_target_serializes() -> None:
 
 @pytest.mark.asyncio
 async def test_six_safe_tools_run_concurrent() -> None:
-    """Six safe tools should complete in roughly one sleep period, not six."""
+    """All six safe tools must enter before any handler is allowed to finish."""
     assert len(_SAFE_SAMPLE) == 6, "Need at least 6 safe tools in _SAFE_TOOL_NAMES"
 
     call_order: list[str] = []
+    completed: list[str] = []
+    all_started = asyncio.Event()
+    release_tools = asyncio.Event()
 
     async def _handler(tc: ToolCall) -> ToolResult:
         call_order.append(tc.tool_name)
-        await asyncio.sleep(_TOOL_SLEEP_S)
+        if len(call_order) == len(_SAFE_SAMPLE):
+            all_started.set()
+        await release_tools.wait()
+        completed.append(tc.tool_name)
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             tool_name=tc.tool_name,
@@ -322,23 +328,23 @@ async def test_six_safe_tools_run_concurrent() -> None:
         tool_handler=_handler,
     )
 
-    t0 = time.monotonic()
-    await _collect(agent)
-    elapsed = time.monotonic() - t0
-
-    # Concurrent: should be ~0.2 s; serial would be ~1.2 s
-    assert elapsed < 0.60, (
-        f"Expected concurrent execution (<0.60 s), got {elapsed:.3f} s. "
-        "Safe tools may still be running serially."
-    )
-    # Speed-up vs serial lower bound
-    serial_estimate = len(_SAFE_SAMPLE) * _TOOL_SLEEP_S
-    assert elapsed * 3 < serial_estimate, (
-        f"Expected at least 3x speedup over serial ({serial_estimate:.1f} s), "
-        f"got {elapsed:.3f} s"
-    )
-    # All 6 tools were called
-    assert sorted(call_order) == sorted(_SAFE_SAMPLE)
+    turn = asyncio.create_task(_collect(agent))
+    try:
+        # This bound only contains a broken/serial dispatcher; concurrency is
+        # proven by the barrier, independently of the Windows runner's speed.
+        async with asyncio.timeout(5):
+            await all_started.wait()
+            assert sorted(call_order) == sorted(_SAFE_SAMPLE)
+            assert completed == []
+            release_tools.set()
+            await turn
+    finally:
+        release_tools.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+    assert sorted(completed) == sorted(_SAFE_SAMPLE)
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio

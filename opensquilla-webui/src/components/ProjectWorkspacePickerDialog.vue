@@ -156,13 +156,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, inject, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import { getPlatform } from '@/platform'
-import { useRpcStore } from '@/stores/rpc'
-import type { SandboxPathEntry, SandboxPathListResponse } from '@/types/rpc'
+import { WORKSPACE_CATALOG_KEY, type WorkspaceCatalog, type WorkspacePathEntry } from '@/modules/workspaceCatalog'
 
 type PickerPhase =
   | 'closed'
@@ -185,7 +184,9 @@ const emit = defineEmits<{
   choose: [path: string]
 }>()
 const { t } = useI18n()
-const rpc = useRpcStore()
+const workspaceCatalog = inject(WORKSPACE_CATALOG_KEY)
+if (!workspaceCatalog) throw new Error('Workspace catalog is unavailable.')
+const workspaceCatalogService: WorkspaceCatalog = workspaceCatalog
 const dialogRef = ref<HTMLElement | null>(null)
 const pathInputRef = ref<HTMLInputElement | null>(null)
 const newDirectoryInputRef = ref<HTMLInputElement | null>(null)
@@ -194,7 +195,7 @@ const currentDirectory = ref('')
 const selectedDirectory = ref('')
 const locationDraft = ref('')
 const parentDirectory = ref<string | null>(null)
-const entries = ref<SandboxPathEntry[]>([])
+const entries = ref<WorkspacePathEntry[]>([])
 const error = ref('')
 const creatingDirectory = ref(false)
 const creatingDirectoryBusy = ref(false)
@@ -237,24 +238,18 @@ async function browse(target?: string, epoch = openEpoch) {
   if (!props.open || !props.enabled || epoch !== openEpoch) return
   const sequence = ++browseSequence
   const normalized = target?.trim() || ''
-  const params: Record<string, string> = {
-    sessionKey: props.sessionKey,
-    kind: 'workspace',
-  }
-  if (normalized) {
-    params.path = normalized
-    if (!isAbsoluteLocation(normalized) && currentDirectory.value) {
-      params.basePath = currentDirectory.value
-    }
-  }
+  const path = normalized && !isAbsoluteLocation(normalized) && currentDirectory.value
+    ? `${currentDirectory.value.replace(/[\\/]$/, '')}/${normalized}`
+    : normalized || undefined
 
   phase.value = 'web-loading'
   error.value = ''
   try {
-    const response = await rpc.call<SandboxPathListResponse>(
-      'sandbox.path.list',
-      params,
-    )
+    const response = await workspaceCatalogService.listPath({
+      sessionKey: props.sessionKey,
+      kind: 'workspace',
+      path,
+    })
     if (!ownsRequest(epoch, sequence)) return
     const resolved = String(response.currentPath || response.path || '').trim()
     if (!resolved) throw new Error('Gateway returned an empty directory path.')
@@ -297,15 +292,12 @@ async function createDirectory() {
   creatingDirectoryBusy.value = true
   error.value = ''
   try {
-    const response = await rpc.call<{ path: string }>(
-      'sandbox.path.create-directory',
-      {
+    const response = await workspaceCatalogService.createDirectory({
         sessionKey: props.sessionKey,
         parentPath: currentDirectory.value,
         name,
         kind: 'workspace',
-      },
-    )
+      })
     if (!props.open || epoch !== openEpoch) return
     const createdPath = String(response.path || '').trim()
     if (!createdPath) throw new Error('Gateway returned an empty directory path.')
@@ -345,16 +337,12 @@ async function openSystemPicker() {
   const epoch = openEpoch
   systemPickerBusy.value = true
   error.value = ''
-  const params: Record<string, string> = {
-    sessionKey: props.sessionKey,
-    kind: 'workspace',
-  }
-  if (currentDirectory.value) params.initialPath = currentDirectory.value
   try {
-    const choice = await rpc.call<{ path: string | null }>(
-      'sandbox.path.pick',
-      params,
-    )
+    const choice = await workspaceCatalogService.pickPath({
+      sessionKey: props.sessionKey,
+      kind: 'workspace',
+      initialPath: currentDirectory.value || undefined,
+    })
     if (epoch !== openEpoch || !props.open) return
     const selected = String(choice?.path || '').trim()
     if (!selected) return

@@ -139,15 +139,6 @@ def approval_snapshot_rpc_payload(queue: ApprovalQueue) -> dict[str, Any]:
     }
 
 
-def approval_forget_rpc_payload(target: Any = None) -> dict[str, Any]:
-    """Compatibility no-op for the removed intent approval cache."""
-
-    if isinstance(target, str) and target.strip():
-        stripped = target.strip()
-        return {"scope": "noop", "target": stripped}
-    return {"scope": "noop"}
-
-
 def approval_extend_rpc_payload(
     queue: ApprovalQueue,
     approval_id: str,
@@ -181,7 +172,6 @@ def approval_resolve_rpc_payload(
 
 __all__ = [
     "approval_extend_rpc_payload",
-    "approval_forget_rpc_payload",
     "approval_lookup_status_rpc_payload",
     "approval_request_rpc_payload",
     "approval_resolve_rpc_payload",

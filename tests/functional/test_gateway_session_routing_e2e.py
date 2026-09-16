@@ -19,6 +19,7 @@ from opensquilla.gateway.boot import start_gateway_server
 from opensquilla.gateway.config import AuthConfig, GatewayConfig, LlmProviderConfig
 from opensquilla.gateway.model_routing import model_routing_snapshot
 from opensquilla.gateway.websocket import SubscriptionManager
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 from opensquilla.session.storage import SessionStorage
@@ -50,6 +51,8 @@ async def _serve_gateway() -> None:
         config_path=str(config_path),
         state_dir=str(state_dir),
         workspace_dir=str(workspace_dir),
+        # This offline routing fixture does not provision an OS sandbox.
+        sandbox=SandboxSettings(run_mode="full", sandbox=False, security_grading=False),
     )
     config.control_ui.enabled = False
     config.llm = LlmProviderConfig(
@@ -68,6 +71,12 @@ async def _serve_gateway() -> None:
     config.heartbeat.enabled = False
     config.squilla_router.enabled = False
     config.squilla_router.rollout_phase = "observe"
+    # The fixture's direct and routed modes share its offline deployment.
+    # Replacing llm after construction must not retain the default provider's ladder.
+    config.squilla_router.tiers = {
+        tier: {"provider": config.llm.provider, "model": config.llm.model}
+        for tier in ("c0", "c1", "c2", "c3")
+    }
     config.llm_ensemble.enabled = False
 
     storage = SessionStorage(str(state_dir / "sessions.db"))
@@ -323,7 +332,7 @@ async def test_real_gateway_websocket_session_routing_contract(
                 "clientRequestId": "routing-first-turn-request",
                 "clientMessageId": "routing-first-turn-message",
                 "queueMode": "followup",
-                "_source": {"runMode": "safe"},
+                "_source": {"runMode": "full"},
             },
         )
         accepted_task_id = str(

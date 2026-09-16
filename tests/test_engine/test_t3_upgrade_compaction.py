@@ -854,6 +854,9 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim(
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 

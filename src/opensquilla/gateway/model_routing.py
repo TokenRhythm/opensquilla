@@ -15,44 +15,64 @@ from typing import Any, Literal, cast
 from opensquilla.router_tiers import (
     CUSTOM_B5_SELECTION_MODE,
     HIGHEST_TEXT_TIER,
-    IMAGE_TIER,
     INDEPENDENT_ENSEMBLE_SELECTION_MODES,
     STATIC_B5_PROFILES,
+    TEXT_TIERS,
     effective_ensemble_selection_mode,
     ensemble_selection_configured,
     normalize_tier_mapping,
     static_b5_profile,
     tier_ensemble_active,
-    tier_index,
 )
 
 ModelRoutingMode = Literal["direct", "router", "ensemble"]
 
 
-def _router_image_route(config: Any) -> tuple[str, dict[str, Any]] | None:
+def _router_image_route(config: Any) -> tuple[str, dict[str, Any], str] | None:
+    """Return the first executable configured c-tier for an image turn.
+
+    This is a public admission snapshot of the runtime Router policy, not a
+    separate routing implementation: only user-configured c0-c3 deployments
+    participate, deployment capability denials are skipped, and proven support
+    is preferred over an unknown deployment that the execution layer may probe.
+    The legacy ``image_model`` row is intentionally non-executable.
+    """
+
     router = getattr(config, "squilla_router", None)
     tiers = normalize_tier_mapping(getattr(router, "tiers", {}) or {})
     c3_fusion_active = bool(
         getattr(getattr(config, "llm_ensemble", None), "enabled", False)
     ) or tier_ensemble_active(tiers, HIGHEST_TEXT_TIER)
-    image_tiers = {
-        name: tier
-        for name, tier in tiers.items()
-        if isinstance(tier, dict)
-        and bool(tier.get("supports_image", False))
-        and bool(str(tier.get("model") or "").strip())
-        and not (c3_fusion_active and name == HIGHEST_TEXT_TIER)
-    }
-    if not image_tiers:
+    llm = getattr(config, "llm", None)
+    active_provider = _clean(getattr(llm, "provider", ""))
+    cross_provider = bool(getattr(router, "cross_provider_tiers", False))
+    candidates: list[tuple[str, dict[str, Any], str]] = []
+    for name in TEXT_TIERS:
+        tier = tiers.get(name)
+        if not isinstance(tier, dict) or bool(tier.get("image_only", False)):
+            continue
+        model = str(tier.get("model") or "").strip()
+        if not model or (c3_fusion_active and name == HIGHEST_TEXT_TIER):
+            continue
+
+        tier_provider = _clean(tier.get("provider"))
+        provider = tier_provider if cross_provider and tier_provider else active_provider
+        provider = provider or tier_provider
+        use_active_authority = not provider or provider == active_provider
+        support = _deployment_vision_support(
+            model=model,
+            provider=provider,
+            api_key=(str(getattr(llm, "api_key", "") or "") if use_active_authority else ""),
+            base_url=(str(getattr(llm, "base_url", "") or "") if use_active_authority else ""),
+            proxy=(str(getattr(llm, "proxy", "") or "") if use_active_authority else ""),
+        )
+        if support in {"supported", "unknown"}:
+            candidates.append((name, tier, support))
+
+    if not candidates:
         return None
-    ordered = sorted(
-        image_tiers,
-        key=lambda name: (tier_index(name) < 0, tier_index(name)),
-    )
-    if IMAGE_TIER in image_tiers:
-        ordered = [IMAGE_TIER, *(name for name in ordered if name != IMAGE_TIER)]
-    selected = ordered[0]
-    return selected, image_tiers[selected]
+    candidates.sort(key=lambda item: item[2] != "supported")
+    return candidates[0]
 
 
 def _deployment_vision_support(
@@ -93,40 +113,20 @@ def _image_input_routing_snapshot(
     *,
     router_enabled: bool,
     ensemble_enabled: bool,
-    selection_mode: str,
 ) -> dict[str, str]:
-    independent_ensemble = bool(
-        ensemble_enabled and selection_mode in INDEPENDENT_ENSEMBLE_SELECTION_MODES
-    )
-    if independent_ensemble or (ensemble_enabled and not router_enabled):
+    if ensemble_enabled:
         return {
-            "admission": "blocked",
+            "admission": "allowed",
             "reason": "ensemble_mode_unsupported",
         }
     if router_enabled:
         image_route = _router_image_route(config)
         if image_route is None:
             return {
-                "admission": "blocked",
+                "admission": "allowed",
                 "reason": "router_image_route_unavailable",
             }
-        _, image_tier = image_route
-        llm = getattr(config, "llm", None)
-        active_provider = _clean(getattr(llm, "provider", ""))
-        tier_provider = _clean(image_tier.get("provider"))
-        cross_provider = bool(
-            getattr(getattr(config, "squilla_router", None), "cross_provider_tiers", False)
-        )
-        provider = tier_provider if cross_provider and tier_provider else active_provider
-        provider = provider or tier_provider
-        use_active_authority = not provider or provider == active_provider
-        vision_support = _deployment_vision_support(
-            model=_clean(image_tier.get("model")),
-            provider=provider,
-            api_key=str(getattr(llm, "api_key", "") or "") if use_active_authority else "",
-            base_url=str(getattr(llm, "base_url", "") or "") if use_active_authority else "",
-            proxy=str(getattr(llm, "proxy", "") or "") if use_active_authority else "",
-        )
+        _, _, vision_support = image_route
         if vision_support == "supported":
             return {
                 "admission": "allowed",
@@ -134,7 +134,7 @@ def _image_input_routing_snapshot(
             }
         if vision_support == "unsupported":
             return {
-                "admission": "blocked",
+                "admission": "allowed",
                 "reason": "model_vision_unsupported",
             }
         return {"admission": "unknown", "reason": "capability_unknown"}
@@ -153,7 +153,7 @@ def _image_input_routing_snapshot(
         return {"admission": "allowed", "reason": "model_vision_supported"}
     if vision_support == "unsupported":
         return {
-            "admission": "blocked",
+            "admission": "allowed",
             "reason": "model_vision_unsupported",
         }
     return {"admission": "unknown", "reason": "capability_unknown"}
@@ -442,9 +442,78 @@ def model_routing_snapshot(config: Any) -> dict[str, Any]:
             config,
             router_enabled=router_enabled,
             ensemble_enabled=ensemble_enabled,
-            selection_mode=selection_mode,
         ),
         "applies_to": "next_accepted_turn",
+    }
+
+
+def model_routing_snapshot_for_mode(
+    config: Any,
+    mode: ModelRoutingMode | str,
+) -> dict[str, Any]:
+    """Project the public routing snapshot for one mode without mutating config.
+
+    Acceptance snapshots intentionally freeze only the routing-owned subtrees.
+    Overlay them onto the live config before deriving public capabilities so
+    Direct and Router still see the active deployment's non-public ``llm``
+    authority while the returned snapshot remains secret-free.
+    """
+
+    captured = capture_model_routing_config(config, session_mode=mode)
+    overlay_live_config = getattr(captured, "overlay_live_config", None)
+    effective_config = (
+        overlay_live_config(config) if callable(overlay_live_config) else captured
+    )
+    return model_routing_snapshot(effective_config)
+
+
+def model_routing_capabilities_by_mode(config: Any) -> dict[str, dict[str, Any]]:
+    """Return a complete, independently fault-tolerant capability matrix."""
+
+    capabilities: dict[str, dict[str, Any]] = {}
+    for mode in ("direct", "router", "ensemble"):
+        try:
+            snapshot = model_routing_snapshot_for_mode(config, mode)
+            image_input = snapshot.get("image_input")
+            if not isinstance(image_input, dict):
+                raise ValueError("image_input capability is unavailable")
+            admission = image_input.get("admission")
+            reason = image_input.get("reason")
+            if admission not in {"allowed", "blocked", "unknown"}:
+                raise ValueError("image_input admission is invalid")
+            if not isinstance(reason, str) or not reason:
+                raise ValueError("image_input reason is invalid")
+            capabilities[mode] = {
+                "image_input": {
+                    "admission": admission,
+                    "reason": reason,
+                }
+            }
+        except Exception:  # noqa: BLE001 - isolate one failed mode projection
+            capabilities[mode] = {
+                "image_input": {
+                    "admission": "unknown",
+                    "reason": "capability_unknown",
+                }
+            }
+    return capabilities
+
+
+def model_routing_public_snapshot(config: Any) -> dict[str, Any]:
+    """Return the additive operator-facing snapshot including all mode capabilities."""
+
+    snapshot = model_routing_snapshot(config)
+    capabilities_by_mode = model_routing_capabilities_by_mode(config)
+    current_capabilities = capabilities_by_mode.get(str(snapshot.get("mode")), {})
+    current_image_input = current_capabilities.get("image_input")
+    return {
+        **snapshot,
+        # Preserve the legacy scalar while making it a projection of the
+        # canonical current mode.  This matters for Router observe configs,
+        # whose internal snapshot deliberately retains router diagnostics even
+        # though their public/effective mode is Direct.
+        "image_input": current_image_input or snapshot["image_input"],
+        "capabilities_by_mode": capabilities_by_mode,
     }
 
 
@@ -830,12 +899,13 @@ async def broadcast_model_routing_changed(
     *,
     source: str,
     config: Any | None = None,
+    snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Broadcast the canonical snapshot to every readable operator surface."""
 
     active_config = config if config is not None else getattr(ctx, "config", None)
-    snapshot = model_routing_snapshot(active_config)
-    payload = {**snapshot, "source": source}
+    public_snapshot = snapshot or model_routing_public_snapshot(active_config)
+    payload = {**public_snapshot, "source": source}
     subscription_manager = getattr(ctx, "subscription_manager", None)
     if subscription_manager is None:
         return payload
@@ -870,13 +940,14 @@ async def broadcast_model_routing_changed_if_needed(
     """
 
     active_config = config if config is not None else getattr(ctx, "config", None)
-    current = model_routing_snapshot(active_config)
+    current = model_routing_public_snapshot(active_config)
     if current == previous:
         return None
     return await broadcast_model_routing_changed(
         ctx,
         source=source,
         config=active_config,
+        snapshot=current,
     )
 
 
@@ -887,9 +958,12 @@ __all__ = [
     "broadcast_model_routing_changed_if_needed",
     "capture_model_routing_config",
     "durable_model_routing_config_snapshot",
+    "model_routing_capabilities_by_mode",
     "model_routing_mode_for_write",
     "model_routing_patches",
+    "model_routing_public_snapshot",
     "model_routing_snapshot",
+    "model_routing_snapshot_for_mode",
     "reconcile_model_routing_write",
     "restore_durable_model_routing_config_snapshot",
 ]

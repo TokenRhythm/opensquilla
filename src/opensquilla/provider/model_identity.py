@@ -11,6 +11,10 @@ DEEPSEEK_V4_MODEL_IDS = frozenset(
     }
 )
 
+# The official API also exposes this alias. Keep its scope explicit instead of
+# assuming aggregators or other compatible APIs serve the same model name.
+DEEPSEEK_DIRECT_REASONING_MODEL_IDS = DEEPSEEK_V4_MODEL_IDS | {"deepseek-flash"}
+
 
 def model_basename(model_id: str | None) -> str:
     """Return a normalized model id without an optional vendor prefix."""

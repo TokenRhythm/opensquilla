@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import ntpath
+import os
 import time
 
 from opensquilla.process_tree import (
@@ -30,6 +32,9 @@ from opensquilla.sandbox.backend.base import Backend
 from opensquilla.sandbox.types import SandboxRequest, SandboxResult
 
 log = logging.getLogger(__name__)
+
+_POWERSHELL_ANALYSIS_CACHE_ENV = "PSModuleAnalysisCachePath"
+_WINDOWS_POWERSHELL_EXECUTABLES = frozenset({"powershell.exe", "pwsh.exe"})
 
 
 def _limits_from_policy(request: SandboxRequest) -> SandboxLimits:
@@ -51,6 +56,26 @@ def _filtered_request_env(request: SandboxRequest) -> dict[str, str]:
         for key, value in request.env.items()
         if key in allowlist and isinstance(value, str)
     }
+
+
+def _preserve_windows_powershell_cache_env(
+    request: SandboxRequest,
+    child_env: dict[str, str],
+) -> None:
+    """Restore the trusted host's PowerShell analysis cache for Windows shells."""
+    if os.name != "nt" or not request.argv:
+        return
+    executable = ntpath.basename(request.argv[0]).casefold()
+    if executable not in _WINDOWS_POWERSHELL_EXECUTABLES:
+        return
+    cache_path = os.environ.get(_POWERSHELL_ANALYSIS_CACHE_ENV)
+    if cache_path is None:
+        return
+    cache_key = _POWERSHELL_ANALYSIS_CACHE_ENV.casefold()
+    for key in tuple(child_env):
+        if key.casefold() == cache_key:
+            child_env.pop(key)
+    child_env[_POWERSHELL_ANALYSIS_CACHE_ENV] = cache_path
 
 
 class NoopBackend(Backend):
@@ -75,6 +100,7 @@ class NoopBackend(Backend):
         limits = _limits_from_policy(request)
         started = time.monotonic()
         child_env = _filtered_env(limits.env_whitelist, _filtered_request_env(request))
+        _preserve_windows_powershell_cache_env(request, child_env)
         spawn_kwargs: dict[str, object] = {
             "stdin": asyncio.subprocess.PIPE if request.stdin is not None else None,
             "stdout": asyncio.subprocess.PIPE,

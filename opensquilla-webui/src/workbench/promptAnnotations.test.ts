@@ -5,13 +5,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT,
   ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT,
-  ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT,
+  PAGE_ANNOTATIONS_SENT_EVENT,
   focusArtifactPromptAnnotation,
-  notifyArtifactPromptAnnotationsAccepted,
+  notifyPageAnnotationsSent,
   reuseArtifactPromptAnnotation,
   type ArtifactPromptAnnotationFocusDetail,
   type ArtifactPromptAnnotationReuseDetail,
-  type ArtifactPromptAnnotationsAcceptedDetail,
+  type PageAnnotationsSentDetail,
 } from './promptAnnotations'
 
 afterEach(() => {
@@ -70,36 +70,36 @@ describe('prompt annotation Workbench activation', () => {
   })
 
   it('notifies the Workbench only after concrete annotation ids are accepted', () => {
-    let detail: ArtifactPromptAnnotationsAcceptedDetail | null = null
-    window.addEventListener(ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT, (event) => {
-      detail = (event as CustomEvent<ArtifactPromptAnnotationsAcceptedDetail>).detail
+    let detail: PageAnnotationsSentDetail | null = null
+    window.addEventListener(PAGE_ANNOTATIONS_SENT_EVENT, (event) => {
+      detail = (event as CustomEvent<PageAnnotationsSentDetail>).detail
     }, { once: true })
 
-    notifyArtifactPromptAnnotationsAccepted({
-      acceptedIds: ['annotation-1'],
+    notifyPageAnnotationsSent({
+      draftIds: ['annotation-1'],
       sessionKey: 'session-a',
     })
 
     expect(detail).toEqual({
-      acceptedIds: ['annotation-1'],
+      draftIds: ['annotation-1'],
       sessionKey: 'session-a',
     })
   })
 
   it('carries the provisional request key when acceptance materializes a session', () => {
-    let detail: ArtifactPromptAnnotationsAcceptedDetail | null = null
-    window.addEventListener(ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT, (event) => {
-      detail = (event as CustomEvent<ArtifactPromptAnnotationsAcceptedDetail>).detail
+    let detail: PageAnnotationsSentDetail | null = null
+    window.addEventListener(PAGE_ANNOTATIONS_SENT_EVENT, (event) => {
+      detail = (event as CustomEvent<PageAnnotationsSentDetail>).detail
     }, { once: true })
 
-    notifyArtifactPromptAnnotationsAccepted({
-      acceptedIds: ['annotation-1'],
+    notifyPageAnnotationsSent({
+      draftIds: ['annotation-1'],
       sessionKey: 'session-canonical',
       requestSessionKey: 'session-draft',
     })
 
     expect(detail).toEqual({
-      acceptedIds: ['annotation-1'],
+      draftIds: ['annotation-1'],
       sessionKey: 'session-canonical',
       requestSessionKey: 'session-draft',
     })

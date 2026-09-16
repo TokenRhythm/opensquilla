@@ -1,12 +1,10 @@
 """Content classification for unified-diff patches.
 
-Used by endgame policies that must distinguish diagnostic instrumentation
-(added print/log statements) from substantive changes: the endgame git freeze
-may allow reverting instrumentation-only diffs, and final-diff salvage must
-not resurrect them into a collected patch. Classification is deliberately
+Used by final-diff salvage to distinguish diagnostic instrumentation
+(added print/log statements) from substantive changes, so the salvage veto
+does not resurrect diagnostic-only diffs into a collected patch. Classification is deliberately
 conservative — anything it cannot positively identify as instrumentation
-counts as a substantive change, so misreads fail toward keeping protections
-active.
+counts as a substantive change.
 """
 
 from __future__ import annotations

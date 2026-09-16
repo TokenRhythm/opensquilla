@@ -36,7 +36,6 @@ from opensquilla.attachment_refs import (
     transcript_material_path,
     write_transcript_material,
 )
-from opensquilla.prompt_annotations import normalize_prompt_annotation_snapshots
 
 log = logging.getLogger(__name__)
 
@@ -90,10 +89,6 @@ def _was_staged(attachment: dict[str, Any]) -> bool:
     return bool(attachment.get("_was_staged"))
 
 
-def _transcript_dir(media_root: Path, session_id: str) -> Path:
-    return Path(media_root) / "transcripts" / session_id
-
-
 def build_transcript_attachment_envelope(
     *,
     text: str,
@@ -103,7 +98,7 @@ def build_transcript_attachment_envelope(
     media_root: Path,
     persist_enabled: bool,
     disk_budget_bytes: int | None = None,
-    prompt_annotations: object = None,
+    page_context: dict[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Build the JSON envelope written to ``transcript_entries.content``.
 
@@ -113,6 +108,8 @@ def build_transcript_attachment_envelope(
 
     When ``disk_budget_bytes`` is provided and a staged write would exceed it,
     the function raises instead of falling back to persistent inline base64.
+    With persistence disabled, every attachment shape becomes metadata plus
+    an unavailable marker; existing material is neither linked nor deleted.
     """
 
     persisted_attachments: list[dict[str, Any]] = []
@@ -123,6 +120,25 @@ def build_transcript_attachment_envelope(
             attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
         )
         name = attachment.get("name", "attachment")
+        if not persist_enabled:
+            size = attachment.get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                size = None
+                data = attachment.get("data")
+                if isinstance(data, str):
+                    try:
+                        size = len(base64.b64decode(data, validate=True))
+                    except (ValueError, TypeError):
+                        pass
+            persisted_attachments.append(
+                {
+                    "name": name,
+                    "mime": media_type,
+                    "size": size,
+                    "missing_reason": "attachment persistence disabled",
+                }
+            )
+            continue
         if is_attachment_ref(attachment):
             sha = attachment["sha256"]
             persisted_attachments.append(
@@ -139,7 +155,7 @@ def build_transcript_attachment_envelope(
         if not isinstance(data, str) or not isinstance(media_type, str):
             continue
 
-        if persist_enabled and _was_staged(attachment):
+        if _was_staged(attachment):
             try:
                 payload = base64.b64decode(data, validate=True)
             except (ValueError, TypeError) as exc:
@@ -180,27 +196,6 @@ def build_transcript_attachment_envelope(
                     "size": len(payload),
                 }
             )
-        elif _was_staged(attachment):
-            try:
-                payload = base64.b64decode(data, validate=True)
-            except (ValueError, TypeError) as exc:
-                log.warning("transcript.persist_decode_failed name=%s err=%s", name, exc)
-                persisted_attachments.append(
-                    {
-                        "name": name,
-                        "mime": media_type,
-                        "missing_reason": "attachment decode failed",
-                    }
-                )
-                continue
-            persisted_attachments.append(
-                {
-                    "name": name,
-                    "mime": media_type,
-                    "size": len(payload),
-                    "missing_reason": "attachment persistence disabled",
-                }
-            )
         else:
             persisted_attachments.append(
                 {
@@ -214,9 +209,8 @@ def build_transcript_attachment_envelope(
     envelope_payload: dict[str, Any] = {"text": text, "attachments": persisted_attachments}
     if display_text is not None:
         envelope_payload["display_text"] = display_text
-    normalized_annotations = normalize_prompt_annotation_snapshots(prompt_annotations)
-    if normalized_annotations:
-        envelope_payload["prompt_annotations"] = list(normalized_annotations)
+    if page_context is not None:
+        envelope_payload["page_context"] = page_context
     envelope = json.dumps(envelope_payload)
     return envelope, disk_writes
 

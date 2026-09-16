@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { foldTurn, TurnAccumulator } from './foldTurn'
 import type { ChatToolCall, ChatToolCallGroup } from '@/types/chat'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { Frame } from '@/types/turnlog'
 import type { InterruptViewState } from '@/types/parts'
 
@@ -489,5 +489,22 @@ describe('TurnAccumulator — incremental live projection', () => {
       rawText: 'Draft candidate.',
       html: '<p>Draft candidate.</p>',
     })
+  })
+})
+
+describe('execution log reference preservation', () => {
+  it('keeps the original log handle in both live and replay projections', () => {
+    const handle = `tr-${'a'.repeat(32)}`
+    const event: Frame = {
+      kind: 'tool-result', seq: 0, toolId: 'execution', name: 'exec', input: '{}',
+      result: 'model-sized preview', executionLogHandle: handle, isError: true, at: 1,
+    }
+    const accumulator = new TurnAccumulator()
+    accumulator.append(event)
+    for (const projection of [fold([event]), accumulator.snapshot(renderMarkdown, toolCallGroups)]) {
+      expect(projection.toolCalls[0]).toMatchObject({
+        executionLogHandle: handle, result: 'model-sized preview', status: 'error',
+      })
+    }
   })
 })

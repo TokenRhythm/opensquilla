@@ -1,6 +1,7 @@
 import { onUnmounted, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { Skill, SkillDependencyInstallOutcome } from '@/types/skills'
+import type { SkillCatalog } from '@/modules/skillCatalog'
 import {
   installActionsForCurrentDependencies,
   normalizeSkill,
@@ -8,12 +9,8 @@ import {
   skillDependencySummary,
 } from '@/composables/skills/useSkillsCatalog'
 
-interface SkillDetailRpc {
-  call(method: string, params?: Record<string, unknown>): Promise<unknown>
-}
-
 interface SkillDetailControllerOptions {
-  rpc: SkillDetailRpc
+  catalog: SkillCatalog
   installDeps: (
     name: string,
     installId: string,
@@ -68,15 +65,7 @@ export function useSkillDetailController(
   }
 
   async function fetchLatest(seed: Skill): Promise<Skill> {
-    const params: Record<string, unknown> = {
-      name: seed.name,
-      includeLifecycle: true,
-    }
-    if (seed.instance_id) params.instanceId = seed.instance_id
-    if (seed.install_id) params.installId = seed.install_id
-    const detail = await options.rpc.call('skills.get', {
-      ...params,
-    }) as Skill
+    const detail = await options.catalog.detail(seed)
     // Eligible rows omit legacy missing_* fields. Clear the seed diagnostics
     // before merging so a transition to ready cannot retain stale list data.
     return normalizeSkill({

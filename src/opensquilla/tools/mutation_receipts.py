@@ -99,20 +99,4 @@ def record_semantic_mutation_receipt(
         except Exception:
             pass
 
-    if changed and receipt["classification"] == "source":
-        try:
-            from opensquilla.tools.source_diff_candidates import (
-                capture_source_diff_candidate,
-            )
-
-            capture_source_diff_candidate(
-                ctx=active,
-                relative_path=relative_path,
-                workspace_epoch=active.workspace_epoch,
-                receipt_id=receipt.get("receipt_id"),
-                tool_name=tool_name,
-            )
-        except Exception:
-            pass
-
     return receipt

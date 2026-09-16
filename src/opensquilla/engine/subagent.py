@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from opensquilla.agents.limits import MAX_SPAWN_DEPTH
 from opensquilla.engine.types import done_text_snapshot
@@ -37,6 +37,7 @@ class SubagentExecutionTarget:
     provider_request_max_chars: int
     model_capabilities: Any = field(default=None, repr=False, compare=False)
     compaction_plan: Any = field(default=None, repr=False, compare=False)
+    model_vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
 
 
 @dataclass
@@ -124,7 +125,11 @@ def resolve_subagent_execution_target(
 
     from opensquilla.context_budget import ContextBudgetGovernor
     from opensquilla.provider.model_catalog import shared_catalog
-    from opensquilla.provider.protocol import configured_provider_id, provider_metadata
+    from opensquilla.provider.protocol import (
+        configured_provider_id,
+        provider_connection_config,
+        provider_metadata,
+    )
     from opensquilla.session.compaction_deployment import (
         build_compaction_execution_plan_from_provider,
     )
@@ -169,6 +174,45 @@ def resolve_subagent_execution_target(
     )
     child_metadata = provider_metadata(child_provider)
     provider_id = configured_provider_id(child_provider) or provider_id
+
+    model_vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
+    if model_id == parent_model:
+        active_vision_support = getattr(
+            parent_provider,
+            "active_model_vision_support",
+            None,
+        )
+        try:
+            raw_vision_support = (
+                active_vision_support(parent_config)
+                if callable(active_vision_support)
+                else getattr(parent_config, "model_vision_support", "unknown")
+            )
+        except Exception:  # noqa: BLE001 - optional active-leg refinement
+            # A selector resolver failure means the current physical leg is
+            # unproven. The parent config may still describe an earlier leg.
+            raw_vision_support = "unknown"
+        if raw_vision_support in {"supported", "unsupported", "unknown"}:
+            model_vision_support = cast(
+                Literal["supported", "unsupported", "unknown"],
+                raw_vision_support,
+            )
+    else:
+        try:
+            connection = provider_connection_config(child_provider)
+            raw_vision_support = shared_catalog().resolve_deployment_vision_support(
+                model_id,
+                provider=provider_id,
+                api_key=connection.api_key,
+                base_url=connection.base_url,
+            )
+        except Exception:  # noqa: BLE001 - missing evidence remains unknown
+            raw_vision_support = "unknown"
+        if raw_vision_support in {"supported", "unsupported", "unknown"}:
+            model_vision_support = cast(
+                Literal["supported", "unsupported", "unknown"],
+                raw_vision_support,
+            )
 
     configured_provider = str(
         getattr(parent_config, "provider_id", "") or ""
@@ -264,6 +308,7 @@ def resolve_subagent_execution_target(
         provider_request_max_chars=request_max_chars,
         model_capabilities=capabilities,
         compaction_plan=compaction_plan,
+        model_vision_support=model_vision_support,
     )
 
 

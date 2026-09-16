@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import opensquilla.gateway.rpc_meta_runs as meta_rpc
-from opensquilla.gateway.rpc.registry import RpcContext
+from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
 from opensquilla.gateway.rpc_meta_runs import (
     _META_SETUP_JOBS,
     _META_SETUP_LATEST,
@@ -98,6 +98,46 @@ def test_meta_setup_scope_contract() -> None:
     assert METHOD_SCOPES["meta.setup.plan"] == READ_SCOPE
     assert METHOD_SCOPES["meta.setup.status"] == READ_SCOPE
     assert METHOD_SCOPES["meta.setup.install"] == ADMIN_SCOPE
+
+
+@pytest.mark.parametrize(
+    ("handler", "params"),
+    (
+        (_handle_meta_setup_plan, {"name": "missing-meta-skill"}),
+        (
+            _handle_meta_setup_install,
+            {
+                "name": "missing-meta-skill",
+                "sessionKey": "agent:main:webchat:missing-meta-skill",
+                "confirmed": True,
+            },
+        ),
+    ),
+)
+def test_meta_setup_contract_declares_real_not_found_error(handler, params) -> None:
+    ctx = RpcContext(conn_id="test", config=_cfg(), skill_loader=_Loader())
+
+    with pytest.raises(RpcHandlerError) as raised:
+        asyncio.run(handler(params, ctx))
+
+    assert raised.value.code == "NOT_FOUND"
+
+
+def test_meta_setup_status_contract_declares_real_not_found_error() -> None:
+    ctx = RpcContext(conn_id="test", config=_cfg(), skill_loader=_Loader())
+
+    with pytest.raises(RpcHandlerError) as raised:
+        asyncio.run(
+            _handle_meta_setup_status(
+                {
+                    "jobId": "missing-job",
+                    "sessionKey": "agent:main:webchat:missing-job",
+                },
+                ctx,
+            )
+        )
+
+    assert raised.value.code == "NOT_FOUND"
 
 
 def test_meta_setup_plan_uses_launch_equivalent_capability_readiness(monkeypatch) -> None:

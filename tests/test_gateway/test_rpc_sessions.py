@@ -18,6 +18,8 @@ from unittest.mock import ANY, AsyncMock
 import pytest
 from starlette.websockets import WebSocketState
 
+import opensquilla.engine.cache_break_monitor as cache_break_monitor
+import opensquilla.gateway.adapters.session_maintenance as session_maintenance_adapter
 from opensquilla.agents.registry import AgentRegistry
 from opensquilla.agents.scope import default_workspace_dir
 from opensquilla.attachment_refs import transcript_material_path
@@ -29,11 +31,6 @@ from opensquilla.contracts.gateway_transport import (
 from opensquilla.engine.types import AnswerGenerationResetEvent, DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
-from opensquilla.gateway.artifact_contexts import (
-    PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
-    PROMPT_ANNOTATION_TOOL_NAMES,
-    BoundPromptAnnotationContext,
-)
 from opensquilla.gateway.attachment_ingest import (
     MAX_STAGED_PDF_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,
@@ -59,6 +56,7 @@ from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get
 from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
+from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.capability_service import CapabilityReport
 from opensquilla.sandbox.guest_profile import (
     GuestProfileBoundaryError,
@@ -81,6 +79,7 @@ from opensquilla.session.models import (
 )
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.visibility import guest_safe_tool_allowlist
+from tests.helpers.image_bytes import image_bytes
 
 _DEFAULT_PRINCIPAL = Principal(
     role="operator", scopes=frozenset(["operator.admin"]), is_owner=True, authenticated=True
@@ -99,92 +98,10 @@ def test_sessions_pending_inputs_steer_scope_contract() -> None:
     assert METHOD_SCOPES["sessions.pending_inputs.steer"] == WRITE_SCOPE
 
 
-def test_prompt_annotation_bridge_fallback_uses_source_only_contract() -> None:
-    context = BoundPromptAnnotationContext(
-        session_key="agent:main:web",
-        session_id="session-1",
-        document_id="document-1",
-        revision_id="revision-1",
-        targets=(),
-        snapshots=(
-            {
-                "version": 1,
-                "annotationId": "annotation-1",
-                "order": 0,
-                "body": "Remove the label.",
-                "targetStatus": "ready",
-                "targetReason": None,
-                "targetKind": "region",
-                "targetText": "label",
-                "document": {"id": "document-1", "name": "page.html", "kind": "html"},
-                "revision": {
-                    "id": "revision-1",
-                    "generation": 1,
-                    "sha256": "a" * 64,
-                },
-                "anchor": {
-                    "id": "anchor-1",
-                    "kind": "html_element",
-                    "tagName": "p",
-                    "locator": {},
-                    "quote": "label",
-                },
-            },
-        ),
-        artifact_format="html",
-        tool_names=PROMPT_ANNOTATION_TOOL_NAMES,
-        operation_class="selection_edit",
-        request_context_prompt="old prompt",
-    )
-
-    downgraded = rpc_sessions._prompt_annotation_source_only_context(context)
-
-    assert downgraded.tool_names == PROMPT_ANNOTATION_SOURCE_TOOL_NAMES
-    assert "document_finish" not in downgraded.tool_names
-    assert "document_browser_inspect" not in downgraded.tool_names
-    assert "source-only compatibility path" in downgraded.request_context_prompt
 
 
-def test_candidate_loop_requires_v4_active_preview_capabilities() -> None:
-    assert rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
-        SimpleNamespace(
-            version=4,
-            available=True,
-            browser_inspect=True,
-            bind_candidate_preview=True,
-            restore_canonical_preview=True,
-        )
-    )
-    assert not rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
-        SimpleNamespace(
-            version=4,
-            available=False,
-            browser_inspect=False,
-            bind_candidate_preview=False,
-            restore_canonical_preview=False,
-        )
-    )
 
 
-def test_candidate_loop_capability_check_accepts_wire_camel_case() -> None:
-    assert rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
-        {
-            "version": 4,
-            "available": True,
-            "browserInspect": True,
-            "bindCandidatePreview": True,
-            "restoreCanonicalPreview": True,
-        }
-    )
-    assert not rpc_sessions._desktop_artifact_bridge_supports_candidate_loop(
-        {
-            "version": 4,
-            "available": True,
-            "browserInspect": True,
-            "bindCandidatePreview": True,
-            "restoreCanonicalPreview": False,
-        }
-    )
 
 
 @dataclass
@@ -217,6 +134,7 @@ class FakeSession:
     auth_profile_override_source: str | None = None
     epoch: int = 0
     workspace_id: str | None = None
+    execution_workspace: dict[str, Any] | None = None
 
 
 @pytest.mark.parametrize(
@@ -333,6 +251,7 @@ class FakeStorage:
         self.memory_durable_receipts: list[Any] = []
         self.list_agent_tasks_calls: list[str | None] = []
         self.list_agent_tasks_for_sessions_calls: list[tuple[str, ...]] = []
+        self.last_transcript_content_batch_calls: list[tuple[tuple[str, ...], int]] = []
 
     async def list_sessions(self, limit: int | None = None) -> list[FakeSession]:
         result = list(self._sessions.values())
@@ -371,6 +290,24 @@ class FakeStorage:
         if limit is not None:
             rows = rows[:limit]
         return rows
+
+    async def list_last_transcript_content_batch(
+        self,
+        session_ids: list[str],
+        *,
+        max_chars: int = 120,
+    ) -> dict[str, str]:
+        self.last_transcript_content_batch_calls.append((tuple(session_ids), max_chars))
+        result: dict[str, str] = {session_id: "" for session_id in session_ids}
+        for session_id in session_ids:
+            for entry in reversed(self._transcripts.get(session_id, [])):
+                if (
+                    getattr(entry, "role", None) in ("user", "assistant")
+                    and getattr(entry, "content", None)
+                ):
+                    result[session_id] = str(entry.content)[:max_chars]
+                    break
+        return result
 
     async def list_user_transcript_content_batch(
         self,
@@ -624,6 +561,28 @@ def make_ctx(session_manager=None, **kwargs) -> RpcContext:
     return ctx
 
 
+async def _reset_durable_session(
+    storage: SessionStorage,
+    current: SessionNode,
+    *,
+    replacement_session_id: str,
+) -> SessionNode:
+    replacement = current.model_copy(deep=True)
+    replacement.session_id = replacement_session_id
+    replacement.epoch = int(current.epoch or 0) + 1
+
+    async def _ignore_archive(_snapshot: Any) -> None:
+        return None
+
+    await storage.reset_session(
+        replacement,
+        expected_session_id=current.session_id,
+        expected_epoch=int(current.epoch or 0),
+        archive_writer=_ignore_archive,
+    )
+    return replacement
+
+
 def _capture_compaction_emits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[tuple[str, str, dict[str, Any]]]:
@@ -638,6 +597,11 @@ def _capture_compaction_emits(
         emitted.append((session_key, event_name, payload))
 
     monkeypatch.setattr(rpc_sessions, "_send_prepared_to_subscribers", _record_emit)
+    monkeypatch.setattr(
+        session_maintenance_adapter,
+        "send_prepared_to_subscribers",
+        _record_emit,
+    )
     return emitted
 
 
@@ -732,6 +696,10 @@ class _ReplayConn:
         self.conn_id = conn_id
         self.client_caps = client_caps
         self.events: list[tuple[str, dict, dict | None]] = []
+
+    def _retire_flow_subscription(self, key: str) -> None:
+        """This replay-only fake has no negotiated consumption-flow state."""
+        assert "transport.flow.v1" not in self.client_caps
 
     async def send_event(
         self,
@@ -1049,6 +1017,179 @@ class TestSessionsCreate:
         assert res.ok is True
         assert res.payload["seededMessage"] is True
         assert session_manager.created_messages == [(res.payload["key"], "user", "hello")]
+
+    @pytest.mark.asyncio
+    async def test_create_with_message_passes_owner_to_capable_storage_proxy(
+        self,
+        dispatcher,
+    ) -> None:
+        class OwnerCapableManager(FakeSessionManager):
+            owner: tuple[str | None, int | None] | None = None
+
+            async def append_message(
+                self,
+                key: str,
+                role: str = "user",
+                content: str = "",
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+            ) -> Any:
+                self.owner = (expected_session_id, expected_session_epoch)
+                return await super().append_message(key, role, content)
+
+        session_manager = OwnerCapableManager()
+        response = await dispatcher.dispatch(
+            "r-create-owner-proxy",
+            "sessions.create",
+            {"agentId": "myagent", "message": "hello"},
+            make_ctx(session_manager=session_manager),
+        )
+
+        assert response.ok is True
+        assert session_manager.owner == (response.payload["sessionId"], 0)
+
+    @pytest.mark.asyncio
+    async def test_create_with_message_keeps_kwargs_only_legacy_writer_ownerless(
+        self,
+        dispatcher,
+    ) -> None:
+        class LegacyKwargsManager(FakeSessionManager):
+            append_kwargs: dict[str, Any] | None = None
+
+            async def append_message(
+                self,
+                key: str,
+                role: str = "user",
+                content: str = "",
+                **kwargs: Any,
+            ) -> Any:
+                self.append_kwargs = kwargs
+                return await super().append_message(key, role, content)
+
+        session_manager = LegacyKwargsManager()
+        response = await dispatcher.dispatch(
+            "r-create-ownerless-kwargs",
+            "sessions.create",
+            {"agentId": "legacy", "message": "hello"},
+            make_ctx(session_manager=session_manager),
+        )
+
+        assert response.ok is True
+        assert session_manager.append_kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_create_with_message_rejects_dropping_durable_writer(
+        self,
+        dispatcher,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opensquilla.session.manager import SessionManager
+
+        storage = await SessionStorage.open(str(tmp_path / "create-dropping-writer.db"))
+        manager = SessionManager(storage, inject_time_prefix=False)
+        append_calls: list[dict[str, Any]] = []
+
+        async def _dropping_append(*_args: Any, **kwargs: Any) -> None:
+            append_calls.append(dict(kwargs))
+
+        monkeypatch.setattr(manager, "append_message", _dropping_append)
+        try:
+            response = await dispatcher.dispatch(
+                "r-create-dropping-writer",
+                "sessions.create",
+                {"agentId": "main", "message": "must not persist"},
+                make_ctx(session_manager=manager),
+            )
+        finally:
+            await storage.close()
+
+        assert response.ok is False
+        assert response.error.code == "INTERNAL_ERROR"
+        assert "cannot enforce a durable owner" in response.error.message
+        assert append_calls == []
+
+    @pytest.mark.asyncio
+    async def test_create_with_message_reset_before_append_preserves_replacement(
+        self,
+        dispatcher,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opensquilla.session.manager import SessionManager
+
+        key = "agent:main:create-owner-race"
+        storage = await SessionStorage.open(str(tmp_path / "create-owner-race.db"))
+        manager = SessionManager(storage, inject_time_prefix=False)
+        original_append = manager.append_message
+        admitted: SessionNode | None = None
+        original_create = manager.create
+
+        async def _capture_create(*args: Any, **kwargs: Any) -> SessionNode:
+            nonlocal admitted
+            admitted = await original_create(*args, **kwargs)
+            return admitted
+
+        async def _reset_before_append(
+            session_key: str,
+            role: str = "user",
+            content: str = "",
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ) -> TranscriptEntry:
+            assert admitted is not None
+            assert (expected_session_id, expected_session_epoch) == (
+                admitted.session_id,
+                int(admitted.epoch or 0),
+            )
+            replacement = await _reset_durable_session(
+                storage,
+                admitted,
+                replacement_session_id="create-replacement-session",
+            )
+            await original_append(
+                key,
+                role="assistant",
+                content="replacement transcript",
+                message_id="create-replacement-message",
+                expected_session_id=replacement.session_id,
+                expected_session_epoch=int(replacement.epoch or 0),
+            )
+            return await original_append(
+                session_key,
+                role=role,
+                content=content,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(rpc_sessions, "_create_session_key", lambda _agent, _kind=None: key)
+        monkeypatch.setattr(manager, "create", _capture_create)
+        monkeypatch.setattr(manager, "append_message", _reset_before_append)
+        try:
+            response = await dispatcher.dispatch(
+                "r-create-owner-race",
+                "sessions.create",
+                {"agentId": "main", "message": "stale seed"},
+                make_ctx(session_manager=manager),
+            )
+            replacement = await storage.get_session(key)
+            assert replacement is not None
+            replacement_transcript = await storage.get_transcript(replacement.session_id)
+        finally:
+            await storage.close()
+
+        assert response.ok is False
+        assert response.error.code == "INTERNAL_ERROR"
+        assert "owner mismatch" in response.error.message.lower()
+        assert replacement.session_id == "create-replacement-session"
+        assert [entry.content for entry in replacement_transcript] == [
+            "replacement transcript"
+        ]
 
     @pytest.mark.asyncio
     async def test_create_uses_agent_registry_model_when_model_not_explicit(self, dispatcher):
@@ -1659,6 +1800,64 @@ class TestSessionsList:
         assert row["workspaceDisplayPath"] == str(workspace)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("saved_context", [False, True])
+    async def test_list_uses_bound_task_workspace(self, dispatcher, tmp_path, saved_context):
+        workspace = tmp_path / "tasks" / "bound-task"
+        # No filesystem creation: metadata remains useful if the directory is
+        # temporarily unavailable, and must not display the shared fallback.
+        session = FakeSession(
+            session_key="agent:main:webchat:bound-workspace",
+            execution_workspace={
+                "version": 1,
+                "id": "6a56c8c1be4a496f9813150a71ba1ac2",
+                "kind": "managed",
+                "root": str(workspace),
+            },
+            origin={RUN_CONTEXT_ORIGIN_KEY: {"workspace": str(tmp_path / "old-shared")}}
+            if saved_context else None,
+        )
+        ctx = make_ctx(session_manager=FakeSessionManager([session]))
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert row["workspace"] == str(workspace)
+        assert row["workspaceLabel"] == "bound-task"
+        assert row["workspaceDisplayPath"] == str(workspace)
+
+    @pytest.mark.asyncio
+    async def test_list_project_workspace_takes_precedence_over_task_binding(
+        self, dispatcher, tmp_path,
+    ):
+        project = tmp_path / "selected-project"
+        session = FakeSession(
+            session_key="agent:main:webchat:project-workspace",
+            workspace_id="project-id",
+            execution_workspace={
+                "version": 1,
+                "id": "6a56c8c1be4a496f9813150a71ba1ac2",
+                "kind": "managed",
+                "root": str(tmp_path / "old-task"),
+            },
+            origin={RUN_CONTEXT_ORIGIN_KEY: {"workspace": str(project)}},
+        )
+        ctx = make_ctx(session_manager=FakeSessionManager([session]))
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        assert res.payload["sessions"][0]["workspace"] == str(project)
+
+    def test_list_invalid_task_binding_does_not_display_shared_fallback(self, tmp_path):
+        session = FakeSession(
+            execution_workspace={"root": str(tmp_path / "invalid")},
+            origin={RUN_CONTEXT_ORIGIN_KEY: {"workspace": str(tmp_path / "old-shared")}},
+        )
+
+        assert rpc_sessions._workspace_metadata_for_session(session, GatewayConfig()) == {}
+
+    @pytest.mark.asyncio
     async def test_list_keeps_default_opensquilla_workspace_flat(
         self, dispatcher, tmp_path, monkeypatch
     ):
@@ -1990,9 +2189,12 @@ class TestSessionsList:
         assert row["runStatus"] == "interrupted"
 
     @pytest.mark.asyncio
-    async def test_list_contract_cron_isolated_row(self, dispatcher):
+    @pytest.mark.parametrize(
+        "session_key", ["cron:daily-summary", "cron:daily-summary:run:abc123"]
+    )
+    async def test_list_contract_cron_isolated_row(self, dispatcher, session_key):
         session = FakeSession(
-            session_key="cron:daily-summary:run:abc123",
+            session_key=session_key,
             display_name="Daily summary",
             origin={
                 "kind": "cron",
@@ -2010,7 +2212,7 @@ class TestSessionsList:
         assert row["sessionKind"] == "cron"
         assert row["surface"] == "cron"
         assert row["groupLabel"] == "Cron"
-        assert row["interactive"] is False
+        assert row["interactive"] is True
         assert row["cron"] == {
             "jobId": "daily-summary",
             "sessionTarget": "isolated",
@@ -2299,6 +2501,59 @@ class TestSessionsList:
 
 
 class TestSessionsSend:
+    @pytest.mark.asyncio
+    async def test_direct_send_rejects_dropping_durable_runner(
+        self,
+        dispatcher,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from opensquilla.session.manager import SessionManager
+
+        storage = await SessionStorage.open(str(tmp_path / "send-dropping-runner.db"))
+        manager = SessionManager(storage, inject_time_prefix=False)
+        session = await manager.create(
+            session_key="agent:main:webchat:send-dropping-runner",
+            agent_id="main",
+        )
+        terminal = asyncio.Event()
+
+        class DroppingRunner:
+            called = False
+
+            async def run(self, *_args: Any, **_kwargs: Any):
+                self.called = True
+                yield DoneEvent(text="must not run")
+
+        async def _emit(
+            _ctx: RpcContext,
+            _session_key: str,
+            event_name: str,
+            _payload: dict[str, Any],
+        ) -> None:
+            if event_name == "session.event.error":
+                terminal.set()
+
+        runner = DroppingRunner()
+        monkeypatch.setattr(rpc_sessions, "_send_prepared_to_subscribers", _emit)
+        try:
+            response = await dispatcher.dispatch(
+                "r-send-dropping-runner",
+                "sessions.send",
+                {"key": session.session_key, "message": "must remain fenced"},
+                make_ctx(
+                    session_manager=manager,
+                    task_runtime=None,
+                    turn_runner=runner,
+                ),
+            )
+            await asyncio.wait_for(terminal.wait(), timeout=2.0)
+        finally:
+            await storage.close()
+
+        assert response.ok is True
+        assert runner.called is False
+
     @pytest.mark.asyncio
     async def test_direct_send_serializes_generation_reset_without_error(
         self,
@@ -2633,9 +2888,8 @@ class TestSessionsSend:
         ]
 
     @pytest.mark.asyncio
-    async def test_safe_send_soft_lands_to_full_when_host_sandbox_is_unavailable(
+    async def test_owner_existing_safe_session_uses_global_full_default(
         self,
-        dispatcher,
         monkeypatch: pytest.MonkeyPatch,
     ):
         unavailable = CapabilityReport(
@@ -2653,7 +2907,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         session = FakeSession(
             session_key="agent:main:webchat:safe-fallback",
             origin={
@@ -2681,22 +2937,16 @@ class TestSessionsSend:
             session_manager=FakeSessionManager([session]),
             task_runtime=runtime,
         )
-        res = await dispatcher.dispatch(
-            "r-safe-fallback",
-            "sessions.send",
+        result = await rpc_sessions._handle_sessions_send_contract(
             {"key": session.session_key, "message": "hello"},
             ctx,
         )
 
-        assert res.ok is True
-        envelope = runtime.enqueue_calls[0]["envelope"]
-        assert envelope.metadata["run_mode"] == "full"
-        assert envelope.metadata["sandbox_mode_resolution"] == {
-            "desiredMode": "safe",
-            "effectiveMode": "full",
-            "fallbackReason": "backend_unavailable",
-            "confirmationRequired": True,
-        }
+        assert result["task_id"] == "task-safe-fallback"
+        assert len(runtime.enqueue_calls) == 1
+        accepted = runtime.enqueue_calls[0]
+        assert accepted["envelope"].metadata["run_mode"] == "full"
+        assert accepted["accepted_run_mode_override"].run_mode is RunMode.FULL
         assert session.origin["sandbox_run_context"]["run_mode"] == "safe"
 
     @pytest.mark.asyncio
@@ -2728,7 +2978,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         session = FakeSession(session_key="agent:main:webchat:guest-no-fallback")
         guest = Principal(
             role="operator",
@@ -2747,7 +2999,7 @@ class TestSessionsSend:
         if source_hint is not None:
             params["_source"] = source_hint
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
-            await rpc_sessions._handle_sessions_send(params, ctx)
+            await rpc_sessions._handle_sessions_send_contract(params, ctx)
 
         assert raised.value.code == "SANDBOX_UNAVAILABLE"
 
@@ -2788,7 +3040,9 @@ class TestSessionsSend:
                     status="queued",
                 )
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         configured_workspace = tmp_path / "real-project"
         configured_workspace.mkdir()
         state_dir = tmp_path / "state"
@@ -2813,7 +3067,7 @@ class TestSessionsSend:
             config=config,
         )
 
-        await rpc_sessions._handle_sessions_send(
+        await rpc_sessions._handle_sessions_send_contract(
             {"key": session.session_key, "message": "hello"},
             ctx,
         )
@@ -2867,7 +3121,9 @@ class TestSessionsSend:
                 "GUEST_DEFAULT_WORKSPACE_UNSAFE: guest scratch directory is retargeted"
             )
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
         monkeypatch.setattr(rpc_sessions, "_guest_profile_for_principal", fail_profile)
         session = FakeSession(session_key="agent:main:webchat:guest-boundary")
         guest = Principal(
@@ -2888,7 +3144,7 @@ class TestSessionsSend:
         )
 
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
-            await rpc_sessions._handle_sessions_send(
+            await rpc_sessions._handle_sessions_send_contract(
                 {"key": session.session_key, "message": "hello"},
                 ctx,
             )
@@ -3127,8 +3383,18 @@ class TestSessionsSend:
             def __init__(self) -> None:
                 self.records: dict[str, AgentTaskRecord] = {}
                 self.turn_context_updates: list[tuple[str, str, dict[str, Any]]] = []
+                self.owner_cas_calls: list[tuple[str | None, int | None]] = []
 
-            async def create_agent_task(self, record: AgentTaskRecord) -> None:
+            async def create_agent_task(
+                self,
+                record: AgentTaskRecord,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+            ) -> None:
+                self.owner_cas_calls.append(
+                    (expected_session_id, expected_session_epoch)
+                )
                 self.records[record.task_id] = record
 
             async def update_agent_task(self, task_id: str, **kwargs: Any) -> None:
@@ -3210,6 +3476,10 @@ class TestSessionsSend:
         assert first.payload["task_id"] == first.payload["turn_id"]
         assert second.payload["task_id"] == second.payload["turn_id"]
         assert second.payload["turn_id"] == first.payload["turn_id"]
+        assert runtime_storage.owner_cas_calls == [
+            (None, None),
+            (session.session_id, session.epoch),
+        ]
         assert runtime_storage.turn_context_updates[-1][2] == {
             "turn_id": first.payload["turn_id"],
             "client_request_id": "request-collect-2",
@@ -3365,15 +3635,15 @@ class TestSessionsSend:
         ("requested_run_mode", "expected_run_mode"),
         [
             ("full", "full"),
-            ("trusted", "full"),
-            ("standard", "full"),
+            ("trusted", None),
+            ("standard", None),
         ],
     )
-    async def test_send_host_capable_token_run_mode_is_resolved_without_persisting(
+    async def test_send_host_capable_token_never_soft_lands_safe_to_full(
         self,
         dispatcher,
         requested_run_mode: str,
-        expected_run_mode: str,
+        expected_run_mode: str | None,
         monkeypatch: pytest.MonkeyPatch,
     ):
         unavailable = CapabilityReport(
@@ -3391,7 +3661,9 @@ class TestSessionsSend:
         async def report(_config):
             return unavailable
 
-        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(
+            "opensquilla.gateway.admission_preparation.current_sandbox_capability_report", report
+        )
 
         class RecordingTaskRuntime:
             def __init__(self) -> None:
@@ -3442,6 +3714,14 @@ class TestSessionsSend:
             },
             ctx,
         )
+
+        if expected_run_mode is None:
+            assert res.ok is False
+            assert res.error is not None
+            assert res.error.code == "SANDBOX_MODE_UNAVAILABLE"
+            assert runtime.enqueue_calls == []
+            assert session.origin["sandbox_run_context"]["run_mode"] == "standard"
+            return
 
         assert res.ok is True
         envelope = runtime.enqueue_calls[0]["envelope"]
@@ -3790,7 +4070,11 @@ class TestSessionsSend:
         self,
         dispatcher,
     ):
-        attachment = {"type": "image/png", "data": "aW1hZ2U=", "name": "image.png"}
+        attachment = {
+            "type": "image/png",
+            "data": base64.b64encode(image_bytes()).decode("ascii"),
+            "name": "image.png",
+        }
 
         web_session = FakeSession(
             session_key="agent:main:webchat:web-display",
@@ -5033,121 +5317,6 @@ class TestSessionsSteer:
         assert response.payload["fallback_safe"] is True
         assert manager.created_messages == []
 
-    @pytest.mark.asyncio
-    async def test_steer_persists_and_injects_into_active_task(
-        self,
-        dispatcher,
-        session,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        calls: list[dict[str, Any]] = []
-
-        class Runtime:
-            async def active_task_id(self, key: str) -> str | None:
-                assert key == session.session_key
-                return "turn-running"
-
-            async def steer(self, key: str, message: str, **kwargs: Any) -> str | None:
-                calls.append({"key": key, "message": message, **kwargs})
-                return "turn-running"
-
-        emitted = _capture_compaction_emits(monkeypatch)
-        manager = FakeSessionManager([session])
-        ctx = make_ctx(session_manager=manager, task_runtime=Runtime())
-        res = await dispatcher.dispatch(
-            "r-steer",
-            "sessions.steer",
-            {
-                "key": session.session_key,
-                "message": "change direction",
-                "clientMessageId": "client-steer",
-                "surfaceId": "tui:test",
-            },
-            ctx,
-        )
-
-        assert res.ok is True
-        assert res.payload["accepted"] is True
-        assert res.payload["turn_id"] == "turn-running"
-        assert manager.created_messages == [(session.session_key, "user", "change direction")]
-        assert calls[0]["persisted_user_message_id"] == "msg-1"
-        assert calls[0]["client_message_id"] == "client-steer"
-        assert manager.updated_turn_contexts[0][2]["disposition"] == "steering"
-        assert manager.updated_turn_contexts[0][2]["turn_id"] == "turn-running"
-        assert emitted[0][1] == "session.event.steer"
-
-    @pytest.mark.asyncio
-    async def test_steer_race_rolls_back_and_reports_idle(self, dispatcher, session) -> None:
-        class Runtime:
-            async def active_task_id(self, _key: str) -> str | None:
-                return "turn-ending"
-
-            async def steer(self, _key: str, _message: str, **_kwargs: Any) -> None:
-                return None
-
-        manager = FakeSessionManager([session])
-        ctx = make_ctx(session_manager=manager, task_runtime=Runtime())
-        res = await dispatcher.dispatch(
-            "r-steer-race",
-            "sessions.steer",
-            {"key": session.session_key, "message": "late"},
-            ctx,
-        )
-
-        assert res.ok is True
-        assert res.payload == {
-            "status": "idle",
-            "accepted": False,
-            "key": session.session_key,
-        }
-        assert manager.removed_messages == [(session.session_key, "msg-1")]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("rollback_failure", ["missing", "exception"])
-    async def test_steer_race_dirty_rollback_fails_closed_without_duplicate_fallback(
-        self,
-        dispatcher,
-        session,
-        rollback_failure: str,
-    ) -> None:
-        class Runtime:
-            async def active_task_id(self, _key: str) -> str | None:
-                return "turn-ending"
-
-            async def steer(self, _key: str, _message: str, **_kwargs: Any) -> None:
-                return None
-
-        class DirtyManager(FakeSessionManager):
-            async def remove_message(self, key: str, message_id: str) -> bool:
-                self.removed_messages.append((key, message_id))
-                if rollback_failure == "exception":
-                    raise OSError("storage unavailable")
-                return False
-
-        manager = DirtyManager([session])
-        ctx = make_ctx(session_manager=manager, task_runtime=Runtime())
-        res = await dispatcher.dispatch(
-            "r-steer-race-dirty",
-            "sessions.steer",
-            {
-                "key": session.session_key,
-                "message": "late but durable",
-                "clientMessageId": "client-dirty-steer",
-            },
-            ctx,
-        )
-
-        assert res.ok is False
-        assert res.error.code == "STEER_RACE_DIRTY"
-        assert res.error.retryable is False
-        assert res.error.details["fallback_safe"] is False
-        assert res.error.details["orphan_message_id"] == "msg-1"
-        assert manager.created_messages == [(session.session_key, "user", "late but durable")]
-        assert manager.removed_messages == [(session.session_key, "msg-1")]
-        assert manager.updated_turn_contexts[-1][2]["disposition"] == "rejected"
-        assert manager.updated_turn_contexts[-1][2]["client_message_id"] == ("client-dirty-steer")
-
-
 class TestSessionsAbort:
     @pytest.mark.asyncio
     async def test_abort_valid(self, dispatcher, ctx_with_sessions, session):
@@ -6126,7 +6295,7 @@ class TestSessionsAbort:
         monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
         monkeypatch.setattr(rpc_sessions, "_ABORT_SESSION_LOOKUP_SECONDS", 0.01)
         owner = asyncio.create_task(compaction_owner())
-        rpc_sessions.register_active_compaction(
+        cache_break_monitor.register_active_compaction(
             session_key,
             "cmp-slow-lookup",
             owner,
@@ -6163,6 +6332,18 @@ class TestSessionsAbort:
     ):
         cancel_entered = asyncio.Event()
         cancel_cancelled = asyncio.Event()
+        real_time = rpc_sessions.time
+
+        class ControlledAbortClock:
+            expired = False
+
+            def monotonic(self) -> float:
+                return 1.0 if self.expired else 0.0
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_time, name)
+
+        clock = ControlledAbortClock()
 
         class Runtime:
             async def list(self, session_key: str | None = None):
@@ -6171,6 +6352,7 @@ class TestSessionsAbort:
 
             async def cancel(self, **_kwargs: Any) -> int:
                 cancel_entered.set()
+                clock.expired = True
                 try:
                     await asyncio.Event().wait()
                 finally:
@@ -6180,6 +6362,9 @@ class TestSessionsAbort:
         async def cancel_background(_session_key: str) -> int:
             return 0
 
+        async def session_tree_keys(_session_manager: Any, root_key: str) -> tuple[str, ...]:
+            return (root_key,)
+
         async def emit(*_args: Any, **_kwargs: Any) -> None:
             return None
 
@@ -6188,6 +6373,12 @@ class TestSessionsAbort:
             "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
             cancel_background,
         )
+        # Keep setup operations inside the shared budget regardless of runner
+        # scheduling, then expire that same budget once Runtime.cancel starts.
+        # asyncio's own monotonic clock remains real, so its timeout still
+        # drives cancellation of the deliberately stuck runtime call.
+        monkeypatch.setattr(rpc_sessions, "time", clock)
+        monkeypatch.setattr(rpc_sessions, "_session_tree_keys", session_tree_keys)
         monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", emit)
         # The runtime cancellation intentionally never completes.  The
         # production handler must return on its shared budget, but a strict
@@ -7045,6 +7236,40 @@ class TestSessionsDelete:
         } == set(matching_ids)
 
     @pytest.mark.asyncio
+    async def test_delete_evicts_only_the_deleted_session_stream(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        sibling_key = "agent:main:subagent:delete-stream-sibling"
+        streams = SessionStreamRegistry()
+        streams.record(
+            session.session_key,
+            "task.failed",
+            {"task_id": "task-deleted", "status": "failed"},
+        )
+        streams.record(
+            sibling_key,
+            "task.failed",
+            {"task_id": "task-sibling", "status": "failed"},
+        )
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+
+        res = await dispatcher.dispatch(
+            "delete-stream-eviction",
+            "sessions.delete",
+            {"key": session.session_key},
+            make_ctx(session_manager=FakeSessionManager([session])),
+        )
+
+        assert res.ok is True
+        assert streams.replay(session.session_key, 0).events == []
+        assert [
+            event.event_name for event in streams.replay(sibling_key, 0).events
+        ] == ["task.failed"]
+
+    @pytest.mark.asyncio
     async def test_delete_holds_lifecycle_fences_through_cleanup(
         self,
         dispatcher,
@@ -7273,44 +7498,6 @@ class TestSessionsDelete:
             for approval_id in matching_ids
         } == {"expired"}
         assert resolved_events == matching_ids
-
-
-class TestSessionsCompact:
-    @pytest.mark.asyncio
-    async def test_compact_valid_uses_summary_compaction(
-        self, dispatcher, ctx_with_sessions, session
-    ):
-        res = await dispatcher.dispatch(
-            "r1", "sessions.compact", {"key": session.session_key}, ctx_with_sessions
-        )
-        assert res.ok is True
-        assert res.payload["mode"] == "summary"
-        assert res.payload["compacted"] is True
-        assert ctx_with_sessions.session_manager.compact_calls[0][:2] == (
-            session.session_key,
-            ctx_with_sessions.config.context_budget_tokens,
-        )
-        assert ctx_with_sessions.session_manager.truncate_calls == []
-
-    @pytest.mark.asyncio
-    async def test_compact_allowed_for_operator_write_scope(self, dispatcher, session):
-        ctx = make_ctx(
-            session_manager=FakeSessionManager([session]),
-            scopes=["operator.read", "operator.write"],
-        )
-
-        res = await dispatcher.dispatch("r1", "sessions.compact", {"key": session.session_key}, ctx)
-
-        assert res.ok is True
-        assert ctx.session_manager.compact_calls
-
-    @pytest.mark.asyncio
-    async def test_compact_not_found(self, dispatcher, ctx_with_sessions):
-        res = await dispatcher.dispatch(
-            "r1", "sessions.compact", {"key": "nonexistent"}, ctx_with_sessions
-        )
-        assert res.ok is False
-        assert res.error.code == "NOT_FOUND"
 
 
 class TestSessionsTruncate:
@@ -7688,7 +7875,7 @@ class TestSessionsContextCompact:
     ):
         events: list[tuple[str, dict[str, Any]]] = []
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -7731,7 +7918,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -7781,7 +7968,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -7895,8 +8082,8 @@ class TestSessionsContextCompact:
                 await release_started_broadcast.wait()
 
         monkeypatch.setattr(
-            rpc_sessions,
-            "_send_prepared_to_subscribers",
+            session_maintenance_adapter,
+            "send_prepared_to_subscribers",
             _block_started_broadcast,
         )
         monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.1)
@@ -8021,8 +8208,8 @@ class TestSessionsContextCompact:
                 await hold_observed_emit.wait()
 
         monkeypatch.setattr(
-            rpc_sessions,
-            "_send_prepared_to_subscribers",
+            session_maintenance_adapter,
+            "send_prepared_to_subscribers",
             _block_first_observed_emit,
         )
 
@@ -8109,7 +8296,7 @@ class TestSessionsContextCompact:
         compaction_id = compact_response.payload["compaction_id"]
         await asyncio.wait_for(terminal_epoch_resolve_started.wait(), timeout=1.0)
 
-        assert rpc_sessions.compaction_terminal_status(compaction_id) is None
+        assert cache_break_monitor.compaction_terminal_status(compaction_id) is None
         replay_before_cancel = get_session_streams().replay(session.session_key, stream_cursor)
         assert not any(
             event.payload.get("compaction_id") == compaction_id
@@ -8141,7 +8328,7 @@ class TestSessionsContextCompact:
             in {"completed", "skipped", "failed", "cancelled", "timed_out"}
         ]
         assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
-        assert rpc_sessions.compaction_terminal_status(compaction_id) == "cancelled"
+        assert cache_break_monitor.compaction_terminal_status(compaction_id) == "cancelled"
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_skipped_when_nothing_removed(
@@ -8156,7 +8343,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8216,7 +8403,7 @@ class TestSessionsContextCompact:
         ctx = make_ctx(session_manager=manager)
         events: list[tuple[str, dict[str, Any]]] = []
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8260,7 +8447,7 @@ class TestSessionsContextCompact:
         ctx = make_ctx(session_manager=manager, config=config)
         events: list[tuple[str, dict[str, Any]]] = []
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8296,7 +8483,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8695,7 +8882,7 @@ class TestSessionsContextCompact:
         events: list[tuple[str, dict[str, Any]]] = []
         emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
-            rpc_sessions,
+            session_maintenance_adapter,
             "notify_compaction",
             lambda session_key, **payload: events.append((session_key, payload)),
         )
@@ -8743,6 +8930,36 @@ class TestSessionsSubscribe:
 
 class TestSessionsMessagesSubscribe:
     @pytest.mark.asyncio
+    async def test_missing_subagent_is_rejected_before_replaying_failed_task(
+        self,
+        dispatcher,
+    ):
+        key = "agent:main:subagent:missing-replay"
+        streams = get_session_streams()
+        streams.record(
+            key,
+            "task.failed",
+            {"task_id": "task-missing", "status": "failed"},
+        )
+        subscriptions = SubscriptionManager()
+        try:
+            response = await dispatcher.dispatch(
+                "missing-subagent-subscribe",
+                "sessions.messages.subscribe",
+                {"key": key, "since_stream_seq": 0},
+                make_ctx(
+                    session_manager=FakeSessionManager([]),
+                    subscription_manager=subscriptions,
+                ),
+            )
+
+            assert response.ok is False
+            assert response.error.code == "SESSION_NOT_FOUND"
+            assert subscriptions.get_message_subscribers(key) == set()
+        finally:
+            streams.evict(key)
+
+    @pytest.mark.asyncio
     async def test_messages_hydrate_uses_bounded_interactive_storage_scope(
         self,
         dispatcher,
@@ -8755,6 +8972,7 @@ class TestSessionsMessagesSubscribe:
             nonlocal observed_bounded_scope
             observed_bounded_scope = session_storage._BOUNDED_INTERACTIVE_READS.get()
             return {
+                **rpc_sessions._deferred_sessions_messages_metadata(),
                 "key": key,
                 "hydration_complete": True,
                 "deferred_fields": [],
@@ -10589,6 +10807,53 @@ class TestSessionsPreview:
         assert len(res.payload["previews"]) == 1
 
     @pytest.mark.asyncio
+    async def test_preview_uses_one_bounded_latest_message_projection(
+        self,
+        dispatcher,
+    ):
+        session = FakeSession(session_key="agent:main:preview", session_id="preview-id")
+        manager = FakeSessionManager([session])
+        manager._storage._transcripts[session.session_id] = [
+            SimpleNamespace(role="system", content="ignore this"),
+            SimpleNamespace(role="user", content="older message"),
+            SimpleNamespace(role="assistant", content="newest message"),
+        ]
+
+        async def fail_full_transcript_read(*args, **kwargs):
+            raise AssertionError("sessions.preview must not load the full transcript")
+
+        manager._storage.get_transcript = fail_full_transcript_read
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch("r1", "sessions.preview", None, ctx)
+
+        assert res.ok is True
+        assert res.payload["previews"][0]["lastMessage"] == "newest message"
+        assert manager._storage.last_transcript_content_batch_calls == [
+            ((session.session_id,), 120)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_preview_does_not_hide_projection_failures(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+    ):
+        async def fail_projection(*args, **kwargs):
+            raise RuntimeError("projection failed")
+
+        ctx_with_sessions.session_manager._storage.list_last_transcript_content_batch = (
+            fail_projection
+        )
+
+        res = await dispatcher.dispatch("r1", "sessions.preview", None, ctx_with_sessions)
+
+        assert res.ok is False
+        assert res.error is not None
+        assert res.error.code == "INTERNAL_ERROR"
+        assert "projection failed" in res.error.message
+
+    @pytest.mark.asyncio
     async def test_preview_no_manager(self, dispatcher, ctx_no_manager):
         res = await dispatcher.dispatch("r1", "sessions.preview", None, ctx_no_manager)
         assert res.ok is True
@@ -10677,7 +10942,10 @@ class TestSessionsResolve:
 
         assert res.ok is False
         assert res.error.code == "INVALID_REQUEST"
-        assert "Ambiguous session id" in res.error.message
+        assert res.error.message == (
+            "Ambiguous session id 'abc'; matches: "
+            "agent:default:abc123, agent:bench:abc999"
+        )
 
     @pytest.mark.asyncio
     async def test_resolve_not_found(self, dispatcher, ctx_with_sessions):
@@ -10686,6 +10954,56 @@ class TestSessionsResolve:
         )
         assert res.ok is False
         assert res.error.code == "NOT_FOUND"
+        assert res.error.message == "'Session not found: nonexistent'"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("params", "message"),
+        [
+            (None, "params.key is required"),
+            ({}, "params.key is required"),
+            ({"key": 42}, "params.key must be a string"),
+        ],
+    )
+    async def test_resolve_preserves_invalid_request_messages(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+        params,
+        message,
+    ):
+        res = await dispatcher.dispatch("r1", "sessions.resolve", params, ctx_with_sessions)
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_REQUEST"
+        assert res.error.message == message
+
+    @pytest.mark.asyncio
+    async def test_resolve_preserves_missing_manager_error(self, dispatcher, ctx_no_manager):
+        res = await dispatcher.dispatch(
+            "r1", "sessions.resolve", {"key": "abc"}, ctx_no_manager
+        )
+
+        assert res.ok is False
+        assert res.error.code == "NOT_FOUND"
+        assert res.error.message == "'No session manager available'"
+
+    @pytest.mark.asyncio
+    async def test_resolve_requires_operator_read_scope(self, dispatcher, session):
+        ctx = make_ctx(
+            scopes=[],
+            session_manager=FakeSessionManager([session]),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.resolve", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is False
+        assert res.error.code == "UNAUTHORIZED"
+        assert res.error.message == (
+            "Insufficient scope for method: sessions.resolve: missing operator.read"
+        )
 
     @pytest.mark.asyncio
     async def test_scope_enforcement(self, dispatcher, session):
@@ -10872,6 +11190,69 @@ class TestSessionsBootstrap:
         assert res.payload["runtime"]["model_routing"]["mode"] == "router"
         assert res.payload["epoch"] == 3
         assert res.payload["stream_cursor"] == stream["stream_seq"]
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_overlays_live_llm_for_session_direct_image_capability(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        class _Catalog:
+            def resolve_deployment_vision_support(self, *_args, **_kwargs) -> str:
+                return "supported"
+
+        monkeypatch.setattr(
+            "opensquilla.provider.model_catalog.shared_catalog",
+            lambda: _Catalog(),
+        )
+        key = "agent:main:webchat:bootstrap-direct-vision"
+        session = FakeSession(session_key=key, session_id="bootstrap-direct-vision")
+        manager = FakeSessionManager([session])
+
+        async def get_session_routing(
+            candidate: str,
+            *,
+            fallback_mode: str,
+        ) -> dict[str, Any]:
+            assert candidate == key
+            assert fallback_mode == "ensemble"
+            return {
+                "mode": "direct",
+                "revision": 3,
+                "source": "session",
+                "initialized": True,
+            }
+
+        manager.get_session_routing = get_session_routing  # type: ignore[attr-defined]
+        ctx = make_ctx(
+            session_manager=manager,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "workspace"),
+                llm={"provider": "openrouter", "model": "direct-vision"},
+                llm_ensemble={
+                    "enabled": True,
+                    "selection_mode": "static_openrouter_b5",
+                },
+                squilla_router={"enabled": False, "rollout_phase": "observe"},
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "bootstrap-direct-vision",
+            "sessions.bootstrap",
+            {"key": key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["routing"]["mode"] == "direct"
+        assert res.payload["routing"]["revision"] == 3
+        assert res.payload["runtime"]["model_routing"]["mode"] == "direct"
+        assert res.payload["runtime"]["model_routing"]["image_input"] == {
+            "admission": "allowed",
+            "reason": "model_vision_supported",
+        }
 
     @pytest.mark.asyncio
     async def test_legacy_bootstrap_preserves_transcript_larger_than_one_mib(

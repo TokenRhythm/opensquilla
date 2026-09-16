@@ -197,7 +197,7 @@ async def test_literal_protocol_like_text_is_canonical_across_stream_done_and_pe
     assert state.turn_segments[0] == {
         "type": "text",
         "text": literal_text,
-        "presentation": "answer",
+        "presentation": "intermediate",
     }
 
     final_text, transcript = await _finalize(state, done_event)
@@ -207,7 +207,7 @@ async def test_literal_protocol_like_text_is_canonical_across_stream_done_and_pe
     assert transcript.calls[0]["tool_calls"][0] == {
         "type": "text",
         "text": literal_text,
-        "presentation": "answer",
+        "presentation": "intermediate",
     }
 
 
@@ -403,7 +403,7 @@ def test_conflicting_done_aggregate_cannot_resurrect_discarded_retry_text() -> N
     assert "".join(state.final_text_parts) == "kept answer"
 
 
-def test_conflicting_done_snapshot_preserves_tool_events_and_replaces_only_text() -> None:
+def test_conflicting_done_snapshot_preserves_tool_events_and_intermediate_activity() -> None:
     state = _make_state()
     text_handler = _TextDeltaHandler()
     text_handler.handle(TextDeltaEvent(text="stale pre-tool narration"), state)
@@ -430,7 +430,13 @@ def test_conflicting_done_snapshot_preserves_tool_events_and_replaces_only_text(
     assert extra == []
     assert done_event.text == "canonical successful answer"
     assert "".join(state.final_text_parts) == "canonical successful answer"
+    assert state.turn_segments[0] == {
+        "type": "text",
+        "text": "stale pre-tool narration",
+        "presentation": "intermediate",
+    }
     assert [segment["type"] for segment in state.turn_segments] == [
+        "text",
         "tool_use",
         "tool_result",
     ]

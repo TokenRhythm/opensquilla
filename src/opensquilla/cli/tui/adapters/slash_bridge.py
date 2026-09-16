@@ -168,23 +168,6 @@ async def save_gateway_transcript_command(
     )
 
 
-async def forget_server_approvals(
-    client: object | None,
-    target: str | None = None,
-    *,
-    output_console: Any | None = None,
-    error_panel_factory: Any | None = None,
-) -> bool:
-    sync_gateway_slash_adapter_io(
-        output_console=output_console,
-        error_panel_factory=error_panel_factory,
-    )
-    return await _gateway_slash_adapter._forget_server_approvals(
-        cast("GatewayClientLike | None", client),
-        target,
-    )
-
-
 async def handle_approvals_command(
     cmd: str,
     client: object | None = None,

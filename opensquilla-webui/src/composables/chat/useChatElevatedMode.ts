@@ -1,4 +1,8 @@
 import { computed, ref, type Ref } from 'vue'
+import {
+  ApprovalCenterError,
+  type ApprovalCenter,
+} from '@/modules/approvalCenter'
 
 const ELEVATED_MODE_KEY = 'opensquilla.elevatedMode'
 const ELEVATED_MODE_VERSION_KEY = 'opensquilla.elevatedMode.version'
@@ -11,6 +15,7 @@ export interface SetElevatedModeOptions {
 
 export interface UseChatElevatedModeOptions {
   sessionKey: Ref<string>
+  approvalCenter: Pick<ApprovalCenter, 'setElevatedMode'>
 }
 
 export function normalizeElevatedMode(mode: string): string {
@@ -68,12 +73,12 @@ export function useChatElevatedMode(options: UseChatElevatedModeOptions) {
   async function syncElevatedMode(mode: string) {
     if (!options.sessionKey.value || elevatedUnavailable.value) return
     try {
-      const resp = await fetch('/api/elevated-mode', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionKey: options.sessionKey.value, mode: mode || 'off' }),
-      })
-      if (resp.status === 403) {
+      await options.approvalCenter.setElevatedMode(
+        options.sessionKey.value,
+        (mode || 'off') as 'off' | 'on' | 'bypass' | 'full',
+      )
+    } catch (err: unknown) {
+      if (err instanceof ApprovalCenterError && err.kind === 'forbidden') {
         elevatedUnavailable.value = true
         try {
           localStorage.removeItem(ELEVATED_MODE_KEY)
@@ -83,8 +88,6 @@ export function useChatElevatedMode(options: UseChatElevatedModeOptions) {
         console.warn('Bypass requires a local owner session (loopback only).')
         return
       }
-      if (!resp.ok) throw new Error('HTTP ' + resp.status)
-    } catch (err: unknown) {
       console.warn('Failed to sync bypass mode:', err instanceof Error ? err.message : String(err))
     }
   }

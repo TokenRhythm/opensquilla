@@ -37,6 +37,59 @@ class FakeProvider:
         ][:max_results]
 
 
+@pytest.mark.asyncio
+async def test_default_search_does_not_fetch_short_provider_content() -> None:
+    async def unexpected_fetch(url: str, max_chars: int) -> dict:
+        pytest.fail("default search must not fetch")
+
+    payload = await run_canonical_web_search(
+        SearchOptions(query="default fetch boundary", provider="tavily"),
+        provider_factory=lambda name: ShortContentProvider(),
+        fetcher=unexpected_fetch,
+    )
+    assert payload["results"][0]["fetched"] is False
+    assert payload["results"][0]["fetch_status"] == "not_requested"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,error", [(404, None), (302, None), (0, None),
+                                          (200, "failed"), (None, None)])
+async def test_attached_fetch_rejects_error_text(status, error) -> None:
+    async def fetch(url: str, max_chars: int) -> dict:
+        return {"status": status, "error": error, "text": "Upstream failure body"}
+
+    payload = await run_canonical_web_search(
+        SearchOptions(query=f"invalid fetch {status} {error}", fetch_top_k=1, provider="tavily"),
+        provider_factory=lambda name: ShortContentProvider(),
+        fetcher=fetch,
+    )
+    assert payload["results"][0]["fetched"] is False
+    assert payload["results"][0]["excerpt"] == "Tiny."
+    assert payload["diagnostics"]["fetch_failed_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,retryable,allowed", [
+    ("timeout", True, True), ("network", True, True), ("rate_limit", True, True),
+    ("http", True, True), ("http", False, False), ("auth", True, False),
+    ("blocked", True, False), ("parse", True, False), ("unknown", True, False),
+])
+async def test_canonical_and_discover_retry_contract(kind, retryable, allowed) -> None:
+    from opensquilla.tools.builtin.web import _web_discover_payload_from_canonical
+
+    class FailingProvider:
+        async def search(self, query, max_results):
+            raise SearchProviderError("tavily", kind, "synthetic error", retryable=retryable)
+
+    payload = await run_canonical_web_search(
+        SearchOptions(query=f"retry {kind} {retryable}", provider="tavily"),
+        provider_factory=lambda name: FailingProvider(),
+    )
+    assert payload["retry_allowed"] is allowed
+    discover = _web_discover_payload_from_canonical(payload, display_provider="tavily")
+    assert discover["retry_allowed"] is allowed
+
+
 class AuthFailProvider:
     name = "tavily"
 
@@ -556,7 +609,10 @@ async def test_canonical_web_search_default_fetcher_fetches_compact_excerpt(
 ) -> None:
     fetch_calls: list[tuple[str, int]] = []
 
-    async def fake_run_web_fetch_payload(url: str, max_chars: int) -> dict[str, Any]:
+    async def fake_run_web_fetch_payload(
+        url: str, max_chars: int, *, _search_excerpt: bool = False
+    ) -> dict[str, Any]:
+        assert _search_excerpt is True
         fetch_calls.append((url, max_chars))
         return {
             "text": (
@@ -655,7 +711,7 @@ async def test_canonical_web_search_auto_network_attempts_at_most_two_ranked_pro
     )
 
     assert payload["ok"] is False
-    assert payload["retry_allowed"] is False
+    assert payload["retry_allowed"] is True
     assert payload["provider_retryable"] is True
     assert calls == ["bocha", "tavily"]
     assert payload["provider_attempts"] == [
@@ -1039,7 +1095,7 @@ async def test_canonical_web_search_rejects_empty_query_without_calling_provider
 
 
 @pytest.mark.asyncio
-async def test_canonical_web_search_limits_root_domain_spam_without_include_filter() -> None:
+async def test_canonical_web_search_keeps_same_domain_results_without_filter() -> None:
     canonical_module.clear_canonical_web_search_cache_for_tests()
 
     payload = await run_canonical_web_search(
@@ -1052,10 +1108,11 @@ async def test_canonical_web_search_limits_root_domain_spam_without_include_filt
         "www.example.com",
         "docs.example.com",
         "blog.example.com",
+        "news.example.com",
         "python.org",
     ]
-    assert payload["diagnostics"]["domain_limited_count"] == 1
-    assert [result["rank"] for result in payload["results"]] == [1, 2, 3, 4]
+    assert payload["diagnostics"]["domain_limited_count"] == 0
+    assert [result["rank"] for result in payload["results"]] == [1, 2, 3, 4, 5]
 
 
 class MultiLabelSuffixProvider:
@@ -1082,18 +1139,8 @@ class MultiLabelSuffixProvider:
         ][:max_results]
 
 
-def test_root_domain_returns_registrable_domain_not_public_suffix() -> None:
-    roots = {
-        canonical_module._root_domain("www.one.co.uk"),
-        canonical_module._root_domain("www.two.co.uk"),
-        canonical_module._root_domain("www.three.co.uk"),
-    }
-    assert "co.uk" not in roots
-    assert len(roots) == 3
-
-
 @pytest.mark.asyncio
-async def test_canonical_web_search_spam_limit_keeps_distinct_multi_label_suffix_sites() -> None:
+async def test_canonical_web_search_keeps_distinct_multi_label_suffix_sites() -> None:
     payload = await run_canonical_web_search(
         SearchOptions(query="uk politics news", max_results=5, fetch_top_k=0),
         provider_factory=lambda name: MultiLabelSuffixProvider(),

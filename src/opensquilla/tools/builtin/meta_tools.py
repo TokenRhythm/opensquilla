@@ -7,7 +7,7 @@ happens inside ``Agent._run_one_streaming``, which intercepts
 ``tc.tool_name == 'meta_invoke'`` before the standard ``_execute_tool``
 path. If this handler ever fires, something is misconfigured.
 
-Visibility: ``exposed_by_default=False``. ``meta_invoke`` is
+Visibility: ``default_access="deny"``. ``meta_invoke`` is
 conditionally surfaced by ``SkillInjector`` (via
 ``ToolContext.surfaced_tools``) when at least one ``kind=meta`` skill
 is present in ``<available_skills>``. Until Task 4 (SkillInjector)
@@ -48,7 +48,7 @@ from opensquilla.tools.registry import tool
         },
     },
     required=["name"],
-    exposed_by_default=False,
+    default_access="deny",
 )
 async def meta_invoke(name: str) -> str:  # noqa: ARG001 — name unused in guard
     raise RuntimeError(

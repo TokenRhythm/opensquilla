@@ -8,7 +8,7 @@ import pytest
 from opensquilla.engine.usage import UsageTracker
 from opensquilla.gateway import rpc_usage
 from opensquilla.gateway.rpc.registry import RpcContext
-from opensquilla.gateway.rpc_usage import _handle_usage_cost, _handle_usage_status
+from opensquilla.gateway.rpc_usage import _read_usage_cost, _read_usage_status
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 
@@ -35,7 +35,7 @@ def test_usage_status_tracker_only_path_surfaces_cache_totals() -> None:
     )
 
     ctx = _ctx(session_manager=None, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     assert payload["totalCacheReadTokens"] == 200
     assert payload["totalCacheWriteTokens"] == 80
@@ -77,7 +77,7 @@ def test_usage_status_surfaces_provider_model_deployment_breakdown() -> None:
     )
 
     payload = asyncio.run(
-        _handle_usage_status(None, _ctx(session_manager=None, usage_tracker=tracker))
+        _read_usage_status(None, _ctx(session_manager=None, usage_tracker=tracker))
     )
 
     [row] = payload["sessions"]
@@ -128,7 +128,7 @@ def test_usage_status_merges_deployment_breakdown_into_persisted_session() -> No
     )
 
     payload = asyncio.run(
-        _handle_usage_status(
+        _read_usage_status(
             None,
             _ctx(
                 session_manager=_FakeSessionManager([session]),
@@ -172,7 +172,7 @@ def test_usage_status_tracker_row_source_matches_breakdown_when_billed() -> None
     )
 
     ctx = _ctx(session_manager=None, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     # Row now reports the real billed total + provider_billed source.
@@ -199,7 +199,7 @@ def test_usage_status_tracker_row_preserves_confirmed_zero_receipt() -> None:
     )
 
     payload = asyncio.run(
-        _handle_usage_status(
+        _read_usage_status(
             None,
             _ctx(session_manager=None, usage_tracker=tracker),
         )
@@ -229,7 +229,7 @@ def test_usage_status_tracker_row_estimated_is_the_unbilled_component() -> None:
     )
 
     ctx = _ctx(session_manager=None, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["costSource"] == "provider_billed"
@@ -266,7 +266,7 @@ def test_usage_status_tracker_row_source_mixed_when_some_models_unbilled() -> No
     )
 
     ctx = _ctx(session_manager=None, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["costSource"] == "mixed"
@@ -337,7 +337,7 @@ def test_usage_status_session_manager_path_reads_cache_fields() -> None:
     sm = _FakeSessionManager([session])
 
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     assert payload["totalCacheReadTokens"] == 300
     assert payload["totalCacheWriteTokens"] == 120
@@ -390,7 +390,7 @@ def test_usage_status_requested_session_uses_indexed_lookup_without_scanning_all
     )
 
     payload = asyncio.run(
-        _handle_usage_status(
+        _read_usage_status(
             {"sessionKey": requested_key},
             _ctx(
                 session_manager=manager,
@@ -419,7 +419,7 @@ def test_usage_status_reports_context_pressure_from_session_context_not_lifetime
     sm = _FakeSessionManager([session])
 
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     context_status = row["contextStatus"]
@@ -450,11 +450,11 @@ def test_usage_status_only_estimates_transcript_context_for_requested_session() 
     )
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
 
-    unrequested = asyncio.run(_handle_usage_status(None, ctx))
+    unrequested = asyncio.run(_read_usage_status(None, ctx))
     assert sm.transcript_calls == 0
     assert unrequested["sessions"][0]["contextStatus"] is None
 
-    requested = asyncio.run(_handle_usage_status({"sessionKey": "agent:webchat:requested"}, ctx))
+    requested = asyncio.run(_read_usage_status({"sessionKey": "agent:webchat:requested"}, ctx))
     assert sm.transcript_calls == 1
     context_status = requested["sessions"][0]["contextStatus"]
     assert context_status["tokenSource"] == "transcript_estimate"
@@ -480,11 +480,11 @@ def test_usage_status_requested_compacted_session_prefers_active_transcript_cont
     )
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
 
-    unrequested = asyncio.run(_handle_usage_status(None, ctx))
+    unrequested = asyncio.run(_read_usage_status(None, ctx))
     assert sm.transcript_calls == 0
     assert unrequested["sessions"][0]["contextStatus"]["contextTokens"] == 1_296_184
 
-    requested = asyncio.run(_handle_usage_status({"sessionKey": "agent:webchat:compact"}, ctx))
+    requested = asyncio.run(_read_usage_status({"sessionKey": "agent:webchat:compact"}, ctx))
     assert sm.transcript_calls == 1
     context_status = requested["sessions"][0]["contextStatus"]
     assert context_status["tokenSource"] == "transcript_estimate"
@@ -510,7 +510,7 @@ def test_usage_status_exposes_session_timestamp_aliases() -> None:
     sm = _FakeSessionManager([session])
 
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["createdAt"] == 1000
@@ -534,7 +534,7 @@ def test_usage_status_tracker_only_rows_have_current_timestamp_aliases(monkeypat
 
     monkeypatch.setattr(rpc_usage, "_now_ms", lambda: 123456)
     ctx = _ctx(session_manager=None, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["createdAt"] == 123456
@@ -565,7 +565,7 @@ def test_usage_status_exposes_persisted_cost_components_and_source() -> None:
     sm = _FakeSessionManager([session])
 
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["costUsd"] == 0.07
@@ -597,7 +597,7 @@ def test_usage_status_exposes_estimate_basis_and_price_source_when_present() -> 
     sm = _FakeSessionManager([session])
 
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["estimateBasis"] == "cache_blind"
@@ -623,7 +623,7 @@ def test_usage_status_estimate_basis_and_price_source_default_none_when_absent()
     sm = _FakeSessionManager([session])
 
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["estimateBasis"] is None
@@ -647,7 +647,7 @@ def test_usage_status_tracker_breakdown_items_carry_provenance_keys_unchanged() 
     )
 
     ctx = _ctx(session_manager=None, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     [item] = row["modelBreakdown"]
@@ -684,7 +684,7 @@ def test_usage_status_merges_tracker_and_session_manager_cache_totals() -> None:
     )
 
     ctx = _ctx(session_manager=sm, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     # cache_read = 400 (db) + 50 (tracker) = 450
     # cache_write = 200 (db) + 10 (tracker) = 210
@@ -722,7 +722,7 @@ def test_usage_status_prefers_persisted_row_over_same_session_tracker_row() -> N
     )
 
     ctx = _ctx(session_manager=sm, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["session"] == "agent:webchat:same"
@@ -761,7 +761,7 @@ def test_usage_status_overlays_tracker_when_persisted_row_is_still_empty() -> No
     )
 
     ctx = _ctx(session_manager=sm, usage_tracker=tracker)
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     [row] = payload["sessions"]
     assert row["session"] == "agent:webchat:stale"
@@ -803,7 +803,7 @@ def test_usage_status_reads_real_session_manager_dict_rows_and_deduplicates_trac
                 model_id="claude-opus-4-7",
             )
             ctx = _ctx(session_manager=manager, usage_tracker=tracker)
-            return await _handle_usage_status(None, ctx)
+            return await _read_usage_status(None, ctx)
         finally:
             await storage.close()
 
@@ -836,7 +836,7 @@ def test_usage_cost_breakdown_carries_cache_fields() -> None:
     sm = _FakeSessionManager([session])
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
 
-    payload = asyncio.run(_handle_usage_cost(None, ctx))
+    payload = asyncio.run(_read_usage_cost(None, ctx))
     [row] = payload["breakdown"]
     assert row["cacheReadTokens"] == 300
     assert row["cacheWriteTokens"] == 120
@@ -862,7 +862,7 @@ def test_usage_cost_exposes_session_timestamp_aliases() -> None:
     sm = _FakeSessionManager([session])
     ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
 
-    payload = asyncio.run(_handle_usage_cost(None, ctx))
+    payload = asyncio.run(_read_usage_cost(None, ctx))
 
     [row] = payload["breakdown"]
     assert row["createdAt"] == 1100
@@ -878,7 +878,7 @@ def test_usage_cost_exposes_session_timestamp_aliases() -> None:
 def test_usage_status_no_data_returns_zeros() -> None:
     """Empty environment: all totals are 0, no error."""
     ctx = _ctx(session_manager=None, usage_tracker=UsageTracker())
-    payload = asyncio.run(_handle_usage_status(None, ctx))
+    payload = asyncio.run(_read_usage_status(None, ctx))
 
     assert payload["totalCacheReadTokens"] == 0
     assert payload["totalCacheWriteTokens"] == 0

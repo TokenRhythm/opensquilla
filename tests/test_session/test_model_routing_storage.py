@@ -45,6 +45,7 @@ async def test_legacy_mode_materializes_once_and_same_mode_retry_is_idempotent()
             expected_revision=1,
         )
         assert changed["revision"] == 2
+        assert changed["changed"] is True
         # An acknowledgement can be lost after the commit. Retrying the exact
         # requested mode with the prior generation must not manufacture a CAS
         # conflict or an extra generation.
@@ -54,6 +55,7 @@ async def test_legacy_mode_materializes_once_and_same_mode_retry_is_idempotent()
             expected_revision=1,
         )
         assert replay["revision"] == 2
+        assert replay["changed"] is False
         with pytest.raises(SessionRoutingConflictError):
             await storage.set_model_routing_mode(key, "direct", expected_revision=1)
     finally:

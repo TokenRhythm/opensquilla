@@ -15,10 +15,7 @@ export const MANIFEST_NAME = 'webui-artifact-manifest.json'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const webuiRoot = resolve(scriptDir, '..')
-const defaultDistDir = resolve(
-  scriptDir,
-  '../../src/opensquilla/gateway/static/dist',
-)
+const defaultDistDir = resolve(webuiRoot, 'dist')
 const sourceInputRoots = [
   '.node-version',
   '.env',
@@ -188,7 +185,7 @@ function referencedEntryAssets(indexHtml) {
   return references
 }
 
-export function writeManifest(distDir = defaultDistDir) {
+export function writeManifest(distDir = defaultDistDir, { sourceRoot = webuiRoot } = {}) {
   const root = resolve(distDir)
   for (const entry of ['index.html', 'desktop.html']) {
     if (!existsSync(resolve(root, entry))) {
@@ -197,7 +194,7 @@ export function writeManifest(distDir = defaultDistDir) {
   }
   const manifest = {
     schemaVersion: 1,
-    sourceFingerprint: sourceFingerprint(),
+    sourceFingerprint: sourceFingerprint(sourceRoot),
     files: recordsFor(root),
   }
   writeFileSync(
@@ -210,7 +207,7 @@ export function writeManifest(distDir = defaultDistDir) {
 
 export function verifyDist(
   distDir = defaultDistDir,
-  { forbidPersonalBgm = false } = {},
+  { forbidPersonalBgm = false, sourceRoot = webuiRoot } = {},
 ) {
   const root = resolve(distDir)
   const indexPath = resolve(root, 'index.html')
@@ -234,7 +231,7 @@ export function verifyDist(
   ) {
     throw new Error(`Unsupported Web UI artifact manifest: ${manifestPath}`)
   }
-  const currentSourceFingerprint = sourceFingerprint()
+  const currentSourceFingerprint = sourceFingerprint(sourceRoot)
   if (manifest.sourceFingerprint !== currentSourceFingerprint) {
     throw new Error(
       'Web UI artifact is stale for the current frontend source. Rebuild it with `npm run build`.',

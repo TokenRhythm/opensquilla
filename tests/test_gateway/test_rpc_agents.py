@@ -17,60 +17,6 @@ def _ctx(config: GatewayConfig, registry: AgentRegistry) -> RpcContext:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("params", "accepted_params"),
-    [
-        (
-            {"agentId": "ops", "sessionKey": "agent:ops:main", "timeoutMs": 100},
-            {"agentId": "ops", "sessionKey": "agent:ops:main", "timeoutMs": 100},
-        ),
-        (
-            {"agent_id": "ops", "session_key": "agent:ops:main", "timeout_ms": 100},
-            {"agentId": "ops", "sessionKey": "agent:ops:main", "timeoutMs": 100},
-        ),
-    ],
-)
-async def test_agent_wait_reports_runtime_bridge_unavailable_with_compat_params(
-    params: dict[str, object],
-    accepted_params: dict[str, object],
-) -> None:
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agent.wait",
-        params,
-        RpcContext(conn_id="test", config=GatewayConfig()),
-    )
-
-    assert result.error is not None
-    assert result.error.code == "agent.unavailable"
-    assert result.error.details["reason"] == "runtime_bridge_unavailable"
-    assert result.error.details["acceptedParams"] == accepted_params
-    assert result.error.details["supportedParams"] == [
-        "agentId",
-        "agent_id",
-        "sessionKey",
-        "session_key",
-        "timeoutMs",
-        "timeout_ms",
-    ]
-    assert "agents.list" in result.error.details["availableRpcMethods"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("params", [{"agentId": 123}, {"sessionKey": "  "}])
-async def test_agent_wait_rejects_non_string_identifiers(params: dict[str, object]) -> None:
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agent.wait",
-        params,
-        RpcContext(conn_id="test", config=GatewayConfig()),
-    )
-
-    assert result.error is not None
-    assert result.error.code == "INVALID_REQUEST"
-
-
-@pytest.mark.asyncio
 async def test_agents_rpc_list_uses_config_backed_registry() -> None:
     cfg = GatewayConfig()
     registry = AgentRegistry(cfg, persist_changes=False)

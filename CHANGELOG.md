@@ -6,6 +6,111 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Browser extensions can now reach state-changing HTTP and WebSocket endpoints
+  through a loopback request authority when their exact custom-scheme origin
+  (for example `chrome-extension://<id>`) is listed in `cors.allowed_origins`.
+  Non-loopback request authorities remain rejected by those guards, `"*"` is
+  never accepted, and existing CORS response-header behavior is unchanged.
+
+### Changed
+
+- Retired four experiment-only diagnostic outputs: runtime-recovery events,
+  final-diff observations, salvage events and focused-verification classification.
+  These events are no longer produced even when runtime event output is configured;
+  final-diff `log` remains accepted but no longer observes. Actual recovery,
+  warnings, salvage, observer events and independent turn-call logs remain.
+  An unused failure-summary cache is removed; public settings/defaults are unchanged.
+  Historical experiment-delivery details are preserved in Git history.
+- Retired the opt-in patch evidence ledger collector and JSON export. Legacy
+  path configuration remains accepted and excludes old diagnostic files from
+  final-diff checks, but no longer creates or overwrites a ledger. Recovery
+  decisions, source-diff salvage and model-visible defaults are unchanged.
+- Retired optional runtime experiments: strict/variant finalize challenges,
+  submit review, patch-evidence prompts, tool-description overrides, tool-loop
+  observation, runtime capsules, text-only tool nudges, and independent deadline
+  thinking cutoffs. Legacy configuration fields remain accepted but inert.
+  Base evidence gates, recovery, tool-result retrieval, Plan/Goal delivery, and
+  deadline wrap-up remain available. Strict-only counters and the retired
+  observers no longer emit runtime diagnostics.
+- The bundled Skill catalog now exposes eight ordinary entry points and three
+  stable Meta workflows, with coding instructions available in coding mode.
+  Internal helpers remain available to their owning workflows. The optional
+  relevance filter is retired; old filter settings are ignored during upgrade.
+- Redundant bundled wrappers, including `cron`, `memory`, `git-diff`, and
+  `http-fetch`, are retired while their native tools remain available. The
+  weather and tmux wrappers and the dedicated HTML-to-PDF/LaTeX wrappers are
+  also retired; generic tools remain available, but their former scripts and
+  output contracts are not preserved. PDF extraction, composition and
+  generation remain supported; arbitrary in-place PDF rewriting is no longer
+  a dedicated Skill capability.
+- In total, 31 bundled Skills are retired: four native-tool wrappers, five
+  audio wrappers, `summarize`, five weather/tmux/HTML-to-PDF/LaTeX/PDF-rewrite
+  wrappers, eight obsolete paper helpers, three creator helpers whose work
+  now runs in the creator runtime, and five stack-trace probes.
+- Catalog retirement takes effect when the upgraded Gateway restarts and
+  rebuilds its Skill snapshot. Personal, project and other user-installed
+  copies are not removed, and memory files and scheduled jobs stay in place.
+  Old Meta workflow definitions that reference retired Skills must be updated
+  by their authors; they are not automatically migrated.
+- Retired opt-in projection experiments: signal-scan hints, provider-history
+  deduplication, tiny compaction guards, configurable stub previews, and fresh
+  diagnostic preservation/retrieval gates. Existing configuration fields remain
+  accepted but no longer activate these mechanisms. Default Tokenjuice results,
+  Store/retrieval guarantees, fixed previews and compaction safety protections
+  remain unchanged; experimental diagnostic counters and events are removed.
+
+### Fixed
+
+- Default Gateway, CLI, decision, trace and safety logs no longer retain
+  prompt/conversation previews, tool output or exception payloads. Gateway
+  operational logs keep their level prefix and use JSON metadata with event
+  identifiers, counts, status codes and exception types; decision logs no longer
+  store prompt-derived intent text.
+  Support bundles re-filter current and rotated legacy logs, omitting legacy
+  free text that cannot be safely parsed. Existing local logs are not deleted
+  and may still contain pre-upgrade private content: review them before sharing
+  outside the bundle flow. Explicit raw turn-call capture remains opt-in (#1208).
+
+- Skill and Meta catalog reads remain compatible when the Web UI and Gateway
+  are upgraded separately. Meta details fall back on older gateways; new
+  gateways preserve public Meta list and detail responses for older clients.
+  Managed instances keep their source and lifecycle identity, and dependency
+  status refreshes after setup without retaining old missing-dependency counts.
+- Retired nested Skill-filter environment variables no longer prevent Gateway
+  startup. Newly authored personal and project Meta SOPs receive the correct
+  invocation defaults, and command completion follows the public catalog.
+
+- Aborting a turn no longer leaves an orphan task that crashes while the turn
+  generator is finalized. The gateway now closes the runner stream when the
+  consuming task exits, and the turn scope stack (process ownership, sandbox
+  policy, Git run mode, runtime pack, and managed toolchain state) tolerates
+  being unwound from a different asyncio Context, such as asyncio's
+  async-generator finalizer. Previously every `chat.abort` logged
+  `Task exception was never retrieved` with a nested
+  `ValueError: ... was created in a different Context` chain, and the
+  subscriber-visible turn-terminal event could be lost.
+
+## [0.5.4] - 2026-08-25
+
+### Added
+
+- Electron Desktop includes a beta for editing single-file HTML attachments and
+  deliverables. It provides preview, source, version, and change views plus
+  Agent-assisted candidate edits that users review before committing. Other
+  document formats and project-wide editing are not included.
+- Optional Python, Node.js, and Windows Git Bash Runtime Packs can be downloaded
+  from Sandbox settings through an immutable catalog. Downloads support resume,
+  cancellation, source fallback, integrity verification, removal, and cache
+  discard without modifying system-installed runtimes.
+- Each chat can now keep its own Direct, Router, or Ensemble strategy while the
+  global strategy remains the default for new chats. C3 can use the shared
+  multi-model fusion plan with resilient fixed-model fallback and independent
+  image routing.
+- The OpenSquilla technical report is available in English and Chinese PDF
+  editions, with the English edition also published on aiXiv.
+
 ### Changed
 
 - Fresh and managed TokenRhythm configurations now use DeepSeek V4 Flash 0731
@@ -13,6 +118,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   C2, and GLM 5.2 B5 fusion for C3. Existing custom inline tiers are not
   migrated, and the mixed-family preset continues to leave thinking levels
   unset.
+- Settings now use ten stable destinations, including combined Security &
+  Privacy controls and a first-level Memory page. Existing Settings deep links
+  continue through compatibility aliases.
+- Desktop installers are slimmer because optional developer runtimes are no
+  longer bundled. The Gateway and control console remain included, and users
+  can install only the Runtime Packs they need.
+
 ### Fixed
 
 - Desktop startup now shows monotonic, milestone-based progress without
@@ -22,6 +134,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   turn. Late provider or tool results are discarded, timed-out writes retain
   their timeout outcome, and committed file changes are recorded before the
   next turn can run.
+- Chat recovery now preserves activity order, router panels, live steering,
+  pending input, long-session scrolling, and durable turn commits across
+  reconnects and session switches. Large and image attachments use complete
+  routing capacity, and current-turn images are available to workspace tools.
+- Desktop and Gateway startup, process-tree cancellation, Windows Safe shell
+  execution, Windows installer progress, macOS Keychain recovery, CLI failure
+  exits, Skill catalog verification, prompt caching, usage accounting, and
+  provider fallback behavior are more reliable across supported platforms.
+
+### Security
+
+- The HTML editing beta uses isolated preview surfaces, opaque mutation grants,
+  atomic revisions, and capability-gated document tools. Older or incomplete
+  Desktop bridges fail closed, while existing attachments and deliverables
+  remain readable and immutable.
+- Runtime Pack downloads are restricted to pinned sources and verified by exact
+  size and SHA-256 before safe extraction and activation. Failures remain local
+  to the requested component and do not block Gateway startup.
 
 ## [0.5.3] - 2026-08-13
 

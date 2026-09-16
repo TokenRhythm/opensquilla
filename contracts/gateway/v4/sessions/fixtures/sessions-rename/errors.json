@@ -1,0 +1,44 @@
+{
+  "format_version": 1,
+  "kind": "error",
+  "cases": [
+    {
+      "id": "error.invalid-empty",
+      "coverage": "empty-title",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "rename-invalid",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INVALID_PARAMS",
+          "message": "displayName must be a non-empty string.",
+          "details": { "field": "displayName" },
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.not-found",
+      "coverage": "missing-session",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "rename-missing",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "'Session not found: agent:main:webchat:missing'",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    }
+  ]
+}

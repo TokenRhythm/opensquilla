@@ -144,6 +144,23 @@ describe('attachment display normalization', () => {
     expect(attachment.data).toBeUndefined()
   })
 
+  it('accepts the semantic camel-case projection from the Session Read Adapter', () => {
+    const attachment = normalizeDisplayAttachment({
+      mimeType: 'application/pdf',
+      sha256Ref: 'e'.repeat(64),
+      attachmentId: 'attachment-e',
+      downloadUrl: '/api/v1/attachments/e',
+    })
+
+    expect(attachment).toMatchObject({
+      kind: 'staged',
+      mime: 'application/pdf',
+      sha256_ref: 'e'.repeat(64),
+      attachmentId: 'attachment-e',
+      download_url: '/api/v1/attachments/e',
+    })
+  })
+
   it('chooses the first valid MIME-like value and ignores generic type values', () => {
     expect(normalizeDisplayAttachment({ mime: 'file', mime_type: 'application/pdf', type: 'image/png' }).mime).toBe('application/pdf')
     expect(normalizeDisplayAttachment({ media_type: 'text/csv', type: 'image/png' }).mime).toBe('text/csv')

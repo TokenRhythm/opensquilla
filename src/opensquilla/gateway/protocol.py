@@ -123,6 +123,7 @@ class TurnCommittedWire(BaseModel):
     schema_version: int = Field(strict=True, ge=1, le=1)
     session_key: str = Field(min_length=1)
     session_id: str | None = None
+    epoch: int | None = Field(default=None, ge=0)
     task_id: str = Field(min_length=1)
     turn_id: str = Field(min_length=1)
     status: Literal["succeeded"]
@@ -318,10 +319,12 @@ class EventFrame(BaseModel):
 
 class PingFrame(BaseModel):
     type: Literal["ping"] = "ping"
+    nonce: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[\x20-\x7e]+$")
 
 
 class PongFrame(BaseModel):
     type: Literal["pong"] = "pong"
+    nonce: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[\x20-\x7e]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +387,9 @@ class PolicyInfo(BaseModel):
     agent_stream_heartbeat_interval_ms: int = 15_000
     agent_stream_idle_timeout_ms: int = 600_000
     webui_stream_idle_grace_ms: int = 630_000
-    client_ws_keepalive_timeout_ms: int = 120_000
+    client_ws_keepalive_timeout_ms: int = 0
+    transport_probe_nonce: bool = False
+    transport_flow: dict[str, Any] | None = None
 
 
 class HelloOk(BaseModel):

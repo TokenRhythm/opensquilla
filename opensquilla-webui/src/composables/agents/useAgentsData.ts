@@ -1,26 +1,36 @@
-import { onActivated, onDeactivated, onUnmounted, computed } from 'vue'
-import { useRequest } from '@/composables/useRequest'
+import { onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import i18n from '@/i18n'
 import type { Agent } from '@/types/agents'
+import type { AgentCatalog } from '@/modules/agentCatalog'
 
 const POLL_MS = 30000
 
-interface AgentsListResponse {
-  agents?: Agent[]
-}
+export function useAgentsData(catalog: AgentCatalog) {
+  const agents = ref<Agent[]>([])
+  const loading = ref(false)
+  const error = ref<string | null>(null)
+  let requestGeneration = 0
 
-export function useAgentsData() {
-  // Error state + the loading flag come from useRequest; failures surface as an
-  // inline ErrorState and a single de-duped toast. `immediate: false` because the
-  // view is kept-alive: onActivated (below) owns the first load too, so letting
-  // useRequest also auto-fetch on mount would double-fire agents.list on first
-  // paint (onMounted and onActivated both run on the first display).
-  const { data, loading, error, refresh, execute } = useRequest<AgentsListResponse>(
-    'agents.list',
-    undefined,
-    { errorLabel: i18n.global.t('console.agents.loadFailed'), immediate: false },
-  )
-  const agents = computed<Agent[]>(() => data.value?.agents ?? [])
+  async function load(showLoading: boolean): Promise<void> {
+    const generation = ++requestGeneration
+    if (showLoading) loading.value = true
+    try {
+      const listed = await catalog.list()
+      if (generation !== requestGeneration) return
+      agents.value = [...listed]
+      error.value = null
+    } catch (cause) {
+      if (generation !== requestGeneration) return
+      error.value = cause instanceof Error
+        ? cause.message
+        : i18n.global.t('console.agents.loadFailed')
+    } finally {
+      if (showLoading && generation === requestGeneration) loading.value = false
+    }
+  }
+
+  const execute = () => load(true)
+  const refresh = () => load(false)
 
   // The consuming view is kept-alive (route meta.keepAlive), so the poll must
   // bind on activation and release on deactivation — it must not keep firing

@@ -1,4 +1,12 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
+
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const PARENT_KEY = 'agent:main:webchat:e2e-session-created-parent'
@@ -9,9 +17,18 @@ function response(id: string | number | undefined, payload: unknown) {
   return JSON.stringify({ type: 'res', id, ok: true, payload })
 }
 
+function errorResponse(id: string | number | undefined, code: string, message: string) {
+  return JSON.stringify({
+    type: 'res',
+    id,
+    ok: false,
+    error: { code, message, retryable: false },
+  })
+}
+
 async function mockSessionCreatedHistory(
   page: Page,
-  options: { liveHandoff?: boolean } = {},
+  options: { liveHandoff?: boolean, deletedFirstChild?: boolean } = {},
 ) {
   await page.addInitScript(() => {
     window.localStorage.setItem('opensquilla-locale', 'en')
@@ -20,7 +37,7 @@ async function mockSessionCreatedHistory(
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
@@ -37,15 +54,24 @@ async function mockSessionCreatedHistory(
         ? frame.params as Record<string, unknown>
         : {}
       if (method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30_000 } }))
+        ws.send(helloOkResponse())
         return
       }
       if (method === 'chat.history') {
         const sessionKey = String(params.sessionKey || '')
+        if (options.deletedFirstChild && sessionKey === FIRST_CHILD_KEY) {
+          ws.send(errorResponse(
+            frame.id as string | number | undefined,
+            'NOT_FOUND',
+            'Session not found',
+          ))
+          return
+        }
         if (sessionKey === PARENT_KEY) {
           if (options.liveHandoff) {
-            ws.send(response(frame.id as string | number | undefined, {
-              messages: [{
+            ws.send(response(
+              frame.id as string | number | undefined,
+              chatHistoryPayload([{
                 role: 'user',
                 text: 'Create a child chat',
                 id: 'live-session-created-user',
@@ -72,18 +98,20 @@ async function mockSessionCreatedHistory(
                 tool_calls: [{
                   tool_use_id: 'spawn-first',
                   name: 'sessions_spawn',
-                  result: JSON.stringify({ session_key: FIRST_CHILD_KEY, status: 'queued' }),
+                  result: JSON.stringify({
+                    session_key: FIRST_CHILD_KEY,
+                    status: 'queued',
+                    title: 'Inspect first child',
+                  }),
                   execution_status: { status: 'success' },
                 }],
-              }],
-              has_more: false,
-              canonical_available: true,
-              canonical_complete: true,
-            }))
+              }]),
+            ))
             return
           }
-          ws.send(response(frame.id as string | number | undefined, {
-            messages: [{
+          ws.send(response(
+            frame.id as string | number | undefined,
+            chatHistoryPayload([{
               role: 'user',
               text: 'Create two child chats',
               id: 'session-created-user',
@@ -104,12 +132,20 @@ async function mockSessionCreatedHistory(
               tool_calls: [{
                 tool_use_id: 'spawn-first',
                 name: 'sessions_spawn',
-                result: JSON.stringify({ session_key: FIRST_CHILD_KEY, status: 'queued' }),
+                result: JSON.stringify({
+                  session_key: FIRST_CHILD_KEY,
+                  status: 'queued',
+                  title: 'Inspect first child',
+                }),
                 execution_status: { status: 'success' },
               }, {
                 tool_use_id: 'spawn-second',
                 name: 'sessions_spawn',
-                result: JSON.stringify({ session_key: SECOND_CHILD_KEY, status: 'queued' }),
+                result: JSON.stringify({
+                  session_key: SECOND_CHILD_KEY,
+                  status: 'queued',
+                  title: 'Verify second child',
+                }),
                 execution_status: { status: 'success' },
               }],
             }, {
@@ -162,15 +198,13 @@ async function mockSessionCreatedHistory(
               id: 'later-assistant',
               timestamp: Math.floor(Date.now() / 1000) + 3,
               turn_context: { turn_id: 'later-turn' },
-            }],
-            has_more: false,
-            canonical_available: true,
-            canonical_complete: true,
-          }))
+            }]),
+          ))
           return
         }
-        ws.send(response(frame.id as string | number | undefined, {
-          messages: [{
+        ws.send(response(
+          frame.id as string | number | undefined,
+          chatHistoryPayload([{
             role: 'assistant',
             text: `Opened child session ${sessionKey}`,
             id: 'child-session-assistant',
@@ -181,19 +215,45 @@ async function mockSessionCreatedHistory(
               routing_source: 'none',
               routing_applied: true,
             },
-          }],
-          has_more: false,
-          canonical_available: true,
-          canonical_complete: true,
-        }))
+          }]),
+        ))
         return
       }
       if (method === 'sessions.messages.snapshot') {
-        ws.send(response(frame.id as string | number | undefined, {
-          key: String(params.key || ''),
-          events: [],
+        ws.send(response(
+          frame.id as string | number | undefined,
+          sessionMessagesSnapshotPayload(String(params.key || ''), {
           current_stream_seq: 0,
-        }))
+          }),
+        ))
+        return
+      }
+      if (method === 'sessions.resolve') {
+        const key = String(params.key || '')
+        if (options.deletedFirstChild && key === FIRST_CHILD_KEY) {
+          ws.send(errorResponse(
+            frame.id as string | number | undefined,
+            'NOT_FOUND',
+            'Session not found',
+          ))
+        } else {
+          ws.send(response(frame.id as string | number | undefined, {
+            session_key: key,
+            session_id: key.split(':').at(-1) || key,
+          }))
+        }
+        return
+      }
+      if (
+        method === 'sessions.messages.subscribe'
+        && options.deletedFirstChild
+        && String(params.key || '') === FIRST_CHILD_KEY
+      ) {
+        ws.send(errorResponse(
+          frame.id as string | number | undefined,
+          'SESSION_NOT_FOUND',
+          'Session was deleted or does not exist.',
+        ))
         return
       }
       const payloads: Record<string, unknown> = {
@@ -213,25 +273,25 @@ async function mockSessionCreatedHistory(
         },
         'models.routing.get': { mode: 'router' },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(
+          String(params.key || ''),
+          {
           run_status: options.liveHandoff ? 'running' : 'idle',
           active_task: options.liveHandoff
             ? { task_id: 'resume-turn', status: 'running' }
             : null,
-        },
-        'sessions.messages.hydrate': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
+          },
+        ),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(
+          String(params.key || ''),
+          {
           run_status: options.liveHandoff ? 'running' : 'idle',
           active_task: options.liveHandoff
             ? { task_id: 'resume-turn', status: 'running' }
             : null,
-        },
+          },
+        ),
         'usage.status': { sessions: [] },
       }
       ws.send(response(frame.id as string | number | undefined, payloads[method] ?? {}))
@@ -247,7 +307,8 @@ test('restores ordered created-chat cards and opens the selected child session',
   await expect(cards).toHaveCount(2)
   await expect(cards.nth(0)).toHaveAttribute('data-session-key', FIRST_CHILD_KEY)
   await expect(cards.nth(1)).toHaveAttribute('data-session-key', SECOND_CHILD_KEY)
-  await expect(cards.nth(0)).toContainText('Chat created')
+  await expect(cards.nth(0)).toContainText('Inspect first child')
+  await expect(cards.nth(1)).toContainText('Verify second child')
   await expect(page.getByText('session_key')).toHaveCount(0)
   await expect(page.getByText('Sub-agent', { exact: true })).toHaveCount(0)
   await expect(page.getByText('subagent_completion')).toHaveCount(0)
@@ -257,7 +318,7 @@ test('restores ordered created-chat cards and opens the selected child session',
   await expect(finalReply.getByTestId('session-created-card')).toHaveCount(2)
   await expect.poll(async () => {
     const text = await finalReply.innerText()
-    return text.indexOf('Parent final reply') < text.indexOf('Chat created')
+    return text.indexOf('Parent final reply') < text.indexOf('Inspect first child')
   }).toBe(true)
 
   await page.reload()
@@ -270,6 +331,35 @@ test('restores ordered created-chat cards and opens the selected child session',
   await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SECOND_CHILD_KEY)
   await expect(page.getByText(`Opened child session ${SECOND_CHILD_KEY}`)).toBeVisible()
   await expect(page.getByRole('group', { name: 'Router selected deepseek-v4-pro' })).toBeVisible()
+})
+
+test('disables a deleted child card and keeps the sibling openable', async ({ page }) => {
+  await mockSessionCreatedHistory(page, { deletedFirstChild: true })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(PARENT_KEY))
+
+  const cards = page.getByTestId('session-created-card')
+  await expect(cards).toHaveCount(2)
+  await expect(cards.nth(0)).toHaveAttribute('data-session-state', 'available')
+  await expect(cards.nth(0).getByRole('button', { name: 'Open chat' })).toBeEnabled()
+  await cards.nth(0).getByRole('button', { name: 'Open chat' }).click()
+  await expect(cards.nth(0)).toHaveAttribute('data-session-state', 'missing')
+  await expect(cards.nth(0)).toContainText('Inspect first child')
+  await expect(cards.nth(0)).toContainText('Deleted')
+  await expect(cards.nth(0).getByRole('button', { name: 'Deleted' })).toBeDisabled()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(PARENT_KEY)
+  await expect(cards.nth(1)).toHaveAttribute('data-session-state', 'available')
+
+  await cards.nth(1).getByRole('button', { name: 'Open chat' }).click()
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SECOND_CHILD_KEY)
+})
+
+test('shows one terminal state for a missing child deep link', async ({ page }) => {
+  await mockSessionCreatedHistory(page, { deletedFirstChild: true })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(FIRST_CHILD_KEY))
+
+  await expect(page.getByText('Session was deleted or does not exist')).toBeVisible()
+  await expect(page.getByText('Conversation history temporarily unavailable')).toHaveCount(0)
+  await expect(page.getByText('Turn failed')).toHaveCount(0)
 })
 
 test('keeps only the router above a created-chat card during the parent handoff', async ({ page }) => {

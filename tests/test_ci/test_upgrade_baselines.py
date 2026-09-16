@@ -1,0 +1,1270 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+from contextlib import closing
+from pathlib import Path
+
+import pytest
+import yaml
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ROOT / ".github" / "scripts"
+DRIVER = ROOT / "desktop/electron/scripts/test-packaged-real-update-flow.mjs"
+
+
+@pytest.fixture
+def complete_v054_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    import upgrade_baseline
+
+    spec = importlib.util.spec_from_file_location(
+        "v054_preservation", SCRIPTS / "verify-release-profile-preservation.py"
+    )
+    assert spec and spec.loader
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    home = tmp_path / "legacy-profile"
+    probe.seed_profile(home, "v054", baseline_version="0.5.4")
+    probe.verify_profile(home, "v054")
+    return home, probe, upgrade_baseline
+
+
+def test_complete_v054_fixture_retains_original_files_and_both_v010_ids(complete_v054_profile):
+    home, _, baseline = complete_v054_profile
+    manifest = baseline.manifest()
+    assert len(manifest["migration_files"]) == 41
+    for name, digest in manifest["migration_files"].items():
+        # The baseline hashes Git blobs; Windows checkouts may use CRLF.
+        payload = (ROOT / "migrations" / name).read_text(encoding="utf-8").encode("utf-8")
+        assert hashlib.sha256(payload).hexdigest() == digest
+    ledger = baseline.verify_ledger(home / "state/sessions.db", exact=True)
+    assert {key for key in ledger if key.startswith("V010__")} == {
+        "V010__meta_skill_runs", "V010__transcript_turn_usage",
+    }
+
+
+def test_complete_v054_upgrade_preserves_history_and_is_idempotent(complete_v054_profile):
+    from opensquilla.persistence.migrator import apply_pending
+
+    home, probe, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    original = baseline.read_ledger(database)
+    candidate_ids = {path.stem for path in (ROOT / "migrations").glob("V*.py")}
+    assert set(apply_pending(str(database), ROOT / "migrations")) == candidate_ids - original.keys()
+    assert set(baseline.verify_ledger(database)) == candidate_ids
+    probe.verify_profile(home, "v054")
+    assert apply_pending(str(database), ROOT / "migrations") == []
+    probe.verify_profile(home, "v054")
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+@pytest.mark.parametrize("missing", [
+    "V010__meta_skill_runs.py", "V010__transcript_turn_usage.py", "V040__document_resources.py",
+])
+def test_complete_v054_missing_migration_refuses_without_writes_then_recovers(
+    complete_v054_profile, tmp_path: Path, missing: str,
+):
+    from opensquilla.persistence.migrator import SchemaAheadError, apply_pending
+
+    home, probe, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    incomplete = tmp_path / "incomplete"
+    shutil.copytree(ROOT / "migrations", incomplete)
+    (incomplete / missing).unlink()
+    before = database.read_bytes()
+    with pytest.raises(SchemaAheadError, match=Path(missing).stem):
+        apply_pending(str(database), incomplete)
+    assert database.read_bytes() == before
+    baseline.verify_ledger(database, exact=True)
+    probe.verify_profile(home, "v054")
+    apply_pending(str(database), ROOT / "migrations")
+    probe.verify_profile(home, "v054")
+    assert apply_pending(str(database), ROOT / "migrations") == []
+
+
+def test_complete_v054_seed_refuses_overwrite(complete_v054_profile):
+    home, probe, _ = complete_v054_profile
+    before = (home / "state/sessions.db").read_bytes()
+    with pytest.raises(FileExistsError):
+        probe.seed_profile(home, "v054", baseline_version="0.5.4")
+    assert (home / "state/sessions.db").read_bytes() == before
+
+
+def test_complete_v054_seed_rejects_tampered_sql(complete_v054_profile, tmp_path, monkeypatch):
+    _, probe, baseline = complete_v054_profile
+    fixture = tmp_path / "tampered"
+    shutil.copytree(baseline.FIXTURE, fixture)
+    with (fixture / "sessions.sql").open("ab") as stream:
+        stream.write(b"\n-- changed\n")
+    monkeypatch.setattr(baseline, "FIXTURE", fixture)
+    with pytest.raises(ValueError, match="SQL digest mismatch"):
+        probe.seed_profile(tmp_path / "new-profile", "v054", baseline_version="0.5.4")
+
+
+def test_complete_v054_ledger_verification_rejects_missing_old_id(complete_v054_profile):
+    home, _, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("DELETE FROM _yoyo_migration WHERE migration_id = ?", (
+            "V040__document_resources",
+        ))
+    with pytest.raises(AssertionError, match="V040__document_resources"):
+        baseline.verify_ledger(database)
+
+
+def test_windows_upgrade_gates_complete_old_ledger_before_install_and_after_restart():
+    source = (SCRIPTS / "verify-release-windows-upgrade.ps1").read_text(encoding="utf-8")
+    seed = source.index("python $probe seed --home $migrationProfile")
+    candidate_install = source.index("$installed = Start-Process")
+    native_gate = source.index("python $migrationProbe --gateway $gateway.FullName")
+    uninstall = source.index("$uninstall = Start-Process")
+    assert seed < candidate_install < native_gate < uninstall
+    assert "--baseline-version '0.5.4'" in source[seed:candidate_install]
+    assert "if ($LASTEXITCODE -ne 0) { throw" in source[native_gate:native_gate + 330]
+    for line in source.splitlines():
+        if "python $probe verify --home $profile" in line:
+            assert "--baseline-version $BaselineVersion" in line
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name", "windows"),
+    [
+        ("desktop-fault-injection.yml", "windows-release-upgrade-audit", True),
+        ("wheelhouse-release.yml", "audit-downloaded-macos-release", False),
+        ("wheelhouse-release.yml", "audit-downloaded-windows-release", True),
+        ("wheelhouse-release.yml", "audit-internal-windows-artifact", True),
+    ],
+)
+def test_fresh_release_audits_build_and_import_harness_before_installing(
+    workflow_name: str, job_name: str, windows: bool
+) -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows" / workflow_name).read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"][job_name]["steps"]
+    preparation = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if "release verification dependencies" in step.get("name", "")
+    ]
+    assert len(preparation) == 1
+    preparation_index, step = preparation[0]
+    assert step["working-directory"] == "desktop/electron"
+    script = step["run"]
+    install_dependencies = script.index("npm ci")
+    build = script.index("npm run build")
+    import_probe = script.index("node --input-type=module -e")
+    assert install_dependencies < build < import_probe
+    assert "await import('./scripts/packaged-first-send-cleanup.mjs')" in script
+    assert "|| true" not in script
+    if windows:
+        assert step["shell"] == "pwsh"
+        for start, stop in ((install_dependencies, build), (build, import_probe)):
+            assert "if ($LASTEXITCODE -ne 0) { throw" in script[start:stop]
+        assert "if ($LASTEXITCODE -ne 0) { throw" in script[import_probe:]
+    else:
+        # The default GitHub-hosted macOS run shell is bash -e.
+        assert step.get("shell", "bash") == "bash"
+    installer_indices = [
+        index
+        for index, candidate in enumerate(steps)
+        if ".github/scripts/verify-release-" in candidate.get("run", "")
+    ]
+    assert installer_indices
+    assert preparation_index < min(installer_indices)
+
+
+def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    unit_step = next(
+        step
+        for step in workflow["jobs"]["desktop-check"]["steps"]
+        if step.get("name") == "Run desktop unit tests"
+    )
+    assert "node scripts/test-ci-case-telemetry.mjs" in unit_step["run"].splitlines()
+    telemetry = ROOT / "desktop/electron/scripts/test-ci-case-telemetry.mjs"
+    native_test = ROOT / "desktop/electron/scripts/test-session-recovery-transport-contract.mjs"
+    assert "await import('./test-session-recovery-transport-contract.mjs')" in telemetry.read_text(
+        encoding="utf-8"
+    )
+    assert "from './session-recovery-transport-contract.mjs'" in native_test.read_text(
+        encoding="utf-8"
+    )
+    suites = json.loads((ROOT / ".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    for suite in ("python-targeted", "release-packaging"):
+        inputs = suites["suites"][suite]["execution_inputs"]
+        assert telemetry.relative_to(ROOT).as_posix() in inputs
+        assert native_test.relative_to(ROOT).as_posix() in inputs
+
+
+@pytest.mark.parametrize(
+    ("launch_fails", "cleanup_fails"), [(False, False), (False, True), (True, False)]
+)
+def test_packaged_recovery_preserves_original_failure_after_cleanup(
+    tmp_path: Path, launch_fails: bool, cleanup_fails: bool
+) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the packaged recovery harness")
+    scripts = ROOT / "desktop/electron/scripts"
+    for name in ("test-packaged-session-recovery.mjs", "session-recovery-transport-contract.mjs"):
+        shutil.copyfile(scripts / name, tmp_path / name)
+    (tmp_path / "packaged-smoke-helpers.mjs").write_text(
+        "export function requiredOption(name) {\n"
+        "return process.argv[process.argv.indexOf(name) + 1] }\n"
+        "export async function waitFor() { throw new Error('Unexpected fixture wait') }\n"
+        "export async function launchPackagedCandidate() {\n"
+        + ("throw new Error('synthetic recovery fault');\n" if launch_fails else "")
+        + "return { context() { return { routeWebSocket() {\n"
+        "throw new Error('synthetic recovery fault') } } } };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "packaged-first-send-cleanup.mjs").write_text(
+        "import assert from 'node:assert/strict';\n"
+        "export async function captureElectronProcessIdentity() {\n"
+        "return { wrapperPid: 111, electronPid: 222 } }\n"
+        "export function electronProcessSnapshot(identity) { return { ...identity } }\n"
+        "export async function cleanupPackagedFirstSend(options) {\n"
+        "assert.equal(options.deferQuit, undefined);\n"
+        "assert.equal(options.unrouteBeforeQuit, undefined);\n"
+        "if (options.app) assert.deepEqual(\n"
+        "options.processIdentity, { wrapperPid: 111, electronPid: 222 });\n"
+        "assert.deepEqual(options.diagnostics(), { processes: options.processIdentity });\n"
+        "options.onPhase('synthetic-cleanup-ran');\n"
+        + ("throw new Error('synthetic cleanup fault');\n" if cleanup_fails else "")
+        + "}\n",
+        encoding="utf-8",
+    )
+    # This is a synthetic error/cleanup contract, not a recovery-latency check.
+    # Allow Windows CI headroom for Node startup and captured-pipe completion.
+    try:
+        result = subprocess.run(
+            [
+                node,
+                str(tmp_path / "test-packaged-session-recovery.mjs"),
+                "--executable",
+                str(tmp_path / "synthetic.exe"),
+                "--user-data-dir",
+                str(tmp_path / "profile"),
+                "--session-key",
+                "synthetic-main",
+                "--switch-session-key",
+                "synthetic-peer",
+                "--label",
+                "synthetic",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30 if os.name == "nt" else 10,
+        )
+    except subprocess.TimeoutExpired as error:
+        error.add_note(f"Captured stdout: {error.stdout!r}\nCaptured stderr: {error.stderr!r}")
+        raise
+    assert result.returncode != 0
+    assert "packaged_session_recovery_failed_before_cleanup" in result.stderr
+    assert "synthetic-cleanup-ran" in result.stderr
+    assert "Error: synthetic recovery fault" in result.stderr
+    assert not result.stdout
+    if cleanup_fails:
+        assert result.stderr.rindex("Error: synthetic recovery fault") > result.stderr.rindex(
+            "Error: synthetic cleanup fault"
+        )
+
+
+def test_downloaded_release_audits_cover_both_official_baselines() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
+    )
+    jobs = workflow["jobs"]
+    for platform in ("macos", "windows"):
+        audit = jobs[f"audit-downloaded-{platform}-release"]
+        assert audit["strategy"]["matrix"]["baseline-version"] == ["0.5.3", "0.5.4"]
+        assert audit["strategy"]["fail-fast"] is False
+        assert audit["needs"] == "prestage-draft-updater-assets"
+        updater_steps = [
+            step for step in audit["steps"] if "Verify official baseline" in step["name"]
+        ]
+        preview_steps = [step for step in audit["steps"] if "Verify preview" in step["name"]]
+        assert len(updater_steps) == len(preview_steps) == 1
+        assert "prerelease == 'false'" in updater_steps[0]["if"]
+        assert "prerelease == 'true'" in preview_steps[0]["if"]
+        for step in (*updater_steps, *preview_steps):
+            assert step["env"]["BASELINE_VERSION"] == "${{ matrix.baseline-version }}"
+            assert "BASELINE_VERSION" in step["run"]
+        if platform == "windows":
+            assert audit["strategy"]["matrix"]["install-mode"] == ["default", "custom"]
+            assert audit["runs-on"] == "windows-2022"
+        # Build-time compatibility keeps the implicit v0.5.3 baseline.
+        build = jobs[f"build-desktop-{platform}"]
+        preservation = [step for step in build["steps"] if "v0.5.3-to-candidate" in step["name"]]
+        assert len(preservation) == 1
+        assert "baseline" not in preservation[0]["run"].lower()
+        assert "0.5.4" not in preservation[0]["run"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Git executable mode is checked on POSIX hosts")
+def test_macos_workflow_helpers_are_executable() -> None:
+    for script in ("verify-release-macos-upgrade.sh", "verify-release-macos-real-update.sh"):
+        assert os.access(SCRIPTS / script, os.X_OK)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="macOS Bash helper validation runs on POSIX hosts")
+@pytest.mark.parametrize(
+    "script", ["verify-release-macos-upgrade.sh", "verify-release-macos-real-update.sh"]
+)
+@pytest.mark.parametrize("baseline", ["", "0.5.2", "0.5.4rc1", "../0.5.4", "0.5.4;false"])
+def test_macos_helpers_reject_unsupported_baseline_before_side_effects(
+    tmp_path: Path, script: str, baseline: str
+) -> None:
+    sandbox = tmp_path / "runner"
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / script), "missing-candidate", "synthetic", baseline],
+        env={**os.environ, "RUNNER_TEMP": str(sandbox)},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 2
+    assert "baseline version must be 0.5.3 or 0.5.4" in result.stderr
+    assert not sandbox.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="macOS Bash helper validation runs on POSIX hosts")
+@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4"])
+def test_macos_download_selects_exact_official_baseline(
+    tmp_path: Path, baseline: str | None
+) -> None:
+    selected = baseline or "0.5.3"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    captured = tmp_path / "download-arguments"
+    gh = fake_bin / "gh"
+    gh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURED_ARGS"\nexit 41\n', encoding="utf-8")
+    gh.chmod(0o755)
+    candidate = tmp_path / "candidate.dmg"
+    candidate.touch()
+    arguments = [
+        "bash",
+        str(SCRIPTS / "verify-release-macos-upgrade.sh"),
+        str(candidate),
+        "synthetic",
+    ]
+    if baseline is not None:
+        arguments.append(baseline)
+    result = subprocess.run(
+        arguments,
+        env={
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "CAPTURED_ARGS": str(captured),
+            "RUNNER_TEMP": str(tmp_path / "runner"),
+            "GITHUB_WORKSPACE": str(ROOT),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 41
+    arguments = captured.read_text(encoding="utf-8").splitlines()
+    assert arguments[:3] == ["release", "download", f"v{selected}"]
+    assert arguments[arguments.index("--repo") + 1] == "TokenRhythm/opensquilla"
+    assert arguments[arguments.index("--pattern") + 1] == f"OpenSquilla-{selected}-mac-arm64.dmg"
+    assert Path(arguments[arguments.index("--dir") + 1]).parts[-2:] == (
+        f"opensquilla-release-preservation-synthetic-{selected}",
+        f"v{selected}",
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="macOS Bash helper validation runs on POSIX hosts")
+@pytest.mark.parametrize("candidate", ["0.5.3", "0.5.4", "0.5.5rc1"])
+def test_macos_real_updater_requires_newer_stable_than_selected_baseline(
+    tmp_path: Path, candidate: str
+) -> None:
+    manifest = tmp_path / "channel.json"
+    manifest.write_text(
+        json.dumps({"version": candidate, "tag": f"v{candidate}", "prerelease": False}),
+        encoding="utf-8",
+    )
+    sandbox = tmp_path / "runner"
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPTS / "verify-release-macos-real-update.sh"),
+            str(manifest),
+            "synthetic",
+            "0.5.4",
+        ],
+        env={**os.environ, "RUNNER_TEMP": str(sandbox), "GITHUB_WORKSPACE": str(ROOT)},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "AssertionError" in result.stderr
+    assert not sandbox.exists()
+
+
+@pytest.fixture
+def rehearsal_driver(tmp_path: Path) -> tuple[str, Path]:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required to execute the packaged updater driver contract")
+    # Run the actual driver with an in-memory desktop bridge. The loopback
+    # manifest is real; no application, release download, or installer is run.
+    driver = tmp_path / "driver.mjs"
+    shutil.copyfile(DRIVER, driver)
+    # Only exercise driver orchestration here. Native process identities and
+    # inherited handles have independent signed-exit-observer contract tests.
+    observer = tmp_path / "fixtures/packaged-cached-handoff/signed-exit-observer.mjs"
+    observer.parent.mkdir(parents=True)
+    observer.write_text(
+        """
+import assert from 'node:assert/strict'
+export function trackSignedChildClose(child) { assert.equal(child.pid, 12345) }
+export async function captureSignedHandoffProcesses({ app }) {
+  return { child: app.process(), electronPid: 12345 }
+}
+export async function observeSignedHandoff({ child, clickPromise }) {
+  assert.equal(child.pid, 12345)
+  await clickPromise
+  return { syntheticOrchestrationOnly: true }
+}
+export async function releaseExitedHandoffTransport(child, evidence) {
+  assert.equal(child.pid, 12345)
+  assert.equal(evidence.syntheticOrchestrationOnly, true)
+}
+export async function preserveFailedDriverUntilExit({ originalError }) {
+  assert.ok(originalError instanceof Error)
+}
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "packaged-first-send-cleanup.mjs").write_text(
+        "export async function closeElectronAndObserveExit(app) { await app.close() }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "packaged-smoke-helpers.mjs").write_text(
+        """
+import { EventEmitter } from 'node:events'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+export function requiredOption(name) {
+  const index = process.argv.indexOf(name)
+  if (index < 0 || !process.argv[index + 1]) throw new Error(`Missing ${name}`)
+  return process.argv[index + 1]
+}
+export async function waitFor(check) {
+  if (!await check()) throw new Error('bridge unavailable')
+}
+export async function launchPackagedCandidate({ env, userDataDir, model }) {
+  console.log('SYNTHETIC_DESKTOP_LAUNCHED')
+  if (env.OPENSQUILLA_DESKTOP_UPDATE_SOURCE !== process.env.SYNTHETIC_EXPECTED_SOURCE) {
+    throw new Error('requested source was not passed to the packaged client')
+  }
+  const signed = process.env.SYNTHETIC_UPDATE_MODE === 'signed-handoff'
+  if (signed) {
+    if (model !== 'opensquilla-release-session-recovery-smoke') {
+      throw new Error('signed handoff must preserve the seed provider model')
+    }
+    await mkdir(userDataDir, { recursive: true })
+    await writeFile(join(userDataDir, 'desktop-credential.json'), 'synthetic retained credential')
+  }
+  if (signed && (env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '1'
+      || env.OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE !== '0'
+      || env.OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION !== '')) {
+    throw new Error('signed handoff must use the production installation path')
+  }
+  let checks = 0
+  const version = process.env.SYNTHETIC_BASELINE_VERSION
+  const app = new EventEmitter()
+  return Object.assign(app, {
+    firstWindow: async () => ({
+      locator: (selector) => ({
+        waitFor: async () => {},
+        isEnabled: async () => true,
+        click: async () => {
+          console.log(`SYNTHETIC_UI_CLICK:${selector}`)
+          if (selector.includes('desktop-update-relaunch')) {
+            console.log('SYNTHETIC_RELAUNCH_REQUESTED')
+            queueMicrotask(() => app.emit('close'))
+          }
+        },
+      }),
+      evaluate: async (callback) => {
+      const body = callback.toString()
+      if (body.includes('typeof window')) return true
+      if (body.includes('getUpdateState')) return { currentVersion: version }
+      if (body.includes('checkForUpdates')) {
+        const root = env.OPENSQUILLA_DESKTOP_UPDATE_CHANNEL_ROOT
+        const response = await fetch(`${root}/channels/stable.json`)
+        if (checks++ === 0) {
+          if (response.status !== 503) throw new Error('missing pre-handoff failure')
+          return { status: 'error', errorCode: 'source_unreachable' }
+        }
+        const manifest = await response.json()
+        return {
+          status: 'available', latestVersion: manifest.version,
+          source: 'oss', installMode: signed ? 'manual' : 'native',
+          fallbackUsed: process.env.SYNTHETIC_FALLBACK_FAULT !== 'discovery',
+        }
+      }
+      if (body.includes('downloadUpdate')) {
+        if (process.env.SYNTHETIC_COMPLETE_SIGNED !== '1') {
+          throw new Error(`DOWNLOAD_REACHED:${version}`)
+        }
+        return {
+          status: 'downloaded', latestVersion: process.env.SYNTHETIC_CANDIDATE_VERSION,
+          source: 'oss', installMode: 'manual', progress: 100,
+          fallbackUsed: process.env.SYNTHETIC_FALLBACK_FAULT !== 'download',
+          canInstall: process.env.SYNTHETIC_CAN_INSTALL === '1',
+        }
+      }
+      if (body.includes('relaunchToUpdate')) {
+        console.log('SYNTHETIC_RELAUNCH_REQUESTED')
+        queueMicrotask(() => app.emit('close'))
+        return true
+      }
+      throw new Error(`unexpected desktop call: ${body}`)
+    } }),
+    process: () => ({ killed: false, pid: 12345 }),
+    close: async () => {},
+  })
+}
+""",
+        encoding="utf-8",
+    )
+    return node, driver
+
+
+def _run_rehearsal_driver(
+    rehearsal_driver: tuple[str, Path],
+    *,
+    baseline: str | None,
+    installed: str,
+    candidate: str = "0.5.5",
+    mode: str = "native",
+    source_sha: str | None = "a" * 40,
+    expected_sha: str | None = hashlib.sha256(b"candidate artifact").hexdigest(),
+    cached_bytes: bytes = b"candidate artifact",
+    complete_signed: bool = False,
+    can_install: bool = True,
+    download_source_mode: str | None = None,
+    fallback_fault: str = '',
+) -> subprocess.CompletedProcess[str]:
+    node, driver = rehearsal_driver
+    manifest = driver.parent / "channel.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "version": candidate,
+                "tag": f"v{candidate}",
+                "prerelease": False,
+                "platforms": {"win32-x64": {"installer": f"OpenSquilla-{candidate}-win-x64.exe"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    arguments = [
+        node,
+        str(driver),
+        "--executable",
+        str(driver.parent / "synthetic-app"),
+        "--user-data-dir",
+        str(driver.parent / "user-data"),
+        "--channel-manifest",
+        str(manifest),
+        "--expected-version",
+        candidate,
+        "--mode",
+        mode,
+    ]
+    if baseline is not None:
+        arguments.extend(["--baseline-version", baseline])
+    if download_source_mode is not None:
+        arguments.extend(["--download-source-mode", download_source_mode])
+    if mode == "signed-handoff":
+        arguments.extend(["--ready-output", str(driver.parent / "handoff.json")])
+        if source_sha is not None:
+            arguments.extend(["--source-sha", source_sha])
+        if expected_sha is not None:
+            arguments.extend(["--expected-sha256", expected_sha])
+        cache = driver.parent / "user-data" / "update-downloads"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / f"OpenSquilla-{candidate}-win-x64.exe").write_bytes(cached_bytes)
+    return subprocess.run(
+        arguments,
+        env={
+            **os.environ,
+            "SYNTHETIC_BASELINE_VERSION": installed,
+            "SYNTHETIC_CANDIDATE_VERSION": candidate,
+            "SYNTHETIC_UPDATE_MODE": mode,
+            "SYNTHETIC_COMPLETE_SIGNED": "1" if complete_signed else "0",
+            "SYNTHETIC_CAN_INSTALL": "1" if can_install else "0",
+            "SYNTHETIC_EXPECTED_SOURCE": (
+                "github" if download_source_mode == "github-to-oss" else "oss"
+            ),
+            "SYNTHETIC_FALLBACK_FAULT": fallback_fault,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+
+
+@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4"])
+def test_rehearsal_driver_accepts_selected_baseline(
+    rehearsal_driver: tuple[str, Path], baseline: str | None
+) -> None:
+    selected = baseline or "0.5.3"
+    result = _run_rehearsal_driver(rehearsal_driver, baseline=baseline, installed=selected)
+    assert result.returncode != 0  # The stub deliberately stops before downloading.
+    assert f"DOWNLOAD_REACHED:{selected}" in result.stderr
+
+
+def test_rehearsal_driver_rejects_mislabeled_official_baseline(
+    rehearsal_driver: tuple[str, Path],
+) -> None:
+    result = _run_rehearsal_driver(rehearsal_driver, baseline="0.5.4", installed="0.5.3")
+    assert result.returncode != 0
+    assert "AssertionError" in result.stderr
+    assert "DOWNLOAD_REACHED" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("baseline", "candidate", "message"),
+    [
+        ("0.5.2", "0.5.5", "--baseline-version must be"),
+        ("0.5.4", "0.5.4", "candidate must be newer"),
+        ("0.5.4", "0.5.3", "candidate must be newer"),
+        ("0.5.4", "0.5.5rc1", "must be a canonical stable version"),
+    ],
+)
+def test_rehearsal_driver_rejects_invalid_versions_before_launch(
+    rehearsal_driver: tuple[str, Path], baseline: str, candidate: str, message: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline=baseline, installed=baseline, candidate=candidate
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4", "0.5.5rc1"])
+def test_signed_handoff_rejects_missing_or_legacy_baseline_before_launch(
+    rehearsal_driver: tuple[str, Path], baseline: str | None
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline=baseline,
+        installed=baseline or "0.5.3",
+        candidate="0.5.6",
+        mode="signed-handoff",
+    )
+    assert result.returncode != 0
+    assert "signed-handoff requires" in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("missing", ["source_sha", "expected_sha"])
+def test_signed_handoff_requires_pinned_artifact_before_launch(
+    rehearsal_driver: tuple[str, Path], missing: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        **{missing: None},
+    )
+    assert result.returncode != 0
+    assert "signed-handoff requires --ready-output" in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("fault", ["capability-denied", "cache-replaced"])
+def test_signed_handoff_rejects_unverified_or_changed_candidate(
+    rehearsal_driver: tuple[str, Path], fault: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        complete_signed=True,
+        can_install=fault != "capability-denied",
+        cached_bytes=b"tampered" if fault == "cache-replaced" else b"candidate artifact",
+    )
+    assert result.returncode != 0
+    assert "SYNTHETIC_RELAUNCH_REQUESTED" not in result.stdout
+    assert "AssertionError" in result.stderr
+    assert "ERR_MODULE_NOT_FOUND" not in result.stderr
+    assert not (rehearsal_driver[1].parent / "handoff.json").exists()
+
+
+def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
+    rehearsal_driver: tuple[str, Path],
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        complete_signed=True,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads((rehearsal_driver[1].parent / "handoff.json").read_text(encoding="utf-8"))
+    assert output["ok"] is False
+    assert output["stage"] == "installer-handoff"
+    assert output["handoffObserved"] is True
+    assert output["requiresPostInstallVerification"] is True
+    assert output["installMode"] == "manual"
+    assert output["mode"] == "signed-handoff"
+    assert output["canInstall"] is True
+    assert output["fromVersion"] == "0.5.5"
+    assert output["toVersion"] == "0.5.6"
+    assert output["sha256"] == hashlib.sha256(b"candidate artifact").hexdigest()
+    assert (
+        output["credentialSha256"] == hashlib.sha256(b"synthetic retained credential").hexdigest()
+    )
+    assert output["sourceSha"] == "a" * 40
+    assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-indicator"]' in result.stdout
+    assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-relaunch"]' in result.stdout
+
+
+@pytest.mark.parametrize("fault", ["", "discovery", "download"])
+def test_signed_download_fallback_requires_both_stage_observations(
+    rehearsal_driver: tuple[str, Path], fault: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.5", installed="0.5.5", candidate="0.5.6",
+        mode="signed-handoff", complete_signed=True,
+        download_source_mode="github-to-oss", fallback_fault=fault,
+    )
+    if fault:
+        assert result.returncode != 0
+        assert "SYNTHETIC_RELAUNCH_REQUESTED" not in result.stdout
+        assert not (rehearsal_driver[1].parent / "handoff.json").exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        output = json.loads((rehearsal_driver[1].parent / "handoff.json").read_text())
+        assert output["sourceFallbackVerified"] is True
+        assert output["source"] == "oss"
+        assert output["networkIsolationVerified"] is False
+        assert output["remotePublicationVerified"] is False
+        assert output["discoveryScope"] == "controlled loopback channel; production asset sources"
+
+
+@pytest.mark.parametrize("mode,source", [
+    ("native", "github-to-oss"), ("manual", "oss"),
+    ("signed-cached-handoff", "github-to-oss"), ("signed-handoff", "invalid"),
+])
+def test_download_source_override_rejects_other_modes_before_launch(
+    rehearsal_driver: tuple[str, Path], mode: str, source: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.5", installed="0.5.5",
+        candidate="0.5.6", mode=mode, download_source_mode=source,
+    )
+    assert result.returncode != 0
+    assert "--download-source-mode" in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.fixture
+def windows_upgrade_harness(tmp_path: Path) -> tuple[str, Path]:
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        message = "PowerShell is required to execute the Windows upgrade helper contract"
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail(message)
+        pytest.skip(message)
+    wrapper = tmp_path / "upgrade-harness.ps1"
+    helper_scripts = tmp_path / ".github" / "scripts"
+    helper_scripts.mkdir(parents=True)
+    helper_source = (SCRIPTS / "verify-release-windows-upgrade.ps1").read_text(encoding="utf-8")
+    known_folder_read = "$programsDirectory = Get-NSISUserProgramsDirectory"
+    assert helper_source.count(known_folder_read) == 1
+    # Replace only the native Windows KnownFolder boundary. The fixture's NSIS
+    # stub installs there independently of the helper's overwritten LOCALAPPDATA.
+    (helper_scripts / "verify-release-windows-upgrade.ps1").write_text(
+        helper_source.replace(
+            known_folder_read, "$programsDirectory = $env:SYNTHETIC_USER_PROGRAMS"
+        ),
+        encoding="utf-8",
+    )
+    # Isolate signature verification at its real script boundary. The production
+    # helper keeps mandatory verification; these version fixtures have no signed
+    # installer or installed uninstaller and also run under PowerShell on POSIX.
+    (helper_scripts / "verify-windows-signatures.ps1").write_text(
+        r"""
+param(
+  [Parameter(Mandatory = $true)][string]$InstallerPath,
+  [Parameter(Mandatory = $true)][string]$InstalledRoot
+)
+$ErrorActionPreference = 'Stop'
+@{ InstallerPath = $InstallerPath; InstalledRoot = $InstalledRoot } |
+  ConvertTo-Json -Compress | Set-Content -LiteralPath $env:SYNTHETIC_SIGNATURE_ARGUMENTS
+if ($env:SYNTHETIC_SIGNATURE_FAILURE -eq 'throw') {
+  throw 'SYNTHETIC_SIGNATURE_REJECTED'
+}
+if ($env:SYNTHETIC_SIGNATURE_FAILURE -eq 'exit') { exit 23 }
+$global:LASTEXITCODE = 0
+""",
+        encoding="utf-8",
+    )
+    # Exercise the real helper with synthetic Win32 version resources. Only external
+    # downloads, installer execution, signature checks, and profile probes are replaced; no Windows
+    # executable runs, so the same regression also runs under PowerShell on POSIX.
+    wrapper.write_text(
+        r"""
+$ErrorActionPreference = 'Stop'
+function New-SyntheticDesktop {
+  param([string]$Path, [string]$Version)
+  if ($Version -notmatch '^(\d+\.\d+\.\d+)') { throw 'Invalid synthetic numeric version.' }
+  $fileVersion = $Matches[1] + '.0'
+  $source = @"
+[assembly: System.Reflection.AssemblyInformationalVersion("$Version")]
+[assembly: System.Reflection.AssemblyFileVersion("$fileVersion")]
+public class SyntheticDesktop {}
+"@
+  $tree = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText($source)
+  $reference = [Microsoft.CodeAnalysis.MetadataReference]::CreateFromFile(
+    [object].Assembly.Location
+  )
+  $options = [Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions]::new(
+    [Microsoft.CodeAnalysis.OutputKind]::DynamicallyLinkedLibrary
+  )
+  $compilation = [Microsoft.CodeAnalysis.CSharp.CSharpCompilation]::Create(
+    [IO.Path]::GetFileNameWithoutExtension($Path), [Microsoft.CodeAnalysis.SyntaxTree[]]@($tree),
+    [Microsoft.CodeAnalysis.MetadataReference[]]@($reference), $options
+  )
+  # Add-Type alone omits Win32 resources. Unix FileVersionInfo falls back to
+  # managed metadata, whereas Windows requires this native version resource.
+  $resources = $compilation.CreateDefaultWin32Resources($true, $false, $null, $null)
+  $stream = [IO.File]::Create($Path)
+  try {
+    $result = $compilation.Emit($stream, $null, $null, $resources, $null, $null,
+      [Threading.CancellationToken]::None)
+    if (-not $result.Success) { throw ($result.Diagnostics -join "`n") }
+  } finally {
+    $stream.Dispose()
+    $resources.Dispose()
+  }
+  $reader = [Reflection.PortableExecutable.PEReader]::new([IO.File]::OpenRead($Path))
+  try {
+    $directory = $reader.PEHeaders.PEHeader.ResourceTableDirectory
+    if ($directory.RelativeVirtualAddress -le 0 -or $directory.Size -le 0) {
+      throw 'Synthetic PE is missing its Win32 resource directory.'
+    }
+    $resourceBytes = $reader.GetSectionData($directory.RelativeVirtualAddress).GetContent(
+      0, $directory.Size
+    )
+    $resourceText = [Text.Encoding]::Unicode.GetString([byte[]]$resourceBytes)
+    if ($resourceText -cnotmatch ('ProductVersion\x00+' + [regex]::Escape($Version) + '\x00')) {
+      throw 'Synthetic PE is missing its exact native ProductVersion.'
+    }
+    if ($resourceText -cnotmatch ('FileVersion\x00+' + [regex]::Escape($fileVersion) + '\x00')) {
+      throw 'Synthetic PE is missing its exact native FileVersion.'
+    }
+  } finally {
+    $reader.Dispose()
+  }
+}
+$baselinePe = Join-Path $PSScriptRoot 'baseline.exe'
+New-SyntheticDesktop -Path $baselinePe -Version $env:SYNTHETIC_BASELINE_PRODUCT_VERSION
+$replacementPe = Join-Path $PSScriptRoot 'replacement.exe'
+if ($env:SYNTHETIC_INSTALLED_VERSION -ne 'no-op') {
+  New-SyntheticDesktop -Path $replacementPe -Version $env:SYNTHETIC_INSTALLED_VERSION
+}
+$script:installerCount = 0
+function gh {
+  Write-Host 'BASELINE_DOWNLOAD_REACHED'
+  $global:LASTEXITCODE = 0
+}
+function python { $global:LASTEXITCODE = 0 }
+function Get-Process { param($Name, $ErrorAction) }
+function Start-Process {
+  param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru)
+  if ([IO.Path]::GetFileName($FilePath) -eq 'OpenSquilla.exe') {
+    throw 'POST_INSTALL_LAUNCH_REACHED'
+  }
+  $script:installerCount += 1
+  $destination = @($ArgumentList | Where-Object { $_.StartsWith('/D=') })
+  $installPath = if ($destination.Count) { $destination[0].Substring(3) } else {
+    if ($env:SYNTHETIC_WRONG_DEFAULT_ROOT -eq '1') {
+      Join-Path $env:LOCALAPPDATA 'unrelated/OpenSquilla'
+    } else { Join-Path $env:SYNTHETIC_USER_PROGRAMS 'OpenSquilla' }
+  }
+  $argumentMode = if ($destination.Count) { 'custom' } else { 'default' }
+  Write-Host "SYNTHETIC_INSTALLER_MODE:$script:installerCount`:$argumentMode"
+  $runtime = Join-Path $installPath 'resources/runtime'
+  New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+  foreach ($metadata in @('runtime-manifest.json', 'runtime-pack-catalog.json')) {
+    Set-Content -LiteralPath (Join-Path $runtime $metadata) -Value '{}'
+  }
+  $app = Join-Path $installPath 'OpenSquilla.exe'
+  if ($script:installerCount -eq 1) {
+    Copy-Item -LiteralPath $baselinePe -Destination $app
+  } elseif ($env:SYNTHETIC_INSTALLED_VERSION -ne 'no-op') {
+    Copy-Item -LiteralPath $replacementPe -Destination $app -Force
+  }
+  Write-Host "SYNTHETIC_INSTALLER_EXIT_ZERO:$script:installerCount"
+  return [PSCustomObject]@{ ExitCode = 0 }
+}
+$arguments = @{
+  CandidateInstaller = $env:SYNTHETIC_CANDIDATE
+  Label = 'version-regression'
+  BaselineVersion = '0.5.4'
+  InstallMode = $env:SYNTHETIC_INSTALL_MODE
+}
+if ($env:SYNTHETIC_MANIFEST) {
+  $arguments.RealUpdateChannelManifest = $env:SYNTHETIC_MANIFEST
+}
+try {
+  & $env:SYNTHETIC_HELPER @arguments
+  throw 'HELPER_COMPLETED_UNEXPECTEDLY'
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+""",
+        encoding="utf-8",
+    )
+    return pwsh, wrapper
+
+
+@pytest.mark.parametrize("github_actions", ["true", ""])
+def test_windows_upgrade_requires_powershell_in_ci(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, github_actions: str
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setenv("GITHUB_ACTIONS", github_actions)
+    expected = pytest.fail.Exception if github_actions == "true" else pytest.skip.Exception
+    with pytest.raises(expected, match="PowerShell is required"):
+        windows_upgrade_harness.__wrapped__(tmp_path)
+
+
+def _run_windows_upgrade_helper(
+    harness: tuple[str, Path],
+    *,
+    candidate_name: str,
+    installed_version: str = "no-op",
+    install_mode: str = "custom",
+    manifest: dict[str, object] | None = None,
+    signature_failure: str = "",
+    baseline_product_version: str = "0.5.4",
+    wrong_default_root: bool = False,
+    existing_default_root: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    pwsh, wrapper = harness
+    candidate = wrapper.parent / candidate_name
+    candidate.touch()
+    known_programs = wrapper.parent / "known-folder" / "Programs"
+    if existing_default_root:
+        existing = known_programs / "OpenSquilla"
+        existing.mkdir(parents=True)
+        (existing / "preserve.txt").write_text("existing installation", encoding="utf-8")
+    manifest_path = wrapper.parent / "channel.json"
+    if manifest is not None:
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+        cwd=wrapper.parent,
+        env={
+            **os.environ,
+            "RUNNER_TEMP": str(wrapper.parent / "runner"),
+            "SYNTHETIC_HELPER": str(
+                wrapper.parent / ".github/scripts/verify-release-windows-upgrade.ps1"
+            ),
+            "SYNTHETIC_CANDIDATE": str(candidate),
+            "SYNTHETIC_INSTALLED_VERSION": installed_version,
+            "SYNTHETIC_INSTALL_MODE": install_mode,
+            "SYNTHETIC_MANIFEST": str(manifest_path) if manifest is not None else "",
+            "SYNTHETIC_SIGNATURE_ARGUMENTS": str(wrapper.parent / "signature-arguments.json"),
+            "SYNTHETIC_SIGNATURE_FAILURE": signature_failure,
+            "SYNTHETIC_BASELINE_PRODUCT_VERSION": baseline_product_version,
+            "SYNTHETIC_USER_PROGRAMS": str(known_programs),
+            "SYNTHETIC_WRONG_DEFAULT_ROOT": "1" if wrong_default_root else "",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=45,
+    )
+
+
+def _assert_windows_signature_arguments(
+    harness: tuple[str, Path], *, candidate: str, install_mode: str
+) -> None:
+    root = harness[1].parent
+    captured = json.loads((root / "signature-arguments.json").read_text(encoding="utf-8-sig"))
+    sandbox = (
+        root
+        / "runner"
+        / (f"opensquilla-release-preservation-version-regression-{install_mode}-0.5.4")
+    )
+    installed = (
+        sandbox / "OpenSquilla"
+        if install_mode == "custom"
+        else root / "known-folder/Programs/OpenSquilla"
+    )
+    assert Path(captured["InstallerPath"]) == root / f"OpenSquilla-{candidate}-win-x64.exe"
+    assert Path(captured["InstalledRoot"]) == installed
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+@pytest.mark.parametrize(
+    ("candidate", "installed"),
+    [
+        ("0.5.5", "no-op"),
+        ("0.5.5-rc1", "no-op"),
+        ("0.5.5-rc1", "0.5.5-rc0"),
+        ("0.5.5-rc1", "0.5.5-RC1"),
+        ("0.5.5", "0.5.5.1"),
+        ("0.5.5", "0.5.5.0.0"),
+        ("0.5.5", "0.5.50"),
+        ("0.5.5-rc1", "0.5.5.0"),
+    ],
+)
+def test_windows_replacement_rejects_successful_installer_with_stale_app(
+    windows_upgrade_harness: tuple[str, Path],
+    install_mode: str,
+    candidate: str,
+    installed: str,
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name=f"OpenSquilla-{candidate}-win-x64.exe",
+        installed_version=installed,
+        install_mode=install_mode,
+    )
+    assert result.returncode != 0
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" in result.stdout
+    actual = "0.5.4" if installed == "no-op" else installed
+    expected_error = f"ProductVersion {actual} does not match the rehearsed version {candidate}"
+    assert expected_error in result.stderr
+    assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
+    _assert_windows_signature_arguments(
+        windows_upgrade_harness, candidate=candidate, install_mode=install_mode
+    )
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+@pytest.mark.parametrize("candidate", ["0.5.5", "0.5.5-rc1"])
+def test_windows_replacement_accepts_exact_installed_candidate_version(
+    windows_upgrade_harness: tuple[str, Path], install_mode: str, candidate: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name=f"OpenSquilla-{candidate}-win-x64.exe",
+        installed_version=candidate,
+        install_mode=install_mode,
+    )
+    assert result.returncode != 0  # Stop before any real application is launched.
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" in result.stdout
+    assert "POST_INSTALL_LAUNCH_REACHED" in result.stderr
+    assert f"SYNTHETIC_INSTALLER_MODE:1:{install_mode}" in result.stdout
+    assert f"SYNTHETIC_INSTALLER_MODE:2:{install_mode}" in result.stdout
+    _assert_windows_signature_arguments(
+        windows_upgrade_harness, candidate=candidate, install_mode=install_mode
+    )
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+def test_windows_upgrade_accepts_zero_revision_for_stable_pe_versions(
+    windows_upgrade_harness: tuple[str, Path], install_mode: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5.0",
+        baseline_product_version="0.5.4.0",
+        install_mode=install_mode,
+    )
+    assert result.returncode != 0
+    assert "POST_INSTALL_LAUNCH_REACHED" in result.stderr
+    assert f"SYNTHETIC_INSTALLER_MODE:1:{install_mode}" in result.stdout
+    assert f"SYNTHETIC_INSTALLER_MODE:2:{install_mode}" in result.stdout
+    _assert_windows_signature_arguments(
+        windows_upgrade_harness, candidate="0.5.5", install_mode=install_mode
+    )
+
+
+@pytest.mark.parametrize("baseline_product_version", ["0.5.4.1", "0.5.40"])
+def test_windows_upgrade_rejects_other_baseline_pe_versions(
+    windows_upgrade_harness: tuple[str, Path], baseline_product_version: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5.0",
+        baseline_product_version=baseline_product_version,
+    )
+    assert result.returncode != 0
+    assert (
+        f"Expected official v0.5.4, found installed version: {baseline_product_version}"
+        in result.stderr
+    )
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" not in result.stdout
+    assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
+
+
+def test_windows_default_install_rejects_unrelated_executable_outside_known_folder(
+    windows_upgrade_harness: tuple[str, Path],
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5",
+        install_mode="default",
+        wrong_default_root=True,
+    )
+    assert result.returncode != 0
+    assert (
+        "default installation did not publish OpenSquilla.exe at the expected installation root"
+        in result.stderr
+    )
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" not in result.stdout
+    assert not (windows_upgrade_harness[1].parent / "signature-arguments.json").exists()
+
+
+def test_windows_default_install_refuses_existing_installation_before_download(
+    windows_upgrade_harness: tuple[str, Path],
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5",
+        install_mode="default",
+        existing_default_root=True,
+    )
+    assert result.returncode != 0
+    assert "requires a fresh runner" in result.stderr
+    assert "BASELINE_DOWNLOAD_REACHED" not in result.stdout
+    sentinel = windows_upgrade_harness[1].parent / "known-folder/Programs/OpenSquilla/preserve.txt"
+    assert sentinel.read_text(encoding="utf-8") == "existing installation"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native Windows KnownFolder read")
+def test_windows_nsis_known_folder_is_independent_of_localappdata_environment(
+    windows_upgrade_harness: tuple[str, Path],
+) -> None:
+    pwsh, wrapper = windows_upgrade_harness
+    # Parse and invoke only the read-only native resolver, never the installer body.
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+  $env:SYNTHETIC_ORIGINAL_HELPER, [ref]$null, [ref]$null
+)
+$function = $ast.Find({ param($node)
+  $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+  $node.Name -eq 'Get-NSISUserProgramsDirectory'
+}, $true)
+Invoke-Expression $function.Extent.Text
+$before = Get-NSISUserProgramsDirectory
+$env:LOCALAPPDATA = $env:SYNTHETIC_SHADOW_LOCALAPPDATA
+$after = Get-NSISUserProgramsDirectory
+@{ before = $before; after = $after } | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=wrapper.parent,
+        env={
+            **os.environ,
+            "SYNTHETIC_ORIGINAL_HELPER": str(SCRIPTS / "verify-release-windows-upgrade.ps1"),
+            "SYNTHETIC_SHADOW_LOCALAPPDATA": str(wrapper.parent / "shadow-localappdata"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    paths = json.loads(result.stdout)
+    assert Path(paths["before"]).is_absolute()
+    assert paths["before"] == paths["after"]
+    assert not Path(paths["after"]).is_relative_to(wrapper.parent)
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+@pytest.mark.parametrize("signature_failure", ["exit", "throw"])
+def test_windows_upgrade_propagates_signature_failure_before_launch(
+    windows_upgrade_harness: tuple[str, Path], install_mode: str, signature_failure: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5",
+        install_mode=install_mode,
+        signature_failure=signature_failure,
+    )
+    assert result.returncode != 0
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" in result.stdout
+    message = (
+        "SYNTHETIC_SIGNATURE_REJECTED"
+        if signature_failure == "throw"
+        else "Candidate or installed Windows Authenticode verification failed."
+    )
+    assert message in result.stderr
+    assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
+    assert "HELPER_COMPLETED_UNEXPECTEDLY" not in result.stderr
+    _assert_windows_signature_arguments(
+        windows_upgrade_harness, candidate="0.5.5", install_mode=install_mode
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate_name",
+    [
+        "OpenSquilla-0.05.5-win-x64.exe",
+        "OpenSquilla-0.5.5rc1-win-x64.exe",
+        "OpenSquilla-0.5.5-rc01-win-x64.exe",
+        "OpenSquilla-0.5.5-win-arm64.exe",
+    ],
+)
+def test_windows_upgrade_rejects_noncanonical_asset_before_side_effects(
+    windows_upgrade_harness: tuple[str, Path], candidate_name: str
+) -> None:
+    result = _run_windows_upgrade_helper(windows_upgrade_harness, candidate_name=candidate_name)
+    assert result.returncode != 0
+    assert "canonical stable or RC asset name" in result.stderr
+    assert "BASELINE_DOWNLOAD_REACHED" not in result.stdout
+    assert not (windows_upgrade_harness[1].parent / "runner").exists()
+
+
+@pytest.mark.parametrize("manifest_version", ["0.5.6", "0.5.5-rc1"])
+def test_windows_upgrade_rejects_manifest_candidate_mismatch_before_side_effects(
+    windows_upgrade_harness: tuple[str, Path], manifest_version: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        manifest={
+            "schemaVersion": 1,
+            "version": manifest_version,
+            "tag": f"v{manifest_version}",
+            "prerelease": False,
+        },
+    )
+    assert result.returncode != 0
+    assert "manifest version does not match installer version 0.5.5" in result.stderr
+    assert "BASELINE_DOWNLOAD_REACHED" not in result.stdout
+    assert not (windows_upgrade_harness[1].parent / "runner").exists()

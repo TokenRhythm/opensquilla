@@ -1,9 +1,4 @@
-"""Compaction safety levers: tiny guard plus default-on assistant protection.
-
-Covers the OPENSQUILLA_PROVIDER_COMPACTION_TINY_GUARD_CHARS and
-OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_ASSISTANT env levers
-with explicit rollback coverage.
-"""
+"""Default-on assistant protection and retired tiny-guard compatibility."""
 
 from __future__ import annotations
 
@@ -62,24 +57,6 @@ def test_tiny_guard_defaults_off_replaces_tiny_arguments(
     assert len(compacted) > len("s1")
 
 
-def test_tiny_guard_keeps_strings_shorter_than_marker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(TINY_GUARD_ENV, "120")
-    monkeypatch.setenv(NEVER_WORSE_ENV, "0")
-    assert _compact_argument_string("s1", preview=False) == "s1"
-    assert _compact_argument_string("y" * 120, preview=False) == "y" * 120
-    long_value = "z" * 121
-    assert _compact_argument_string(long_value, preview=False) != long_value
-
-
-def test_tiny_guard_applies_to_hard_compact(monkeypatch: pytest.MonkeyPatch) -> None:
-    value = "h" * 110
-    assert _hard_compact_string(value, label="t").startswith("[opensquilla_compacted:")
-    monkeypatch.setenv(TINY_GUARD_ENV, "120")
-    assert _hard_compact_string(value, label="t") == value
-
-
 def test_tiny_guard_invalid_env_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(TINY_GUARD_ENV, "not-a-number")
     monkeypatch.setenv(NEVER_WORSE_ENV, "0")
@@ -87,23 +64,26 @@ def test_tiny_guard_invalid_env_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
     assert compacted.startswith("[provider_request_tool_input_compacted:")
 
 
-def test_aggregate_mode_preserves_tiny_arguments_with_guard(
+@pytest.mark.parametrize("legacy_value", ["0", "120", "1000000", "invalid"])
+@pytest.mark.parametrize("never_worse", ["0", "1"])
+def test_retired_tiny_guard_preserves_off_mode_and_empty_strings(
     monkeypatch: pytest.MonkeyPatch,
+    legacy_value: str,
+    never_worse: str,
 ) -> None:
-    monkeypatch.setenv(TINY_GUARD_ENV, "120")
-    monkeypatch.setenv(PROTECT_RECENT_ENV, "0")
-    monkeypatch.setenv(NEVER_WORSE_ENV, "0")
-    compacted, metadata = _compact_recent_tail_payload_once(_aggregate_args_payload())
-    assert metadata["aggregate_tool_arguments_compacted"] is True
-    for message in compacted["messages"]:
-        for tool_call in message.get("tool_calls") or []:
-            arguments = json.loads(tool_call["function"]["arguments"])
-            # Tiny fields survive verbatim; only the oversized command is compacted.
-            assert arguments["workdir"] == "/w"
-            assert arguments["session"] == "s1"
-            assert arguments["command"].startswith(
-                "[provider_request_tool_input_compacted:"
-            )
+    from opensquilla.provider.request_proof import _compact_tool_arguments
+
+    monkeypatch.setenv(NEVER_WORSE_ENV, never_worse)
+    values = ["", "s1", "x" * 120, "x" * 2000]
+    sites = (
+        lambda value: _compact_argument_string(value, preview=False),
+        lambda value: _compact_tool_arguments(value, preview=False),
+        lambda value: _hard_compact_string(value, label="test"),
+    )
+    baseline = [[site(value) for value in values] for site in sites]
+    monkeypatch.setenv(TINY_GUARD_ENV, legacy_value)
+    assert [[site(value) for value in values] for site in sites] == baseline
+    assert all(site("") == "" for site in sites)
 
 
 def test_protect_recent_assistant_on_by_default() -> None:
@@ -253,7 +233,7 @@ def test_proof_reports_tier_and_lever_state(monkeypatch: pytest.MonkeyPatch) -> 
     assert proof is not None
     assert proof["compaction_tier"] == proof["retry_count"]
     assert proof["compaction_tier"] >= 1
-    assert proof["compaction_tiny_guard_chars"] == 120
+    assert "compaction_tiny_guard_chars" not in proof
     assert proof["compaction_protect_recent_assistant"] is True
 
 
@@ -265,7 +245,7 @@ def test_proof_tier_zero_when_fits() -> None:
     )
     assert proof is not None
     assert proof["compaction_tier"] == 0
-    assert proof["compaction_tiny_guard_chars"] == 0
+    assert "compaction_tiny_guard_chars" not in proof
     assert proof["compaction_protect_recent_assistant"] is True
     assert proof["compaction_protect_recent_results"] == 2
     assert proof["compaction_protect_error_results"] is True

@@ -65,7 +65,13 @@ _CODE_CALL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*\(")
 
 @dataclass(frozen=True, slots=True)
 class RepetitionGuardPolicy:
-    """Conservative fixed policy for one provider attempt."""
+    """Conservative fixed policy for one provider attempt.
+
+    Repetition counts include the first occurrence of the repeated unit.
+    ``required_consecutive_checks`` requires that many adjacent period pairs
+    inside the candidate suffix to meet the similarity threshold; it does not
+    add later stream checkpoints after ``min_repetitions`` has been reached.
+    """
 
     max_buffer_chars: int = 65_536
     check_stride_chars: int = 256
@@ -131,7 +137,6 @@ class StreamingRepetitionGuard:
         self._normalized_chars = 0
         self._next_check = self.policy.check_stride_chars
         self._last_whitespace: str | None = None
-        self._repeat_evidence_streak = 0
 
     @property
     def buffered_chars(self) -> int:
@@ -145,7 +150,6 @@ class StreamingRepetitionGuard:
         self._normalized_chars = 0
         self._next_check = self.policy.check_stride_chars
         self._last_whitespace = None
-        self._repeat_evidence_streak = 0
 
     def feed(self, text: str) -> tuple[str, RepetitionDetection | None]:
         if not text:
@@ -175,11 +179,7 @@ class StreamingRepetitionGuard:
             pending.clear()
             candidate = self._detect()
             self._next_check += self.policy.check_stride_chars
-            if candidate is None:
-                self._repeat_evidence_streak = 0
-                continue
-            self._repeat_evidence_streak += 1
-            if self._repeat_evidence_streak >= self.policy.required_consecutive_checks:
+            if candidate is not None:
                 return text[: raw_index + 1], candidate
 
         if pending:
@@ -215,7 +215,7 @@ class StreamingRepetitionGuard:
 
     def _detect(self) -> RepetitionDetection | None:
         policy = self.policy
-        if self._buffer_chars < policy.min_repeated_chars + policy.min_period_chars:
+        if self._buffer_chars < policy.min_repeated_chars:
             return None
 
         text = self._buffer_text()
@@ -238,15 +238,25 @@ class StreamingRepetitionGuard:
                     policy.large_period_min_repetitions,
                 )
             repeated_chars = max(min_repeated, period * min_repetitions)
-            if repeated_chars + period > len(text):
+            if repeated_chars > len(text):
                 continue
 
-            comparison = text[-(repeated_chars + period) :]
+            comparison = text[-repeated_chars:]
             previous = comparison[:-period]
             current = comparison[period:]
+            comparison_chars = len(previous)
+            if comparison_chars <= 0:
+                continue
             matches = sum(left == right for left, right in zip(previous, current, strict=True))
-            similarity = matches / repeated_chars
+            similarity = matches / comparison_chars
             if similarity < min_similarity:
+                continue
+            if not _has_consecutive_period_evidence(
+                comparison,
+                period=period,
+                checks=max(1, policy.required_consecutive_checks),
+                min_similarity=min_similarity,
+            ):
                 continue
             return RepetitionDetection(
                 period_chars=period,
@@ -293,6 +303,29 @@ class StreamingRepetitionGuard:
                     occurrences += 1
         ranked = sorted(votes, key=lambda period: (-votes[period], period))
         return sorted(ranked[: policy.max_candidate_periods])
+
+
+def _has_consecutive_period_evidence(
+    text: str,
+    *,
+    period: int,
+    checks: int,
+    min_similarity: float,
+) -> bool:
+    """Require recent adjacent periods to independently meet the threshold."""
+
+    evidence_chars = period * (checks + 1)
+    if evidence_chars > len(text):
+        return False
+    evidence = text[-evidence_chars:]
+    for index in range(checks):
+        start = index * period
+        previous = evidence[start : start + period]
+        current = evidence[start + period : start + period * 2]
+        matches = sum(left == right for left, right in zip(previous, current, strict=True))
+        if matches / period < min_similarity:
+            return False
+    return True
 
 
 def _looks_structured(text: str, period: int) -> bool:

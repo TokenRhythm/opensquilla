@@ -56,6 +56,12 @@ def test_desktop_renderer_is_local_and_gateway_connection_is_described() -> None
     assert "desktopGatewayConnectionSnapshot" in main_ts
     assert "gateway:connection-changed" in main_ts
     assert "gateway:connection" in _read("desktop/electron/src/preload.cts")
+    connection_handler = _section(
+        main_ts,
+        "ipcMain.handle('gateway:connection'",
+        "ipcMain.handle('gateway:cli-invocation'",
+    )
+    assert "refreshSandboxUpgradeReport()" in connection_handler
     assert "if (mainWindow === window) mainWindow = null" in main_ts
 
 
@@ -116,7 +122,7 @@ def test_desktop_owned_gateway_is_unconditionally_loopback_bound() -> None:
     assert "'0.0.0.0'" not in start_gateway
 
 
-def test_desktop_artifact_bridge_credentials_reach_only_the_owned_gateway_child() -> None:
+def test_desktop_browser_credentials_reach_only_the_owned_gateway_child() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     preload = _read("desktop/electron/src/preload.cts")
     child_environment = _section(
@@ -130,15 +136,15 @@ def test_desktop_artifact_bridge_credentials_reach_only_the_owned_gateway_child(
         "async function startGatewayWithPortRecovery",
     )
 
-    assert "delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]" in child_environment
-    assert "delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]" in child_environment
-    assert "await desktopArtifactBridgeLoopback.start()" in start_gateway
-    assert "...artifactBridgeEnvironment" in start_gateway
-    assert start_gateway.index("await desktopArtifactBridgeLoopback.start()") < start_gateway.index(
+    assert "delete environment[DESKTOP_BROWSER_URL_ENV]" in child_environment
+    assert "delete environment[DESKTOP_BROWSER_TOKEN_ENV]" in child_environment
+    assert "await desktopBrowser.start()" in start_gateway
+    assert "...browserEnvironment" in start_gateway
+    assert start_gateway.index("await desktopBrowser.start()") < start_gateway.index(
         "const port = await findGatewayPort()"
     )
-    assert "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL" not in preload
-    assert "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN" not in preload
+    assert "OPENSQUILLA_DESKTOP_BROWSER_URL" not in preload
+    assert "OPENSQUILLA_DESKTOP_BROWSER_TOKEN" not in preload
 
 
 def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
@@ -1350,8 +1356,8 @@ def test_desktop_gateway_port_selection_is_bind_aware_and_bounded() -> None:
     ) in recovery
     assert "gatewayExitLooksLikePortInUse(message)" in recovery
     assert "desktopLog('gateway_port_retry'" in recovery
-    assert "if (portConflictExit && !hasExplicitGatewayPort())" in start
-    assert "sendBootError(gatewayState.error)" in start
+    assert "if (!childWasReady && portConflictExit && !hasExplicitGatewayPort())" in start
+    assert "publishTerminalGatewayExitError(classifiedMessage)" in start
 
 
 def test_windows_gateway_hard_terminate_clears_pid_without_unlinking_lock() -> None:
@@ -1408,9 +1414,18 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
     scripts = package_json["scripts"]
 
     for local_script in ("dist:local", "pack:local"):
-        commands = scripts[local_script].split(" && ")
+        public_script = local_script.removesuffix(":local")
+        assert scripts[local_script] == f"npm run {public_script}"
+        commands = scripts[public_script].split(" && ")
         assert "npm run fetch:runtimes" not in commands
         assert commands.index("npm run build:web") < commands.index("npm run build:gateway")
+        assert commands.index("npm run build:gateway") < commands.index(
+            f"npm run {public_script}:prepared"
+        )
+        prepared = scripts[f"{public_script}:prepared"].split(" && ")
+        builder = "electron-builder --dir" if public_script == "pack" else "electron-builder"
+        assert prepared.index("npm run verify:prepared") < prepared.index(builder)
+        assert "npm run build:gateway" not in prepared
 
     runtime_resources = {
         (entry["from"], entry["to"])
@@ -1423,8 +1438,8 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
         ("runtime/runtime-pack-catalog.json", "runtime/runtime-pack-catalog.json"),
     }
 
-    assert scripts["dist"].endswith(" && npm run verify:package")
-    assert scripts["pack"].endswith(" && npm run verify:package")
+    assert scripts["dist:prepared"].endswith(" && npm run verify:package")
+    assert scripts["pack:prepared"].endswith(" && npm run verify:package")
 
 
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
@@ -1524,24 +1539,27 @@ def test_desktop_onboarding_exposes_immediate_and_slow_submit_feedback() -> None
 
 def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
+    router_profiles = _read("desktop/electron/src/desktop-router-profiles.ts")
+    router_config = _read("desktop/electron/src/desktop-router-config.ts")
     tokenrhythm_catalog = _section(main_ts, "id: 'tokenrhythm'", "id: 'openrouter'")
-    tokenrhythm_profile = _section(main_ts, "  tokenrhythm: {", "  openrouter: {")
+    tokenrhythm_profile = _section(router_profiles, "  tokenrhythm: {", "  openrouter: {")
     onboarding_html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
 
     assert "routerSupported: true" in tokenrhythm_catalog
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
     assert "model: 'deepseek-v4-pro-0813'" in tokenrhythm_catalog
-    assert "const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])" in main_ts
-    assert "!INLINE_ROUTER_PROFILE_IDS.has(credential.provider)" in main_ts
+    assert "desktopRouterConfigTomlLines(credential, existingRaw, routerWriteIntent)" in main_ts
+    assert "`preset_binding = ${tomlValue(binding)}`" in router_config
     assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html
     assert (
         "routerMode.value = modelRoutingMode.value === 'direct' ? 'disabled' : 'recommended';"
         in onboarding_html
     )
-    assert "routerTiers = clone(routerProfiles[profileKeyForMode()]);" in onboarding_html
-    assert "return provider.value;" in onboarding_html
-    assert "routerDefaultTier: 'c1'," in onboarding_html
-    assert "routerTiers: clone(routerTiers)," in onboarding_html
+    assert "routerTiers:" not in onboarding_html
+    assert "routerDefaultTier:" not in onboarding_html
+    assert "defaultTiers: defaultRouterTiers(provider," in main_ts
+    assert "routerDefaultTier: 'c1'," in router_config
+    assert "routerPresetBinding: 'follow_primary'," in router_config
     assert "[data-model-routing-mode]" not in onboarding_html
     assert "'selection_mode = \"custom_b5\"'" in main_ts
     assert "'[[llm_ensemble.candidates]]'" in main_ts
@@ -1558,7 +1576,7 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
         assert model in tokenrhythm_profile
     assert "ensembleEnabled: true" in tokenrhythm_profile
     assert "thinkingLevel" not in tokenrhythm_profile
-    assert "ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}" in main_ts
+    assert "ensemble_enabled = ${tomlValue(ensembleEnabled)}" in router_config
 
 
 def test_desktop_legacy_inline_router_does_not_inherit_new_c3_ensemble() -> None:
@@ -1754,8 +1772,9 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
 
     assert "const GATEWAY_OUTPUT_TAIL_MAX_CHARS = 12_000" in main_ts
     assert "const NEWER_CONFIG_DIAGNOSTIC_FIELDS = [" in main_ts
-    for field in ["'llm_ensemble'", "'privacy'", "'sandbox.auto_setup'", "'llm_profiles'"]:
+    for field in ["'llm_ensemble'", "'privacy'", "'llm_profiles'"]:
         assert field in main_ts
+    assert "'sandbox.auto_setup'" not in main_ts
     assert (
         "function classifyGatewayExitMessage(message: string, outputTail: string): string"
         in main_ts
@@ -1773,6 +1792,95 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     )
     assert "exitMessage: earlyExitMessage" in wait
     assert "if (result.status === 'exited') throw new Error(result.message)" in wait
+
+
+def test_ready_desktop_gateway_unexpected_exit_has_bounded_cross_platform_restart() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+    restart = _section(
+        main_ts,
+        "function invalidateGatewayUnexpectedExitRestart",
+        "function ensureGatewayStarted",
+    )
+    stop = _section(
+        main_ts,
+        "function stopGateway(): void",
+        "// ── Desktop updates",
+    )
+    join = _section(
+        main_ts,
+        "async function stopAndJoinAllLifecycleOwnedGateways",
+        "function restoreDownloadedUpdateRetryState",
+    )
+    migration = _section(
+        main_ts,
+        "ipcMain.handle('desktop:migration:run'",
+        "ipcMain.handle('desktop:migration:last-result'",
+    )
+
+    assert (
+        "const GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS = [1_000, 2_000, 4_000] as const"
+        in main_ts
+    )
+    assert "const gatewayReadyProcesses = new WeakMap" in main_ts
+    assert "const startupUnexpectedExitRestartGeneration" in start
+    assert (
+        "startupUnexpectedExitRestartGeneration === gatewayUnexpectedExitRestartGeneration"
+        in start
+    )
+    assert "const childReadyAuthority = gatewayReadyProcesses.get(child)" in start
+    assert "const abnormalExit = signal !== null || (code !== null && code !== 0)" in start
+    assert "let childSpawnSucceeded = false" in start
+    assert "child.once('spawn', () =>" in start
+    post_spawn_error = _section(
+        start,
+        "if (childSpawnSucceeded)",
+        "if (isCurrentGateway) gatewayProcess = null",
+    )
+    assert "gateway_child_process_error" in post_spawn_error
+    assert "return" in post_spawn_error
+    abnormal_exit = _section(
+        start,
+        "if (abnormalExit)",
+        "publishTerminalGatewayExitError(classifiedMessage)",
+    )
+    assert "scheduleGatewayUnexpectedExitRestart" in abnormal_exit
+    assert "childWasReady" in abnormal_exit
+    assert "childReadyAuthority" in abnormal_exit
+    assert "cancelGatewayUnexpectedExitRestart('Gateway exited normally')" in abnormal_exit
+    assert (
+        "scheduleGatewayUnexpectedExitRestart(message, gatewayReadyProcesses.has(child))"
+        in start
+    )
+    assert "markGatewayProcessReady(child)" in start
+    assert "gatewayUnexpectedExitRestartAttempt + 1" in restart
+    assert "GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS[attempt - 1]" in restart
+    assert (
+        "gatewayUnexpectedExitRestartAttempt >= GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS.length"
+        in restart
+    )
+    assert "generation === gatewayUnexpectedExitRestartGeneration" in restart
+    assert "desktopOpenFlowRevision === gatewayUnexpectedExitRestartOpenFlowRevision" in restart
+    assert "desktopProfileKey() === gatewayUnexpectedExitRestartProfileKey" in restart
+    assert "readyAuthority.profileKey !== desktopProfileKey()" in restart
+    assert "readyAuthority.openFlowRevision !== desktopOpenFlowRevision" in restart
+    assert "!isQuitting" in restart
+    assert "!updateApplying" in restart
+    assert "appExitPhase === 'running'" in restart
+    assert "!desktopWriters.closed" in restart
+    assert "void ensureGatewayStarted()" in restart
+    assert "gatewayUnexpectedExitRestartTimer.unref()" in restart
+    assert "process.platform" not in restart
+    assert "cancelGatewayUnexpectedExitRestart('Gateway stop requested')" in stop
+    assert "cancelGatewayUnexpectedExitRestart('Gateway stop/join requested')" in join
+    assert "cancelGatewayUnexpectedExitRestart('Gateway state cleared')" in main_ts
+    assert "cancelGatewayUnexpectedExitRestart('desktop settings save started')" in main_ts
+    assert "cancelGatewayUnexpectedExitRestart('profile migration started')" in migration
+    assert "cancelGatewayUnexpectedExitRestart('desktop open flow invalidated')" in main_ts
 
 
 def test_start_gateway_preserves_host_path_without_static_runtime_injection() -> None:
@@ -1851,7 +1959,10 @@ def test_dev_gateway_runtime_is_process_tree_aware_on_termination() -> None:
     assert "detached: runtime.mode === 'dev' && process.platform !== 'win32'" in start
     assert "if (runtime.mode === 'dev') gatewayProcessTreeChildren.add(child)" in start
     assert "gatewayProcessTreeChildren.has(child)" in terminate
-    assert "spawnSync('taskkill', ['/pid', String(pid), '/t', '/f']" in terminate
+    assert "terminateWindowsProcessTree({" in terminate
+    assert "timeoutMs: WINDOWS_PROCESS_TREE_KILL_TIMEOUT_MS" in terminate
+    assert "gatewayProcessTreeTerminations.has(child)" in terminate
+    assert "gateway_process_tree_termination_failed" in terminate
     assert "process.kill(-pid, signal)" in terminate
     assert "child.kill(signal)" in terminate
 
@@ -2041,7 +2152,13 @@ def test_desktop_update_actions_are_guarded_against_reentry() -> None:
     assert "if (!desktopUpdateCheckAllowed()) return" in check_update
     assert "downloading: updateDownloadInProgress ||" in check_allowed
     assert "applying: updateApplying" in check_allowed
-    assert "downloaded: downloadedUpdateVersion !== null" in check_allowed
+    # Manual installer caches must not suppress discovery of a newer or
+    # withdrawn candidate. Native updates still block checks while downloaded.
+    assert "downloaded: desktopUpdateInstallMode() !== 'manual'" in check_allowed
+    assert (
+        "&& (downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded')"
+        in check_allowed
+    )
     assert "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return" in apply_update
     assert apply_update.index("if (updateApplying) return") < apply_update.index(
         "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return"
@@ -2173,8 +2290,13 @@ def test_apply_downloaded_update_waits_for_actual_gateway_exit_before_install() 
     assert "hasGatewayProcessExited(child)" in wait_helper
     assert "child.once('exit', () => finish(true))" in wait_helper
     assert "setTimeout(resolve" not in apply_update
-    assert "await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
-    assert apply_update.index("await stopAndJoinAllLifecycleOwnedGateways(") < apply_update.index(
+    shared_stop = _section(
+        main_ts, "async function stopOwnedGatewaysForUpdate", "async function applyWindowsInstaller"
+    )
+    assert "await stopAndJoinAllLifecycleOwnedGateways(" in shared_stop
+    assert "allowGracefulShutdownWhileQuitting = true" in shared_stop
+    assert "await stopOwnedGatewaysForUpdate()" in apply_update
+    assert apply_update.index("await stopOwnedGatewaysForUpdate()") < apply_update.index(
         "autoUpdater.quitAndInstall(false, true)"
     )
 
@@ -2188,7 +2310,7 @@ def test_apply_downloaded_update_timeout_restores_retry_state_before_returning()
     )
 
     assert "const pendingVersion = downloadedUpdateVersion" in apply_update
-    assert "const exited = await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    assert "const exited = await stopOwnedGatewaysForUpdate()" in apply_update
     assert "if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0)" in apply_update
     timeout_branch = _section(
         apply_update,
@@ -2519,6 +2641,20 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
     ]:
         assert expected in verifier
 
+    assert "createWindowIndex + 8_000" not in verifier
+    assert "waitIndex + 1_000" not in verifier
+    assert re.search(
+        r"sourceBetweenMarkers\(\s*source,\s*'async function createMainWindow',"
+        r"\s*'function currentMainWindow',",
+        verifier,
+    )
+    assert re.search(
+        r"sourceBetweenMarkers\(\s*source,\s*'async function waitForGateway',"
+        r"\s*'function hasGatewayProcessExited',",
+        verifier,
+    )
+    assert r"readinessCheck\(\s*url(?:\s*,[^)]*)?\)" in verifier
+
 
 def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
@@ -2540,6 +2676,7 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "sessions.messages.subscribe" in recovery
     assert "frame.params?.sessionKey === sessionKey" in recovery
     assert "frame.params?.key === sessionKey" in recovery
+    assert "switchSessionKey = requiredOption('--switch-session-key')" in recovery
     assert "let targetSocketCounted = false" in recovery
     assert recovery.count("countTargetSocket()") == 2
     assert "client.onMessage" in recovery
@@ -2547,32 +2684,51 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "server.send(message)" in recovery
     assert "client.send(message)" in recovery
     assert "page.clock" not in recovery
-    assert "socketCount > 1" in recovery
+    assert "assertConcurrentRecoveryTransport" in recovery
+    assert "socketPolicies.get(recoverySocketIndex)?.concurrent_history_reads" in recovery
+    assert "newSocketCount: nextSocketIndex - recoverySocketCountBaseline" in recovery
+    assert "closeCount: physicalCloseCount - recoveryCloseCountBaseline" in recovery
+    assert "const terminalTransport = recoveryTransportSample()" in recovery
+    assert "const recoveredTransport = recoveryTransportSample()" in recovery
+    assert "await cleanupPackagedFirstSend" in recovery
+    assert "processesAfterCleanup: electronProcessSnapshot(processIdentity)" in recovery
+    assert "app?.close().catch(() => {})" not in recovery
+    assert "healthyNavigationSocketIds.size" in recovery
     assert "expectedLastMessage" in recovery
     assert "preservedDraft" in recovery
 
 
-def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electron() -> None:
+def test_browser_workbench_gates_require_real_electron_and_foreground_input() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
-    gate = _read("desktop/electron/scripts/test-offline-document-workbench-e2e.mjs")
     native = _read("desktop/electron/scripts/test-native-workbench-v2-electron.mjs")
     ci = _read(".github/workflows/ci.yml")
 
     assert (
-        package_json["scripts"]["test:offline-document-workbench-e2e"]
-        == "npm run build && node scripts/test-offline-document-workbench-e2e.mjs"
+        package_json["scripts"]["test:desktop-browser"]
+        == "npm run build && node scripts/test-desktop-browser.mjs"
+        " && node scripts/test-desktop-browser-electron.mjs"
     )
-    assert "test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable" in gate
-    assert "test-native-workbench-v2-electron.mjs" in gate
-    assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND: '1'" in gate
-    assert "owned-Gateway WebSocket lifecycle" in gate
-    assert "real Electron process" in gate
+    for name, script in (
+        ("native-workbench-v2", "test-native-workbench-v2-electron.mjs"),
+        ("desktop-browser", "test-desktop-browser.mjs"),
+        ("desktop-browser-electron", "test-desktop-browser-electron.mjs"),
+    ):
+        assert script in package_json["scripts"]["test:desktop-workbench"]
+        assert ci.count(f"'{name}:scripts/{script}'") == 3
+    foreground = ci.index('if [[ "${name}" == "native-workbench-v2" ]]; then')
+    invocation = ci.index('"${telemetry[@]}" xvfb-run -a node', foreground)
+    case_setup = ci[foreground:invocation]
+    assert "export OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND=1" in case_setup
+    assert "else\n              unset OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND" in case_setup
     assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND === '1'" in native
     assert "requires an unlocked foreground GUI session" in native
     assert "OPENSQUILLA_WORKBENCH_E2E_MODE || 'stress'" in native
     assert "const annotationGeometryDeltas = fixture.stressMode" in native
     assert "? [96, -24, 24, -32, 32]" in native
-    assert "const annotationRearmCycleCount = fixture.stressMode ? 3 : 1" in native
+    assert "const annotationRearmCycleCount = fixture.stressMode ? 50 : 8" in native
+    assert "rearm: true" in native
+    assert "annotationAtomicHandoffPendingState" in native
+    assert "annotationAtomicFailureRetained" in native
     assert "restoreTrustedAnnotationInputFocus" in native
     assert "state.ownerFocused" in native
     assert "&& state.nativeFocused" in native
@@ -2587,9 +2743,6 @@ def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electro
     assert "ELECTRON_FOREGROUND_PREREQUISITE_MISSING" in native
     assert "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED" in native
     assert "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED" in native
-    assert ci.count(
-        "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
-    ) == 3
 
 
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
@@ -2618,6 +2771,7 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "assertRuntimeSetReady" not in build_gateway
     assert "fetch-bundled-runtimes.mjs" not in build_gateway
     assert "function externalizeControlUiArtifact()" in build_gateway
+    assert "join(repoRoot, 'opensquilla-webui', 'dist')" in build_gateway
     assert "join(runtimeGatewayDir, 'control-ui-dist')" in build_gateway
     assert "cpSync(controlUiDistDir, sharedDistDir" in build_gateway
     assert "exactly one shared Web UI artifact" in build_gateway
@@ -2693,7 +2847,11 @@ def test_desktop_gateway_bundle_collects_usage_ledger_and_verifies_query_ui() ->
 
     assert "'--collect-all',\n  'opensquilla'," in build_script
     assert migration.is_file()
-    assert "const USAGE_QUERY_METHOD = 'usage.query'" in usage_query
+    assert re.search(
+        r"import type \{[^}]*\bObservability\b[^}]*\} from '@/modules/observability'",
+        usage_query,
+    )
+    assert "return observability.usage(range, options)" in usage_query
     assert "controlUiVerifier" in build_script
     assert "spawnSync(process.execPath, [controlUiVerifier, controlUiDistDir]" in build_script
     assert build_script.index("\nassertControlUiArtifactReady()\n") < build_script.index(
@@ -2705,15 +2863,16 @@ def test_windows_release_workflow_fails_fast_after_gateway_build_failure() -> No
     workflow = _read(".github/workflows/wheelhouse-release.yml")
     windows_build = _section(
         workflow,
-        "      - name: Build unsigned Windows installer",
+        "      - name: Build signed Windows installer",
         "      - name: Verify Electron package",
     )
 
-    assert "shell: bash" in windows_build
-    assert "set -euo pipefail" in windows_build
+    assert "shell: pwsh" in windows_build
+    assert "if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed.' }" in windows_build
     assert windows_build.index("npm run build:gateway") < windows_build.index(
         "          npm run build\n"
     )
+    assert "node scripts/build-signed-windows.cjs" in windows_build
 
 
 def test_desktop_native_artifact_open_allows_active_documents_with_file_extensions() -> None:
@@ -2808,7 +2967,7 @@ def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> No
         "function currentMainWindow(): BrowserWindow | null",
     )
 
-    assert "details.frame !== window.webContents.mainFrame" in create_window
+    assert "if (!isLiveMainFrameConsoleMessage(window, details)) return" in create_window
     assert "new RendererConsoleLogLimiter()" in create_window
     assert "app.getPath('home')" in create_window
     assert "webContents.on('render-process-gone'" in create_window
@@ -2863,17 +3022,102 @@ def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
 
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
     drain = _section(main_ts, "async function drainOwnedGatewayForQuit", "app.on('before-quit'")
+    owned_gateway_quit = _section(
+        before_quit,
+        "if (children.length > 0)",
+        "// Fail closed:",
+    )
+    preview_create = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:create'",
+        "ipcMain.handle('desktop:workbench:preview-lease:renew'",
+    )
+    preview_renew = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:renew'",
+        "ipcMain.handle('desktop:workbench:preview-lease:revoke'",
+    )
+    preview_revoke = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:preview-lease:revoke'",
+        "ipcMain.handle('desktop:workbench:surface:create'",
+    )
+    surface_create = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:create'",
+        "ipcMain.handle('desktop:workbench:surface:navigate'",
+    )
+    surface_navigate = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:navigate'",
+        "ipcMain.handle('desktop:workbench:permission:respond'",
+    )
+    surface_destroy = _section(
+        main_ts,
+        "ipcMain.handle('desktop:workbench:surface:destroy'",
+        "// ── Desktop data cleanup",
+    )
     assert "process.platform === 'win32'" not in before_quit
     assert "event.preventDefault()" in before_quit
     assert "requestOwnedGatewayShutdown(" in drain
     assert "waitForGatewayProcessExit(child)" in drain
+    assert (
+        "const gatewayHardTerminatedProcesses = "
+        "new WeakSet<ChildProcessWithoutNullStreams>()"
+    ) in main_ts
+    assert "gatewayHardTerminatedProcesses.add(child)" in _section(
+        main_ts,
+        "function hardTerminateGatewayProcess",
+        "function terminateGatewayProcess",
+    )
+    assert "let hardTerminated = gatewayHardTerminatedProcesses.has(child)" in drain
+    assert (
+        "hardTerminated: hardTerminated || gatewayHardTerminatedProcesses.has(child)"
+        in drain
+    )
+    already_exited = _section(
+        drain,
+        "if (hasGatewayProcessExited(child))",
+        "const accepted = requestShutdown",
+    )
+    assert "desktopLog('quit_gateway_exit'" in already_exited
+    assert "exited: true" in already_exited
+    assert "hardTerminated: gatewayHardTerminatedProcesses.has(child)" in already_exited
+    final_tree_kill = _section(
+        drain,
+        "if (!exited && !hasGatewayProcessExited(child))",
+        "desktopLog('quit_gateway_exit'",
+    )
+    assert final_tree_kill.index("hardTerminated = true") < final_tree_kill.index(
+        "terminateGatewayProcess(child, 'SIGKILL')"
+    )
+    assert final_tree_kill.index(
+        "gatewayHardTerminatedProcesses.add(child)"
+    ) < final_tree_kill.index("terminateGatewayProcess(child, 'SIGKILL')")
     assert "app.exit(0)" in before_quit
     # Repeated quit events join one in-flight drain and cannot launch competing
     # shutdown/kill sequences against the same child.
     assert "let quitGatewayDrainPromise: Promise<boolean> | null = null" in main_ts
     assert "if (quitGatewayDrainPromise)" in before_quit
     assert "const children = liveLifecycleOwnedGatewayProcesses()" in before_quit
-    assert "Promise.all(children.map((child) => drainOwnedGatewayForQuit(" in before_quit
+    assert "Promise.all(children.map((child) => drainOwnedGatewayForQuit(" in owned_gateway_quit
+    assert "const previewCleanup = artifactPreviewLeaseBroker.revokeAll()" in owned_gateway_quit
+    assert "void nativeWorkbenchSurfaces.destroyAll()" in owned_gateway_quit
+    assert owned_gateway_quit.index(
+        "artifactPreviewLeaseBroker.revokeAll()"
+    ) < owned_gateway_quit.index(
+        "nativeWorkbenchSurfaces.destroyAll()"
+    )
+    assert owned_gateway_quit.index("const previewCleanup") < owned_gateway_quit.index(
+        "drainOwnedGatewayForQuit("
+    )
+    exit_admission_guard = "appExitPhase !== 'running'"
+    assert exit_admission_guard in preview_create
+    assert exit_admission_guard in preview_renew
+    assert exit_admission_guard in surface_create
+    assert exit_admission_guard in surface_navigate
+    assert exit_admission_guard not in preview_revoke
+    assert exit_admission_guard not in surface_destroy
     assert "if (exited)" in before_quit
     assert before_quit.index("if (exited)") < before_quit.index("app.exit(0)")
 
@@ -2928,7 +3172,11 @@ def test_desktop_update_and_recovery_join_every_lifecycle_owned_gateway() -> Non
 
     assert "await stopAndJoinAllLifecycleOwnedGateways()" in stop_wait
     assert "liveProcesses: liveLifecycleOwnedGatewayProcesses" in coordinator
-    assert "await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    shared_stop = _section(
+        main_ts, "async function stopOwnedGatewaysForUpdate", "async function applyWindowsInstaller"
+    )
+    assert "await stopAndJoinAllLifecycleOwnedGateways(" in shared_stop
+    assert "await stopOwnedGatewaysForUpdate()" in apply_update
     assert "liveLifecycleOwnedGatewayProcesses().length > 0" in apply_update
     assert apply_update.index("liveLifecycleOwnedGatewayProcesses().length > 0") < (
         apply_update.index("autoUpdater.quitAndInstall(false, true)")
@@ -3063,8 +3311,25 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     )
     assert "firstMain.kill('SIGKILL')" in script
     assert "verifyDesktopGatewayOwnership(firstRecord)" in script
+    assert "'orphan Desktop Gateway ownership verification'" in script
+    assert "electronChildCleanup.remainingMs('verify-orphan-survived')" in script
     assert "await launchDesktop(" in script
-    assert "loaded.record.pid !== firstRecord.pid" in script
+    assert "sameDesktopGatewayOwnershipInstance(loaded.record, firstRecord)" in script
+    assert "verifyDesktopGatewayOwnership(loaded.record)" in script
+    assert "'verified replacement Desktop Gateway ownership record'" in script
+    assert "process.kill(secondRecord.pid, 'SIGKILL')" in script
+    assert "sameDesktopGatewayOwnershipInstance(loaded.record, secondRecord)" in script
+    assert "assert.notEqual(secondRecord.instance_nonce, firstRecord.instance_nonce)" in script
+    assert "assert.notEqual(thirdRecord.instance_nonce, secondRecord.instance_nonce)" in script
+    assert "return !gatewayProcessSnapshot(firstRecord).alive" in script
+    assert "return !gatewayProcessSnapshot(secondRecord).alive" in script
+    assert "function processAlive(pid)" not in script
+    assert "gatewayProcesses: ownedInstances.map" in script
+    assert "assert.equal(thirdRecord.port, secondRecord.port)" in script
+    assert "assert.equal(secondPage.url(), rendererUrlBeforeCrash)" in script
+    assert "'renderer-observed-child-crash'" in script
+    assert "'renderer-reconnected-after-child-restart'" in script
+    assert "verifyDesktopGatewayOwnership(thirdRecord)" in script
     assert "waitForDesktopGatewayOwnershipRelease" in script
     assert "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000" in lifecycle
     assert "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000" in main
@@ -3080,6 +3345,15 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "createPhaseBudget('hard-crash-exit', CRASH_EXIT_BUDGET_MS)" in script
     assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000" in script
     assert "const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000" in script
+    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in script
+    assert "closeElectronWithDeadline" in script
+    assert "desktopShutdownEvidenceSince" in script
+    assert "canAcceptWindowsElectronShutdownFallback" in script
+    assert "ownershipReleased && !gatewayProcessSnapshot(thirdRecord).alive" in script
+    assert "'successful-electron-shutdown'" in script
+    assert "'finally-second-electron-shutdown'" in script
+    assert "'finally-first-electron-shutdown'" in script
+    assert "await secondApp.close()" not in script
     assert (
         "createPhaseBudget(\n"
         "    'windows-electron-child-cleanup',\n"
@@ -3097,10 +3371,82 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "async function waitFor(check, label, timeoutMs = 60_000)" not in script
 
 
+def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_failures() -> None:
+    orphan_flow = _read(
+        "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
+    )
+    profile_flow = _read("desktop/electron/scripts/test-profile-consolidation-flow.mjs")
+    profile_import_flow = _read("desktop/electron/scripts/test-profile-import-flow.mjs")
+    window_flow = _read("desktop/electron/scripts/test-desktop-window-background-flow.mjs")
+    theme_flow = _read("desktop/electron/scripts/test-desktop-theme-flow.mjs")
+    helper = _read("desktop/electron/scripts/e2e-shutdown-helpers.mjs")
+
+    assert "server.closeIdleConnections?.()" in helper
+    assert "server.closeAllConnections?.()" in helper
+    assert "for (const socket of sockets) socket.destroy()" in helper
+    assert "terminateWindowsProcessTree" in helper
+    assert "child.kill('SIGKILL')" in helper
+    assert "forced process exit" in helper
+    assert "desktop_e2e_electron_shutdown_failed" in helper
+    assert "canAcceptWindowsElectronShutdownFallback" in helper
+    assert "desktopShutdownEvidenceSince" in helper
+    assert "record.hardTerminated === false" in helper
+    assert "record.reason === 'all lifecycle-owned Gateways exited'" in helper
+    assert "shutdown?.closeErrorCode === 'DESKTOP_E2E_SHUTDOWN_TIMEOUT'" in helper
+    assert "shutdown?.forcedExitSucceeded === true" in helper
+    assert "shutdown?.processTreeReaped === true" in helper
+    assert "gatewayExitCount > 0 && allGatewayExitsClean" in helper
+    assert "committedExitIndex > lastGatewayExitIndex" in helper
+    for flow in (
+        orphan_flow,
+        profile_flow,
+        profile_import_flow,
+        window_flow,
+        theme_flow,
+    ):
+        assert "readFile(desktopLogPath, 'utf8').catch(() => null)" in flow
+        assert "readFile(desktopLogPath, 'utf8').catch(() => '')" not in flow
+    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in profile_import_flow
+    assert "closeElectronWithDeadline" in profile_import_flow
+    assert "desktopShutdownEvidenceSince" in profile_import_flow
+    assert "canAcceptWindowsElectronShutdownFallback" in profile_import_flow
+    assert "trackHttpServerConnections" in profile_import_flow
+    assert "closeHttpServerWithDeadline" in profile_import_flow
+    assert "await closeActiveApp('profile-import-final-shutdown', { failOnError: false })" in (
+        profile_import_flow
+    )
+    assert "await app.close()" not in profile_import_flow
+    assert "app.close().catch(() => {})" not in profile_import_flow
+    for flow in (window_flow, theme_flow):
+        assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in flow
+        assert "closeElectronWithDeadline" in flow
+        assert "desktopShutdownEvidenceSince" in flow
+        assert "canAcceptWindowsElectronShutdownFallback" in flow
+        assert "flowSucceeded && shutdownError" in flow
+        assert ".close().catch(() => {})" not in flow
+
+
+def test_desktop_shutdown_diagnostics_report_file_cleanup_errors_without_masking_exit() -> None:
+    source = _read("desktop/electron/scripts/test-desktop-window-background-flow.mjs")
+    diagnostics = _section(source, "diagnostics: async () => {", "shutdownError = shutdown.error")
+
+    assert "await handle?.close()" in diagnostics
+    assert "logCloseFailed: true" in diagnostics
+    assert (
+        "closeErrorCode: ['ENOENT', 'EACCES', 'EPERM', 'EBUSY', 'EIO'].includes(error?.code)"
+        in diagnostics
+    )
+    assert "...shutdownDiagnostics," in diagnostics
+    assert "? error.code : 'OTHER'" in diagnostics
+    assert "error.message" not in diagnostics
+    assert "return shutdownDiagnostics" in diagnostics
+    assert "flowSucceeded && shutdownError" in source
+
+
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     # Stable and same-base preview discovery uses a rate-limit-free static OSS
     # manifest. Versioned assets then use a strict OSS/GitHub generic feed with
-    # runtime fallback; unsigned Windows verifies an exact versioned installer
+    # runtime fallback; Windows verifies an exact versioned installer
     # against the release SHA256SUMS (OSS mirror first, canonical GitHub
     # Release as fail-over) before revealing it.
     main_ts = _read("desktop/electron/src/main.ts")
@@ -3155,7 +3501,8 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     )
     assert "autoUpdater.allowDowngrade = false" in resolver_feed
     assert "current?.rc !== null" in resolver_feed
-    assert "const resolved = await resolveDesktopUpdate()" in check
+    assert "let resolved: ResolvedDesktopUpdate | null" in check
+    assert "resolved = await resolveDesktopUpdate()" in check
     assert "await checkNativeDesktopUpdate(resolved)" in check
     assert "result?.isUpdateAvailable !== true" in native_check
     assert "result?.isUpdateAvailable !== true" in native_download
@@ -3166,9 +3513,9 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     assert "manualInstallerActionInProgress = false" in manual_download
     assert "desktopUpdateStatus === 'checking'" in manual_download
     assert "await checkForUpdates(true)" in manual_download
-    assert "desktopUpdateStatus !== 'available'" in manual_download
+    assert "!['available', 'error'].includes(desktopUpdateStatus)" in manual_download
     assert "desktopUpdateErrorMessage('source_unreachable')" in manual_download
-    assert "'install_failed'" in manual_download
+    assert "const verified = await verifyCachedInstaller(" in manual_download
     assert "manualInstall" in check
     assert "updateAssetUrl(resolved.candidate, resolved.source)" in check
     assert "updateAssetUrl(candidate, source, 'SHA256SUMS')" in main_ts
@@ -3187,10 +3534,17 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
         "err.code === 'download_failed' || err.code === 'integrity_failed'"
         in verified_windows_download
     )
-    assert "source: verified.source" in manual_download
-    assert "fallbackUsed: verified.fallbackUsed" in manual_download
-    assert "rememberSuccessfulUpdateSource(verified.source)" in manual_download
-    assert "shell.showItemInFolder(verified.path)" in manual_download
+    assert (
+        "publishVerifiedWindowsInstaller(verified, downloaded.source, downloaded.fallbackUsed)"
+        in manual_download
+    )
+    assert "rememberSuccessfulUpdateSource(downloaded.source)" in manual_download
+    assert "shell.showItemInFolder" not in manual_download
+    assert (
+        manual_download.index("await saveWindowsUpdateCache(")
+        < manual_download.index("const verified = await verifyCachedInstaller(")
+        < manual_download.index("publishVerifiedWindowsInstaller(verified,")
+    )
     assert "shell.openExternal(installerUrl)" not in manual_download
     manual_discovery = _section(
         main_ts,
@@ -3573,7 +3927,7 @@ def test_complete_profile_import_holds_exclusive_writer_admission_through_reconc
     save_credential = _section(
         main_ts,
         "async function saveDesktopCredential",
-        "// Sections the desktop config template owns",
+        "const DESKTOP_OWNED_CONFIG_SECTIONS",
     )
     assert "writerReserved = false" in save_credential
     assert "writerReserved\n    ? () => {}" in save_credential
@@ -3740,7 +4094,7 @@ def test_single_page_onboarding_never_contains_profile_migration() -> None:
 
 def test_onboarding_inline_json_escapes_script_terminators_and_line_separators() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    helper = _section(main_ts, "function inlineScriptJson", "function routerTierTomlLines")
+    helper = _section(main_ts, "function inlineScriptJson", "function ensembleConfigTomlLines")
     html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
 
     assert ".replace(/</g, '\\\\u003c')" in helper
@@ -3754,12 +4108,12 @@ def test_onboarding_inline_json_escapes_script_terminators_and_line_separators()
         "desktopLocale",
         "PROVIDER_CATALOG",
         "SEARCH_PROVIDER_CATALOG",
-        "ROUTER_PROFILES",
         "pendingProviderSetup",
     ):
         assert f"${{inlineScriptJson({value})}}" in html
     assert "${inlineScriptJson(PROVIDER_NOTE_MESSAGES)}" not in html
     assert "${inlineScriptJson(TEXT_ROUTER_TIERS)}" not in html
+    assert "${inlineScriptJson(ROUTER_PROFILES)}" not in html
 
 
 def test_migration_preload_bridge_and_progress_channel() -> None:
@@ -3854,6 +4208,18 @@ def test_consolidation_e2e_waits_for_primary_route_and_emits_renderer_diagnostic
     assert "page.on('pageerror'" in source
     assert "windows=${JSON.stringify(windows)}" in control
     assert "gatewayLogTail: gatewayLog.slice(-8_000)" in source
+    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in source
+    assert "closeElectronWithDeadline" in source
+    assert "desktopShutdownEvidenceSince" in source
+    assert "canAcceptWindowsElectronShutdownFallback" in source
+    assert "closeActiveApp('consolidated-primary-electron-shutdown')" in source
+    assert "closeActiveApp('completed-receipt-electron-shutdown')" in source
+    assert "closeActiveApp('config-only-electron-shutdown')" in source
+    assert "closeActiveApp('credential-only-electron-shutdown')" in source
+    assert "closeActiveApp('invalid-credential-electron-shutdown')" in source
+    assert "closeActiveApp('finally-profile-electron-shutdown'" in source
+    assert "await app.close()" not in source
+    assert "await app?.close()" not in source
 
 
 def test_consolidation_e2e_covers_receipt_replay_and_inactive_state_archival() -> None:

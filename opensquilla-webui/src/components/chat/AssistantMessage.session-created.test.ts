@@ -46,7 +46,11 @@ function timeline(call: ChatToolCall): ChatStreamTimelineItem[] {
   }]
 }
 
-async function mount(message: ChatRenderedMessage, onOpenSession = vi.fn()) {
+async function mount(
+  message: ChatRenderedMessage,
+  onOpenSession = vi.fn(),
+  resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>,
+) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(AssistantMessage, {
@@ -67,6 +71,7 @@ async function mount(message: ChatRenderedMessage, onOpenSession = vi.fn()) {
     toolSecondaryText: () => '',
     copyMessage: async () => true,
     onOpenSession,
+    resolveSessionAvailability,
   })
   apps.push(app)
   app.use(i18n)
@@ -105,7 +110,7 @@ describe('AssistantMessage created session cards', () => {
     }))
 
     expect(el.querySelectorAll('[data-testid="session-created-card"]')).toHaveLength(1)
-    expect(el.textContent).toContain('Chat created')
+    expect(el.textContent).toContain('Chat abc12345')
     expect(el.textContent).not.toContain('session_key')
     expect(el.querySelector('.tool-row')).toBeNull()
 
@@ -128,6 +133,38 @@ describe('AssistantMessage created session cards', () => {
       'agent:main:subagent:abc12345',
       'agent:main:subagent:def67890',
     ])
+    expect(el.textContent).toContain('Chat abc12345')
+    expect(el.textContent).toContain('Chat def67890')
+  })
+
+  it('shows the spawn title and disables a card when the session was deleted', async () => {
+    const call = spawnCall({
+      result: JSON.stringify({
+        session_key: 'agent:main:subagent:abc12345',
+        title: 'Inspect session cleanup',
+      }),
+    })
+    const onOpenSession = vi.fn()
+    const resolveSessionAvailability = vi.fn().mockResolvedValue(false)
+    const { el } = await mount(
+      message({ toolCalls: [call], timelineItems: timeline(call) }),
+      onOpenSession,
+      resolveSessionAvailability,
+    )
+
+    expect(resolveSessionAvailability).not.toHaveBeenCalled()
+    el.querySelector<HTMLButtonElement>('.session-created-card__open')?.click()
+    await vi.waitFor(() => {
+      expect(el.querySelector('[data-testid="session-created-card"]')
+        ?.getAttribute('data-session-state')).toBe('missing')
+    })
+    expect(el.textContent).toContain('Inspect session cleanup')
+    expect(el.textContent).toContain('Deleted')
+    const button = el.querySelector<HTMLButtonElement>('.session-created-card__open')
+    expect(button?.disabled).toBe(true)
+    button?.click()
+    expect(onOpenSession).not.toHaveBeenCalled()
+    expect(resolveSessionAvailability).toHaveBeenCalledTimes(1)
   })
 
   it('keeps malformed and failed results out of the semantic card surface', async () => {
@@ -158,6 +195,6 @@ describe('AssistantMessage created session cards', () => {
       }],
     }))
     const replyText = target.el.textContent || ''
-    expect(replyText.indexOf('Parent final reply')).toBeLessThan(replyText.indexOf('Chat created'))
+    expect(replyText.indexOf('Parent final reply')).toBeLessThan(replyText.indexOf('Chat abc12345'))
   })
 })

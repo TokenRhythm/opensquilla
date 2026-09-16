@@ -29,8 +29,6 @@ from opensquilla.provider import (
     Message,
     ProviderRequestCorrelation,
     TextDeltaEvent,
-    ToolUseEndEvent,
-    ToolUseStartEvent,
 )
 from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
 from opensquilla.provider.protocol import ProviderMetadata
@@ -242,68 +240,6 @@ async def test_flush_runner_rejects_wrong_memory_path() -> None:
     assert result.is_error
     assert "only append to" in result.content
     assert calls == []
-
-
-@pytest.mark.asyncio
-async def test_flush_runner_allows_selected_part_archive_path(tmp_path) -> None:
-    plan = resolve_flush_plan(workspace_dir=tmp_path, archive_max_bytes=5)
-    first_path = tmp_path / plan.relative_path
-    first_path.parent.mkdir(parents=True)
-    first_path.write_text("123456", encoding="utf-8")
-    plan = resolve_flush_plan(workspace_dir=tmp_path, archive_max_bytes=5)
-    assert plan.relative_path.endswith("-part001.md")
-
-    calls: list[ToolCall] = []
-
-    async def handler(call: ToolCall) -> ToolResult:
-        calls.append(call)
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content=f"Saved to {plan.relative_path} (1 chunks indexed; integrity=ok).",
-        )
-
-    class PartPathProvider:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def chat(self, *_args: Any, **_kwargs: Any):
-            self.calls += 1
-            if self.calls == 1:
-                yield ToolUseStartEvent(
-                    tool_use_id="flush-save-1",
-                    tool_name="memory_save",
-                )
-                yield ToolUseEndEvent(
-                    tool_use_id="flush-save-1",
-                    tool_name="memory_save",
-                    arguments={
-                        "path": plan.relative_path,
-                        "content": "durable fact",
-                        "mode": "append",
-                    },
-                )
-            yield DoneEvent()
-
-    service = SessionFlushService(
-        provider_selector=lambda _agent_id: PartPathProvider(),
-        tool_registry=SimpleNamespace(
-            to_tool_definitions=lambda: [SimpleNamespace(name="memory_save")]
-        ),
-        tool_handler=handler,
-    )
-
-    save_results, _done_event = await service._run_llm_flush_sub_agent(
-        PartPathProvider(),
-        agent_id="main",
-        plan=plan,
-        user_prompt="save durable memory",
-        flush_tools=[SimpleNamespace(name="memory_save")],
-        source_name="test",
-    )
-
-    assert [result.path for result in save_results] == [plan.relative_path]
-    assert calls and calls[0].arguments["path"] == plan.relative_path
 
 
 @pytest.mark.asyncio

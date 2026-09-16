@@ -121,6 +121,40 @@ async def test_runtime_install_returns_operation_without_waiting_for_status(
 
 
 @pytest.mark.asyncio
+async def test_runtime_install_rejects_changed_component_identity(monkeypatch, tmp_path) -> None:
+    import opensquilla.runtime_packs as runtime_packs
+    from opensquilla.gateway import rpc_sandbox
+
+    monkeypatch.setattr(runtime_packs, "start_install", lambda *_args: _operation())
+
+    with pytest.raises(RpcHandlerError) as excinfo:
+        await rpc_sandbox._handle_sandbox_runtime_install(
+            {"componentId": "node"},
+            _ctx(tmp_path),
+        )
+
+    assert excinfo.value.code == "RUNTIME_JOB_CONFLICT"
+    assert str(tmp_path) not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_runtime_remove_rejects_changed_component_identity(monkeypatch, tmp_path) -> None:
+    import opensquilla.runtime_packs as runtime_packs
+    from opensquilla.gateway import rpc_sandbox
+
+    monkeypatch.setattr(runtime_packs, "remove_component", lambda *_args: _operation())
+
+    with pytest.raises(RpcHandlerError) as excinfo:
+        await rpc_sandbox._handle_sandbox_runtime_remove(
+            {"componentId": "node"},
+            _ctx(tmp_path),
+        )
+
+    assert excinfo.value.code == "RUNTIME_JOB_CONFLICT"
+    assert str(tmp_path) not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
 async def test_runtime_mutations_require_owner(tmp_path) -> None:
     from opensquilla.gateway import rpc_sandbox
 
@@ -245,6 +279,23 @@ async def test_runtime_cancel_projects_stale_operation_as_conflict(monkeypatch, 
             _ctx(tmp_path),
         )
     assert excinfo.value.code == "RUNTIME_JOB_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancel_rejects_changed_operation_identity(monkeypatch, tmp_path) -> None:
+    import opensquilla.runtime_packs as runtime_packs
+    from opensquilla.gateway import rpc_sandbox
+
+    monkeypatch.setattr(runtime_packs, "cancel_install", lambda *_args: _operation())
+
+    with pytest.raises(RpcHandlerError) as excinfo:
+        await rpc_sandbox._handle_sandbox_runtime_cancel(
+            {"componentId": "python", "operationId": "replaced-operation"},
+            _ctx(tmp_path),
+        )
+
+    assert excinfo.value.code == "RUNTIME_JOB_CONFLICT"
+    assert str(tmp_path) not in str(excinfo.value)
 
 
 @pytest.mark.asyncio

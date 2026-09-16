@@ -38,9 +38,11 @@ def test_interrupted_prepared_journal_retries_to_commit(tmp_path: Path) -> None:
     assert report.ok is True
     assert report.status == "committed"
     assert inspect_sandbox_upgrade(tmp_path).ok is True
+    assert not coordinator.snapshot_path.exists()
+    assert not coordinator.journal_path.exists()
 
 
-def test_invalid_journal_requires_manual_recovery_without_rollback(
+def test_invalid_legacy_journal_is_reported_as_non_blocking_artifact(
     tmp_path: Path,
 ) -> None:
     journal = tmp_path / ".sandbox-upgrade-v2.json"
@@ -48,8 +50,8 @@ def test_invalid_journal_requires_manual_recovery_without_rollback(
 
     report = inspect_sandbox_upgrade(tmp_path)
 
-    assert report.ok is False
-    assert report.status == "manual_recovery_required"
+    assert report.ok is True
+    assert report.status == "legacy_artifacts_present"
     assert journal.exists()
 
 
@@ -69,7 +71,12 @@ def test_concurrent_direct_update_migrations_serialize_on_profile_lock(
             )
         )
 
-    assert all(report.ok and report.status == "committed" for report in reports)
+    assert {report.status for report in reports} <= {
+        "committed",
+        "not_required",
+        "retry_required",
+    }
+    assert any(report.ok for report in reports)
     assert 'run_mode = "safe"' in (tmp_path / "config.toml").read_text(
         encoding="utf-8"
     )

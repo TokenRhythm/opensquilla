@@ -4,6 +4,7 @@ import {
   createSessionTaskAttentionStore,
   SESSION_TASK_ATTENTION_STORAGE_KEY,
 } from './useSessionTaskAttention'
+import type { SessionDirectoryChange } from '@/modules/sessionDirectoryChanges'
 
 class MemoryStorage {
   private values = new Map<string, string>()
@@ -67,6 +68,71 @@ describe('useSessionTaskAttention', () => {
     expect(createSessionTaskAttentionStore(storage).attentionFor('session-a', 'idle'))
       .toBe('completed')
   })
+
+  it('handles the typed directory projection without parsing wire aliases', () => {
+    const store = createSessionTaskAttentionStore(null)
+    const change: SessionDirectoryChange = {
+      key: 'session-a',
+      reason: 'taskTerminal',
+      runStatus: 'idle',
+      lastTask: { id: 'task-a', status: 'succeeded' },
+    }
+
+    store.handleSessionDirectoryChange(change, BACKGROUND_CONTEXT)
+
+    expect(store.attentionFor('session-a', 'idle')).toBe('completed')
+  })
+
+  it('keeps typed current-visible terminal changes read and deduplicates replay', () => {
+    const storage = new MemoryStorage()
+    const store = createSessionTaskAttentionStore(storage)
+    const change: SessionDirectoryChange = {
+      key: 'session-a',
+      reason: 'taskTerminal',
+      lastTask: { id: 'task-a', status: 'succeeded' },
+    }
+
+    store.handleSessionDirectoryChange(change, {
+      currentSessionKey: 'session-a',
+      currentSessionVisible: true,
+    })
+    store.handleSessionDirectoryChange(change, BACKGROUND_CONTEXT)
+
+    expect(store.attentionFor('session-a', 'idle')).toBe('none')
+    const persisted = JSON.parse(
+      storage.getItem(SESSION_TASK_ATTENTION_STORAGE_KEY) || '{}',
+    )
+    expect(persisted.read['session-a']).toBe('task-a')
+  })
+
+  it.each([
+    ['completed', 'completed'],
+    ['failed', 'failed'],
+    ['cancelled', 'none'],
+  ] as const)('maps typed terminal status %s to %s', (status, expected) => {
+    const store = createSessionTaskAttentionStore(null)
+    store.handleSessionDirectoryChange({
+      key: 'session-a',
+      reason: 'taskTerminal',
+      lastTask: { id: `task-${status}`, status },
+    }, BACKGROUND_CONTEXT)
+
+    expect(store.attentionFor('session-a', status)).toBe(expected)
+  })
+
+  it.each(['updated', 'unknown'] as const)(
+    'ignores non-task directory reason %s for task attention',
+    reason => {
+      const store = createSessionTaskAttentionStore(null)
+      store.handleSessionDirectoryChange({
+        key: 'session-a',
+        reason,
+        lastTask: { id: 'task-generic', status: 'succeeded' },
+      }, BACKGROUND_CONTEXT)
+
+      expect(store.attentionFor('session-a', 'idle')).toBe('none')
+    },
+  )
 
   it('marks a static cron reminder unread until its automation session is opened', () => {
     const store = createSessionTaskAttentionStore(null)

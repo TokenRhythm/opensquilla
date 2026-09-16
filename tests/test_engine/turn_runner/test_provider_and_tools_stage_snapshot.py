@@ -138,7 +138,12 @@ def _patch_observability(runner, state):
 
     runner._emit_turn_event = _emit_turn_event.__get__(runner, TurnRunner)
 
-    async def _persist_turn_error(self, session_key, event):  # noqa: ARG001
+    async def _persist_turn_error(  # noqa: ARG001
+        self,
+        session_key,
+        event,
+        **_owner_kwargs,
+    ):
         state.persist_error_calls.append((session_key, event))
 
     runner._persist_turn_error = _persist_turn_error.__get__(runner, TurnRunner)

@@ -1,5 +1,8 @@
 ---
 name: meta-arxiv-daily-digest-deck
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Fetch the day's top arXiv submissions in a chosen category, write a structured per-paper digest, render the digest as a PPTX deck (one slide per paper), and persist the digest to long-term memory. Use for a daily 'arxiv morning briefing' — manual fire or cron-scheduled."
 kind: meta
 meta_priority: 55

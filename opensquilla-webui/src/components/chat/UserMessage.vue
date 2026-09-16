@@ -27,6 +27,14 @@
          above the text bubble, never packed inside it — text gets a filled
          bubble, images render as bordered bare media, files as icon chips. -->
     <div class="msg-user-stack">
+      <span
+        v-if="message.provenanceKind === 'cron'"
+        class="msg-user-cron-source"
+        data-testid="cron-input-source"
+      >
+        <Icon name="cron" :size="12" aria-hidden="true" />
+        {{ t('chat.provenance.scheduledTrigger') }}
+      </span>
       <div
         v-if="message.promptAnnotations?.length"
         class="msg-prompt-annotations"
@@ -78,25 +86,37 @@
       </div>
       <div v-if="message.attachments?.length" class="msg-attachments">
         <template v-for="attachment in message.attachments" :key="attachment.renderKey">
-          <button
+          <span
             v-if="isImageDisplayAttachment(attachment) && (attachment.dataUrl || attachment.data)"
-            type="button"
-            class="msg-thumb-button"
-            :title="attachmentDownloadLabel(attachment)"
-            :aria-label="attachmentDownloadLabel(attachment)"
-            :aria-busy="downloadingAttachments.has(attachment.renderKey)"
-            :disabled="downloadingAttachments.has(attachment.renderKey)"
-            @click.stop="downloadAttachment(attachment)"
+            class="msg-file-resource"
           >
-            <img
-              class="msg-thumb"
-              :src="attachmentImageSrc(attachment)"
-              :alt="attachment.name"
-            />
-            <span v-if="downloadingAttachments.has(attachment.renderKey)" class="msg-thumb-button__busy" aria-hidden="true">
-              <span class="spinner msg-file-chip__spinner" />
+            <button
+              type="button"
+              class="msg-thumb-button"
+              :title="attachmentPrimaryActionLabel(attachment)"
+              :aria-label="attachmentPrimaryActionLabel(attachment)"
+              @click.stop="emit('previewImage', attachment)"
+            >
+              <img
+                class="msg-thumb"
+                :src="attachmentImageSrc(attachment)"
+                :alt="attachment.name"
+              />
+            </button>
+            <span v-if="!shareMode" class="msg-file-resource__actions">
+              <button
+                type="button"
+                :title="attachmentDownloadLabel(attachment)"
+                :aria-label="attachmentDownloadLabel(attachment)"
+                :aria-busy="downloadingAttachments.has(attachment.renderKey)"
+                :disabled="downloadingAttachments.has(attachment.renderKey)"
+                @click.stop="downloadAttachment(attachment)"
+              >
+                <span v-if="downloadingAttachments.has(attachment.renderKey)" class="spinner msg-file-chip__spinner" aria-hidden="true" />
+                <Icon v-else name="download" :size="14" />
+              </button>
             </span>
-          </button>
+          </span>
           <span v-else class="msg-file-resource">
             <button
               type="button"
@@ -111,7 +131,7 @@
               <span class="msg-file-chip__icon" aria-hidden="true">
                 <span v-if="downloadingAttachments.has(attachment.renderKey)" class="spinner msg-file-chip__spinner" />
                 <Icon v-else-if="failedDownloads.has(attachment.renderKey)" name="refresh" :size="16" />
-                <Icon v-else name="fileText" :size="16" />
+                <Icon v-else :name="isImageDisplayAttachment(attachment) ? 'image' : 'fileText'" :size="16" />
               </span>
               <span class="msg-file-chip__body">
                 <span class="msg-file-chip__name">{{ attachment.name }}</span>
@@ -119,11 +139,11 @@
               </span>
             </button>
             <span
-              v-if="workbenchAttachmentResource(attachment) && !shareMode"
+              v-if="(isImageDisplayAttachment(attachment) || workbenchAttachmentResource(attachment)) && !shareMode"
               class="msg-file-resource__actions"
             >
               <button
-                v-if="attachmentCanOpen(attachment)"
+                v-if="isImageDisplayAttachment(attachment) || attachmentCanOpen(attachment)"
                 type="button"
                 :title="attachmentDownloadLabel(attachment)"
                 :aria-label="attachmentDownloadLabel(attachment)"
@@ -244,6 +264,7 @@ const emit = defineEmits<{
   edit: [message: ChatRenderedMessage]
   editAttachment: [attachment: DisplayAttachment]
   previewAttachment: [attachment: DisplayAttachment]
+  previewImage: [attachment: DisplayAttachment]
   toggleShare: [messageId: string]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
 }>()
@@ -397,7 +418,7 @@ function attachmentCanOpen(attachment: DisplayAttachment): boolean {
   const resource = workbenchAttachmentResource(attachment)
   if (!resource) return false
   if (!props.workbenchResourcePreviewEnabled && !props.workbenchResourceEditEnabled) return false
-  return resource.capabilities.preview === true || resource.capabilities.manualEdit === true
+  return resource.capabilities.preview === true || resource.capabilities.edit === true
 }
 
 function attachmentOpenReason(attachment: DisplayAttachment): string {
@@ -411,6 +432,7 @@ function attachmentOpenReason(attachment: DisplayAttachment): string {
 }
 
 function attachmentPrimaryActionLabel(attachment: DisplayAttachment): string {
+  if (isImageDisplayAttachment(attachment)) return t('chat.openTitle', { title: attachment.name })
   if (!attachmentCanOpen(attachment)) return attachmentDownloadLabel(attachment)
   const label = t('workbench.resources.open', { name: attachment.name })
   const reason = attachmentOpenReason(attachment)
@@ -422,6 +444,10 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
 }
 
 function activateAttachment(attachment: DisplayAttachment) {
+  if (isImageDisplayAttachment(attachment)) {
+    emit('previewImage', attachment)
+    return
+  }
   if (attachmentCanOpen(attachment)) {
     emit('previewAttachment', attachment)
     return
@@ -523,6 +549,18 @@ function activateAttachment(attachment: DisplayAttachment) {
   align-items: flex-end;
   gap: 0.375rem;
   min-width: 0;
+}
+
+.msg-user-cron-source {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 1px var(--sp-2);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border));
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-surface));
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
 }
 
 .msg-user-steer-status {
@@ -900,20 +938,6 @@ function activateAttachment(attachment: DisplayAttachment) {
 .msg-thumb-button:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
-}
-
-.msg-thumb-button:disabled {
-  cursor: wait;
-}
-
-.msg-thumb-button__busy {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  border-radius: var(--radius-card);
-  background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
-  color: var(--accent);
 }
 
 .msg-file-chip__icon {

@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "kind": "response",
+  "cases": [
+    {
+      "id": "response.full",
+      "coverage": "full-fork-durable-identity",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-full", "ok": true, "payload": { "key": "agent:main:webchat:child-full", "parentKey": "agent:main:webchat:parent" }, "error": null }
+    },
+    {
+      "id": "response.before",
+      "coverage": "before-message-fork-durable-identity",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-before-camel", "ok": true, "payload": { "key": "agent:main:webchat:child-prefix", "parentKey": "agent:main:webchat:parent" }, "error": null }
+    },
+    {
+      "id": "response.through",
+      "coverage": "through-turn-capability-acknowledgement",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-through-camel", "ok": true, "payload": { "key": "agent:main:webchat:child-through", "parentKey": "agent:main:webchat:parent", "forkMode": "through_turn", "throughTurnId": "turn-terminal" }, "error": null }
+    },
+    {
+      "id": "response.additive",
+      "coverage": "future-additive-result-fields",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-additive", "ok": true, "payload": { "key": "agent:main:webchat:child-additive", "parentKey": "agent:main:webchat:parent", "future": { "accepted": true } }, "error": null }
+    }
+  ]
+}

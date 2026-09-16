@@ -4,6 +4,7 @@ import { createApp, nextTick } from 'vue'
 import i18n from '@/i18n'
 import type { CronJob } from '@/types/cron'
 import CronView from './CronView.vue'
+import { CRON_SCHEDULER_KEY, type CronScheduler } from '@/modules/cronScheduler'
 
 const testState = vi.hoisted(() => ({
   jobs: [] as CronJob[],
@@ -135,6 +136,7 @@ function mountCronView(): HTMLElement {
   const app = createApp(CronView)
   apps.push(app)
   app.use(i18n)
+  app.provide(CRON_SCHEDULER_KEY, {} as CronScheduler)
   app.mount(host)
   return host
 }

@@ -1,11 +1,5 @@
 import type { ChatRenderedMessage } from '@/types/chat'
 
-export interface ForkRpcResponse {
-  key?: string
-  forkMode?: string
-  throughTurnId?: string
-}
-
 export interface ForkTransitionLifetime {
   begin: () => number
   invalidate: (generation?: number) => void
@@ -67,39 +61,6 @@ export function forkNavigationPhase(
   parentKey: string,
 ): 'opening' | 'returning' {
   return targetKey === parentKey ? 'returning' : 'opening'
-}
-
-export function forkRpcRequest(parentKey: string, throughTurnId?: string): {
-  method: 'sessions.fork' | 'sessions.forkThroughTurn'
-  params: { key: string; throughTurnId?: string }
-} {
-  return throughTurnId
-    ? {
-        method: 'sessions.forkThroughTurn',
-        params: { key: parentKey, throughTurnId },
-      }
-    : {
-        method: 'sessions.fork',
-        params: { key: parentKey },
-      }
-}
-
-export function validatedForkChildKey(
-  response: ForkRpcResponse | null | undefined,
-  throughTurnId?: string,
-): string {
-  if (
-    throughTurnId
-    && (
-      response?.forkMode !== 'through_turn'
-      || response.throughTurnId !== throughTurnId
-    )
-  ) {
-    throw new Error('Fork response did not confirm the requested turn boundary')
-  }
-  const childKey = typeof response?.key === 'string' ? response.key : ''
-  if (!childKey) throw new Error('Fork response returned no key')
-  return childKey
 }
 
 /**

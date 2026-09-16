@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import opensquilla.gateway.rpc_chat as rpc_chat_module
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
@@ -13,6 +12,7 @@ from opensquilla.artifact_session import (
     ArtifactKind,
     ArtifactSessionService,
 )
+from opensquilla.gateway.adapters import session_history_projection
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
 from opensquilla.session.manager import SessionManager
@@ -1250,12 +1250,23 @@ async def test_chat_history_mutation_ledger_overrides_task_facts_and_is_scoped(
             initial_artifact=blob(f"base-{turn_id}"),
             actor=actor,
         )
-        attempt = await service.reserve_mutation_attempt(
-            document_id=created.document.document_id,
-            turn_id=turn_id,
-            tool_use_id=f"tool-{turn_id}",
-            base_revision_id=created.revision.revision_id,
-            proposal_sha256=hashlib.sha256(turn_id.encode()).hexdigest(),
+        # Seed a receipt written by a previous installation; no retired
+        # execution API is available to create new document mutations.
+        await storage._conn.execute(
+            """INSERT INTO artifact_mutation_attempts (
+                mutation_attempt_id, document_id, turn_id, tool_use_id,
+                base_revision_id, proposal_sha256, status, state_revision,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', 1, 1, 1)""",
+            (
+                f"attempt-{turn_id}", created.document.document_id, turn_id,
+                f"tool-{turn_id}", created.revision.revision_id,
+                hashlib.sha256(turn_id.encode()).hexdigest(),
+            ),
+        )
+        await storage._conn.commit()
+        attempt = await service.get_mutation_attempt_for_resolution(
+            document_id=created.document.document_id, turn_id=turn_id
         )
         return created, attempt
 
@@ -1281,27 +1292,35 @@ async def test_chat_history_mutation_ledger_overrides_task_facts_and_is_scoped(
             expected_document_state_revision=applied_document.document.state_revision,
             actor=actor,
         )
-        applied_attempt = await service.mark_mutation_attempt_applied(
-            document_id=applied_document.document.document_id,
-            turn_id="turn-ledger-applied",
-            tool_use_id="tool-turn-ledger-applied",
-            change_set_id=applied_change.change_set_id,
-            revision_id=applied_result.revision.revision_id,
+        await storage._conn.execute(
+            """UPDATE artifact_mutation_attempts
+               SET status = 'applied', change_set_id = ?, revision_id = ?
+               WHERE turn_id = ?""",
+            (applied_change.change_set_id, applied_result.revision.revision_id,
+             "turn-ledger-applied"),
+        )
+        await storage._conn.commit()
+        applied_attempt = await service.get_mutation_attempt_for_resolution(
+            document_id=applied_document.document.document_id, turn_id="turn-ledger-applied"
         )
 
         failed_document, _ = await reserve("turn-ledger-failed")
-        failed_attempt = await service.mark_mutation_attempt_failed(
-            document_id=failed_document.document.document_id,
-            turn_id="turn-ledger-failed",
-            tool_use_id="tool-turn-ledger-failed",
-            failure_code="restart_commit_not_applied",
-        )
         ambiguous_document, _ = await reserve("turn-ledger-ambiguous")
-        ambiguous_attempt = await service.mark_mutation_attempt_ambiguous(
-            document_id=ambiguous_document.document.document_id,
-            turn_id="turn-ledger-ambiguous",
-            tool_use_id="tool-turn-ledger-ambiguous",
-            failure_code="restart_commit_outcome_unknown",
+        for turn_id, status, code in (
+            ("turn-ledger-failed", "failed", "restart_commit_not_applied"),
+            ("turn-ledger-ambiguous", "ambiguous", "restart_commit_outcome_unknown"),
+        ):
+            await storage._conn.execute(
+                "UPDATE artifact_mutation_attempts SET status = ?, failure_code = ? "
+                "WHERE turn_id = ?",
+                (status, code, turn_id),
+            )
+        await storage._conn.commit()
+        failed_attempt = await service.get_mutation_attempt_for_resolution(
+            document_id=failed_document.document.document_id, turn_id="turn-ledger-failed"
+        )
+        ambiguous_attempt = await service.get_mutation_attempt_for_resolution(
+            document_id=ambiguous_document.document.document_id, turn_id="turn-ledger-ambiguous"
         )
         _reserved_document, reserved_attempt = await reserve("turn-ledger-reserved")
         await reserve("turn-ledger-foreign", owner_session_key=foreign_session_key)
@@ -1800,7 +1819,11 @@ async def test_chat_history_waits_for_same_connection_compaction_rewrite(
 async def test_chat_history_session_lock_wait_is_bounded_and_retryable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rpc_chat_module, "_CHAT_HISTORY_LOCK_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(
+        session_history_projection,
+        "_CHAT_HISTORY_LOCK_BUDGET_SECONDS",
+        0.05,
+    )
     session_key = "agent:main:webchat:bounded-history-lock"
     mutation_lock = asyncio.Lock()
     await mutation_lock.acquire()
@@ -1854,7 +1877,11 @@ async def test_chat_history_session_lock_wait_is_bounded_and_retryable(
 async def test_chat_history_busy_maps_to_retryable_wire_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rpc_chat_module, "_CHAT_HISTORY_LOCK_BUDGET_SECONDS", 0.01)
+    monkeypatch.setattr(
+        session_history_projection,
+        "_CHAT_HISTORY_LOCK_BUDGET_SECONDS",
+        0.01,
+    )
     session_key = "agent:main:webchat:history-wire-busy"
     mutation_lock = asyncio.Lock()
     await mutation_lock.acquire()

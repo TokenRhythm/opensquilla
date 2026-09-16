@@ -146,7 +146,7 @@
                  secondary ("2 web actions"), so the raw call-count pill would
                  repeat it. -->
             <span v-if="presentation !== 'activity'" class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
-            <span v-if="item.group.secondary && (!item.group.isRunning || groupOpen(item.group))" class="tool-row__arg">{{ item.group.secondary }}</span>
+            <span v-if="groupSecondary(item.group) && (!item.group.isRunning || groupOpen(item.group))" class="tool-row__arg">{{ groupSecondary(item.group) }}</span>
             <Icon
               v-if="presentation === 'activity' && groupHasDetails(item.group)"
               class="step-chevron tool-row__activity-arrow"
@@ -215,8 +215,25 @@
                   <Icon v-if="presentation !== 'activity' && callHasDetails(call)" class="step-chevron" name="chevronRight" :size="14" />
                 </span>
               </button>
+              <div
+                v-if="activityTargetsVisible(call)"
+                class="tool-row-targets"
+              >
+                <template v-for="target in activityTargets(call)" :key="target.kind === 'url' ? target.url : target.text">
+                  <button
+                    v-if="target.kind === 'url'"
+                    type="button"
+                    class="tool-row-target tool-row-target--url"
+                    :title="t('workbench.browser.openSide')"
+                    @click="openActivityTarget(target)"
+                  >
+                    {{ target.text }}
+                  </button>
+                  <span v-else class="tool-row-target tool-row-target--path">{{ target.text }}</span>
+                </template>
+              </div>
               <Transition name="activity-tool-detail" :css="presentation === 'activity'">
-                <div v-if="callOpen(call)" class="tool-row-body">
+                <div v-if="callOpen(call) && callHasDetailBody(call)" class="tool-row-body">
                   <ActivityToolDetails
                     v-if="presentation === 'activity' || isDocumentCall(call)"
                     :call="call"
@@ -283,8 +300,25 @@
                 <Icon v-if="presentation !== 'activity' && callHasDetails(call)" class="step-chevron" name="chevronRight" :size="14" />
               </span>
             </button>
+            <div
+              v-if="activityTargetsVisible(call)"
+              class="tool-row-targets"
+            >
+              <template v-for="target in activityTargets(call)" :key="target.kind === 'url' ? target.url : target.text">
+                <button
+                  v-if="target.kind === 'url'"
+                  type="button"
+                  class="tool-row-target tool-row-target--url"
+                  :title="t('workbench.browser.openSide')"
+                  @click="openActivityTarget(target)"
+                >
+                  {{ target.text }}
+                </button>
+                <span v-else class="tool-row-target tool-row-target--path">{{ target.text }}</span>
+              </template>
+            </div>
             <Transition name="activity-tool-detail" :css="presentation === 'activity'">
-              <div v-if="callOpen(call)" class="tool-row-body">
+              <div v-if="callOpen(call) && callHasDetailBody(call)" class="tool-row-body">
                 <ActivityToolDetails
                   v-if="presentation === 'activity' || isDocumentCall(call)"
                   :call="call"
@@ -469,6 +503,7 @@ function toolResultContext(
     toolName: call.name,
     inputRaw: call.inputRaw || call.inputPreview,
     section,
+    executionLogHandle: section === 'input' ? undefined : call.executionLogHandle,
   }
 }
 
@@ -574,7 +609,7 @@ const ToolRowSections = defineComponent({
                 h('span', { class: 'tool-row-section__compact-snippet' }, compactSnippet(resultContent)),
               ])
             : h('pre', { class: 'tool-row-section__pre' }, call.resultPreview),
-          call.result.length > SECTION_PREVIEW_LIMIT || compact
+          call.result.length > SECTION_PREVIEW_LIMIT || compact || call.executionLogHandle
             ? h('button', {
                 type: 'button',
                 class: 'step-view-btn',
@@ -610,7 +645,6 @@ import type {
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import {
   toolGroupStatusText as defaultToolGroupStatusText,
-  isDocumentAgentToolName,
   toolSecondaryText as defaultToolSecondaryText,
   toolStatusText as defaultToolStatusText,
   toolIconName,
@@ -621,7 +655,13 @@ import { toolState } from '@/utils/chat/toParts'
 import { composeTree, statusVisual, type StatusVisual } from '@/components/run/runTrace'
 import { copyTextWithFallback } from '@/utils/browser'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
-import { hasActivityToolDetail } from '@/utils/chat/activityToolDetails'
+import {
+  hasActivityToolDetail,
+  projectActivityToolTargets,
+  type ActivityToolTarget,
+} from '@/utils/chat/activityToolDetails'
+import { isLegacyDocumentTool } from '@/utils/chat/legacyDocumentTool'
+import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
 
 const { t } = useI18n()
 const { mode: toolDetailDisplayMode } = useToolDetailPreference()
@@ -785,63 +825,6 @@ function decorateCodeBlocks() {
 // Chat passes `items` (proven group data); non-chat surfaces pass flat steps,
 // which compose into the same tool-group timeline shape so the markup never
 // branches on input source.
-function withoutFailedActivityRows(
-  items: ChatStreamTimelineItem[],
-): ChatStreamTimelineItem[] {
-  if (props.presentation !== 'activity') return items
-
-  return items.flatMap((item): ChatStreamTimelineItem[] => {
-    if (item.type !== 'tool-group') return [item]
-    const documentAgentGroup = item.group.operationKey.startsWith('document.')
-      || isDocumentAgentToolName(item.group.operationKey)
-
-    const failedCalls = item.group.calls.filter(
-      call => call.isError || call.status === 'error',
-    )
-    // Restored histories can retain only the group-level failure marker. In
-    // that case none of the calls is safe to present as completed activity.
-    if (
-      (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-      && !documentAgentGroup
-    ) {
-      return []
-    }
-
-    const groupLevelWriterError = documentAgentGroup
-      && (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-    const calls = item.group.calls.filter(
-      call => (
-        (!call.isError && call.status !== 'error')
-        || isDocumentAgentToolName(call.name)
-      ),
-    ).map(call => groupLevelWriterError
-      ? { ...call, isError: true, status: 'error' as const }
-      : call)
-    if (calls.length === 0) return []
-
-    const isRunning = calls.some(call => call.isRunning)
-    const isError = calls.some(call => call.isError || call.status === 'error')
-      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
-    return [{
-      ...item,
-      group: {
-        ...item.group,
-        calls,
-        isRunning,
-        isError,
-        status: isError
-          ? 'error'
-          : isRunning
-          ? ''
-          : calls.every(call => call.status === 'success')
-            ? 'success'
-            : '',
-      },
-    }]
-  })
-}
 
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
   const items = props.items ?? composeTree(props.steps ?? []).map((node): ChatStreamTimelineItem => {
@@ -865,7 +848,26 @@ const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
     }
     return { type: 'tool-group', key: node.step.id, group }
   })
-  return withoutFailedActivityRows(items)
+  return items.map((item): ChatStreamTimelineItem => {
+    if (item.type !== 'tool-group') return item
+    const group = item.group
+    const singleCall = group.calls.length === 1 ? group.calls[0] : undefined
+    const restoredFailure = singleCall && !group.isRunning && !singleCall.isRunning
+      && (group.isError || group.status === 'error')
+      && !singleCall.isError && singleCall.status !== 'error'
+    const hasLegacyDetails = group.calls.some(isDocumentCall)
+    if (!restoredFailure && !hasLegacyDetails) return item
+    return {
+      ...item,
+      group: {
+        ...group,
+        secondary: hasLegacyDetails ? '' : group.secondary,
+        calls: restoredFailure
+          ? [{ ...singleCall, isError: true, status: 'error' }]
+          : group.calls,
+      },
+    }
+  })
 })
 
 function stepToRenderItem(step: NodeStep): ChatToolCallRenderItem {
@@ -1082,8 +1084,7 @@ function operationKey(call: ChatToolCallRenderItem): string {
 }
 
 function isDocumentCall(call: ChatToolCallRenderItem): boolean {
-  const key = operationKey(call)
-  return key === 'document.read' || key === 'document.update'
+  return isLegacyDocumentTool(call.name)
 }
 
 function callDefaultOpen(call: ChatToolCallRenderItem): boolean {
@@ -1197,7 +1198,7 @@ function activityGroupIconClass(group: ChatToolCallGroup) {
   }
 }
 
-function callHasDetails(call: ChatToolCallRenderItem): boolean {
+function callHasDetailBody(call: ChatToolCallRenderItem): boolean {
   if (props.presentation === 'activity' || isDocumentCall(call)) {
     return hasActivityToolDetail(call, operationKey(call))
   }
@@ -1209,8 +1210,52 @@ function callHasDetails(call: ChatToolCallRenderItem): boolean {
   )
 }
 
+function hasCollapsibleActivityTargets(call: ChatToolCallRenderItem): boolean {
+  const key = operationKey(call)
+  return props.presentation === 'activity'
+    && (
+      call.presentation?.category === 'search'
+      || key === 'web.search'
+      || key === 'web.discover'
+    )
+    && activityTargets(call).length > 0
+}
+
+function callHasDetails(call: ChatToolCallRenderItem): boolean {
+  return callHasDetailBody(call) || hasCollapsibleActivityTargets(call)
+}
+
 function groupHasDetails(group: ChatToolCallGroup): boolean {
-  return group.calls.some(callHasDetails)
+  if (group.calls.some(callHasDetails)) return true
+  return props.presentation === 'activity'
+    && group.calls.length > 1
+    && group.calls.some(call => activityTargets(call).length > 0)
+}
+
+function activityTargets(call: ChatToolCallRenderItem): ActivityToolTarget[] {
+  if (props.presentation !== 'activity') return []
+  return projectActivityToolTargets(call, operationKey(call))
+}
+
+function activityTargetsVisible(call: ChatToolCallRenderItem): boolean {
+  const targets = activityTargets(call)
+  if (!targets.length) return false
+  return !hasCollapsibleActivityTargets(call) || callOpen(call)
+}
+
+function openActivityTarget(target: Extract<ActivityToolTarget, { kind: 'url' }>) {
+  requestBrowserWorkbenchOpen(target.url)
+}
+
+function isResourceActivityCall(call: ChatToolCallRenderItem): boolean {
+  if (props.presentation !== 'activity') return false
+  const category = call.presentation?.category
+  return category === 'search' || category === 'file_read' || category === 'network_read'
+}
+
+function groupSecondary(group: ChatToolCallGroup): string {
+  if (props.presentation === 'activity' && group.calls.some(isResourceActivityCall)) return ''
+  return group.secondary
 }
 
 function showGroupStatus(group: ChatToolCallGroup): boolean {
@@ -1223,6 +1268,7 @@ function singleCallSecondary(
   group: ChatToolCallGroup,
   call: ChatToolCallRenderItem,
 ): string {
+  if (isResourceActivityCall(call)) return ''
   return props.presentation === 'activity'
     ? group.secondary
     : resolvedSecondaryText(call)
@@ -1230,7 +1276,11 @@ function singleCallSecondary(
 
 function resultCountText(call: ChatToolCallRenderItem): string {
   if (call.isRunning || call.isError) return ''
-  const count = toolResultCount(call.result, call.name)
+  const targetCount = props.presentation === 'activity'
+    && operationKey(call) === 'web.search'
+    ? activityTargets(call).filter(target => target.kind === 'url').length
+    : 0
+  const count = targetCount || toolResultCount(call.result, call.name)
   return count === null ? '' : t('shared.runTrace.resultsCount', { count })
 }
 
@@ -1252,6 +1302,7 @@ function resolvedGroupStatusText(group: ChatToolCallGroup): string {
 }
 
 function resolvedSecondaryText(call: ChatToolCallRenderItem): string {
+  if (isResourceActivityCall(call) || isDocumentCall(call)) return ''
   return (props.toolSecondaryText ?? defaultToolSecondaryText)(call)
 }
 
@@ -1268,8 +1319,7 @@ function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
 }
 
 function forwardShowResult(content: string, title: string, context?: ToolResultContext) {
-  const key = toolOperationKey(context?.toolName || '')
-  if (key === 'document.read' || key === 'document.update') return
+  if (isLegacyDocumentTool(context?.toolName)) return
   emit('showResult', content, title, context)
 }
 
@@ -1616,6 +1666,47 @@ function fmtTok(n?: number | null): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.tool-row-targets {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.125rem;
+  min-width: 0;
+  margin: 0.0625rem 0 0.25rem 1.625rem;
+}
+
+.tool-row-target {
+  display: block;
+  max-width: min(100%, 42rem);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.tool-row-target--url {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  text-align: left;
+}
+
+.tool-row-target--url:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.125rem;
+}
+
+.tool-row-target--url:focus-visible {
+  outline: none;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--focus-ring);
 }
 
 .tool-row__trailing {

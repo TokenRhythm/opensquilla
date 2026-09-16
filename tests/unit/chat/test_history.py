@@ -249,6 +249,69 @@ def test_transcript_entries_to_chat_messages_sanitizes_tool_call_preflight_paylo
     assert "Confirmed request fields" not in trigger
 
 
+def test_transcript_entries_to_chat_messages_projects_public_tool_arguments() -> None:
+    presentation = {
+        "category": "network_read",
+        "primaryArguments": ["url"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+    raw_tool_calls = [
+        {
+            "type": "tool_use",
+            "tool_use_id": "fetch-1",
+            "name": "http_request",
+            "input": {
+                "url": "https://example.test/report",
+                "headers": {"Authorization": "secret"},
+                "body": "private request body",
+            },
+            "tool_presentation": presentation,
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "fetch-1",
+            "name": "http_request",
+            "arguments": {
+                "url": "https://example.test/report",
+                "headers": {"Authorization": "secret"},
+            },
+            "result": "ok",
+            "tool_presentation": presentation,
+        },
+    ]
+    entry = _assistant_entry(tool_calls=raw_tool_calls)
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["tool_calls"][0]["input"] == {
+        "url": "https://example.test/report"
+    }
+    assert messages[0]["tool_calls"][1]["arguments"] == {
+        "url": "https://example.test/report"
+    }
+    assert entry.tool_calls == raw_tool_calls
+
+
+def test_transcript_entries_to_chat_messages_classifies_legacy_tool_arguments() -> None:
+    entry = _assistant_entry(
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "tool_use_id": "read-legacy",
+                "name": "read_file",
+                "input": {"path": "src/app.py", "offset": 500, "limit": 1000},
+            }
+        ]
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    tool_use = messages[0]["tool_calls"][0]
+    assert tool_use["input"] == {"path": "src/app.py"}
+    assert "tool_presentation" not in tool_use
+
+
 def test_transcript_entries_to_chat_messages_keeps_plain_confirmed_fields_text() -> None:
     entry = SimpleNamespace(
         id=46,

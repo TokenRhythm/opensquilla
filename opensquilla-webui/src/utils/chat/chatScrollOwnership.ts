@@ -59,10 +59,6 @@ export interface ResolveChatWheelOwnershipOptions {
   respectOverscrollBehavior?: boolean
 }
 
-export interface ScrollableAncestorOptions {
-  epsilonPx?: number
-}
-
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
@@ -131,18 +127,6 @@ function directionForNormalizedDelta(
   if (Math.abs(delta.deltaY) <= epsilonPx) return null
   if (isPredominantlyHorizontal(delta, Boolean(event.shiftKey), epsilonPx)) return null
   return delta.deltaY < 0 ? 'up' : 'down'
-}
-
-/**
- * Whether a wheel event is eligible for vertical chat ownership.  This is a
- * named predicate for callers that only need filtering and not an owner.
- */
-export function isChatVerticalWheel(
-  event: ChatWheelEventLike,
-  pageHeight = 0,
-  epsilonPx = CHAT_WHEEL_EPSILON_PX,
-): boolean {
-  return getChatWheelDirection(event, pageHeight, epsilonPx) !== null
 }
 
 function isHTMLElement(value: EventTarget | null | undefined): value is HTMLElement {
@@ -227,27 +211,6 @@ function canScrollInDirection(
 function isOverscrollBlocking(element: HTMLElement): boolean {
   const value = overscrollBehaviorYFor(element).trim().toLowerCase()
   return value === 'contain' || value === 'none'
-}
-
-/**
- * Find the nearest ancestor with a real vertical scroll range.  `boundary`,
- * when supplied, is inclusive and prevents accidentally selecting the page
- * when a chat sub-surface is being handed off.
- */
-export function findNearestScrollableAncestor(
-  target: EventTarget | null,
-  boundary: HTMLElement | null = null,
-  options: ScrollableAncestorOptions = {},
-): HTMLElement | null {
-  const epsilonPx = options.epsilonPx ?? CHAT_WHEEL_EPSILON_PX
-  const path = ancestorPath(target)
-  if (boundary && !path.includes(boundary)) return null
-  for (const value of path) {
-    const current = value as HTMLElement
-    if (hasVerticalOverflow(current, epsilonPx)) return current
-    if (current === boundary) break
-  }
-  return null
 }
 
 function pathForEvent(event: ChatWheelEventLike): EventTarget[] {

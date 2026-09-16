@@ -17,11 +17,3 @@ class ArtifactConflictError(ArtifactSessionError):
 
 class ArtifactValidationError(ArtifactSessionError, ValueError):
     """Raised when an ArtifactSession command is structurally invalid."""
-
-
-class WriterLeaseConflictError(ArtifactConflictError):
-    """Raised when another writer owns the live document lease."""
-
-
-class WriterLeaseExpiredError(ArtifactConflictError):
-    """Raised when a write presents a stale or expired fencing token."""

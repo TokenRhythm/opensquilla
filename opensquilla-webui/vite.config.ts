@@ -54,7 +54,10 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: resolve(__dirname, '../src/opensquilla/gateway/static/dist'),
+    // Keep the generated artifact owned by the WebUI package.  Packaging and
+    // desktop jobs explicitly stage this verified directory into the Python
+    // package; Vite itself must not write into the backend source tree.
+    outDir: resolve(__dirname, 'dist'),
     emptyOutDir: true,
     sourcemap: true,
     rollupOptions: {

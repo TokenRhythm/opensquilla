@@ -71,7 +71,7 @@ def test_plan_visibility_is_fail_closed_but_default_visibility_is_unchanged() ->
             name="plugin.write",
             description="plugin",
             parameters={},
-            exposed_by_default=False,
+            default_access="deny",
         ),
         _ok,
     )

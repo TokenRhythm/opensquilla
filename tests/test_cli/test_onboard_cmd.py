@@ -1772,7 +1772,7 @@ def test_configure_provider_fails_closed_for_unclassified_foreign_router(tmp_pat
     )
 
     assert result.exit_code == 2
-    assert "custom Router tiers reference provider(s)" in result.output
+    assert "Router tiers reference provider(s)" in result.output
     data = tomllib.loads(target.read_text())
     # A legacy config has no explicit ownership binding, so a headless client
     # cannot assume consent to replace the ladder. The failed switch is atomic.

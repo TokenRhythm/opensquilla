@@ -36,6 +36,7 @@ from urllib.parse import quote
 import structlog
 
 from opensquilla import __version__
+from opensquilla.observability.log_privacy import scrub_log_artifact
 from opensquilla.observability.redact import scrub_text
 from opensquilla.observability.turn_call_log import LOG_DIR_ENV
 from opensquilla.paths import default_opensquilla_home
@@ -70,6 +71,10 @@ def _write_text(archive: zipfile.ZipFile, entry_name: str, text: str) -> None:
     """Scrub and write one text artifact; refuse hard-excluded names."""
     if _is_excluded(entry_name):
         raise ValueError(f"refusing to bundle excluded artifact: {entry_name}")
+    if entry_name.startswith(("logs/", "desktop/", "decisions/", "traces/")) or (
+        entry_name == "errors.jsonl"
+    ):
+        text = scrub_log_artifact(text)
     archive.writestr(entry_name, scrub_text(text))
 
 

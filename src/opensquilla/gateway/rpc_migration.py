@@ -22,6 +22,10 @@ from typing import Any
 
 import structlog
 
+from opensquilla.gateway.adapters.migration_operations_contract import (
+    register_migration_operations_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 
 log = structlog.get_logger(__name__)
@@ -412,7 +416,6 @@ def _preview_payload(
     }
 
 
-@_d.method("migration.sources.list", scope="operator.admin")
 async def _handle_migration_sources_list(
     params: Any,
     ctx: RpcContext,
@@ -457,7 +460,6 @@ async def _handle_migration_sources_list(
     return _list_payload(candidates)
 
 
-@_d.method("migration.sources.preview", scope="operator.admin")
 async def _handle_migration_sources_preview(
     params: Any,
     ctx: RpcContext,
@@ -501,6 +503,23 @@ async def _handle_migration_sources_preview(
         blockers=payload["blockers"],
     )
     return payload
+
+
+_MIGRATION_OPERATIONS_CONTRACT_IMPLEMENTATIONS = {
+    "migration.sources.list": _handle_migration_sources_list,
+    "migration.sources.preview": _handle_migration_sources_preview,
+}
+
+_MIGRATION_OPERATIONS_CONTRACT_HANDLERS = {
+    method: register_migration_operations_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _MIGRATION_OPERATIONS_CONTRACT_IMPLEMENTATIONS.items()
+}
 
 
 __all__ = [

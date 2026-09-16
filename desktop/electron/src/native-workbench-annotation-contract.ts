@@ -14,7 +14,6 @@ export const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH = 304
 export const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT = 160
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
-const SHA256_PATTERN = /^[a-f0-9]{64}$/
 
 export interface NativeWorkbenchAnnotationCapabilities {
   version: NativeWorkbenchAnnotationProtocolVersion
@@ -22,6 +21,7 @@ export interface NativeWorkbenchAnnotationCapabilities {
   picker: boolean
   trustedOverlay: boolean
   overlayCopyVersion?: 1
+  atomicCloseRearm?: true
   reason?: string
 }
 
@@ -56,6 +56,7 @@ export interface NativeWorkbenchAnnotationOverlayCloseRequest {
   version: NativeWorkbenchAnnotationProtocolVersion
   surfaceId: string
   annotationId?: string
+  rearm?: true
 }
 
 export interface NativeWorkbenchAnnotationRect {
@@ -65,22 +66,19 @@ export interface NativeWorkbenchAnnotationRect {
   height: number
 }
 
-/**
- * A bounded, untrusted candidate emitted to the trusted Control UI. The
- * Gateway must still match it against the canonical revision before creating
- * an editable source anchor.
- */
+/** Bounded page context for annotation messages; it grants no source-edit authority. */
 export interface NativeWorkbenchAnnotationSelection {
   selectionId: string
   tagName: string
   elementPath: string
-  domSha256?: string
-  elementProofSha256: string
+  targetRef: string
+  locatorHint: string
+  selectionText: string
   rect: NativeWorkbenchAnnotationRect
 }
 
 export interface NativeWorkbenchAnnotationSelectionCandidate
-  extends Omit<NativeWorkbenchAnnotationSelection, 'selectionId'> {
+  extends Omit<NativeWorkbenchAnnotationSelection, 'selectionId' | 'targetRef'> {
   viewportWidth: number
   viewportHeight: number
 }
@@ -241,9 +239,12 @@ export function parseNativeWorkbenchAnnotationOverlayCloseRequest(
 ): NativeWorkbenchAnnotationOverlayCloseRequest {
   const request = parseExactRequest(
     value,
-    ['version', 'surfaceId', 'annotationId'],
+    ['version', 'surfaceId', 'annotationId', 'rearm'],
     'overlay close',
   )
+  if (request.rearm !== undefined && request.rearm !== true) {
+    throw new Error('The native Workbench annotation overlay close request is invalid.')
+  }
   return {
     version: request.version as NativeWorkbenchAnnotationProtocolVersion,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
@@ -255,6 +256,7 @@ export function parseNativeWorkbenchAnnotationOverlayCloseRequest(
             'annotation',
           ),
         }),
+    ...(request.rearm === true ? { rearm: true as const } : {}),
   }
 }
 
@@ -303,8 +305,8 @@ export function parseNativeWorkbenchAnnotationSelection(
       'ok',
       'tagName',
       'elementPath',
-      'domSha256',
-      'elementProofSha256',
+      'locatorHint',
+      'selectionText',
       'rect',
       'viewportWidth',
       'viewportHeight',
@@ -315,12 +317,10 @@ export function parseNativeWorkbenchAnnotationSelection(
     || typeof selection.elementPath !== 'string'
     || selection.elementPath.length === 0
     || selection.elementPath.length > NATIVE_WORKBENCH_ANNOTATION_ELEMENT_PATH_MAX_LENGTH
-    || (selection.domSha256 !== undefined && (
-      typeof selection.domSha256 !== 'string'
-      || !SHA256_PATTERN.test(selection.domSha256)
-    ))
-    || typeof selection.elementProofSha256 !== 'string'
-    || !SHA256_PATTERN.test(selection.elementProofSha256)
+    || typeof selection.locatorHint !== 'string'
+    || selection.locatorHint.length > 4096
+    || typeof selection.selectionText !== 'string'
+    || selection.selectionText.length > 4096
     || !finiteRect
     || !Number.isFinite(selection.viewportWidth)
     || !Number.isFinite(selection.viewportHeight)
@@ -334,8 +334,8 @@ export function parseNativeWorkbenchAnnotationSelection(
   return {
     tagName: selection.tagName,
     elementPath: selection.elementPath,
-    ...(selection.domSha256 === undefined ? {} : { domSha256: selection.domSha256 }),
-    elementProofSha256: selection.elementProofSha256,
+    locatorHint: selection.locatorHint,
+    selectionText: selection.selectionText,
     rect: {
       x: rect.x as number,
       y: rect.y as number,

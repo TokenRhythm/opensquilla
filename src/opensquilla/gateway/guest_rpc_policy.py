@@ -6,6 +6,15 @@ import re
 import secrets
 from typing import Any
 
+from opensquilla.contracts.generated.v4.sessions_delete_metadata import (
+    SESSIONS_DELETE_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_rename_metadata import (
+    SESSIONS_RENAME_METHOD,
+)
 from opensquilla.session.keys import canonicalize_session_key, parse_agent_id
 
 _OWNER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -19,13 +28,16 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "chat.clarify_submit",
         "artifacts.list",
         "artifacts.get",
-        "sessions.list",
-        "sessions.rename",
-        "sessions.delete",
+        SESSIONS_LIST_METHOD,
+        SESSIONS_RENAME_METHOD,
+        SESSIONS_DELETE_METHOD,
         "sessions.bootstrap",
+        "sessions.executionLog.read",
         "sessions.messages.subscribe",
         "sessions.messages.hydrate",
         "sessions.messages.snapshot",
+        "sessions.messages.snapshot.read",
+        "transport.flow.update",
         "sessions.messages.unsubscribe",
         "sessions.pending_inputs.enqueue",
         "sessions.pending_inputs.list",
@@ -43,10 +55,12 @@ _SESSION_KEY_FIELDS = {
     "chat.abort": ("sessionKey", "key"),
     "chat.clarify_submit": ("sessionKey", "key"),
     "sessions.bootstrap": ("key", "sessionKey"),
-    "sessions.rename": ("key", "sessionKey"),
+    "sessions.executionLog.read": ("sessionKey",),
+    SESSIONS_RENAME_METHOD: ("key", "sessionKey"),
     "sessions.messages.subscribe": ("key", "sessionKey"),
     "sessions.messages.hydrate": ("key", "sessionKey"),
     "sessions.messages.snapshot": ("key", "sessionKey"),
+    "sessions.messages.snapshot.read": ("key",),
     "sessions.messages.unsubscribe": ("key", "sessionKey"),
     "sessions.pending_inputs.enqueue": ("key", "sessionKey"),
     "sessions.pending_inputs.list": ("key", "sessionKey"),
@@ -59,6 +73,15 @@ _SESSION_KEY_FIELDS = {
 
 class GuestRpcPolicyError(PermissionError):
     """Raised when an anonymous guest crosses the RPC ownership boundary."""
+
+
+def is_guest_rpc_method_allowed(method: str) -> bool:
+    """Return the legacy allowlist decision used for Contract drift checks.
+
+    Ownership and sanitization stay in ``GuestRpcPolicy`` until contracted.
+    """
+
+    return method in GUEST_RPC_ALLOWLIST
 
 
 def _guest_namespace_parts(session_key: object) -> tuple[str, str] | None:
@@ -134,7 +157,7 @@ class GuestRpcPolicy:
 
         if not cls.is_guest(ctx):
             return params
-        if method not in GUEST_RPC_ALLOWLIST:
+        if not is_guest_rpc_method_allowed(method):
             raise GuestRpcPolicyError("Anonymous guest RPC method is not allowed")
 
         owner_id = getattr(ctx.principal, "guest_owner_id", None)
@@ -151,7 +174,13 @@ class GuestRpcPolicy:
             params.pop("initialRoutingMode", None)
             params.pop("initial_routing_mode", None)
 
-        if method == "sessions.list":
+        if method == SESSIONS_LIST_METHOD:
+            return params
+
+        if method == "transport.flow.update":
+            # The handler operates on ctx.conn_id only and checks every key
+            # against that connection's existing subscriptions. No authority
+            # or subscription can be acquired through consumption feedback.
             return params
 
         if method == "chat.send":
@@ -172,7 +201,7 @@ class GuestRpcPolicy:
             normalized["_source"] = normalized_source
             return normalized
 
-        if method == "sessions.delete":
+        if method == SESSIONS_DELETE_METHOD:
             if not isinstance(params, dict):
                 raise GuestRpcPolicyError("Guest session key is required")
             raw_keys = params.get("keys")
@@ -210,4 +239,5 @@ __all__ = [
     "GuestRpcPolicyError",
     "guest_owned_session_key",
     "guest_owns_session_key",
+    "is_guest_rpc_method_allowed",
 ]

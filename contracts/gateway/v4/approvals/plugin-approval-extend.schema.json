@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/approvals/plugin-approval-extend.schema.json",
+  "title": "OpenSquilla plugin.approval.extend Contract",
+  "description": "Language-neutral Contract for the existing plugin.approval.extend Gateway v4 wire behavior.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/PluginApprovalExtendRequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/PluginApprovalExtendResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.75.1",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "15.0.4"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.17.1",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "plugin.approval.extend",
+    "kind": "command",
+    "scope": "operator.approvals",
+    "guestAllowed": false,
+    "lifecycle": "legacy",
+    "canonicalAlias": "exec.approval.extend",
+    "idempotency": "non-idempotent",
+    "timeout": {
+      "policy": "caller"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "plugin.approval.extend"
+    },
+    "request": "#/$defs/PluginApprovalExtendRequestFrame",
+    "params": "#/$defs/PluginApprovalExtendParams",
+    "response": "#/$defs/PluginApprovalExtendResponseFrame",
+    "result": "#/$defs/PluginApprovalExtendResult",
+    "errors": [
+      {
+        "code": "INVALID_PARAMS"
+      },
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "NOT_FOUND"
+      },
+      {
+        "code": "STORAGE_BUSY",
+        "retryable": true,
+        "retryAfterMs": true,
+        "details": true
+      },
+      {
+        "code": "UNAVAILABLE",
+        "retryable": true
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "PluginApprovalExtendParams": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "PluginApprovalExtendResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "mode",
+        "approved",
+        "resolved",
+        "resolution",
+        "deadline",
+        "consumed",
+        "pending"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "prompt",
+            "auto-approve",
+            "auto-deny"
+          ]
+        },
+        "approved": {
+          "type": "boolean"
+        },
+        "resolved": {
+          "type": "boolean"
+        },
+        "resolution": {
+          "type": "string"
+        },
+        "deadline": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "consumed": {
+          "type": "boolean"
+        },
+        "pending": {
+          "type": "boolean"
+        },
+        "resolutionInProgress": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "PluginApprovalExtendLegacyNonObjectParams": {
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {}
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "PluginApprovalExtendRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "plugin.approval.extend"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginApprovalExtendParams"
+            },
+            {
+              "$ref": "#/$defs/PluginApprovalExtendLegacyNonObjectParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "accepted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "PluginApprovalExtendOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/PluginApprovalExtendResult"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "PluginApprovalExtendErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "PluginApprovalExtendResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PluginApprovalExtendOkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/PluginApprovalExtendErrorResponseFrame"
+        }
+      ]
+    }
+  }
+}

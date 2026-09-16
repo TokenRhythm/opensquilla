@@ -1,7 +1,25 @@
 import { describe, expect, it } from 'vitest'
-import { useChatTaskOwnership } from './useChatTaskOwnership'
+import { chatTaskId, useChatTaskOwnership } from './useChatTaskOwnership'
+import type { ChatRunTask } from '@/types/chat'
 
 describe('useChatTaskOwnership', () => {
+  it.each<{ task: ChatRunTask | null | undefined; expected: string }>([
+    { task: undefined, expected: '' },
+    { task: null, expected: '' },
+    { task: {}, expected: '' },
+    { task: { task_id: 'task-A' }, expected: 'task-A' },
+    { task: { taskId: 'task-A' }, expected: 'task-A' },
+    { task: { task_id: '', turn_id: 'task-A' }, expected: 'task-A' },
+    { task: { turnId: 'task-A' }, expected: 'task-A' },
+    { task: { task_id: ' task-A ', taskId: 'task-B' }, expected: 'task-A' },
+    { task: { task_id: ' ', taskId: 'task-B' }, expected: '' },
+    { task: { ownershipTaskId: undefined, taskId: 'task-A' }, expected: 'task-A' },
+    { task: { ownershipTaskId: '', task_id: 'task-B' }, expected: '' },
+    { task: { ownershipTaskId: 'task-A', task_id: 'task-B' }, expected: 'task-A' },
+  ])('preserves projected ownership authority and unprojected task fallback: %j', ({ task, expected }) => {
+    expect(chatTaskId(task)).toBe(expected)
+  })
+
   it('keeps Stop bound to A when B starts before A publishes its cancelled terminal', () => {
     const ownership = useChatTaskOwnership()
 
@@ -131,5 +149,20 @@ describe('useChatTaskOwnership', () => {
     expect(accepted.claimRender).toBe(false)
     expect(ownership.runningTaskId.value).toBe('task-A')
     expect([...ownership.queuedTaskIds.value]).toEqual(['task-B'])
+  })
+
+  it('does not restore a task that terminal history already settled', () => {
+    const ownership = useChatTaskOwnership()
+    ownership.noteTerminal('task-settled')
+
+    ownership.applySnapshot({
+      run_status: 'running',
+      active_task: { task_id: 'task-settled', status: 'running' },
+      tasks: [{ task_id: 'task-settled', status: 'running' }],
+    } as never, true)
+
+    expect(ownership.isSettled('task-settled')).toBe(true)
+    expect(ownership.runningTaskId.value).toBe('')
+    expect(ownership.hasAuthoritativeWork.value).toBe(false)
   })
 })

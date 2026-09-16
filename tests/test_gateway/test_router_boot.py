@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from dataclasses import fields
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -30,7 +31,6 @@ from opensquilla.gateway.boot import (
     build_services,
     build_task_runtime_run_kwargs,
     dispatch_task_runtime_turn,
-    emit_skill_filter_banner,
     validate_squilla_router_runtime,
 )
 from opensquilla.gateway.channel_dispatch import _stamp_channel_admin_principal
@@ -46,6 +46,7 @@ from opensquilla.gateway.model_routing import (
     model_routing_snapshot,
 )
 from opensquilla.gateway.routing import (
+    RouteEnvelope,
     build_channel_route_envelope,
     build_cli_route_envelope,
     build_cron_route_envelope,
@@ -64,9 +65,16 @@ from opensquilla.scheduler.types import CronJob, JobStatus
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionIntent
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolSpec
+
+
+def test_route_envelope_session_epoch_is_append_only_for_positional_callers() -> None:
+    assert [field.name for field in fields(RouteEnvelope)][-2:] == [
+        "runtime_services",
+        "session_epoch",
+    ]
 
 
 def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> None:
@@ -77,34 +85,13 @@ def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> No
     assert "_compaction_listener_remove" in source
 
 
-def test_shared_service_boot_prewarms_tokenrhythm_install_id_after_config_load() -> None:
+def test_gateway_boot_does_not_start_retired_legacy_telemetry() -> None:
     source = Path("src/opensquilla/gateway/boot.py").read_text(encoding="utf-8")
-    build_start = source.index("async def build_services(")
-    config_load = source.index("GatewayConfig.load(", build_start)
-    prewarm = source.index("_prewarm_tokenrhythm_install_id(config)", build_start)
-    provider_setup = source.index("# ── Provider selector", build_start)
-    live_catalog = source.index("await refresh_live_model_catalog(", build_start)
 
-    # build_services is shared by Gateway, one-shot agents, and --standalone.
-    assert config_load < prewarm < provider_setup < live_catalog
-
-
-def test_tokenrhythm_install_id_prewarm_never_breaks_boot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.gateway import boot
-    from opensquilla.provider import tokenrhythm_correlation
-
-    def fail_prewarm(**_kwargs: Any) -> None:
-        raise RuntimeError("synthetic resolver failure")
-
-    monkeypatch.setattr(
-        tokenrhythm_correlation,
-        "prewarm_tokenrhythm_install_id",
-        fail_prewarm,
-    )
-
-    boot._prewarm_tokenrhythm_install_id(GatewayConfig())
+    assert "_start_background_install_telemetry" not in source
+    assert "run_daily_usage_upload_loop" not in source
+    assert "prewarm_tokenrhythm_install_id" not in source
+    assert '"gateway.install_telemetry"' not in source
 
 
 def test_gateway_startup_phase_log_uses_bounded_fields(
@@ -308,18 +295,12 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         events.append("reconcile_process_owners")
         return 0
 
-    monkeypatch.setattr(
-        boot,
-        "_start_background_install_telemetry",
-        lambda config: events.append("install_telemetry"),
-    )
     monkeypatch.setattr(boot, "build_services", fail_build_services)
     monkeypatch.setattr(
         "opensquilla.process_tree.reconcile_persisted_processes",
         reconcile,
     )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: events.append("acquire"),
@@ -366,7 +347,6 @@ def test_failed_second_start_does_not_reset_active_stream_generation(
         {"text": "still live"},
     )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
 
     def reject_second_owner(_self: Any) -> None:
         raise RuntimeError("gateway already owns pid lock")
@@ -414,7 +394,6 @@ def test_failed_desktop_ownership_does_not_reset_active_stream_generation(
         {"text": "still live"},
     )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: events.append("acquire"),
@@ -453,7 +432,7 @@ def test_failed_desktop_ownership_does_not_reset_active_stream_generation(
         reset_session_streams()
 
 
-def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_ready(
+def test_start_gateway_server_does_not_start_retired_legacy_telemetry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -498,6 +477,7 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
 
     async def fake_build_services(**kwargs: Any) -> Any:
         call_order.append("build_services")
+        assert kwargs["defer_sandbox_startup"] is True
         config = kwargs["config"]
 
         async def close() -> None:
@@ -524,32 +504,15 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
             close=close,
         )
 
-    def fake_start_background_install_telemetry(
-        *,
-        config: GatewayConfig,
-        on_result: Any,
-    ) -> None:
+    def fake_sandbox_startup(config: GatewayConfig) -> Any:
         assert app_holder["app"].state.gateway_ready is True
-        call_order.append("install_telemetry")
-        on_result(
-            SimpleNamespace(
-                skipped_reason=None,
-                event="install",
-                sent=True,
-                uploaded=False,
-                endpoint_configured=True,
-            )
-        )
-
-    def fake_daily_usage_loop(storage: Any, *, config: GatewayConfig) -> Any:
-        assert app_holder["app"].state.gateway_ready is True
-        call_order.append("daily_usage")
+        assert "listener" in call_order
+        call_order.append("sandbox_startup")
 
         async def complete() -> None:
             return None
 
         return complete()
-
     real_create_gateway_app = boot.create_gateway_app
 
     def capture_gateway_app(*args: Any, **kwargs: Any) -> Any:
@@ -565,15 +528,7 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
     monkeypatch.setattr(boot.uvicorn, "Server", FakeUvicornServer)
     monkeypatch.setattr(boot, "_desktop_router_preload_enabled", lambda: False)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
-    monkeypatch.setattr(
-        "opensquilla.observability.install_telemetry.start_background_install_telemetry",
-        fake_start_background_install_telemetry,
-    )
-    monkeypatch.setattr(
-        "opensquilla.observability.usage_telemetry.run_daily_usage_upload_loop",
-        fake_daily_usage_loop,
-    )
+    monkeypatch.setattr(boot, "_ensure_sandbox_setup_on_boot", fake_sandbox_startup)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: None,
@@ -595,12 +550,9 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
         try:
             assert call_order == ["build_services", "runtime_state"]
             await asyncio.sleep(0)
-            telemetry_logs = [
-                kwargs for event, kwargs in debug_logs if event == "gateway.install_telemetry"
-            ]
-            assert len(telemetry_logs) == 1
-            assert telemetry_logs[0]["telemetry_event"] == "install"
-            assert "event" not in telemetry_logs[0]
+            assert "gateway.install_telemetry" not in {
+                event for event, _kwargs in debug_logs
+            }
             assert "gateway.install_telemetry_skipped" not in {
                 event for event, _kwargs in debug_logs
             }
@@ -610,8 +562,7 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
                 "listener_callback",
                 "listener",
                 "gateway_ready",
-                "install_telemetry",
-                "daily_usage",
+                "sandbox_startup",
             ]
         finally:
             await server.close()
@@ -655,6 +606,88 @@ def test_build_task_runtime_run_kwargs_forwards_task_id_as_root_turn() -> None:
     kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
 
     assert kwargs["root_turn_id"] == "task-turn-123"
+
+
+def test_build_task_runtime_run_kwargs_forwards_exact_session_owner() -> None:
+    run = SimpleNamespace(
+        task_id="task-turn-123",
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        session_id="session-123",
+        session_epoch=0,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["expected_session_id"] == "session-123"
+    assert kwargs["expected_session_epoch"] == 0
+
+
+def test_build_task_runtime_run_kwargs_omits_legacy_session_owner() -> None:
+    run = SimpleNamespace(
+        task_id="task-turn-legacy",
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert "expected_session_id" not in kwargs
+    assert "expected_session_epoch" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_rejects_stale_internal_owner_before_provider_dispatch() -> None:
+    class Storage:
+        async def get_session(self, _session_key: str) -> Any:
+            return SimpleNamespace(session_id="replacement-session", epoch=8)
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def run(self, *_args: Any, **_kwargs: Any):
+            self.called = True
+            yield DoneEvent()
+
+    envelope = build_cron_route_envelope(
+        SimpleNamespace(id="owner-race", name="owner race"),
+        session_key="cron:owner-race",
+        session_id="admitted-session",
+        session_epoch=7,
+    )
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="task-owner-race",
+        session_key=envelope.session_key,
+        session_id=envelope.session_id,
+        session_epoch=envelope.session_epoch,
+        envelope=envelope,
+    )
+    runner = RecordingTurnRunner()
+
+    with pytest.raises(StaleEpochError, match="changed before provider dispatch"):
+        await dispatch_task_runtime_turn(
+            run,
+            config=GatewayConfig(),
+            session_manager=SimpleNamespace(_storage=Storage()),
+            turn_runner=runner,
+            event_emitter=lambda *_args, **_kwargs: None,
+        )
+
+    assert runner.called is False
 
 
 def test_build_task_runtime_run_kwargs_forwards_provider_correlation() -> None:
@@ -859,28 +892,6 @@ def test_build_task_runtime_run_kwargs_forwards_exact_assistant_sink() -> None:
     assert kwargs["assistant_message_sink"] is sink
 
 
-def test_build_task_runtime_run_kwargs_forwards_document_mutation_outcome_sink() -> None:
-    def sink(_outcome: dict[str, Any]) -> None:
-        return None
-
-    run = SimpleNamespace(
-        agent_id="main",
-        attachments=[],
-        input_provenance=None,
-        run_kind="session_turn",
-        no_memory_capture=False,
-        fresh_user_session=False,
-        ingress_pipeline_steps=(),
-        semantic_message=None,
-        persisted_user_message_id="msg-123",
-        document_mutation_outcome_sink=sink,
-    )
-
-    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
-
-    assert kwargs["document_mutation_outcome_sink"] is sink
-
-
 def test_gateway_stream_timeout_config_defaults_remain_serializable() -> None:
     config = GatewayConfig()
 
@@ -1011,7 +1022,7 @@ def test_gateway_home_falls_back_to_config_path_parent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_prewarms_an_existing_ready_setup(
+async def test_boot_sandbox_setup_initializes_without_capability_probes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
@@ -1044,7 +1055,7 @@ async def test_boot_sandbox_setup_prewarms_an_existing_ready_setup(
         return object()
 
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
+        "opensquilla.sandbox.setup_runtime.initialize_sandbox_runtime",
         fake_status,
     )
     monkeypatch.setattr(
@@ -1056,39 +1067,11 @@ async def test_boot_sandbox_setup_prewarms_an_existing_ready_setup(
 
     assert result is not None
     assert result.state is SandboxSetupState.READY
-    assert calls == ["status", "capability"]
+    assert calls == ["status"]
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_can_be_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.gateway import boot
-
-    async def fail_if_called(config: GatewayConfig) -> object:
-        raise AssertionError("sandbox.auto_setup=false must not inspect setup")
-
-    monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
-        fail_if_called,
-    )
-
-    result = await boot._ensure_sandbox_setup_on_boot(
-        GatewayConfig(
-            sandbox={
-                "auto_setup": False,
-                "run_mode": "trusted",
-                "sandbox": True,
-                "security_grading": True,
-            },
-        )
-    )
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
+async def test_boot_sandbox_failure_keeps_gateway_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
@@ -1107,7 +1090,7 @@ async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
         calls.append("status")
         assert setup_config is config
         return SetupResult(
-            state=SandboxSetupState.NOT_SETUP,
+            state=SandboxSetupState.FAILED,
             platform="auto",
             message="Sandbox setup requires administrator approval.",
             requires_admin=True,
@@ -1119,7 +1102,7 @@ async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
         return object()
 
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
+        "opensquilla.sandbox.setup_runtime.initialize_sandbox_runtime",
         fake_status,
     )
     monkeypatch.setattr(
@@ -1130,12 +1113,12 @@ async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
     result = await boot._ensure_sandbox_setup_on_boot(config)
 
     assert result is not None
-    assert result.state is SandboxSetupState.NOT_SETUP
+    assert result.state is SandboxSetupState.FAILED
     assert calls == ["status"]
 
 
 @pytest.mark.asyncio
-async def test_build_services_schedules_sandbox_setup_after_runtime(
+async def test_build_services_defers_sandbox_startup_until_gateway_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1149,6 +1132,7 @@ async def test_build_services_schedules_sandbox_setup_after_runtime(
         events.append("setup")
 
     def fake_configure_runtime(*args: Any, **kwargs: Any) -> Any:
+        assert kwargs["defer_backend"] is True
         events.append("runtime")
         return SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {}))
 
@@ -1186,14 +1170,73 @@ async def test_build_services_schedules_sandbox_setup_after_runtime(
         config=config,
         session_db_path=str(tmp_path / "sessions.sqlite"),
         seed_agent_workspaces=False,
+        defer_sandbox_startup=True,
     )
     try:
         assert events == ["runtime"]
-        assert len(scheduled) == 1
-        assert services.sandbox_setup_task is background_task
+        assert scheduled == []
+        assert services.sandbox_setup_task is None
     finally:
         await services.close()
     assert events == ["runtime", "runtime_reset"]
+
+
+@pytest.mark.asyncio
+async def test_embedded_gateway_defers_sandbox_until_inprocess_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway import boot
+    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+
+    initialized = asyncio.Event()
+
+    def unexpected_backend_selection(_settings: SandboxSettings, **_kwargs: Any) -> Any:
+        raise AssertionError("embedded gateway startup must defer sandbox selection")
+
+    async def fake_initialize(config: GatewayConfig) -> SetupResult:
+        assert config.state_dir == str(tmp_path / "state")
+        initialized.set()
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="test",
+            message="Sandbox initialized.",
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.select_backend",
+        unexpected_backend_selection,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_runtime.initialize_sandbox_runtime",
+        fake_initialize,
+    )
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.release",
+        lambda self: None,
+    )
+
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+        mcp={"enabled": False},
+        memory={"flush_enabled": False},
+    )
+
+    server = await boot.start_gateway_server(config=config, run=False)
+    try:
+        await asyncio.wait_for(initialized.wait(), timeout=1.0)
+        assert server.app.state.gateway_ready is True
+        assert server._services.sandbox_setup_task is not None
+    finally:
+        await server.close()
 
 
 @pytest.mark.asyncio
@@ -1269,7 +1312,6 @@ async def test_bare_full_default_boots_full_capability(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
     )
 
     services = await boot.build_services(
@@ -1417,7 +1459,6 @@ async def test_start_gateway_server_shares_diagnostics_state_between_app_and_tur
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: None,
@@ -1502,7 +1543,6 @@ async def test_start_gateway_server_creates_default_subscription_manager(
     monkeypatch.setattr("opensquilla.gateway.event_bridge.EventBridge", FakeEventBridge)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: None,
@@ -1602,7 +1642,6 @@ async def test_start_gateway_server_schedules_router_preload_after_channels(
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(boot, "create_background_task", fake_create_background_task)
     monkeypatch.setattr(boot.uvicorn, "Server", FakeServer)
     monkeypatch.setattr(
@@ -1692,7 +1731,6 @@ def test_start_gateway_server_passes_tls_files_to_uvicorn(
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(boot, "create_background_task", fake_create_background_task)
     monkeypatch.setattr(boot.uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(boot.uvicorn, "Server", FakeServer)
@@ -1806,7 +1844,6 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(scheduler_jobs, "set_failure_dispatcher", _record_dispatcher)
     monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
     monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
@@ -1970,7 +2007,6 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         auto_handler_mod,
         "make_auto_propose_handler",
@@ -2425,7 +2461,6 @@ async def test_build_services_registers_session_search_tool(
         channels={"channels": []},
         mcp={"enabled": False},
         memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
     )
 
     services = await build_services(
@@ -2506,34 +2541,6 @@ def test_router_boot_validation_still_fails_when_required_bundle_missing(tmp_pat
         validate_squilla_router_runtime(config)
 
 
-def test_skill_filter_banner_accepts_tokenizers_without_transformers(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    from opensquilla.memory.embedding import LocalEmbeddingProvider
-
-    def fake_find_spec(name: str):
-        if name in {"onnxruntime", "tokenizers"}:
-            return object()
-        if name == "transformers":
-            return None
-        raise AssertionError(name)
-
-    monkeypatch.setattr("importlib.util.find_spec", fake_find_spec)
-    monkeypatch.setattr(
-        LocalEmbeddingProvider,
-        "_bundled_onnx_dir",
-        classmethod(lambda cls, model_name: tmp_path),
-    )
-
-    emit_skill_filter_banner(
-        SimpleNamespace(filter_enabled=True, filter_strategy="semantic", filter_embedding_model="")
-    )
-
-    assert "ONNX embedding backend not available" not in caplog.text
-
-
 @pytest.mark.asyncio
 async def test_build_services_fails_fast_for_explicit_remote_memory_without_key(
     monkeypatch: pytest.MonkeyPatch,
@@ -2547,7 +2554,6 @@ async def test_build_services_fails_fast_for_explicit_remote_memory_without_key(
         state_dir=str(tmp_path / "state"),
         workspace_dir=str(tmp_path / "workspace"),
         memory={"embedding": {"provider": "openai"}},
-        sandbox={"auto_setup": False},
     )
 
     with pytest.raises(ValueError, match="memory.embedding.remote.api_key"):

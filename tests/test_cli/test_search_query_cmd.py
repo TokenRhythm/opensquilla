@@ -22,6 +22,7 @@ def test_search_query_web_search_options_use_local_search(monkeypatch):
     ) -> dict[str, object]:
         seen_options.append(options)
         assert "fetcher" in kwargs
+        assert options.fetch_top_k == 0
         return {
             "ok": True,
             "query": options.query,
@@ -81,6 +82,7 @@ def test_search_query_web_search_text_output_renders_results(monkeypatch):
         **kwargs: object,
     ) -> dict[str, object]:
         assert "fetcher" in kwargs
+        assert options.fetch_top_k == 0
         return {
             "ok": True,
             "query": options.query,

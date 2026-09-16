@@ -15,13 +15,13 @@ from typing import Any
 
 import pytest
 
-from opensquilla.gateway import rpc_sessions
-from opensquilla.gateway.rpc_sessions import (
-    _ALLOWED_MEDIA_TYPES,
-    _MAX_ATTACHMENT_BYTES,
-    _MAX_ATTACHMENTS,
-    _MAX_TEXT_ATTACHMENT_BYTES,
-    _validate_attachments,
+from opensquilla.gateway import attachment_ingest
+from opensquilla.gateway.attachment_ingest import (
+    ALLOWED_MEDIA_TYPES,
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS,
+    TEXT_ATTACHMENT_BYTES,
+    validate_attachments,
 )
 
 
@@ -42,7 +42,7 @@ def _attach(media_type: str, payload: bytes, **extra: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def test_rendered_media_types_set_contents() -> None:
-    assert _ALLOWED_MEDIA_TYPES == {
+    assert ALLOWED_MEDIA_TYPES == {
         "image/png",
         "image/jpeg",
         "image/gif",
@@ -63,7 +63,7 @@ def test_rendered_media_types_set_contents() -> None:
 
 
 def test_max_attachments_per_turn_is_ten() -> None:
-    assert _MAX_ATTACHMENTS == 10
+    assert MAX_ATTACHMENTS == 10
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ def test_max_attachments_per_turn_is_ten() -> None:
 
 def test_pdf_inline_accepted() -> None:
     pdf_bytes = b"%PDF-1.4\n%fake one-page pdf body\n"
-    out = _validate_attachments([_attach("application/pdf", pdf_bytes, name="r.pdf")])
+    out, _failures = validate_attachments([_attach("application/pdf", pdf_bytes, name="r.pdf")])
     assert len(out) == 1
     assert out[0]["type"] == "application/pdf"
     assert out[0]["data"] == _b64(pdf_bytes)
@@ -89,14 +89,14 @@ def test_pdf_inline_accepted() -> None:
 )
 def test_text_csv_json_inline_accepted(claimed_mime: str, payload: bytes) -> None:
     name = f"f.{claimed_mime.split('/')[-1]}"
-    out = _validate_attachments([_attach(claimed_mime, payload, name=name)])
+    out, _failures = validate_attachments([_attach(claimed_mime, payload, name=name)])
     assert len(out) == 1
     assert out[0]["type"] == claimed_mime
 
 
 def test_html_inline_accepted() -> None:
     html = b"<html><body>hi</body></html>"
-    out = _validate_attachments([_attach("text/html", html, name="page.html")])
+    out, _failures = validate_attachments([_attach("text/html", html, name="page.html")])
     assert len(out) == 1
     assert out[0]["type"] == "text/html"
 
@@ -110,7 +110,7 @@ def test_unknown_binary_mime_accepted_as_opaque() -> None:
     # bytes are never parsed or inlined, and the specific claim survives as
     # the label. Unknown *textual* uploads still resolve to text/plain — see
     # test_unknown_textual_upload_accepted_via_utf8_fallback in the ingest suite.
-    out = _validate_attachments(
+    out, _failures = validate_attachments(
         [_attach("application/x-binary", b"\x00\x01\x02\x03 binary blob", name="x.bin")]
     )
     assert len(out) == 1
@@ -120,8 +120,6 @@ def test_unknown_binary_mime_accepted_as_opaque() -> None:
 def test_unknown_binary_mime_rejected_when_opaque_admission_disabled() -> None:
     # attachments.accept_opaque=false restores the legacy fail-closed gate,
     # including the error copy third-party clients may match on.
-    from opensquilla.gateway.attachment_ingest import validate_attachments
-
     with pytest.raises(ValueError, match="not allowed"):
         validate_attachments(
             [_attach("application/x-binary", b"\x00\x01\x02\x03 binary blob", name="x.bin")],
@@ -130,21 +128,21 @@ def test_unknown_binary_mime_rejected_when_opaque_admission_disabled() -> None:
 
 
 def test_oversize_rejected() -> None:
-    payload = b"%PDF-1.4\n" + b"a" * (_MAX_ATTACHMENT_BYTES + 1)
+    payload = b"%PDF-1.4\n" + b"a" * (MAX_ATTACHMENT_BYTES + 1)
     with pytest.raises(ValueError, match="exceeds"):
-        _validate_attachments([_attach("application/pdf", payload, name="big.pdf")])
+        validate_attachments([_attach("application/pdf", payload, name="big.pdf")])
 
 
 def test_text_family_above_direct_cap_rejected() -> None:
-    payload = b"a" * (_MAX_TEXT_ATTACHMENT_BYTES + 1)
+    payload = b"a" * (TEXT_ATTACHMENT_BYTES + 1)
     with pytest.raises(ValueError, match="exceeds"):
-        _validate_attachments([_attach("text/plain", payload, name="big.txt")])
+        validate_attachments([_attach("text/plain", payload, name="big.txt")])
 
 
 def test_too_many_attachments_rejected() -> None:
-    items = [_attach("text/plain", b"x", name=f"f{i}.txt") for i in range(_MAX_ATTACHMENTS + 1)]
+    items = [_attach("text/plain", b"x", name=f"f{i}.txt") for i in range(MAX_ATTACHMENTS + 1)]
     with pytest.raises(ValueError, match="at most"):
-        _validate_attachments(items)
+        validate_attachments(items)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +156,7 @@ def test_mime_sniff_overrides_client_claim() -> None:
     claim, the sniffed type wins.
     """
     pdf_bytes = b"%PDF-1.4\nbody\n"
-    out = _validate_attachments([_attach("text/plain", pdf_bytes, name="weird.txt")])
+    out, _failures = validate_attachments([_attach("text/plain", pdf_bytes, name="weird.txt")])
     assert out[0]["type"] == "application/pdf"
 
 
@@ -171,14 +169,14 @@ def test_claimed_pdf_without_magic_bytes_rejected() -> None:
     """
     not_a_pdf = b"definitely not a pdf, just text bytes\n"
     with pytest.raises(ValueError, match=r"(magic|415|application/pdf)"):
-        _validate_attachments([_attach("application/pdf", not_a_pdf, name="liar.pdf")])
+        validate_attachments([_attach("application/pdf", not_a_pdf, name="liar.pdf")])
 
 
-def test_mime_sniff_logs_warning_on_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mime_sniff_logs_warning_on_mismatch() -> None:
     """Mismatch between claimed and sniffed MIME emits a structured warning.
 
     The validator uses structlog (not stdlib logging) so we capture via
-    monkeypatch on the module-level logger rather than caplog — testing
+    the explicit logger port rather than caplog — testing
     the contract, not the framework plumbing.
     """
     captured: list[tuple[str, dict[str, Any]]] = []
@@ -186,7 +184,7 @@ def test_mime_sniff_logs_warning_on_mismatch(monkeypatch: pytest.MonkeyPatch) ->
     def _record_warning(event: str, **kwargs: Any) -> None:
         captured.append((event, kwargs))
 
-    real_log = rpc_sessions.log
+    real_log = attachment_ingest.log
 
     class _WarningLog:
         def warning(self, event: str, **kwargs: Any) -> None:
@@ -195,10 +193,10 @@ def test_mime_sniff_logs_warning_on_mismatch(monkeypatch: pytest.MonkeyPatch) ->
         def __getattr__(self, name: str) -> Any:
             return getattr(real_log, name)
 
-    monkeypatch.setattr(rpc_sessions, "log", _WarningLog())
-
     pdf_bytes = b"%PDF-1.4\nbody\n"
-    _validate_attachments([_attach("text/plain", pdf_bytes, name="weird.txt")])
+    validate_attachments(
+        [_attach("text/plain", pdf_bytes, name="weird.txt")], logger=_WarningLog()
+    )
 
     assert any(
         "mime" in event.lower() and "mismatch" in event.lower() for event, _ in captured
@@ -218,7 +216,7 @@ def test_file_uuid_reference_resolved() -> None:
     The validator must not crash on the staged upload shape and must thread
     ``file_uuid`` through for downstream materialization.
     """
-    out = _validate_attachments(
+    out, _failures = validate_attachments(
         [
             {
                 "file_uuid": "u-deadbeef",
@@ -242,7 +240,7 @@ def test_attachment_with_both_data_and_file_uuid_rejected() -> None:
     item = _attach("application/pdf", b"%PDF-1.4\n", name="x.pdf")
     item["file_uuid"] = "u-1234"
     with pytest.raises(ValueError, match=r"(both|exactly one)"):
-        _validate_attachments([item])
+        validate_attachments([item])
 
 
 async def test_resolve_attachments_expired_uuid_raises_typed_error(tmp_path) -> None:

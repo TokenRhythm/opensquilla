@@ -251,6 +251,10 @@ function rowStatus(model: DiscoveredModel): string {
   return status
 }
 
+function modelSupportsMultimodalInput(model: DiscoveredModel): boolean {
+  return model.capabilities.includes('vision')
+}
+
 function usesCatalogOnlyMetadata(model: DiscoveredModel): boolean {
   return model.metadata?.schemaVersion === 1 && model.metadata.published === null
 }
@@ -590,6 +594,13 @@ function onKeydown(event: KeyboardEvent) {
                     class="setup-model-combobox__badge setup-model-combobox__badge--status"
                   >
                     {{ rowStatus(model) }}
+                  </span>
+                  <span
+                    v-if="modelSupportsMultimodalInput(model)"
+                    class="setup-model-combobox__badge setup-model-combobox__badge--multimodal"
+                    :title="t('setup.provider.modelMultimodalTitle')"
+                  >
+                    {{ t('setup.provider.modelMultimodal') }}
                   </span>
                   <span
                     v-if="usesCatalogOnlyMetadata(model)"
@@ -969,6 +980,11 @@ function onKeydown(event: KeyboardEvent) {
 .setup-model-combobox__badge--catalog {
   background: var(--bg-hover);
   color: var(--text-dim);
+}
+
+.setup-model-combobox__badge--multimodal {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
 }
 
 .setup-model-combobox__footer {

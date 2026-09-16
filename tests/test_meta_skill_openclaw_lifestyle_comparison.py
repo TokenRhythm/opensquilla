@@ -13,7 +13,7 @@ from scripts.compare_meta_skill_openclaw_lifestyle import (
     _apply_lifestyle_judge_result,
     _compare_results,
     _judge_lifestyle_with_retries,
-    _lifestyle_judge_result_is_complete,
+    _normalized_lifestyle_judge_result,
     build_lifestyle_rows,
     judge_existing,
     load_openclaw_baseline,
@@ -417,8 +417,8 @@ def test_lifestyle_judge_result_requires_subscores_and_rationale() -> None:
         model="judge-model",
     )
 
-    assert _lifestyle_judge_result_is_complete(incomplete) is False
-    assert _lifestyle_judge_result_is_complete(complete) is True
+    assert _normalized_lifestyle_judge_result(incomplete) is None
+    assert _normalized_lifestyle_judge_result(complete) is not None
 
 
 def test_lifestyle_judge_scores_are_recomputed_from_weighted_subscores() -> None:

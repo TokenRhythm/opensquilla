@@ -116,6 +116,7 @@ export type AssistantActivityStatusCode =
   | 'chat.activity.provider.rateLimited'
   | 'chat.activity.provider.retryWait'
   | 'chat.activity.provider.retrying'
+  | 'chat.activity.provider.retryingWithoutLimit'
   | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
@@ -196,6 +197,7 @@ export type AssistantAnswerSource =
   | 'canonical'
   | 'terminal-timeline-boundary'
   | 'terminal-control-boundary'
+  | 'explicit-no-answer'
   | 'none'
 
 export interface AssistantAnswerResolution {
@@ -246,12 +248,6 @@ const FILE_INSPECT_TOOLS = new Set([
   'list_directory',
   'glob_search',
   'grep_search',
-  'document_inspect',
-  'document_read',
-  'document_locate',
-  'document_browser_inspect',
-  'document_browser_screenshot',
-  'document_browser_reload',
 ])
 const FILE_CHANGE_TOOLS = new Set([
   'write_file',
@@ -261,10 +257,6 @@ const FILE_CHANGE_TOOLS = new Set([
   'edit_file',
   'edit_source',
   'apply_patch',
-  'document_apply',
-  'document_patch',
-  'document_browser_act',
-  'document_finish',
 ])
 const COMMAND_TOOLS = new Set([
   'exec',
@@ -552,7 +544,22 @@ function terminalTimelineAnswerCandidate(
   // preceding work narration inside Activity even when no tool separates it
   // from the final answer span.
   const boundaryItem = timeline[index]
-  const crossedPresentationBoundary = index >= 0
+  let semanticBoundaryIndex = index
+  let crossedPrecedingControl = false
+  while (
+    semanticBoundaryIndex >= 0
+    && isSuccessfulAnswerTransparentControlGroup(timeline[semanticBoundaryIndex]!)
+  ) {
+    crossedPrecedingControl = true
+    semanticBoundaryIndex -= 1
+  }
+  const semanticBoundaryItem = timeline[semanticBoundaryIndex]
+  const crossedPresentationBoundary = semanticBoundaryIndex >= 0
+    && semanticBoundaryItem?.type === 'text'
+    && semanticBoundaryItem.presentation === 'intermediate'
+  const crossedConfirmedControlBoundary = crossedPrecedingControl
+    && crossedPresentationBoundary
+  const crossedImmediatePresentationBoundary = index >= 0
     && boundaryItem?.type === 'text'
     && boundaryItem.presentation === 'intermediate'
   const crossedOrdinaryToolBoundary = index >= 0
@@ -561,7 +568,8 @@ function terminalTimelineAnswerCandidate(
   if (
     !crossedControlBoundary
     && !crossedOrdinaryToolBoundary
-    && !crossedPresentationBoundary
+    && !crossedImmediatePresentationBoundary
+    && !crossedConfirmedControlBoundary
   ) return null
 
   const compact = chunks.join('')
@@ -570,7 +578,7 @@ function terminalTimelineAnswerCandidate(
     compact,
     readable: readableTextAggregate(chunks),
     indexes,
-    source: crossedControlBoundary
+    source: crossedControlBoundary || crossedConfirmedControlBoundary
       ? 'terminal-control-boundary'
       : 'terminal-timeline-boundary',
   }
@@ -616,6 +624,30 @@ export function resolveAssistantAnswer(
         ? 'readable'
         : null
     : null
+  const textItems = timeline.filter(
+    (item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> =>
+      item.type === 'text',
+  )
+  const hasExplicitIntermediateOnly = textItems.length > 0
+    && textItems.every(item => item.presentation === 'intermediate')
+  const hasSemanticActivityBoundary = timeline.some(item => item.type === 'tool-group')
+    || Boolean(message.planRevisions?.length)
+  const allToolsSettledSuccessfully = timeline.every(item =>
+    item.type !== 'tool-group' || isSettledSuccessfulToolGroup(item),
+  )
+  const canUseExplicitNoAnswer = completedAnswerLifecycle(message, lifecycle)
+    && hasSemanticActivityBoundary
+    && hasExplicitIntermediateOnly
+    && allToolsSettledSuccessfully
+    && (matchedAggregate !== null || !canonical.trim())
+
+  if (canUseExplicitNoAnswer) {
+    return {
+      text: '',
+      source: 'explicit-no-answer',
+      activityItems: visibleTimeline,
+    }
+  }
   const canUseTerminalBoundary = completedAnswerLifecycle(message, lifecycle)
     && matchedAggregate !== null
     && candidate !== null
@@ -847,10 +879,11 @@ function statusLabelFor(
       })
     }
     if (phase === 'retrying') {
-      return codeDescriptor('chat.activity.provider.retrying', {
-        attempt: Math.max(0, Number.parseInt(first, 10) || 0),
-        limit: Math.max(0, Number.parseInt(second, 10) || 0),
-      })
+      const attempt = Math.max(0, Number.parseInt(first, 10) || 0)
+      const limit = Math.max(0, Number.parseInt(second, 10) || 0)
+      return limit > 0
+        ? codeDescriptor('chat.activity.provider.retrying', { attempt, limit })
+        : codeDescriptor('chat.activity.provider.retryingWithoutLimit', { attempt })
     }
     if (phase === 'fallback') return codeDescriptor('chat.activity.provider.fallback')
     return codeDescriptor('chat.activity.lifecycle.working')
@@ -1182,7 +1215,9 @@ export function projectAssistantActivity(
   const answerResolution = resolveAssistantAnswer(presentationMessage, timeline, lifecycle)
   const hasTimelineText = timeline.some(item => item.type === 'text')
   const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
-  const canSeparateActivity = hasCanonicalAnswer || !hasTimelineText
+  const canSeparateActivity = hasCanonicalAnswer
+    || answerResolution.source === 'explicit-no-answer'
+    || !hasTimelineText
   const hasStructuralAnswerBoundary =
     answerResolution.source === 'terminal-control-boundary'
     || answerResolution.source === 'terminal-timeline-boundary'

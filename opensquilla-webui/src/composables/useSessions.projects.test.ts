@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
   arrangeSidebarSections,
-  normalizeSessionItem,
   type SessionItem,
 } from './useSessions'
+import { normalizeV4SessionItem } from '@/adapters/gateway/sessionDirectoryV4'
+import type { SessionRow } from '@/contracts/generated/v4/sessionsList'
 import type { ProjectWorkspaceItem } from './useProjectWorkspaces'
-import type { RawSessionItem } from '@/types/rpc'
 
-function session(raw: RawSessionItem): SessionItem {
-  const item = normalizeSessionItem(raw)
+function session(raw: SessionRow): SessionItem {
+  const item = normalizeV4SessionItem(raw)
   if (!item) throw new Error('fixture did not normalize')
   return item
 }

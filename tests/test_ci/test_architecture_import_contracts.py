@@ -8,6 +8,9 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    # Source adapters consume the transport-neutral install command's pure
+    # identifier parser; application never imports the Skill implementation.
+    ("skills", "application"),
     ("agents", "gateway"),
     ("agents", "identity"),
     ("agents", "onboarding"),
@@ -15,10 +18,16 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # Format-specific delivery validation reuses canonical attachment MIME and
     # container signatures; contracts remains implementation-free.
     ("artifact_validation.py", "contracts"),
+    # Retained images reuse canonical MIME limits and content validation before
+    # workspace materialization. Contracts never imports the workspace writer.
+    ("attachment_workspace.py", "contracts"),
     # ArtifactSession is a durable lower-level domain. It uses the shared
     # async-SQLite compatibility shim, while Gateway, session lifecycle, and
     # context-bound tools consume its public service without an import cycle.
     ("artifact_session", "compat"),
+    # Transcript publication and the tool registry share a presentation-only
+    # value contract. Contracts remains a leaf and never imports chat or tools.
+    ("chat", "contracts"),
     ("channels", "engine"),
     ("channels", "contracts"),
     ("channels", "gateway"),
@@ -49,6 +58,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "search"),
     ("cli", "session"),
     ("cli", "skills"),
+    # CLI surfaces emit only closed, consent-gated lifecycle facts through the
+    # telemetry package; telemetry never imports the CLI back.
+    ("cli", "telemetry"),
     ("cli", "tools"),
     ("cli", "uninstall"),
     # code-task assembles the subagent's per-run config from the operator's
@@ -96,6 +108,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("engine", "session"),
     ("engine", "skills"),
     ("engine", "squilla_router"),
+    # Turn and file-parse lifecycle observers terminate in the lower-level
+    # scoped telemetry sink and do not expose user content.
+    ("engine", "telemetry"),
     ("engine", "tools"),
     # The measurement-only eval harness observes providers (and pricing) through
     # their public surface; nothing imports eval back, so it joins no cycle.
@@ -132,6 +147,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # Gateway's post-dream hook drives the opt-in router self-learning
     # orchestrator (offline retrain; default-off, fail-open).
     ("gateway", "squilla_router"),
+    # Gateway composition owns scoped telemetry lifecycle and its authenticated
+    # consent RPC boundary; telemetry does not import Gateway implementation.
+    ("gateway", "telemetry"),
     ("gateway", "tools"),
     # The reusable Python Gateway client shares the bounded WebSocket receive
     # contract with the CLI client; contracts remains implementation-free.
@@ -169,6 +187,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # transaction layer; recovery does not import migration back.
     ("migration", "recovery"),
     ("migration", "onboarding"),
+    # Setup mutations reuse the settings owner's secret-provenance rules.
+    # Application has no dependency back on onboarding or runtime packages.
+    ("onboarding", "application"),
     ("onboarding", "channels"),
     ("onboarding", "gateway"),
     ("onboarding", "provider"),
@@ -246,6 +267,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("skills", "provider"),
     ("skills", "safety"),
     ("skills", "tools"),
+    # Telemetry uses the shared async-SQLite shim and passive-network privacy
+    # policy; both remain lower-level dependencies and introduce no cycle.
+    ("telemetry", "compat"),
+    ("telemetry", "observability"),
     ("tools", "agents"),
     ("tools", "artifact_session"),
     ("tools", "channels"),

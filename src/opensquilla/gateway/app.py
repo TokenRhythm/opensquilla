@@ -18,6 +18,9 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from opensquilla import __version__
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
 from opensquilla.gateway.approval_events import build_approval_snapshot_item
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
@@ -89,6 +92,7 @@ def create_gateway_app(
     extra_routes: list[Route] | None = None,
     prompt_cache_keepalive_service: Any = None,
     skill_management_service: Any = None,
+    sandbox_upgrade_report: dict[str, object] | None = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -198,7 +202,12 @@ def create_gateway_app(
         cursor = request.query_params.get("cursor")
         if cursor is not None:
             params["cursor"] = cursor
-        result = await dispatcher.dispatch("_http", "sessions.list", params or None, ctx)
+        result = await dispatcher.dispatch(
+            "_http",
+            SESSIONS_LIST_METHOD,
+            params or None,
+            ctx,
+        )
         if result.ok:
             return _with_http_guest_cookie(
                 request,
@@ -257,6 +266,7 @@ def create_gateway_app(
                 "status": "running",
                 "provider": provider_name,
                 "auth_mode": config.auth.mode,
+                "sandboxUpgrade": sandbox_upgrade_report,
             }
         )
 

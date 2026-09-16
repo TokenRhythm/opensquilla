@@ -14,6 +14,10 @@ from opensquilla.chat.flattened_tool_markers import (
     strip_confirmed_flattened_tool_result,
     strip_flattened_used_tool_lines,
 )
+from opensquilla.contracts.tool_presentation import (
+    project_tool_arguments_payload,
+    resolve_tool_presentation_fields,
+)
 from opensquilla.meta_preflight_protocol import (
     display_text_from_preflight_confirmation,
     strip_preflight_confirmation_protocol_text,
@@ -27,6 +31,20 @@ _LEGACY_PLAN_IMPLEMENTATION_PROMPT = re.compile(
 )
 
 
+def _legacy_tool_presentation(segment: dict[str, Any]) -> dict[str, Any] | None:
+    """Classify old tool-use rows that predate persisted presentation metadata."""
+
+    if segment.get("type") != "tool_use" or not isinstance(segment.get("input"), dict):
+        return None
+    name = segment.get("name") or segment.get("tool_name")
+    if not isinstance(name, str) or not name:
+        return None
+    return resolve_tool_presentation_fields(
+        name=name,
+        parameter_names=tuple(str(key) for key in segment["input"]),
+    ).to_payload()
+
+
 def _sanitize_display_protocol_payload(value: Any) -> Any:
     if isinstance(value, str):
         clean = strip_preflight_confirmation_protocol_text(value)
@@ -34,10 +52,29 @@ def _sanitize_display_protocol_payload(value: Any) -> Any:
     if isinstance(value, list):
         return [_sanitize_display_protocol_payload(item) for item in value]
     if isinstance(value, dict):
-        return {
+        projected = {
             key: _sanitize_display_protocol_payload(item)
             for key, item in value.items()
         }
+        presentation = projected.get("tool_presentation")
+        if not isinstance(presentation, dict):
+            presentation = _legacy_tool_presentation(projected)
+        if (
+            projected.get("type") in {"tool_use", "tool_result"}
+            and isinstance(presentation, dict)
+        ):
+            for field in ("input", "arguments"):
+                if field not in projected:
+                    continue
+                arguments = projected[field]
+                if isinstance(arguments, dict):
+                    projected[field] = project_tool_arguments_payload(
+                        presentation,
+                        arguments,
+                    )
+                elif presentation.get("argumentDisplay") == "primary":
+                    projected[field] = {}
+        return projected
     return value
 
 
@@ -243,6 +280,7 @@ def transcript_entries_to_chat_messages(
         attachments = None
         artifacts = None
         prompt_annotations = None
+        page_context = None
         if content and content.startswith("{"):
             try:
                 parsed = json.loads(content)
@@ -250,6 +288,9 @@ def transcript_entries_to_chat_messages(
                     display_text = parsed.get("display_text")
                     content = display_text if isinstance(display_text, str) else parsed["text"]
                     attachments = _public_attachment_projection(parsed.get("attachments"))
+                    raw_page_context = parsed.get("page_context")
+                    if isinstance(raw_page_context, dict):
+                        page_context = raw_page_context
                     from opensquilla.prompt_annotations import (
                         PromptAnnotationSnapshotError,
                         normalize_prompt_annotation_snapshots,
@@ -343,6 +384,8 @@ def transcript_entries_to_chat_messages(
             msg["artifacts"] = artifacts
         if prompt_annotations:
             msg["promptAnnotations"] = prompt_annotations
+        if page_context:
+            msg["pageContext"] = page_context
         usage = getattr(projected_entry, "turn_usage", None)
         if isinstance(usage, dict):
             msg["usage"] = usage

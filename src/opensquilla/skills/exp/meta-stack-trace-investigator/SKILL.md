@@ -1,5 +1,8 @@
 ---
 name: meta-stack-trace-investigator
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user gives a stack trace, traceback, runtime error, or failing log that benefits from multi-skill orchestration across trace parsing, repo/history inspection, patch-target analysis, reproduction guidance, and verification commands."
 kind: meta
 meta_priority: 60

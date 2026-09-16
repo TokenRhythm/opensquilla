@@ -28,12 +28,13 @@ class CustomBuildHook(BuildHookInterface):
         sys.path.insert(0, str(root))
         try:
             from scripts.verify_webui_artifact import (
+                STAGED_DIST_RELATIVE,
                 verify_dist,
                 verify_sdist_source_inventory,
             )
 
             verify_dist(
-                root / "src/opensquilla/gateway/static/dist",
+                root / STAGED_DIST_RELATIVE,
                 webui_root=root / "opensquilla-webui",
                 # Source archives are easy to redistribute accidentally. Keep
                 # standard sdists privacy-safe even when a checkout contains

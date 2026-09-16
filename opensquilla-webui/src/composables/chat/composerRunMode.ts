@@ -2,13 +2,11 @@ import type { SandboxRunMode, SandboxSetupStatusPayload } from '@/types/sandbox'
 
 export function effectiveComposerRunMode(
   preference: SandboxRunMode,
-  setupStatus: SandboxSetupStatusPayload | null,
+  _setupStatus: SandboxSetupStatusPayload | null,
   activeLock: SandboxRunMode | null,
-  setupResolved = true,
+  _setupResolved = true,
 ): SandboxRunMode {
   if (activeLock) return activeLock
-  if (!setupResolved) return 'full'
-  if (preference === 'safe' && setupStatus && setupStatus.state !== 'ready') return 'full'
   return preference
 }
 
@@ -20,9 +18,10 @@ export function composerRunModeSelectionAction(
   canSetup: boolean,
   setupResolved = true,
 ): ComposerRunModeSelectionAction {
-  if (mode === 'safe' && !setupResolved) return 'ignore'
-  if (mode === 'full' || setupStatus === null || setupStatus.state === 'ready') return 'persist'
-  return canSetup ? 'setup' : 'ignore'
+  if (mode === 'full') return 'persist'
+  if (!setupResolved || setupStatus === null) return 'ignore'
+  if (setupStatus.state === 'ready') return 'persist'
+  return setupStatus.state === 'not_setup' && canSetup ? 'setup' : 'ignore'
 }
 
 export async function completeComposerSafeSetup(

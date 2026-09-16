@@ -355,30 +355,87 @@ def test_selectable_discovery_accepts_official_subdomains(
     assert calls == [discovery_base_url]
 
 
-def test_tokenrhythm_discovery_accepts_official_subdomains(monkeypatch: Any) -> None:
+def test_tokenrhythm_subdomain_discovery_uses_isolated_live_listing(
+    monkeypatch: Any,
+) -> None:
     from opensquilla.gateway import model_catalog_refresh
 
-    calls: list[str] = []
+    calls: list[dict[str, Any]] = []
 
-    async def _fake_catalog(**kwargs: Any) -> ProviderModelsDiscoverResult:
-        calls.append(kwargs["base_url"])
-        return ProviderModelsDiscoverResult(ok=True, provider_id="tokenrhythm")
+    async def _unexpected_catalog(**_kwargs: Any) -> ProviderModelsDiscoverResult:
+        raise AssertionError("a non-production origin must not enter the catalog coordinator")
+
+    async def _fake_raw(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True,
+            provider_id="tokenrhythm",
+            source="live",
+            models=[{"id": "uat-model"}],
+        )
 
     monkeypatch.setattr(
         model_catalog_refresh,
         "discover_tokenrhythm_models",
-        _fake_catalog,
+        _unexpected_catalog,
         raising=False,
     )
+    monkeypatch.setattr(probe_module, "discover_provider_models", _fake_raw)
 
     result = _discover_selectable(
         provider_id="tokenrhythm",
         api_key="synthetic-key",
-        base_url="https://api.tokenrhythm.studio/v1",
+        base_url="https://uat.tokenrhythm.studio/v1",
+        force_refresh=True,
+        persist_catalog=True,
+        catalog_config=object(),
     )
 
     assert result.ok is True
-    assert calls == ["https://api.tokenrhythm.studio/v1"]
+    assert result.source == "live"
+    assert result.models == [{"id": "uat-model"}]
+    assert calls == [
+        {
+            "provider_id": "tokenrhythm",
+            "api_key": "synthetic-key",
+            "api_key_env": "",
+            "base_url": "https://uat.tokenrhythm.studio/v1",
+            "proxy": "",
+        }
+    ]
+
+
+def test_tokenrhythm_uat_listing_does_not_inherit_production_metadata(
+    monkeypatch: Any,
+) -> None:
+    from opensquilla.gateway import model_catalog_refresh
+
+    async def _unexpected_catalog(**_kwargs: Any) -> ProviderModelsDiscoverResult:
+        raise AssertionError("UAT must not enter the production catalog coordinator")
+
+    monkeypatch.setattr(
+        model_catalog_refresh,
+        "discover_tokenrhythm_models",
+        _unexpected_catalog,
+        raising=False,
+    )
+    seen = _patch_response(monkeypatch, _models_response)
+
+    result = _discover_selectable(
+        provider_id="tokenrhythm",
+        api_key="synthetic-uat-key",
+        base_url="https://uat.tokenrhythm.studio/v1",
+    )
+
+    assert result.ok is True
+    assert result.source == "live"
+    assert [model["id"] for model in result.models] == ["test-model-a"]
+    assert str(seen[0].url) == "https://uat.tokenrhythm.studio/v1/models"
+    assert seen[0].headers["authorization"] == "Bearer synthetic-uat-key"
+    metadata = result.models[0]["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["published"] is None
+    assert metadata["declared"] is not None
 
 
 def test_discover_reports_missing_key_without_network(monkeypatch: Any) -> None:

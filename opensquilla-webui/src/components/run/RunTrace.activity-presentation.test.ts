@@ -9,6 +9,7 @@ import type {
   ChatToolCallGroup,
   ChatToolCallRenderItem,
 } from '@/types/chat'
+import { BROWSER_WORKBENCH_OPEN_EVENT } from '@/workbench/browserItems'
 import runTraceSource from './RunTrace.vue?raw'
 
 const mountedApps: App[] = []
@@ -72,6 +73,7 @@ async function mountTimeline(
   items: ChatStreamTimelineItem[],
   options: {
     presentation?: 'activity'
+    groupOpen?: boolean
     itemOpen?: boolean
     onShowResult?: (content: string, title: string, context?: unknown) => void
     toolStatusText?: (call: ChatToolCallRenderItem) => string
@@ -85,7 +87,7 @@ async function mountTimeline(
       return () => h(ToolCallTimeline, {
         items,
         ...(options.presentation ? { presentation: options.presentation } : {}),
-        isToolGroupOpen: () => false,
+        isToolGroupOpen: () => options.groupOpen === true,
         isToolItemOpen: () => options.itemOpen === true,
         toolGroupStatusText: (toolGroup: ChatToolCallGroup) => {
           if (toolGroup.isRunning) return 'Running'
@@ -249,7 +251,7 @@ describe('RunTrace activity presentation', () => {
     ).toEqual(['Done', 'Failed'])
   })
 
-  it('neutralizes completed chrome and omits failed activity', async () => {
+  it('neutralizes completed chrome while keeping failed activity visible', async () => {
     const el = await mountTimeline(
       [completedGroup, failedGroup],
       { presentation: 'activity' },
@@ -272,16 +274,19 @@ describe('RunTrace activity presentation', () => {
     expect(
       Array.from(el.querySelectorAll('.tool-row--group .tool-row__status'))
         .map(node => node.textContent),
-    ).toEqual([])
+    ).toEqual(["Didn't complete"])
     expect(
       el.querySelector('.tool-row--group')?.getAttribute('aria-expanded'),
     ).toBe('false')
     expect(el.querySelector('.tool-row__bullet--err')).toBeNull()
-    expect(el.querySelector('.tool-row__activity-icon--error')).toBeNull()
+    expect(el.querySelector('.tool-row__activity-icon--error')).not.toBeNull()
     expect(el.querySelector('.tool-row__state-icon--err')).toBeNull()
-    expect(el.querySelector('.activity-tool-details__line--error')).toBeNull()
+    const errorSections = [...el.querySelectorAll('.activity-tool-details__section')]
+      .filter(section => section.querySelector('.activity-tool-details__section-label')?.textContent === 'error')
+    expect(errorSections).toHaveLength(2)
+    expect(errorSections.every(section => section.querySelector('.activity-tool-details__preview')?.textContent === 'failed')).toBe(true)
     expect(el.querySelector('.tool-row-section--error')).toBeNull()
-    expect(el.textContent).not.toContain('failed-group')
+    expect(el.textContent).toContain('failed-group')
   })
 
   it('uses the running treatment without repeating a running status label', async () => {
@@ -296,7 +301,7 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.tool-row--group .tool-row__status')).toBeNull()
   })
 
-  it('omits a single failed activity call', async () => {
+  it('shows a single failed activity call and its terminal status', async () => {
     const el = await mountTimeline([
       group('single-failure-group', [
         call('single-failure', {
@@ -308,9 +313,9 @@ describe('RunTrace activity presentation', () => {
       ]),
     ], { presentation: 'activity' })
 
-    expect(el.querySelector('.tool-row--error')).toBeNull()
-    expect(el.textContent).not.toContain('single-failure-group')
-    expect(el.querySelector('[role="status"]')).toBeNull()
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+    expect(el.textContent).toContain('single-failure-group')
+    expect(el.querySelector('.tool-row__status')?.textContent).toBe("Didn't complete")
   })
 
   it.each(['document_apply', 'document_patch'])(
@@ -333,10 +338,10 @@ describe('RunTrace activity presentation', () => {
     },
   )
 
-  it('keeps a restored document writer group-level failure visible', async () => {
-    const restoredFailure = group('document.update', [
+  it.each(['shell', 'document_patch'])('keeps a restored %s group-level failure visible', async (name) => {
+    const restoredFailure = group('restored-failure', [
       call('restored-writer', {
-        name: 'document_patch',
+        name,
         status: 'success',
       }),
     ])
@@ -346,9 +351,11 @@ describe('RunTrace activity presentation', () => {
 
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
     expect(el.textContent).toContain("Didn't complete")
+    expect(restoredFailure.group.calls[0]?.status).toBe('success')
+    expect(restoredFailure.group.calls[0]?.isError).toBe(false)
   })
 
-  it('omits cancelled activity even when it has injected status copy', async () => {
+  it('keeps cancelled activity and its injected status copy visible', async () => {
     const el = await mountTimeline([
       group('single-cancelled-group', [
         call('single-cancelled', {
@@ -363,12 +370,12 @@ describe('RunTrace activity presentation', () => {
       toolStatusText: () => 'Cancelled',
     })
 
-    expect(el.querySelector('.tool-row--error')).toBeNull()
-    expect(el.textContent).not.toContain('Cancelled')
-    expect(el.querySelector('[role="status"]')).toBeNull()
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+    expect(el.textContent).toContain('Cancelled')
+    expect(el.querySelector('.tool-row__status')?.textContent).toBe('Cancelled')
   })
 
-  it('keeps successful calls from a mixed activity group', async () => {
+  it('keeps successful and failed calls from a mixed activity group', async () => {
     const el = await mountTimeline([
       group('mixed-group', [
         call('successful-call'),
@@ -381,10 +388,11 @@ describe('RunTrace activity presentation', () => {
       ]),
     ], { presentation: 'activity' })
 
-    expect(el.querySelectorAll('.tool-row')).toHaveLength(1)
-    expect(el.querySelector('.tool-row--error')).toBeNull()
+    expect(el.querySelectorAll('.tool-row')).toHaveLength(3)
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
     expect(el.textContent).toContain('mixed-group')
-    expect(el.textContent).not.toContain('failed-call')
+    expect(el.textContent).toContain('successful-call')
+    expect(el.textContent).toContain('failed-call')
   })
 
   it('keeps a successful activity call collapsed until explicitly opened', async () => {
@@ -398,6 +406,110 @@ describe('RunTrace activity presentation', () => {
     expect(row?.getAttribute('aria-expanded')).toBe('false')
     expect(el.querySelector('.tool-row-body')).toBeNull()
     expect(el.querySelector('.activity-tool-details')).toBeNull()
+  })
+
+  it('keeps search URLs collapsed without exposing invocation details', async () => {
+    const inputRaw = JSON.stringify({ query: 'AI news today 2026-08-26' })
+    const el = await mountTimeline([
+      group('web.search', [
+        call('search-call', {
+          name: 'web_search',
+          inputRaw,
+          inputPreview: inputRaw,
+          sources: [{ url: 'https://example.test/result', title: 'Result' }],
+          result: JSON.stringify({
+            ok: true,
+            provider_attempts: [{ provider: 'brave', status: 'success' }],
+          }),
+        }),
+      ]),
+    ], { presentation: 'activity' })
+
+    const row = el.querySelector('.tool-row')
+    expect(row?.getAttribute('aria-expanded')).toBe('false')
+    expect(el.querySelector('.step-chevron')).not.toBeNull()
+    expect(el.querySelector('.tool-row-targets')).toBeNull()
+    expect(el.querySelector('.tool-row-body')).toBeNull()
+    expect(el.querySelector('.activity-tool-details')).toBeNull()
+    expect(el.textContent).not.toMatch(/INPUT|RESULT|provider_attempts/)
+  })
+
+  it('lists web-search result URLs as side-browser targets without exposing the query', async () => {
+    const opened: string[] = []
+    const onOpen = (event: Event) => {
+      opened.push((event as CustomEvent<{ url: string }>).detail.url)
+    }
+    window.addEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onOpen)
+
+    const searchCall = (id: string, urls: string[]) => call(id, {
+      name: 'web_search',
+      inputRaw: '{}',
+      inputPreview: '',
+      sources: urls.map(url => ({ url, title: id })),
+      presentation: {
+        category: 'search',
+        primaryArguments: [],
+        argumentDisplay: 'primary',
+        lifecycleDisplay: 'boundary',
+      },
+    })
+    const el = await mountTimeline([
+      group('web.search', [
+        searchCall('first result', [
+          'https://example.test/one',
+          'https://example.test/two',
+        ]),
+        searchCall('second result', ['https://docs.example.test/three']),
+      ]),
+    ], { presentation: 'activity', groupOpen: true, itemOpen: true })
+
+    try {
+      const groupRow = el.querySelector('.tool-row--group')
+      const memberRows = el.querySelectorAll('.tool-row--member')
+      const urlTargets = el.querySelectorAll<HTMLButtonElement>('.tool-row-target--url')
+
+      expect(groupRow?.getAttribute('aria-expanded')).toBe('true')
+      expect(memberRows).toHaveLength(2)
+      expect(Array.from(memberRows).every(row => row.getAttribute('aria-expanded') === 'true')).toBe(true)
+      expect(urlTargets).toHaveLength(3)
+      expect(urlTargets[0]?.textContent).toContain('example.test/one')
+      expect(memberRows[0]?.textContent).toContain('2 results')
+      expect(el.textContent).not.toMatch(/INPUT|RESULT|query|provider_attempts/)
+      expect(el.querySelector('.activity-tool-details')).toBeNull()
+
+      urlTargets[0]?.click()
+      expect(opened).toEqual(['https://example.test/one'])
+    } finally {
+      window.removeEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onOpen)
+    }
+  })
+
+  it('shows a file-read path as plain text without making it clickable or expandable', async () => {
+    const inputRaw = JSON.stringify({ path: 'src/App.vue' })
+    const el = await mountTimeline([
+      group('file.inspect', [call('read-file', {
+        name: 'read_file',
+        inputRaw,
+        inputPreview: inputRaw,
+        result: 'private file contents',
+        resultPreview: 'private file contents',
+        presentation: {
+          category: 'file_read',
+          primaryArguments: ['path'],
+          argumentDisplay: 'primary',
+          lifecycleDisplay: 'boundary',
+        },
+      })]),
+    ], { presentation: 'activity', itemOpen: true })
+
+    const row = el.querySelector('.tool-row')
+    const path = el.querySelector('.tool-row-target--path')
+    expect(row?.hasAttribute('aria-expanded')).toBe(false)
+    expect(path?.tagName).toBe('SPAN')
+    expect(path?.textContent).toBe('src/App.vue')
+    expect(el.querySelector('.tool-row-target--url')).toBeNull()
+    expect(el.querySelector('.activity-tool-details')).toBeNull()
+    expect(el.textContent).not.toMatch(/INPUT|RESULT|private file contents/)
   })
 
   it.each([undefined, 'activity' as const])(
@@ -509,15 +621,13 @@ describe('RunTrace activity presentation', () => {
     },
   )
 
-  it('shows long activity details in one bounded preview and preserves raw forwarding', async () => {
-    const result = 'file contents\n'.repeat(30)
+  it('shows long generic-tool details in one bounded preview and preserves raw forwarding', async () => {
+    const result = 'custom tool result\n'.repeat(30)
     const onShowResult = vi.fn()
-    // A read-shaped call: content-size summaries are reserved for read
-    // operations, so this is the compact-summary path.
     const el = await mountTimeline([
       group('long-result-group', [
         call('long-result', {
-          name: 'read_file',
+          name: 'custom_tool',
           result,
           resultPreview: result.slice(0, 200),
         }),
@@ -535,8 +645,8 @@ describe('RunTrace activity presentation', () => {
     )
     expect(details).not.toBeNull()
     expect(details?.classList.contains('activity-tool-details--bounded')).toBe(true)
-    expect(window?.textContent).toContain('file contents')
-    expect(window?.textContent).toContain('view full')
+    expect(window?.textContent).toContain('custom tool result')
+    expect(window?.textContent).toContain('expand content')
     expect(el.querySelector('.activity-tool-details__summary')).toBeNull()
     expect(el.querySelectorAll('.activity-tool-details__window')).toHaveLength(1)
     expect(el.querySelector('.tool-row-section')).toBeNull()
@@ -550,7 +660,7 @@ describe('RunTrace activity presentation', () => {
       `INPUT\n{}\n\nRESULT\n${result.trim()}`,
       'long-result-group · details',
       {
-        toolName: 'read_file',
+        toolName: 'custom_tool',
         inputRaw: '{}',
         section: undefined,
       },

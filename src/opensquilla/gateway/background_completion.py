@@ -22,6 +22,63 @@ EventEmitter = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 ChannelManagerRef = Callable[[], Any | None]
 
 
+def _accepts_keyword_arg(call: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(call).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
+        for parameter in parameters
+    )
+
+
+def _accepts_explicit_keyword_arg(call: Any, name: str) -> bool:
+    try:
+        parameter = inspect.signature(call).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
+def _session_owner_kwargs(
+    operation: Any,
+    *,
+    session_id: object,
+    session_epoch: object,
+) -> dict[str, object]:
+    if session_epoch is None:
+        if session_id is None:
+            return {}
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id must be a non-empty string when present")
+        if _accepts_keyword_arg(operation, "expected_session_id"):
+            return {"expected_session_id": session_id}
+        return {}
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        raise ValueError("session_epoch requires a valid session_id and non-negative epoch")
+    if not all(
+        _accepts_explicit_keyword_arg(operation, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError(
+            "Modern subagent completion requires an exact session-owner operation"
+        )
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
+
+
 @dataclass(frozen=True)
 class _DeliveryResult:
     status: str
@@ -105,6 +162,7 @@ class BackgroundCompletionManager:
         parent_session_key: str,
         parent_task_id: str,
         pending_count: int | None = None,
+        parent_envelope: Any | None = None,
     ) -> None:
         group_id = self.group_id(parent_session_key, parent_task_id)
         async with self._state_lock:
@@ -117,10 +175,15 @@ class BackgroundCompletionManager:
             if group_id in self._waiting_groups or group_id in self._wake_groups:
                 return
             self._waiting_groups.add(group_id)
+            if parent_envelope is not None:
+                self._parent_envelopes[group_id] = parent_envelope
+            else:
+                parent_envelope = self._parent_envelopes.get(group_id)
         payload = self._base_payload(
             parent_session_key=parent_session_key,
             parent_task_id=parent_task_id,
             status="waiting",
+            parent_envelope=parent_envelope,
         )
         if pending_count is not None:
             payload["pending_count"] = pending_count
@@ -132,12 +195,17 @@ class BackgroundCompletionManager:
         parent_session_key: str,
         parent_task_id: str,
         task_runtime: Any,
+        parent_envelope: Any | None = None,
     ) -> None:
         group_id = self.group_id(parent_session_key, parent_task_id)
         if not await self._begin_group_admission(parent_session_key, group_id):
             return
         try:
-            parent_envelope = _parent_envelope_from_task_runtime(task_runtime, parent_task_id)
+            admitted_parent_envelope = parent_envelope
+            parent_envelope = admitted_parent_envelope or _parent_envelope_from_task_runtime(
+                task_runtime,
+                parent_task_id,
+            )
             parent_run_mode_override = _parent_run_mode_override_from_task_runtime(
                 task_runtime,
                 parent_task_id,
@@ -161,7 +229,10 @@ class BackgroundCompletionManager:
                     return
                 self._group_parents[group_id] = parent_session_key
                 if parent_envelope is not None:
-                    self._parent_envelopes.setdefault(group_id, parent_envelope)
+                    if admitted_parent_envelope is not None:
+                        self._parent_envelopes[group_id] = parent_envelope
+                    else:
+                        self._parent_envelopes.setdefault(group_id, parent_envelope)
                 if parent_run_mode_override is not None:
                     self._parent_run_mode_overrides.setdefault(
                         group_id,
@@ -271,13 +342,18 @@ class BackgroundCompletionManager:
         task_runtime: Any,
         message: str,
         provenance: dict[str, Any],
+        parent_envelope: Any | None = None,
     ) -> None:
         """Schedule a parent wake without waiting inline for same-session work."""
         group_id = self.group_id(parent_session_key, parent_task_id)
         if not await self._begin_group_admission(parent_session_key, group_id):
             return
         try:
-            parent_envelope = _parent_envelope_from_task_runtime(task_runtime, parent_task_id)
+            admitted_parent_envelope = parent_envelope
+            parent_envelope = admitted_parent_envelope or _parent_envelope_from_task_runtime(
+                task_runtime,
+                parent_task_id,
+            )
             parent_run_mode_override = _parent_run_mode_override_from_task_runtime(
                 task_runtime,
                 parent_task_id,
@@ -302,7 +378,11 @@ class BackgroundCompletionManager:
                 self._group_parents[group_id] = parent_session_key
                 self._wake_groups.add(group_id)
                 self._waiting_groups.discard(group_id)
-                parent_envelope = self._parent_envelopes.get(group_id) or parent_envelope
+                parent_envelope = (
+                    admitted_parent_envelope
+                    or self._parent_envelopes.get(group_id)
+                    or parent_envelope
+                )
                 if parent_envelope is not None:
                     self._parent_envelopes[group_id] = parent_envelope
                 parent_run_mode_override = self._parent_run_mode_overrides.get(
@@ -533,13 +613,25 @@ class BackgroundCompletionManager:
         parent_session_key: str,
         parent_task_id: str,
         status: str,
+        parent_envelope: Any | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "group_id": self.group_id(parent_session_key, parent_task_id),
             "parent_session_key": parent_session_key,
             "parent_task_id": parent_task_id,
             "status": status,
         }
+        session_id = getattr(parent_envelope, "session_id", None)
+        if isinstance(session_id, str) and session_id:
+            payload["session_id"] = session_id
+        session_epoch = getattr(parent_envelope, "session_epoch", None)
+        if (
+            isinstance(session_epoch, int)
+            and not isinstance(session_epoch, bool)
+            and session_epoch >= 0
+        ):
+            payload["epoch"] = session_epoch
+        return payload
 
     async def _enqueue_and_watch_parent_wake(
         self,
@@ -592,12 +684,22 @@ class BackgroundCompletionManager:
                     return
             send_with_envelope = getattr(task_runtime, "send_with_envelope", None)
             if parent_envelope is not None and callable(send_with_envelope):
+                if getattr(parent_envelope, "session_epoch", None) is not None and not (
+                    _accepts_explicit_keyword_arg(send_with_envelope, "envelope")
+                ):
+                    raise RuntimeError(
+                        "Modern subagent completion requires owner-bound wake admission"
+                    )
                 handle = await send_with_envelope(
                     parent_envelope,
                     message,
                     provenance=provenance,
                     stream_event_sink=stream_collector,
                     accepted_run_mode_override=parent_run_mode_override,
+                )
+            elif getattr(parent_envelope, "session_epoch", None) is not None:
+                raise RuntimeError(
+                    "Modern subagent completion requires owner-bound wake admission"
                 )
             else:
                 handle = await task_runtime.send(
@@ -623,6 +725,7 @@ class BackgroundCompletionManager:
                 synthesis_task_id=None,
                 error_class=error_class,
                 error_message=error_message,
+                parent_envelope=parent_envelope,
             )
             async with self._state_lock:
                 self._wake_groups.discard(group_id)
@@ -633,6 +736,7 @@ class BackgroundCompletionManager:
             parent_session_key=parent_session_key,
             parent_task_id=parent_task_id,
             status="synthesizing",
+            parent_envelope=parent_envelope,
         )
         if isinstance(synthesis_task_id, str) and synthesis_task_id:
             payload["synthesis_task_id"] = synthesis_task_id
@@ -646,6 +750,7 @@ class BackgroundCompletionManager:
                 synthesis_task_id=None,
                 error_class="MissingTaskHandle",
                 error_message="parent wake did not return a synthesis task id",
+                parent_envelope=parent_envelope,
             )
             return
 
@@ -656,6 +761,7 @@ class BackgroundCompletionManager:
             final_text=stream_collector.text,
             delivery_target=delivery_target,
             task_runtime=task_runtime,
+            parent_envelope=parent_envelope,
         )
 
     async def _wait_for_parent_task_to_release(
@@ -685,6 +791,7 @@ class BackgroundCompletionManager:
         final_text: Callable[[], str],
         delivery_target: _DeliveryTarget | None,
         task_runtime: Any,
+        parent_envelope: Any | None,
     ) -> None:
         try:
             record = await task_runtime.wait(synthesis_task_id)
@@ -705,6 +812,7 @@ class BackgroundCompletionManager:
                 synthesis_task_id=synthesis_task_id,
                 error_class=error_class,
                 error_message=error_message,
+                parent_envelope=parent_envelope,
             )
             return
 
@@ -720,6 +828,35 @@ class BackgroundCompletionManager:
                 synthesis_status=synthesis_status,
                 error_class=_optional_str(getattr(record, "error_class", None)),
                 error_message=_optional_str(getattr(record, "error_message", None)),
+                parent_envelope=parent_envelope,
+            )
+            return
+
+        try:
+            await _require_current_parent_owner(
+                self._session_manager,
+                parent_session_key=parent_session_key,
+                parent_envelope=parent_envelope,
+            )
+        except Exception as exc:  # noqa: BLE001 - stale owner becomes a group failure.
+            error_class, error_message = sanitize_agent_error(
+                {
+                    "status": "failed",
+                    "terminal_reason": "error",
+                    "error_class": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+                fallback_error_class=type(exc).__name__,
+                fallback_error_message=str(exc) or "Agent error",
+            )
+            await self._emit_terminal_failure(
+                parent_session_key=parent_session_key,
+                parent_task_id=parent_task_id,
+                synthesis_task_id=synthesis_task_id,
+                synthesis_status=synthesis_status,
+                error_class=error_class,
+                error_message=error_message,
+                parent_envelope=parent_envelope,
             )
             return
 
@@ -733,6 +870,7 @@ class BackgroundCompletionManager:
             parent_session_key=parent_session_key,
             parent_task_id=parent_task_id,
             status="done",
+            parent_envelope=parent_envelope,
         )
         payload.update(
             {
@@ -757,11 +895,13 @@ class BackgroundCompletionManager:
         error_class: str | None = None,
         error_message: str | None = None,
         synthesis_status: str | None = None,
+        parent_envelope: Any | None = None,
     ) -> None:
         payload = self._base_payload(
             parent_session_key=parent_session_key,
             parent_task_id=parent_task_id,
             status="failed",
+            parent_envelope=parent_envelope,
         )
         if synthesis_task_id:
             payload["synthesis_task_id"] = synthesis_task_id
@@ -857,6 +997,35 @@ class BackgroundCompletionManager:
             self._parent_run_mode_overrides.pop(group_id, None)
             if group_id not in self._cancelled_groups:
                 self._group_parents.pop(group_id, None)
+
+
+async def _require_current_parent_owner(
+    session_manager: Any,
+    *,
+    parent_session_key: str,
+    parent_envelope: Any | None,
+) -> None:
+    session_id = getattr(parent_envelope, "session_id", None)
+    session_epoch = getattr(parent_envelope, "session_epoch", None)
+    if session_id is None and session_epoch is None:
+        return
+    get_session = getattr(session_manager, "get_session", None)
+    if not callable(get_session):
+        if session_epoch is not None:
+            raise RuntimeError(
+                "Modern subagent completion requires an exact parent-owner read"
+            )
+        return
+    current = await get_session(
+        parent_session_key,
+        **_session_owner_kwargs(
+            get_session,
+            session_id=session_id,
+            session_epoch=session_epoch,
+        ),
+    )
+    if current is None:
+        raise RuntimeError("Parent session is no longer current")
 
 
 async def _get_session(session_manager: Any, session_key: str) -> Any | None:

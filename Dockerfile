@@ -21,8 +21,10 @@ ARG OPENSQUILLA_FORBID_PERSONAL_BGM=0
 WORKDIR /build/opensquilla-webui
 
 # Cache dependency installation independently from application source. Vite
-# writes the verified bundle to /build/src/.../static/dist; the final Python
-# stage copies only that artifact, never Node.js or node_modules.
+# writes the verified bundle to /build/opensquilla-webui/dist; the build script
+# then explicitly stages the same bytes into /build/src/.../static/dist. The
+# final Python stage copies only that staged artifact, never Node.js or
+# node_modules.
 COPY opensquilla-webui/package.json opensquilla-webui/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
 COPY opensquilla-webui/ ./
@@ -63,6 +65,7 @@ COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py
 COPY opensquilla-webui/ ./opensquilla-webui/
 COPY src/ ./src/
 COPY migrations/ ./migrations/
+COPY desktop/electron/runtime/runtime-pack-catalog.json ./desktop/electron/runtime/runtime-pack-catalog.json
 COPY --from=webui-builder \
     /build/src/opensquilla/gateway/static/dist/ \
     ./src/opensquilla/gateway/static/dist/

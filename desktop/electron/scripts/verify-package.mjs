@@ -6,6 +6,7 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 import { verifyInstallerProgressPolicy } from './installer-progress-policy.mjs'
+import { verifyGatewayIntegrity } from './gateway-integrity.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -227,6 +228,12 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   }
 
   const files = await listFiles(root)
+  try {
+    verifyGatewayIntegrity(repoRoot, root, { platform })
+  } catch (error) {
+    fail(`${label} ${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
   if (files.length === 0) {
     fail(`${label} runtime is empty: ${root}`)
     return
@@ -286,6 +293,14 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   }
 }
 
+function sourceBetweenMarkers(source, startMarker, endMarker) {
+  const startIndex = source.indexOf(startMarker)
+  if (startIndex === -1) return ''
+  const endIndex = source.indexOf(endMarker, startIndex + startMarker.length)
+  if (endIndex === -1) return ''
+  return source.slice(startIndex, endIndex)
+}
+
 function verifyMainProcess(source, label) {
   for (const expected of [
     'gatewayStartPromise',
@@ -340,16 +355,22 @@ function verifyMainProcess(source, label) {
   if (source.includes('/control/chat/new') || source.includes('waitForControlUi')) {
     fail(`${label} main process still makes the Desktop document depend on Gateway Control UI`)
   }
-  const createWindowIndex = source.indexOf('async function createMainWindow')
-  const createWindowSource = createWindowIndex === -1
-    ? ''
-    : source.slice(createWindowIndex, createWindowIndex + 8_000)
+  const createWindowSource = sourceBetweenMarkers(
+    source,
+    'async function createMainWindow',
+    'function currentMainWindow',
+  )
   if (!createWindowSource.includes('loadURL(DESKTOP_RENDERER_URL)')) {
     fail(`${label} main window does not load the local Desktop renderer`)
   }
-  const waitIndex = source.indexOf('async function waitForGateway')
-  const waitSource = waitIndex === -1 ? '' : source.slice(waitIndex, waitIndex + 1_000)
-  if (!waitSource.includes('readinessCheck(url)') || waitSource.includes('healthCheck(url)')) {
+  const waitSource = sourceBetweenMarkers(
+    source,
+    'async function waitForGateway',
+    'function hasGatewayProcessExited',
+  )
+  const usesReadinessProbe = /readinessCheck\(\s*url(?:\s*,[^)]*)?\)/.test(waitSource)
+  const usesHealthProbe = /healthCheck\(\s*url(?:\s*,[^)]*)?\)/.test(waitSource)
+  if (!usesReadinessProbe || usesHealthProbe) {
     fail(`${label} gateway startup does not use the readiness endpoint`)
   }
 

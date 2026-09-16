@@ -25,8 +25,7 @@ function resultRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function spawnedSessionKey(value: unknown): string | null {
-  const record = resultRecord(value)
+function spawnedSessionKey(record: Record<string, unknown> | null): string | null {
   const key = typeof record?.session_key === 'string'
     ? record.session_key.trim()
     : ''
@@ -43,11 +42,14 @@ export function createdSessionFromToolCall(
     || call.isError
     || call.status !== 'success'
   ) return null
-  const sessionKey = spawnedSessionKey(call.result)
+  const record = resultRecord(call.result)
+  const sessionKey = spawnedSessionKey(record)
   if (!sessionKey) return null
+  const title = typeof record?.title === 'string' ? record.title.trim() : ''
   return {
     callId: call.toolId,
     sessionKey,
+    ...(title ? { title } : {}),
   }
 }
 

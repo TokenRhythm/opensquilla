@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-race-a'
@@ -35,7 +36,7 @@ test('late chat.send response cannot navigate away from the current session', as
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloOkResponse())
           return
         }
         if (frame.method === 'chat.send') {
@@ -83,6 +84,8 @@ test('late chat.send response cannot navigate away from the current session', as
                 runStatus: 'idle',
               },
             ],
+            count: 2,
+            ts: 1_800_000_000,
             has_more: false,
           },
           'sessions.messages.subscribe': {

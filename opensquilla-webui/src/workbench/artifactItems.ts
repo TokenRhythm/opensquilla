@@ -1,4 +1,4 @@
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchPreviewDescriptor } from '@/types/workbenchResources'
 import {
   artifactFileTitle,
@@ -9,6 +9,7 @@ import {
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import type { WorkbenchItem } from './types'
+import { previewPagePathFromUrl } from '@/utils/workbench/previewPagePath'
 
 const BASE64_URL_ALPHABET =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
@@ -78,33 +79,6 @@ export function artifactWorkbenchItemId(
     privateIdentityDigest(sessionKey),
     artifactIdentityToken(resourceIdentity || artifactIdentity(artifact)),
   ].join(':')
-}
-
-export function artifactCollectionWorkbenchItemId(sessionKey: string): string {
-  return [
-    'artifact-collection',
-    privateIdentityDigest(sessionKey),
-  ].join(':')
-}
-
-export function createArtifactCollectionWorkbenchItem(options: {
-  artifacts: readonly ArtifactPayload[]
-  sessionKey: string
-  title: string
-}): WorkbenchItem {
-  const { artifacts, sessionKey, title } = options
-  return {
-    id: artifactCollectionWorkbenchItemId(sessionKey),
-    kind: 'artifact-collection',
-    title,
-    scope: { type: 'session', id: sessionKey },
-    hostKind: 'dom',
-    retention: 'keep-alive',
-    payload: {
-      artifacts: [...artifacts],
-      sessionKey,
-    },
-  }
 }
 
 export function createArtifactPreviewWorkbenchItem(options: {
@@ -230,19 +204,6 @@ export function preparedPreviewFromWorkbenchItem(
   return value as WorkbenchPreviewDescriptor
 }
 
-export function artifactsFromWorkbenchItem(
-  item: WorkbenchItem | null,
-): readonly ArtifactPayload[] {
-  if (item?.kind !== 'artifact-collection') return []
-  const artifacts = item.payload.artifacts
-  return Array.isArray(artifacts)
-    ? artifacts.filter(
-      (artifact): artifact is ArtifactPayload =>
-        Boolean(artifact) && typeof artifact === 'object',
-    )
-    : []
-}
-
 export function artifactFromWorkbenchItem(
   item: WorkbenchItem | null,
 ): ArtifactPayload | null {
@@ -251,6 +212,31 @@ export function artifactFromWorkbenchItem(
   return artifact && typeof artifact === 'object'
     ? artifact as ArtifactPayload
     : null
+}
+
+/** File operations follow the displayed Document, never a related delivery. */
+export function fileActionArtifactFromWorkbenchItem(
+  item: WorkbenchItem, state: Readonly<Record<string, unknown>>,
+): ArtifactPayload | undefined {
+  const artifact = artifactFromWorkbenchItem(item)
+  if (!artifact) return
+  const prepared = preparedPreviewFromWorkbenchItem(item)
+  if (prepared && prepared.resource.type !== 'document') return artifact
+  const documentId = typeof state.workingFileDocumentId === 'string' && state.workingFileDocumentId
+    ? state.workingFileDocumentId
+    : typeof artifact.documentId === 'string'
+      && item.payload.resourceIdentity === `document:${artifact.documentId}` ? artifact.documentId : ''
+  if (!documentId) return artifact
+  if (state.workingFilePageUnknown === true) return
+  const pagePath = state.previewLaunchUrl ? previewPagePathFromUrl(
+    String(state.currentUrl || state.previewLaunchUrl), {
+      launch_url: String(state.previewLaunchUrl), entrypoint: String(state.workingFileEntrypoint || ''),
+      page_path: String(state.workingFileInitialPage || ''),
+    },
+  ) : artifact.previewPagePath
+  if (state.previewLaunchUrl && !pagePath) return
+  return { ...artifact, source: 'workspace-preview', documentId,
+    ...(pagePath ? { previewPagePath: pagePath } : {}) }
 }
 
 export function navigationArtifactsFromWorkbenchItem(

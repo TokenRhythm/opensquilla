@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/skills'
 const INSTALL_DELAY_MS = 120
@@ -198,9 +199,7 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
       if (frame.type !== 'req') return
 
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({
-          type: 'hello-ok',
-          protocol: 3,
+        ws.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'skills-add-drawer-e2e' },
           features: {
             methods: [
@@ -299,7 +298,7 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
             auto_enable_max_risk: 'low',
           },
         },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'usage.status': { sessions: [] },
       }
       ws.send(response(frame.id, payloads[String(frame.method)] ?? {}))

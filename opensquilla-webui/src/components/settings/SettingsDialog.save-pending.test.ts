@@ -72,7 +72,6 @@ function mockCatalog() {
     privacyPanel: ref({}),
     memoryPanel: ref({ autoCapture: true }),
     modelStrategyPanel: ref({}),
-    presetPanel: ref(null),
     channelsPanel: ref({}),
     capabilitiesPanel: ref({}),
     hasSetupAction: ref(false),

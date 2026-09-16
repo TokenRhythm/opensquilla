@@ -8,9 +8,96 @@ import {
   buildRendererConsoleLogEntry,
   buildRendererGoneLogEntry,
   buildRendererStateLogEntry,
+  isLiveMainFrameConsoleMessage,
   RendererConsoleLogLimiter,
   shouldForwardConsoleLevel,
 } from '../dist/desktop-renderer-log.js'
+
+// A late console event must not touch an already destroyed native window.
+// The signed Windows package failed here after app.exit: Electron's default
+// uncaught-exception handler opened a synchronous error dialog and blocked exit.
+const trustedMainFrame = {}
+const liveContents = { isDestroyed: () => false, mainFrame: trustedMainFrame }
+const liveWindow = { isDestroyed: () => false, webContents: liveContents }
+assert.equal(isLiveMainFrameConsoleMessage(liveWindow, { frame: trustedMainFrame }), true)
+assert.equal(isLiveMainFrameConsoleMessage(liveWindow, { frame: {} }), false)
+for (const missingFrame of [null, undefined]) {
+  assert.equal(isLiveMainFrameConsoleMessage(liveWindow, { frame: missingFrame }), false)
+  assert.equal(isLiveMainFrameConsoleMessage({
+    isDestroyed: () => false,
+    webContents: { isDestroyed: () => false, mainFrame: missingFrame },
+  }, { frame: missingFrame }), false, 'two missing frames must not establish trusted identity')
+}
+
+let lateWindowContentsReads = 0
+let lateDetailsFrameReads = 0
+const destroyedWindow = {
+  isDestroyed: () => true,
+  get webContents() {
+    lateWindowContentsReads += 1
+    throw new TypeError('Object has been destroyed')
+  },
+}
+const lateDetails = {
+  get frame() {
+    lateDetailsFrameReads += 1
+    throw new TypeError('Object has been destroyed')
+  },
+}
+assert.equal(isLiveMainFrameConsoleMessage(destroyedWindow, lateDetails), false)
+assert.equal(lateWindowContentsReads, 0, 'a destroyed window must fence its native getter')
+assert.equal(lateDetailsFrameReads, 0, 'a destroyed window must also fence the event frame getter')
+
+// Reproduce the exact old expression from signed app.asar/dist/main.js:7904.
+// The guarded call must reject the same window without repeating that access.
+const previousFrameCheck = (window, details) => details.frame !== window.webContents.mainFrame
+assert.throws(
+  () => previousFrameCheck(destroyedWindow, { frame: trustedMainFrame }),
+  { name: 'TypeError', message: 'Object has been destroyed' },
+)
+assert.equal(lateWindowContentsReads, 1)
+assert.equal(isLiveMainFrameConsoleMessage(destroyedWindow, { frame: trustedMainFrame }), false)
+assert.equal(lateWindowContentsReads, 1)
+
+let destroyedContentsFrameReads = 0
+const destroyedContentsWindow = {
+  isDestroyed: () => false,
+  webContents: {
+    isDestroyed: () => true,
+    get mainFrame() {
+      destroyedContentsFrameReads += 1
+      throw new TypeError('Object has been destroyed')
+    },
+  },
+}
+assert.equal(isLiveMainFrameConsoleMessage(destroyedContentsWindow, lateDetails), false)
+assert.equal(destroyedContentsFrameReads, 0, 'destroyed contents must fence its mainFrame getter')
+assert.equal(lateDetailsFrameReads, 0, 'destroyed contents must fence the event frame getter')
+
+// Native teardown can invalidate a getter after the alive checks pass.
+assert.equal(isLiveMainFrameConsoleMessage(liveWindow, lateDetails), false)
+assert.equal(lateDetailsFrameReads, 1)
+let invalidatedMainFrameReads = 0
+assert.equal(isLiveMainFrameConsoleMessage({
+  isDestroyed: () => false,
+  webContents: {
+    isDestroyed: () => false,
+    get mainFrame() {
+      invalidatedMainFrameReads += 1
+      throw new TypeError('Object has been destroyed')
+    },
+  },
+}, { frame: trustedMainFrame }), false)
+assert.equal(invalidatedMainFrameReads, 1)
+let invalidatedContentsReads = 0
+assert.equal(isLiveMainFrameConsoleMessage({
+  isDestroyed: () => false,
+  get webContents() {
+    invalidatedContentsReads += 1
+    throw new TypeError('Object has been destroyed')
+  },
+}, { frame: trustedMainFrame }), false)
+assert.equal(invalidatedContentsReads, 1)
 
 // Only errors are forwarded by default. Renderer warning/info/debug chatter is
 // dropped; a real process hang has its own structured lifecycle event.

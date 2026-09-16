@@ -1,10 +1,13 @@
 import { strict as assert } from 'node:assert'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import { desktopRouterConfigTomlLines } from '../dist/desktop-router-config.js'
+import { parse, stringify } from 'smol-toml'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -38,6 +41,96 @@ async function waitFor(check, label, timeoutMs = 60_000) {
   }
   const suffix = lastError ? ` Last error: ${lastError.message || lastError}` : ''
   throw new Error(`Timed out waiting for ${label}.${suffix}`)
+}
+
+async function fileExists(path) {
+  try {
+    await readFile(path)
+    return true
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+async function readDirectoryOrEmpty(path) {
+  try {
+    return await readdir(path)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return []
+    throw error
+  }
+}
+
+async function startOnboardingProbeServer(initialMode = 'success') {
+  let mode = initialMode
+  const requests = []
+  const server = createServer((request, response) => {
+    const body = []
+    request.on('data', (chunk) => body.push(chunk))
+    request.on('end', () => {
+      requests.push({
+        method: request.method,
+        url: request.url,
+        authorization: request.headers.authorization || '',
+        body: Buffer.concat(body).toString('utf8'),
+      })
+      if (mode === 'reject') {
+        response.writeHead(401, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          error: {
+            message: 'Synthetic credential rejected.',
+            type: 'authentication_error',
+            code: 'invalid_api_key',
+          },
+        }))
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end([
+        'data: {"id":"chatcmpl-onboarding-test","object":"chat.completion.chunk","created":0,"model":"synthetic-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
+        '',
+        'data: {"id":"chatcmpl-onboarding-test","object":"chat.completion.chunk","created":0,"model":"synthetic-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}',
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'))
+    })
+  })
+  await new Promise((resolveListen, rejectListen) => {
+    const onError = (error) => rejectListen(error)
+    server.once('error', onError)
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', onError)
+      resolveListen()
+    })
+  })
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    setMode(nextMode) {
+      mode = nextMode
+    },
+    async close() {
+      await new Promise((resolveClose, rejectClose) => {
+        server.close((error) => (error ? rejectClose(error) : resolveClose()))
+      })
+    },
+  }
+}
+
+async function setOnboardingBaseUrl(page, baseUrl) {
+  await page.locator('#baseUrl').evaluate((input, value) => {
+    input.value = value
+  }, baseUrl)
+}
+
+function isManagedTelemetrySpoolEntry(name) {
+  return name.endsWith('.ready')
+    || name.includes('.processing.')
+    || (name.startsWith('.') && name.endsWith('.tmp'))
 }
 
 async function readOnboardingTelemetry(userDataDir) {
@@ -375,6 +468,7 @@ async function launchIsolatedOnboarding(prefix) {
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
+      OPENSQUILLA_TESTING: '1',
       OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION: '',
       LANG: 'en_US.UTF-8',
       LC_ALL: 'en_US.UTF-8',
@@ -402,6 +496,11 @@ async function installPendingSaveStub(app) {
   })
 }
 
+async function assertUnifiedTelemetryNotice(page) {
+  assert.equal(await page.locator('input[name="reliabilityDiagnosticsEnabled"], input[name="productAnalyticsEnabled"]').count(), 0)
+  assert.equal(await page.locator('[data-i18n="onboarding.telemetry.notice"]').count(), 1)
+}
+
 async function pendingSaveState(app) {
   return await app.evaluate(() => {
     const state = globalThis.__opensquillaOnboardingSaveTest
@@ -425,6 +524,16 @@ async function settlePendingSave(app, outcome) {
     }
     pending.resolveSave(nextOutcome.result)
   }, outcome)
+}
+
+// Dispatch the renderer click after the button is visible.  Hosted macOS and
+// Windows runners can keep the onboarding card in a CSS transition long
+// enough for Playwright's pointer hit-testing to miss the first click; the
+// DOM event still exercises the same single-flight handler on every platform.
+async function clickFinish(page) {
+  const finish = page.locator('#finish')
+  await finish.waitFor({ state: 'visible' })
+  await finish.evaluate((button) => button.click())
 }
 
 async function assertSubmitPending(
@@ -518,12 +627,13 @@ async function verifySubmitFeedbackAndSingleFlight() {
     const apiKey = page.locator('#apiKey')
     await apiKey.fill('synthetic-submit-key')
     await page.locator('#onboardingLocale').selectOption('de')
+    await assertUnifiedTelemetryNotice(page)
     await installPendingSaveStub(app)
 
     await page.locator('#providerSelectToggle').click()
     assert.equal(await page.locator('#providerSelectToggle').getAttribute('aria-expanded'), 'true')
     assert.equal(await page.locator('#providerSelectPanel').isVisible(), true)
-    await page.locator('#finish').click()
+    await clickFinish(page)
     await assertSubmitPending(page, app, 1, {
       initialStatus: 'Desktop-Profil wird vorbereitet',
       savingLabel: 'Einrichtung wird gespeichert…',
@@ -550,6 +660,8 @@ async function verifySubmitFeedbackAndSingleFlight() {
     await assertSubmitActionsDoNotOverlap(page)
     const firstState = await pendingSaveState(app)
     assert.equal(firstState.lastPayload?.apiKey, 'synthetic-submit-key')
+    assert.equal(Object.hasOwn(firstState.lastPayload, 'reliabilityDiagnosticsEnabled'), false)
+    assert.equal(Object.hasOwn(firstState.lastPayload, 'productAnalyticsEnabled'), false)
 
     await page.locator('#finish').evaluate((button) => {
       button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
@@ -579,7 +691,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     )
     await page.locator('#onboardingLocale').selectOption('en')
 
-    await page.locator('#finish').click()
+    await clickFinish(page)
     await assertSubmitPending(page, app, 2)
     await settlePendingSave(app, {
       reject: true,
@@ -587,7 +699,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     })
     await assertSubmitRestored(page, 'Synthetic onboarding save rejected.', 'synthetic-submit-key')
 
-    await page.locator('#finish').click()
+    await clickFinish(page)
     await assertSubmitPending(page, app, 3)
     await settlePendingSave(app, {
       reject: false,
@@ -635,6 +747,82 @@ async function verifySubmitFeedbackAndSingleFlight() {
 
 await verifySubmitFeedbackAndSingleFlight()
 
+async function verifyProbeBeforePersistenceAndRetry() {
+  const probeServer = await startOnboardingProbeServer('reject')
+  const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
+    'opensquilla-electron-onboarding-probe-test-',
+  )
+  const credentialPath = join(userDataDir, 'desktop-credential.json')
+  const configPath = join(userDataDir, 'opensquilla', 'config.toml')
+  const syntheticKey = 'synthetic-probe-retry-key'
+  try {
+    const page = await setupWindow(app)
+    await page.locator('#providerSelectToggle').click()
+    await page.locator('[data-provider-option="openai"]').click()
+    await page.locator('#apiKey').fill(syntheticKey)
+    await setOnboardingBaseUrl(page, probeServer.baseUrl)
+    await assertUnifiedTelemetryNotice(page)
+    const submittedModel = await page.locator('#model').inputValue()
+
+    await page.locator('#finish').click()
+    const errorText = await waitFor(async () => {
+      const text = (await page.locator('#error').innerText()).trim()
+      const formReady = await page.locator('#setup-form').getAttribute('aria-busy') === 'false'
+      return text && formReady && !await page.locator('#finish').isDisabled() ? text : null
+    }, 'rejected provider probe to restore onboarding editing')
+    assert.match(errorText, /401|authentication|credential|API key/i)
+    const retryLayout = await page.evaluate(() => ({
+      error: document.querySelector('#error').getBoundingClientRect().toJSON(),
+      finish: document.querySelector('#finish').getBoundingClientRect().toJSON(),
+    }))
+    assert.ok(retryLayout.error.bottom <= retryLayout.finish.top,
+      `probe error must not cover the retry action: ${JSON.stringify(retryLayout)}`)
+    if (screenshotPath) await page.screenshot({ path: screenshotPath.replace(/\.png$/i, '') + '-retry.png' })
+    assert.equal(errorText.includes(syntheticKey), false, 'probe errors must redact the submitted key')
+    assert.equal(await page.locator('#apiKey').inputValue(), syntheticKey)
+    assert.equal(await fileExists(credentialPath), false, 'a rejected probe must not persist credentials')
+    assert.equal(await fileExists(configPath), false, 'a rejected probe must not persist config')
+    const failedTrace = await waitFor(async () => {
+      const records = await readOnboardingTelemetry(userDataDir)
+      return records.find((record) => (
+        record.event === 'onboarding_save_finished' && record.outcome === 'threw'
+      )) || null
+    }, 'rejected provider probe timing trace')
+    assert.equal(failedTrace.writerAdmitted, false)
+    assert.equal(failedTrace.settingsPersistedConfirmed, false)
+    assert.equal(probeServer.requests.length, 1)
+    assert.equal(probeServer.requests[0].method, 'POST')
+    assert.equal(probeServer.requests[0].url, '/v1/chat/completions')
+    assert.equal(probeServer.requests[0].authorization, `Bearer ${syntheticKey}`)
+    assert.equal(JSON.parse(probeServer.requests[0].body).model, submittedModel)
+
+    probeServer.setMode('success')
+    await page.locator('#finish').click()
+    const saved = await waitFor(async () => {
+      if (!await fileExists(credentialPath) || !await fileExists(configPath)) return null
+      return JSON.parse(await readFile(credentialPath, 'utf8'))
+    }, 'successful retry to persist onboarding settings')
+    assert.equal(saved.provider, 'openai')
+    assert.equal(saved.model, submittedModel)
+    assert.equal(saved.baseUrl, probeServer.baseUrl)
+    assert.equal(probeServer.requests.length, 2, 'retry must perform a fresh provider probe')
+    assert.equal(probeServer.requests[1].authorization, `Bearer ${syntheticKey}`)
+    assert.equal(JSON.parse(probeServer.requests[1].body).model, submittedModel)
+  } catch (error) {
+    const desktopLog = await readFile(join(userDataDir, 'logs', 'desktop.log'), 'utf8')
+      .catch(() => '<desktop log unavailable>')
+    throw new Error(`${error?.message || error}\nDesktop log:\n${desktopLog}`, { cause: error })
+  } finally {
+    await app.close().catch(() => {})
+    await probeServer.close().catch(() => {})
+    await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+await verifyProbeBeforePersistenceAndRetry()
+
+const successfulProbeServer = await startOnboardingProbeServer()
+
 const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
   'opensquilla-electron-onboarding-test-',
 )
@@ -651,7 +839,10 @@ try {
   const desktopPage = await waitFor(async () => {
     for (const candidate of app.windows()) {
       if (candidate.isClosed()) continue
-      if (candidate.url().startsWith('opensquilla-app://desktop/')) return candidate
+      if (
+        candidate.url().startsWith('opensquilla-app://desktop/')
+        && await candidate.locator('#app').count() === 1
+      ) return candidate
     }
     return null
   }, 'local Desktop renderer')
@@ -965,6 +1156,15 @@ try {
   assert.equal(await page.locator('#searchKeyLabel').isVisible(), false)
   assert.equal(await page.locator('#searchApiKeyError').innerText(), '')
   assert.equal(await page.locator('#apiKey').inputValue(), 'synthetic-tokenrhythm-key')
+  await setOnboardingBaseUrl(page, successfulProbeServer.baseUrl)
+  await assertUnifiedTelemetryNotice(page)
+  const earlySpoolRoot = join(
+    userDataDir,
+    'opensquilla',
+    'state',
+    'telemetry',
+    'desktop-early-spool',
+  )
   await page.locator('#finish').click()
 
   const saved = await waitFor(async () => {
@@ -984,19 +1184,44 @@ try {
   assert.equal(credential.provider, 'tokenrhythm')
   assert.equal(credential.modelRoutingMode, 'squilla_router')
   assert.equal(credential.routerMode, 'recommended')
+  assert.equal(credential.routerPresetBinding, 'follow_primary')
+  assert.match(config, /preset_binding = "follow_primary"/)
+  assert.doesNotMatch(config, /tier_profile\s*=/)
+  assert.doesNotMatch(config, /reliability_diagnostics_enabled|product_analytics_enabled/)
+  assert.doesNotMatch(config, /(?:reliability|product_analytics)_(?:notice_version|consented_at_utc)/)
+  const consentMirror = JSON.parse(await readFile(
+    join(userDataDir, 'opensquilla', 'state', 'telemetry', 'desktop-consent-mirror.json'),
+    'utf8',
+  ))
+  assert.deepEqual(consentMirror.reliability, {
+    enabled: true,
+    notice_version: 'reliability-v1',
+    consented_at_utc: null,
+    forced_off: false,
+  })
+  assert.deepEqual(consentMirror.growth, {
+    enabled: true,
+    notice_version: 'growth-v2',
+    consented_at_utc: null,
+    forced_off: false,
+  })
+  const reliabilitySpool = await readDirectoryOrEmpty(join(earlySpoolRoot, 'reliability'))
+  assert.equal(reliabilitySpool.some(isManagedTelemetrySpoolEntry), false, 'automated UI tests must not produce telemetry')
+  const remainingGrowthSpool = await readDirectoryOrEmpty(join(earlySpoolRoot, 'growth'))
+  assert.equal(remainingGrowthSpool.some(isManagedTelemetrySpoolEntry), false)
   assert.equal(credential.routerDefaultTier, 'c1')
   assert.equal(credential.model, 'deepseek-v4-pro-0813')
   assert.equal(credential.routerTiers.c0.model, 'deepseek-v4-flash-0731')
   assert.equal(credential.routerTiers.c1.model, 'deepseek-v4-pro-0813')
   assert.equal(credential.routerTiers.c2.model, 'kimi-k2.7-code')
   assert.equal(credential.routerTiers.c3.model, 'glm-5.2')
-  assert.equal(credential.routerTiers.c0.supportsImage, false)
-  assert.equal(credential.routerTiers.c1.supportsImage, false)
-  assert.equal(credential.routerTiers.c2.supportsImage, false)
-  assert.equal(credential.routerTiers.c3.supportsImage, false)
+  assert.equal(Object.hasOwn(credential.routerTiers.c0, 'supportsImage'), false)
+  assert.equal(Object.hasOwn(credential.routerTiers.c1, 'supportsImage'), false)
+  assert.equal(Object.hasOwn(credential.routerTiers.c2, 'supportsImage'), false)
+  assert.equal(Object.hasOwn(credential.routerTiers.c3, 'supportsImage'), false)
   assert.equal(credential.routerTiers.c3.ensembleEnabled, true)
   assert.equal(credential.routerTiers.image_model.model, 'kimi-k2.6')
-  assert.equal(credential.routerTiers.image_model.supportsImage, true)
+  assert.equal(Object.hasOwn(credential.routerTiers.image_model, 'supportsImage'), false)
   assert.match(config, /\[squilla_router\]\nenabled = true/)
   assert.match(config, /\[llm\][\s\S]*?model = "deepseek-v4-pro-0813"/)
   assert.match(config, /\[squilla_router\.tiers\.c0\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-flash-0731"/)
@@ -1004,7 +1229,15 @@ try {
   assert.match(config, /\[squilla_router\.tiers\.c2\]\nprovider = "tokenrhythm"\nmodel = "kimi-k2.7-code"/)
   assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "glm-5.2"[\s\S]*?ensemble_enabled = true/)
   assert.doesNotMatch(config, /thinking_level\s*=/)
+  assert.doesNotMatch(config, /supports_image\s*=/)
   assert.match(config, /\[llm_ensemble\]\nenabled = false/)
+  assert.equal(successfulProbeServer.requests.length, 1)
+  assert.equal(successfulProbeServer.requests[0].url, '/v1/chat/completions')
+  assert.equal(
+    successfulProbeServer.requests[0].authorization,
+    'Bearer synthetic-tokenrhythm-key',
+  )
+  assert.equal(JSON.parse(successfulProbeServer.requests[0].body).model, credential.model)
 
   const readyConnection = await waitFor(async () => {
     const connection = await desktopPage.evaluate(
@@ -1113,6 +1346,82 @@ try {
   assert.equal(await desktopPage.locator('#desktop-runtime-banner').isVisible(), true)
   assert.equal(await desktopPage.locator('#desktop-runtime-retry').isVisible(), true)
 
+  // Exercise the real main-process save transaction after an isolated Control
+  // UI edit. Its config must win over Desktop's deliberately stale credential.
+  const routerConfigPath = join(userDataDir, 'opensquilla', 'config.toml')
+  const routerCredentialPath = join(userDataDir, 'desktop-credential.json')
+  const operatorConfig = config
+    .replace('preset_binding = "follow_primary"', 'preset_binding = "custom"')
+    .replace('model = "deepseek-v4-flash-0731"', 'model = "operator-custom-c0"')
+    + '\n[squilla_router.budget_gate]\naction = "cap"\nlimit_usd = 2.5\n'
+  await writeFile(routerConfigPath, operatorConfig)
+  const operatorRouter = desktopRouterConfigTomlLines(credential, operatorConfig, 'preserve')
+  const saveDesktop = payload => desktopPage.evaluate(
+    payload => window.opensquillaDesktop.saveDesktopSettings(payload), payload,
+  )
+  const rotated = await saveDesktop({ apiKey: 'synthetic-rotated-key' })
+  assert.equal(rotated.routerPresetBinding, 'follow_primary', 'key edits preserve credential metadata')
+  assert.deepEqual(desktopRouterConfigTomlLines(credential, await readFile(routerConfigPath, 'utf8'), 'preserve'), operatorRouter)
+  const disabled = await saveDesktop({ routerMode: 'disabled' })
+  assert.equal(disabled.routerPresetBinding, 'follow_primary')
+  assert.equal(disabled.routerTiers.c3.ensembleEnabled, true)
+  assert.deepEqual(desktopRouterConfigTomlLines(credential, await readFile(routerConfigPath, 'utf8'), 'preserve'),
+    operatorRouter.map(line => line === 'enabled = true' ? 'enabled = false' : line))
+  await saveDesktop({ routerMode: 'recommended' })
+  assert.deepEqual(desktopRouterConfigTomlLines(credential, await readFile(routerConfigPath, 'utf8'), 'preserve'), operatorRouter)
+  const historicalCredential = JSON.parse(await readFile(routerCredentialPath, 'utf8'))
+  delete historicalCredential.routerPresetBinding
+  await writeFile(routerCredentialPath, JSON.stringify(historicalCredential, null, 2))
+  const historicalSnapshot = await saveDesktop({ searchProvider: 'duckduckgo', routerPresetBinding: 'follow_primary' })
+  assert.equal(Object.hasOwn(historicalSnapshot, 'routerPresetBinding'), false)
+  assert.equal(Object.hasOwn(JSON.parse(await readFile(routerCredentialPath, 'utf8')), 'routerPresetBinding'), false)
+  assert.deepEqual(desktopRouterConfigTomlLines(credential, await readFile(routerConfigPath, 'utf8'), 'preserve'), operatorRouter)
+  const edited = await saveDesktop({ routerTiers: {
+    ...historicalSnapshot.routerTiers,
+    c1: { ...historicalSnapshot.routerTiers.c1, thinkingLevel: 'high', extra: { temperature: 0.3 } },
+  }, routerPresetBinding: 'follow_primary' })
+  assert.equal(edited.routerPresetBinding, 'custom')
+  assert.match(await readFile(routerConfigPath, 'utf8'), /thinking_level = "high"/)
+  const reset = await saveDesktop({ routerResetToRecommended: true,
+    routerTiers: { c1: { provider: 'tokenrhythm', model: 'untrusted-renderer-model' } } })
+  assert.equal(reset.routerPresetBinding, 'follow_primary')
+  assert.equal(reset.routerTiers.c1.model, 'deepseek-v4-pro-0813')
+  assert.match(await readFile(routerConfigPath, 'utf8'), /preset_binding = "follow_primary"/)
+
+  // Switching a generated Desktop profile must follow config.toml ownership,
+  // update its primary fallback, and retain the saved custom Ensemble plan.
+  const beforeSwitch = parse(await readFile(routerConfigPath, 'utf8'))
+  beforeSwitch.squilla_router.default_tier = 'c2'
+  beforeSwitch.squilla_router.rollout_phase = 'observe'
+  beforeSwitch.squilla_router.budget_gate = { action: 'cap', limit_usd: 2.5 }
+  beforeSwitch.llm_ensemble = { enabled: false, selection_mode: 'custom_b5',
+    candidates: [{ provider: 'tokenrhythm', model: 'custom/a' },
+      { provider: 'openrouter', model: 'custom/b' }],
+    proposer_max_retries: 3,
+  }
+  await writeFile(routerConfigPath, stringify(beforeSwitch))
+  const switched = await saveDesktop({ provider: 'openrouter', apiKey: 'synthetic-openrouter-key' })
+  const afterSwitch = parse(await readFile(routerConfigPath, 'utf8'))
+  assert.equal(switched.provider, 'openrouter')
+  assert.equal(switched.model, switched.routerTiers.c2.model)
+  assert.equal(switched.baseUrl, 'https://openrouter.ai/api/v1')
+  assert.equal(afterSwitch.llm.model, switched.model)
+  assert.equal(afterSwitch.squilla_router.preset_binding, 'follow_primary')
+  assert.equal(afterSwitch.squilla_router.enabled, true)
+  assert.equal(afterSwitch.squilla_router.rollout_phase, 'observe')
+  assert.deepEqual(afterSwitch.squilla_router.budget_gate, beforeSwitch.squilla_router.budget_gate)
+  assert.ok(Object.values(afterSwitch.squilla_router.tiers).every(tier => tier.provider === 'openrouter'))
+  assert.deepEqual(afterSwitch.llm_ensemble, beforeSwitch.llm_ensemble)
+
+  afterSwitch.squilla_router.preset_binding = 'custom'
+  await writeFile(routerConfigPath, stringify(afterSwitch))
+  const beforeRejectedConfig = await readFile(routerConfigPath, 'utf8')
+  const beforeRejectedCredential = await readFile(routerCredentialPath, 'utf8')
+  await assert.rejects(saveDesktop({ provider: 'tokenrhythm', apiKey: 'synthetic-tokenrhythm-key' }),
+    /Saved Router tiers use another provider/)
+  assert.equal(await readFile(routerConfigPath, 'utf8'), beforeRejectedConfig)
+  assert.equal(await readFile(routerCredentialPath, 'utf8'), beforeRejectedCredential)
+
   console.log(JSON.stringify({
     ok: true,
     steps: 1,
@@ -1124,5 +1433,6 @@ try {
   }, null, 2))
 } finally {
   await app.close().catch(() => {})
+  await successfulProbeServer.close().catch(() => {})
   await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
 }

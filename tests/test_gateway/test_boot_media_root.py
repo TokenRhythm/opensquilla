@@ -9,6 +9,7 @@ other test failure. This pins the production wiring.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,7 +53,6 @@ async def test_build_services_wires_media_root_into_session_manager(
     config = GatewayConfig(
         memory={"flush_enabled": False},
         attachments={"media_root": str(media)},
-        sandbox={"auto_setup": False},
     )
 
     services = await build_services(
@@ -68,12 +68,15 @@ async def test_build_services_wires_media_root_into_session_manager(
 
 
 @pytest.mark.asyncio
-async def test_build_services_reconciles_artifact_mutations_before_ready(
+@pytest.mark.parametrize("failure_kind", ["exception", "report"])
+async def test_build_services_continues_when_optional_sandbox_migration_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
-    calls: list[tuple[object, Path]] = []
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[sandbox]\nrun_mode = "trusted"\n', encoding="utf-8")
 
     def reject_background_task(coro):
         close = getattr(coro, "close", None)
@@ -81,40 +84,79 @@ async def test_build_services_reconciles_artifact_mutations_before_ready(
             close()
         raise AssertionError("unit tests must not schedule real sandbox setup")
 
-    async def fake_reconcile(service, store):
-        calls.append((service, store.media_root))
-        return type(
-            "Summary",
-            (),
-            {
-                "examined": 0,
-                "applied": 0,
-                "failed": 0,
-                "ambiguous": 0,
-                "deleted_candidates": 0,
-            },
-        )()
+    def fail_optional_migration(_home: Path):
+        if failure_kind == "exception":
+            raise PermissionError("residual process holds the config")
+        return SimpleNamespace(
+            ok=False,
+            status="retry_required",
+            error="residual process holds the config",
+        )
 
     monkeypatch.setattr(
         "opensquilla.gateway.boot.create_background_task",
         reject_background_task,
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.artifact_mutation_recovery.reconcile_pending_artifact_mutations",
-        fake_reconcile,
+        "opensquilla.sandbox.upgrade_migration.ensure_sandbox_upgrade_migrated",
+        fail_optional_migration,
+    )
+
+    services = await build_services(
+        config=GatewayConfig(
+            config_path=str(config_path),
+            memory={"flush_enabled": False},
+        ),
+        session_db_path=":memory:",
+        seed_agent_workspaces=False,
+    )
+    try:
+        assert services.session_manager is not None
+        assert 'run_mode = "trusted"' in config_path.read_text(encoding="utf-8")
+    finally:
+        await services.close()
+
+
+@pytest.mark.asyncio
+async def test_build_services_reconciles_artifact_mutations_before_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
+    calls: list[tuple[str, object]] = []
+
+    def reject_background_task(coro):
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        raise AssertionError("unit tests must not schedule real sandbox setup")
+
+    async def retire(service):
+        calls.append(("retire", service))
+
+    async def recover(service, store, **_kwargs):
+        calls.append(("recover", service))
+        return type("Summary", (), {"examined": 0})()
+
+    monkeypatch.setattr("opensquilla.gateway.boot.create_background_task", reject_background_task)
+    monkeypatch.setattr(
+        "opensquilla.artifact_session.ArtifactSessionService.retire_legacy_html_state", retire
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.document_resource_recovery.reconcile_pending_document_resources",
+        recover,
     )
     media = tmp_path / "media"
     services = await build_services(
         config=GatewayConfig(
             memory={"flush_enabled": False},
             attachments={"media_root": str(media)},
-            sandbox={"auto_setup": False},
         ),
         session_db_path=":memory:",
         seed_agent_workspaces=False,
     )
     try:
-        assert len(calls) == 1
-        assert calls[0][1] == media
+        assert [item[0] for item in calls] == ["retire", "recover"]
+        assert calls[0][1] is calls[1][1]
     finally:
         await services.close()

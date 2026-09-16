@@ -5,9 +5,8 @@
  */
 export function freshDesktopSandboxConfigLines(
   existingConfig: string | null,
-  platform: NodeJS.Platform,
+  _platform: NodeJS.Platform,
 ): string[] {
   if (existingConfig !== null) return []
-  const runMode = platform === 'darwin' ? 'safe' : 'full'
-  return ['[sandbox]', `run_mode = "${runMode}"`, '']
+  return ['[sandbox]', 'run_mode = "full"', '']
 }

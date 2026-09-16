@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-live-clock-a'
@@ -51,10 +52,8 @@ test('keeps one task clock across A to B to A without sending again', async ({ p
         const key = String(frame.params?.key || frame.params?.sessionKey || '')
 
         if (method === 'connect') {
-          ws.send(JSON.stringify({
-            protocol: 3,
+          ws.send(helloOkResponse({
             policy: {
-              tick_interval_ms: 30_000,
               webui_stream_idle_grace_ms: 1_260_000,
             },
           }))
@@ -215,6 +214,8 @@ test('keeps one task clock across A to B to A without sending again', async ({ p
                   : null,
               },
             ],
+            count: 2,
+            ts: 1_800_000_000,
             has_more: false,
           },
           'sessions.messages.unsubscribe': null,

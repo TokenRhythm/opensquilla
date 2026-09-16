@@ -147,6 +147,7 @@ async def test_write_file_repeated_stop_waits_for_commit_and_receipt(
     assert len(ctx.workspace_file_writes) == 1
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tool_name",

@@ -1,15 +1,12 @@
+import { pageAnnotationSnapshots } from '@/types/pageContext'
 import { nextTick, ref, type Ref } from 'vue'
 import type {
   ChatMessage,
   ChatTimelineSegment,
+  ChatTurnOutcome,
   ChatUsagePayload,
   RawToolCallPayload,
 } from '@/types/chat'
-import type {
-  ChatCompactionSummary,
-  ChatHistoryMessage,
-  ChatHistoryResponse,
-} from '@/types/rpc'
 import type { StatusPart } from '@/types/parts'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import { normalizeDisplayAttachments } from '@/utils/chat/attachments'
@@ -22,6 +19,7 @@ import {
 } from '@/utils/chat/historyMerge'
 import {
   captureVisibleMessageAnchor,
+  createScrollHandoffGuard,
   restoreMessageAnchor,
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
@@ -31,12 +29,19 @@ import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   isRpcAbort,
-  phaseCallOptions,
-  phaseTimeoutMs,
   type SessionBootstrapPhaseContext,
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import {
+  SessionReadSessionMissingError,
+  type SessionReadCompactionSummary,
+  type SessionReadHistoryPage,
+  type SessionReadLease,
+  type SessionReadLeaseReader,
+  type SessionReadMessage,
+  type SessionReadTurnContext,
+  type SessionReadTurnOutcome,
+} from '@/modules/sessionReadLifecycle'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import {
   activityReasoningBlocks,
@@ -45,38 +50,7 @@ import {
 import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
-import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnnotationProvider'
-
-type RpcClient = {
-  policy?: Record<string, unknown> | null
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    options?: RpcCallOptions,
-  ) => Promise<T>
-}
-
-function historyTerminationActions(rpc: RpcClient) {
-  const action = rpc.policy?.concurrent_history_reads === true
-    ? 'reject' as const
-    : 'reconnect' as const
-  return {
-    timeoutAction: action,
-    abortAction: action,
-  }
-}
-
-function nonReconnectingHistoryActions() {
-  return {
-    timeoutAction: 'reject' as const,
-    abortAction: 'reject' as const,
-  }
-}
+import { normalizePromptAnnotationSnapshot } from '@/utils/chat/promptAnnotationHistory'
 
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
   return Array.isArray(value)
@@ -89,22 +63,31 @@ function usagePayload(value: unknown): ChatUsagePayload | undefined {
   return value as ChatUsagePayload
 }
 
-function historyTurnId(value: unknown): string | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const context = value as Record<string, unknown>
-  const turnId = context.disposition === 'promoted'
-    ? context.promoted_turn_id ?? context.turn_id ?? context.target_turn_id
-    : context.turn_id
-  return typeof turnId === 'string' && turnId ? turnId : undefined
+function historyTurnId(value: SessionReadTurnContext | null): string | undefined {
+  if (!value) return undefined
+  if (historyContextText(value, 'disposition') === 'promoted') {
+    return value.promotedTurnId
+      ?? value.turnId
+      ?? historyContextText(value, 'targetTurnId')
+  }
+  return value.turnId ?? undefined
 }
 
-function historyContextText(value: unknown, key: string): string | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const raw = (value as Record<string, unknown>)[key]
+function camelHistoryKey(key: string): string {
+  return key.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())
+}
+
+function historyContextText(
+  value: SessionReadTurnContext | null,
+  key: string,
+): string | undefined {
+  if (!value) return undefined
+  const camelKey = camelHistoryKey(key)
+  const raw = value.additional[key] ?? value.additional[camelKey]
   return typeof raw === 'string' && raw ? raw : undefined
 }
 
-function historyTurnPresentationProvenance(value: unknown): {
+function historyTurnPresentationProvenance(value: SessionReadTurnContext | null): {
   inputMode?: string
   runKind?: string
 } {
@@ -121,7 +104,7 @@ function historyTurnPresentationProvenance(value: unknown): {
   }
 }
 
-function historyHasSteerEvidence(value: unknown): boolean {
+function historyHasSteerEvidence(value: SessionReadTurnContext | null): boolean {
   const disposition = historyContextText(value, 'disposition')
   const intent = historyContextText(value, 'intent')
   // Current gateways persist an intent for both primary sends and Steers.
@@ -133,13 +116,13 @@ function historyHasSteerEvidence(value: unknown): boolean {
   // shared by every durable user input.
   return disposition === 'steering'
     || disposition === 'promoted'
-    || Boolean(historyContextText(value, 'promoted_turn_id'))
+    || Boolean(value?.promotedTurnId)
     || Boolean(historyContextText(value, 'promoted_from_turn_id'))
     || Boolean(historyContextText(value, 'model_call_id'))
     || historyContextInteger(value, 'applied_iteration') !== undefined
 }
 
-function historyInputDisposition(value: unknown): ChatMessage['inputDisposition'] {
+function historyInputDisposition(value: SessionReadTurnContext | null): ChatMessage['inputDisposition'] {
   const disposition = historyContextText(value, 'disposition')
   if (!historyHasSteerEvidence(value)) return undefined
   return ['steering', 'applied', 'promoted', 'cancelled', 'rejected'].includes(
@@ -149,20 +132,25 @@ function historyInputDisposition(value: unknown): ChatMessage['inputDisposition'
     : undefined
 }
 
-function historyDispositionRevision(value: unknown): number | undefined {
+function historyDispositionRevision(value: SessionReadTurnContext | null): number | undefined {
   if (
     !historyHasSteerEvidence(value)
     || !value
-    || typeof value !== 'object'
-    || Array.isArray(value)
   ) return undefined
-  const revision = Number((value as Record<string, unknown>).revision)
+  const revision = Number(value.additional.revision)
   return Number.isInteger(revision) && revision >= 0 ? revision : undefined
 }
 
-function historyContextInteger(value: unknown, key: string): number | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const raw = (value as Record<string, unknown>)[key]
+function historyContextInteger(
+  value: SessionReadTurnContext | null,
+  key: string,
+): number | undefined {
+  if (!value) return undefined
+  if (key === 'applied_iteration' || key === 'appliedIteration') {
+    return value.appliedIteration ?? undefined
+  }
+  const camelKey = camelHistoryKey(key)
+  const raw = value.additional[key] ?? value.additional[camelKey]
   if (typeof raw !== 'number' && typeof raw !== 'string') return undefined
   if (typeof raw === 'string' && !raw.trim()) return undefined
   const number = Number(raw)
@@ -170,13 +158,11 @@ function historyContextInteger(value: unknown, key: string): number | undefined 
 }
 
 function historyActivityMarkers(
-  value: unknown,
+  value: SessionReadTurnContext | null,
   suppressedCompactionIds: ReadonlySet<string> = new Set(),
 ): StatusPart[] {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return []
-  const markers = (value as Record<string, unknown>).activity_markers
-  if (!Array.isArray(markers)) return []
-  return markers.flatMap((marker): StatusPart[] => {
+  if (!value) return []
+  return value.activityMarkers.flatMap((marker): StatusPart[] => {
     if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return []
     const data = marker as Record<string, unknown>
     if (data.kind !== 'context_compaction') return []
@@ -213,12 +199,12 @@ function summaryCount(value: unknown): number | undefined {
 }
 
 function compactionSummaryMessage(
-  summary: ChatCompactionSummary,
+  summary: SessionReadCompactionSummary,
   canonicalComplete: boolean | null,
 ): ChatMessage | null {
   const summaryId = summaryStableValue(summary.id)
-  const compactionId = summaryStableValue(summary.compaction_id)
-  const compactionIndex = summaryStableValue(summary.compaction_index)
+  const compactionId = summaryStableValue(summary.compactionId)
+  const compactionIndex = summaryStableValue(summary.compactionIndex)
   const identity = summaryId
     ? `summary:${summaryId}`
     : compactionId
@@ -231,36 +217,33 @@ function compactionSummaryMessage(
   return {
     role: 'maintenance',
     text: '',
-    ts: normalizedEpochMilliseconds(summary.created_at),
+    ts: normalizedEpochMilliseconds(summary.createdAt),
     messageId: `maintenance:context-compaction:${identity}`,
     restoredFromHistory: true,
     maintenance: {
       kind: 'context_compaction',
       compactionId: compactionId || identity,
-      source: String(summary.trigger_reason || '').trim().toLowerCase() === 'manual'
+      source: String(summary.triggerReason || '').trim().toLowerCase() === 'manual'
         ? 'manual'
         : 'automatic',
       state: 'completed',
       durability: 'durable',
-      removedCount: summaryCount(summary.removed_count),
-      keptCount: summaryCount(summary.kept_count),
+      removedCount: summaryCount(summary.removedCount),
+      keptCount: summaryCount(summary.keptCount),
       historyArchived: true,
       canonicalComplete,
     },
   }
 }
 
-function compactionSummaryMessages(data: ChatHistoryResponse): ChatMessage[] {
-  const summaries = data.compaction_summaries ?? data.compactionSummaries ?? []
-  const completeness = data.canonical_complete ?? data.canonicalComplete
-  const canonicalComplete = typeof completeness === 'boolean' ? completeness : null
-  return summaries.flatMap((summary) => {
-    const message = compactionSummaryMessage(summary, canonicalComplete)
+function compactionSummaryMessages(data: SessionReadHistoryPage): ChatMessage[] {
+  return data.compactionSummaries.flatMap((summary) => {
+    const message = compactionSummaryMessage(summary, data.canonicalComplete)
     return message ? [message] : []
   })
 }
 
-function summaryCompactionIds(data: ChatHistoryResponse): Set<string> {
+function summaryCompactionIds(data: SessionReadHistoryPage): Set<string> {
   return new Set(
     compactionSummaryMessages(data).map(message => message.maintenance!.compactionId),
   )
@@ -371,13 +354,35 @@ function mergeHistoryMaintenance(
   return merged
 }
 
+function turnOutcomeRecord(outcome: SessionReadTurnOutcome): Record<string, unknown> {
+  return {
+    ...outcome.additional,
+    turnId: outcome.turnId,
+    taskId: outcome.taskId ?? undefined,
+    status: outcome.status,
+    startedAt: outcome.startedAt ?? undefined,
+    finishedAt: outcome.finishedAt ?? undefined,
+    outcome: outcome.outcome,
+    errorClass: outcome.errorClass ?? undefined,
+    retryable: outcome.retryable ?? undefined,
+    activitySnapshot: outcome.activitySnapshot ?? undefined,
+    usage: outcome.usage ?? undefined,
+    usageCallIndex: outcome.replayProof.usageCallIndex ?? undefined,
+    noPriorProviderDispatch: outcome.replayProof.noPriorProviderDispatch ?? undefined,
+    replaySafe: outcome.replayProof.replaySafe ?? undefined,
+    retryAfterMs: outcome.replayProof.retryAfterMs ?? undefined,
+    userMessageId: outcome.replayProof.userMessageId ?? undefined,
+    terminalMessage: outcome.replayProof.terminalMessage ?? undefined,
+  }
+}
+
 function attachHistoryTurnOutcomes(
   messages: ChatMessage[],
-  data: ChatHistoryResponse,
+  data: SessionReadHistoryPage,
 ): ChatMessage[] {
   const outcomes =
-    (data.turn_outcomes || [])
-      .map(normalizeTurnOutcome)
+    data.turnOutcomes
+      .map(outcome => normalizeTurnOutcome(turnOutcomeRecord(outcome)))
       .filter(outcome => outcome !== undefined)
   const byTurnId = new Map(outcomes.map(outcome => [outcome.turnId, outcome] as const))
   if (byTurnId.size === 0) return messages
@@ -445,11 +450,13 @@ function attachHistoryTurnOutcomes(
     }
   })
 
-  // A pre-provider barrier may fail before an assistant transcript row exists.
-  // Materialize one status-only assistant row from the terminal task snapshot
-  // so refresh and reconnect show the completed route/activity trace.
+  // A terminal task may finish before an assistant transcript row exists.
+  // Materialize one activity-only assistant row so refresh and reconnect keep
+  // the durable route/activity trace inspectable.
   for (const outcome of outcomes) {
-    if (!isUsageAccountingBarrier(outcome.errorClass) || !outcome.statusHistory?.length) continue
+    const legacyUsageActivity = isUsageAccountingBarrier(outcome.errorClass)
+      && Boolean(outcome.statusHistory?.length)
+    if (!outcome.activitySnapshot && !legacyUsageActivity) continue
     if (enriched.some(message => message.turnId === outcome.turnId && message.role === 'assistant')) continue
     const turnIndexes = enriched.flatMap((message, index) =>
       message.turnId === outcome.turnId ? [index] : [],
@@ -457,16 +464,34 @@ function attachHistoryTurnOutcomes(
     if (!turnIndexes.length) continue
     const firstTerminalIndex = turnIndexes.find(index => enriched[index]?.role === 'error')
     const insertionIndex = firstTerminalIndex ?? Math.max(...turnIndexes) + 1
-    enriched.splice(insertionIndex, 0, {
+    const activityOnlyMessage: ChatMessage = {
       role: 'assistant',
       text: '',
       ts: outcome.finishedAt ?? null,
       turnId: outcome.turnId,
       turnOutcome: outcome,
-      statusHistory: outcome.statusHistory.map(entry => ({ ...entry })),
+      statusHistory: (outcome.statusHistory || []).map(entry => ({ ...entry })),
       messageId: `terminal-activity:${outcome.taskId || outcome.turnId}`,
       restoredFromHistory: true,
-    })
+    }
+    if (outcome.activitySnapshot) {
+      const snapshotReasoningBlocks = outcome.activitySnapshot.complete
+        ? activityReasoningBlocks(outcome.activitySnapshot, '')
+        : undefined
+      const snapshotComplete = Boolean(
+        outcome.activitySnapshot.complete
+        && snapshotReasoningBlocks !== undefined
+        && activitySnapshotMatchesMessage(outcome.activitySnapshot, activityOnlyMessage),
+      )
+      activityOnlyMessage.activitySnapshot = snapshotComplete
+        ? outcome.activitySnapshot
+        : { ...outcome.activitySnapshot, complete: false }
+      activityOnlyMessage.activitySnapshotIncomplete = !snapshotComplete
+      if (snapshotComplete) {
+        activityOnlyMessage.reasoningBlocks = snapshotReasoningBlocks?.map(block => ({ ...block }))
+      }
+    }
+    enriched.splice(insertionIndex, 0, activityOnlyMessage)
   }
 
   // The task outcome is the durable authority for a pre-provider usage
@@ -541,9 +566,7 @@ type AcceptedEnsembleMode = 'ensemble' | 'llm_ensemble'
 function acceptedEnsembleMode(message: ChatMessage): AcceptedEnsembleMode | null {
   if (message.role !== 'router' || !message.routerDecision) return null
   const raw = String(
-    message.routerDecision.accepted_routing_mode
-    || message.routerDecision.acceptedRoutingMode
-    || '',
+    message.routerDecision.accepted_routing_mode || '',
   ).trim().toLowerCase()
   return raw === 'ensemble' || raw === 'llm_ensemble' ? raw : null
 }
@@ -641,7 +664,8 @@ function preserveAcceptedEnsembleRouterRows(
 }
 
 export interface UseChatHistoryOptions {
-  rpc: RpcClient
+  /** The bootstrap owner supplies the one lease shared with live subscription. */
+  sessionReadLeaseReader: SessionReadLeaseReader
   sessionKey: Ref<string>
   messages: Ref<ChatMessage[]>
   threadRef?: Ref<HTMLElement | null>
@@ -651,8 +675,11 @@ export interface UseChatHistoryOptions {
   autoScroll?: Ref<boolean>
   /** Invalidates deferred anchor work when the reused chat viewport changes session. */
   scrollEpoch?: Ref<number>
+  /** Lets application-owned navigation take precedence over deferred viewport corrections. */
+  canApplyViewportCorrection?: () => boolean
   stripTimePrefix: (text: string) => string
   scrollToBottom: () => void
+  onTerminalTask?: (outcome: ChatTurnOutcome) => void
 }
 
 export interface ChatHistoryState {
@@ -668,6 +695,7 @@ export interface ChatHistoryState {
   initialLoadStatus: InitialHistoryLoadStatus
   loadEarlierError: boolean
   recoveryError: boolean
+  sessionMissing: boolean
 }
 
 interface HistoryLoadParams {
@@ -727,7 +755,22 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     initialLoadStatus: 'pending',
     loadEarlierError: false,
     recoveryError: false,
+    sessionMissing: false,
   })
+
+  function notifyTerminalTasks(data: SessionReadHistoryPage) {
+    if (!options.onTerminalTask) return
+    for (const raw of data.turnOutcomes) {
+      const outcome = normalizeTurnOutcome(turnOutcomeRecord(raw))
+      if (
+        outcome?.taskId
+        && ['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted']
+          .includes(outcome.status.toLowerCase())
+      ) {
+        options.onTerminalTask(outcome)
+      }
+    }
+  }
 
   function cancelAnchorStabilization() {
     const stop = stopAnchorStabilization
@@ -771,65 +814,67 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function mapHistoryMessage(
-    msg: ChatHistoryMessage,
+    msg: SessionReadMessage,
     suppressedCompactionIds: ReadonlySet<string> = new Set(),
   ): ChatMessage {
     // History rows carry the turn's reasoning text but not the measured
     // thinking duration; live turn records re-fill seconds after sync.
-    const rawReasoningText = typeof msg.reasoning_content === 'string'
-      ? msg.reasoning_content
+    const rawReasoningText = typeof msg.reasoningContent === 'string'
+      ? msg.reasoningContent
       : ''
     // v2 reasoning entries address the canonical transcript in UTF-16 units.
     // Use trim only to decide whether the field is empty; never shift a valid
     // snapshot's offsets by rewriting its leading or trailing whitespace.
     const reasoningText = rawReasoningText.trim() ? rawReasoningText : ''
-    const messageId = msg.message_id || msg.id || ''
-    const steerContext = historyHasSteerEvidence(msg.turn_context)
-    const turnProvenance = historyTurnPresentationProvenance(msg.turn_context)
+    const messageId = msg.messageId || msg.id || ''
+    const steerContext = historyHasSteerEvidence(msg.turnContext)
+    const turnProvenance = historyTurnPresentationProvenance(msg.turnContext)
     return {
       role: msg.role || 'assistant',
       text: msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
-      ts: msg.timestamp || msg.ts || null,
+      ts: msg.createdAt,
       reasoning: reasoningText ? { text: reasoningText, seconds: 0 } : undefined,
-      routerDecision: msg.router_decision || msg.routerDecision || null,
-      artifacts: msg.artifacts || [],
-      tool_calls: recordArray<RawToolCallPayload>(msg.tool_calls),
-      planRevisions: planRevisionsFromToolSegments(msg.tool_calls),
+      routerDecision: msg.routerDecision,
+      artifacts: [...msg.artifacts],
+      tool_calls: recordArray<RawToolCallPayload>(msg.toolCalls),
+      planRevisions: planRevisionsFromToolSegments(msg.toolCalls),
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
-      attachments: normalizeDisplayAttachments(msg.attachments, { messageId }),
-      promptAnnotations: (msg.promptAnnotations || msg.prompt_annotations || [])
-        .map(normalizePromptAnnotationSnapshot)
-        .filter((item): item is PromptAnnotationSnapshot => item !== null)
-        .sort((left, right) => left.sentOrder - right.sentOrder),
-      provenanceKind: msg.provenance_kind || '',
-      provenanceSourceSessionKey: msg.provenance_source_session_key || '',
-      provenanceSourceTool: msg.provenance_source_tool || '',
-      turnId: historyTurnId(msg.turn_context),
+      attachments: normalizeDisplayAttachments([...msg.attachments], { messageId }),
+      promptAnnotations: msg.pageContext
+        ? pageAnnotationSnapshots(msg.pageContext)
+        : msg.promptAnnotations
+            .map(normalizePromptAnnotationSnapshot)
+            .filter((item): item is PromptAnnotationSnapshot => item !== null)
+            .sort((left, right) => (left.sentOrder || 0) - (right.sentOrder || 0)),
+      provenanceKind: msg.provenance.kind || '',
+      provenanceSourceSessionKey: msg.provenance.sourceSessionKey || '',
+      provenanceSourceTool: msg.provenance.sourceTool || '',
+      turnId: historyTurnId(msg.turnContext),
       turnInputMode: turnProvenance.inputMode,
       turnRunKind: turnProvenance.runKind,
-      inputDisposition: historyInputDisposition(msg.turn_context),
-      inputDispositionRevision: historyDispositionRevision(msg.turn_context),
+      inputDisposition: historyInputDisposition(msg.turnContext),
+      inputDispositionRevision: historyDispositionRevision(msg.turnContext),
       steerClientRequestId: steerContext
-        ? historyContextText(msg.turn_context, 'client_request_id')
+        ? historyContextText(msg.turnContext, 'client_request_id')
         : undefined,
       steerClientMessageId: steerContext
-        ? historyContextText(msg.turn_context, 'client_message_id')
+        ? historyContextText(msg.turnContext, 'client_message_id')
         : undefined,
       steerModelCallId: steerContext
-        ? historyContextText(msg.turn_context, 'model_call_id')
+        ? historyContextText(msg.turnContext, 'model_call_id')
         : undefined,
       steerAppliedIteration: steerContext
-        ? historyContextInteger(msg.turn_context, 'applied_iteration')
+        ? historyContextInteger(msg.turnContext, 'applied_iteration')
         : undefined,
       promotedFromTurnId: steerContext
-        ? historyContextText(msg.turn_context, 'promoted_from_turn_id')
+        ? historyContextText(msg.turnContext, 'promoted_from_turn_id')
         : undefined,
-      usage: usagePayload(msg.usage) || usagePayload(msg.turn_usage),
+      usage: usagePayload(msg.usage),
       model: msg.model || undefined,
-      input: msg.input || msg.input_tokens || undefined,
-      output: msg.output || msg.output_tokens || undefined,
+      input: msg.inputTokens ?? undefined,
+      output: msg.outputTokens ?? undefined,
       statusHistory: msg.role === 'assistant'
-        ? historyActivityMarkers(msg.turn_context, suppressedCompactionIds)
+        ? historyActivityMarkers(msg.turnContext, suppressedCompactionIds)
         : undefined,
       messageId,
       restoredFromHistory: true,
@@ -844,34 +889,32 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     return messages.some(msg => msg.restoredFromHistory !== true)
   }
 
-  function responseCanonicalComplete(data: ChatHistoryResponse): boolean | null {
-    const value = data.canonical_complete ?? data.canonicalComplete
-    return typeof value === 'boolean' ? value : historyState.value.canonicalComplete
+  function responseCanonicalComplete(data: SessionReadHistoryPage): boolean | null {
+    return data.canonicalComplete
   }
 
-  function responseCanonicalAvailable(data: ChatHistoryResponse): boolean | null {
-    const value = data.canonical_available ?? data.canonicalAvailable
-    return typeof value === 'boolean' ? value : historyState.value.canonicalAvailable
+  function responseCanonicalAvailable(data: SessionReadHistoryPage): boolean | null {
+    return data.canonicalAvailable
   }
 
   function updateHistoryState(
-    data: ChatHistoryResponse,
+    data: SessionReadHistoryPage,
     prepend: boolean,
     initialLoadError = false,
   ) {
-    const nextOldestCursor = data.oldest_cursor ?? data.oldestCursor ?? null
+    const nextOldestCursor = data.oldestCursor
     const requestedCursor = prepend ? historyState.value.oldestCursor : null
     const cursorAdvanced = !prepend || nextOldestCursor !== requestedCursor
     const preserveLoadedBoundary = !prepend && hasLoadedEarlier
     historyState.value = {
       hasMore: preserveLoadedBoundary
         ? historyState.value.hasMore
-        : Boolean(data.has_more ?? data.hasMore) && cursorAdvanced,
+        : data.hasMore && cursorAdvanced,
       oldestCursor: preserveLoadedBoundary ? historyState.value.oldestCursor : nextOldestCursor,
       newestCursor: prepend
         ? historyState.value.newestCursor
-        : data.newest_cursor ?? data.newestCursor ?? null,
-      historyScope: data.history_scope ?? data.historyScope ?? '',
+        : data.newestCursor,
+      historyScope: data.scope,
       canonicalAvailable: responseCanonicalAvailable(data),
       canonicalComplete: responseCanonicalComplete(data),
       loading: false,
@@ -882,6 +925,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         : initialLoadError ? 'error' : 'ready',
       loadEarlierError: false,
       recoveryError: prepend ? historyState.value.recoveryError : initialLoadError,
+      sessionMissing: false,
     }
   }
 
@@ -910,33 +954,55 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       initialLoadStatus: 'pending',
       loadEarlierError: false,
       recoveryError: false,
+      sessionMissing: false,
     }
     return crossedSession
   }
 
-  function callHistory<T>(
-    request: Record<string, unknown>,
-    bootstrap: SessionBootstrapPhaseContext,
-    nonReconnecting = false,
-  ): Promise<T> {
-    const callOptions = {
-      ...phaseCallOptions(bootstrap, 'chat.history'),
-      // History is background content. A slow read may fail independently,
-      // without recycling a Gateway that advertises concurrent reads. Legacy
-      // serial Gateways still need a fresh connection to escape a stuck read.
-      ...(nonReconnecting
-        ? nonReconnectingHistoryActions()
-        : historyTerminationActions(options.rpc)),
-      onSent: (socketGeneration: number) => {
-        bootstrap.markHistoryRequestSent?.(socketGeneration)
-      },
+  function markSessionMissing(key: string): boolean {
+    if (!key || key !== options.sessionKey.value) return false
+    resetForSession(key)
+    // The live registration can prove absence before the eager history frame
+    // is admitted. Retire that read so its later rejection cannot overwrite
+    // this terminal state or a successor session.
+    cancelActiveHistory()
+    failedHistoryRequest = null
+    historyState.value = {
+      ...historyState.value,
+      loading: false,
+      loadingEarlier: false,
+      retrying: false,
+      initialLoadStatus: 'ready',
+      loadEarlierError: false,
+      recoveryError: false,
+      sessionMissing: true,
     }
-    const response = options.rpc.call<T>(
-      'chat.history',
-      request,
-      callOptions,
-    )
-    return response
+    return true
+  }
+
+  function callHistory(
+    lease: SessionReadLease,
+    request: {
+      direction: 'latest' | 'before' | 'after'
+      cursor?: string
+      limit: number
+    },
+    bootstrap: SessionBootstrapPhaseContext,
+  ): Promise<SessionReadHistoryPage> {
+    const deadlineAt = Math.min(bootstrap.deadlineAt, bootstrap.attemptDeadlineAt)
+    const readOptions = {
+      signal: bootstrap.signal,
+      deadlineAt,
+      budgetMs: Math.max(1, deadlineAt - Date.now()),
+      limit: request.limit,
+    }
+    if (request.direction === 'before') {
+      return lease.history.before(request.cursor || '', readOptions)
+    }
+    if (request.direction === 'after') {
+      return lease.history.after(request.cursor || '', readOptions)
+    }
+    return lease.history.latest(readOptions)
   }
 
   async function runHistoryLoad(
@@ -945,6 +1011,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): Promise<SessionPhaseResult | void> {
     if (!options.sessionKey.value) return
     const key = options.sessionKey.value
+    const lease = options.sessionReadLeaseReader.current()
     const requestScrollEpoch = options.scrollEpoch?.value ?? 0
     const crossedSession = resetForSession(key)
     cancelAnchorStabilization()
@@ -975,6 +1042,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
     const isCurrentRequest = () => (
       key === options.sessionKey.value
+      && options.sessionReadLeaseReader.current() === lease
       && requestSeq === historyRequestSeq
       && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
     )
@@ -983,13 +1051,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       historyState.value = historyStateBeforeLoad
     }
     try {
-      await options.rpc.waitForConnection(
-        phaseTimeoutMs(bootstrap, 'chat.history'),
-        bootstrap.signal,
-        nonReconnecting
-          ? nonReconnectingHistoryActions()
-          : historyTerminationActions(options.rpc),
-      )
+      if (!lease) throw new Error('No active session read lease.')
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {
           historyState.value = {
@@ -1002,20 +1064,30 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
         return { ok: false, cancelled: true }
       }
-      const request: Record<string, unknown> = {
-        sessionKey: key,
-        limit: !params.prepend && options.messages.value.length > 50
-          ? Math.min(200, options.messages.value.length)
-          : 50,
-        includeCanonical: true,
-        includeSummaries: true,
-      }
-      if (params.before != null) request.before = params.before
-      const data = await callHistory<ChatHistoryResponse>(request, bootstrap, nonReconnecting)
+      const limit = !params.prepend && options.messages.value.length > 50
+        ? Math.min(200, options.messages.value.length)
+        : 50
+      const data = await callHistory(
+        lease,
+        params.before != null
+          ? { direction: 'before', cursor: String(params.before), limit }
+          : { direction: 'latest', limit },
+        bootstrap,
+      )
       if (!isCurrentRequest()) return { ok: false, cancelled: true }
-      const msgs = data.messages || []
-      const canonicalAvailable = data.canonical_available ?? data.canonicalAvailable
-      if (canonicalAvailable === false) {
+      const msgs = data.messages
+      const canonicalAvailable = data.canonicalAvailable
+      // A draft WebChat key has no canonical store yet, but the server can
+      // positively confirm its empty transcript. Reconnection must accept
+      // that state without treating unavailable or already-loaded history
+      // as empty, or the first message remains blocked by the live fence.
+      const confirmedEmptyDraft = data.canonicalComplete === true
+        && msgs.length === 0
+        && !data.hasMore
+        && !params.prepend
+        && !hasLoadedEarlier
+        && options.messages.value.length === 0
+      if (canonicalAvailable === false && !confirmedEmptyDraft) {
         if (nonReconnecting) {
           restoreSilentBackgroundState()
           return { ok: false }
@@ -1043,6 +1115,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           return { ok: !historyState.value.recoveryError }
         }
       }
+
+      if (canonicalAvailable !== false) notifyTerminalTasks(data)
 
       const summaryIds = summaryCompactionIds(data)
       let mapped = attachHistoryTurnOutcomes(
@@ -1080,7 +1154,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         const bridgedKeys = new Set<string>()
         const visitedCursors = new Set<string>()
         let after: string | number = bridgeStart
-        let finalBridgeData: ChatHistoryResponse | null = null
+        let finalBridgeData: SessionReadHistoryPage | null = null
         let bridgeComplete = responseCanonicalComplete(data)
         let bridgePageCount = 0
         let bridgeTruncated = false
@@ -1092,19 +1166,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
           visitedCursors.add(afterKey)
 
-          const bridgeData = await callHistory<ChatHistoryResponse>(
-            {
-              sessionKey: key,
-              limit: 200,
-              after,
-              includeCanonical: true,
-              includeSummaries: true,
-            },
+          const bridgeData = await callHistory(
+            lease,
+            { direction: 'after', cursor: String(after), limit: 200 },
             bootstrap,
-            nonReconnecting,
           )
           if (!isCurrentRequest()) return { ok: false, cancelled: true }
-          const bridgeAvailable = bridgeData.canonical_available ?? bridgeData.canonicalAvailable
+          const bridgeAvailable = bridgeData.canonicalAvailable
           if (bridgeAvailable === false) {
             if (nonReconnecting) {
               restoreSilentBackgroundState()
@@ -1124,8 +1192,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             return { ok: false }
           }
 
+          notifyTerminalTasks(bridgeData)
+
           const page = attachHistoryTurnOutcomes(
-            (bridgeData.messages || []).map(message =>
+            bridgeData.messages.map(message =>
               mapHistoryMessage(message, summaryCompactionIds(bridgeData)),
             ),
             bridgeData,
@@ -1139,11 +1209,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
           finalBridgeData = bridgeData
           bridgePageCount += 1
-          const pageComplete = bridgeData.canonical_complete ?? bridgeData.canonicalComplete
+          const pageComplete = bridgeData.canonicalComplete
           if (pageComplete === false) bridgeComplete = false
 
-          const hasMore = Boolean(bridgeData.has_more ?? bridgeData.hasMore)
-          const nextCursor = bridgeData.newest_cursor ?? bridgeData.newestCursor ?? null
+          const hasMore = bridgeData.hasMore
+          const nextCursor = bridgeData.newestCursor
           if (page.length === 0 || nextCursor == null || String(nextCursor) === afterKey) {
             throw new Error('History forward pagination did not advance')
           }
@@ -1174,13 +1244,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         bridgeContinuationNeeded = bridgeTruncated
         historyData = {
           ...data,
-          newest_cursor: finalBridgeData.newest_cursor ?? finalBridgeData.newestCursor ?? null,
-          canonical_available: true,
-          canonical_complete: bridgeComplete ?? undefined,
+          newestCursor: finalBridgeData.newestCursor,
+          canonicalAvailable: true,
+          canonicalComplete: bridgeComplete,
         }
       }
 
-      if (canonicalAvailable !== false) failedHistoryRequest = null
+      if (canonicalAvailable !== false || confirmedEmptyDraft) failedHistoryRequest = null
       // Gate the full-session error on explicit coverage metadata. Older
       // Gateways used canonical_available=false for a legitimate empty WebChat
       // session but did not yet publish canonical_complete.
@@ -1189,7 +1259,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         && !hasLoadedEarlier
         && mapped.length === 0
         && canonicalAvailable === false
-        && (data.canonical_complete ?? data.canonicalComplete) === false
+        && data.canonicalComplete === false
       updateHistoryState(
         historyData,
         Boolean(params.prepend),
@@ -1235,9 +1305,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         return { ok: true }
       }
 
-      const prependContainer = params.prepend ? options.threadRef?.value ?? null : null
-      const prependAnchor = captureVisibleMessageAnchor(prependContainer)
-      const prependFallbackHeight = prependAnchor ? 0 : prependContainer?.scrollHeight ?? 0
+      const followingLiveEdge = !params.prepend && (options.autoScroll?.value ?? true)
+      const historyContainer = options.threadRef?.value ?? null
+      const visibleAnchor = !followingLiveEdge
+        ? captureVisibleMessageAnchor(historyContainer)
+        : null
+      const prependFallbackHeight = visibleAnchor ? 0 : historyContainer?.scrollHeight ?? 0
       if (params.prepend) {
         const existing = new Set(previousTranscript.map(messageKey))
         const transcript = interleaveHistoryModelCallSegments(
@@ -1281,29 +1354,68 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       options.lastHeaderRole.value = ''
       options.lastHeaderDay.value = ''
 
-      if (params.prepend) {
+      if (visibleAnchor) {
         await nextTick()
         if (!isCurrentRequest()) return { ok: false, cancelled: true }
-        if (prependAnchor) {
-          restoreMessageAnchor(prependAnchor)
-          stopAnchorStabilization = stabilizeMessageAnchor(prependAnchor, {
+        if (
+          (options.canApplyViewportCorrection?.() ?? true)
+          && restoreMessageAnchor(visibleAnchor)
+        ) {
+          stopAnchorStabilization = stabilizeMessageAnchor(visibleAnchor, {
             isCurrent: () => options.sessionKey.value === key
               && historySessionKey.value === key
               && historyRequestSeq === requestSeq
               && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
-              && options.threadRef?.value === prependContainer,
-          })
-        } else if (prependContainer) {
-          applyProgrammaticScroll(prependContainer, () => {
-            prependContainer.scrollTop += Math.max(
-              0,
-              prependContainer.scrollHeight - prependFallbackHeight,
-            )
+              && options.threadRef?.value === historyContainer
+              && (options.canApplyViewportCorrection?.() ?? true),
           })
         }
-      } else if (options.autoScroll?.value ?? true) {
+      } else if (params.prepend && historyContainer) {
         await nextTick()
-        options.scrollToBottom()
+        if (!isCurrentRequest()) return { ok: false, cancelled: true }
+        applyProgrammaticScroll(historyContainer, () => {
+          historyContainer.scrollTop += Math.max(
+            0,
+            historyContainer.scrollHeight - prependFallbackHeight,
+          )
+        })
+      } else if (followingLiveEdge) {
+        // Message assignment is one synchronous commit. Install the input
+        // guard immediately afterwards and before yielding to layout.
+        const liveEdgeGuard = historyContainer
+          ? createScrollHandoffGuard(historyContainer)
+          : null
+        try {
+          await nextTick()
+          if (!isCurrentRequest()) return { ok: false, cancelled: true }
+          if (
+            !liveEdgeGuard?.isCancelled()
+            && (options.canApplyViewportCorrection?.() ?? true)
+            && (
+              !historyContainer
+              || (
+                historyContainer.isConnected
+                && options.threadRef?.value === historyContainer
+              )
+            )
+          ) {
+            // The long-history virtualizer may clamp scrollTop while replacing
+            // its rows. That layout event is not reader intent, so restore the
+            // live-edge ownership captured before the commit and mark the
+            // correction as application-owned.
+            if (options.autoScroll) options.autoScroll.value = true
+            if (historyContainer) {
+              applyProgrammaticScroll(historyContainer, () => {
+                historyContainer.scrollTop = historyContainer.scrollHeight
+              })
+              liveEdgeGuard?.acceptCurrentPosition()
+            } else {
+              options.scrollToBottom()
+            }
+          }
+        } finally {
+          liveEdgeGuard?.dispose()
+        }
       }
       // Keep reconnect catch-up moving even when no later live event arrives.
       // Each scheduled request is still bounded to MAX_FORWARD_BRIDGE_PAGES,
@@ -1346,6 +1458,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             : historyState.value.initialLoadStatus,
           loadEarlierError: Boolean(params.prepend),
           recoveryError: !params.prepend,
+          sessionMissing: !params.prepend
+            && error instanceof SessionReadSessionMissingError,
         }
         flushPendingHistorySync()
       }
@@ -1472,6 +1586,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
   }
 
+  async function reconcileHistory(): Promise<SessionPhaseResult | void> {
+    const key = options.sessionKey.value
+    // A read admitted before the snapshot cannot prove a terminal transition
+    // after its watermark. Join it, then admit one fresh current-window read.
+    await activeHistory?.promise.catch(() => {})
+    if (options.sessionKey.value !== key) return { ok: false, cancelled: true }
+    return loadHistory({ nonReconnecting: true })
+  }
+
   function cleanup() {
     cancelActiveHistory()
     historySyncPending = false
@@ -1483,8 +1606,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     historySessionKey,
     historyState,
     loadHistory,
+    reconcileHistory,
     loadEarlierHistory,
     retryHistory,
+    markSessionMissing,
     scheduleHistorySync,
     cancelAnchorStabilization,
     cancelActiveHistory,

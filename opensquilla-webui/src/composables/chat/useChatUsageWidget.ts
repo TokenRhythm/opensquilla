@@ -1,21 +1,9 @@
 import { computed, ref, type Ref } from 'vue'
-import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
-
-type RpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
+import type {
+  UsageContextStatus,
+  UsageReporting,
+  UsageReportingRequestOptions,
+} from '@/modules/usageReporting'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -28,8 +16,8 @@ export interface ChatUsageAccumulator {
 }
 
 export interface UseChatUsageWidgetOptions {
-  rpc: RpcClient
-  readCallOptions?: RpcCallOptions
+  usageReporting: UsageReporting
+  readOptions?: UsageReportingRequestOptions
   sessionKey: Ref<string>
   tokenVizEnabled: () => boolean
 }
@@ -41,47 +29,10 @@ interface PersistedUsageWidget {
   model?: string
 }
 
-// Proactive context-window pressure, emitted by the gateway on usage.status
-// (rpc_usage.py `_context_status`). pressure is 0..1; warningRatio is the
-// gateway's threshold (0.85) above which the user should be warned before
-// compaction kicks in. Both camelCase and snake_case are sent for compat.
-export interface ContextStatus {
-  contextTokens?: number
-  context_tokens?: number
-  contextWindowTokens?: number
-  context_window_tokens?: number
-  pressure?: number
-  warningRatio?: number
-  warning_ratio?: number
-}
-
 export interface ContextWarning {
   pct: number
   usedK: number
   windowK: number
-}
-
-interface UsageStatusSession {
-  session?: string
-  sessionKey?: string
-  key?: string
-  input_tokens?: number
-  inputTokens?: number
-  output_tokens?: number
-  outputTokens?: number
-  cache_read_tokens?: number
-  cacheReadTokens?: number
-  cache_write_tokens?: number
-  cacheWriteTokens?: number
-  cost_usd?: number
-  costUsd?: number
-  model?: string
-  contextStatus?: ContextStatus | null
-  context_status?: ContextStatus | null
-}
-
-interface UsageStatusResponse {
-  sessions?: UsageStatusSession[]
 }
 
 export function createEmptyUsageAccumulator(): ChatUsageAccumulator {
@@ -97,11 +48,12 @@ export function createEmptyUsageAccumulator(): ChatUsageAccumulator {
 }
 
 export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
+  const usageReporting = options.usageReporting
   const usageAccum = ref<ChatUsageAccumulator>(createEmptyUsageAccumulator())
   const usageModel = ref('')
   const savingsPopupLastTs = ref(0)
   const lastSavingsPopupIdentity = ref('')
-  const contextStatus = ref<ContextStatus | null>(null)
+  const contextStatus = ref<UsageContextStatus | null>(null)
 
   // Surfaced as a topbar chip only once the session's context window crosses the
   // gateway's warning ratio (0.85) — a proactive heads-up before compaction,
@@ -110,10 +62,10 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
     const cs = contextStatus.value
     if (!cs) return null
     const pressure = Number(cs.pressure ?? 0)
-    const ratio = Number(cs.warningRatio ?? cs.warning_ratio ?? 0.85)
-    const windowTokens = Number(cs.contextWindowTokens ?? cs.context_window_tokens ?? 0)
+    const ratio = cs.warningRatio
+    const windowTokens = cs.contextWindowTokens
     if (!(ratio > 0) || !(windowTokens > 0) || pressure < ratio) return null
-    const used = Number(cs.contextTokens ?? cs.context_tokens ?? 0)
+    const used = cs.contextTokens
     return {
       pct: Math.round(Math.min(1, pressure) * 100),
       usedK: Math.round(used / 1000),
@@ -161,29 +113,23 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   async function loadCurrentSessionUsage() {
     if (!options.sessionKey.value) return
     try {
-      await waitForSessionRpcConnection(options.rpc, options.readCallOptions)
-      const params = { sessionKey: options.sessionKey.value }
-      const usage = options.readCallOptions
-        ? await options.rpc.call<UsageStatusResponse>(
-            'usage.status',
-            params,
-            options.readCallOptions,
-          )
-        : await options.rpc.call<UsageStatusResponse>('usage.status', params)
-      const sessions = usage?.sessions || []
-      const current = sessions.find(s => (s.session || s.sessionKey || s.key) === options.sessionKey.value)
+      const usage = await usageReporting.status(
+        options.sessionKey.value,
+        options.readOptions,
+      )
+      const current = usage.sessions.find(s => s.sessionKey === options.sessionKey.value)
       if (current) {
-        usageAccum.value.input = Number(current.input_tokens || current.inputTokens || 0)
-        usageAccum.value.output = Number(current.output_tokens || current.outputTokens || 0)
-        usageAccum.value.cacheRead = Number(current.cache_read_tokens || current.cacheReadTokens || 0)
-        usageAccum.value.cacheWrite = Number(current.cache_write_tokens || current.cacheWriteTokens || 0)
-        const costVal = Number(current.cost_usd || current.costUsd || 0)
-        usageAccum.value.cost = costVal > 0 ? costVal : null
+        usageAccum.value.input = current.inputTokens ?? 0
+        usageAccum.value.output = current.outputTokens ?? 0
+        usageAccum.value.cacheRead = current.cacheReadTokens ?? 0
+        usageAccum.value.cacheWrite = current.cacheWriteTokens ?? 0
+        const costVal = current.costUsd
+        usageAccum.value.cost = costVal != null && costVal > 0 ? costVal : null
         usageModel.value = current.model || ''
         // Refresh (or clear) the context-pressure chip for this session. Clearing
         // when absent stops a previous session's warning from sticking after a
         // switch to a session that is well under threshold.
-        contextStatus.value = current.contextStatus ?? current.context_status ?? null
+        contextStatus.value = current.contextStatus
         saveWidgetState()
       }
     } catch {

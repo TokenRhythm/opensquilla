@@ -918,6 +918,56 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     expect(copyTextWithFallback).toHaveBeenCalledWith('Final answer.\n\nAI generated')
   })
 
+  it('does not copy explicit intermediate-only activity as an answer', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    const copied = await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Work narration.',
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: 'Work narration.',
+          rawText: 'Work narration.',
+          presentation: 'intermediate',
+        },
+        {
+          type: 'tool-group',
+          key: 'finish',
+          group: {
+            groupId: 'finish',
+            operationKey: 'file.read',
+            label: 'Read',
+            iconName: 'edit',
+            calls: [{
+              toolId: 'finish',
+              renderKey: 'finish',
+              name: 'read_file',
+              displayName: 'Read',
+              inputRaw: '{"path":"README.md"}',
+              inputPreview: 'README.md',
+              isRunning: false,
+              status: 'success',
+              isError: false,
+              result: 'ok',
+              resultPreview: 'ok',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: false,
+            status: 'success',
+          },
+        },
+      ],
+    }))
+
+    expect(copied).toBe(false)
+    expect(copyTextWithFallback).not.toHaveBeenCalled()
+  })
+
   it('copies the complete terminal Markdown answer from an ordinary tool transcript', async () => {
     const { api } = makeOptions([], text => text, () => 'AI generated')
 

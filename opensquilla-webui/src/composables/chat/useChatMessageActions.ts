@@ -88,6 +88,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     if (answer.source === 'canonical') {
       return options.sanitizeCopyText(answer.text, { provenance })
     }
+    if (answer.source === 'explicit-no-answer') return ''
     // The raw message text can be absent in older history, so rebuild only
     // that source-less compatibility case from the available segments while
     // applying the same provenance-aware silent-reply projection as the body.
@@ -106,6 +107,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   async function copyMessage(msg: ChatRenderedMessage): Promise<boolean> {
     try {
       const text = copyableMessageText(msg)
+      if (!text) return false
       const isAssistant = (msg.displayRole || msg.role) === 'assistant'
       const label = isAssistant ? options.aiGeneratedLabel?.().trim() : ''
       await copyTextWithFallback(label && text ? `${text}\n\n${label}` : text)

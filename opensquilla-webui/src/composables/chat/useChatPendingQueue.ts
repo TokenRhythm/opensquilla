@@ -1,3 +1,4 @@
+import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import { computed, nextTick, ref, watch, type Ref } from 'vue'
 import type {
   Attachment,
@@ -5,7 +6,7 @@ import type {
   HiddenControlDispatchResult,
   PendingSteerPhase,
 } from '@/types/chat'
-import type { SessionSteerV2Params } from '@/types/rpc'
+import type { SessionSteerV2Params } from '@/types/chat'
 import { isControlInput } from '@/utils/chat/inputSemantics'
 import { createClientMessageId, createClientRequestId } from '@/utils/chat/messageIdentity'
 import {
@@ -18,13 +19,18 @@ import type {
   PendingInputWalRecord,
   PendingInputWalState,
 } from '@/utils/chat/pendingInputWal'
+import {
+  PendingInputQueueError,
+  type PendingInputQueuePort,
+  type PendingInputServerItem,
+} from '@/modules/pendingInputQueue'
 import { snapshotSteerRequest } from './useChatSteerDelivery'
 
 const MAX_PENDING = 5
 const MAX_REMOVAL_TOMBSTONES = 256
 const MAX_PROMPT_ANNOTATION_IDS = 16
 
-function normalizePromptAnnotationIds(
+function normalizeAnnotationDraftIds(
   ids: unknown,
 ): string[] {
   return (Array.isArray(ids) ? ids : [])
@@ -104,7 +110,8 @@ export interface PendingQueueOwnerContext {
 
 export interface PendingQueuePayload {
   text: string
-  promptAnnotationIds?: readonly string[]
+  draftIds?: readonly string[]
+  pageContext?: ChatPageContext
   attachments?: Attachment[]
   intent?: string | null
   confirmedPlainText?: boolean
@@ -128,10 +135,7 @@ export interface UseChatPendingQueueOptions {
   resetInputHistory: () => void
   hasComposer: () => boolean
   pendingInputWal?: PendingInputWal | null
-  rpc?: {
-    call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-  }
-  supportsMethod?: (method: string) => boolean
+  pendingInputQueue?: PendingInputQueuePort | null
   connectionState?: Readonly<Ref<string>>
   prepareAttachmentsForSend?: (options: {
     attachments: Attachment[]
@@ -159,6 +163,7 @@ export interface UseChatPendingQueueOptions {
 }
 
 export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
+  const pendingInputQueue = options.pendingInputQueue
   const pendingQueue = ref<ChatPendingItem[]>([])
   const parkedQueues = new Map<string, ChatPendingItem[]>()
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
@@ -236,16 +241,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   })
 
   function supportsServerQueue(): boolean {
-    return Boolean(
-      options.rpc
-      && options.supportsMethod?.('sessions.pending_inputs.enqueue'),
-    )
+    return pendingInputQueue?.supportsQueue() === true
   }
 
   function supportsServerReorder(): boolean {
     return Boolean(
       supportsServerQueue()
-      && options.supportsMethod?.('sessions.pending_inputs.reorder')
+      && pendingInputQueue?.supportsReorder()
       && (!options.connectionState || options.connectionState.value === 'connected'),
     )
   }
@@ -266,8 +268,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       clientRequestId: item.pendingClientRequestId!,
       clientMessageId: item.pendingClientMessageId!,
       text: item.text,
-      ...(item.promptAnnotationIds?.length
-        ? { promptAnnotationIds: normalizePromptAnnotationIds(item.promptAnnotationIds) }
+      ...(item.retiredAnnotationInput ? { retiredAnnotationInput: true } : {}),
+      ...(item.pageContext ? { pageContext: normalizePageContext(item.pageContext)! } : {}),
+      ...(item.draftIds?.length
+        ? { draftIds: normalizeAnnotationDraftIds(item.draftIds) }
         : {}),
       attachments: (item.attachments || []).map(attachment => ({ ...attachment })),
       intent: item.intent,
@@ -303,8 +307,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return {
       pendingUiId: record.pendingInputId,
       text: record.text,
-      ...(normalizePromptAnnotationIds(record.promptAnnotationIds).length
-        ? { promptAnnotationIds: normalizePromptAnnotationIds(record.promptAnnotationIds) }
+      ...((record.retiredAnnotationInput || record.promptAnnotationIds?.length)
+        ? { retiredAnnotationInput: true } : {}),
+      ...(record.pageContext ? { pageContext: normalizePageContext(record.pageContext)! } : {}),
+      ...(normalizeAnnotationDraftIds(record.draftIds).length
+        ? { draftIds: normalizeAnnotationDraftIds(record.draftIds) }
         : {}),
       attachments: record.attachments.map(attachment => ({ ...attachment })),
       intent: record.intent,
@@ -370,7 +377,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   async function cancelServerIdentity(sessionKey: string, pendingInputId: string) {
     if (!supportsServerQueue()) return
-    await options.rpc!.call('sessions.pending_inputs.cancel', {
+    await pendingInputQueue!.cancel({
       key: sessionKey,
       pendingInputId,
     })
@@ -432,9 +439,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ))
   }
 
-  function rpcErrorCode(error: unknown): string {
-    const code = (error as { code?: unknown } | null)?.code
-    return typeof code === 'string' ? code : ''
+  function pendingQueueFailure(error: unknown): PendingInputQueueError | null {
+    return error instanceof PendingInputQueueError ? error : null
   }
 
   function durableAttachmentMetadata(attachment: Attachment): Attachment {
@@ -448,36 +454,21 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
-  function attachmentsFromServerItem(serverItem: Record<string, unknown>): Attachment[] {
-    const rawAttachments = Array.isArray(serverItem.attachments)
-      ? serverItem.attachments
-      : []
-    return rawAttachments.flatMap((rawAttachment, index) => {
-      if (!rawAttachment || typeof rawAttachment !== 'object') return []
-      const attachment = rawAttachment as Record<string, unknown>
-      const name = typeof attachment.name === 'string'
-        ? attachment.name
-        : 'attachment'
-      const mime = typeof attachment.mime === 'string'
-        ? attachment.mime
-        : typeof attachment.type === 'string'
-          ? attachment.type
-          : 'application/octet-stream'
-      return [{
-        kind: 'staged' as const,
-        local_id: -(index + 1),
-        name,
-        mime,
-        durable_material: true as const,
-        ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
-      }]
-    })
+  function attachmentsFromServerItem(serverItem: PendingInputServerItem): Attachment[] {
+    return (serverItem.attachments || []).map((attachment, index) => ({
+      kind: 'staged' as const,
+      local_id: -(index + 1),
+      name: attachment.name,
+      mime: attachment.mime,
+      durable_material: true as const,
+      ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
+    }))
   }
 
   async function ensureServerStaged(item: ChatPendingItem): Promise<void> {
     const pendingInputId = item.pendingInputId
     if (!pendingInputId || !options.pendingInputWal) return
-    if (item.ownerRequestId) return
+    if (item.ownerRequestId || item.retiredAnnotationInput) return
     if (
       item.pendingPersistenceState === 'cancelling'
       || item.pendingRetainAfterCancel === true
@@ -530,28 +521,23 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             // IndexedDB-only draft when the next Gateway is older/offline.
             item.pendingMayHaveServerCopy = true
             await writeWalItem(item, 'saving')
-            const response = await options.rpc!.call<Record<string, unknown>>(
-              'sessions.pending_inputs.enqueue',
-              {
+            const response = await pendingInputQueue!.enqueue({
                 key: item.ownerSessionKey || options.sessionKey.value,
                 pendingInputId,
                 clientRequestId: item.pendingClientRequestId,
                 clientMessageId: item.pendingClientMessageId,
-                message: providerMessage || 'Describe these attachments',
+                message: providerMessage || item.pageContext?.annotations?.map(item => item.text).join('\n') || 'Describe these attachments',
                 attachments: sendable.map(serializeSendableAttachment),
-                ...(item.promptAnnotationIds?.length
-                  ? { promptAnnotationIds: normalizePromptAnnotationIds(item.promptAnnotationIds) }
-                  : {}),
+                ...(item.pageContext ? { pageContext: item.pageContext } : {}),
                 ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
-                ...(sendable.length > 0 || literalSlashEscape
+                ...(sendable.length > 0 || literalSlashEscape || Boolean(item.pageContext?.annotations?.length)
                   ? { displayText: queuedText }
                   : {}),
                 ...(item.intent ? { intent: item.intent } : {}),
                 ...(Number.isSafeInteger(item.pendingPosition)
                   ? { position: item.pendingPosition }
                   : {}),
-              },
-            )
+              })
             if (wasRemoved(sessionKey, pendingInputId)) {
               // A peer may cancel while this enqueue response is in flight.
               // Cancel again after the ACK so an enqueue that committed after
@@ -560,7 +546,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               await options.pendingInputWal!.delete(pendingInputId).catch(() => {})
               return
             }
-            const fingerprint = response.requestFingerprint ?? response.request_fingerprint
+            const fingerprint = response.requestFingerprint
             const revision = response.revision
             if (typeof fingerprint !== 'string' || !fingerprint) {
               throw new Error('Gateway returned an invalid pending-input acknowledgement')
@@ -578,11 +564,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             flushDeferredPendingDrain()
             return
           } catch (error) {
-            const code = rpcErrorCode(error)
+            const kind = pendingQueueFailure(error)?.kind
             if (
               !refreshedLostUpload
               && options.prepareAttachmentsForSend
-              && (code === 'ATTACHMENT_EXPIRED' || code === 'ATTACHMENT_LOST_IN_RESTART')
+              && (kind === 'attachment-expired' || kind === 'attachment-lost')
               && item.attachments.some(attachment => attachment.kind === 'staged' && attachment.file)
             ) {
               refreshedLostUpload = true
@@ -597,10 +583,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           }
         }
       } catch (error) {
-        const code = rpcErrorCode(error)
+        const failure = pendingQueueFailure(error)
         if (
-          code === 'PENDING_INPUT_CANCELLED'
-          || code === 'PENDING_INPUT_ALREADY_DISPATCHED'
+          failure?.kind === 'cancelled'
+          || failure?.kind === 'already-dispatched'
         ) {
           // A peer or an earlier crashed tab already committed the durable
           // terminal outcome. Treat that server tombstone as authoritative
@@ -612,12 +598,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           broadcastChange(sessionKey, pendingInputId, 'removed')
           return
         }
-        if (code === 'METHOD_NOT_FOUND') {
+        if (failure?.kind === 'unsupported') {
           await writeWalItem(item, 'local_only')
           flushDeferredPendingDrain()
           return
         }
-        if ((error as { accepted?: unknown } | null)?.accepted === false) {
+        if (failure?.accepted === false) {
           await writeWalItem(item, 'retryable').catch(() => {})
           options.onPendingPersistenceError?.('server_rejected')
           return
@@ -685,12 +671,20 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (!supportsServerQueue()) {
       for (const item of [...pendingQueue.value]) {
         if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
+        const pendingInputId = item.pendingInputId!
+        // A snapshot can race the WAL write and the enqueue itself. Keep an
+        // in-flight/saving row visible until its owner settles; otherwise an
+        // empty list response would tombstone a perfectly valid local item.
+        const saving = item.pendingPersistenceState === 'saving'
+        const stagingInFlight = stagingOperations.has(pendingInputId)
         if (
-          !walIds.has(item.pendingInputId!)
-          && !locallyCreatingIds.has(item.pendingInputId!)
+          !walIds.has(pendingInputId)
+          && !locallyCreatingIds.has(pendingInputId)
+          && !saving
+          && !stagingInFlight
         ) {
-          rememberRemoval(sessionKey, item.pendingInputId!)
-          removePendingIdentity(sessionKey, item.pendingInputId!)
+          rememberRemoval(sessionKey, pendingInputId)
+          removePendingIdentity(sessionKey, pendingInputId)
           continue
         }
         // A cancellation WAL is a durable delete intent, never a draft to
@@ -719,26 +713,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
 
     try {
-      const response = await options.rpc!.call<{ items?: Array<Record<string, unknown>> }>(
-        'sessions.pending_inputs.list',
-        { key: sessionKey },
-      )
+      const response = { items: await pendingInputQueue!.list(sessionKey) }
       if (disposed || generation !== hydrateGeneration || options.sessionKey.value !== sessionKey) {
         return
       }
       const serverItems = Array.isArray(response.items) ? response.items : []
       const serverIds = new Set<string>()
       for (const serverItem of serverItems) {
-        const pendingInputId = String(
-          serverItem.pendingInputId || serverItem.pending_input_id || '',
-        )
-        const clientRequestId = String(
-          serverItem.clientRequestId || serverItem.client_request_id || '',
-        )
-        const clientMessageId = String(
-          serverItem.clientMessageId || serverItem.client_message_id || '',
-        )
-        if (!pendingInputId || !clientRequestId || !clientMessageId) continue
+        const pendingInputId = serverItem.pendingInputId
+        const clientRequestId = serverItem.clientRequestId
+        const clientMessageId = serverItem.clientMessageId
         if (wasRemoved(sessionKey, pendingInputId)) {
           void cancelServerIdentity(sessionKey, pendingInputId).catch(() => {})
           continue
@@ -753,18 +737,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             pendingUiId: pendingInputId,
             text: typeof serverItem.displayText === 'string'
               ? serverItem.displayText
-              : String(serverItem.message || ''),
+              : serverItem.message || '',
             attachments: serverAttachments,
             intent: typeof serverItem.intent === 'string' ? serverItem.intent : null,
-            ...(normalizePromptAnnotationIds(
-              serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
-            ).length
-              ? {
-                  promptAnnotationIds: normalizePromptAnnotationIds(
-                    serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
-                  ),
-                }
-              : {}),
+            ...(normalizePageContext(serverItem.pageContext)
+              ? { pageContext: normalizePageContext(serverItem.pageContext)! } : {}),
             ...(serverItem.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
             ownerSessionKey: sessionKey,
             pendingInputId,
@@ -786,15 +763,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           // snapshot with safe server-owned metadata before marking it staged.
           item.attachments = serverAttachments
         }
-        const serverPromptAnnotationIds = normalizePromptAnnotationIds(
-          serverItem.promptAnnotationIds || serverItem.prompt_annotation_ids,
-        )
-        if (serverPromptAnnotationIds.length > 0) {
-          item.promptAnnotationIds = serverPromptAnnotationIds
-        }
-        item.pendingRequestFingerprint = String(
-          serverItem.requestFingerprint || serverItem.request_fingerprint || '',
-        ) || undefined
+        const serverPageContext = normalizePageContext(serverItem.pageContext)
+        if (serverPageContext) item.pageContext = serverPageContext
+        item.pendingRequestFingerprint = serverItem.requestFingerprint
         item.pendingServerRevision = typeof serverItem.revision === 'number'
           ? serverItem.revision
           : 1
@@ -810,12 +781,19 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       for (const item of [...pendingQueue.value]) {
         if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
         if (serverIds.has(item.pendingInputId!)) continue
+        const pendingInputId = item.pendingInputId!
+        // The list snapshot may have started before the WAL write or enqueue
+        // completed. Preserve an in-flight row until its owner settles.
+        const saving = item.pendingPersistenceState === 'saving'
+        const stagingInFlight = stagingOperations.has(pendingInputId)
         if (
-          !walIds.has(item.pendingInputId!)
-          && !locallyCreatingIds.has(item.pendingInputId!)
+          !walIds.has(pendingInputId)
+          && !locallyCreatingIds.has(pendingInputId)
+          && !saving
+          && !stagingInFlight
         ) {
-          rememberRemoval(sessionKey, item.pendingInputId!)
-          removePendingIdentity(sessionKey, item.pendingInputId!)
+          rememberRemoval(sessionKey, pendingInputId)
+          removePendingIdentity(sessionKey, pendingInputId)
           continue
         }
         if (item.pendingPersistenceState === 'cancelling') {
@@ -890,11 +868,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return false
     }
     const ownerRequestId = resolveOwnerRequestId(owner)
-    const promptAnnotationIds = normalizePromptAnnotationIds(payload.promptAnnotationIds)
+    const draftIds = normalizeAnnotationDraftIds(payload.draftIds)
     const item: ChatPendingItem = {
       pendingUiId: createClientRequestId(),
       text: payload.text,
-      ...(promptAnnotationIds.length ? { promptAnnotationIds } : {}),
+      ...(payload.pageContext ? { pageContext: normalizePageContext(payload.pageContext)! } : {}),
+      ...(draftIds.length ? { draftIds } : {}),
       attachments: (payload.attachments || []).map(a => ({ ...a })),
       intent: payload.intent ?? null,
       ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),
@@ -937,7 +916,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     owner?: PendingQueueOwner,
     enqueueOptions?: {
       confirmedPlainText?: boolean
-      promptAnnotationIds?: readonly string[]
+      draftIds?: readonly string[]
+      pageContext?: ChatPageContext
+      attachments?: Attachment[]
     },
   ): boolean | Promise<boolean> {
     if (isControlInput(text) && !enqueueOptions?.confirmedPlainText) return false
@@ -946,10 +927,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const composerIntent = options.pendingSessionIntent.value
     const queued = enqueuePendingPayload({
       text,
-      ...(enqueueOptions?.promptAnnotationIds?.length
-        ? { promptAnnotationIds: enqueueOptions.promptAnnotationIds }
+      ...(enqueueOptions?.pageContext ? { pageContext: enqueueOptions.pageContext } : {}),
+      ...(enqueueOptions?.draftIds?.length
+        ? { draftIds: enqueueOptions.draftIds }
         : {}),
-      attachments: options.pendingAttachments.value,
+      attachments: enqueueOptions?.attachments ?? options.pendingAttachments.value,
       intent: composerIntent,
       ...(enqueueOptions?.confirmedPlainText ? { confirmedPlainText: true } : {}),
     }, owner)
@@ -1167,9 +1149,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // connected to a queue-capable Gateway must attempt the server tombstone
       // before its local WAL is removed. Otherwise a deleted chip can reappear
       // on the next hydrate.
-      await options.rpc!.call('sessions.pending_inputs.cancel', {
+      await pendingInputQueue!.cancel({
         key: item.ownerSessionKey || options.sessionKey.value,
-        pendingInputId: item.pendingInputId,
+        pendingInputId: item.pendingInputId!,
         ...(previousState === 'staged' && item.pendingServerRevision
           ? { expectedRevision: item.pendingServerRevision }
           : {}),
@@ -1248,6 +1230,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const item = pendingQueue.value[index]
     if (
       !item
+      || item.retiredAnnotationInput
       || (item.hiddenControl && !allowHiddenControl)
       || item.deliveryState === 'steering'
       || item.steerAttempt?.phase === 'submitting'
@@ -1337,10 +1320,18 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return result !== false
   }
 
-  function switchPendingQueue(targetSessionKey: string): void | Promise<void> {
+  function switchPendingQueue(
+    targetSessionKey: string,
+    shouldCommit: () => boolean = () => true,
+    handoffSignal?: AbortSignal,
+  ): void | Promise<void> {
     if (reorderCommitPromise) {
-      return reorderCommitPromise.then(() => switchPendingQueue(targetSessionKey))
+      return reorderCommitPromise.then(() => {
+        if (!shouldCommit()) return
+        return switchPendingQueue(targetSessionKey, shouldCommit, handoffSignal)
+      })
     }
+    if (!shouldCommit()) return
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
@@ -1398,17 +1389,26 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   async function acceptDurableHandoff(
     targetSessionKey: string,
     ownerRequestId: string,
+    shouldApply: () => boolean = () => true,
+    handoffSignal?: AbortSignal,
   ): Promise<boolean> {
     if (!options.pendingInputWal?.acceptHandoff) return false
     if (options.pendingInputWal.listHandoffs) {
       const records = await options.pendingInputWal.listHandoffs()
+      if (!shouldApply()) return false
       if (!records.some(record => record.ownerRequestId === ownerRequestId)) return false
     }
+    if (!shouldApply()) return false
     const commit = await options.pendingInputWal.acceptHandoff(
       ownerRequestId,
       targetSessionKey,
+      shouldApply,
+      handoffSignal,
     )
-    applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
+    if (!commit) return false
+    if (shouldApply()) {
+      applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
+    }
     return true
   }
 
@@ -1444,15 +1444,27 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
-  async function adoptPendingQueue(targetSessionKey: string, ownerRequestId: string) {
+  async function adoptPendingQueue(
+    targetSessionKey: string,
+    ownerRequestId: string,
+    shouldCommit: () => boolean = () => true,
+    handoffSignal?: AbortSignal,
+  ) {
     if (reorderCommitPromise) await reorderCommitPromise
     else cancelPendingReorder()
-    clearPendingDrainAfterTerminalTimer()
+    if (!shouldCommit()) return
     const sourceSessionKey = options.sessionKey.value
     const durableCommitApplied = await acceptDurableHandoff(
       targetSessionKey,
       ownerRequestId,
+      shouldCommit,
+      handoffSignal,
     )
+    if (!shouldCommit()) return
+    // The source queue still owns its terminal drain signal until the durable
+    // handoff has committed and this epoch is current. Clearing it before the
+    // await would strand A if IndexedDB failed or A→B was superseded by A.
+    clearPendingDrainAfterTerminalTimer()
     const carried: ChatPendingItem[] = []
     const stayingVisible: ChatPendingItem[] = []
     const stayingHidden: ChatPendingItem[] = []
@@ -1517,11 +1529,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || item.hiddenControl
       || item.deliveryState
       || item.steerAttempt
-      // Annotation IDs refer to durable drafts owned by the annotation store.
-      // This queue only has the IDs, not enough snapshot data to reconstruct
-      // those drafts in the composer. Never turn such a queued batch into a
-      // plain-text edit and silently drop its annotation context.
-      || item.promptAnnotationIds?.length
+      // The text editor cannot reconstruct a frozen page selection. Keep the
+      // complete queued context until it is sent or explicitly removed.
+      || item.pageContext
       || item.pendingPersistenceState === 'saving'
       || item.pendingPersistenceState === 'cancelling'
       || hasUneditablePendingAttachments(item)
@@ -1655,6 +1665,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     clearPendingDrainAfterTerminalTimer()
     if (pendingQueue.value.length === 0) return
     const head = pendingQueue.value[0]
+    if (head?.retiredAnnotationInput) return
     const ownerSessionKey = head?.ownerSessionKey || options.sessionKey.value
     if (ownerSessionKey !== options.sessionKey.value) {
       if (head) head.deliveryState = 'retryable'
@@ -1830,24 +1841,24 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   async function applyServerReorderItems(
-    rawItems: Array<Record<string, unknown>>,
+    items: PendingInputServerItem[],
   ): Promise<void> {
     const byId = new Map(
-      rawItems.map(raw => [String(raw.pendingInputId || raw.pending_input_id || ''), raw]),
+      items.map(item => [item.pendingInputId, item]),
     )
-    const orderedIds = rawItems
+    const orderedIds = items
       .slice()
       .sort((left, right) => Number(left.position) - Number(right.position))
-      .map(raw => String(raw.pendingInputId || raw.pending_input_id || ''))
+      .map(item => item.pendingInputId)
     if (
       orderedIds.length !== pendingQueue.value.length
       || orderedIds.some(id => !id || !byId.has(id))
     ) throw new Error('Gateway returned an incomplete pending order')
     restorePendingOrder(orderedIds)
     for (const item of pendingQueue.value) {
-      const raw = byId.get(item.pendingInputId || '')!
-      item.pendingPosition = Number(raw.position)
-      item.pendingServerRevision = Number(raw.revision)
+      const serverItem = byId.get(item.pendingInputId || '')!
+      item.pendingPosition = Number(serverItem.position)
+      item.pendingServerRevision = Number(serverItem.revision)
       item.pendingWalRevision = (item.pendingWalRevision ?? 0) + 1
     }
     if (!options.pendingInputWal?.putMany) {
@@ -1862,18 +1873,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   async function recoverServerReorder(): Promise<boolean> {
-    if (!options.rpc || !supportsServerQueue()) return false
+    if (!pendingInputQueue || !supportsServerQueue()) return false
     const expectedOrder = pendingQueue.value.map(item => item.pendingInputId)
     try {
-      const response = await options.rpc.call<{ items?: Array<Record<string, unknown>> }>(
-        'sessions.pending_inputs.list',
-        { key: options.sessionKey.value },
-      )
+      const response = { items: await pendingInputQueue.list(options.sessionKey.value) }
       const items = Array.isArray(response.items) ? response.items : []
       const serverOrder = items
         .slice()
         .sort((left, right) => Number(left.position) - Number(right.position))
-        .map(item => String(item.pendingInputId || item.pending_input_id || ''))
+        .map(item => item.pendingInputId)
       await applyServerReorderItems(items)
       if (serverOrder.some((id, index) => id !== expectedOrder[index])) {
         options.onPendingPersistenceError?.('order_conflict')
@@ -1952,16 +1960,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return
     }
     try {
-      const response = await options.rpc!.call<{ items?: Array<Record<string, unknown>> }>(
-        'sessions.pending_inputs.reorder',
-        {
+      const response = await pendingInputQueue!.reorder({
           key: options.sessionKey.value,
           items: pendingQueue.value.map(item => ({
             pendingInputId: item.pendingInputId,
             expectedRevision: item.pendingServerRevision,
           })),
-        },
-      )
+        })
       await applyServerReorderItems(Array.isArray(response.items) ? response.items : [])
       broadcastChange(options.sessionKey.value)
       finishPendingReorder()

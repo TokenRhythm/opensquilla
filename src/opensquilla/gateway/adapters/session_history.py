@@ -1,0 +1,286 @@
+"""Gateway adapter for the application-owned session history read seam.
+
+The v4 Gateway has historically combined three concerns in ``rpc_chat``:
+request cursor parsing, concrete session-manager/storage calls, and the
+transport-neutral choice between a canonical transcript and the active
+transcript.  This adapter owns the concrete side of that boundary.  The
+application module only receives normalized cursors and narrow reader Ports;
+the existing handler remains responsible for the final chat-message
+projection and response envelope.
+
+Keeping the adapter separate is intentional.  It lets the WebSocket handler
+and the bootstrap composition use exactly one history implementation while
+leaving the v4 wire shape and all legacy fallback/error semantics untouched.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import structlog
+
+from opensquilla.application.session_history import (
+    HistoryCursor,
+    HistoryPage,
+    SessionHistoryApplication,
+    paginate_transcript,
+)
+from opensquilla.chat.flattened_tool_markers import (
+    has_flattened_used_tool_line,
+    is_flattened_tool_result_dump,
+)
+from opensquilla.session.storage import StorageBusyError
+
+log = structlog.get_logger(__name__)
+
+
+def parse_history_cursor(value: object) -> HistoryCursor | None:
+    """Parse the legacy ``created_at|entry_id`` cursor without raising.
+
+    The v4 handler historically treated an absent, empty, or malformed
+    cursor as an unpositioned read.  Keeping that conversion in the adapter
+    means the application layer never needs to know the wire representation.
+    """
+
+    raw = str(value or "").strip()
+    if not raw or "|" not in raw:
+        return None
+    created_at, stable_id = raw.split("|", 1)
+    try:
+        return int(created_at), int(stable_id)
+    except ValueError:
+        return None
+
+
+def _cursor_text(entry: object | None) -> str | None:
+    """Render an entry cursor for compatibility reads inside this adapter."""
+
+    if entry is None:
+        return None
+    created_at = getattr(entry, "created_at", "")
+    stable_id = getattr(entry, "id", None) or getattr(entry, "message_id", "")
+    if created_at in {None, ""} or stable_id in {None, ""}:
+        return None
+    return f"{created_at}|{stable_id}"
+
+
+def canonical_page_parts(page: object) -> tuple[list[object], bool, bool]:
+    """Normalize the concrete manager's legacy page return shapes.
+
+    Older managers returned ``(entries, has_more)`` while newer ones return a
+    small object carrying ``canonical_complete``.  The shape belongs here at
+    the concrete boundary; neither the application service nor the handler
+    needs to branch on it.
+    """
+
+    if isinstance(page, dict):
+        entries = page.get("entries")
+        has_more = page.get("has_more", False)
+        canonical_complete = page.get("canonical_complete", True)
+    elif isinstance(page, tuple):
+        entries = page[0] if page else None
+        has_more = page[1] if len(page) > 1 else False
+        canonical_complete = page[2] if len(page) > 2 else True
+    else:
+        entries = getattr(page, "entries", None)
+        has_more = getattr(page, "has_more", False)
+        canonical_complete = getattr(page, "canonical_complete", True)
+    if entries is None:
+        raise TypeError("canonical transcript page is missing entries")
+    return list(entries), bool(has_more), bool(canonical_complete)
+
+
+class SessionHistoryStorageAdapter:
+    """Expose only the two history reader Ports required by the application.
+
+    ``manager`` is deliberately accepted as an opaque object.  The concrete
+    Gateway session manager has changed shape several times, and retaining
+    duck-typed capability checks here preserves compatibility with old test
+    doubles and packaged clients without leaking those checks into the
+    application module.
+    """
+
+    def __init__(self, manager: object) -> None:
+        self._manager = manager
+
+    async def read_canonical_page(
+        self,
+        session_key: str,
+        *,
+        limit: int,
+        before: HistoryCursor | None,
+        after: HistoryCursor | None,
+    ) -> HistoryPage | None:
+        """Read canonical history, returning ``None`` only when unavailable.
+
+        Non-retryable canonical failures historically fell back to the active
+        transcript.  ``StorageBusyError`` is intentionally preserved so the
+        dispatcher can return its existing retryable error envelope.
+        """
+
+        page_getter = getattr(self._manager, "get_canonical_transcript_page", None)
+        if callable(page_getter):
+            try:
+                page = await page_getter(
+                    session_key,
+                    limit=limit,
+                    before=before,
+                    after=after,
+                )
+                entries, has_more, canonical_complete = canonical_page_parts(page)
+                return HistoryPage(
+                    entries=tuple(entries),
+                    has_more=has_more,
+                    canonical_available=True,
+                    canonical_complete=canonical_complete,
+                )
+            except StorageBusyError:
+                raise
+            except Exception:  # noqa: BLE001 - preserve legacy active fallback
+                return None
+
+        getter = getattr(self._manager, "get_canonical_transcript", None)
+        if callable(getter):
+            try:
+                transcript = tuple(await getter(session_key))
+                page_entries, has_more = paginate_transcript(
+                    transcript,
+                    limit=limit,
+                    before=before,
+                    after=after,
+                )
+                return HistoryPage(
+                    entries=page_entries,
+                    has_more=has_more,
+                    canonical_available=True,
+                    canonical_complete=True,
+                )
+            except StorageBusyError:
+                raise
+            except Exception:  # noqa: BLE001 - preserve legacy active fallback
+                return None
+        return None
+
+    async def read_active_transcript(self, session_key: str) -> Sequence[object]:
+        """Read the legacy active transcript, preserving missing capability semantics."""
+
+        getter = getattr(self._manager, "get_transcript", None)
+        if not callable(getter):
+            return ()
+        transcript = await getter(session_key)
+        return tuple(transcript or ())
+
+    def application(self) -> SessionHistoryApplication:
+        """Compose the transport-neutral history application for this manager."""
+
+        return SessionHistoryApplication(active=self, canonical=self)
+
+    async def load_legacy_tool_projection_context(
+        self,
+        session_key: str,
+        entries: list[object],
+        *,
+        canonical_available: bool,
+    ) -> tuple[object | None, object | None]:
+        """Load one adjacent canonical row at either page edge when required.
+
+        This is a presentation compatibility read, not part of pagination.
+        It remains in the Gateway adapter because the marker format is a
+        legacy wire projection concern.  Errors have the same behavior as the
+        former handler helper: busy is retryable; other failures leave the
+        selected page intact and are logged.
+        """
+
+        if not entries or not canonical_available:
+            return None, None
+        page_getter = getattr(
+            self._manager,
+            "get_canonical_transcript_page",
+            None,
+        )
+        if not callable(page_getter):
+            return None, None
+
+        previous_entry = None
+        next_entry = None
+        oldest_cursor = parse_history_cursor(_cursor_text(entries[0]))
+        newest_cursor = parse_history_cursor(_cursor_text(entries[-1]))
+
+        if _needs_legacy_tool_lookbehind(entries[0]) and oldest_cursor is not None:
+            try:
+                page = await page_getter(
+                    session_key,
+                    limit=1,
+                    before=oldest_cursor,
+                    after=None,
+                )
+                candidates, _has_more, _complete = canonical_page_parts(page)
+            except StorageBusyError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - optional projection read
+                log.warning(
+                    "chat_history_legacy_projection_context_unavailable",
+                    edge="before",
+                    error_type=type(exc).__name__,
+                )
+                return None, None
+            if candidates:
+                candidate = candidates[-1]
+                candidate_cursor = parse_history_cursor(_cursor_text(candidate))
+                if candidate_cursor is not None and candidate_cursor < oldest_cursor:
+                    previous_entry = candidate
+
+        if _needs_legacy_tool_lookahead(entries[-1]) and newest_cursor is not None:
+            try:
+                page = await page_getter(
+                    session_key,
+                    limit=1,
+                    before=None,
+                    after=newest_cursor,
+                )
+                candidates, _has_more, _complete = canonical_page_parts(page)
+            except StorageBusyError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - optional projection read
+                log.warning(
+                    "chat_history_legacy_projection_context_unavailable",
+                    edge="after",
+                    error_type=type(exc).__name__,
+                )
+                return None, None
+            if candidates:
+                candidate = candidates[0]
+                candidate_cursor = parse_history_cursor(_cursor_text(candidate))
+                if candidate_cursor is not None and candidate_cursor > newest_cursor:
+                    next_entry = candidate
+        return previous_entry, next_entry
+
+
+def build_session_history_application(manager: object) -> SessionHistoryApplication:
+    """Build the history application and keep adapter ownership explicit."""
+
+    return SessionHistoryStorageAdapter(manager).application()
+
+
+def _needs_legacy_tool_lookbehind(entry: object | None) -> bool:
+    if entry is None or getattr(entry, "tool_call_id", None):
+        return False
+    role = str(getattr(entry, "role", "") or "").lower()
+    content = str(getattr(entry, "content", "") or "")
+    return role in {"tool", "user"} and is_flattened_tool_result_dump(content)
+
+
+def _needs_legacy_tool_lookahead(entry: object | None) -> bool:
+    if entry is None or getattr(entry, "tool_calls", None):
+        return False
+    role = str(getattr(entry, "role", "") or "").lower()
+    content = str(getattr(entry, "content", "") or "")
+    return role == "assistant" and has_flattened_used_tool_line(content)
+
+
+__all__ = [
+    "SessionHistoryStorageAdapter",
+    "build_session_history_application",
+    "canonical_page_parts",
+    "parse_history_cursor",
+]

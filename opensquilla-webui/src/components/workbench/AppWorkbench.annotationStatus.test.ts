@@ -3,6 +3,22 @@ import { describe, expect, it } from 'vitest'
 import appWorkbenchSource from './AppWorkbench.vue?raw'
 
 describe('AppWorkbench annotation mode status', () => {
+  it('omits reopening and refresh callbacks from the active preview file menu', () => {
+    const menu = appWorkbenchSource.match(/<ResourceActionsMenu\b[^>]*\/>/)?.[0]
+
+    expect(menu).toBeDefined()
+    expect(menu).toContain(':previewable="false"')
+    expect(menu).not.toContain('@open=')
+  })
+
+  it('keeps the original annotation target and includes its optional subpage when focusing', () => {
+    const start = appWorkbenchSource.indexOf('async function onPromptAnnotationFocus(')
+    const end = appWorkbenchSource.indexOf('\nasync function onPromptAnnotationReuse(', start)
+    const source = appWorkbenchSource.slice(start, end)
+    expect(source).toContain('targetRef: draft.targetRef')
+    expect(source).toContain('...(draft.pagePath ? { pagePath: draft.pagePath } : {})')
+    expect(source).not.toContain('getWorkbenchBrowserTarget')
+  })
   it('renders live guidance only for the active annotation toolbar action', () => {
     expect(appWorkbenchSource).toContain(
       'v-if="isActiveAnnotationToolbarItem(toolbarItem)"',
@@ -28,6 +44,19 @@ describe('AppWorkbench annotation mode status', () => {
   it('associates the active toggle with the visible guidance', () => {
     expect(appWorkbenchSource).toContain(':aria-describedby="isActiveAnnotationToolbarItem(toolbarItem)')
     expect(appWorkbenchSource).toContain("? 'workbench-annotation-mode-status'")
+  })
+
+  it('marks the annotation action as beta without changing its accessible label', () => {
+    expect(appWorkbenchSource).toContain(
+      "v-if=\"toolbarItem.id === 'toggle-annotation-mode'\"",
+    )
+    expect(appWorkbenchSource).toContain('class="app-workbench__action-beta"')
+    expect(appWorkbenchSource).toMatch(
+      /app-workbench__action-beta[\s\S]*aria-hidden="true"[\s\S]*>\s*β\s*<\/span>/,
+    )
+    expect(appWorkbenchSource).toMatch(
+      /\.app-workbench__action-beta\s*\{[\s\S]*font-size: 7px;[\s\S]*opacity: 0\.58;/,
+    )
   })
 
   it('uses the workbench container width and preserves fixed-size toolbar actions', () => {
@@ -62,7 +91,7 @@ describe('AppWorkbench annotation mode status', () => {
     )
   })
 
-  it('routes source.patched invalidations through resource and preview refresh', () => {
+  it("routes document version invalidations through resource and preview refresh", () => {
     const start = appWorkbenchSource.indexOf('function onArtifactState(')
     const end = appWorkbenchSource.indexOf('\nfunction promptAnnotationItem(', start)
     const source = appWorkbenchSource.slice(start, end)
@@ -71,22 +100,22 @@ describe('AppWorkbench annotation mode status', () => {
     expect(source).toContain('workbenchResources.load(activeSessionKey, true)')
     expect(source).toContain('refreshResourceCollectionItem(activeSessionKey)')
     expect(source).toContain('void refreshArtifactDocumentItem(item)')
-    // Artifact actions, including source.patched, share one content-free
+    // Version actions share one content-free
     // invalidation path; filtering by action here would leave Preview stale.
     expect(source).not.toContain('event.action')
     expect(appWorkbenchSource).toContain(
-      "rpc.on('session.event.artifact_state', onArtifactState)",
+      'artifactWorkbench.subscribeDocumentChanges(onArtifactState)',
     )
   })
 
-  it('matches annotation acceptance across provisional and canonical session keys', () => {
-    const start = appWorkbenchSource.indexOf('async function onPromptAnnotationsAccepted')
+  it("matches sent page annotations across provisional and canonical session keys", () => {
+    const start = appWorkbenchSource.indexOf("async function onPageAnnotationsSent")
     const end = appWorkbenchSource.indexOf('\nasync function beforeCloseItem', start)
     const source = appWorkbenchSource.slice(start, end)
 
     expect(start).toBeGreaterThan(-1)
-    expect(source).toContain('promptAnnotationAcceptanceQueue.enqueue(detail)')
-    expect(source).toContain('schedulePromptAnnotationAcceptanceFlush()')
+    expect(source).toContain("pageAnnotationSendQueue.enqueue(detail)")
+    expect(source).toContain("schedulePageAnnotationSendFlush()")
     expect(appWorkbenchSource).toContain(
       'const stopPromptAnnotationLifecycle = store.onLifecycle',
     )
@@ -153,14 +182,18 @@ describe('AppWorkbench annotation mode status', () => {
     ) || []
 
     expect(appWorkbenchSource).toContain('function artifactPreviewItemForExplicitOpen(')
-    expect(explicitOpenCalls).toHaveLength(3)
+    expect(explicitOpenCalls).toHaveLength(2)
     expect(appWorkbenchSource).not.toContain('let artifactSectionRequestId')
   })
 
   it('contains expected resource refresh aborts at every fire-and-forget call site', () => {
-    const guardedLoads = appWorkbenchSource.match(
-      /void workbenchResources\.load\([^;]+?\.catch\(\(\) => undefined\)/gs,
+    const loadCalls = appWorkbenchSource.match(
+      /void (?:artifactWorkbench\.ready\(\)\.then\(\(\) => )?workbenchResources\.load\(/g,
     ) || []
-    expect(guardedLoads).toHaveLength(4)
+    const guardedLoads = appWorkbenchSource.match(
+      /void (?:artifactWorkbench\.ready\(\)\.then\(\(\) => )?workbenchResources\.load\([^;]+?\.catch\(\(\) => undefined\)/gs,
+    ) || []
+    expect(loadCalls).toHaveLength(3)
+    expect(guardedLoads).toHaveLength(loadCalls.length)
   })
 })

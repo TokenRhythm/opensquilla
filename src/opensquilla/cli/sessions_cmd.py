@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,10 +13,9 @@ from rich.table import Table
 
 from opensquilla.cli.chat.session_state import messages_to_markdown
 from opensquilla.cli.gateway_client import session_history_all
-from opensquilla.cli.gateway_rpc import run_gateway_sync
+from opensquilla.cli.gateway_rpc import default_gateway_url, run_gateway_sync
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
-from opensquilla.cli.url_utils import normalize_gateway_url
 
 app = typer.Typer(help="Manage chat sessions.")
 
@@ -87,12 +85,28 @@ def _filter_sessions(
         if status and str(row.get("status") or "").lower() != status.lower():
             continue
         if channel:
+            # `list_sessions` projects the channel under the canonical source
+            # fields built by chat.source.chat_source_metadata — `channel_kind`,
+            # `source_kind` and `surface`. On cron and webchat rows the plain
+            # `channel` key is null, so matching only the legacy names filtered
+            # every one of those rows out and `--channel cron` returned nothing.
+            # Falsy values are skipped so a null field cannot contribute "" to
+            # the comparison set.
             channel_values = {
-                str(row.get("channel") or ""),
-                str(row.get("last_channel") or ""),
-                str(row.get("lastChannel") or ""),
-                str(row.get("source_channel") or ""),
-                str(row.get("sourceChannel") or ""),
+                str(row.get(key))
+                for key in (
+                    "channel",
+                    "last_channel",
+                    "lastChannel",
+                    "source_channel",
+                    "sourceChannel",
+                    "channel_kind",
+                    "channelKind",
+                    "source_kind",
+                    "sourceKind",
+                    "surface",
+                )
+                if row.get(key)
             }
             if channel not in channel_values:
                 continue
@@ -109,9 +123,13 @@ async def _with_client(action):
 
     client = GatewayClient()
     try:
-        await client.connect(
-            normalize_gateway_url(os.environ.get("OPENSQUILLA_GATEWAY_URL", "ws://localhost:18791/ws"))
-        )
+        # `default_gateway_url()` is what `sessions list`/`show`/`abort` reach
+        # through `run_gateway_sync`. The literal this replaced skipped the
+        # config entirely, so `resume`, `delete` and `export` went to
+        # 127.0.0.1:18791 no matter which profile was selected — a named
+        # profile's gateway on another port was invisible to them (#1379).
+        # `OPENSQUILLA_GATEWAY_URL` still wins; the resolver checks it first.
+        await client.connect(default_gateway_url())
         return await action(client)
     except SystemExit as exc:
         console.print(f"[dim]{exc}[/dim]")
