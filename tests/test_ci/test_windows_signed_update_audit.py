@@ -1233,7 +1233,9 @@ def test_reparse_or_symlink_directory_is_never_followed_for_cleanup(
     assert (target / "marker.txt").read_bytes() == marker
 
 
+@pytest.mark.ci_serial
 def test_real_node_and_frozen_python_complete_only_in_new_temporary_parent(tmp_path: Path) -> None:
+    # Isolate the real Node/Python process launches from parallel runner load.
     node = shutil.which("node")
     assert node
     roaming = tmp_path.resolve() / "Roaming"
