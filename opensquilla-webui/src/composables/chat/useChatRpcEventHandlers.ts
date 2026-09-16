@@ -2398,6 +2398,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           turnOutcome?.replaySafe === true,
         ),
         errorCode,
+        modelCapacity: rawPayload.modelCapacity,
         turnId: terminalTurnId || undefined,
         turnOutcome,
         terminalNotice: true,

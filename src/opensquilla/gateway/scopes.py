@@ -179,6 +179,7 @@ METHOD_SCOPES: dict[str, str] = {
     "logs.tail": READ_SCOPE,
     "logs.trace": READ_SCOPE,
     "models.list": READ_SCOPE,
+    "models.capacity.resolve": READ_SCOPE,
     "models.routing.get": READ_SCOPE,
     "providers.status": READ_SCOPE,
     # OpenSquilla-only; non-consuming peek at a session's router-control hold

@@ -1808,6 +1808,8 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     safe_payload = {
         key: value for key, value in payload.items() if key not in sensitive_provider_fields
     }
+    if safe_payload.get("model_capacity") is None:
+        safe_payload.pop("model_capacity", None)
     return {
         **safe_payload,
         "code": code,

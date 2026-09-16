@@ -190,18 +190,27 @@ def build_terminal_reply(
     if is_context_payload_too_large(record_or_payload) or (
         isinstance(existing, str) and _contains_context_payload_marker(existing)
     ):
+        capacity = _read_value(record_or_payload, "model_capacity")
+        capacity_hint = ""
+        if isinstance(capacity, Mapping) and capacity.get("source") == "default":
+            window = capacity.get("contextWindow")
+            if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+                capacity_hint = (
+                    f" The context window uses a system default of {window:,} tokens; "
+                    "verify this model's limits in Settings > Model Routing > Model settings."
+                )
         # Only our complete, fixed diagnostics may survive this boundary.
         # Upstream prose (including text appended to a known message) stays
         # behind the generic context-error projection below.
         for message in CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES.values():
             if error_message == _normalize(message):
-                return message
+                return message + capacity_hint
         return (
             "The request is too large for the provider context window after "
             "automatic context compaction and payload reduction. OpenSquilla "
             "preserved the recoverable state; retry with a narrower request "
             "or a larger-context model."
-        )
+        ) + capacity_hint
     if (
         error_class == "empty_response"
         and error_message == _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE

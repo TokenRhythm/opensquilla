@@ -647,6 +647,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         provenanceSourceTool: msg.provenanceSourceTool,
         stopNotice: msg.stopNotice,
         errorCode: msg.errorCode,
+        modelCapacity: msg.modelCapacity,
       }
       // Additive: derive discriminated parts from the finished rendered
       // object so they cannot drift from the fields the components read. Only

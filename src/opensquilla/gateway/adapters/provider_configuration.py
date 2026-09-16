@@ -21,6 +21,7 @@ from opensquilla.gateway.provider_runtime import resolve_provider_selector_confi
 from opensquilla.gateway.provider_status_runtime import read_provider_status
 from opensquilla.gateway.setup_config_runtime import sync_media_runtime
 from opensquilla.provider.model_catalog import ModelCatalog as ProviderModelCatalog
+from opensquilla.provider.model_catalog import shared_catalog
 
 _catalog = ProviderModelCatalog()
 
@@ -71,6 +72,8 @@ def model_info_to_projection(model: dict[str, Any]) -> dict[str, Any]:
 
     provider_id = str(model.get("provider", "") or "")
     model_id = str(model.get("model_id", "") or "")
+    # Capacity is enriched separately from the shared runtime resolver. Keep
+    # capability/source projection independent of mutable session overrides.
     entry = _catalog.resolve_entry(model_id, provider=provider_id)
     capabilities: list[str] = ["chat"]
     context_window = model.get("context_window", 0)
@@ -166,6 +169,39 @@ class GatewayModelCatalogPort:
         self._config = config
 
     async def load_model_catalog(self) -> ModelCatalogResult:
+        from opensquilla.provider.model_capacity import (
+            custom_capacity_identity,
+            install_custom_capacity,
+            resolve_model_capacities,
+        )
+
+        catalog = shared_catalog()
+        identities = {provider: custom_capacity_identity(self._config, provider)
+                      for provider in ("custom", "custom_anthropic")}
+
+        def project(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            for provider, identity in identities.items():
+                selected = [item for item in items if item.get("provider") == provider]
+                if selected:
+                    install_custom_capacity(catalog, identity, provider, selected)
+            projected = [model_info_to_projection(item) for item in items]
+            # Only custom endpoint rows need the shared capacity enrichment.
+            # Other providers can carry credential-scoped snapshot limits that
+            # must not be replaced by a different deployment's catalog entry.
+            capacities = resolve_model_capacities(catalog, self._config, [
+                {"provider": str(item["provider"]), "model": str(item["id"])}
+                for item in projected
+                if item["provider"].strip().lower() in identities
+            ])["models"]
+            by_key = {(row["provider"], row["model"]): row for row in capacities}
+            for item in projected:
+                limits = by_key.get((item["provider"].strip().lower(), item["id"].strip()))
+                if limits is None:
+                    continue
+                item["contextWindow"] = limits["contextWindow"]["value"]
+                item["maxOutputTokens"] = limits["maxOutputTokens"]["value"]
+            return projected
+
         models: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         selector = self._provider_selector
@@ -193,7 +229,7 @@ class GatewayModelCatalogPort:
                     return cached_tokenrhythm_models(_snapshot_config_for_selector_leg(config))
 
                 detailed = await list_models_detailed(snapshot_resolver=snapshot_resolver)
-                models = [model_info_to_projection(item) for item in detailed.models]
+                models = project(detailed.models)
                 errors = [model_list_error_to_projection(item) for item in detailed.errors]
             else:
                 current = getattr(selector, "current_config", None)
@@ -208,10 +244,10 @@ class GatewayModelCatalogPort:
                     )
 
                     cached = cached_tokenrhythm_models(self._config)
-                    models = [model_info_to_projection(item.model_dump()) for item in cached]
+                    models = project([item.model_dump() for item in cached])
                 else:
                     detailed = await list_models_detailed()
-                    models = [model_info_to_projection(item) for item in detailed.models]
+                    models = project(detailed.models)
                     errors = [model_list_error_to_projection(item) for item in detailed.errors]
         except Exception:
             pass

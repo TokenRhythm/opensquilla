@@ -131,6 +131,30 @@ export interface ProviderCatalog {
 
 export interface ModelCatalog {
   list(options?: { signal?: AbortSignal }): Promise<ModelCatalogResult>
+  readonly capacitySupported?: boolean
+  resolveCapacity?(models: readonly ModelCapacityTarget[]): Promise<{ models: ModelCapacity[] }>
+}
+
+export interface ModelCapacityFailure {
+  provider: string
+  model: string
+  contextWindow: number
+  source: ModelCapacitySource
+}
+export interface ModelCapacityTarget { provider: string; model: string }
+export type ModelCapacitySource = 'catalog' | 'default' | 'override' | 'config'
+export interface ModelCapacityLimit {
+  automatic: number
+  automaticSource: ModelCapacitySource
+  override: number | null
+  value: number
+  source: ModelCapacitySource
+  editable: boolean
+}
+export interface ModelCapacity extends ModelCapacityTarget {
+  contextWindow: ModelCapacityLimit
+  maxOutputTokens: ModelCapacityLimit
+  localRuntime: boolean
 }
 
 export interface ProviderStatus {

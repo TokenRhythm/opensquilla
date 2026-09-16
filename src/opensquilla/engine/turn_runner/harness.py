@@ -552,6 +552,12 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
         user_context_window = _positive_int_or_zero(
             getattr(llm_cfg, "context_window_tokens", 0)
         )
+        if provider and provider.strip().lower() != str(
+            getattr(llm_cfg, "provider", "") or ""
+        ).strip().lower():
+            # The global context declaration belongs to the primary deployment;
+            # a routed model at another provider must use its own capacity.
+            user_context_window = 0
         # Explicit provider-request proof budget (chars). Positive values bypass
         # the derived context-budget ladder in ContextBudgetGovernor.from_values.
         user_proof_max_chars = _positive_int_or_zero(

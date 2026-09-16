@@ -1,5 +1,7 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { readTransportFailure } from './transportTypes'
+import { MODELS_CAPACITY_RESOLVE_METHOD } from '@/contracts/generated/v4/modelsCapacityResolve'
+import { validateParams as validateCapacityParams, validateResult as validateCapacityResult } from '@/contracts/generated/v4/modelsCapacityResolveValidators.mjs'
 import type {
   ModelCatalogResult,
   ModelDescriptor,
@@ -211,6 +213,19 @@ export function createV4ProviderConfiguration(
   events: EventTransport,
 ): ProviderConfiguration {
   return {
+    get capacitySupported() {
+      return rpc.supports?.(MODELS_CAPACITY_RESOLVE_METHOD) === true
+    },
+    async resolveCapacity(models) {
+      if (rpc.supports?.(MODELS_CAPACITY_RESOLVE_METHOD) !== true) {
+        throw new ProviderConfigurationError('unsupported', 'Model capacity requires a newer Gateway.')
+      }
+      const params = { models: models.map(({ provider, model }) => ({ provider, model })) }
+      if (!validateCapacityParams(params)) throw new ProviderConfigurationError('invalid', 'Invalid model capacity targets')
+      const result = await requestProvider(rpc, MODELS_CAPACITY_RESOLVE_METHOD, params, options())
+      if (!validateCapacityResult(result)) throw new Error('Invalid model capacity response')
+      return result as { models: import('@/modules/providerConfiguration').ModelCapacity[] }
+    },
     get resetRecommendedSupported() {
       return rpc.supports?.(MODELS_ROUTING_RESET_RECOMMENDED_METHOD) === true
     },

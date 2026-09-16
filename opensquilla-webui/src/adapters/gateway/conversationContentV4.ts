@@ -303,6 +303,14 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
     if (typeof turnId === 'string') result.completedTurnId = turnId.trim()
   }
   if (kind === 'turn-failed' || kind === 'task-failed' || kind === 'task-timed-out' || kind === 'task-abandoned') {
+    const capacity = object(source.model_capacity)
+    if (typeof capacity.provider === 'string' && capacity.provider.trim() && capacity.provider.length <= 1024
+      && typeof capacity.model === 'string' && capacity.model.trim() && capacity.model.length <= 1024
+      && Number.isSafeInteger(capacity.contextWindow) && Number(capacity.contextWindow) > 0
+      && ['default', 'catalog', 'config', 'override'].includes(String(capacity.source))) {
+      result.modelCapacity = { provider: capacity.provider, model: capacity.model,
+        contextWindow: Number(capacity.contextWindow), source: capacity.source as import('@/modules/providerConfiguration').ModelCapacitySource }
+    }
     result.terminalOutcome = normalizeTurnOutcome({ ...source, turn_id: taskId, status: 'failed' })
     const errorCode = usageAccountingErrorCode(source)
     if (errorCode) result.error_class = errorCode
