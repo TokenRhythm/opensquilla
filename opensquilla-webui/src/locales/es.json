@@ -4170,6 +4170,8 @@
     "compact": {
       "compacting": "Compactando el contexto",
       "compacted": "Contexto compactado",
+      "temporarilyReduced": "Historial reducido temporalmente; continuando",
+      "summarySaved": "Resumen guardado",
       "historyPreserved": "Contexto anterior resumido; los mensajes originales siguen disponibles en el historial",
       "historyIncomplete": "Contexto anterior resumido; algunos mensajes originales no están disponibles",
       "historySummarized": "Contexto anterior resumido",

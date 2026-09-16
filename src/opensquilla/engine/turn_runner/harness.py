@@ -1415,6 +1415,7 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
         expected_session_id: str | None = None,
@@ -1470,6 +1471,8 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             persist_kwargs["source_entries"] = source_entries
         if "source_preimage" in params or accepts_kwargs:
             persist_kwargs["source_preimage"] = source_preimage
+        if "source_context_fingerprint" in params or accepts_kwargs:
+            persist_kwargs["source_context_fingerprint"] = source_context_fingerprint
         if "source_boundary_message_id" in params or accepts_kwargs:
             persist_kwargs["source_boundary_message_id"] = source_boundary_message_id
         if "source_boundary_entry_id" in params or accepts_kwargs:

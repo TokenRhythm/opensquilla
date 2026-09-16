@@ -356,15 +356,24 @@ def test_fixed_router_and_ensemble_roles_use_provider_scoped_capacity(configured
         assert configs[0].provider_request_max_chars > configs[1].provider_request_max_chars > 0
 
 
-def test_default_capacity_error_has_source_and_exact_model_target(configured):
+@pytest.mark.parametrize("reason", [
+    "provider_request_budget_exhausted",
+    "provider_system_prompt_too_large",
+    "provider_tool_schema_too_large",
+    "provider_protected_context_too_large",
+])
+def test_default_capacity_error_has_source_and_exact_model_target(configured, reason):
     from opensquilla.engine.agent import Agent
     from opensquilla.engine.types import AgentConfig
-    from opensquilla.session.terminal_reply import build_terminal_reply
+    from opensquilla.session.terminal_reply import (
+        CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES,
+        build_terminal_reply,
+    )
 
     _, _catalog = configured
     agent = object.__new__(Agent)
     agent.config = AgentConfig(provider_id="custom", model_id=MODEL, context_window_tokens=8192)
-    agent._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+    agent._last_compaction_refusal_reason = reason
     event = agent._context_overflow_error()
     assert event.model_capacity == {
         "provider": "custom",
@@ -372,9 +381,15 @@ def test_default_capacity_error_has_source_and_exact_model_target(configured):
         "contextWindow": 8192,
         "source": "default",
     }
-    text = build_terminal_reply({"error_class": event.code, "model_capacity": event.model_capacity})
+    text = build_terminal_reply({
+        "error_class": event.code,
+        "error_message": event.message,
+        "model_capacity": event.model_capacity,
+    })
     assert "system default of 8,192 tokens" in text
     assert "Model settings" in text
+    if reason in CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES:
+        assert text.startswith(CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES[reason])
 
 
 def test_conflicting_listing_rows_take_smaller_limits(configured):

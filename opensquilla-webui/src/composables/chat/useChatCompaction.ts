@@ -1,6 +1,7 @@
 import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import {
+  compactionCompletedLabelCode,
   compactionSkippedLabelCode,
   compactionSkipIsInformational,
 } from '@/utils/chat/compactionStatus'
@@ -441,7 +442,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (status === 'emergency_ephemeral') {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
-      showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.compacted'), {
+      showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.temporarilyReduced'), {
         tone: 'warn',
         detail: typeof payload.detail === 'string'
           ? payload.detail
@@ -455,7 +456,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (status === 'completed') {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
-      showCompactStatus('completed', i18n.global.t('chat.compact.compacted'), {
+      showCompactStatus('completed', i18n.global.t(compactionCompletedLabelCode(payload.durability)), {
         tone: 'ok',
         source,
         compactionId,
