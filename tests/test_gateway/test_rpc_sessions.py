@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -9334,6 +9335,8 @@ class TestSessionsMessagesSubscribe:
             store._operation_lock.release()
 
         try:
+            # Recovery performs ordinary SQLite commits; allow Windows disk I/O
+            # headroom without relaxing the blocked admission deadline above.
             recovered = await asyncio.wait_for(
                 dispatcher.dispatch(
                     "legacy-retry",
@@ -9341,7 +9344,7 @@ class TestSessionsMessagesSubscribe:
                     {"key": key},
                     context,
                 ),
-                timeout=0.5,
+                timeout=5.0 if os.name == "nt" else 0.5,
             )
             assert recovered.ok is True
             assert recovered.payload["hydration_complete"] is True
