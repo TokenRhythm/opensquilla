@@ -281,7 +281,6 @@ class SchedulerOps:
         )
 
         if kind == ScheduleKind.AT:
-            _reject_past_at(cron_expr, now)
             job.delete_after_run = True
             job.next_run_at = datetime.fromisoformat(cron_expr)
         elif kind == ScheduleKind.EVERY and cron_expr.isdigit():
@@ -293,7 +292,13 @@ class SchedulerOps:
             # CRON or EVERY with cron expression: scan forward
             job.next_run_at = _next_run(job, now)
 
-        return await self._store.create_or_get(job)
+        # A retry may arrive after the original execution time. Only validate a
+        # new row, after deduplication and with a fresh clock inside the lock.
+        validate_new = (
+            (lambda: _reject_past_at(cron_expr, self._now()))
+            if kind == ScheduleKind.AT else None
+        )
+        return await self._store.create_or_get(job, validate_new=validate_new)
 
     async def update(self, job_id: str, **patch) -> CronJob | None:
         """Apply a partial update to an existing job. Returns None if not found."""
@@ -314,7 +319,8 @@ class SchedulerOps:
         structured_kind = patch.pop("schedule_kind", None)
         structured_value = patch.pop("schedule_value", None)
         structured_tz = patch.pop("schedule_tz", None)
-        if structured_kind is not None and structured_value is not None:
+        schedule_updated = structured_kind is not None and structured_value is not None
+        if schedule_updated:
             kind, cron_expr = _validate_structured_schedule(structured_kind, structured_value)
             if structured_tz is not None:
                 raw_tz = (structured_tz or "").strip()
@@ -339,7 +345,7 @@ class SchedulerOps:
                 "pass schedule_kind + schedule_value instead"
             )
 
-        for field in ("name", "timeout_seconds", "enabled", "origin_session_key"):
+        for field in ("name", "timeout_seconds", "origin_session_key"):
             if field in patch:
                 setattr(job, field, patch.pop(field))
         if "tool_policy" in patch:
@@ -384,6 +390,19 @@ class SchedulerOps:
             job.session_target,
             job.origin_session_key,
         )
+
+        # Persist the enabled toggle with the validated schedule and payload.
+        # A rejected patch must never resume or pause the existing job.
+        if "enabled" in patch:
+            job.enabled = bool(patch.pop("enabled"))
+            if not job.enabled:
+                job.status = JobStatus.PAUSED
+            elif job.status in (JobStatus.PAUSED, JobStatus.DISABLED, JobStatus.FAILED):
+                job.status = JobStatus.PENDING
+                job.backoff_until = None
+                job.consecutive_errors = 0
+                if not schedule_updated and job.schedule_kind != ScheduleKind.AT:
+                    job.next_run_at = _next_run(job, now)
 
         job.updated_at = now
         await self._store.save(job)
