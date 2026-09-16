@@ -15028,6 +15028,81 @@ class SessionStorage:
         return result
 
     @_serialized_read
+    async def list_canonical_user_transcript_content_batch(
+        self,
+        session_ids: list[str],
+        *,
+        limit_per_session: int = 3,
+    ) -> dict[str, list[str]]:
+        """Return early user text across active and archived transcript rows.
+
+        Each source uses its existing session cursor index to select at most
+        ``limit_per_session`` candidates per session. Merging those candidates
+        in one statement preserves a single snapshot while compaction moves
+        rows between tables. Archived rows keep their original transcript ID,
+        matching canonical history ordering instead of archive insertion order.
+        """
+        unique_ids = list(dict.fromkeys(session_ids))
+        result: dict[str, list[str]] = {sid: [] for sid in unique_ids}
+        bounded_limit = max(0, int(limit_per_session))
+        if not unique_ids or not bounded_limit:
+            return result
+
+        # One parameter per session plus three limits stays below SQLite's
+        # historical 999-variable limit, including large directory requests.
+        chunk = 300
+        for index in range(0, len(unique_ids), chunk):
+            batch = unique_ids[index : index + chunk]
+            values = ",".join("(?)" for _ in batch)
+            sql = f"""
+                WITH requested(session_id) AS (VALUES {values}),
+                candidates AS (
+                    SELECT active.session_id, active.content,
+                           active.created_at, active.id AS original_entry_id
+                    FROM requested
+                    JOIN transcript_entries AS active ON active.id IN (
+                        SELECT id FROM transcript_entries
+                        WHERE session_id = requested.session_id
+                          AND role = 'user'
+                          AND COALESCE(content, '') != ''
+                        ORDER BY created_at ASC, id ASC
+                        LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT archived.session_id, archived.content,
+                           archived.created_at, archived.original_entry_id
+                    FROM requested
+                    JOIN compacted_transcript_entries AS archived ON archived.id IN (
+                        SELECT id FROM compacted_transcript_entries
+                        WHERE session_id = requested.session_id
+                          AND role = 'user'
+                          AND COALESCE(content, '') != ''
+                        ORDER BY created_at ASC, original_entry_id ASC, id ASC
+                        LIMIT ?
+                    )
+                ),
+                ranked AS (
+                    SELECT session_id, content,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY session_id
+                               ORDER BY created_at ASC, original_entry_id ASC
+                           ) AS rn
+                    FROM candidates
+                )
+                SELECT session_id, content
+                FROM ranked
+                WHERE rn <= ?
+                ORDER BY session_id ASC, rn ASC
+            """
+            params = [*batch, bounded_limit, bounded_limit, bounded_limit]
+            async with self.conn.execute(sql, params) as cur:
+                rows = await cur.fetchall()
+            for sid, content in rows:
+                if isinstance(content, str):
+                    result[sid].append(content)
+        return result
+
+    @_serialized_read
     async def list_last_transcript_content_batch(
         self,
         session_ids: list[str],

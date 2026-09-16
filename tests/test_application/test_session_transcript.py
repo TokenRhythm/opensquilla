@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,6 +10,7 @@ import pytest
 
 from opensquilla.application.session_transcript import (
     SessionPreviewQuery,
+    SessionRecord,
     SessionTranscriptApplication,
 )
 
@@ -158,3 +159,38 @@ async def test_preview_preserves_duplicate_and_empty_session_ids_for_storage_por
 
     assert len(result.previews) == 3
     assert preview.calls == [(["same-id", "", "same-id"], 120)]
+
+
+@pytest.mark.asyncio
+async def test_preview_title_overrides_preserve_message_projection() -> None:
+    refused = session(session_key="agent:main:webchat:refused", session_id="refused-id")
+    ordinary = session(session_key="agent:main:webchat:ordinary", session_id="ordinary-id")
+    sessions = SessionPort([refused, ordinary])
+    preview = PreviewPort({"refused-id": "Latest reply", "ordinary-id": "Another reply"})
+
+    class Titles:
+        calls: list[list[str]] = []
+
+        async def list_title_overrides(
+            self,
+            rows: Sequence[SessionRecord],
+        ) -> Mapping[str, str]:
+            self.calls.append([row.session_key for row in rows])
+            return {refused.session_key: "First visible request"}
+
+    titles = Titles()
+    transcript = SessionTranscriptApplication(
+        sessions=sessions,
+        preview_content=preview,
+        preview_titles=titles,
+        clock=FixedClock(),
+    )
+
+    result = await transcript.preview(
+        SessionPreviewQuery(keys=(ordinary.session_key, refused.session_key, "missing")),
+    )
+
+    assert titles.calls == [[ordinary.session_key, refused.session_key]]
+    assert [item.title for item in result.previews] == ["Default chat", "First visible request"]
+    assert [item.last_message for item in result.previews] == ["Another reply", "Latest reply"]
+    assert preview.calls == [(["ordinary-id", "refused-id"], 120)]

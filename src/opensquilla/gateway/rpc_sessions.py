@@ -217,7 +217,12 @@ from opensquilla.gateway.session_services import (
     set_session_epoch,
 )
 from opensquilla.gateway.session_streams import get_session_streams
-from opensquilla.gateway.session_view import build_session_view_item, derive_transcript_title
+from opensquilla.gateway.session_title_recovery import read_refused_title_fallbacks
+from opensquilla.gateway.session_view import (
+    build_session_view_item,
+    derive_transcript_title,
+    has_refused_chat_title,
+)
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
@@ -576,8 +581,10 @@ async def _fork_title_state(
     if all(getattr(session, "session_key", None) != parent.session_key for session in sessions):
         sessions.append(parent)
 
-    transcript_titles = await _list_transcript_titles(storage, sessions)
     channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    transcript_titles = await _list_transcript_titles(
+        storage, sessions, channel_types=channel_types
+    )
     sessions_by_key = {
         str(getattr(session, "session_key", "") or ""): session for session in sessions
     }
@@ -2125,11 +2132,37 @@ async def _list_task_rows_by_session(
     return {key: await _list_task_rows(ctx, storage, key) for key in keys}
 
 
-async def _list_transcript_titles(storage: Any, sessions: list[Any]) -> dict[str, str]:
+async def _list_transcript_titles(
+    storage: Any,
+    sessions: Sequence[Any],
+    *,
+    channel_types: dict[str, str] | None = None,
+) -> dict[str, str]:
+    affected = [
+        session
+        for session in sessions
+        if has_refused_chat_title(session, channel_types=channel_types)
+    ]
+    titles = {
+        str(getattr(session, "session_id", "") or ""): ""
+        for session in affected
+        if getattr(session, "session_id", None)
+    }
+    if affected:
+        try:
+            titles.update(
+                await read_refused_title_fallbacks(storage, affected, channel_types=channel_types)
+            )
+        except Exception:
+            # Keep list/search enrichment best-effort. A failed historical read
+            # selects the existing default, never an unrelated active-tail topic.
+            log.warning("sessions.refused_title_recovery_failed", exc_info=True)
     session_ids = [str(getattr(session, "session_id", "") or "") for session in sessions]
-    session_ids = [session_id for session_id in session_ids if session_id]
+    session_ids = [
+        session_id for session_id in session_ids if session_id and session_id not in titles
+    ]
     if not session_ids:
-        return {}
+        return titles
 
     title_inputs: dict[str, list[str]] = {session_id: [] for session_id in session_ids}
     storage_batch = getattr(storage, "list_user_transcript_content_batch", None)
@@ -2163,7 +2196,6 @@ async def _list_transcript_titles(storage: Any, sessions: list[Any]) -> dict[str
                     if str(getattr(entry, "role", "") or "").lower() == "user"
                 ][:3]
 
-    titles: dict[str, str] = {}
     for session_id, values in title_inputs.items():
         for value in values:
             title = derive_transcript_title(value)
@@ -2404,7 +2436,10 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         storage,
         [s.session_key for s in sessions],
     )
-    transcript_titles = await _list_transcript_titles(storage, sessions)
+    channel_types = _channel_types_from_config(ctx.config)
+    transcript_titles = await _list_transcript_titles(
+        storage, sessions, channel_types=channel_types
+    )
 
     # Batch transcript counts in one round-trip to avoid N+1 against
     # count_transcript_entries. Storage layers that don't implement the batch
@@ -2420,7 +2455,6 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
             entry_counts = {}
 
     result = []
-    channel_types = _channel_types_from_config(ctx.config)
     for s in sessions:
         # Fetch entry count for metadata
         entry_count = entry_counts.get(s.session_id, 0)
@@ -2551,12 +2585,16 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
             updated_at=view.get("updatedAt"),
         )
 
+    async def read_titles(sessions: Sequence[Any]) -> dict[str, str]:
+        return await _list_transcript_titles(storage, sessions, channel_types=channel_types)
+
     result = await SessionDirectory(storage).search(
         raw_query,
         raw_limit,
         now_ms=now_ms,
         project=project,
         derive_transcript_title=derive_transcript_title,
+        read_transcript_titles=read_titles,
     )
     return {
         "sessions": [
@@ -4197,6 +4235,7 @@ def _build_session_read_application(
         storage=storage,
         ports=ports,
         clock=clock,
+        channel_types=_channel_types_from_config(ctx.config),
     )
 
 

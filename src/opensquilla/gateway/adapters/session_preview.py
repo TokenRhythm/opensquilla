@@ -15,12 +15,14 @@ from typing import Any
 from opensquilla.application.session_transcript import (
     Clock,
     PreviewContentReader,
+    PreviewTitleReader,
     SessionPreviewQuery,
     SessionPreviewResult,
     SessionRecord,
     SessionRecordReader,
     SessionTranscriptApplication,
 )
+from opensquilla.gateway.session_title_recovery import read_refused_title_fallbacks
 from opensquilla.session.storage import SessionStorage
 
 
@@ -34,8 +36,14 @@ class SessionPreviewStorageAdapter:
     protocol-shaped test doubles remain confined to Gateway fixture setup.
     """
 
-    def __init__(self, storage: SessionStorage) -> None:
+    def __init__(
+        self,
+        storage: SessionStorage,
+        *,
+        channel_types: dict[str, str] | None = None,
+    ) -> None:
         self._storage = storage
+        self._channel_types = channel_types
 
     async def get_session(self, key: str) -> SessionRecord | None:
         return await self._storage.get_session(key)
@@ -53,6 +61,21 @@ class SessionPreviewStorageAdapter:
             session_ids,
             max_chars=max_chars,
         )
+
+    async def list_title_overrides(
+        self,
+        sessions: Sequence[SessionRecord],
+    ) -> Mapping[str, str]:
+        """Recover known bad automatic titles with one bounded batch read."""
+
+        titles = await read_refused_title_fallbacks(
+            self._storage, sessions, channel_types=self._channel_types
+        )
+        return {
+            session.session_key: titles[session.session_id] or str(session.session_id or "")[:8]
+            for session in sessions
+            if session.session_id in titles
+        }
 
 
 class SystemClock:
@@ -134,18 +157,21 @@ def build_session_preview_application(
     storage: SessionStorage,
     *,
     clock: Clock | None = None,
+    channel_types: dict[str, str] | None = None,
 ) -> SessionTranscriptApplication:
     """Compose the preview application service from a Gateway storage object."""
 
-    storage_adapter = SessionPreviewStorageAdapter(storage)
+    storage_adapter = SessionPreviewStorageAdapter(storage, channel_types=channel_types)
     # Keep these assignments as a static conformance check.  If a future
     # facade changes a Port signature, mypy fails here instead of allowing a
     # concrete storage method to leak into the application service.
     sessions: SessionRecordReader = storage_adapter
     preview_content: PreviewContentReader = storage_adapter
+    preview_titles: PreviewTitleReader = storage_adapter
     return SessionTranscriptApplication(
         sessions=sessions,
         preview_content=preview_content,
+        preview_titles=preview_titles,
         clock=clock if clock is not None else SystemClock(),
     )
 
