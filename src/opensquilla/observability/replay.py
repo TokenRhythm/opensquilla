@@ -58,10 +58,12 @@ def format_transcript(entry: DecisionEntry) -> str:
     for step in entry.pipeline_steps:
         if step.applied:
             status = "OK"
-        elif step.fallback_reason is None:
+        elif step.status == "failed" or step.fallback_reason is not None:
+            status = f"FAIL({step.fallback_reason})" if step.fallback_reason is not None else "FAIL"
+        elif step.status == "skipped":
             status = "SKIPPED"
         else:
-            status = f"FAIL({step.fallback_reason})"
+            status = "UNKNOWN"
         lines.append(
             f"    - {step.step_name} [{status}] "
             f"tier={step.routed_tier} "
