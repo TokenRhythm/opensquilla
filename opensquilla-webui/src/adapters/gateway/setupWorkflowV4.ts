@@ -24,14 +24,23 @@ interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
   ready?(options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<void>
   supports?(method: string): boolean
+  readonly policy?: Readonly<Record<string, unknown>> | null
 }
 
-const options = (signal?: AbortSignal): RpcCallOptions => ({
-  timeoutMs: 20_000,
+const options = (
+  request?: SetupRequestOptions,
+  cancelOnAbort = false,
+): RpcCallOptions => ({
+  timeoutMs: request?.timeoutMs ?? 20_000,
   timeoutAction: 'reject',
   abortAction: 'reject',
-  ...(signal ? { signal } : {}),
+  ...(cancelOnAbort ? { cancelOnAbort: true } : {}),
+  ...(request?.signal ? { signal: request.signal } : {}),
 })
+
+const hasExplicitProbeMode = (command: { mode?: unknown }): boolean => (
+  command.mode === 'reachability' || command.mode === 'model'
+)
 
 const wireParams = (value: object): Record<string, unknown> => ({ ...value })
 
@@ -88,10 +97,11 @@ async function requestContract(
   contract: SetupContractDescriptor,
   params: Record<string, unknown> | undefined,
   request?: SetupRequestOptions,
+  cancelOnAbort = false,
 ): Promise<Record<string, unknown>> {
   let result: unknown
   try {
-    result = await rpc.request(contract.method, params, options(request?.signal))
+    result = await rpc.request(contract.method, params, options(request, cancelOnAbort))
   } catch (error) {
     throw mapSetupError(error)
   }
@@ -111,7 +121,13 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
       return requestContract(rpc, setupContracts.providerConfigure, wireParams(command), request)
     },
     probePrimary(command, request) {
-      return requestContract(rpc, setupContracts.providerProbe, wireParams(command), request)
+      return requestContract(
+        rpc,
+        setupContracts.providerProbe,
+        wireParams(command),
+        request,
+        hasExplicitProbeMode(command),
+      )
     },
     discoverPrimaryModels(command, request) {
       return requestContract(rpc, setupContracts.modelsDiscover, wireParams(command), request) as Promise<SetupDiscoveryResult>
@@ -142,10 +158,22 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
       return requestContract(rpc, setupContracts.profileActivate, wireParams(command), request)
     },
     probeProfile(command, request) {
-      return requestContract(rpc, setupContracts.profileProbe, wireParams(command), request)
+      return requestContract(
+        rpc,
+        setupContracts.profileProbe,
+        wireParams(command),
+        request,
+        hasExplicitProbeMode(command),
+      )
     },
     probeDraftProfile(command, request) {
-      return requestContract(rpc, setupContracts.profileDraftProbe, wireParams(command), request) as Promise<SetupDiscoveryResult>
+      return requestContract(
+        rpc,
+        setupContracts.profileDraftProbe,
+        wireParams(command),
+        request,
+        hasExplicitProbeMode(command),
+      ) as Promise<SetupDiscoveryResult>
     },
     async discoverProfileModels(command, request) {
       try {
@@ -207,11 +235,18 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
       get imageModelDiscovery() {
         return rpc.supports?.(setupContracts.imageModelsDiscover.method) !== false
       },
+      get providerProbeModes() {
+        const advertised = rpc.policy?.provider_probe_modes
+        return Array.isArray(advertised)
+          && advertised.every(value => typeof value === 'string')
+          && advertised.includes('reachability')
+          && advertised.includes('model')
+      },
     },
     async catalog(request) {
       let result: unknown
       try {
-        result = await rpc.request(ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
+        result = await rpc.request(ONBOARDING_CATALOG_METHOD, undefined, options(request))
       } catch (error) {
         throw mapSetupError(error)
       }

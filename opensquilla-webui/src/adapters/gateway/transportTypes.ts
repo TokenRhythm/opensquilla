@@ -25,6 +25,7 @@ export interface TransportCallOptions {
   signal?: AbortSignal
   timeoutAction?: TransportTerminationAction
   abortAction?: TransportTerminationAction
+  cancelOnAbort?: boolean
   expectedGeneration?: number
   onSent?: (socketGeneration: number) => void
 }

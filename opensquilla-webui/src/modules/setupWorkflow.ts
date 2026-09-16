@@ -25,9 +25,14 @@ export interface SetupDiscoveryResult extends SetupStatus {
   readonly firstResponseMs?: number
   readonly totalMs?: number
   readonly latencyMs?: number
+  readonly verificationLevel?: 'reachable' | 'model_verified' | 'none'
+  readonly failureStage?: 'reachability' | 'model'
 }
 
-export interface SetupRequestOptions { signal?: AbortSignal }
+export interface SetupRequestOptions {
+  signal?: AbortSignal
+  timeoutMs?: number
+}
 
 export type SetupWorkflowErrorCode =
   | 'not-found'
@@ -78,7 +83,10 @@ export interface ConfigurePrimaryProvider {
   routerAction?: string | null
   imageGenerationIntent?: string | null
 }
-export interface ProbePrimaryProvider extends ConfigurePrimaryProvider {}
+export type ProviderProbeMode = 'reachability' | 'model'
+export interface ProbePrimaryProvider extends ConfigurePrimaryProvider {
+  mode?: ProviderProbeMode
+}
 export interface DiscoverPrimaryModels extends Omit<ConfigurePrimaryProvider, 'model' | 'presetId' | 'routerAction' | 'imageGenerationIntent'> { forceRefresh?: boolean | null }
 
 export interface UpsertProfile {
@@ -118,6 +126,7 @@ export interface ProfileProbe {
   baseUrl?: string | null
   proxy?: string | null
   forceRefresh?: boolean | null
+  mode?: ProviderProbeMode
 }
 
 export interface ConfigureRouter {
@@ -218,6 +227,8 @@ export interface SetupCapabilities {
   readonly profileUpsertAndActivate: boolean
   readonly primaryProviderRemoval: boolean
   readonly imageModelDiscovery: boolean
+  /** Omitted by in-process implementations that support the current API directly. */
+  readonly providerProbeModes?: boolean
 }
 export interface SetupWorkflow extends SetupCatalogPort, SetupStatusPort {
   readonly capabilities: SetupCapabilities

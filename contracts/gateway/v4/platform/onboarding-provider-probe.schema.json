@@ -114,6 +114,13 @@
             "string",
             "null"
           ]
+        },
+        "mode": {
+          "enum": [
+            "reachability",
+            "model",
+            null
+          ]
         }
       },
       "required": [
@@ -145,7 +152,22 @@
     },
     "OnboardingProviderProbeResult": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": true,
+      "properties": {
+        "ok": { "type": "boolean" },
+        "providerId": { "type": "string" },
+        "model": { "type": "string" },
+        "failureKind": { "type": "string" },
+        "message": { "type": "string" },
+        "code": { "type": "string" },
+        "latencyMs": { "type": "integer", "minimum": 0 },
+        "firstResponseMs": { "type": ["integer", "null"], "minimum": 0 },
+        "totalMs": { "type": "integer", "minimum": 0 },
+        "verificationLevel": {
+          "enum": ["reachable", "model_verified", "none"]
+        },
+        "failureStage": { "enum": ["reachability", "model"] }
+      }
     },
     "RpcError": {
       "type": "object",
