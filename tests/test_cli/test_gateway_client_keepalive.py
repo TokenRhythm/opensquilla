@@ -494,41 +494,51 @@ async def test_cron_run_respects_configured_job_budget(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_send_message_lost_acceptance_is_not_replayed() -> None:
-    client = GatewayClient(request_timeout_s=0.01)
+async def test_send_message_lost_acceptance_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayClient()
     ws = _FakeWebSocket()
     client._ws = ws  # noqa: SLF001
-    listener = asyncio.create_task(client._listen())  # noqa: SLF001
-    client._listener_task = listener  # noqa: SLF001
+    original_send = ws.send
 
-    async def acknowledge_subscriptions() -> None:
-        handled = 0
-        while True:
-            if handled == len(ws.sent):
-                await asyncio.sleep(0)
-                continue
-            request = json.loads(ws.sent[handled])
-            handled += 1
-            if request["method"] == "sessions.send":
-                continue  # The Gateway accepts the write but its receipt is lost.
-            await ws.iter_queue.put(json.dumps({
-                "type": "res", "id": request["id"], "ok": True,
-                "payload": {"replay_complete": True},
-            }))
+    async def send(payload: str) -> None:
+        await original_send(payload)
+        request = json.loads(payload)
+        if request["method"] != "sessions.send":
+            # Complete prerequisite/cleanup receipts deterministically; only
+            # the accepted send loses its receipt in this scenario.
+            client._pending[request["id"]].set_result(  # noqa: SLF001
+                {"ok": True, "payload": {"replay_complete": True}}
+            )
 
-    acknowledgements = asyncio.create_task(acknowledge_subscriptions())
+    monkeypatch.setattr(ws, "send", send)
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    monkeypatch.setattr(loop, "time", lambda: now)
     stream = client.send_message("agent:main:lost-acceptance", "Synthetic message")
+    task = asyncio.create_task(anext(stream))
     try:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert [json.loads(payload)["method"] for payload in ws.sent] == [
+            "sessions.messages.subscribe", "sessions.send",
+        ]
+        assert not task.done()
+        now += 31
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert task.done(), "the lost send receipt must reach the ordinary RPC deadline"
         with pytest.raises(TimeoutError, match=r"sessions\.send timed out"):
-            await asyncio.wait_for(anext(stream), timeout=0.5)
+            await task
         assert [json.loads(payload)["method"] for payload in ws.sent] == [
             "sessions.messages.subscribe", "sessions.send", "sessions.messages.unsubscribe",
         ]
         assert client._pending == {}  # noqa: SLF001
         assert client._event_subscriptions == {}  # noqa: SLF001
     finally:
-        acknowledgements.cancel()
-        await asyncio.gather(acknowledgements, return_exceptions=True)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await stream.aclose()
         await client.close()
 
