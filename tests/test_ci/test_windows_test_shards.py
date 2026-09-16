@@ -68,13 +68,6 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
-    # Title refusal and archived first-message regressions use the declared
-    # provisional floor until a comparable three-run Windows duration refresh.
-    "tests/test_gateway/test_compacted_title_recovery.py",
-    "tests/test_gateway/test_session_title_recovery.py",
-    "tests/test_session/test_canonical_title_inputs.py",
-    "tests/test_session/test_naming_refusal.py",
-    "tests/test_session/test_title_quality.py",
     # Telemetry regressions use provisional weights until the next comparable
     # Windows duration refresh supplies measured timings.
     "tests/test_engine/test_runtime_usage_telemetry.py",
@@ -145,6 +138,13 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_router_configured_image_policy.py",
     "tests/test_provider/test_image_projection.py",
     "tests/test_session/test_attachment_manifest.py",
+    # Title refusal and archived first-message regressions use the declared
+    # provisional floor until a comparable three-run Windows duration refresh.
+    "tests/test_gateway/test_compacted_title_recovery.py",
+    "tests/test_gateway/test_session_title_recovery.py",
+    "tests/test_session/test_canonical_title_inputs.py",
+    "tests/test_session/test_naming_refusal.py",
+    "tests/test_session/test_title_quality.py",
     "tests/contracts/test_approval_center_contract.py",
     "tests/test_gateway/test_chat_history_characterization.py",
     "tests/contracts/test_conversation_events_contract.py",
