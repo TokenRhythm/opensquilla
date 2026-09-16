@@ -120,7 +120,7 @@ def _build_turn_runner(session_manager: Any) -> TurnRunner:
         model_catalog=None,
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,

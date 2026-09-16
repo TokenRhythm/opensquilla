@@ -30,6 +30,10 @@ from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
 from opensquilla.history_cursor import HistoryCursorInvalidatedError
+from opensquilla.persistence.memory_flush_retirement import (
+    RETIRED_MEMORY_COLUMNS,
+    memory_flush_retirement_statements,
+)
 from opensquilla.session.attachment_manifest import preserve_attachment_occurrence_ids
 from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.goals import (
@@ -950,7 +954,6 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     removed_count INTEGER NOT NULL DEFAULT 0,
     kept_count INTEGER NOT NULL DEFAULT 0,
     chunk_count INTEGER NOT NULL DEFAULT 0,
-    flush_receipt_status TEXT NOT NULL DEFAULT 'unknown',
     covered_through_id INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1
@@ -1204,7 +1207,6 @@ CREATE TABLE IF NOT EXISTS memory_durable_receipts (
     turn_id TEXT,
     scope TEXT NOT NULL,
     source_path TEXT,
-    target_path TEXT,
     content_hash TEXT,
     coverage_turn_id TEXT,
     coverage_hash TEXT,
@@ -1212,8 +1214,6 @@ CREATE TABLE IF NOT EXISTS memory_durable_receipts (
     idempotency_key TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL,
     reason TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    next_retry_at_ms INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1
@@ -2367,6 +2367,7 @@ class SessionStorage:
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
         await self._migrate_memory_durable_receipt_coverage_columns()
+        await self._retire_legacy_memory_flush_metadata()
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_COVERAGE)
         # Recency index for list_sessions / title search. Guarded on the column
         # because a very old (pre-updated_at) sessions table can survive here
@@ -2758,10 +2759,6 @@ class SessionStorage:
             "chunk_count": (
                 "ALTER TABLE session_summaries ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"
             ),
-            "flush_receipt_status": (
-                "ALTER TABLE session_summaries ADD COLUMN "
-                "flush_receipt_status TEXT NOT NULL DEFAULT 'unknown'"
-            ),
         }
         changed = False
         for column, sql in additions.items():
@@ -2794,6 +2791,37 @@ class SessionStorage:
                 changed = True
         if changed:
             await self._conn.commit()
+
+    async def _retire_legacy_memory_flush_metadata(self) -> None:
+        """Converge direct legacy opens using the versioned upgrade's SQL plan."""
+        # Normal opens need only metadata reads. Re-check under the writer lock
+        # below because another opener may finish retirement after this probe.
+        for table, retired in RETIRED_MEMORY_COLUMNS.items():
+            async with self.conn.execute(f'PRAGMA table_info("{table}")') as cur:
+                if retired.intersection(row[1] for row in await cur.fetchall()):
+                    break
+        else:
+            return
+        async with self._write_transaction("retire_legacy_memory_flush_metadata") as conn:
+            async with conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('session_summaries', 'memory_durable_receipts')"
+            ) as cur:
+                tables = {row[0]: row[1] for row in await cur.fetchall()}
+            columns = {}
+            for table in tables:
+                async with conn.execute(f'PRAGMA table_info("{table}")') as cur:
+                    columns[table] = [row[1] for row in await cur.fetchall()]
+            async with conn.execute(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type IN ('index', 'trigger') "
+                "AND tbl_name IN ('session_summaries', 'memory_durable_receipts') "
+                "AND sql IS NOT NULL"
+            ) as cur:
+                objects = [(row[0], row[1]) for row in await cur.fetchall()]
+            for statement in memory_flush_retirement_statements(
+                table_sql=tables, columns=columns, schema_objects=objects,
+            ):
+                await conn.execute(statement)
 
     @property
     def conn(self) -> Any:
@@ -9278,7 +9306,7 @@ class SessionStorage:
 
         ``expected_session_id`` is checked in the same write transaction as the
         receipt UPSERT. A missing or replaced session raises ``KeyError``.
-        Omitting it intentionally retains synthetic repair and legacy behavior.
+        Omitting it supports receipts written without a live session owner.
         """
 
         receipt.session_key = canonicalize_session_key(receipt.session_key)
@@ -9394,48 +9422,6 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [MemoryDurableReceipt(**_deserialize_row(dict(row))) for row in rows]
 
-    @_serialized_read
-    async def list_memory_repair_receipts(
-        self,
-        *,
-        statuses: tuple[str, ...],
-        limit: int,
-        due_before_ms: int | None = None,
-        path: str | None = None,
-        session_key_prefix: str | None = None,
-    ) -> list[MemoryDurableReceipt]:
-        """List repair candidates without bypassing the shared operation gate."""
-
-        if limit <= 0 or not statuses:
-            return []
-        placeholders = ", ".join("?" for _ in statuses)
-        clauses = [f"status IN ({placeholders})"]
-        params: list[Any] = [*statuses]
-        if due_before_ms is not None:
-            clauses.append("(next_retry_at_ms IS NULL OR next_retry_at_ms <= ?)")
-            params.append(due_before_ms)
-        if path is not None:
-            clauses.append("(source_path = ? OR target_path = ?)")
-            params.extend((path, path))
-        if session_key_prefix is not None:
-            clauses.append("substr(session_key, 1, ?) = ?")
-            params.extend((len(session_key_prefix), session_key_prefix))
-        params.append(limit)
-        async with self.conn.execute(
-            f"""
-            SELECT * FROM memory_durable_receipts
-            WHERE {' AND '.join(clauses)}
-            ORDER BY
-                next_retry_at_ms IS NOT NULL ASC,
-                next_retry_at_ms ASC,
-                created_at ASC,
-                rowid ASC
-            LIMIT ?
-            """,
-            params,
-        ) as cur:
-            rows = await cur.fetchall()
-        return [MemoryDurableReceipt(**_deserialize_row(dict(row))) for row in rows]
 
     @_serialized_read
     async def list_recent_memory_durable_receipts(
@@ -9443,6 +9429,7 @@ class SessionStorage:
         *,
         limit: int,
         session_key_prefix: str | None = None,
+        scope: str | None = None,
     ) -> list[MemoryDurableReceipt]:
         """Return the newest durable receipts under the storage read gate."""
 
@@ -9453,6 +9440,9 @@ class SessionStorage:
         if session_key_prefix is not None:
             clauses.append("substr(session_key, 1, ?) = ?")
             params.extend((len(session_key_prefix), session_key_prefix))
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         async with self.conn.execute(
@@ -9467,137 +9457,6 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [MemoryDurableReceipt(**_deserialize_row(dict(row))) for row in rows]
 
-    @_serialized_read
-    async def memory_durable_receipt_exists_for_path(
-        self,
-        path: str,
-        *,
-        session_key_prefix: str | None = None,
-    ) -> bool:
-        """Check source/target path identity without exposing the raw connection."""
-
-        clauses = ["(source_path = ? OR target_path = ?)"]
-        params: list[Any] = [path, path]
-        if session_key_prefix is not None:
-            clauses.append("substr(session_key, 1, ?) = ?")
-            params.extend((len(session_key_prefix), session_key_prefix))
-        async with self.conn.execute(
-            f"""
-            SELECT 1 FROM memory_durable_receipts
-            WHERE {' AND '.join(clauses)}
-            LIMIT 1
-            """,
-            params,
-        ) as cur:
-            return await cur.fetchone() is not None
-
-    async def claim_memory_repair_receipt(
-        self,
-        receipt_id: str,
-        *,
-        eligible_statuses: tuple[str, ...],
-        claimed_status: str,
-        now_ms: int,
-    ) -> MemoryDurableReceipt | None:
-        """Atomically claim one due repair receipt and return the claimed row."""
-
-        if not eligible_statuses:
-            return None
-        placeholders = ", ".join("?" for _ in eligible_statuses)
-        async with self._write_transaction("claim_memory_repair_receipt") as conn:
-            async with conn.execute(
-                f"""
-                UPDATE memory_durable_receipts
-                SET status = ?, updated_at = ?
-                WHERE receipt_id = ?
-                  AND status IN ({placeholders})
-                  AND (next_retry_at_ms IS NULL OR next_retry_at_ms <= ?)
-                """,
-                (
-                    claimed_status,
-                    now_ms,
-                    receipt_id,
-                    *eligible_statuses,
-                    now_ms,
-                ),
-            ) as cur:
-                claimed = cur.rowcount or 0
-            if claimed != 1:
-                return None
-            async with conn.execute(
-                "SELECT * FROM memory_durable_receipts WHERE receipt_id = ?",
-                (receipt_id,),
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                raise RuntimeError("Claimed memory repair receipt was not readable")
-            return MemoryDurableReceipt(**_deserialize_row(dict(row)))
-
-    async def recover_stale_memory_repair_claims(
-        self,
-        *,
-        running_status: str,
-        pending_status: str,
-        stale_before_ms: int,
-        next_retry_at_ms: int,
-        updated_at_ms: int,
-        reason: str,
-    ) -> int:
-        """Move stale repair claims back to pending in one explicit transaction."""
-
-        async with self._write_transaction("recover_stale_memory_repair_claims") as conn:
-            async with conn.execute(
-                """
-                UPDATE memory_durable_receipts
-                SET status = ?,
-                    reason = ?,
-                    next_retry_at_ms = ?,
-                    updated_at = ?
-                WHERE status = ?
-                  AND updated_at <= ?
-                """,
-                (
-                    pending_status,
-                    reason,
-                    next_retry_at_ms,
-                    updated_at_ms,
-                    running_status,
-                    stale_before_ms,
-                ),
-            ) as cur:
-                return int(cur.rowcount or 0)
-
-    async def update_memory_durable_receipt(
-        self,
-        receipt_id: str,
-        **fields: Any,
-    ) -> MemoryDurableReceipt:
-        allowed = set(MemoryDurableReceipt.model_fields) - {"receipt_id", "created_at"}
-        unknown = sorted(set(fields) - allowed)
-        if unknown:
-            raise ValueError(
-                f"Unknown memory durable receipt fields: {', '.join(unknown)}"
-            )
-        if "session_key" in fields:
-            fields["session_key"] = canonicalize_session_key(fields["session_key"])
-        fields.setdefault("updated_at", _now_ms())
-        assignments = ", ".join(f"{name} = ?" for name in fields)
-        values = [_serialize(value) for value in fields.values()]
-        values.append(receipt_id)
-        async with self._write_transaction("update_memory_durable_receipt") as conn:
-            await conn.execute(
-                f"UPDATE memory_durable_receipts SET {assignments} WHERE receipt_id = ?",
-                values,
-            )
-            async with conn.execute(
-                "SELECT * FROM memory_durable_receipts WHERE receipt_id = ?",
-                (receipt_id,),
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                raise KeyError(f"Memory durable receipt not found: {receipt_id}")
-            updated = MemoryDurableReceipt(**_deserialize_row(dict(row)))
-        return updated
 
     @_serialized_read
     async def list_agent_tasks_for_sessions(
@@ -15568,27 +15427,6 @@ class SessionStorage:
     async def get_all_summaries(self, session_id: str) -> list[SessionSummary]:
         return await self._select_all_summaries(self.conn, session_id)
 
-    @_serialized_read
-    async def list_degraded_summaries(
-        self,
-        *,
-        session_key_prefix: str | None = None,
-        limit: int = 50,
-    ) -> list[SessionSummary]:
-        clauses = ["flush_receipt_status IN ('degraded_forensic', 'failed_retryable')"]
-        params: list[Any] = []
-        if session_key_prefix:
-            clauses.append("session_key LIKE ?")
-            params.append(f"{session_key_prefix}%")
-        params.append(limit)
-        sql = (
-            "SELECT * FROM session_summaries "
-            f"WHERE {' AND '.join(clauses)} "
-            "ORDER BY created_at ASC LIMIT ?"
-        )
-        async with self.conn.execute(sql, params) as cur:
-            rows = await cur.fetchall()
-        return [SessionSummary(**_deserialize_row(dict(r))) for r in rows]
 
     @_serialized_read
     async def get_compacted_transcript_entries(
@@ -15627,37 +15465,6 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
 
-    async def update_summary_flush_receipt_status(
-        self,
-        summary_id: int,
-        status: str,
-    ) -> None:
-        async with self._write_transaction("update_summary_flush_receipt_status") as conn:
-            await conn.execute(
-                "UPDATE session_summaries SET flush_receipt_status = ? WHERE id = ?",
-                (status, summary_id),
-            )
-
-    async def update_summary_flush_receipt_status_by_compaction(
-        self,
-        *,
-        session_key: str,
-        compaction_id: str,
-        status: str,
-    ) -> int:
-        async with self._write_transaction(
-            "update_summary_flush_receipt_status_by_compaction"
-        ) as conn:
-            cur = await conn.execute(
-                """
-                UPDATE session_summaries
-                SET flush_receipt_status = ?
-                WHERE session_key = ? AND compaction_id = ?
-                """,
-                (status, canonicalize_session_key(session_key), compaction_id),
-            )
-            count = int(cur.rowcount or 0)
-        return count
 
     # ── SessionContextState CRUD ─────────────────────────────────────────────
 

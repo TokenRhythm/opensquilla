@@ -222,7 +222,7 @@ async def test_v020_database_reaches_service_ready_with_live_sink(
         control_ui={"enabled": False},
         channels={"channels": []},
         mcp={"enabled": False},
-        memory={"flush_enabled": False},
+        memory={},
     )
 
     services = await build_services(

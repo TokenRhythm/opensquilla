@@ -65,6 +65,3 @@ trusted_fake_ip_cidrs = ["198.18.0.0/15"]
 # whole run on the wrong workflow. The outer gateway keeps its own meta_skill
 # setting; only this isolated subprocess is gated.
 enabled = false
-
-[memory]
-flush_enabled = false

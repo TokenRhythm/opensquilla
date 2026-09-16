@@ -72,7 +72,7 @@ def context(storage: BoundedStorage | SessionStorage) -> RpcContext:
             is_owner=True,
             authenticated=True,
         ),
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
     )
     ctx.session_manager = SimpleNamespace(storage=storage)
     return ctx
@@ -174,7 +174,7 @@ async def test_preview_non_mapping_params_fail_before_unavailable_manager(
             is_owner=True,
             authenticated=True,
         ),
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
     )
 
     with pytest.raises(AttributeError):

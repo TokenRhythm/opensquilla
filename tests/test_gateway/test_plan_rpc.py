@@ -70,7 +70,7 @@ async def _open_plan_rpc_stack(
         principal=_PRINCIPAL,
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "workspace"),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
         ),
         session_manager=manager,

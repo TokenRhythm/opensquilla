@@ -56,7 +56,6 @@ from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
 from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
 from opensquilla.provider.selector import ProviderConfig
-from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.capability_service import CapabilityReport
 from opensquilla.sandbox.guest_profile import (
@@ -97,12 +96,6 @@ def test_sessions_steer_v2_scope_contract() -> None:
 
 def test_sessions_pending_inputs_steer_scope_contract() -> None:
     assert METHOD_SCOPES["sessions.pending_inputs.steer"] == WRITE_SCOPE
-
-
-
-
-
-
 
 
 @dataclass
@@ -511,6 +504,14 @@ class FakeSessionManager:
             remaining_budget_tokens=max(context_window_tokens - 400, 0),
         )
 
+    async def record_memory_checkpoint(self, session_key, transcript, **kwargs):
+        session = await self._storage.get_session(session_key)
+        assert session.session_id == kwargs["expected_session_id"]
+        assert session.epoch == kwargs["expected_session_epoch"]
+        receipt = _checkpoint_receipt(session, turn_id="rewrite", entries=transcript)
+        self._storage.memory_durable_receipts.append(receipt)
+        return receipt
+
     async def apply_intent(self, session_key: str, intent: str, **kwargs):
         self.applied_intents.append((session_key, str(intent)))
         session = await self._storage.get_session(session_key)
@@ -554,7 +555,7 @@ def make_ctx(session_manager=None, **kwargs) -> RpcContext:
     defaults = {
         "conn_id": "test-conn",
         "principal": principal,
-        "config": GatewayConfig(memory={"flush_enabled": False}),
+        "config": GatewayConfig(),
     }
     defaults.update(kwargs)
     ctx = RpcContext(**defaults)
@@ -875,7 +876,7 @@ def _exact_pdf(size: int) -> bytes:
 
 
 def _ctx_config_with_media_root(tmp_path) -> GatewayConfig:
-    cfg = GatewayConfig(memory={"flush_enabled": False})
+    cfg = GatewayConfig()
     cfg.attachments.media_root = str(tmp_path)
     return cfg
 
@@ -1254,7 +1255,7 @@ class TestSessionsCreate:
 
     @pytest.mark.asyncio
     async def test_create_persists_complete_named_profile_deployment(self, dispatcher):
-        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg = GatewayConfig()
         cfg.llm_profiles["openai:work"] = LlmProviderProfile(
             api_key="synthetic-named-secret",
             base_url="https://api.openai.com/v1",
@@ -1307,7 +1308,7 @@ class TestSessionsCreate:
 
     @pytest.mark.asyncio
     async def test_create_rejects_named_profile_provider_mismatch(self, dispatcher):
-        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg = GatewayConfig()
         cfg.llm_profiles["anthropic:work"] = LlmProviderProfile(
             api_key="synthetic-named-secret",
             base_url="https://api.anthropic.com",
@@ -1789,7 +1790,7 @@ class TestSessionsList:
         session = FakeSession(session_key="agent:main:webchat:workspace-config")
         ctx = make_ctx(
             session_manager=FakeSessionManager([session]),
-            config=GatewayConfig(workspace_dir=str(workspace), memory={"flush_enabled": False}),
+            config=GatewayConfig(workspace_dir=str(workspace)),
         )
 
         res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
@@ -1876,7 +1877,7 @@ class TestSessionsList:
         )
         ctx = make_ctx(
             session_manager=FakeSessionManager([session]),
-            config=GatewayConfig(memory={"flush_enabled": False}),
+            config=GatewayConfig(),
         )
 
         res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
@@ -2026,7 +2027,6 @@ class TestSessionsList:
             last_to="ou_demo_user",
         )
         config = GatewayConfig(
-            memory={"flush_enabled": False},
             channels={
                 "channels": [
                     {
@@ -2841,8 +2841,7 @@ class TestSessionsSend:
             task_runtime=None,
             turn_runner=DelayedCanonicalRunner(),
             config=GatewayConfig(
-                memory={"flush_enabled": False},
-                agent_stream_idle_timeout_seconds=0.001,
+                    agent_stream_idle_timeout_seconds=0.001,
                 agent_stream_heartbeat_interval_seconds=0.0,
             ),
         )
@@ -3050,7 +3049,6 @@ class TestSessionsSend:
         config = GatewayConfig(
             workspace_dir=str(configured_workspace),
             state_dir=str(state_dir),
-            memory={"flush_enabled": False},
         )
         session = FakeSession(session_key="agent:main:webchat:guest-ingress")
         runtime = RecordingTaskRuntime()
@@ -3140,8 +3138,7 @@ class TestSessionsSend:
             principal=guest,
             config=GatewayConfig(
                 workspace_dir=str(tmp_path / "workspace"),
-                memory={"flush_enabled": False},
-            ),
+                ),
         )
 
         with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
@@ -4908,8 +4905,7 @@ class TestSessionsSend:
         ctx = make_ctx(
             session_manager=FakeSessionManager([session]),
             config=GatewayConfig(
-                memory={"flush_enabled": False},
-                attachments={"accept_opaque": False},
+                    attachments={"accept_opaque": False},
             ),
         )
         res = await dispatcher.dispatch(
@@ -6507,7 +6503,7 @@ class TestSessionsPatch:
         self,
         dispatcher,
     ):
-        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg = GatewayConfig()
         cfg.llm_profiles["openai:work"] = LlmProviderProfile(
             api_key="synthetic-named-secret",
             base_url="https://api.openai.com/v1",
@@ -6581,7 +6577,7 @@ class TestSessionsPatch:
         self,
         dispatcher,
     ):
-        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg = GatewayConfig()
         cfg.llm_profiles["openai:work"] = LlmProviderProfile(
             api_key="synthetic-named-secret",
             base_url="https://api.openai.com/v1",
@@ -6713,7 +6709,7 @@ class TestSessionsPatch:
         self,
         dispatcher,
     ):
-        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg = GatewayConfig()
         cfg.llm_profiles["openai:work"] = LlmProviderProfile(
             api_key="synthetic-named-secret",
             base_url="https://api.openai.com/v1",
@@ -6846,6 +6842,154 @@ class TestSessionsRename:
         assert session.model == "original-model"
 
 
+@pytest.mark.parametrize("checkpoint_fails", [False, True])
+async def test_truncate_preserves_transcript_checkpoint(
+    dispatcher, tmp_path, monkeypatch, checkpoint_fails
+):
+    from opensquilla.session.manager import SessionManager
+
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    manager = SessionManager(storage, checkpoint_workspace_dir=workspace)
+    try:
+        key = "agent:main:webchat:checkpoint-rewrite"
+        original = await manager.create(key)
+        await manager.append_message(key, role="user", content="synthetic transcript to preserve")
+        original_content = [entry.content for entry in await manager.get_transcript(key)]
+        if checkpoint_fails:
+            def fail_checkpoint(*_args, **_kwargs):
+                raise OSError("synthetic disk failure")
+
+            monkeypatch.setattr(
+                "opensquilla.memory.checkpoint.append_checkpoint_events", fail_checkpoint,
+            )
+
+        result = await dispatcher.dispatch(
+            "r1", "sessions.truncate", {"key": key, "maxMessages": 0},
+            make_ctx(session_manager=manager),
+        )
+
+        current = await storage.get_session(key)
+        transcript = await manager.get_transcript(key)
+        if checkpoint_fails:
+            assert result.ok is False
+            assert result.error.code == "CHECKPOINT_FAILED"
+            assert current.session_id == original.session_id
+            assert current.epoch == original.epoch
+            assert [entry.content for entry in transcript] == original_content
+        else:
+            assert result.ok is True
+            assert transcript == []
+            receipts = await storage.list_memory_durable_receipts(
+                session_key=key, session_id=original.session_id,
+                scope="checkpoint", status="checkpoint_saved",
+            )
+            assert len(receipts) == 1
+            events = [
+                json.loads(line)
+                for line in (workspace / receipts[0].source_path).read_text().splitlines()
+            ]
+            assert [event["content"] for event in events] == original_content
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("checkpoint_setup", ["unconfigured", "unavailable", "long_session_key"])
+async def test_reset_archives_canonical_history_without_memory_checkpoint(
+    dispatcher, tmp_path, monkeypatch, checkpoint_setup
+):
+    from opensquilla.paths import native_io_path
+    from opensquilla.session.manager import SessionManager
+
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    workspace = tmp_path / "workspace"
+    if checkpoint_setup == "unavailable":
+        workspace.mkdir()
+        (workspace / "memory").write_text("occupied", encoding="utf-8")
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    manager = SessionManager(
+        storage,
+        checkpoint_workspace_dir=None if checkpoint_setup == "unconfigured" else workspace,
+    )
+    try:
+        suffix = "a" * 260 if checkpoint_setup == "long_session_key" else "archive-reset"
+        key = f"agent:main:webchat:{suffix}"
+        original = await manager.create(key)
+        for index in range(4):
+            await manager.append_message(key, "user", f"synthetic message {index}")
+        await manager.persist_compaction_result(
+            key,
+            "synthetic summary",
+            [{"role": "assistant", "content": "synthetic latest reply"}],
+            compaction_id="cmp_reset_archive",
+        )
+        canonical_before_reset = [
+            entry.model_dump(mode="json") for entry in await manager.get_canonical_transcript(key)
+        ]
+
+        result = await dispatcher.dispatch(
+            "r1", "sessions.reset", {"key": key}, make_ctx(session_manager=manager)
+        )
+
+        assert result.ok is True, result.error
+        current = await storage.get_session(key)
+        assert current.session_id != original.session_id
+        assert current.epoch == original.epoch + 1
+        assert await manager.get_transcript(key) == []
+        archives = list(archive_dir.glob("*.json"))
+        assert len(archives) == 1
+        archived = json.loads(native_io_path(archives[0]).read_text(encoding="utf-8"))
+        assert archived["session_key"] == key
+        assert archived["session_id"] == original.session_id
+        assert archived["transcript_entries"] == canonical_before_reset
+        assert archived["summaries"][0]["compaction_id"] == "cmp_reset_archive"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("force", [False, True])
+async def test_reset_archive_failure_preserves_history_and_generation(
+    dispatcher, tmp_path, monkeypatch, force
+):
+    from opensquilla.session.manager import SessionManager
+    from opensquilla.session.models import SessionSummary
+
+    archive_path = tmp_path / "not-a-directory"
+    archive_path.write_text("occupied", encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_path))
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    manager = SessionManager(storage)
+    try:
+        key = "agent:main:webchat:archive-failure"
+        original = await manager.create(key)
+        await manager.append_message(key, "user", "synthetic message to preserve")
+        await storage.save_summary(
+            SessionSummary(
+                session_key=key, session_id=original.session_id,
+                summary_text="synthetic summary to preserve",
+            )
+        )
+        transcript_before_reset = await manager.get_transcript(key)
+        summaries_before_reset = await storage.get_all_summaries(original.session_id)
+
+        result = await dispatcher.dispatch(
+            "r1", "sessions.reset", {"key": key, "force": force},
+            make_ctx(session_manager=manager),
+        )
+
+        assert result.ok is False
+        assert result.error.code == "INTERNAL_ERROR"
+        current = await storage.get_session(key)
+        assert current.session_id == original.session_id
+        assert current.epoch == original.epoch
+        assert await manager.get_transcript(key) == transcript_before_reset
+        assert await storage.get_all_summaries(original.session_id) == summaries_before_reset
+    finally:
+        await storage.close()
+
+
 class TestSessionsReset:
     @pytest.mark.asyncio
     async def test_reset_valid(self, dispatcher, ctx_with_sessions, session):
@@ -6908,160 +7052,15 @@ class TestSessionsReset:
         assert runtime.cancelled is False
 
     @pytest.mark.asyncio
-    async def test_reset_allows_checkpoint_receipt_when_flush_receipt_is_degraded(
-        self, dispatcher, session
-    ):
-        previous_session_id = session.session_id
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
-        manager._storage.memory_durable_receipts.append(
-            _checkpoint_receipt(session, turn_id="cmp-reset", entries=manager.transcript)
-        )
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="raw",
-                    result_status="parse_failed_archived",
-                    flushed_paths=["memory/.raw_fallbacks/raw.md"],
-                    content_hash="h1",
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverified",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverified",
-                    obligation_missing_ids=[],
-                    to_dict=lambda: {
-                        "mode": "raw",
-                        "result_status": "parse_failed_archived",
-                        "flushed_paths": ["memory/.raw_fallbacks/raw.md"],
-                        "content_hash": "h1",
-                    },
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True}),
-        )
-
-        res = await dispatcher.dispatch("r1", "sessions.reset", {"key": session.session_key}, ctx)
-
-        assert res.ok is True
-        assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
-        assert manager.applied_intents == [(session.session_key, "reset_same_key")]
-        flush_kwargs = flush_service.execute.await_args.kwargs
-        correlation = flush_kwargs["provider_request_correlation"]
-        assert correlation.session_id == previous_session_id
-        assert correlation.turn_id == flush_kwargs["turn_id"]
-        assert correlation.execution_id != correlation.turn_id
-        assert correlation.call_kind == "auxiliary.session_flush"
-
-    @pytest.mark.asyncio
-    async def test_reset_refuses_stale_checkpoint_receipt_for_later_transcript(
+    async def test_reset_uses_session_lock(
         self, dispatcher, session
     ):
         manager = FakeSessionManager([session])
-        manager.transcript = [
-            SimpleNamespace(id=1, content="checkpointed"),
-            SimpleNamespace(id=2, content="not checkpointed"),
-        ]
-        manager._storage.memory_durable_receipts.append(
-            _checkpoint_receipt(
-                session,
-                turn_id="cmp-reset-old",
-                entries=manager.transcript[:1],
-            )
-        )
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="error",
-                    result_status="archive_failed",
-                    flushed_paths=[],
-                    content_hash="h1",
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverified",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverified",
-                    obligation_missing_ids=[],
-                    to_dict=lambda: {
-                        "mode": "error",
-                        "result_status": "archive_failed",
-                        "flushed_paths": [],
-                        "content_hash": "h1",
-                    },
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True}),
-        )
-
-        res = await dispatcher.dispatch("r1", "sessions.reset", {"key": session.session_key}, ctx)
-
-        assert res.ok is False
-        assert res.error.code == "flush_disk_error"
-        assert res.error.details["memory_safety_status"] == "unsafe"
-        assert res.error.details["semantic_memory_status"] == "failed"
-        assert manager.applied_intents == []
-
-    @pytest.mark.asyncio
-    async def test_reset_without_flush_service_allows_covering_checkpoint_receipt(
-        self, dispatcher, session
-    ):
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
-        manager._storage.memory_durable_receipts.append(
-            _checkpoint_receipt(session, turn_id="cmp-reset", entries=manager.transcript)
-        )
-        ctx = make_ctx(session_manager=manager, flush_service=None)
-
-        res = await dispatcher.dispatch("r1", "sessions.reset", {"key": session.session_key}, ctx)
-
-        assert res.ok is True
-        assert manager.applied_intents == [(session.session_key, "reset_same_key")]
-
-    @pytest.mark.asyncio
-    async def test_reset_skips_flush_when_session_reset_trigger_disabled(self, dispatcher, session):
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(id=1, content="message to discard")]
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(side_effect=AssertionError("reset flush should be disabled"))
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True, "flush_triggers": ["manual"]}),
-        )
-
-        res = await dispatcher.dispatch("r1", "sessions.reset", {"key": session.session_key}, ctx)
-
-        assert res.ok is True
-        assert "flush_receipt" not in res.payload
-        flush_service.execute.assert_not_called()
-        assert manager.applied_intents == [(session.session_key, "reset_same_key")]
-
-    @pytest.mark.asyncio
-    async def test_reset_without_flush_service_checkpoint_gate_uses_session_lock(
-        self, dispatcher, session
-    ):
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
-        manager._storage.memory_durable_receipts.append(
-            _checkpoint_receipt(session, turn_id="cmp-reset", entries=manager.transcript)
-        )
         turn_runner = _RecordingTurnRunner()
         lock = turn_runner._get_session_lock(session.session_key)
         await lock.acquire()
         ctx = make_ctx(
             session_manager=manager,
-            flush_service=None,
             turn_runner=turn_runner,
         )
         reset_task = asyncio.create_task(
@@ -7373,11 +7372,6 @@ class TestSessionsDelete:
             assert active_fences == {"background", "runtime", "direct", "write"}
             order.append("router-drain")
 
-        async def drain_turn(keys: list[str]) -> None:
-            assert keys == [session.session_key]
-            assert active_fences == {"background", "runtime", "direct", "write"}
-            order.append("turn-drain")
-
         original_expire = _isolated_approval_queue.expire_pending_for_session
 
         def observed_expire(key: str) -> int:
@@ -7415,7 +7409,6 @@ class TestSessionsDelete:
             ),
             turn_runner=SimpleNamespace(
                 get_session_lock=lambda _key: WriteLock(),
-                drain_session_background_writes=drain_turn,
             ),
         )
 
@@ -7433,7 +7426,6 @@ class TestSessionsDelete:
             "direct:enter",
             "write:enter",
             "router-drain",
-            "turn-drain",
             "expire",
             "delete",
             "evict",
@@ -7561,97 +7553,33 @@ class TestSessionsTruncate:
         assert ctx_with_sessions.session_manager.compact_calls == []
 
     @pytest.mark.asyncio
-    async def test_truncate_refuses_degraded_flush_receipt(self, dispatcher, session):
+    async def test_truncate_noop_does_not_require_checkpoint(self, dispatcher, session):
         manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(content="message to preserve")]
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
-                    invalid_candidate_count=0,
-                    obligation_status="ok",
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True}),
+        manager.transcript = [SimpleNamespace(id=1, content="message to keep")]
+        manager.record_memory_checkpoint = AsyncMock(side_effect=OSError("disk full"))
+
+        result = await dispatcher.dispatch(
+            "r1", "sessions.truncate", {"key": session.session_key, "maxMessages": 1},
+            make_ctx(session_manager=manager),
         )
 
-        res = await dispatcher.dispatch(
-            "r1", "sessions.truncate", {"key": session.session_key}, ctx
-        )
-
-        assert res.ok is False
-        assert res.error.code == "CONTEXT_FLUSH_FAILED"
-        assert manager.truncate_calls == []
+        assert result.ok is True
+        manager.record_memory_checkpoint.assert_not_awaited()
+        assert manager.truncate_calls == [(session.session_key, 1)]
 
     @pytest.mark.asyncio
-    async def test_truncate_allows_checkpoint_receipt_when_flush_receipt_is_degraded(
-        self, dispatcher, session
-    ):
-        previous_session_id = session.session_id
+    async def test_truncate_force_requires_admin_even_without_transcript(self, dispatcher, session):
         manager = FakeSessionManager([session])
-        manager.transcript = [
-            SimpleNamespace(id=1, content="message to remove"),
-            SimpleNamespace(id=2, content="message to keep"),
-        ]
-        manager._storage.memory_durable_receipts.append(
-            _checkpoint_receipt(
-                session,
-                turn_id="cmp-truncate",
-                entries=manager.transcript[:1],
-            )
-        )
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="raw",
-                    result_status="parse_failed_archived",
-                    flushed_paths=["memory/.raw_fallbacks/raw.md"],
-                    content_hash="h1",
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverified",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverified",
-                    obligation_missing_ids=[],
-                    to_dict=lambda: {
-                        "mode": "raw",
-                        "result_status": "parse_failed_archived",
-                        "flushed_paths": ["memory/.raw_fallbacks/raw.md"],
-                        "content_hash": "h1",
-                    },
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True}),
+
+        result = await dispatcher.dispatch(
+            "r1", "sessions.truncate", {"key": session.session_key, "force": True},
+            make_ctx(session_manager=manager, scopes=["operator.read", "operator.write"]),
         )
 
-        res = await dispatcher.dispatch(
-            "r1",
-            "sessions.truncate",
-            {"key": session.session_key, "maxMessages": 1},
-            ctx,
-        )
+        assert result.ok is False
+        assert result.error.code == "permission_denied"
+        assert manager.truncate_calls == []
 
-        assert res.ok is True
-        assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
-        assert manager.truncate_calls == [(session.session_key, 1)]
-        flush_kwargs = flush_service.execute.await_args.kwargs
-        correlation = flush_kwargs["provider_request_correlation"]
-        assert correlation.session_id == previous_session_id
-        assert correlation.turn_id == flush_kwargs["turn_id"]
-        assert correlation.execution_id != correlation.turn_id
-        assert correlation.call_kind == "auxiliary.session_flush"
 
     @pytest.mark.asyncio
     async def test_truncate_refuses_stale_checkpoint_for_later_removed_messages(
@@ -7669,34 +7597,8 @@ class TestSessionsTruncate:
                 entries=manager.transcript[:1],
             )
         )
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="error",
-                    result_status="archive_failed",
-                    flushed_paths=[],
-                    content_hash="h1",
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverified",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverified",
-                    obligation_missing_ids=[],
-                    to_dict=lambda: {
-                        "mode": "error",
-                        "result_status": "archive_failed",
-                        "flushed_paths": [],
-                        "content_hash": "h1",
-                    },
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True}),
-        )
+        manager.record_memory_checkpoint = AsyncMock(side_effect=OSError("disk full"))
+        ctx = make_ctx(session_manager=manager)
 
         res = await dispatcher.dispatch(
             "r1",
@@ -7706,13 +7608,12 @@ class TestSessionsTruncate:
         )
 
         assert res.ok is False
-        assert res.error.code == "CONTEXT_FLUSH_FAILED"
-        assert res.error.details["memory_safety_status"] == "unsafe"
-        assert res.error.details["semantic_memory_status"] == "failed"
+        assert res.error.code == "CHECKPOINT_FAILED"
         assert manager.truncate_calls == []
 
+
     @pytest.mark.asyncio
-    async def test_truncate_without_flush_service_allows_covering_checkpoint_receipt(
+    async def test_truncate_reuses_covering_checkpoint(
         self, dispatcher, session
     ):
         manager = FakeSessionManager([session])
@@ -7727,7 +7628,8 @@ class TestSessionsTruncate:
                 entries=manager.transcript[:1],
             )
         )
-        ctx = make_ctx(session_manager=manager, flush_service=None)
+        manager.record_memory_checkpoint = AsyncMock(side_effect=AssertionError("duplicate write"))
+        ctx = make_ctx(session_manager=manager)
 
         res = await dispatcher.dispatch(
             "r1",
@@ -7738,36 +7640,8 @@ class TestSessionsTruncate:
 
         assert res.ok is True
         assert manager.truncate_calls == [(session.session_key, 1)]
+        manager.record_memory_checkpoint.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_truncate_skips_flush_when_session_reset_trigger_disabled(
-        self, dispatcher, session
-    ):
-        manager = FakeSessionManager([session])
-        manager.transcript = [
-            SimpleNamespace(id=1, content="message to remove"),
-            SimpleNamespace(id=2, content="message to keep"),
-        ]
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(side_effect=AssertionError("truncate flush should be disabled"))
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True, "flush_triggers": ["manual"]}),
-        )
-
-        res = await dispatcher.dispatch(
-            "r1",
-            "sessions.truncate",
-            {"key": session.session_key, "maxMessages": 1},
-            ctx,
-        )
-
-        assert res.ok is True
-        assert "flush_receipt" not in res.payload
-        flush_service.execute.assert_not_called()
-        assert manager.truncate_calls == [(session.session_key, 1)]
 
     @pytest.mark.asyncio
     async def test_truncate_refuses_orphaned_checkpoint_receipt(self, dispatcher, session):
@@ -7781,43 +7655,15 @@ class TestSessionsTruncate:
                 status="receipt_orphaned",
             )
         )
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="error",
-                    result_status="archive_failed",
-                    flushed_paths=[],
-                    content_hash="h1",
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverified",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverified",
-                    obligation_missing_ids=[],
-                    to_dict=lambda: {
-                        "mode": "error",
-                        "result_status": "archive_failed",
-                        "flushed_paths": [],
-                        "content_hash": "h1",
-                    },
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True}),
-        )
+        manager.record_memory_checkpoint = AsyncMock(side_effect=OSError("disk full"))
+        ctx = make_ctx(session_manager=manager)
 
         res = await dispatcher.dispatch(
-            "r1", "sessions.truncate", {"key": session.session_key}, ctx
+            "r1", "sessions.truncate", {"key": session.session_key, "maxMessages": 0}, ctx
         )
 
         assert res.ok is False
-        assert res.error.code == "CONTEXT_FLUSH_FAILED"
-        assert res.error.details["memory_safety_status"] == "unsafe"
-        assert res.error.details["semantic_memory_status"] == "failed"
+        assert res.error.code == "CHECKPOINT_FAILED"
         assert manager.truncate_calls == []
 
 
@@ -7875,7 +7721,6 @@ class TestSessionsContextCompact:
                 "max_tokens": 512,
             },
             context_budget_tokens=100_000,
-            memory={"flush_enabled": False},
         )
         current = ProviderConfig(
             provider="openai",
@@ -8528,7 +8373,6 @@ class TestSessionsContextCompact:
 
         manager.compact_with_result = _blocked  # type: ignore[method-assign]
         config = GatewayConfig(
-            memory={"flush_enabled": False},
             compaction={
                 "total_timeout_seconds": 0.02,
                 "heartbeat_interval_seconds": 1.0,
@@ -8610,269 +8454,6 @@ class TestSessionsContextCompact:
             "Preserve architecture decisions."
         ]
 
-    @pytest.mark.asyncio
-    async def test_context_compact_missing_flush_service_does_not_block_compaction(
-        self, dispatcher, session
-    ):
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(content="message to preserve")]
-        ctx = make_ctx(
-            session_manager=manager,
-            config=GatewayConfig(memory={"flush_enabled": True}),
-        )
-
-        res = await dispatcher.dispatch(
-            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
-        )
-
-        assert res.ok is True
-        assert len(manager.compact_calls) == 1
-        assert manager.compact_calls[0][:2] == (session.session_key, 100000)
-
-    @pytest.mark.asyncio
-    async def test_context_compact_degraded_flush_receipt_does_not_block_compaction(
-        self, dispatcher, session
-    ):
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(content="message to preserve")]
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="raw",
-                    result_status="parse_failed_archived",
-                    flushed_paths=["memory/.raw_fallbacks/raw.md"],
-                    content_hash="h1",
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverified",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverified",
-                    obligation_missing_ids=[],
-                    to_dict=lambda: {
-                        "mode": "raw",
-                        "result_status": "parse_failed_archived",
-                        "flushed_paths": ["memory/.raw_fallbacks/raw.md"],
-                        "content_hash": "h1",
-                    },
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True}),
-        )
-
-        res = await dispatcher.dispatch(
-            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
-        )
-
-        assert res.ok is True
-        assert len(manager.compact_calls) == 1
-        assert manager.compact_calls[0][:2] == (session.session_key, 100000)
-        assert manager.compact_kwargs[0]["flush_receipt_status"] == "degraded_forensic"
-        assert res.payload["flush_receipt_status"] == "degraded_forensic"
-        flush_correlation = flush_service.execute.await_args.kwargs[
-            "provider_request_correlation"
-        ]
-        compact_correlation = manager.compact_kwargs[0][
-            "provider_request_correlation"
-        ]
-        assert isinstance(flush_correlation, ProviderRequestCorrelation)
-        assert isinstance(compact_correlation, ProviderRequestCorrelation)
-        assert flush_correlation.session_id == compact_correlation.session_id
-        assert flush_correlation.turn_id == compact_correlation.turn_id
-        assert flush_correlation.execution_id != compact_correlation.execution_id
-        assert flush_correlation.call_kind == "auxiliary.session_flush"
-        assert compact_correlation.call_kind == "auxiliary.compaction"
-
-    @pytest.mark.asyncio
-    async def test_context_compact_block_mode_allows_checkpoint_receipt(self, dispatcher, session):
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
-        manager._storage.memory_durable_receipts.append(
-            _checkpoint_receipt(session, turn_id="cmp-compact", entries=manager.transcript)
-        )
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="raw",
-                    result_status="parse_failed_archived",
-                    flushed_paths=["memory/.raw_fallbacks/raw.md"],
-                    content_hash="h1",
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverified",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverified",
-                    obligation_missing_ids=[],
-                    to_dict=lambda: {
-                        "mode": "raw",
-                        "result_status": "parse_failed_archived",
-                        "flushed_paths": ["memory/.raw_fallbacks/raw.md"],
-                        "content_hash": "h1",
-                    },
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(
-                memory={
-                    "flush_enabled": True,
-                    "flush_triggers": ["manual"],
-                    "flush_compaction_safety_mode": "block",
-                }
-            ),
-        )
-
-        res = await dispatcher.dispatch(
-            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
-        )
-
-        assert res.ok is True
-        assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
-        assert res.payload["flush_receipt_status"] == "unsafe"
-        assert manager.compact_calls[0][:2] == (session.session_key, 100000)
-
-    @pytest.mark.asyncio
-    async def test_context_compact_block_mode_refuses_stale_checkpoint_receipt(
-        self, dispatcher, session
-    ):
-        manager = FakeSessionManager([session])
-        manager.transcript = [
-            SimpleNamespace(id=1, content="checkpointed"),
-            SimpleNamespace(id=2, content="not checkpointed"),
-        ]
-        manager._storage.memory_durable_receipts.append(
-            _checkpoint_receipt(
-                session,
-                turn_id="cmp-compact-old",
-                entries=manager.transcript[:1],
-            )
-        )
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="error",
-                    result_status="archive_failed",
-                    flushed_paths=[],
-                    content_hash="h1",
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverified",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverified",
-                    obligation_missing_ids=[],
-                    to_dict=lambda: {
-                        "mode": "error",
-                        "result_status": "archive_failed",
-                        "flushed_paths": [],
-                        "content_hash": "h1",
-                    },
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(
-                memory={
-                    "flush_enabled": True,
-                    "flush_triggers": ["manual"],
-                    "flush_compaction_safety_mode": "block",
-                }
-            ),
-        )
-
-        res = await dispatcher.dispatch(
-            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
-        )
-
-        assert res.ok is False
-        assert res.error.code == "CONTEXT_FLUSH_FAILED"
-        assert res.error.details["memory_safety_status"] == "unsafe"
-        assert res.error.details["semantic_memory_status"] == "failed"
-        assert manager.compact_calls == []
-
-    @pytest.mark.asyncio
-    async def test_context_compact_block_mode_refuses_without_checkpoint_receipt(
-        self, dispatcher, session
-    ):
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(content="message to preserve")]
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="raw",
-                    integrity_ok=True,
-                    output_coverage_status="ok",
-                    missing_candidate_count=0,
-                    invalid_candidate_count=0,
-                    obligation_status="ok",
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(
-                memory={
-                    "flush_enabled": True,
-                    "flush_triggers": ["manual"],
-                    "flush_compaction_safety_mode": "block",
-                }
-            ),
-        )
-
-        res = await dispatcher.dispatch(
-            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
-        )
-
-        assert res.ok is False
-        assert res.error.code == "CONTEXT_FLUSH_FAILED"
-        assert manager.compact_calls == []
-
-    @pytest.mark.asyncio
-    async def test_context_compact_persists_noop_flush_receipt_status(self, dispatcher, session):
-        manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(content="message to preserve")]
-        flush_service = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(
-                    mode="llm",
-                    result_status="ok_noop_no_memory",
-                    flushed_paths=[],
-                    raw_reason=None,
-                    error=None,
-                    indexed_chunk_count=0,
-                    integrity_status="unverified",
-                    output_coverage_status="unverifiable",
-                    invalid_candidate_count=0,
-                    candidate_missing_ids=[],
-                    obligation_status="unverifiable",
-                    obligation_missing_ids=[],
-                )
-            )
-        )
-        ctx = make_ctx(
-            session_manager=manager,
-            flush_service=flush_service,
-            config=GatewayConfig(memory={"flush_enabled": True}),
-        )
-
-        res = await dispatcher.dispatch(
-            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
-        )
-
-        assert res.ok is True
-        assert len(manager.compact_calls) == 1
-        assert manager.compact_kwargs[0]["flush_receipt_status"] == "noop_no_memory"
-        assert res.payload["flush_receipt_status"] == "noop_no_memory"
 
     @pytest.mark.asyncio
     async def test_context_compact_allowed_for_operator_write_scope(self, dispatcher, session):
@@ -8892,15 +8473,13 @@ class TestSessionsContextCompact:
         )
 
     @pytest.mark.asyncio
-    async def test_context_compact_passes_provider_config_without_flush_receipt(self, dispatcher):
+    async def test_context_compact_passes_provider_config(self, dispatcher):
         session = FakeSession(session_key="agent:main:abc123", model="session/model")
         manager = FakeSessionManager([session])
         selector = _FakeProviderSelector()
-        flush_service = SimpleNamespace(execute=AsyncMock(side_effect=AssertionError("no flush")))
         ctx = make_ctx(
             session_manager=manager,
             provider_selector=selector,
-            flush_service=flush_service,
         )
 
         res = await dispatcher.dispatch(
@@ -8911,9 +8490,7 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
-        assert "flush_receipt" not in res.payload
         assert res.payload["summary_source"] == "fallback"
-        flush_service.execute.assert_not_called()
         config = manager.compact_calls[0][2]
         assert isinstance(config, CompactionConfig)
         assert config.api_key == "provider-key"
@@ -11497,7 +11074,6 @@ async def test_search_classifies_custom_named_channel_sessions(dispatcher):
         updated_at=2000,
     )
     config = GatewayConfig(
-        memory={"flush_enabled": False},
         channels={
             "channels": [
                 {

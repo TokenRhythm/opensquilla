@@ -72,7 +72,7 @@ def ctx(manager):
     context = RpcContext(
         conn_id="test-conn",
         principal=_PRINCIPAL,
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
         turn_runner=runner,
     )
     context.session_manager = manager

@@ -534,9 +534,6 @@ def test_meta_sub_agent_inherits_physical_request_contract_without_outer_state(
         retry_max_backoff_ms=56_789,
         reasoning_prefill_recovery_mode="recover",
         stop_sequences=["STOP-A", "STOP-B"],
-        flush_enabled=True,
-        flush_triggers=["manual", "pre_compaction"],
-        flush_pre_compaction=True,
         compaction_profile="research",
         compaction_protected_recent_messages=9,
         compaction_total_timeout_seconds=321.0,
@@ -607,11 +604,6 @@ def test_meta_sub_agent_inherits_physical_request_contract_without_outer_state(
     assert child.retry_base_backoff_ms == 1_234
     assert child.retry_max_backoff_ms == 56_789
     assert child.reasoning_prefill_recovery_mode == "recover"
-    # Memory flush is an outer lifecycle concern, not part of the one-shot
-    # sub-Agent's physical request/compaction contract.
-    assert child.flush_enabled is False
-    assert child.flush_triggers == ["session_reset", "manual", "idle"]
-    assert child.flush_pre_compaction is False
     assert child.compaction_profile == "research"
     assert child.compaction_protected_recent_messages == 9
     assert child.compaction_total_timeout_seconds == 321.0
@@ -648,12 +640,9 @@ def test_meta_sub_agent_inherits_physical_request_contract_without_outer_state(
     # Mutable policy lists and the rebuilt breakpoint belong to the child.
     assert child.stop_sequences == parent.stop_sequences
     assert child.stop_sequences is not parent.stop_sequences
-    assert child.flush_triggers is not parent.flush_triggers
     assert child.cache_breakpoints is not parent.cache_breakpoints
     child.stop_sequences.append("CHILD-ONLY")
-    child.flush_triggers.append("pre_compaction")
     assert parent.stop_sequences == ["STOP-A", "STOP-B"]
-    assert parent.flush_triggers == ["manual", "pre_compaction"]
     assert parent.cache_breakpoints == [
         {"text": "outer prompt", "cache": "true"}
     ]

@@ -56,9 +56,6 @@ class PromptReport:
     reasoning_hint_resolved: str | None = None
     cache_base_chars: int = 0
     cache_dynamic_chars: int = 0
-    session_flush_extraction_model: str | None = None
-    session_flush_fallback_used: bool = False
-    session_flush_fallback_reason: str | None = None
     system_hash: str = ""
     tool_entries: list[ToolEntry] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
@@ -206,18 +203,5 @@ def build_prompt_report(
         ),
         cache_base_chars=int(metadata.get("cache_base_chars") or 0),
         cache_dynamic_chars=int(metadata.get("cache_dynamic_chars") or 0),
-        session_flush_extraction_model=(
-            str(metadata["session_flush_extraction_model"])
-            if metadata.get("session_flush_extraction_model") is not None
-            else None
-        ),
-        session_flush_fallback_used=bool(
-            metadata.get("session_flush_fallback_used", False)
-        ),
-        session_flush_fallback_reason=(
-            str(metadata["session_flush_fallback_reason"])
-            if metadata.get("session_flush_fallback_reason") is not None
-            else None
-        ),
         tool_entries=tool_entries,
     )

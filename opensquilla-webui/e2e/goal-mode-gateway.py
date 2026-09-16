@@ -346,8 +346,6 @@ async def main() -> None:
         tier["model"] = MODEL
     config.naming.enabled = False
     config.compaction.enabled = False
-    config.memory.flush_enabled = False
-    config.memory.repair_enabled = False
     config.memory.ttl_sweep_interval_minutes = 0
     config.meta_skill.enabled = False
     config.heartbeat.enabled = False

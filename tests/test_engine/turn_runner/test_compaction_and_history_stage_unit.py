@@ -248,7 +248,6 @@ async def test_admitted_owner_is_forwarded_to_compaction_and_history() -> None:
 
 
 
-
 @pytest.mark.asyncio
 async def test_t3_handled_skips_preflight() -> None:
     stage, t3, preflight, history, _ = _make_stage(
@@ -290,17 +289,6 @@ async def test_t3_compact_failed_skips_preflight() -> None:
     assert outcome.output.preflight_invoked is False
     assert len(preflight.calls) == 0
 
-
-@pytest.mark.asyncio
-async def test_t3_flush_failed_falls_through_to_preflight() -> None:
-    stage, t3, preflight, _, _ = _make_stage(
-        t3=_RecordingT3(return_value="flush_failed"),
-    )
-    outcome = await stage.run(_make_input())
-
-    assert outcome.output.t3_upgrade_status == "flush_failed"
-    assert outcome.output.preflight_invoked is True
-    assert len(preflight.calls) == 1
 
 
 @pytest.mark.asyncio

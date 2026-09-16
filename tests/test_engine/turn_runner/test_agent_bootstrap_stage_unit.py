@@ -57,23 +57,23 @@ def _default_catalog(*, capabilities: Any = None) -> _ResolvedCatalog:
 def _default_aux(
     *,
     thinking: bool | ThinkingLevel = False,
-    flush_compaction_requires_safe_receipt: bool = False,
+
 ) -> _AgentConfigAuxiliaries:
     return _AgentConfigAuxiliaries(
         thinking=thinking,
-        flush_workspace_dir="/tmp/flush",
+
         tool_result_store_dir="/tmp/tool-results",
         tool_result_store_session_id="session-test",
-        flush_enabled=True,
-        flush_triggers=["session_reset", "manual", "idle", "pre_compaction"],
-        flush_pre_compaction=True,
-        flush_timeout_seconds=15.0,
-        flush_background_timeout_seconds=120.0,
-        flush_backoff_initial_seconds=30.0,
-        flush_backoff_max_seconds=300.0,
-        flush_archive_max_bytes=800_000,
-        flush_compaction_requires_safe_receipt=flush_compaction_requires_safe_receipt,
-        flush_compaction_safety_mode="protect",
+
+
+
+
+
+
+
+
+
+
         compaction_profile="conversation",
         compaction_protected_recent_messages=0,
         compaction_total_timeout_seconds=120.0,
@@ -1226,7 +1226,7 @@ def test_value_objects_frozen() -> None:
 
     aux = _default_aux()
     with pytest.raises(Exception):  # noqa: BLE001
-        aux.flush_enabled = False  # type: ignore[misc]
+        aux.thinking = False  # type: ignore[misc]
 
     result = _MemorySnapshotResult(sync_manager=None, private_memory_allowed=True)
     with pytest.raises(Exception):  # noqa: BLE001

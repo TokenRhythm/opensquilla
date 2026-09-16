@@ -236,9 +236,7 @@ from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     compact_context,
     compaction_prompt_layout,
-    compaction_remaining_seconds,
     compaction_replay_summary,
-    require_compaction_time,
 )
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
@@ -249,11 +247,7 @@ from opensquilla.session.compaction_lifecycle import (
     compaction_effect_payload,
     compaction_lifecycle_payload,
     compaction_result_payload,
-    flush_receipt_allows_destructive_compaction,
-    flush_receipt_is_successful_flush,
-    flush_trigger_enabled,
     new_compaction_id,
-    pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.context_view import format_compaction_summary_context
 from opensquilla.session.terminal_reply import (
@@ -2361,7 +2355,6 @@ class Agent:
         session_key: str | None = None,
         turn_call_logger: TurnCallLogger | None = None,
         memory_sync_manager: Any | None = None,
-        session_flush_service: Any | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_context: ToolContext | None = None,
         failure_injector: FailureInjector | None = None,
@@ -2475,13 +2468,6 @@ class Agent:
         # internal slot.
         self._memory_sync_manager: Any | None = memory_sync_manager
 
-        # Memory flush state (sub-agent based, re-entrant per compaction cycle)
-        self._flush_done_this_cycle: bool = False
-        self._active_flush_task: asyncio.Task | None = None
-        self._flush_wait_timed_out_task: asyncio.Task | None = None
-        self._flush_backoff_until: float = 0.0
-        self._flush_backoff_seconds: float = 0.0
-        self._session_flush_service = session_flush_service
         self._last_compaction_refusal_reason: str | None = None
         self._compaction_failed_this_turn = False
         self._pending_durable_compaction_event: CompactionEvent | None = None
@@ -2694,22 +2680,6 @@ class Agent:
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
-        if reason == "memory_flush_timeout_before_compaction":
-            return ErrorEvent(
-                message=(
-                    "Context compaction could not run because the pre-compaction "
-                    "memory flush timed out."
-                ),
-                code="compaction_refused_flush_timeout",
-            )
-        if reason == "memory_flush_degraded_before_compaction":
-            return ErrorEvent(
-                message=(
-                    "Context compaction could not run because the pre-compaction "
-                    "memory flush did not produce a verified summary."
-                ),
-                code="compaction_refused_memory_flush",
-            )
         if reason == "empty_summary_rejected":
             return ErrorEvent(
                 message="Context compaction produced no replacement summary.",
@@ -15232,8 +15202,7 @@ class Agent:
     ) -> CompactionOutcome | None:
         """Check if estimated live context tokens exceed the overflow threshold.
 
-        Uses sub-agent flush instead of prompt injection.
-        The flush is re-entrant: it can trigger on every approach to threshold.
+        Preserve canonical history while selecting a provider-compatible request view.
         """
         self._last_compaction_refusal_reason = None
         window_tokens = compaction_window_tokens or self.config.context_window_tokens
@@ -15429,188 +15398,6 @@ class Agent:
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
-        # --- Pre-compaction flush; inline compaction can continue on degraded flush. ---
-        flush_task: asyncio.Task | None = None
-        self._consume_completed_flush_task()
-
-        async def _await_flush_task() -> Any | None:
-            # Give flush a grace period to complete instead of cancelling immediately.
-            # Adds up to flush_timeout_seconds (default 15s) of latency, but without
-            # this the flush is effectively dead code (always cancelled before finishing).
-            if flush_task is not None and not flush_task.done():
-                if flush_task is self._flush_wait_timed_out_task:
-                    return None
-                try:
-                    require_compaction_time(compaction_config, phase="flushing")
-                    remaining = compaction_remaining_seconds(compaction_config)
-                    wait_timeout = self.config.flush_timeout_seconds
-                    if remaining is not None:
-                        wait_timeout = min(wait_timeout, remaining)
-                    receipt = await asyncio.wait_for(
-                        asyncio.shield(flush_task),
-                        timeout=wait_timeout,
-                    )
-                    logger.info("memory_flush.completed_after_compaction")
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return receipt
-                except TimeoutError:
-                    require_compaction_time(compaction_config, phase="flushing")
-                    self._flush_wait_timed_out_task = flush_task
-                    next_retry_seconds = self._record_flush_timeout_backoff()
-                    logger.warning(
-                        "memory_flush.timed_out",
-                        timeout_seconds=self.config.flush_timeout_seconds,
-                        next_retry_seconds=next_retry_seconds,
-                    )
-                except CompactionTimeoutError:
-                    raise
-                except Exception as exc:
-                    logger.warning("memory_flush.await_failed", error=str(exc))
-                    self._mark_flush_task_completed(flush_task)
-                    return None
-            if flush_task is not None and flush_task.done():
-                try:
-                    receipt = flush_task.result()
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return receipt
-                except Exception as exc:
-                    logger.warning("memory_flush.await_failed", error=str(exc))
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return None
-            return None
-
-        pre_compaction_flush_enabled = flush_trigger_enabled(
-            self.config,
-            "pre_compaction",
-        )
-
-        if not self._flush_done_this_cycle and pre_compaction_flush_enabled:
-            try:
-                from opensquilla.memory.flush import (
-                    resolve_flush_plan,
-                    should_flush,
-                )
-
-                now = time.monotonic()
-                if self._active_flush_task is not None and not self._active_flush_task.done():
-                    logger.debug("memory_flush.skipped", reason="already_running")
-                    flush_task = self._active_flush_task
-                elif now < self._flush_backoff_until:
-                    logger.warning(
-                        "memory_flush.skipped",
-                        reason="backoff",
-                        retry_after_seconds=round(self._flush_backoff_until - now, 3),
-                    )
-                else:
-                    transcript_bytes = sum(
-                        len(m.content.encode("utf-8")) if isinstance(m.content, str) else 0
-                        for m in messages
-                    )
-
-                    if should_flush(
-                        total_tokens=estimated_context_tokens,
-                        threshold_tokens=int(threshold),
-                        transcript_bytes=transcript_bytes,
-                    ):
-                        plan = resolve_flush_plan(
-                            workspace_dir=self.config.flush_workspace_dir,
-                            archive_max_bytes=self.config.flush_archive_max_bytes,
-                        )
-                        logger.info(
-                            "memory_flush.triggered",
-                            path=plan.relative_path,
-                            total_tokens=estimated_context_tokens,
-                            threshold=int(threshold),
-                        )
-                        flush_task = asyncio.create_task(self._run_flush(plan, list(messages)))
-                        flush_task.add_done_callback(self._on_flush_task_done)
-                        self._active_flush_task = flush_task
-                        self._flush_done_this_cycle = True
-            except Exception:
-                logger.debug("memory_flush.skipped", reason="flush module unavailable")
-
-        if pre_compaction_flush_enabled:
-            if (
-                flush_task is not None
-                and not flush_task.done()
-                and time.monotonic() < self._flush_backoff_until
-            ):
-                logger.warning(
-                    "memory_flush.skipped",
-                    reason="backoff",
-                    retry_after_seconds=round(self._flush_backoff_until - time.monotonic(), 3),
-                )
-                self._flush_done_this_cycle = False
-            try:
-                receipt = await _await_flush_task()
-            except asyncio.CancelledError:
-                if self._session_key:
-                    notify_compaction(
-                        self._session_key,
-                        source="automatic",
-                        phase="flushing",
-                        status="cancelled",
-                        reason="cancelled",
-                        **compaction_effect_payload(status="cancelled"),
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
-                        ),
-                    )
-                raise
-            except CompactionTimeoutError as exc:
-                self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
-                if self._session_key:
-                    notify_compaction(
-                        self._session_key,
-                        source="automatic",
-                        phase=exc.phase,
-                        status="timed_out",
-                        reason=self._last_compaction_refusal_reason,
-                        **compaction_effect_payload(status="timed_out"),
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
-                        ),
-                    )
-                return _local_after_failure("compaction_deadline_exceeded")
-            if not flush_receipt_allows_destructive_compaction(receipt):
-                reason = "memory_flush_degraded_before_compaction"
-                if flush_task is not None and self._flush_wait_timed_out_task is flush_task:
-                    reason = "memory_flush_timeout_before_compaction"
-                logger.warning(
-                    "memory_flush.degraded_before_compaction",
-                    reason=reason,
-                    mode=getattr(receipt, "mode", None),
-                    integrity_status=getattr(receipt, "integrity_status", None),
-                    indexed_chunk_count=getattr(receipt, "indexed_chunk_count", None),
-                )
-                self._flush_done_this_cycle = False
-                if pre_compaction_flush_requires_safe_receipt(self.config):
-                    self._last_compaction_refusal_reason = reason
-                    if self._session_key:
-                        notify_compaction(
-                            self._session_key,
-                            source="automatic",
-                            phase="agent_inline_overflow",
-                            status="skipped",
-                            reason=reason,
-                            tokens_before=estimated_context_tokens,
-                            context_window_tokens=window_tokens,
-                            **compaction_effect_payload(
-                                status="skipped",
-                                reason=reason,
-                            ),
-                            **compaction_lifecycle_payload(
-                                compaction_id,
-                                COMPACTION_TRIGGERED_EVENT,
-                            ),
-                        )
-                    return _local_after_failure(reason)
-
         # --- Compaction ---
         # Summaries consume flattened text; retention and cut decisions use
         # the original structured message's text and native-media estimate.
@@ -15794,40 +15581,6 @@ class Agent:
                     )
                 return None
             has_structured_content = any(not isinstance(m.content, str) for m in messages)
-            try:
-                await _await_flush_task()
-            except asyncio.CancelledError:
-                if self._session_key:
-                    notify_compaction(
-                        self._session_key,
-                        source="automatic",
-                        phase="flushing",
-                        status="cancelled",
-                        reason="cancelled",
-                        **compaction_effect_payload(status="cancelled"),
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
-                        ),
-                    )
-                raise
-            except CompactionTimeoutError as exc:
-                self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
-                if self._session_key:
-                    notify_compaction(
-                        self._session_key,
-                        source="automatic",
-                        phase=exc.phase,
-                        status="timed_out",
-                        reason=self._last_compaction_refusal_reason,
-                        **compaction_effect_payload(status="timed_out"),
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
-                        ),
-                    )
-                return _local_after_failure("compaction_deadline_exceeded")
-            self._flush_done_this_cycle = False
             skip_reason = getattr(result, "skip_reason", None) or (
                 "structured_content_noop" if has_structured_content else "noop"
             )
@@ -15871,42 +15624,6 @@ class Agent:
             )
         compacted.extend(messages[kept_start_index:])
 
-        try:
-            await _await_flush_task()
-        except asyncio.CancelledError:
-            if self._session_key:
-                notify_compaction(
-                    self._session_key,
-                    source="automatic",
-                    phase="flushing",
-                    status="cancelled",
-                    reason="cancelled",
-                    **compaction_effect_payload(status="cancelled"),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-            raise
-        except CompactionTimeoutError as exc:
-            self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
-            if self._session_key:
-                notify_compaction(
-                    self._session_key,
-                    source="automatic",
-                    phase=exc.phase,
-                    status="timed_out",
-                    reason=self._last_compaction_refusal_reason,
-                    **compaction_effect_payload(status="timed_out"),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-            return _local_after_failure("compaction_deadline_exceeded")
-
-        # Reset flush flag so it can trigger again after next compaction
-        self._flush_done_this_cycle = False
 
         # Trigger 6: post-compaction sync
         if self._memory_sync_manager is not None:
@@ -15958,65 +15675,6 @@ class Agent:
             runtime_compaction_config=compaction_config,
         )
 
-    def _consume_completed_flush_task(self) -> None:
-        task = self._active_flush_task
-        if task is None or not task.done():
-            return
-        self._mark_flush_task_completed(task)
-
-    def _on_flush_task_done(self, task: asyncio.Task) -> None:
-        self._mark_flush_task_completed(task)
-
-    def _mark_flush_task_completed(self, task: asyncio.Task) -> None:
-        if self._flush_wait_timed_out_task is task:
-            self._flush_wait_timed_out_task = None
-        if self._active_flush_task is not task:
-            return
-        try:
-            receipt = task.result()
-        except asyncio.CancelledError:
-            logger.debug("memory_flush.cancelled")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("memory_flush.background_failed", error=str(exc))
-        else:
-            mode = getattr(receipt, "mode", None)
-            if not flush_receipt_is_successful_flush(receipt):
-                next_retry_seconds = self._ensure_flush_degraded_backoff()
-                logger.warning(
-                    "memory_flush.degraded",
-                    mode=mode,
-                    result_status=getattr(receipt, "result_status", None),
-                    integrity_status=getattr(receipt, "integrity_status", None),
-                    output_coverage_status=getattr(receipt, "output_coverage_status", None),
-                    obligation_status=getattr(receipt, "obligation_status", None),
-                    raw_reason=getattr(receipt, "raw_reason", None),
-                    next_retry_seconds=next_retry_seconds,
-                )
-            else:
-                self._flush_backoff_seconds = 0.0
-                self._flush_backoff_until = 0.0
-        self._active_flush_task = None
-
-    def _record_flush_timeout_backoff(self) -> float:
-        initial = max(0.0, float(self.config.flush_backoff_initial_seconds))
-        maximum = max(initial, float(self.config.flush_backoff_max_seconds))
-        if initial == 0:
-            self._flush_backoff_seconds = 0.0
-            self._flush_backoff_until = 0.0
-            return 0.0
-        if self._flush_backoff_seconds <= 0:
-            next_retry_seconds = initial
-        else:
-            next_retry_seconds = min(self._flush_backoff_seconds * 2, maximum)
-        self._flush_backoff_seconds = next_retry_seconds
-        self._flush_backoff_until = time.monotonic() + next_retry_seconds
-        return next_retry_seconds
-
-    def _ensure_flush_degraded_backoff(self) -> float:
-        remaining = self._flush_backoff_until - time.monotonic()
-        if remaining > 0:
-            return remaining
-        return self._record_flush_timeout_backoff()
 
     @staticmethod
     def _adjust_index_after_prefix_compaction(
@@ -16031,64 +15689,6 @@ class Agent:
         summary_prefix = 2 if summary_present and original_index > 0 else 0
         return summary_prefix + max(0, original_index - kept_start_index)
 
-    async def _run_flush(
-        self,
-        plan: Any,
-        messages: list[Message],
-    ) -> Any | None:
-        """Run memory flush before compaction; delegates to SessionFlushService.
-
-        When a ``SessionFlushService`` is injected, this method forwards the
-        call and returns its receipt. When no service is injected (standalone
-        Agent instances in unit tests or legacy paths), it falls back to an
-        inline raw-dump so we don't silently drop data.
-        """
-        service = getattr(self, "_session_flush_service", None)
-        if service is not None:
-            try:
-                from opensquilla.session.keys import parse_agent_id
-
-                sk = getattr(self, "_session_key", None) or "agent:main:legacy"
-                return await service.execute(
-                    messages,
-                    session_key=sk,
-                    agent_id=parse_agent_id(sk),
-                    timeout=self.config.flush_background_timeout_seconds,
-                    message_window=0,
-                    segment_mode="auto",
-                    provider_request_correlation=derive_provider_request_correlation(
-                        self._provider_request_correlation,
-                        execution_id=uuid.uuid4().hex,
-                        call_kind="auxiliary.session_flush",
-                    ),
-                )
-            except asyncio.CancelledError:
-                logger.debug("memory_flush.cancelled")
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("memory_flush.service_failed", error=str(exc))
-            return None
-
-        # Legacy fallback — only hit when no service is injected.
-        from opensquilla.memory.flush import dump_transcript_excerpt
-
-        if self.provider is None and self.tool_handler is not None:
-            excerpt = dump_transcript_excerpt(messages)
-            if excerpt.strip():
-                from opensquilla.tool_boundary import ToolCall as _FlushToolCall
-
-                await self.tool_handler(
-                    _FlushToolCall(
-                        tool_use_id="flush-fallback",
-                        tool_name="memory_save",
-                        arguments={
-                            "content": excerpt,
-                            "path": plan.relative_path,
-                            "mode": "append",
-                        },
-                    )
-                )
-        return None
 
     @staticmethod
     def _has_provider_context_replay_marker(arguments: dict[str, Any]) -> bool:
@@ -18116,18 +17716,6 @@ class Agent:
             length_capped_continuations=self.config.length_capped_continuations,
             context_window_tokens=child_target.context_window_tokens,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
-            flush_enabled=self.config.flush_enabled,
-            flush_triggers=list(self.config.flush_triggers),
-            flush_pre_compaction=self.config.flush_pre_compaction,
-            flush_timeout_seconds=self.config.flush_timeout_seconds,
-            flush_background_timeout_seconds=self.config.flush_background_timeout_seconds,
-            flush_backoff_initial_seconds=self.config.flush_backoff_initial_seconds,
-            flush_backoff_max_seconds=self.config.flush_backoff_max_seconds,
-            flush_archive_max_bytes=self.config.flush_archive_max_bytes,
-            flush_compaction_requires_safe_receipt=(
-                self.config.flush_compaction_requires_safe_receipt
-            ),
-            flush_compaction_safety_mode=self.config.flush_compaction_safety_mode,
             compaction_profile=self.config.compaction_profile,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
             compaction_total_timeout_seconds=self.config.compaction_total_timeout_seconds,

@@ -108,14 +108,23 @@ def test_cli_01_era_migrates_with_expected_strips() -> None:
     assert cfg.port == 18790
 
 
-def test_modern_era_configs_strip_retired_skill_filter_settings() -> None:
+def test_modern_era_configs_strip_retired_skill_filter_and_memory_flush_settings() -> None:
     for era in ("cli-0.3", "cli-0.4"):
         data = tomllib.loads(
             (FIXTURES_ROOT / era / "config.toml").read_text(encoding="utf-8")
         )
         result = migrate_config_payload(data)
         assert result.changed, (era, result.changes, result.removed_fields)
+        retired_memory = {
+            "flush_enabled", "flush_timeout_seconds", "flush_background_timeout_seconds",
+            "flush_backoff_initial_seconds", "flush_backoff_max_seconds", "flush_archive_max_bytes",
+            "flush_compaction_requires_safe_receipt", "flush_compaction_safety_mode",
+            "repair_enabled", "repair_interval_seconds", "repair_max_items_per_tick",
+        }
+        if era == "cli-0.4":
+            retired_memory.update({"flush_triggers", "flush_pre_compaction"})
         assert set(result.removed_fields) == {
+            *(f"memory.{key}" for key in retired_memory),
             "skills.filter_embedding_model",
             "skills.filter_enabled",
             "skills.filter_lexical_top_n",

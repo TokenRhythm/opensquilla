@@ -62,7 +62,6 @@ if TYPE_CHECKING:
 # stage body branches on ``t3_status`` to decide whether to fall through
 # to preflight; keeping a local copy avoids a runtime → stage import.
 _T3_NOT_APPLICABLE: str = "not_applicable"
-_T3_FLUSH_FAILED: str = "flush_failed"
 
 # ---------------------------------------------------------------------------
 # Ports — four narrow Protocols
@@ -73,15 +72,12 @@ class T3UpgradeCompactionPort(Protocol):
     """Wraps ``TurnRunner._maybe_compact_on_t3_upgrade``.
 
     The helper performs router-state inspection, circuit-breaker
-    checks, flush coordination, and the actual
+    checks, checkpoint preservation, and the actual
     ``SessionManager.compact`` call. The port wraps the public contract:
 
     - Returns one of ``"not_applicable"`` / ``"handled"`` /
-      ``"flush_failed"`` / ``"compact_failed"`` (the four ``_T3_*``
-      sentinels). The CALLER branches on the return value to decide
-      whether to fall through to generic preflight
-      (``not_applicable`` and ``flush_failed`` fall through;
-      ``handled`` and ``compact_failed`` do NOT).
+      ``"compact_failed"``. Only ``not_applicable`` falls through
+      to generic preflight.
     - All exception handling is internal; ``asyncio.CancelledError`` is
       re-raised, other exceptions are logged + swallowed.
 
@@ -119,7 +115,7 @@ class PreflightCompactionPort(Protocol):
     """Wraps ``TurnRunner._maybe_preflight_compact``.
 
     Fires ONLY when the t3-upgrade branch returned a status that allows
-    fall-through (i.e., ``not_applicable`` or ``flush_failed``).
+    fall-through (i.e., ``not_applicable``).
 
     Returns ``None``. The CALLER does NOT branch on the return; the side
     effect is implicit (DB rewrite + ``mark_compacted_this_turn`` if a
@@ -306,8 +302,7 @@ class CompactionAndHistoryStage:
 
     1. ``t3_upgrade.maybe_compact`` (unless compaction is suppressed).
     2. ``preflight.maybe_compact`` (called ONLY when compaction is enabled and
-       t3 returned
-       ``_T3_NOT_APPLICABLE`` or ``_T3_FLUSH_FAILED``).
+       t3 returned ``_T3_NOT_APPLICABLE``).
     3. ``history_loader.load`` (always called).
     4. ``request_context_prepender.prepend`` (always called; pure).
 
@@ -399,7 +394,7 @@ class CompactionAndHistoryStage:
             await self._fire_after_compact(t3_state, {"status": t3_status})
 
             # 2. Preflight compaction (fall-through cases only).
-            if t3_status in {_T3_NOT_APPLICABLE, _T3_FLUSH_FAILED}:
+            if t3_status == _T3_NOT_APPLICABLE:
                 preflight_invoked = True
                 preflight_state = CompactionState(
                     session_key=inp.session_key,

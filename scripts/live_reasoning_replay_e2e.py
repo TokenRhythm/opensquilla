@@ -442,7 +442,6 @@ def _config(
     config.memory.retrieval_mode = "fts_only"
     config.memory.auto_capture_enabled = False
     config.memory.capture_mode = "off"
-    config.memory.repair_enabled = False
     config.memory.dream.enabled = False
     config.meta_skill.enabled = False
     config.heartbeat.enabled = False

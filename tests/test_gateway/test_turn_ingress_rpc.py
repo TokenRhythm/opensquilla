@@ -120,7 +120,7 @@ async def _open_real_stack(
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "workspace"),
             attachments={"media_root": str(db_path.parent / "media")},
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
         ),
         session_manager=manager,
@@ -2081,7 +2081,7 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     hold_blocker = asyncio.Event()
     gateway_config = GatewayConfig(
         workspace_dir=str(tmp_path / "workspace"),
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
     )
     routing_state: dict[str, Any] = {"mode": "router", "revision": 7}

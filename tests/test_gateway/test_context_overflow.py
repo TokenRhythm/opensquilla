@@ -264,55 +264,8 @@ class _FailingTurnCompactionMarker:
         raise RuntimeError(f"marker unavailable for {session_key}")
 
 
-def _cfg(
-    policy: ContextOverflowPolicy,
-    budget: int = 20,
-    *,
-    flush_enabled: bool = False,
-    flush_timeout_seconds: float = 5.0,
-    flush_background_timeout_seconds: float = 60.0,
-    flush_pre_compaction: bool | None = None,
-    flush_compaction_requires_safe_receipt: bool = False,
-    flush_compaction_safety_mode: str | None = None,
-) -> GatewayConfig:
-    memory: dict[str, object] = {
-        "flush_enabled": flush_enabled,
-        "flush_timeout_seconds": flush_timeout_seconds,
-        "flush_background_timeout_seconds": flush_background_timeout_seconds,
-        "flush_compaction_requires_safe_receipt": (flush_compaction_requires_safe_receipt),
-    }
-    if flush_pre_compaction is None:
-        flush_pre_compaction = flush_enabled
-    memory["flush_pre_compaction"] = flush_pre_compaction
-    if flush_compaction_safety_mode is not None:
-        memory["flush_compaction_safety_mode"] = flush_compaction_safety_mode
-    return GatewayConfig(
-        context_overflow_policy=policy,
-        context_budget_tokens=budget,
-        memory=memory,
-    )
-
-
-def test_gateway_memory_flush_triggers_normalize_aliases() -> None:
-    string_cfg = GatewayConfig(memory={"flush_triggers": "reset, inline_overflow"})
-    list_cfg = GatewayConfig(memory={"flush_triggers": ["manual", "pre-compaction"]})
-
-    assert string_cfg.memory.flush_triggers == ["session_reset", "pre_compaction"]
-    assert list_cfg.memory.flush_triggers == ["manual", "pre_compaction"]
-
-
-@pytest.mark.parametrize(
-    "flush_triggers",
-    [
-        "bogus",
-        ["manual", "bogus"],
-    ],
-)
-def test_gateway_memory_flush_triggers_reject_unknown_values(
-    flush_triggers: object,
-) -> None:
-    with pytest.raises(ValueError, match="unknown flush trigger"):
-        GatewayConfig(memory={"flush_triggers": flush_triggers})
+def _cfg(policy: ContextOverflowPolicy, budget: int = 20) -> GatewayConfig:
+    return GatewayConfig(context_overflow_policy=policy, context_budget_tokens=budget)
 
 
 def _history(n_entries: int, chars_per_entry: int) -> list[_FakeEntry]:
@@ -465,25 +418,10 @@ async def test_auto_summarize_invokes_compaction_and_retries_once() -> None:
     assert outcome.tokens_after <= outcome.budget_tokens
 
 
-
-
 @pytest.mark.asyncio
 async def test_auto_summarize_preserves_root_and_splits_auxiliary_executions() -> None:
-    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, flush_enabled=True)
+    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, )
     sm = _ResultCompactionSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(
-        execute=AsyncMock(
-            return_value=SimpleNamespace(
-                mode="llm",
-                integrity_ok=True,
-                output_coverage_status="ok",
-                invalid_candidate_count=0,
-                candidate_missing_ids=[],
-                obligation_status="ok",
-                obligation_missing_ids=[],
-            )
-        )
-    )
     compaction_correlation = ProviderRequestCorrelation(
         session_id="durable-session-1",
         turn_id="overflow-turn-1",
@@ -497,7 +435,6 @@ async def test_auto_summarize_preserves_root_and_splits_auxiliary_executions() -
         transcript=sm._transcript,
         session_key="agent:main:s-correlation",
         session_manager=sm,
-        flush_service=flush_service,
         provider_request_correlation=compaction_correlation,
         root_operation_id=compaction_correlation.turn_id,
     )
@@ -509,13 +446,6 @@ async def test_auto_summarize_preserves_root_and_splits_auxiliary_executions() -
         is compaction_correlation
     )
     assert sm.compact_kwargs[0]["compaction_id"] == compaction_correlation.turn_id
-    flush_correlation = flush_service.execute.await_args.kwargs[
-        "provider_request_correlation"
-    ]
-    assert flush_correlation.session_id == compaction_correlation.session_id
-    assert flush_correlation.turn_id == compaction_correlation.turn_id
-    assert flush_correlation.execution_id != compaction_correlation.execution_id
-    assert flush_correlation.call_kind == "auxiliary.session_flush"
 
 
 @pytest.mark.asyncio
@@ -796,12 +726,10 @@ async def test_auto_summarize_uses_ephemeral_trim_when_marker_fails(
     assert outcome.reason == "emergency_ephemeral"
     assert outcome.refusal is None
     assert outcome.retried is True
-    assert outcome.flush_receipt is None
     assert sm.compact_calls == []
     assert [payload["status"] for _, payload in events] == ["emergency_ephemeral"]
     assert events[-1][1]["reason"] == "emergency_ephemeral"
     assert events[-1][1]["durability"] == "request_scoped"
-    assert events[-1][1]["flush_receipt_status"] == "not_required"
     assert "marker unavailable" in events[-1][1]["message"]
 
 
@@ -896,284 +824,21 @@ async def test_auto_summarize_uses_fallback_summary_when_context_cannot_be_verif
 
 
 @pytest.mark.asyncio
-async def test_auto_summarize_compacts_while_protect_flush_runs_in_background() -> None:
-    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, flush_enabled=True)
-    sm = _FakeSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(
-        execute=AsyncMock(
-            return_value=SimpleNamespace(
-                mode="llm",
-                integrity_ok=False,
-                output_coverage_status="ok",
-                missing_candidate_count=0,
-                invalid_candidate_count=0,
-                obligation_status="ok",
-            )
-        )
-    )
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-flush",
-        session_manager=sm,
-        flush_service=flush_service,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.summarized is True
-    assert outcome.retried is True
-    assert outcome.reason is None
-    assert outcome.refusal is None
-    assert outcome.flush_receipt is None
-    assert outcome.lifecycle is not None
-    assert outcome.lifecycle.flush_receipt is outcome.flush_receipt
-    assert outcome.lifecycle.refused is False
-    _assert_armed_compact_call(sm, "agent:main:s-flush", 10)
-    await asyncio.sleep(0)
-    flush_service.execute.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_auto_summarize_flush_enabled_without_trigger_skips_flush_service() -> None:
-    cfg = _cfg(
-        ContextOverflowPolicy.AUTO_SUMMARIZE,
-        budget=10,
-        flush_enabled=True,
-        flush_pre_compaction=False,
-    )
-    sm = _FakeSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(execute=AsyncMock())
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-flush-disabled-trigger",
-        session_manager=sm,
-        flush_service=flush_service,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.summarized is True
-    assert outcome.retried is True
-    assert outcome.flush_receipt is None
-    flush_service.execute.assert_not_called()
-    _assert_armed_compact_call(sm, "agent:main:s-flush-disabled-trigger", 10)
-
-
-@pytest.mark.asyncio
-async def test_auto_summarize_compacts_when_distill_fails_after_checkpoint() -> None:
-    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, flush_enabled=True)
-    sm = _CheckpointingSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(
-        execute=AsyncMock(side_effect=RuntimeError("bad json"))
-    )
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-distill-fails",
-        session_manager=sm,
-        flush_service=flush_service,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.summarized is True
-    assert outcome.retried is True
-    assert outcome.reason is None
-    assert outcome.refusal is None
-    assert outcome.flush_receipt is None
-    assert sm.calls == ["checkpoint", "compact"]
-    _assert_armed_compact_call(sm, "agent:main:s-distill-fails", 10)
-    await asyncio.sleep(0)
-    assert flush_service.execute.await_args.kwargs["message_window"] == 0
-
-
-@pytest.mark.asyncio
-async def test_auto_summarize_strict_semantic_failure_after_checkpoint_refuses() -> None:
-    cfg = _cfg(
-        ContextOverflowPolicy.AUTO_SUMMARIZE,
-        budget=10,
-        flush_enabled=True,
-        flush_compaction_requires_safe_receipt=True,
-    )
-    sm = _CheckpointingSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(
-        execute=AsyncMock(
-            return_value=SimpleNamespace(
-                mode="error",
-                result_status="archive_failed",
-                flushed_paths=[],
-                content_hash="h1",
-                indexed_chunk_count=0,
-                integrity_status="unverified",
-                output_coverage_status="unverified",
-                invalid_candidate_count=0,
-                candidate_missing_ids=[],
-                obligation_status="unverified",
-                obligation_missing_ids=[],
-            )
-        )
-    )
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-distill-fails-after-checkpoint",
-        session_manager=sm,
-        flush_service=flush_service,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.summarized is False
-    assert outcome.retried is False
-    assert outcome.reason == "compaction_flush_failed"
-    assert outcome.refusal is not None
-    assert sm.calls == ["checkpoint"]
-    assert sm.compact_calls == []
-
-
-@pytest.mark.asyncio
-async def test_auto_summarize_strict_invalid_checkpoint_receipt_refuses_compaction() -> None:
-    cfg = _cfg(
-        ContextOverflowPolicy.AUTO_SUMMARIZE,
-        budget=10,
-        flush_enabled=True,
-        flush_compaction_requires_safe_receipt=True,
-    )
+async def test_auto_summarize_invalid_checkpoint_receipt_prevents_compaction() -> None:
+    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10)
     sm = _InvalidCheckpointSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(
-        execute=AsyncMock(
-            return_value=SimpleNamespace(
-                mode="error",
-                result_status="archive_failed",
-                flushed_paths=[],
-                content_hash="h1",
-                indexed_chunk_count=0,
-                integrity_status="unverified",
-                output_coverage_status="unverified",
-                invalid_candidate_count=0,
-                candidate_missing_ids=[],
-                obligation_status="unverified",
-                obligation_missing_ids=[],
-            )
+
+    with pytest.raises(RuntimeError, match="durable transcript backup"):
+        await apply_context_overflow_policy(
+            config=cfg,
+            message="m",
+            transcript=sm._transcript,
+            session_key="agent:main:s-invalid-checkpoint-receipt",
+            session_manager=sm,
         )
-    )
 
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-invalid-checkpoint-receipt",
-        session_manager=sm,
-        flush_service=flush_service,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.summarized is False
-    assert outcome.retried is False
-    assert outcome.reason == "compaction_flush_failed"
-    assert outcome.refusal is not None
-    assert outcome.refusal["error"]["memory_safety_status"] == "unsafe"
-    assert outcome.refusal["error"]["semantic_memory_status"] == "failed"
     assert sm.calls == ["checkpoint"]
     assert sm.compact_calls == []
-
-@pytest.mark.asyncio
-async def test_auto_summarize_strict_flush_receipt_refuses_before_compaction() -> None:
-    cfg = _cfg(
-        ContextOverflowPolicy.AUTO_SUMMARIZE,
-        budget=10,
-        flush_enabled=True,
-        flush_compaction_requires_safe_receipt=True,
-    )
-    sm = _FakeSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(
-        execute=AsyncMock(
-            return_value=SimpleNamespace(
-                mode="llm",
-                integrity_status="missing_chunks",
-                indexed_chunk_count=1,
-                output_coverage_status="ok",
-                invalid_candidate_count=0,
-                candidate_missing_ids=[],
-                obligation_status="ok",
-                obligation_missing_ids=[],
-            )
-        )
-    )
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-strict-flush",
-        session_manager=sm,
-        flush_service=flush_service,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.summarized is False
-    assert outcome.retried is False
-    assert outcome.reason == "compaction_flush_failed"
-    assert outcome.refusal is not None
-    assert outcome.refusal["error"]["reason"] == "compaction_flush_failed"
-    assert outcome.refusal["error"]["memory_safety_status"] == "unsafe"
-    assert outcome.refusal["error"]["semantic_memory_status"] == "degraded"
-    assert outcome.flush_receipt is not None
-    assert outcome.lifecycle is not None
-    assert outcome.lifecycle.refused is True
-    assert outcome.lifecycle.reason == "compaction_flush_failed"
-    assert sm.compact_calls == []
-
-
-@pytest.mark.asyncio
-async def test_auto_summarize_protect_flush_receipt_degrades_without_refusal() -> None:
-    cfg = _cfg(
-        ContextOverflowPolicy.AUTO_SUMMARIZE,
-        budget=10,
-        flush_enabled=True,
-        flush_compaction_safety_mode="protect",
-    )
-    sm = _ResultCompactionSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(
-        execute=AsyncMock(
-            return_value=SimpleNamespace(
-                mode="llm",
-                integrity_status="missing_chunks",
-                indexed_chunk_count=1,
-                output_coverage_status="ok",
-                invalid_candidate_count=0,
-                candidate_missing_ids=[],
-                obligation_status="ok",
-                obligation_missing_ids=[],
-            )
-        )
-    )
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-protect-flush",
-        session_manager=sm,
-        flush_service=flush_service,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.summarized is True
-    assert outcome.retried is True
-    assert outcome.reason is None
-    assert outcome.refusal is None
-    _assert_armed_compact_call(sm, "agent:main:s-protect-flush", 10)
-    assert sm.compact_kwargs[0]["flush_receipt_status"] == "degraded_forensic"
-    assert sm.compact_kwargs[0]["trigger_reason"] == "gateway_auto_summarize"
-    await asyncio.sleep(0)
-    flush_service.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1183,7 +848,7 @@ async def test_auto_summarize_compaction_failure_uses_ephemeral_trim() -> None:
             self.compact_calls.append((session_key, budget, config))
             raise RuntimeError("preimage unavailable")
 
-    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, flush_enabled=False)
+    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, )
     sm = _FailingSessionManager(_history(6, 40))
 
     outcome = await apply_context_overflow_policy(
@@ -1201,77 +866,6 @@ async def test_auto_summarize_compaction_failure_uses_ephemeral_trim() -> None:
     assert outcome.reason == "emergency_ephemeral"
     assert outcome.truncated_entries > 0
     assert len(outcome.trimmed_history) < len(sm._transcript)
-
-
-@pytest.mark.asyncio
-async def test_auto_summarize_compacts_when_flush_service_is_missing() -> None:
-    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, flush_enabled=True)
-    sm = _FakeSessionManager(_history(6, 40))
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-missing-flush",
-        session_manager=sm,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.summarized is True
-    assert outcome.retried is True
-    assert outcome.reason is None
-    assert outcome.refusal is None
-    _assert_armed_compact_call(sm, "agent:main:s-missing-flush", 10)
-
-
-@pytest.mark.asyncio
-async def test_auto_summarize_compacts_while_slow_flush_runs_in_background() -> None:
-    cfg = _cfg(
-        ContextOverflowPolicy.AUTO_SUMMARIZE,
-        budget=10,
-        flush_enabled=True,
-        flush_timeout_seconds=0.001,
-        flush_background_timeout_seconds=42.0,
-    )
-    sm = _FakeSessionManager(_history(6, 40))
-    flush_started = asyncio.Event()
-    flush_release = asyncio.Event()
-
-    async def _slow_flush(*args: Any, **kwargs: Any) -> Any:
-        flush_started.set()
-        await flush_release.wait()
-        return SimpleNamespace(
-            mode="llm",
-            integrity_ok=True,
-            output_coverage_status="ok",
-            missing_candidate_count=0,
-            invalid_candidate_count=0,
-            obligation_status="ok",
-            timeout_seconds=kwargs.get("timeout"),
-        )
-
-    flush_service = SimpleNamespace(execute=AsyncMock(side_effect=_slow_flush))
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:s-slow-flush",
-        session_manager=sm,
-        flush_service=flush_service,
-    )
-
-    await asyncio.wait_for(flush_started.wait(), timeout=1.0)
-    assert outcome.over_budget is True
-    assert outcome.summarized is True
-    assert outcome.retried is True
-    assert outcome.reason is None
-    assert outcome.refusal is None
-    _assert_armed_compact_call(sm, "agent:main:s-slow-flush", 10)
-    assert flush_service.execute.await_args.kwargs["timeout"] == 42.0
-
-    flush_release.set()
-    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

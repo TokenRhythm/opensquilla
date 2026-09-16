@@ -1109,7 +1109,7 @@
       "lifecycle": "stable",
       "name": "sessions.contextCompact",
       "schema": "sessions/sessions-context-compact.schema.json",
-      "schemaSha256": "a9bcba2772be22bf06c9cfe11b7162afe60d77a1d7bfb2df39656bc83dc637f0"
+      "schemaSha256": "6be69d63530aa63b4ef254aa1d0d0dd9330b320c2e41c96dbf7cb9e7ce917a1f"
     },
     {
       "lifecycle": "stable",
@@ -1247,7 +1247,7 @@
       "lifecycle": "stable",
       "name": "sessions.reset",
       "schema": "sessions/sessions-reset.schema.json",
-      "schemaSha256": "43ce0304359b7c4e81fa9d5b0edabab53d468c710b6c4522be93724262ac4587"
+      "schemaSha256": "c41b3764243186609a3e31c47aa2d63f5508f2fcb7e5bb4420a3f8bda7048d1d"
     },
     {
       "lifecycle": "stable",
@@ -1466,7 +1466,7 @@
     "generatorSha256": "f781c6d8e31b336c2d2e342784935b3d327c9947cb35e56de8e44a0a83bffae6",
     "methodCount": 215,
     "schemaCount": 225,
-    "schemaTreeSha256": "ecef928334e2ed47be4fee8de109d2de74ab2cbc22d26e8691d47e6754cdbc7e"
+    "schemaTreeSha256": "840fa1aabc2cf9ec62fb500bbe7771c49a00a5f54e367cabc3865fa57fb63579"
   },
   "wireVersion": 4
 }

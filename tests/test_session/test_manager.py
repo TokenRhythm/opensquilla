@@ -1842,7 +1842,6 @@ async def test_branch_fork_transcript_copies_compaction_summaries(manager):
             removed_count=3,
             kept_count=1,
             chunk_count=2,
-            flush_receipt_status="safe",
             covered_through_id=123,
         )
     )
@@ -1878,7 +1877,6 @@ async def test_branch_fork_transcript_copies_compaction_summaries(manager):
     assert child_summaries[0].removed_count == 3
     assert child_summaries[0].kept_count == 1
     assert child_summaries[0].chunk_count == 2
-    assert child_summaries[0].flush_receipt_status == "safe"
     assert child_summaries[0].covered_through_id == 123
     assert child_summaries[0].session_id == child.session_id
     assert child_summaries[0].session_key == "agent:main:direct:u1"
@@ -2600,7 +2598,6 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
             "removed_count",
             "kept_count",
             "chunk_count",
-            "flush_receipt_status",
         }.issubset(columns)
 
         summary = await storage.get_latest_summary("legacy-session")
@@ -2619,7 +2616,6 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
         assert summary.removed_count == 0
         assert summary.kept_count == 0
         assert summary.chunk_count == 0
-        assert summary.flush_receipt_status == "unknown"
     finally:
         await storage.close()
 
@@ -3396,7 +3392,7 @@ async def test_compact_with_result_rejects_owner_rotated_at_exact_boundaries(
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(manager):
+async def test_compact_with_result_preserves_canonical_history(manager):
     await manager.create("agent:main:main")
     for i in range(20):
         await manager.append_message(
@@ -3410,13 +3406,10 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1000,
-        flush_receipt_status="unsafe",
         config=synthetic_compaction_config(),
     )
 
     assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "degraded_forensic"
     canonical_contents = [
         entry.content for entry in await manager.get_canonical_transcript("agent:main:main")
     ]
@@ -3424,110 +3417,31 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
 
 
 @pytest.mark.asyncio
-async def test_degraded_compaction_preimage_can_be_listed_for_repair(manager):
+async def test_compaction_archive_remains_readable(manager):
     await manager.create("agent:main:main")
     for i in range(20):
         await manager.append_message(
             "agent:main:main",
             "user",
-            f"repair msg {i} " + ("x" * 500),
+            f"archived msg {i} " + ("x" * 500),
             token_count=200,
         )
 
     await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1000,
-        flush_receipt_status="degraded_forensic",
         config=synthetic_compaction_config(),
     )
 
-    pending = await manager.list_degraded_compactions(agent_id="main")
-    assert len(pending) == 1
-    assert pending[0].flush_receipt_status == "degraded_forensic"
-    preimage = await manager.get_compaction_preimage(pending[0])
-    assert preimage
-    assert preimage[0].content.startswith("repair msg 0")
-    await manager.mark_compaction_repair_status(pending[0], "repaired")
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_compaction_flush_status_can_be_backfilled_by_compaction_id(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"background flush msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        compaction_id="cmp-bg-flush",
-        flush_receipt_status="degraded_forensic",
-        config=synthetic_compaction_config(),
-    )
-
-    updated = await manager.mark_compaction_flush_receipt_status(
-        "agent:main:main",
-        "cmp-bg-flush",
-        "safe",
-    )
-
-    assert updated == 1
     summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "safe"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_noop_memory_flush_compaction_status_does_not_enter_repair_queue(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"noop msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    result = await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        flush_receipt_status="noop_no_memory",
-        config=synthetic_compaction_config(),
+    assert len(summaries) == 1
+    assert summaries[0].compaction_id is not None
+    archived = await manager._storage.get_compacted_transcript_entries(
+        session_id=summaries[0].session_id,
+        compaction_id=summaries[0].compaction_id,
     )
-
-    assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "noop_no_memory"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_archive_only_memory_flush_compaction_status_does_not_enter_repair_queue(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"archive msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    result = await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        flush_receipt_status="archive_only",
-        config=synthetic_compaction_config(),
-    )
-
-    assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "archive_only"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
+    assert archived
+    assert archived[0].content.startswith("archived msg 0")
 
 
 @pytest.mark.asyncio

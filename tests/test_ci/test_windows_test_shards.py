@@ -216,7 +216,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_config_persist_corruption.py",
     "tests/test_gateway/test_config_profile_paths.py",
     "tests/test_gateway/test_cron_result_payload.py",
-    "tests/test_gateway/test_memory_repair_storage_gate.py",
     "tests/test_gateway/test_p1a_exact_abort_contract.py",
     "tests/test_gateway/test_rpc_ingress_validation.py",
     "tests/test_gateway/test_sessions_list_contract_adapter.py",

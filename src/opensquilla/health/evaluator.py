@@ -497,22 +497,6 @@ def evaluate_memory(payload: dict[str, Any]) -> list[HealthFinding]:
             )
         )
 
-    pending = _int_from_payload(payload, "pendingRepairCount", "pendingRepairs")
-    if pending:
-        findings.append(
-            HealthFinding(
-                id="memory.repair.pending",
-                severity="warn",
-                surface="memory",
-                title="Memory repair work is pending",
-                detail=f"{pending} compaction repair item(s) require attention.",
-                evidence={"pendingRepairCount": pending},
-                fix_steps=[
-                    FixStep(label="List repairs", command="opensquilla memory repair list --json"),
-                    FixStep(label="Run repairs", command="opensquilla memory repair run --json"),
-                ],
-            )
-        )
     return findings
 
 

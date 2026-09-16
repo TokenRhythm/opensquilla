@@ -382,6 +382,9 @@ class _StandaloneHarness:
     async def create_session(self, session_key: str, *, agent_id: str = "main") -> object:
         return SimpleNamespace(session_key=session_key, agent_id=agent_id)
 
+    async def get_session(self, session_key: str) -> object:
+        return SimpleNamespace(session_key=session_key, session_id="session-1", epoch=0)
+
     async def read_transcript(self, session_key: str) -> list[Any]:
         exc = self.read_errors.get(session_key)
         if exc is not None:
@@ -399,22 +402,17 @@ class _StandaloneHarness:
     ) -> str:
         return "summary"
 
-    async def flush_transcript(
+    async def checkpoint_transcript(
         self,
-        transcript: object,
         session_key: str,
+        transcript: object,
         **kwargs: object,
     ) -> object:
         return SimpleNamespace(
-            mode="llm",
-            error=None,
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
+            scope="checkpoint",
+            status="checkpoint_saved",
+            source_path="memory/.checkpoints/session-1.jsonl",
+            content_hash="synthetic-content-hash",
         )
 
     async def get_session_routing(self, session_key: str) -> dict[str, Any]:
@@ -449,10 +447,11 @@ def _standalone_context(
         tool_ctx=object(),
         slash_services=StandaloneSlashServices(
             create_session=harness.create_session,
+            get_session=harness.get_session,
             read_transcript=harness.read_transcript,
             truncate_session=harness.truncate_session,
             compact_session=harness.compact_session,
-            flush_transcript=harness.flush_transcript,
+            checkpoint_transcript=harness.checkpoint_transcript,
             get_session_routing=harness.get_session_routing,
             set_session_routing=harness.set_session_routing,
         ),

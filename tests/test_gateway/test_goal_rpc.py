@@ -155,7 +155,11 @@ async def _open_goal_rpc_stack(
     ),
 ) -> AsyncIterator[_GoalRpcStack]:
     storage = await SessionStorage.open(str(db_path))
-    manager = SessionManager(storage, inject_time_prefix=False)
+    manager = SessionManager(
+        storage,
+        inject_time_prefix=False,
+        checkpoint_workspace_dir=db_path.parent / "workspace",
+    )
 
     async def no_op_handler(_run: TaskRun) -> None:
         return None
@@ -177,7 +181,7 @@ async def _open_goal_rpc_stack(
 
     gateway_config = GatewayConfig(
         workspace_dir=str(db_path.parent / "workspace"),
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
         goal=GoalConfig(
             execution_enabled=execution_enabled,
@@ -3034,8 +3038,6 @@ async def test_non_user_run_kinds_cannot_claim_a_goal_candidate(
             "cron_turn",
             "memory",
             "memory_dream",
-            "memory_flush",
-            "memory_repair",
             "compaction",
             "session_compaction",
         ):
@@ -4258,7 +4260,7 @@ async def test_goal_artifact_loop_commits_and_settles_durable_terminal_state(
         config = GatewayConfig(
             workspace_dir=str(tmp_path / "workspace"),
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
             goal=GoalConfig(execution_enabled=True),
             squilla_router=SquillaRouterConfig(enabled=False),
@@ -4508,7 +4510,7 @@ async def test_real_turn_runner_continuation_reuses_durable_goal_context_and_com
         config = GatewayConfig(
             workspace_dir=str(tmp_path / "workspace"),
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
             goal=GoalConfig(execution_enabled=True),
             squilla_router=SquillaRouterConfig(enabled=False),
@@ -4835,7 +4837,7 @@ async def test_running_goal_edit_adopts_revision_in_same_task_without_transcript
         config = GatewayConfig(
             workspace_dir=str(tmp_path / "workspace"),
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
             goal=GoalConfig(execution_enabled=True),
             squilla_router=SquillaRouterConfig(enabled=False),

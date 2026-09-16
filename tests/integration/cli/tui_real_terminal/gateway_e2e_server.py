@@ -140,7 +140,6 @@ async def main() -> None:
     config.squilla_router.enabled = False
     config.naming.enabled = False
     config.compaction.enabled = False
-    config.memory.repair_enabled = False
     config.memory.ttl_sweep_interval_minutes = 0
     config.meta_skill.enabled = False
     config.heartbeat.enabled = False

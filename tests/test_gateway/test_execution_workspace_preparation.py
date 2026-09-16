@@ -27,7 +27,7 @@ def _managed_config(tmp_path: Path) -> GatewayConfig:
     return GatewayConfig(
         sandbox={"run_mode": "full"},
         attachments={"media_root": str(tmp_path / "media")},
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
     )
 

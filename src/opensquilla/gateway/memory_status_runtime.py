@@ -2,45 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from opensquilla.gateway.memory_health import memory_health_from_durable_ledger
 from opensquilla.session.keys import normalize_agent_id
-
-
-def _repair_summary_wire(summary: Any) -> dict[str, Any]:
-    return {
-        "summaryId": getattr(summary, "id", None),
-        "sessionKey": getattr(summary, "session_key", ""),
-        "compactionId": getattr(summary, "compaction_id", None),
-        "flushReceiptStatus": getattr(summary, "flush_receipt_status", "unknown"),
-        "removedCount": int(getattr(summary, "removed_count", 0) or 0),
-        "coveredThroughId": getattr(summary, "covered_through_id", None),
-        "createdAt": getattr(summary, "created_at", None),
-    }
-
-
-def _raw_fallback_rows_for_manager(manager: Any) -> list[dict[str, Any]]:
-    root = getattr(manager, "workspace_dir", None) or getattr(manager, "memory_dir", None)
-    if root is None:
-        return []
-    raw_root = Path(root) / "memory" / ".raw_fallbacks"
-    if not raw_root.is_dir():
-        return []
-    rows: list[dict[str, Any]] = []
-    for file_path in sorted(path for path in raw_root.glob("*.md") if path.is_file()):
-        try:
-            stat = file_path.stat()
-        except OSError:
-            continue
-        rows.append(
-            {
-                "path": (Path("memory") / ".raw_fallbacks" / file_path.name).as_posix(),
-                "sizeBytes": stat.st_size,
-            }
-        )
-    return rows
 
 
 async def read_memory_status(
@@ -141,23 +106,6 @@ async def read_memory_status(
         )
     )
     if deep:
-        repair_rows: list[Any] = []
-        repair_failures: list[dict[str, Any]] = []
-        list_degraded = getattr(session_manager, "list_degraded_compactions", None)
-        if callable(list_degraded):
-            try:
-                repair_rows = await list_degraded(agent_id=agent_id, limit=50)
-                repair_failures = [
-                    _repair_summary_wire(row)
-                    for row in repair_rows
-                    if str(getattr(row, "flush_receipt_status", ""))
-                    in {"failed_retryable", "quarantined"}
-                ]
-            except Exception:
-                repair_rows = []
-                repair_failures = []
-
-        raw_rows = _raw_fallback_rows_for_manager(manager) if manager is not None else []
         payload.update(
             {
                 "fileCount": manager_status.get("file_count"),
@@ -173,11 +121,6 @@ async def read_memory_status(
                 "embeddingModel": manager_status.get("embedding_model"),
                 "vectorWeight": manager_status.get("vector_weight"),
                 "textWeight": manager_status.get("text_weight"),
-                "pendingRepairCount": len(repair_rows),
-                "recentPreimages": [_repair_summary_wire(row) for row in repair_rows[:5]],
-                "repairFailures": repair_failures[:5],
-                "rawFallbackCount": len(raw_rows),
-                "recentRawFallbacks": raw_rows[-5:],
             }
         )
     return payload

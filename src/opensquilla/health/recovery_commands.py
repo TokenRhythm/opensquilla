@@ -14,8 +14,6 @@ CONFIG_AWARE_COMMAND_PREFIXES = (
     "opensquilla search configure",
     "opensquilla diagnostics status",
     "opensquilla memory status",
-    "opensquilla memory repair list",
-    "opensquilla memory repair run",
     "opensquilla configure ",
     "opensquilla onboard",
     "opensquilla sandbox ",

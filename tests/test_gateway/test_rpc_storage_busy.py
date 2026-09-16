@@ -14,7 +14,7 @@ async def test_dispatch_maps_storage_busy_for_non_send_handlers() -> None:
 
     async def _busy(params, ctx):
         raise StorageBusyError(
-            "claim_memory_repair_receipt",
+            "upsert_memory_durable_receipt",
             waited_ms=2075,
             retry_after_ms=250,
         )
@@ -34,6 +34,6 @@ async def test_dispatch_maps_storage_busy_for_non_send_handlers() -> None:
     assert response.error.retry_after_ms == 250
     assert response.error.accepted is None
     assert response.error.details == {
-        "operation": "claim_memory_repair_receipt",
+        "operation": "upsert_memory_durable_receipt",
         "waited_ms": 2075,
     }

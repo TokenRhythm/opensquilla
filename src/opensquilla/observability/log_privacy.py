@@ -34,11 +34,11 @@ _IDENTIFIERS = frozenset("""
     routed_tier routing_source skill meta_skill skill_name skills_invoked
     skill_catalog_ids alias_resolution_chain activation_mode input_mode run_kind
     channel channel_id transport protocol backend platform architecture version
-    format summary_format summary_source coverage_status flush_receipt_status
+    format summary_format summary_source coverage_status
     cost_source thinking_mode retrieval_mode cache_mode daily_notes_policy_reason
     vision_followup_gate_decision vision_followup_gate_source
     vision_followup_gate_model vision_followup_gate_reason vision_followup_fallback
-    session_flush_extraction_model consumer_window_source
+    consumer_window_source
     pressure_kind target_window_source capture_mode recall_mode file_role role policy
     ts at timestamp prompt_hash system_prompt_hash tool_list_hash message_hash
     cache_base_hash cache_dynamic_hash cache_legacy_hash cache_shadow_final_hash
@@ -58,7 +58,7 @@ _CONTENT_FIELDS = frozenset({
     "intent_summary", "session_intent", "user_intent", "user_message", "body",
     "api_key", "token", "secret", "password", "authorization", "exc_info", "stack_info",
     # These fields also receive str(exc) or model-produced prose at call sites.
-    "reason", "fallback_reason", "image_route_reason", "session_flush_fallback_reason",
+    "reason", "fallback_reason", "image_route_reason",
 })
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:/@+\-]{0,255}\Z")
 _LEGACY_PREFIX = re.compile(

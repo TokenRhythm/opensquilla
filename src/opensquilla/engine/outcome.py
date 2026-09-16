@@ -57,8 +57,6 @@ _BLOCKED_CODES = frozenset(
         "usage_accounting_unavailable",
         "sandbox_threshold_exceeded",
         "tool_policy_denied",
-        "compaction_refused_flush_timeout",
-        "compaction_refused_memory_flush",
         "compaction_refused_empty_summary",
         "context_unsalvageable",
     }
