@@ -2231,8 +2231,99 @@ describe('useChatHistory canonical pagination', () => {
     expect(readHistory).toHaveBeenCalledTimes(3)
   })
 
-  it('replaces stale canonical rows by retrying a rejected cursor from latest', async () => {
+  it('refreshes background history after an unrelated earlier-page failure', async () => {
+    vi.useFakeTimers()
     const { api, readHistory, historyFixture, messages } = makeHistory(false)
+    try {
+      historyFixture
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m4')],
+          hasMore: true,
+          oldestCursor: 'cursor-4',
+          newestCursor: 'cursor-4',
+          canonicalAvailable: true,
+        })
+        .mockRejectedValueOnce(new Error('offline'))
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m4'), historyMessage('m9')],
+          hasMore: true,
+          oldestCursor: 'cursor-4',
+          newestCursor: 'cursor-9',
+          canonicalAvailable: true,
+        })
+
+      await api.loadHistory()
+      await api.loadEarlierHistory()
+      expect(api.historyState.value.loadEarlierError).toBe(true)
+
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(60)
+
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(readHistory).toHaveBeenLastCalledWith('latest', null, expect.any(Object))
+      expect(messages.value.map(message => message.messageId)).toEqual(['m4', 'm9'])
+      expect(api.historyState.value.loadEarlierError).toBe(false)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['invalid', 'stale'] as const)(
+    'keeps a %s cursor failure explicit until latest recovery replaces the window',
+    async reason => {
+      const { api, readHistory, historyFixture, messages } = makeHistory(false)
+      const cursorError = new SessionReadHistoryCursorError(reason, 'cursor rejected')
+      historyFixture
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m4')],
+          hasMore: true,
+          oldestCursor: 'cursor-4',
+          newestCursor: 'cursor-4',
+          canonicalAvailable: true,
+        })
+        .mockRejectedValueOnce(cursorError)
+        .mockResolvedValueOnce({
+          messages: [historyMessage('m9')],
+          hasMore: false,
+          oldestCursor: 'cursor-9',
+          newestCursor: 'cursor-9',
+          canonicalAvailable: true,
+        })
+
+      await api.loadHistory()
+      await api.loadEarlierHistory()
+      await expect(api.loadHistory()).resolves.toMatchObject({ ok: false, error: cursorError })
+      await expect(api.reconcileHistory()).resolves.toMatchObject({ ok: false, error: cursorError })
+      expect(readHistory).toHaveBeenCalledTimes(2)
+      expect(messages.value.map(message => message.messageId)).toEqual(['m4'])
+      await api.retryHistory()
+
+      expect(readHistory).toHaveBeenNthCalledWith(
+        2,
+        'before',
+        'cursor-4',
+        expect.any(Object),
+      )
+      expect(readHistory).toHaveBeenNthCalledWith(3, 'latest', null, expect.any(Object))
+      expect(messages.value.map(message => message.messageId)).toEqual(['m9'])
+      expect(api.historyState.value).toMatchObject({
+        oldestCursor: 'cursor-9',
+        newestCursor: 'cursor-9',
+        loadEarlierError: false,
+        recoveryError: false,
+      })
+      api.cleanup()
+    },
+  )
+
+  it('shares a failed latest recovery and retries it without returning to the rejected cursor', async () => {
+    const { api, readHistory, historyFixture, messages } = makeHistory(false)
+    const recoveryError = new Error('connection unavailable')
+    let rejectRecovery!: (error: Error) => void
+    const recovery = new Promise<SessionReadHistoryPageFixture>((_resolve, reject) => {
+      rejectRecovery = reject
+    })
     historyFixture
       .mockResolvedValueOnce({
         messages: [historyMessage('m4')],
@@ -2241,9 +2332,8 @@ describe('useChatHistory canonical pagination', () => {
         newestCursor: 'cursor-4',
         canonicalAvailable: true,
       })
-      .mockRejectedValueOnce(
-        new SessionReadHistoryCursorError('stale', 'cursor rejected'),
-      )
+      .mockRejectedValueOnce(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      .mockReturnValueOnce(recovery)
       .mockResolvedValueOnce({
         messages: [historyMessage('m9')],
         hasMore: false,
@@ -2254,15 +2344,23 @@ describe('useChatHistory canonical pagination', () => {
 
     await api.loadHistory()
     await api.loadEarlierHistory()
-    await api.retryHistory()
+    const retry = api.retryHistory()
+    const joined = api.loadHistory()
+    const reconciliation = api.reconcileHistory()
+    expect(joined).toBe(retry)
+    rejectRecovery(recoveryError)
 
-    expect(readHistory).toHaveBeenNthCalledWith(
-      2,
-      'before',
-      'cursor-4',
-      expect.any(Object),
-    )
-    expect(readHistory).toHaveBeenNthCalledWith(3, 'latest', null, expect.any(Object))
+    for (const pending of [retry, joined, reconciliation]) {
+      await expect(pending).resolves.toMatchObject({ ok: false, error: recoveryError })
+    }
+    expect(readHistory).toHaveBeenCalledTimes(3)
+    expect(messages.value.map(message => message.messageId)).toEqual(['m4'])
+    expect(api.historyState.value.recoveryError).toBe(true)
+
+    await expect(api.retryHistory()).resolves.toMatchObject({ ok: true })
+    expect(readHistory.mock.calls.map(call => call[0])).toEqual([
+      'latest', 'before', 'latest', 'latest',
+    ])
     expect(messages.value.map(message => message.messageId)).toEqual(['m9'])
     expect(api.historyState.value).toMatchObject({
       oldestCursor: 'cursor-9',
@@ -2270,6 +2368,7 @@ describe('useChatHistory canonical pagination', () => {
       loadEarlierError: false,
       recoveryError: false,
     })
+    api.cleanup()
   })
 
   it('surfaces and retries an initial history request failure', async () => {

@@ -724,6 +724,7 @@ type FailedHistoryRequest =
   | {
       kind: 'latest'
       key: string
+      error: unknown
     }
 
 const MAX_FORWARD_BRIDGE_PAGES = 2
@@ -794,7 +795,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       historySyncTimer = null
       const timerNonReconnecting = historySyncTimerNonReconnecting
       historySyncTimerNonReconnecting = false
-      if (historyState.value.loading || failedHistoryRequest) {
+      if (historyState.value.loading || failedHistoryRequest?.kind === 'latest') {
         historySyncPending = true
         historySyncPendingNonReconnecting ||= timerNonReconnecting
         return
@@ -1459,7 +1460,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
         failedHistoryRequest = cursorRequiresLatestReload || params.replaceCanonicalWindow
-          ? { kind: 'latest', key }
+          ? { kind: 'latest', key, error }
           : bridgeAttempted
             ? { kind: 'bridge', key }
             : {
@@ -1504,7 +1505,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     ) {
       historySyncPending = true
       historySyncPendingNonReconnecting ||= Boolean(params.nonReconnecting)
-      return
+      // Bootstrap and live reconciliation treat an absent result as success.
+      // Keep their recovery fence closed until the replacement page succeeds.
+      return Promise.resolve({ ok: false, error: failedHistoryRequest.error })
     }
     if (activeHistory) {
       if (
