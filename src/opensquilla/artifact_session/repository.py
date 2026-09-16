@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import secrets
 import time
@@ -568,6 +569,7 @@ class ArtifactSessionRepository:
         lease_id: str | None = None,
         payload: dict[str, Any] | None = None,
         created_at: int | None = None,
+        event_id: str | None = None,
     ) -> None:
         await conn.execute(
             """
@@ -578,7 +580,7 @@ class ArtifactSessionRepository:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                self._id_factory("audit"),
+                event_id if event_id is not None else self._id_factory("audit"),
                 document_id,
                 event_type,
                 actor.kind.value,
@@ -827,6 +829,7 @@ class ArtifactSessionRepository:
         deliverable: ArtifactBlobRef,
         actor: Actor,
         working_source: dict[str, str] | None = None,
+        publication_id: str = "",
     ) -> tuple[CommitResult, DocumentSourceBinding, bool]:
         """Atomically adopt and bind one public generated deliverable.
 
@@ -980,6 +983,20 @@ class ArtifactSessionRepository:
                     conn, commit=commit, session_key=session_key, session_id=session_id,
                     working_source=working_source,
                 )
+                if publication_id and not rows:
+                    # The initial snapshot is already this occurrence's version.
+                    # Record its receipt before another publisher can advance the
+                    # head, so delayed adoption cannot reapply the old snapshot.
+                    identity = f"{commit.document.document_id}\0{publication_id}".encode()
+                    await self._append_audit(
+                        conn,
+                        document_id=commit.document.document_id,
+                        event_type="document.source_published",
+                        event_id=f"working-publish:{hashlib.sha256(identity).hexdigest()}",
+                        actor=actor,
+                        revision_id=commit.revision.revision_id,
+                        payload={"artifact_id": deliverable.artifact_id},
+                    )
             return commit, binding, True
 
     async def retire_legacy_html_state(self) -> None:
