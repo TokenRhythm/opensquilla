@@ -132,9 +132,7 @@ async def test_cron_creator_authority_survives_persistence_without_widening_owne
         creator_is_owner or expected_persisted_host_execute
     )
     assert bool(envelope.metadata.get("cron_trusted_owner")) is creator_is_owner
-    assert bool(envelope.metadata.get("cron_trusted_host")) is (
-        expected_persisted_host_execute
-    )
+    assert bool(envelope.metadata.get("cron_trusted_host")) is (expected_persisted_host_execute)
     assert bool(envelope.metadata.get(PRINCIPAL_HOST_EXECUTE_METADATA_KEY)) is (
         expected_persisted_host_execute
     )
@@ -322,6 +320,153 @@ async def test_ops_add_at_rejects_naive_iso(tmp_path: Path) -> None:
                 schedule_kind=ScheduleKind.AT,
                 schedule_value="2026-05-15T09:00:00",
             )
+    finally:
+        await store.close()
+
+
+async def test_ops_add_at_rejects_past_timestamp(tmp_path: Path) -> None:
+    """A one-time ``at`` in the past would fire immediately then delete itself;
+    reject it at creation time instead (issue #1516)."""
+    store, ops = await _open_ops(tmp_path)
+    try:
+        past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        with pytest.raises(ValueError, match="in the past"):
+            await ops.add(
+                name="stale",
+                handler_key="agent_run",
+                payload=make_agent_turn_payload("ping"),
+                session_target=SessionTarget.ISOLATED,
+                schedule_kind=ScheduleKind.AT,
+                schedule_value=past,
+            )
+        # Nothing should have been persisted.
+        assert await store.list_active() == []
+    finally:
+        await store.close()
+
+
+async def test_ops_update_at_rejects_past_timestamp(tmp_path: Path) -> None:
+    """Repointing a job to a past one-time ``at`` is rejected as well."""
+    store, ops = await _open_ops(tmp_path)
+    try:
+        future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        job = await ops.add(
+            name="once",
+            handler_key="agent_run",
+            payload=make_agent_turn_payload("ping"),
+            session_target=SessionTarget.ISOLATED,
+            schedule_kind=ScheduleKind.AT,
+            schedule_value=future,
+        )
+        before = await store.get(job.id)
+        past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        with pytest.raises(ValueError, match="in the past"):
+            await ops.update(
+                job.id,
+                schedule_kind=ScheduleKind.AT,
+                schedule_value=past,
+            )
+        assert await store.get(job.id) == before
+    finally:
+        await store.close()
+
+
+async def test_ops_at_idempotent_retries_after_due_time_return_existing_job(tmp_path: Path) -> None:
+    store, _ = await _open_ops(tmp_path)
+    now = datetime(2035, 1, 1, 12, tzinfo=UTC)
+    ops = SchedulerOps(store, clock=lambda: now)
+    at = (now + timedelta(seconds=1)).isoformat()
+    try:
+        async def add_once(key: str = "same-request"):
+            return await ops.add(
+                name="once",
+                payload=make_agent_turn_payload("synthetic reminder"),
+                schedule_kind=ScheduleKind.AT,
+                schedule_value=at,
+                idempotency_key=key,
+            )
+
+        original = await add_once()
+        now += timedelta(seconds=2)
+        retries = await asyncio.gather(*(add_once() for _ in range(8)))
+
+        assert all(job.id == original.id and job.deduplicated for job in retries)
+        with pytest.raises(ValueError, match="in the past"):
+            await add_once("different-request")
+        assert len(await store.list_active()) == 1
+    finally:
+        await store.close()
+
+
+async def test_ops_at_checks_time_after_waiting_for_creation_lock(tmp_path: Path) -> None:
+    store, _ = await _open_ops(tmp_path)
+    now = datetime(2035, 1, 1, 12, tzinfo=UTC)
+    started = asyncio.Event()
+
+    def clock() -> datetime:
+        started.set()
+        return now
+
+    ops = SchedulerOps(store, clock=clock)
+    try:
+        async with store._idempotent_create_lock:
+            pending = asyncio.create_task(ops.add(
+                name="once",
+                payload=make_agent_turn_payload("synthetic reminder"),
+                schedule_kind=ScheduleKind.AT,
+                schedule_value=(now + timedelta(seconds=1)).isoformat(),
+                idempotency_key="new-request",
+            ))
+            await started.wait()
+            now += timedelta(seconds=2)
+        with pytest.raises(ValueError, match="in the past"):
+            await pending
+        assert await store.list_active() == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "at", ["2035-01-01T12:00:00Z", "2035-01-01T20:00:00+08:00"],
+)
+async def test_ops_at_accepts_the_current_instant_with_either_offset(
+    tmp_path: Path, at: str,
+) -> None:
+    store, _ = await _open_ops(tmp_path)
+    now = datetime(2035, 1, 1, 12, tzinfo=UTC)
+    ops = SchedulerOps(store, clock=lambda: now)
+    try:
+        job = await ops.add(
+            name="once",
+            payload=make_agent_turn_payload("synthetic reminder"),
+            schedule_kind=ScheduleKind.AT,
+            schedule_value=at,
+        )
+        assert job.next_run_at == now
+    finally:
+        await store.close()
+
+
+async def test_ops_overdue_at_metadata_update_preserves_schedule(tmp_path: Path) -> None:
+    store, _ = await _open_ops(tmp_path)
+    now = datetime(2035, 1, 1, 12, tzinfo=UTC)
+    ops = SchedulerOps(store, clock=lambda: now)
+    try:
+        job = await ops.add(
+            name="once",
+            payload=make_agent_turn_payload("synthetic reminder"),
+            schedule_kind=ScheduleKind.AT,
+            schedule_value="2035-01-01T21:00:00+08:00",
+        )
+        assert job.next_run_at == now + timedelta(hours=1)
+        now += timedelta(hours=2)
+
+        changed = await ops.update(job.id, name="renamed", enabled=False)
+
+        assert changed is not None
+        assert changed.name == "renamed"
+        assert changed.next_run_at == job.next_run_at
+        assert changed.enabled is False
     finally:
         await store.close()
 

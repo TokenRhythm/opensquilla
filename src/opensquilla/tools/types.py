@@ -296,6 +296,10 @@ class ToolContext:
     # Frozen admission revision prevents old turns from changing newer holds.
     router_control_routing_revision: int | None = None
 
+    # Trusted install receipts are shared with built-in tools only for this turn.
+    # Appended to preserve positional compatibility; never serialize this state.
+    skill_install_turn: Any | None = field(default=None, repr=False)
+
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
     """Return whether ``ctx`` carries authority for a top-level Goal turn.

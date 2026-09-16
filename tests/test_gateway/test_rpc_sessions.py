@@ -6274,16 +6274,38 @@ class TestSessionsAbort:
         dispatcher,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        from opensquilla.application import turn_cancellation
+
         session_key = "agent:main:abort-slow-lookup"
+        owner_started = asyncio.Event()
         owner_release = asyncio.Event()
+        lookup_started = asyncio.Event()
         lookup_cancelled = asyncio.Event()
+        real_time = rpc_sessions.time
+        real_wait = asyncio.wait
+        wait_budgets: list[tuple[str, float | None]] = []
+
+        class ControlledAbortClock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_time, name)
+
+        clock = ControlledAbortClock()
 
         async def compaction_owner() -> None:
+            owner_started.set()
             await owner_release.wait()
 
         class SlowStorage:
             async def get_session(self, key: str):
                 assert key == session_key
+                # Cancellation must already be requested before storage blocks.
+                assert owner.cancelling() > 0
+                lookup_started.set()
                 try:
                     await asyncio.Event().wait()
                 finally:
@@ -6292,35 +6314,58 @@ class TestSessionsAbort:
         class Manager:
             storage = SlowStorage()
 
+        async def observe_wait(tasks, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+            operation = "compaction_drain" if owner in tasks else "session_lookup"
+            wait_budgets.append((operation, timeout))
+            if operation == "session_lookup":
+                await asyncio.wait_for(lookup_started.wait(), timeout=1.0)
+            result = await real_wait(tasks, timeout=timeout, return_when=return_when)
+            if operation == "session_lookup":
+                # Account for the lookup's budget without counting host
+                # scheduling delays against the shared Stop deadline.
+                clock.now = 0.01
+            return result
+
         monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
         monkeypatch.setattr(rpc_sessions, "_ABORT_SESSION_LOOKUP_SECONDS", 0.01)
+        monkeypatch.setattr(rpc_sessions, "time", clock)
+        observed_asyncio = SimpleNamespace(**(vars(asyncio) | {"wait": observe_wait}))
+        monkeypatch.setattr(rpc_sessions, "asyncio", observed_asyncio)
+        monkeypatch.setattr(turn_cancellation, "asyncio", observed_asyncio)
         owner = asyncio.create_task(compaction_owner())
+        await asyncio.wait_for(owner_started.wait(), timeout=1.0)
         cache_break_monitor.register_active_compaction(
             session_key,
             "cmp-slow-lookup",
             owner,
         )
-        started_at = rpc_sessions.time.monotonic()
         try:
-            res = await dispatcher.dispatch(
-                "r1",
-                "sessions.abort",
-                {"key": session_key},
-                make_ctx(session_manager=Manager()),
+            # This outer watchdog catches an unbounded await; the actual
+            # product timeouts and cancellation order are asserted below.
+            res = await asyncio.wait_for(
+                dispatcher.dispatch(
+                    "r1",
+                    "sessions.abort",
+                    {"key": session_key},
+                    make_ctx(session_manager=Manager()),
+                ),
+                timeout=1.0,
             )
-            elapsed = rpc_sessions.time.monotonic() - started_at
-            await asyncio.gather(owner, return_exceptions=True)
-            await asyncio.wait_for(lookup_cancelled.wait(), timeout=0.2)
+            await asyncio.wait_for(asyncio.gather(owner, return_exceptions=True), timeout=1.0)
+            await asyncio.wait_for(lookup_cancelled.wait(), timeout=1.0)
         finally:
             if not owner.done():
                 owner.cancel()
-                await asyncio.gather(owner, return_exceptions=True)
+                await asyncio.wait_for(asyncio.gather(owner, return_exceptions=True), timeout=1.0)
 
         assert res.ok is True
         assert res.payload["aborted"] is True
         assert res.payload["cancelled_compactions"] == 1
         assert owner.cancelled() is True
-        assert elapsed < 0.15
+        assert [operation for operation, _ in wait_budgets] == [
+            "session_lookup", "compaction_drain",
+        ]
+        assert [timeout for _, timeout in wait_budgets] == pytest.approx([0.01, 0.04])
 
     @pytest.mark.ci_serial
     @pytest.mark.asyncio

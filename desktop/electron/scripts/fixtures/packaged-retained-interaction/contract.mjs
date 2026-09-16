@@ -102,6 +102,24 @@ export async function assertPreservedInputs(plan) {
   }
 }
 
+export async function assertNoExistingDesktop(runFile, windowsDirectory = process.env.SystemRoot) {
+  // Only the image name is needed here. Avoid loading PowerShell and CIM for
+  // this conservative guard against joining an existing single-instance owner.
+  assert.ok(typeof windowsDirectory === 'string' && isAbsolute(windowsDirectory), 'Windows process census requires an absolute SystemRoot')
+  const { stdout, stderr } = await runFile(join(windowsDirectory, 'System32', 'tasklist.exe'), ['/FO', 'CSV', '/NH'], { windowsHide: true, timeout: 15_000 })
+  assert.equal((stderr || '').trim(), '', 'Windows process census returned unexpected stderr')
+  assert.ok(typeof stdout === 'string' && stdout.trim(), 'Windows process census returned no CSV rows')
+  const names = stdout.trim().split(/\r?\n/).map(row => {
+    // Parse complete quoted CSV rows, including commas and escaped quotes.
+    // Unfiltered tasklist must list at least one process; INFO/error text or a
+    // partially malformed response must never stand in for an empty census.
+    const fields = row.match(/^"((?:[^"\r\n]|"")*)","([0-9]+)","((?:[^"\r\n]|"")*)","((?:[^"\r\n]|"")*)","((?:[^"\r\n]|"")*)"$/)
+    assert.ok(fields && fields[1], 'Windows process census returned malformed CSV')
+    return fields[1].replaceAll('""', '"').toLowerCase()
+  })
+  assert.equal(names.includes('opensquilla.exe'), false, 'Close existing Desktop instances before this isolated probe')
+}
+
 export function auditMessages(auditId) {
   return {
     first: `Retained profile first send ${auditId}`,

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
 
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_cron import (
@@ -148,5 +152,103 @@ async def test_update_enabled_false_applies_sibling_fields(tmp_path: Path) -> No
         assert after is not None
         assert after.status == JobStatus.PAUSED
         assert payload_text(after.payload, after.session_target) == "new prompt"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "enabled"),
+    [
+        (JobStatus.PENDING, False),
+        (JobStatus.PAUSED, True),
+        (JobStatus.DISABLED, True),
+        (JobStatus.FAILED, True),
+    ],
+)
+@pytest.mark.parametrize(
+    ("patch", "error"),
+    [
+        ({"schedule": {"kind": "at", "at": "2035-01-01T19:59:59+08:00"}}, "in the past"),
+        ({"tz": "Invalid/Timezone"}, "Unknown timezone"),
+    ],
+    ids=["past-at", "invalid-timezone"],
+)
+async def test_update_invalid_patch_does_not_change_enabled_or_persist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: JobStatus,
+    enabled: bool,
+    patch: dict,
+    error: str,
+) -> None:
+    now = datetime(2035, 1, 1, 12, tzinfo=UTC)
+    store = JobStore(str(tmp_path / "cron.db"))
+    await store.open()
+    engine = SchedulerEngine(store, clock=lambda: now)
+    try:
+        job = await engine.add_job(
+            name="original",
+            schedule_kind=ScheduleKind.AT,
+            schedule_value=(now + timedelta(hours=1)).isoformat(),
+            payload=make_agent_turn_payload("original reminder"),
+        )
+        job.status = status
+        job.enabled = not enabled
+        job.consecutive_errors = 2
+        job.backoff_until = now + timedelta(minutes=1)
+        await store.save(job)
+        before = await store.get(job.id)
+        save = AsyncMock(wraps=store.save)
+        monkeypatch.setattr(store, "save", save)
+
+        with pytest.raises(ValueError, match=error):
+            await _handle_cron_update(
+                {"id": job.id, "enabled": enabled, "name": "changed", **patch},
+                _ctx(engine),
+            )
+
+        assert await store.get(job.id) == before
+        save.assert_not_awaited()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_update_enabled_and_schedule_persist_together_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    now = datetime(2035, 1, 1, 12, tzinfo=UTC)
+    store = JobStore(str(tmp_path / "cron.db"))
+    await store.open()
+    engine = SchedulerEngine(store, clock=lambda: now)
+    try:
+        job = await engine.add_job(
+            name="original",
+            enabled=not enabled,
+            schedule_kind=ScheduleKind.AT,
+            schedule_value=(now + timedelta(hours=1)).isoformat(),
+            payload=make_agent_turn_payload("original reminder"),
+        )
+        save = AsyncMock(wraps=store.save)
+        monkeypatch.setattr(store, "save", save)
+        new_at = (now + timedelta(hours=2)).isoformat()
+
+        await _handle_cron_update(
+            {
+                "id": job.id,
+                "enabled": enabled,
+                "text": "updated reminder",
+                "schedule": {"kind": "at", "at": new_at},
+            },
+            _ctx(engine),
+        )
+
+        after = await store.get(job.id)
+        assert after is not None
+        assert after.status == (JobStatus.PENDING if enabled else JobStatus.PAUSED)
+        assert after.enabled is enabled
+        assert after.next_run_at == now + timedelta(hours=2)
+        assert payload_text(after.payload, after.session_target) == "updated reminder"
+        save.assert_awaited_once()
     finally:
         await store.close()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
@@ -620,9 +620,13 @@ class JobStore:
         await self._execute_save(job)
         await self._db().commit()
 
-    async def create_or_get(self, job: CronJob) -> CronJob:
-        """Atomically create an idempotent job or return the existing row."""
+    async def create_or_get(
+        self, job: CronJob, *, validate_new: Callable[[], None] | None = None,
+    ) -> CronJob:
+        """Return an existing row, or validate and create under the idempotency lock."""
         if not job.idempotency_key:
+            if validate_new is not None:
+                validate_new()
             await self.save(job)
             return job
 
@@ -631,6 +635,8 @@ class JobStore:
             if existing is not None:
                 existing.deduplicated = True
                 return existing
+            if validate_new is not None:
+                validate_new()
             try:
                 await self._execute_save(job)
                 await self._db().commit()

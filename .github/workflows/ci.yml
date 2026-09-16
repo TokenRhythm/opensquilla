@@ -128,7 +128,7 @@ jobs:
     name: Plan CI suites
     needs: queue-attestation
     if: >-
-      ${{ always()
+      ${{ !cancelled()
           && (github.event_name != 'merge_group'
               || (vars.CI_OPTIMIZATION_MODE || 'enforce') != 'enforce'
               || needs.queue-attestation.result != 'success'
@@ -248,6 +248,9 @@ jobs:
                   handle.write(f"{key}={value}\n")
           PY
 
+      - name: Report test timing coverage
+        run: python3 .github/scripts/windows_test_shards.py report --github-summary "${GITHUB_STEP_SUMMARY}"
+
       - name: Summarize canonical CI plan
         env:
           REQUIRED_SUITES: ${{ steps.plan.outputs.required_suites }}
@@ -292,7 +295,7 @@ jobs:
   workflow-lint:
     name: Validate GitHub Actions workflows
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'workflow-lint') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'workflow-lint') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -315,7 +318,7 @@ jobs:
     needs: plan-ci
     # This job owns the generated package input. Source-only Python tests stay
     # parallel; only packaging/browser/desktop consumers wait for this artifact.
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-artifact') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-artifact') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -378,7 +381,7 @@ jobs:
     name: Frontend tests and package validation
     needs: [plan-ci, frontend-artifact]
     if: >-
-      ${{ always()
+      ${{ !cancelled()
           && needs.plan-ci.result == 'success'
           && needs.frontend-artifact.result == 'success'
           && (contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation')
@@ -390,7 +393,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download verified frontend artifact
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-required-artifact
         with:
           name: opensquilla-webui-dist
           path: opensquilla-webui/dist/
@@ -456,7 +459,7 @@ jobs:
           name: gateway-contract-hashes-linux
           path: ${{ runner.temp }}/gateway-contract-hashes.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 31
           overwrite: true
 
       - name: Run frontend type checks
@@ -519,7 +522,7 @@ jobs:
   gateway-contract-verification-linux:
     name: Complete Gateway Contract verification (Linux)
     needs: [plan-ci]
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -567,14 +570,14 @@ jobs:
           name: gateway-contract-verification-hashes-linux
           path: ${{ runner.temp }}/gateway-contract-verification-hashes.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 31
           overwrite: true
 
   gateway-contract-windows:
     name: Gateway Contract determinism (Windows)
     needs: [plan-ci, frontend-check, gateway-contract-verification-linux]
     if: >-
-      ${{ always()
+      ${{ !cancelled()
           && needs.plan-ci.result == 'success'
           && needs.frontend-check.result == 'success'
           && needs.gateway-contract-verification-linux.result == 'success'
@@ -639,7 +642,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Download Linux Gateway Contract hash manifest
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-required-artifact
         with:
           name: gateway-contract-hashes-linux
           path: ${{ runner.temp }}/gateway-contract-hashes-linux
@@ -655,7 +658,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Download Linux verification hash manifest
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-required-artifact
         with:
           name: gateway-contract-verification-hashes-linux
           path: ${{ runner.temp }}/gateway-contract-verification-hashes-linux
@@ -671,7 +674,7 @@ jobs:
   webui-chat-recovery:
     name: WebUI chat recovery
     needs: [plan-ci, frontend-artifact]
-    if: ${{ always() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-chat-recovery') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-chat-recovery') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -683,7 +686,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download verified frontend artifact
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-required-artifact
         with:
           name: opensquilla-webui-dist
           path: opensquilla-webui/dist/
@@ -762,6 +765,8 @@ jobs:
           --workers=2
 
       - name: Upload chat recovery traces
+        id: chat-traces
+        continue-on-error: true
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
@@ -770,10 +775,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      - name: Warn if chat-traces upload failed
+        if: ${{ !cancelled() && steps.chat-traces.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
   tui-check:
     name: OpenTUI package tests
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'tui') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'tui') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -819,7 +829,7 @@ jobs:
   desktop-check:
     name: Desktop Electron unit tests
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-static') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-static') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -903,11 +913,12 @@ jobs:
           node scripts/test-telemetry-growth-lifecycle.mjs
           node scripts/test-telemetry-protocol.mjs
           node ../../.github/scripts/verify-sandbox-package.mjs --source
+          node --test ../../.github/scripts/test-prepare-electron.mjs
 
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && (contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-targeted') || contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full')) }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && (contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-targeted') || contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -1007,7 +1018,7 @@ jobs:
   ubuntu-full:
     name: Full offline tests (ubuntu-latest, ${{ matrix.shard }})
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -1086,7 +1097,17 @@ jobs:
             "${maxfail_args[@]}" \
             2>&1 | tee "${CI_REPORT_DIR}/pytest.log"
 
+      - name: Check local ubuntu-report files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "${CI_REPORT_DIR}/first-failure.txt"
+          test -s "${CI_REPORT_DIR}/junit.xml"
+          test -s "${CI_REPORT_DIR}/pytest.log"
+
       - name: Upload Ubuntu full shard report
+        id: ubuntu-report
+        continue-on-error: true
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
@@ -1095,10 +1116,15 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Warn if ubuntu-report upload failed
+        if: ${{ !cancelled() && steps.ubuntu-report.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
   windows-full:
     name: Windows high-risk (${{ matrix.shard }})
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-high-risk') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-high-risk') }}
     runs-on: windows-latest
     timeout-minutes: 60
     strategy:
@@ -1312,7 +1338,17 @@ jobs:
             }
           }
 
+      - name: Check local windows-report files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "${CI_REPORT_DIR}/first-failure.txt"
+          test -s "${CI_REPORT_DIR}/junit.xml"
+          test -s "${CI_REPORT_DIR}/pytest.log"
+
       - name: Upload Windows shard report
+        id: windows-report
+        continue-on-error: true
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
@@ -1321,10 +1357,15 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Warn if windows-report upload failed
+        if: ${{ !cancelled() && steps.windows-report.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
   macos-recovery:
     name: macOS profile recovery and native no-replace (3.12)
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'macos-recovery') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'macos-recovery') }}
     runs-on: macos-latest
     timeout-minutes: 30
 
@@ -1400,7 +1441,17 @@ jobs:
           printf 'pytest_exit_code=%s\n' "${status}" > "${CI_REPORT_DIR}/first-failure.txt"
           exit "${status}"
 
+      - name: Check local macos-report files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "${CI_REPORT_DIR}/first-failure.txt"
+          test -s "${CI_REPORT_DIR}/junit.xml"
+          test -s "${CI_REPORT_DIR}/pytest.log"
+
       - name: Upload macOS recovery report
+        id: macos-report
+        continue-on-error: true
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
@@ -1409,13 +1460,18 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Warn if macos-report upload failed
+        if: ${{ !cancelled() && steps.macos-report.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
   desktop-recovery-e2e:
     # Every matrix cell gets a fresh hosted runner.  Keep ownership and the
     # heavier workbench cell separate on both Windows and macOS so process,
     # native-focus, and local-socket state cannot leak across those domains.
     name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
     needs: [plan-ci, frontend-artifact]
-    if: ${{ always() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-recovery-e2e') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-recovery-e2e') }}
     strategy:
       fail-fast: false
       matrix:
@@ -1428,10 +1484,9 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}
       OPENSQUILLA_TURN_CALL_LOG: "0"
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
-      # Electron's postinstall download is otherwise repeated on every fresh
-      # hosted runner. Keep it beside the Playwright cache so a cold macOS
-      # worker cannot spend the case watchdog budget downloading the binary.
-      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+      # Electron 42 install.js reads electron_config_cache. Prepare its binary
+      # before any case starts so cold downloads do not consume E2E timeouts.
+      electron_config_cache: ${{ github.workspace }}/.cache/electron
       CI_E2E_SHARD: ${{ matrix.shard }}
       # Keep merge-critical workbench coverage deterministic and bounded.
       # Scheduled/manual runs retain the wider geometry/rearm stress cycles.
@@ -1461,7 +1516,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download verified frontend artifact
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-required-artifact
         with:
           name: opensquilla-webui-dist
           path: opensquilla-webui/dist/
@@ -1497,7 +1552,7 @@ jobs:
         id: electron-cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.ELECTRON_CACHE }}
+          path: ${{ env.electron_config_cache }}
           key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
 
       - name: Install Python dependencies
@@ -1509,11 +1564,15 @@ jobs:
         shell: bash
         run: npm ci
 
+      - name: Prepare and verify pinned Electron binary
+        shell: bash
+        run: node .github/scripts/prepare-electron.mjs desktop/electron
+
       - name: Seed Electron binary cache from nightly main
         if: ${{ github.event_name == 'schedule' && steps.electron-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.ELECTRON_CACHE }}
+          path: ${{ env.electron_config_cache }}
           key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
 
       - name: Install WebUI recovery dependencies
@@ -1975,7 +2034,17 @@ jobs:
           uv run pytest tests/test_ci/test_windows_signed_update_audit.py -q \
             --junitxml="${CI_REPORT_DIR}/native-write-view-contracts.xml"
 
+      - name: Check local desktop-summary files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "${CI_REPORT_DIR}/environment.txt"
+          test -s "${CI_REPORT_DIR}/first-failure.txt"
+          test -s "${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
+
       - name: Upload Desktop recovery summary
+        id: desktop-summary
+        continue-on-error: true
         if: ${{ success() }}
         uses: actions/upload-artifact@v4
         with:
@@ -1991,7 +2060,14 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Warn if desktop-summary upload failed
+        if: ${{ !cancelled() && steps.desktop-summary.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
       - name: Upload Desktop recovery failure report
+        id: desktop-failure
+        continue-on-error: true
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
@@ -2000,10 +2076,15 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Warn if desktop-failure upload failed
+        if: ${{ !cancelled() && steps.desktop-failure.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
   skill-hub:
     name: skill-hub-contract (${{ matrix.os }})
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'skill-hub') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'skill-hub') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -2059,6 +2140,7 @@ jobs:
             tests/test_skills_hub_doctor.py \
             tests/test_skills_hash_consumers.py \
             tests/test_skill_install_source.py \
+            tests/test_engine/test_skill_install_turn.py \
             tests/test_engine/test_skill_install_settlement.py \
             tests/test_gateway/test_skill_install_status.py \
             tests/test_skills/test_hub_install_operations.py \
@@ -2088,7 +2170,7 @@ jobs:
   release-packaging:
     name: Release packaging contracts
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'release-packaging') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'release-packaging') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -2138,7 +2220,7 @@ jobs:
   readme-locale-check:
     name: README locale parity
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'readme-locale') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'readme-locale') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -2157,14 +2239,14 @@ jobs:
   managed-toolchain-artifacts:
     name: Managed Toolchain Artifact E2E
     needs: plan-ci
-    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'managed-toolchain') }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'managed-toolchain') }}
     uses: ./.github/workflows/managed-toolchain-artifacts.yml
 
   main-canary:
     name: Queue/main installation and offline gateway canary
     needs: queue-attestation
     if: >-
-      ${{ always()
+      ${{ !cancelled()
           && ((github.event_name == 'push'
                && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')
               || (github.event_name == 'merge_group'
@@ -2270,6 +2352,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # A skipped required job can count as passing. Keep this gate unconditional,
+      # but stop before checkout or evidence creation when the run was cancelled.
+      - name: Reject cancelled workflow
+        if: ${{ cancelled() }}
+        shell: bash
+        run: |
+          echo "ERROR: cancelled workflow cannot satisfy required CI checks." >&2
+          exit 1
+
       - name: Accept verified queue or main fast path
         if: >-
           ${{ (github.event_name == 'merge_group'
