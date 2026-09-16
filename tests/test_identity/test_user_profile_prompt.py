@@ -72,6 +72,18 @@ def test_system_prompt_requires_bare_single_token_silent_replies() -> None:
     assert "Never use `NO_REPLY` for messages from a human user" in prompt
 
 
+def test_system_prompt_explains_dynamic_execution_identity_fields() -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="full"),
+        tools=None,
+    )
+
+    assert "When explicitly asked about the underlying model" in prompt
+    assert "use the current request's execution facts." in prompt
+    assert "Execution selected for this turn" not in prompt
+    assert "router_tier" not in prompt
+
+
 def test_system_prompt_disambiguates_session_memory_results() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),

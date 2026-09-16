@@ -1378,6 +1378,10 @@ jobs:
             tests/test_recovery
             tests/test_migration/test_opensquilla_home_migration.py
             tests/test_desktop/test_electron_startup_contract.py
+            tests/test_engine/test_request_execution_identity.py
+            tests/test_gateway/test_session_model_routing_rpc.py
+            tests/test_tools/test_execution_status.py
+            tests/test_provider_ensemble.py
             -q
             --durations=50
             --junitxml="${CI_REPORT_DIR}/junit.xml"
@@ -2052,6 +2056,13 @@ jobs:
             tests/test_skills_hub_lockfile_contract.py \
             tests/test_skills_hub_doctor.py \
             tests/test_skills_hash_consumers.py \
+            tests/test_skill_install_source.py \
+            tests/test_engine/test_skill_install_settlement.py \
+            tests/test_gateway/test_skill_install_status.py \
+            tests/test_skills/test_hub_install_operations.py \
+            tests/test_skills/test_staging_io_worker.py \
+            tests/test_skills_hub_streaming.py \
+            tests/test_skills_hub_streaming_faults.py \
             tests/test_skills/test_hub_management_service.py \
             tests/test_skills/test_hub_scanner.py \
             tests/test_skills/test_hub_transaction_recovery.py \

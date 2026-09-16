@@ -26,7 +26,7 @@ export interface RpcTransport {
   ): Promise<T>
   ready(options?: TransportReadyOptions): Promise<void>
   supports(method: string): boolean
-  supportsProviderProbeMode(mode: 'reachability' | 'model'): boolean
+  readonly policy?: Readonly<Record<string, unknown>> | null
   markUnsupported(method: string): void
   acknowledgeDelivery?(receipt: TransportDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: TransportInstalledReceipt): Promise<void> | void
@@ -147,12 +147,7 @@ export function createPrivateGatewayTransports(
       supports(method) {
         return source.hasRpcMethod(method)
       },
-      supportsProviderProbeMode(mode) {
-        const advertised = source.policy?.provider_probe_modes
-        return Array.isArray(advertised)
-          && advertised.every(value => typeof value === 'string')
-          && advertised.includes(mode)
-      },
+      get policy() { return source.policy },
       markUnsupported(method) {
         source.rememberUnsupportedMethod(method)
       },

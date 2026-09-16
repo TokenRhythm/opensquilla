@@ -93,6 +93,50 @@ def _check_ssrf(url: str) -> list[str]:
     return validate_http_url_for_fetch(url)
 
 
+def _web_fetch_httpx_client_kwargs(
+    url: str,
+    vetted_ips: list[str] | None,
+    headers: Mapping[str, str],
+    managed_kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build httpx client kwargs for one web_fetch hop.
+
+    Direct and environment-proxied fetches pin to the SSRF-vetted IP by default.
+    Delegating DNS to an environment proxy requires a separate explicit opt-in:
+    the proxy must then enforce the final destination's access policy. Managed
+    sandbox proxies retain their own routing and policy independently.
+    """
+    client_kwargs: dict[str, Any] = {
+        "timeout": 30.0,
+        "follow_redirects": False,
+        "headers": dict(headers),
+        **managed_kwargs,
+    }
+    if "proxy" in managed_kwargs:
+        return client_kwargs
+
+    trust_env = bool(managed_kwargs.get("trust_env"))
+    env_proxy = _environment_proxy_url(url) if trust_env else None
+    trust_proxy_dns = (
+        os.environ.get("OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if env_proxy is not None and trust_proxy_dns:
+        client_kwargs["proxy"] = env_proxy
+        # An explicit proxy already disables HTTPX's proxy discovery. Preserve
+        # trust_env so SSL_CERT_FILE / SSL_CERT_DIR still configure TLS roots.
+        return client_kwargs
+
+    transport = _pinned_transport(url, vetted_ips or [], proxy=env_proxy, trust_env=trust_env)
+    # IP literals need no DNS pinning. Still install an explicit transport so
+    # HTTPX cannot rediscover a proxy after our NO_PROXY decision.
+    client_kwargs["transport"] = (
+        transport if transport is not None
+        else httpx.AsyncHTTPTransport(proxy=env_proxy, trust_env=trust_env)
+    )
+    return client_kwargs
+
+
 def _html_to_markdown(html: str) -> str:
     import html2text
 
@@ -300,27 +344,10 @@ async def run_web_fetch_payload(
             if marker is not None:
                 raise ValueError("Blocked redirect URL containing sensitive data")
 
-            # Pin the connection to the address that just passed the SSRF guard
-            # so a rebinding second DNS resolution cannot reach a private IP.
-            # When a managed proxy is active it already resolves once through the
-            # guarded path, so skip client-side pinning in that mode.
-            transport = None
-            if "proxy" not in managed_kwargs:
-                transport_kwargs: dict[str, object] = {}
-                if managed_kwargs.get("trust_env"):
-                    proxy_url = _environment_proxy_url(current_url)
-                    if proxy_url is not None:
-                        transport_kwargs["proxy"] = proxy_url
-                transport = _pinned_transport(current_url, vetted, **transport_kwargs)
-            client_kwargs: dict[str, object] = {
-                "timeout": 30.0,
-                "follow_redirects": False,
-                "headers": headers,
-                **managed_kwargs,
-            }
-            if transport is not None:
-                client_kwargs["transport"] = transport
-            async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
+            client_kwargs = _web_fetch_httpx_client_kwargs(
+                current_url, vetted, headers, managed_kwargs
+            )
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.get(current_url)
             if response.status_code not in {301, 302, 303, 307, 308}:
                 break

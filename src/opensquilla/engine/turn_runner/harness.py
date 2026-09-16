@@ -1076,6 +1076,7 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: Any | None = None,
+        compaction_request_context: Any | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -1091,6 +1092,10 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if compaction_request_context is not None and _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade, "compaction_request_context"
+        ):
+            correlation_kwargs["compaction_request_context"] = compaction_request_context
         if attachment_path_resolver is not None and _accepts_keyword_arg(
             self._runner._maybe_compact_on_t3_upgrade,
             "attachment_path_resolver",
@@ -1177,6 +1182,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: Any | None = None,
+        compaction_request_context: Any | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -1192,6 +1198,10 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if compaction_request_context is not None and _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact, "compaction_request_context"
+        ):
+            correlation_kwargs["compaction_request_context"] = compaction_request_context
         if attachment_path_resolver is not None and _accepts_keyword_arg(
             self._runner._maybe_preflight_compact,
             "attachment_path_resolver",
@@ -1399,6 +1409,7 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
         expected_session_id: str | None = None,
@@ -1454,6 +1465,8 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             persist_kwargs["source_entries"] = source_entries
         if "source_preimage" in params or accepts_kwargs:
             persist_kwargs["source_preimage"] = source_preimage
+        if "source_context_fingerprint" in params or accepts_kwargs:
+            persist_kwargs["source_context_fingerprint"] = source_context_fingerprint
         if "source_boundary_message_id" in params or accepts_kwargs:
             persist_kwargs["source_boundary_message_id"] = source_boundary_message_id
         if "source_boundary_entry_id" in params or accepts_kwargs:
@@ -2059,9 +2072,8 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
     """Bind ``TurnRunner._persist_turn_error`` as a Protocol port.
 
     Forwards verbatim. The helper owns its own log-and-continue
-    try/except and guards both ``session_manager is None`` and
-    ``event is None`` internally, so the adapter and stage body have no
-    additional guards.
+    try/except and guards ``event is None`` internally; diagnostic recording
+    does not require a session manager.
     """
 
     def __init__(self, runner: TurnRunner) -> None:
@@ -2075,6 +2087,11 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         append_transcript: bool = True,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        turn_id: str | None = None,
+        surface: str = "unknown",
+        provider: str | None = None,
+        model: str | None = None,
+        fallback_hops: int = 0,
     ) -> None:
         await self._runner._persist_turn_error(
             session_key,
@@ -2082,6 +2099,11 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
             append_transcript=append_transcript,
             expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch,
+            turn_id=turn_id,
+            surface=surface,
+            provider=provider,
+            model=model,
+            fallback_hops=fallback_hops,
         )
 
 

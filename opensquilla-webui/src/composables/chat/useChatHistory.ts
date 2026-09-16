@@ -169,7 +169,7 @@ function historyActivityMarkers(
     const id = String(data.id || '').trim()
     if (!id || suppressedCompactionIds.has(id)) return []
     const rawStatus = String(data.status || 'completed').toLowerCase()
-    const state = rawStatus === 'completed'
+    const state = rawStatus === 'completed' || rawStatus === 'emergency_ephemeral'
       ? 'completed'
       : rawStatus === 'failed' ? 'failed' : 'running'
     const at = Number(data.at)
@@ -181,7 +181,9 @@ function historyActivityMarkers(
       category: 'maintenance',
       state,
       source: 'automatic',
-      durability: 'durable',
+      durability: rawStatus === 'emergency_ephemeral'
+        ? 'request_scoped'
+        : String(data.durability || 'durable'),
     }]
   })
 }
@@ -1077,7 +1079,17 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       if (!isCurrentRequest()) return { ok: false, cancelled: true }
       const msgs = data.messages
       const canonicalAvailable = data.canonicalAvailable
-      if (canonicalAvailable === false) {
+      // A draft WebChat key has no canonical store yet, but the server can
+      // positively confirm its empty transcript. Reconnection must accept
+      // that state without treating unavailable or already-loaded history
+      // as empty, or the first message remains blocked by the live fence.
+      const confirmedEmptyDraft = data.canonicalComplete === true
+        && msgs.length === 0
+        && !data.hasMore
+        && !params.prepend
+        && !hasLoadedEarlier
+        && options.messages.value.length === 0
+      if (canonicalAvailable === false && !confirmedEmptyDraft) {
         if (nonReconnecting) {
           restoreSilentBackgroundState()
           return { ok: false }
@@ -1240,7 +1252,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
       }
 
-      if (canonicalAvailable !== false) failedHistoryRequest = null
+      if (canonicalAvailable !== false || confirmedEmptyDraft) failedHistoryRequest = null
       // Gate the full-session error on explicit coverage metadata. Older
       // Gateways used canonical_available=false for a legitimate empty WebChat
       // session but did not yet publish canonical_complete.

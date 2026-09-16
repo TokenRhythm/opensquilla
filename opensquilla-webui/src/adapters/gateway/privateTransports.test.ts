@@ -77,6 +77,30 @@ describe('private Gateway transports', () => {
     expect(workflow.capabilities.providerProbeModes).toBe(true)
   })
 
+  it.each([
+    undefined,
+    null,
+    {},
+    { provider_probe_modes: 'model,reachability' },
+    { provider_probe_modes: ['model'] },
+    { provider_probe_modes: ['reachability'] },
+    { provider_probe_modes: ['model', 'reachability', 1] },
+  ])('keeps legacy probing for missing or incomplete policy %j', policy => {
+    const transports = createPrivateGatewayTransports({ ...source(), policy })
+    expect(createV4SetupWorkflow(transports.rpc).capabilities.providerProbeModes).toBe(false)
+  })
+
+  it('reflects a replacement connection policy without rebuilding the workflow', () => {
+    const rpcSource = source()
+    const workflow = createV4SetupWorkflow(createPrivateGatewayTransports(rpcSource).rpc)
+
+    expect(workflow.capabilities.providerProbeModes).toBe(true)
+    rpcSource.policy = { provider_probe_modes: ['model'] }
+    expect(workflow.capabilities.providerProbeModes).toBe(false)
+    rpcSource.policy = { provider_probe_modes: ['reachability', 'model'] }
+    expect(workflow.capabilities.providerProbeModes).toBe(true)
+  })
+
   it('owns idempotent event unsubscription', () => {
     const rpcSource = source()
     const unsubscribe = vi.fn()

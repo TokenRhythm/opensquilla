@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { nextTick, ref, watch, type Ref } from 'vue'
 
 import { useChatHistory } from './useChatHistory'
+import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import { RpcTimeoutError } from '@/lib/rpc'
 import {
@@ -1338,6 +1339,49 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value[0]?.turnId).toBe('turn-1')
   })
 
+  it.each([
+    ['emergency_ephemeral', undefined],
+    ['completed', 'request_scoped'],
+  ])('restores a temporary %s reduction without claiming a saved summary', async (status, durability) => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-temporary',
+          role: 'assistant',
+          text: 'Continued after reducing the request context.',
+          turnContext: {
+            turnId: 'turn-temporary',
+            activityMarkers: [{
+              kind: 'context_compaction',
+              id: 'cmp-temporary',
+              status,
+              durability,
+              at: 1_720_000_000_000,
+            }],
+          },
+        }],
+        canonicalComplete: true,
+        hasMore: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      restoredFromHistory: true,
+      statusHistory: [{ state: 'completed', durability: 'request_scoped' }],
+    })
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      statusHistory: messages.value[0]!.statusHistory,
+    })
+    expect(projection.statusSteps[0]).toMatchObject({
+      isCurrent: false,
+      label: { code: 'chat.compact.temporarilyReduced' },
+    })
+  })
+
   it('prefers a durable summary boundary over duplicate activity metadata', async () => {
     const { api, messages } = makeHistory(false, {
       response: {
@@ -2307,6 +2351,66 @@ describe('useChatHistory canonical pagination', () => {
       canonicalAvailable: false,
       canonicalComplete: true,
     })
+  })
+
+  it('reconciles a confirmed empty draft after live reconnect', async () => {
+    const { api, messages, readHistory } = makeHistory(false, {
+      response: {
+        messages: [],
+        hasMore: false,
+        canonicalAvailable: false,
+        canonicalComplete: true,
+      },
+    })
+
+    await expect(api.reconcileHistory()).resolves.toEqual({ ok: true })
+
+    expect(readHistory).toHaveBeenCalledOnce()
+    expect(messages.value).toEqual([])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: true,
+      recoveryError: false,
+    })
+  })
+
+  it.each([false, undefined])(
+    'does not accept unavailable empty reconciliation with completeness %s',
+    async canonicalComplete => {
+      const { api } = makeHistory(false, {
+        response: {
+          messages: [],
+          hasMore: false,
+          canonicalAvailable: false,
+          canonicalComplete,
+        },
+      })
+      const before = { ...api.historyState.value }
+
+      await expect(api.reconcileHistory()).resolves.toEqual({ ok: false })
+
+      expect(api.historyState.value).toEqual(before)
+    },
+  )
+
+  it('preserves loaded durable history when reconciliation claims a missing empty session', async () => {
+    const { api, messages, historyFixture } = makeHistory(false)
+    await api.loadHistory()
+    const beforeMessages = messages.value.slice()
+    const beforeState = { ...api.historyState.value }
+    historyFixture.mockResolvedValueOnce({
+      messages: [],
+      hasMore: false,
+      canonicalAvailable: false,
+      canonicalComplete: true,
+    })
+
+    await expect(api.reconcileHistory()).resolves.toEqual({ ok: false })
+
+    expect(messages.value).toEqual(beforeMessages)
+    expect(messages.value[0]?.messageId).toBe('m1')
+    expect(api.historyState.value).toEqual(beforeState)
   })
 
   it('keeps an old-gateway empty success without canonical fields compatible', async () => {

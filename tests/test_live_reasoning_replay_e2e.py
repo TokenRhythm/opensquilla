@@ -39,6 +39,16 @@ def test_harness_requires_explicit_live_opt_in(capsys):
     assert json.loads(capsys.readouterr().out)["status"] == "live_opt_in_required"
 
 
+@pytest.mark.parametrize(("content", "expected"), [
+    ("COMPACTION_LABEL=amberfox", "amberfox"),
+    ("COMPACTION_LABEL=mapleforest", "mapleforest"),
+    ('COMPACTION_LABEL = "cedar-harbor"', "cedar-harbor"),
+    ("No label was generated.", None),
+])
+def test_compaction_fact_does_not_depend_on_exact_label_format(content, expected):
+    assert harness._compaction_generated_label(content) == expected
+
+
 def test_final_non_tool_assistant_is_checked_after_restart():
     calls = _calls()
     checks = harness._assert_wire_replay(calls, 3, "deepseek")
@@ -113,6 +123,49 @@ async def test_observer_captures_already_read_error_response_without_public_body
     assert observer.calls[0].body_format == "json"
     assert observer.calls[0].body_error_code == "403"
     assert "private-error-body" not in json.dumps(harness._wire_diagnostics(observer))
+
+
+@pytest.mark.asyncio
+async def test_compaction_call_limit_blocks_transport_before_fourth_request():
+    sent = 0
+
+    async def respond(request):
+        nonlocal sent
+        sent += 1
+        return httpx.Response(200, json={})
+
+    observer = harness.WireObserver(
+        "https://example.invalid", httpx.MockTransport(respond), max_calls=3
+    )
+    with observer.observe():
+        async with httpx.AsyncClient() as client:
+            for _ in range(3):
+                await client.post("https://example.invalid/chat/completions", json={"messages": []})
+            with pytest.raises(harness.ReplayCheckError, match="physical_model_call_limit"):
+                await client.post("https://example.invalid/chat/completions", json={"messages": []})
+    assert sent == len(observer.calls) == 3
+
+
+def test_usage_report_keeps_missing_cache_and_reasoning_distinct_from_zero():
+    calls = [
+        harness.WireCall(request={}, usage={}),
+        harness.WireCall(request={}, usage={
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 0},
+        }),
+        harness.WireCall(request={}, usage={
+            "prompt_cache_hit_tokens": 1024,
+            "completion_tokens_details": {"reasoning_tokens": 2000},
+        }),
+    ]
+    missing = harness._usage_report(calls[:1])
+    assert missing["cached_input_tokens"] is None
+    assert missing["reasoning_tokens"] is None
+    report = harness._usage_report(calls)
+    assert report["cached_input_tokens_by_call"] == [None, 0, 1024]
+    assert report["reasoning_tokens_by_call"] == [None, 0, 2000]
+    assert report["cached_input_tokens"] == 1024
+    assert report["reasoning_tokens"] == 2000
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "changed_reasoning", "no_tools"])
@@ -201,6 +254,29 @@ def test_live_cli_suppresses_provider_output_and_restores_environment(monkeypatc
     assert json.loads(public)["ok"] is True
     assert os.environ["UNRELATED_SECRET"] == "never-pass-this"
     assert roots and not roots[0].exists()
+
+
+@pytest.mark.parametrize("variant", [
+    "basic", "tools", "replay_off", "model_switch", "repeated", "truncated", "long_reasoning",
+])
+def test_compaction_cli_passes_explicit_variant_and_model(monkeypatch, capsys, variant):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-cli-credential")
+    received = []
+
+    async def run(root, **kwargs):
+        received.append(kwargs)
+        return {"ok": True, "provider": "openrouter", "scenario": "compaction"}
+
+    monkeypatch.setattr(harness, "run_case", run)
+    assert harness.main([
+        "--live", "--provider", "openrouter", "--scenario", "compaction",
+        "--compaction-variant", variant, "--compaction-next-model", "deepseek/deepseek-v4-pro",
+    ]) == 0
+    assert len(received) == 1
+    assert received[0]["compaction_variant"] == variant
+    assert received[0]["compaction_next_model"] == "deepseek/deepseek-v4-pro"
+    assert received[0]["api_key"] == "synthetic-cli-credential"
+    assert "synthetic-cli-credential" not in capsys.readouterr().out
 
 
 def test_models_without_returned_native_state_are_not_claimed_as_replay_coverage():

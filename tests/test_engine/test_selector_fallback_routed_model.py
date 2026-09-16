@@ -3238,6 +3238,32 @@ def _image_continuation_runtime(
 
 
 @pytest.mark.asyncio
+async def test_tool_image_upgrade_rebinds_owned_execution_facts(monkeypatch) -> None:
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
+
+    runtime = _image_continuation_runtime(monkeypatch)
+    selected = ExecutionIdentity(provider="openrouter", model="synthetic/text-small")
+    runtime.config = runtime.config.model_copy(update={"execution_identity": selected})
+    runtime.messages[0] = with_execution_identity(runtime.messages[0], selected)
+    canonical = [message.model_dump(mode="json") for message in runtime.messages]
+
+    rebound = await runtime.wrapper.prepare_image_continuation(runtime.messages, runtime.config)
+    assert rebound is not None
+    events = [event async for event in runtime.wrapper.chat(runtime.messages, config=rebound)]
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    call = runtime.built[-1].calls[0]
+    assert call["config"].execution_identity.model == runtime.image_model
+    text = call["payload"]["messages"][0]["content"]
+    assert '"model":"synthetic/image-large"' in text
+    assert '"model":"synthetic/text-small"' not in text
+    assert text.count("Current response execution:") == 1
+    assert runtime.config.execution_identity == selected
+    assert [message.model_dump(mode="json") for message in runtime.messages] == canonical
+
+
+@pytest.mark.asyncio
 async def test_tool_image_upgrade_binds_real_selector_catalog_budget_and_wire(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

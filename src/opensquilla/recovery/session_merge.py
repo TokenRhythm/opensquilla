@@ -818,6 +818,15 @@ def _clear_excluded_operational_rows(path: Path) -> tuple[str, ...]:
             ):
                 if table in excluded:
                     connection.execute(f"DELETE FROM {_quote(table)}")
+            if "telemetry_daily_usage" in excluded and "preference_key" in _columns(
+                connection, "runtime_preferences"
+            ):
+                # This copy starts fresh usage buckets; its source may keep
+                # collecting, so the empty store also needs a fresh identity.
+                connection.execute(
+                    "DELETE FROM runtime_preferences WHERE preference_key = ?",
+                    ("telemetry.daily_usage_store_id",),
+                )
             context_columns = _columns(connection, "session_context_states")
             if {"portable", "valid", "invalid_reason"}.issubset(context_columns):
                 connection.execute(

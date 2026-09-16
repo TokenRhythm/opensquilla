@@ -16,6 +16,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from opensquilla.cli.main import app
@@ -29,6 +30,7 @@ def _no_ambient_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """The env form reads the operator's config; keep the runner off the host's."""
 
     monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_PORT", raising=False)
 
 
 def _empty_config(tmp_path: Path) -> Path:
@@ -84,6 +86,113 @@ def test_a_real_key_still_prints_its_export(key: str, env_var: str) -> None:
 
     assert result.exit_code == 0, result.stdout
     assert f"export {env_var}=18823" in result.stdout
+
+
+def _config_tree_snapshot(root: Path) -> dict[str, bytes | None]:
+    return {
+        path.relative_to(root).as_posix(): None if path.is_dir() else path.read_bytes()
+        for path in root.rglob("*")
+    }
+
+
+@pytest.mark.parametrize("port", [-1, 65536])
+@pytest.mark.parametrize("original", [None, b"", b"# Keep this comment.\nport = 18791\n"])
+def test_invalid_port_is_not_persisted(
+    port: int,
+    original: bytes | None,
+    tmp_path: Path,
+) -> None:
+    # Both existing documents lack config_version: a rejected edit must not
+    # persist a migration or create its backups/locks while loading the file.
+    target = tmp_path / "settings" / "opensquilla.toml"
+    if original is not None:
+        target.parent.mkdir()
+        target.write_bytes(original)
+    before = _config_tree_snapshot(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["config", "set", "--config", str(target), "--", "port", str(port)],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid value for port" in result.stdout
+    assert _config_tree_snapshot(tmp_path) == before
+    if original is None:
+        assert not target.exists()
+
+
+@pytest.mark.parametrize("port", [-1, 65536])
+def test_invalid_port_is_not_printed_as_an_export(port: int) -> None:
+    result = runner.invoke(app, ["config", "set", "--", "port", str(port)])
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid value for port" in result.stdout
+    assert "export" not in result.output
+
+
+@pytest.mark.parametrize("port", [-1, 65536])
+def test_existing_invalid_port_is_reported_without_leaking_other_invalid_values(
+    port: int,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "opensquilla.toml"
+    target.write_text(
+        f'port = {port}\ndebug = "synthetic-sensitive-token"\n', encoding="utf-8"
+    )
+    before = _config_tree_snapshot(tmp_path)
+
+    result = runner.invoke(
+        app, ["config", "set", "log_level", "INFO", "--config", str(target)]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid value for port" in result.stdout
+    assert "synthetic-sensitive-token" not in result.output
+    assert "Traceback" not in result.output
+    assert _config_tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("port", [0, 1, 65535])
+def test_valid_port_boundaries_are_persisted_and_exported(port: int, tmp_path: Path) -> None:
+    target = _empty_config(tmp_path)
+
+    saved = runner.invoke(app, ["config", "set", "port", str(port), "--config", str(target)])
+    exported = runner.invoke(app, ["config", "set", "port", str(port)])
+
+    assert saved.exit_code == 0, saved.output
+    assert exported.exit_code == 0, exported.output
+    assert tomllib.loads(target.read_text(encoding="utf-8"))["port"] == port
+    assert f"export OPENSQUILLA_GATEWAY_PORT={port}" in exported.stdout
+    assert GatewayConfig.load(target).port == port
+
+
+@pytest.mark.parametrize("port", [0, 1, 65535])
+def test_gateway_config_accepts_port_boundaries_from_model_and_environment(
+    port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert GatewayConfig(port=port).port == port
+
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_PORT", str(port))
+
+    assert GatewayConfig.load(None).port == port
+
+
+@pytest.mark.parametrize("port", [-1, 65536])
+def test_gateway_config_rejects_invalid_port_from_model_and_environment(
+    port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError) as model_error:
+        GatewayConfig(port=port)
+    assert any(error["loc"] == ("port",) for error in model_error.value.errors())
+
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_PORT", str(port))
+
+    with pytest.raises(ValidationError) as environment_error:
+        GatewayConfig.load(None)
+    assert any(error["loc"] == ("port",) for error in environment_error.value.errors())
 
 
 @pytest.mark.parametrize(

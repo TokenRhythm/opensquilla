@@ -260,8 +260,13 @@ def build_compaction_llm_plan_from_provider_config(
     deployment_fingerprint: str = "",
     portable: bool = True,
     source: str = "provider_config",
+    replay_provider_state: bool | None = False,
 ) -> CompactionExecutionPlan:
-    """Build an isolated auxiliary provider from a complete deployment config."""
+    """Build an isolated auxiliary provider from a complete deployment config.
+
+    Prefix summaries serialize portable history with replay disabled. Suffix
+    summaries pass ``None`` to preserve the active request's serialization.
+    """
 
     model = str(model_override or config.model or "").strip()
     (
@@ -280,9 +285,11 @@ def build_compaction_llm_plan_from_provider_config(
         config,
         model=model,
         provider_routing=dict(config.provider_routing),
-        # A summary request contains freshly serialized portable messages.
-        # Provider-private state from the consumer turn must never be replayed.
-        replay_provider_state=False,
+        replay_provider_state=(
+            config.replay_provider_state
+            if replay_provider_state is None
+            else replay_provider_state
+        ),
     )
     provider = build_provider_from_config(isolated)
     return CompactionExecutionPlan(
@@ -394,6 +401,7 @@ def resolve_compaction_execution_plan(
     session_key: str = "",
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     credential_pool_failure_reporter: Callable[[str, str, Any], None] | None = None,
+    active_only: bool = False,
 ) -> CompactionExecutionPlan | None:
     """Freeze the ordered physical targets for one compaction operation.
 
@@ -401,6 +409,9 @@ def resolve_compaction_execution_plan(
     proposer fanout is never a compaction target. The routed/base deployment
     and configured single-provider fallbacks follow it. Explicit provider and
     model configuration, when complete and executable, takes precedence.
+    ``active_only`` retains only the current physical deployment for suffix
+    requests, including its replay policy. Previous turns and configured
+    summary overrides cannot change that request's model or serialization.
     """
 
     candidates: list[CompactionExecutionTarget] = []
@@ -423,6 +434,7 @@ def resolve_compaction_execution_plan(
                     else 0
                 ),
                 source=source,
+                replay_provider_state=None if active_only else False,
             )
         except Exception:
             return
@@ -463,6 +475,24 @@ def resolve_compaction_execution_plan(
                 credential_pool=resolution_metadata.get("credential_pool"),
             )
 
+    aggregator = getattr(active_provider, "aggregator", None)
+    aggregator_config = getattr(aggregator, "provider_config", None)
+    aggregator_ready = bool(getattr(aggregator, "ready", True))
+    if active_only:
+        if isinstance(aggregator_config, ProviderConfig) and aggregator_ready:
+            add_config(aggregator_config, source="ensemble_aggregator")
+        else:
+            add_config(active_provider_config, source="active_deployment")
+        if candidates:
+            return CompactionExecutionPlan(candidates=tuple(candidates))
+        # Providers without a complete factory config retain their existing
+        # serialization policy; never infer replay from the suffix switch.
+        return build_compaction_execution_plan_from_provider(
+            active_provider,
+            context_window_tokens=context_window_tokens,
+            source="active_deployment",
+        )
+
     explicit_provider = str(
         getattr(compaction_config, "provider", "") or ""
     ).strip()
@@ -496,9 +526,6 @@ def resolve_compaction_execution_plan(
             source="explicit_model_current_provider",
         )
 
-    aggregator = getattr(active_provider, "aggregator", None)
-    aggregator_config = getattr(aggregator, "provider_config", None)
-    aggregator_ready = bool(getattr(aggregator, "ready", True))
     if isinstance(aggregator_config, ProviderConfig) and aggregator_ready:
         add_config(aggregator_config, source="ensemble_aggregator")
 

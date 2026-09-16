@@ -354,8 +354,8 @@
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
-       Chat, Sessions, Overview, then More for the flat drawer containing
-       Sessions / Overview / Skills & Channels / Cron and Settings. -->
+       Chat, Overview, then More for the sidebar drawer with session history,
+       navigation, and Settings. -->
   <nav
     class="mobile-tabbar"
     :class="{ 'is-keyboard-open': mobileKeyboardOpen }"
@@ -370,16 +370,6 @@
     >
       <Icon name="chat" :size="20" />
       <span class="mobile-tab__label">{{ t('nav.chat') }}</span>
-    </router-link>
-    <router-link
-      to="/sessions"
-      class="mobile-tab"
-      :class="{ 'is-active': isNavActive('/sessions') }"
-      @click="handleNavClick"
-    >
-      <Icon name="sessions" :size="20" />
-      <span class="mobile-tab__label">{{ t('nav.sessions') }}</span>
-      <span v-if="appStore.approvalCount > 0" class="mobile-tab__badge">{{ appStore.approvalCount }}</span>
     </router-link>
     <router-link
       to="/overview"
@@ -1659,7 +1649,7 @@ async function onDeleteSession(key: string) {
 // in-thread card can be answered. The live `pendingApprovals` list (kept fresh
 // by the push subscription + reconnect seed) is the source of truth — no
 // re-fetch — and the oldest pending session is the deterministic target. With
-// no routable session, fall back to the Sessions page.
+// no routable session, fall back to Chat; the topbar retains the pending count.
 function openBlockedApprovalSession() {
   const oldest = appStore.oldestPendingWithSession
   if (oldest?.sessionKey) {
@@ -1667,9 +1657,8 @@ function openBlockedApprovalSession() {
     switchToSession(oldest.sessionKey, 'approval.openBlockedSession')
     return
   }
-  // No session attached to the pending approval: land on Sessions, whose
-  // attention strip shows the pending count (the /approvals page is retired).
-  router.push('/sessions')
+  // No session attached to the pending approval: return to chat.
+  router.push('/chat')
 }
 
 // Footer settings row. Both platforms mount the same `/settings` overlay now, so

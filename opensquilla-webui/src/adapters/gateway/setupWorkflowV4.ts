@@ -24,7 +24,7 @@ interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
   ready?(options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<void>
   supports?(method: string): boolean
-  supportsProviderProbeMode?(mode: 'reachability' | 'model'): boolean
+  readonly policy?: Readonly<Record<string, unknown>> | null
 }
 
 const options = (
@@ -236,8 +236,11 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
         return rpc.supports?.(setupContracts.imageModelsDiscover.method) !== false
       },
       get providerProbeModes() {
-        return rpc.supportsProviderProbeMode?.('reachability') === true
-          && rpc.supportsProviderProbeMode('model') === true
+        const advertised = rpc.policy?.provider_probe_modes
+        return Array.isArray(advertised)
+          && advertised.every(value => typeof value === 'string')
+          && advertised.includes('reachability')
+          && advertised.includes('model')
       },
     },
     async catalog(request) {

@@ -20,7 +20,7 @@ vi.mock('@/stores/rpc', () => ({
 }))
 
 const setupWorkflow = createV4SetupWorkflow({
-  supportsProviderProbeMode: () => true,
+  policy: { provider_probe_modes: ['reachability', 'model'] },
   request<T>(method: string, params?: Record<string, unknown>): Promise<T> {
     return callMock(method, params) as Promise<T>
   },
@@ -651,7 +651,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       throw new Error(`unexpected rpc method: ${method}`)
     })
     const workflow = createV4SetupWorkflow({
-      supportsProviderProbeMode: () => false,
+      policy: {},
       request<T>(method: string, params?: Record<string, unknown>, options?: unknown): Promise<T> {
         return requestMock(method, params, options) as Promise<T>
       },
@@ -685,7 +685,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       throw new Error(`unexpected rpc method: ${method}`)
     })
     const workflow = createV4SetupWorkflow({
-      supportsProviderProbeMode: () => true,
+      policy: { provider_probe_modes: ['reachability', 'model'] },
       request<T>(method: string, params?: Record<string, unknown>, options?: unknown): Promise<T> {
         return requestMock(method, params, options) as Promise<T>
       },

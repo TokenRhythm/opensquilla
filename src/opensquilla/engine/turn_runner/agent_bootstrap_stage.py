@@ -28,6 +28,7 @@ from opensquilla.engine.runtime_recovery import (
     normalize_reasoning_prefill_recovery_mode,
     normalize_runtime_recovery_mode,
 )
+from opensquilla.provider.types import ExecutionIdentity
 from opensquilla.tools.write_policy import validate_workspace_write_deny_env
 
 if TYPE_CHECKING:
@@ -748,6 +749,14 @@ class AgentBootstrapStage:
             system_prompt=inp.final_prompt,
             cache_breakpoints=inp.cache_breakpoints,
             request_context_prompt=inp.request_context_prompt,
+            execution_identity=ExecutionIdentity(
+                kind=(
+                    "multi_model_fusion"
+                    if agent_metadata.get("ensemble_enabled") else "single_model"
+                ),
+                model=inp.resolved_model,
+                provider=inp.active_provider_id,
+            ),
             cache_mode=inp.turn.metadata.get("cache_mode", "off"),
             skills_context_prompt=inp.turn.metadata.get("skills_context_prompt"),
             model_id=inp.resolved_model,
