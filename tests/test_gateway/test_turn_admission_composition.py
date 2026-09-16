@@ -148,7 +148,7 @@ methods = (
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
 # Includes the product-activity and session execution-log methods.
-assert len(registry.list_methods()) == 295
+assert len(registry.list_methods()) == 296
 assert registry.get_entry("telemetry.product_active.record") is not None
 assert registry.get_entry("sessions.executionLog.read") is not None
 for method in methods:
