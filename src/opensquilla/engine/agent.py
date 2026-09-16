@@ -10013,6 +10013,7 @@ class Agent:
                         terminal_error = ErrorEvent(
                             message=terminal_message,
                             code="empty_response",
+                            failure_kind=ProviderFailureKind.EMPTY_RESPONSE.value,
                         )
                         yield terminal_error
                         break
@@ -10093,12 +10094,7 @@ class Agent:
                             provider_error.code,
                             failure_kind.value,
                         )
-                        kind = _fallback.classify_error(
-                            provider_error.message,
-                            provider_name=getattr(self.provider, "provider_name", ""),
-                            status_code=provider_error_status_code,
-                            raw_code=provider_error.code,
-                        )
+                        kind = failure_kind
                         if (
                             image_failure.is_unsupported
                             and (
