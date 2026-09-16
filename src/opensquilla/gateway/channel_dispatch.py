@@ -216,6 +216,7 @@ def _terminal_payload_from_error_event(event: ErrorEvent) -> dict[str, str | Non
         "terminal_reason": "timeout" if is_timeout else "error",
         "error_class": event.code,
         "error_message": event.message,
+        "failure_kind": event.failure_kind,
     }
 
 

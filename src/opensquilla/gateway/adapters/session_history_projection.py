@@ -39,7 +39,7 @@ from opensquilla.gateway.terminal_activity import (
     usage_barrier_replay_proof,
 )
 from opensquilla.session.storage import StorageBusyError, bounded_interactive_storage_reads
-from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.session.terminal_reply import append_error_ref, build_terminal_reply, safe_error_id
 from opensquilla.turn_outcome_projection import (
     extract_fork_terminal_outcome_projection,
     terminal_turn_outcome,
@@ -420,6 +420,21 @@ async def _chat_history_turn_outcomes(
         if snapshot is not None:
             projected["activity_snapshot"] = snapshot
         error_class = getattr(row, "error_class", None)
+        if (
+            status != "succeeded"
+            and isinstance(outcome, dict)
+            and (outcome.get("failure_kind") or safe_error_id(outcome.get("error_id")))
+        ):
+            projected["terminal_message"] = append_error_ref(
+                build_terminal_reply({
+                    "status": status,
+                    "terminal_reason": getattr(row, "terminal_reason", None),
+                    "error_class": error_class,
+                    "error_message": getattr(row, "error_message", None),
+                    "failure_kind": outcome.get("failure_kind"),
+                }),
+                safe_error_id(outcome.get("error_id")),
+            )
         if is_usage_accounting_barrier(error_class):
             if outcome is None:
                 outcome = terminal_turn_outcome(status, projected.get("outcome"))
@@ -444,7 +459,7 @@ async def _chat_history_turn_outcomes(
             if primary_user_message_id is not None:
                 projected["user_message_id"] = primary_user_message_id
                 outcome["user_message_id"] = primary_user_message_id
-            projected["terminal_message"] = build_terminal_reply(
+            projected["terminal_message"] = append_error_ref(build_terminal_reply(
                 {
                     "status": status,
                     "terminal_reason": getattr(row, "terminal_reason", None),
@@ -452,7 +467,7 @@ async def _chat_history_turn_outcomes(
                     "error_message": getattr(row, "error_message", None),
                     **replay_proof,
                 }
-            )
+            ), safe_error_id(outcome.get("error_id")))
             retry_after_ms = safe_retry_after_ms(details.get("retry_after_ms"))
             if retry_after_ms is not None:
                 projected["retry_after_ms"] = retry_after_ms

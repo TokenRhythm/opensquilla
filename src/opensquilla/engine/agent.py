@@ -10021,12 +10021,7 @@ class Agent:
                             provider_error.code,
                             failure_kind.value,
                         )
-                        kind = _fallback.classify_error(
-                            provider_error.message,
-                            provider_name=getattr(self.provider, "provider_name", ""),
-                            status_code=provider_error_status_code,
-                            raw_code=provider_error.code,
-                        )
+                        kind = failure_kind
                         if (
                             image_failure.is_unsupported
                             and (

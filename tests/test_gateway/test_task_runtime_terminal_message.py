@@ -148,6 +148,7 @@ async def test_typed_provider_exception_is_sanitized_in_task_record_and_wire_eve
             code="PRIVATE_UPSTREAM_CODE",
             terminal_reason="error",
             failure_kind="transport_transient",
+            error_id="abcd1234",
         )
 
     runtime = _make_runtime(_provider_failure_handler, event_emitter=_emitter)
@@ -163,9 +164,14 @@ async def test_typed_provider_exception_is_sanitized_in_task_record_and_wire_eve
     assert raw_marker not in repr(record)
     terminal_event = next(event for event in emitted if event[1] == "task.failed")
     assert raw_marker not in repr(terminal_event)
-    assert terminal_event[2]["terminal_message"] == "The task failed before it could finish."
+    assert terminal_event[2]["terminal_message"] == (
+        "The connection to the model provider was interrupted. Try again. (ref: abcd1234)"
+    )
+    assert terminal_event[2]["code"] == "provider_transport_transient"
     assert record.details is not None
     assert record.details["turn_outcome"]["retryable"] is True
+    assert record.details["turn_outcome"]["error_id"] == "abcd1234"
+    assert terminal_event[2]["turn_outcome"] == record.details["turn_outcome"]
 
 
 @pytest.mark.asyncio
@@ -759,7 +765,9 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", [None, "empty_response"])
 async def test_task_runtime_stream_reasoning_budget_error_emits_actionable_terminal_message(
+    failure_kind: str | None,
 ) -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     engine_message = (
@@ -768,7 +776,7 @@ async def test_task_runtime_stream_reasoning_budget_error_emits_actionable_termi
     )
 
     async def _stream():
-        yield ErrorEvent(message=engine_message, code="empty_response")
+        yield ErrorEvent(message=engine_message, code="empty_response", failure_kind=failure_kind)
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
         emitted.append((session_key, event_name, payload))
@@ -807,7 +815,7 @@ async def test_task_runtime_stream_error_terminal_message_carries_error_ref() ->
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
         emitted.append((session_key, event_name, payload))
 
-    with pytest.raises(TaskRuntimeStreamError):
+    with pytest.raises(TaskRuntimeStreamError) as raised:
         await _emit_task_runtime_stream_events(
             _stream(),
             "agent:main:test",
@@ -818,6 +826,8 @@ async def test_task_runtime_stream_error_terminal_message_carries_error_ref() ->
         )
 
     payload = emitted[-1][2]
+    assert raised.value.error_id == "abcd1234"
+    assert payload["turn_outcome"]["error_id"] == "abcd1234"
     assert payload["error_id"] == "abcd1234"
     assert payload["message"].endswith("(ref: abcd1234)")
     assert payload["terminal_message"].endswith("(ref: abcd1234)")
