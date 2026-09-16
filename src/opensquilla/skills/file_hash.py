@@ -8,6 +8,8 @@ import stat
 from pathlib import Path
 from typing import Never, Protocol
 
+from opensquilla.skills.io_worker import check_staging_cancelled
+
 _HASH_CHUNK_SIZE = 1024 * 1024
 _IS_WINDOWS = os.name == "nt"
 _PATH_CHANGED_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
@@ -189,6 +191,7 @@ def _raise_if_file_changed(
 def _read_chunk(descriptor: int, size: int) -> bytes:
     """Read one bounded chunk; kept separate for deterministic race injection tests."""
 
+    check_staging_cancelled()
     return os.read(descriptor, size)
 
 
