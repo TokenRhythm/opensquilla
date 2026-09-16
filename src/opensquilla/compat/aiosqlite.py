@@ -80,6 +80,9 @@ class Connection(AbstractAsyncContextManager["Connection"], Protocol):
     @property
     def in_transaction(self) -> bool: ...
 
+    @property
+    def total_changes(self) -> int: ...
+
     def execute(self, sql: str, params: Iterable[Any] = ()) -> CursorContext: ...
 
     def executemany(
@@ -210,6 +213,10 @@ class _AsyncConnection:
     @property
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
+
+    @property
+    def total_changes(self) -> int:
+        return self._conn.total_changes
 
     async def _execute(self, sql: str, params: Iterable[Any] = ()) -> _AsyncCursor:
         async with self._locked:
