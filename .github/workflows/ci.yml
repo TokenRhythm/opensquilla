@@ -1735,14 +1735,14 @@ jobs:
             else
               unset OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND
             fi
-            local case_args=()
+            set --
             if [[ "${name}" == "window-background-flow" && "${RUNNER_OS}" == "macOS" ]]; then
-              case_args=(--connection-faults --flow-control --idle-send --background-ms=65000)
+              set -- --connection-faults --flow-control --idle-send --background-ms=65000
             fi
             if [[ "${RUNNER_OS}" == "Linux" ]]; then
-              "${telemetry[@]}" xvfb-run -a node "${script}" "${case_args[@]}" 2>&1 | tee "${log_path}"
+              "${telemetry[@]}" xvfb-run -a node "${script}" "$@" 2>&1 | tee "${log_path}"
             else
-              "${telemetry[@]}" node "${script}" "${case_args[@]}" 2>&1 | tee "${log_path}"
+              "${telemetry[@]}" node "${script}" "$@" 2>&1 | tee "${log_path}"
             fi
           }
 

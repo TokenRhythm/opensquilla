@@ -1684,6 +1684,42 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     }
 
 
+@pytest.mark.parametrize("runner_os,name", [
+    ("macOS", "window-background-flow"),
+    ("macOS", "onboarding-flow"),
+    ("Linux", "window-background-flow"),
+    ("Windows", "window-background-flow"),
+])
+def test_desktop_case_arguments_work_with_nounset(
+    tmp_path: Path, runner_os: str, name: str,
+) -> None:
+    steps = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+    flow = next(s["run"] for s in steps
+                if s.get("name") == "Run compiled Desktop recovery flows")
+    definition = flow.split("classify_retryable_infrastructure_failure()", 1)[0]
+    definition = definition.replace("${{ matrix.shard }}", "profiles")
+    # Execute the real shell entry point while recording, rather than launching,
+    # its Node command. macOS's system Bash rejects empty arrays under nounset.
+    script = definition + '\nnode() { printf "%s\\n" "$@"; }\n'
+    script += 'run_case "$CASE_NAME" "scripts/synthetic-flow.mjs" 1\n'
+    shell = "/bin/bash" if sys.platform == "darwin" else _bash_executable()
+    result = subprocess.run(
+        [shell, "-euo", "pipefail", "-c", script],
+        env={**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(),
+             "RUNNER_OS": runner_os, "CASE_NAME": name},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    arguments = result.stdout.splitlines()
+    command = arguments[arguments.index("--") + 1:]
+    expected = ["xvfb-run", "-a"] if runner_os == "Linux" else []
+    expected += ["node", "scripts/synthetic-flow.mjs"]
+    if runner_os == "macOS" and name == "window-background-flow":
+        expected += ["--connection-faults", "--flow-control", "--idle-send",
+                     "--background-ms=65000"]
+    assert command == expected
+
+
 def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> None:
     job = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]
     steps = job["steps"]
