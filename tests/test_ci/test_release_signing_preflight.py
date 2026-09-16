@@ -705,6 +705,7 @@ def test_signing_material_timeout_is_offline_and_diagnoses_phase(
     assert len(calls) == 1
 
 
+@pytest.mark.ci_serial
 def test_signing_cleanup_removes_certificate_after_environment_export_fails(tmp_path: Path) -> None:
     runner_temp = tmp_path / "runner"
     runner_temp.mkdir()
@@ -741,6 +742,7 @@ def test_signing_cleanup_removes_certificate_after_environment_export_fails(tmp_
     assert sentinel.read_bytes() == b"outside signing cleanup"
 
 
+@pytest.mark.ci_serial
 def test_signing_cleanup_missing_certificate_does_not_follow_exported_path(tmp_path: Path) -> None:
     runner_temp = tmp_path / "runner"
     runner_temp.mkdir()
@@ -759,6 +761,7 @@ def test_signing_cleanup_missing_certificate_does_not_follow_exported_path(tmp_p
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows exclusive file handles prevent deletion")
+@pytest.mark.ci_serial
 def test_signing_cleanup_delete_failure_fails_the_step(tmp_path: Path) -> None:
     runner_temp = tmp_path / "runner"
     runner_temp.mkdir()

@@ -162,7 +162,10 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "tool_result_snapshot_writer",
         "execution_status_snapshot",
         "router_control_routing_revision",
+        "skill_install_turn",
     ]
+
+    assert ToolContext().skill_install_turn is None
 
 
 def test_tool_context_preserves_complete_legacy_positional_constructor() -> None:
@@ -216,3 +219,16 @@ def test_tool_context_preserves_snapshot_writer_positional_constructor() -> None
     assert context.tool_result_snapshot_writer is write_snapshot
     assert context.execution_status_snapshot is None
     assert context.router_control_routing_revision is None
+
+
+def test_tool_context_appends_install_receipts_after_published_routing_fields() -> None:
+    defaults = ToolContext()
+    published_fields = fields(ToolContext)[:111]
+    assert published_fields[-1].name == "router_control_routing_revision"
+    published_values = [getattr(defaults, item.name) for item in published_fields]
+    published_values[-1] = 7
+
+    context = ToolContext(*published_values)
+
+    assert context.router_control_routing_revision == 7
+    assert context.skill_install_turn is None
