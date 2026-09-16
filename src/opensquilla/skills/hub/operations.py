@@ -25,6 +25,16 @@ def operation_database(journal_path: Path) -> Path:
     return journal_path.parent / "install-operations.sqlite3"
 
 
+def _interrupted_result(phase: str, result: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
+    if phase == "rolled_back" and result and result.get("rollbackPerformed") is True:
+        return "failed", result
+    return "recovery_required", {
+        "success": False,
+        "message": "The interrupted install has no proven terminal receipt.",
+        "recoveryRequired": True,
+    }
+
+
 class InstallOperationStore:
     """Store receipts in the profile's existing Skill transaction state directory."""
 
@@ -122,13 +132,13 @@ class InstallOperationStore:
             }
         state = row["state"]
         result = json.loads(row["result"]) if row["result"] else None
-        if state == "running" and row["process"] != self.process_id:
-            state = "recovery_required"
-            result = {
-                "success": False,
-                "message": "The interrupted install has no proven terminal receipt.",
-                "recoveryRequired": True,
-            }
+        if state == "running":
+            if row["process"] != self.process_id:
+                state, result = _interrupted_result(row["phase"], result)
+            else:
+                # A rollback checkpoint proves the disk state after a crash,
+                # but the current worker still owns catalog/cancellation settlement.
+                result = None
         payload = {
             "operationId": operation_id,
             "state": state,
@@ -147,6 +157,23 @@ class InstallOperationStore:
                 "WHERE root=? AND owner=? AND id=? AND state='running'",
                 (phase, json.dumps(progress), time.time(), self.root_id, owner, operation_id),
             )
+
+    def checkpoint_rollback(self, owner: str, operation_id: str) -> None:
+        """Persist disk/lock restoration before its transaction journal is removed."""
+        result = {
+            "success": False,
+            "message": "Interrupted installation was rolled back.",
+            "rollbackPerformed": True,
+        }
+        with self.connect() as db:
+            updated = db.execute(
+                "UPDATE skill_installs SET phase='rolled_back', result=?, updated=? "
+                "WHERE root=? AND owner=? AND id=? AND process=? AND state='running'",
+                (json.dumps(result), time.time(), self.root_id, owner, operation_id,
+                 self.process_id),
+            ).rowcount
+            if updated != 1:
+                raise ValueError("Install rollback checkpoint has no running operation")
 
     def finish(
         self, owner: str, operation_id: str, result: dict[str, Any], *,
@@ -196,19 +223,22 @@ class InstallOperationStore:
     def recover_orphans(self, journal_path: Path) -> None:
         if journal_path.exists():
             return
-        result = json.dumps(
-            {
-                "success": False,
-                "recoveryRequired": True,
-                "message": "The interrupted installation has no proven terminal receipt.",
-            }
-        )
         with self.connect() as db:
-            db.execute(
-                "UPDATE skill_installs SET state='recovery_required', phase='complete', result=?, "
-                "updated=? WHERE root=? AND state='running' AND process!=?",
-                (result, time.time(), self.root_id, self.process_id),
-            )
+            rows = db.execute(
+                "SELECT owner, id, phase, result FROM skill_installs "
+                "WHERE root=? AND state='running' AND process!=?",
+                (self.root_id, self.process_id),
+            ).fetchall()
+            for row in rows:
+                state, result = _interrupted_result(
+                    row["phase"], json.loads(row["result"]) if row["result"] else None,
+                )
+                db.execute(
+                    "UPDATE skill_installs SET state=?, phase='complete', result=?, updated=? "
+                    "WHERE root=? AND owner=? AND id=? AND state='running' AND process!=?",
+                    (state, json.dumps(result), time.time(), self.root_id,
+                     row["owner"], row["id"], self.process_id),
+                )
         self.prune()
 
     def prune(self) -> None:

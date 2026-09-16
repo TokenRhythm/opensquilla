@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 import threading
 import uuid
 from pathlib import Path
@@ -211,6 +214,114 @@ async def test_committed_cleanup_warning_is_preserved_in_all_receipts(
     )
     assert not any(item.blocking for item in recovered)
     assert operations.store.read("owner", operation_id)["result"] == result
+
+
+@pytest.mark.parametrize("crash_point", ["before", "after"])
+def test_restart_retains_rollback_proof_around_journal_removal(
+    tmp_path: Path, crash_point: str,
+) -> None:
+    operation_id = str(uuid.uuid4())
+    worker = textwrap.dedent("""\
+        import asyncio
+        import os
+        import sys
+        from pathlib import Path
+
+        from opensquilla.skills.hub import transaction
+        from tests.test_skills.test_hub_management_service import FakeImmutableSource, _service
+
+        root = Path(sys.argv[1])
+        operation_id = sys.argv[2]
+        crash_point = sys.argv[3]
+        source = FakeImmutableSource({
+            "SKILL.md": "---\\nname: demo\\ndescription: Crash fixture.\\n---\\n# Demo\\n",
+        })
+        service = _service(root, source)
+
+        async def reject_postflight(**kwargs):
+            raise RuntimeError("synthetic postflight rejection")
+
+        service._reload_and_verify = reject_postflight
+        remove_journal = transaction.remove_transaction_journal
+
+        def crash_at_removal(path):
+            status = service.install_operations.store.read("owner", operation_id)
+            assert status["state"] == "running" and not status["terminal"]
+            assert "result" not in status
+            if crash_point == "after":
+                remove_journal(path)
+            os._exit(73)
+
+        transaction.remove_transaction_journal = crash_at_removal
+
+        async def install():
+            return (await service.install("demo", "fake")).to_dict()
+
+        asyncio.run(service.install_operations.run("owner", operation_id, {}, install))
+        raise AssertionError("worker missed its crash point")
+    """)
+    crashed = subprocess.run(
+        [sys.executable, "-c", worker, str(tmp_path), operation_id, crash_point],
+        capture_output=True, text=True, check=False, timeout=20,
+    )
+    assert crashed.returncode == 73, crashed.stderr
+    managed = tmp_path / "managed"
+    journal_path = tmp_path / "transaction.json"
+    lockfile_path = tmp_path / "skills-lock.json"
+    assert journal_path.exists() is (crash_point == "before")
+    assert not (managed / "demo").exists()
+    assert Lockfile.load(lockfile_path).get("demo") is None
+    restarted = InstallOperationStore(
+        operation_database(journal_path), root_id=managed_root_identity(managed),
+    )
+    receipt = restarted.read("owner", operation_id)
+    assert receipt["state"] == "failed"
+    assert receipt["result"]["rollbackPerformed"] is True
+    recovered = recover_pending_skill_transaction(
+        managed_dir=managed, lockfile_path=lockfile_path, journal_path=journal_path,
+    )
+    assert not any(item.blocking for item in recovered)
+    restarted.recover_orphans(journal_path)
+    assert restarted.read("owner", operation_id)["state"] == "failed"
+    assert restarted.read("owner", operation_id)["result"]["rollbackPerformed"] is True
+    assert not journal_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_rollback_checkpoint_failure_keeps_journal_for_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeImmutableSource({
+        "SKILL.md": "---\nname: demo\ndescription: Crash fixture.\n---\n# Demo\n",
+    })
+    service = _service(tmp_path, source)
+    operations = service.install_operations
+    operation_id = str(uuid.uuid4())
+
+    async def fail_postflight(**kwargs):
+        raise RuntimeError("synthetic postflight rejection")
+
+    def fail_checkpoint(*args):
+        raise OSError("synthetic checkpoint failure")
+
+    monkeypatch.setattr(service, "_reload_and_verify", fail_postflight)
+    monkeypatch.setattr(operations.store, "checkpoint_rollback", fail_checkpoint)
+
+    async def install():
+        return (await service.install("demo", "fake")).to_dict()
+
+    result = await operations.run("owner", operation_id, {}, install)
+    assert result["recoveryRequired"] is True
+    assert operations.store.read("owner", operation_id)["state"] == "recovery_required"
+    assert service.journal_path.exists()
+    assert not (service.managed_dir / "demo").exists()
+    recovered = recover_pending_skill_transaction(
+        managed_dir=service.managed_dir, lockfile_path=service.lockfile_path,
+        journal_path=service.journal_path,
+    )
+    assert not any(item.blocking for item in recovered)
+    assert operations.store.read("owner", operation_id)["state"] == "failed"
+    assert not service.journal_path.exists()
 
 
 @pytest.mark.parametrize(

@@ -1043,6 +1043,11 @@ def recover_pending_skill_transaction(
         )
         # A running installer still has to restore the live catalog and report
         # why it rolled back. Only orphan recovery owns its terminal receipt.
+        if settles_in_caller and journal.phase != "committed":
+            assert current_operation is not None
+            current_operation.store.checkpoint_rollback(
+                current_operation.owner, current_operation.id,
+            )
         if journal.install_operation_id and not settles_in_caller:
 
             store = InstallOperationStore(
