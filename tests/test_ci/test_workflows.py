@@ -37,6 +37,121 @@ def _workflow_texts() -> list[str]:
     return [path.read_text(encoding="utf-8") for path in WORKFLOW_DIR.glob("*.yml")]
 
 
+def test_only_diagnostic_uploads_can_fail_without_failing_ci() -> None:
+    expected = {
+        "webui-chat-recovery": {"chat-traces"},
+        "ubuntu-full": {"ubuntu-report"},
+        "windows-full": {"windows-report"},
+        "macos-recovery": {"macos-report"},
+        "desktop-recovery-e2e": {"desktop-summary", "desktop-failure"},
+    }
+    for job_id, job in _workflow("ci.yml")["jobs"].items():
+        assert not job.get("continue-on-error")
+        allowed = expected.get(job_id, set())
+        steps = job.get("steps", [])
+        assert {s.get("id") for s in steps if s.get("continue-on-error")} == allowed
+        for step_id in allowed:
+            upload = next(s for s in steps if s.get("id") == step_id)
+            assert upload["uses"] == "actions/upload-artifact@v4"
+            warning = next(s for s in steps if s.get("name") == f"Warn if {step_id} upload failed")
+            assert warning["if"] == (
+                "${{ !cancelled() && steps." + step_id + ".outcome == 'failure' }}"
+            )
+            assert "::warning::" in warning["run"]
+        for upload in steps:
+            if (upload.get("uses") == "actions/upload-artifact@v4"
+                    and upload.get("id") not in allowed):
+                assert not upload.get("continue-on-error")
+
+
+@pytest.mark.parametrize(
+    "step_id", ["ubuntu-report", "windows-report", "macos-report", "desktop-summary"],
+)
+def test_local_diagnostic_generation_remains_required(tmp_path: Path, step_id: str) -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    job = next(job for job in jobs.values()
+               if any(s.get("id") == step_id for s in job.get("steps", [])))
+    steps = job["steps"]
+    check = next(s for s in steps if s.get("name") == f"Check local {step_id} files")
+    upload = next(s for s in steps if s.get("id") == step_id)
+    assert steps.index(check) < steps.index(upload)
+    assert "if" not in check  # Normal success path; earlier test/setup failures stay red.
+    assert not check.get("continue-on-error")
+    env = {**os.environ, "CI_REPORT_DIR": tmp_path.as_posix()}
+    command = [_bash_executable(), "-euo", "pipefail", "-c", check["run"]]
+    assert subprocess.run(command, env=env, capture_output=True).returncode != 0
+    for name in re.findall(r'CI_REPORT_DIR\}/([^"\n]+)', check["run"]):
+        (tmp_path / name).write_text("generated report\n", encoding="utf-8")
+    assert subprocess.run(command, env=env, capture_output=True).returncode == 0
+
+
+def test_required_artifact_downloads_share_a_bounded_hard_gate() -> None:
+    action_path = Path(".github/actions/download-required-artifact/action.yml")
+    action = yaml.safe_load(action_path.read_text(encoding="utf-8"))
+    first, retry, guard = action["runs"]["steps"]
+    for transfer in (first, retry):
+        assert transfer["uses"] == "actions/download-artifact@v4"
+        assert transfer["continue-on-error"] is True
+        assert transfer["with"] == {"name": "${{ inputs.name }}", "path": "${{ inputs.path }}"}
+    assert retry["if"] == "${{ !cancelled() && steps.first.outcome == 'failure' }}"
+    assert guard["if"] == "${{ !cancelled() }}"
+    assert guard["env"] == {
+        "FIRST_OUTCOME": "${{ steps.first.outcome }}",
+        "RETRY_OUTCOME": "${{ steps.retry.outcome }}",
+    }
+    assert not guard.get("continue-on-error")
+    assert "sleep" not in json.dumps(action)
+    for workflow, count in [("ci.yml", 5), ("windows-nsis-upgrade-regression.yml", 1)]:
+        steps = [s for j in _workflow(workflow)["jobs"].values() for s in j.get("steps", [])]
+        downloads = [s for s in steps
+                     if s.get("uses") == "./.github/actions/download-required-artifact"]
+        assert len(downloads) == count
+        assert all(not s.get("continue-on-error") for s in downloads)
+        assert all(s.get("uses") != "actions/download-artifact@v4" for s in steps)
+
+
+def test_ci_preparation_helpers_are_bound_by_the_existing_trust_policy() -> None:
+    policy = json.loads(Path(".github/ci/trust-policy.v1.json").read_text(encoding="utf-8"))
+    assert {
+        ".github/actions/download-required-artifact/action.yml",
+        ".github/scripts/prepare-electron.mjs",
+    } <= set(policy["merge_critical_inputs"])
+
+
+@pytest.mark.parametrize("first,retry,success", [
+    ("success", "skipped", True), ("failure", "success", True),
+    ("failure", "failure", False), ("skipped", "skipped", False),
+    ("failure", "skipped", False), ("cancelled", "skipped", False),
+    ("", "", False),
+])
+def test_required_artifact_final_outcome_cannot_wash_failures_green(
+    first: str, retry: str, success: bool,
+) -> None:
+    action_path = Path(".github/actions/download-required-artifact/action.yml")
+    action = yaml.safe_load(action_path.read_text(encoding="utf-8"))
+    guard = action["runs"]["steps"][-1]
+    result = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", guard["run"]],
+        env={**os.environ, "FIRST_OUTCOME": first, "RETRY_OUTCOME": retry},
+        capture_output=True, text=True,
+    )
+    assert (result.returncode == 0) is success
+    assert ("::warning::" in result.stdout) is (first == "failure" and success)
+
+
+def test_contract_artifact_retention_matches_frontend_rerun_window() -> None:
+    names = {
+        "gateway-contract-hashes-linux", "gateway-contract-verification-hashes-linux",
+        "opensquilla-webui-dist",
+    }
+    uploads = [s for j in _workflow("ci.yml")["jobs"].values() for s in j.get("steps", [])
+               if s.get("uses") == "actions/upload-artifact@v4"
+               and s.get("with", {}).get("name") in names]
+    assert len(uploads) == 3
+    assert all(s["with"]["retention-days"] >= 31 and not s.get("continue-on-error")
+               for s in uploads)
+
+
 def test_partial_queue_wiring_preserves_canary_gate_and_does_not_mint_root_evidence() -> None:
     jobs = _workflow("ci.yml")["jobs"]
     assert "outputs.partial == 'true'" in jobs["main-canary"]["if"]
@@ -425,7 +540,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert jobs["plan-ci"]["outputs"]["reason_codes"] == (
         "${{ steps.plan.outputs.reason_codes }}"
     )
-    assert "always()" in jobs["plan-ci"]["if"]
+    assert jobs["plan-ci"]["if"].startswith("${{ !cancelled()")
     assert "github.event_name != 'merge_group'" in jobs["plan-ci"]["if"]
     assert "needs.queue-attestation.result != 'success'" in (
         jobs["plan-ci"]["if"]
@@ -447,7 +562,10 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert planner_consumers
     for job_name, job in planner_consumers.items():
         condition = str(job.get("if", ""))
-        assert "always()" in condition, job_name
+        # An explicit status function also permits skipped/failed dependencies;
+        # dropping it would implicitly require success() and break PR planning.
+        assert condition.startswith("${{ !cancelled()"), job_name
+        assert "always()" not in condition, job_name
         assert "needs.plan-ci.result == 'success'" in condition, job_name
     for job_name in ("webui-chat-recovery", "desktop-recovery-e2e"):
         assert "needs.frontend-artifact.result == 'success'" in str(
@@ -474,6 +592,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert jobs["main-canary"]["name"] == (
         "Queue/main installation and offline gateway canary"
     )
+    assert jobs["main-canary"]["if"].startswith("${{ !cancelled()")
     assert "needs.queue-attestation.result == 'success'" in jobs["main-canary"]["if"]
     assert "test_gateway_silent_reply_process_e2e.py" in str(jobs["main-canary"])
     assert all(
@@ -532,6 +651,28 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
         if step.get("name") == "Upload tree-indexed CI evidence v2"
     )
     assert tree_upload["if"] == "${{ steps.attestation.outcome == 'success' }}"
+
+
+def test_cancelled_workflow_fails_required_gate_before_checkout_or_evidence() -> None:
+    gate = _workflow("ci.yml")["jobs"]["ci-result"]
+    # GitHub accepts skipped required jobs. The aggregate gate must still run
+    # after failed/skipped dependencies and explicitly reject cancellation.
+    assert gate["if"] == "always()"
+    guard, *remaining_steps = gate["steps"]
+    assert guard["name"] == "Reject cancelled workflow"
+    assert guard["if"] == "${{ cancelled() }}"
+    assert not guard.get("continue-on-error")
+    assert guard["shell"] == "bash"
+    completed = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", guard["run"]],
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    assert completed.returncode == 1
+    assert "cancelled workflow cannot satisfy required CI checks" in completed.stderr
+    # Keep the implicit success() guard after rejection; status overrides here
+    # could run checkout or mint trusted evidence despite the failed guard.
+    for step in remaining_steps:
+        assert not re.search(r"\b(?:always|cancelled|failure)\s*\(", step.get("if", ""))
 
 
 @pytest.mark.parametrize(
@@ -617,6 +758,7 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_skills_hub_lockfile_contract.py",
         "tests/test_skills_hub_doctor.py",
         "tests/test_skills_hash_consumers.py",
+        "tests/test_engine/test_skill_install_turn.py",
         "tests/test_engine/test_skill_install_settlement.py",
         "tests/test_gateway/test_skill_install_status.py",
         "tests/test_skills/test_hub_install_operations.py",
@@ -1526,12 +1668,21 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
         "${{ github.workspace }}/.cache/ms-playwright"
     )
-    assert job["env"]["ELECTRON_CACHE"] == "${{ github.workspace }}/.cache/electron"
+    assert job["env"]["electron_config_cache"] == "${{ github.workspace }}/.cache/electron"
     assert job["env"]["OPENSQUILLA_DESKTOP_CASE_TIMEOUT_MS"] == "900000"
     assert electron_cache["uses"] == "actions/cache/restore@v4"
-    assert electron_cache["with"]["path"] == "${{ env.ELECTRON_CACHE }}"
+    assert electron_cache["with"]["path"] == "${{ env.electron_config_cache }}"
     assert "hashFiles('desktop/electron/package-lock.json')" in electron_cache["with"]["key"]
     assert electron_cache_seed["uses"] == "actions/cache/save@v4"
+    electron_install = next(s for s in steps if s.get("name") == "Install Desktop dependencies")
+    electron_prepare = next(s for s in steps
+                            if s.get("name") == "Prepare and verify pinned Electron binary")
+    assert electron_prepare["run"] == "node .github/scripts/prepare-electron.mjs desktop/electron"
+    assert not electron_prepare.get("continue-on-error")
+    assert (steps.index(electron_cache) < steps.index(electron_install)
+            < steps.index(electron_prepare) < steps.index(electron_cache_seed))
+    assert electron_cache_seed["with"]["path"] == electron_cache["with"]["path"]
+    assert electron_cache_seed["with"]["key"] == electron_cache["with"]["key"]
     assert job["env"]["OPENSQUILLA_WORKBENCH_E2E_MODE"] == (
         "${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') "
         "&& 'smoke' || 'stress' }}"
@@ -2055,10 +2206,11 @@ def test_windows_high_risk_job_cannot_wash_test_failures_green() -> None:
     serialized = json.dumps(windows_full, sort_keys=True)
 
     assert windows_full["strategy"]["fail-fast"] is False
-    assert all("continue-on-error" not in step for step in windows_full["steps"])
+    assert {step.get("id") for step in windows_full["steps"]
+            if step.get("continue-on-error")} == {"windows-report"}
     assert "--reruns" not in serialized
     assert "pytest-rerunfailures" not in serialized
-    assert "continue-on-error" not in serialized
+    assert "continue-on-error" not in test_step
     assert "|| true" not in test_step["run"]
     assert "set -euo pipefail" in test_step["run"]
     assert "github.run_attempt" in serialized
@@ -2096,7 +2248,8 @@ def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -
     assert upload_step["if"] == "${{ always() }}"
     assert upload_step["with"]["if-no-files-found"] == "error"
     assert "github.run_attempt" in upload_step["with"]["name"]
-    assert "continue-on-error" not in serialized
+    assert {step.get("id") for step in job["steps"]
+            if step.get("continue-on-error")} == {"macos-report"}
     assert "--reruns" not in serialized
     assert "pytest-rerunfailures" not in serialized
     assert "|| true" not in test_step["run"]
@@ -2171,7 +2324,8 @@ def test_ubuntu_quality_keeps_targeted_pr_tests_and_full_ci_uses_balanced_matrix
     assert "maxfail_args+=(--maxfail=3)" in full_test_step["run"]
     assert '"${maxfail_args[@]}"' in full_test_step["run"]
     assert "--reruns" not in json.dumps(ubuntu_full, sort_keys=True)
-    assert all("continue-on-error" not in step for step in ubuntu_full["steps"])
+    assert {step.get("id") for step in ubuntu_full["steps"]
+            if step.get("continue-on-error")} == {"ubuntu-report"}
 
 
 def test_manual_workflows_reference_existing_test_files() -> None:
