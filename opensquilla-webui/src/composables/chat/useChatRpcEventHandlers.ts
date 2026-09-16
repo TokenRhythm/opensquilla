@@ -53,6 +53,7 @@ import {
   taskTerminalStatus as eventTaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { dedupeTerminalErrorNotices } from '@/utils/chat/terminalErrorNotices'
 import {
   useChatSteerDelivery,
   type ChatSteerDeliveryApi,
@@ -2121,6 +2122,23 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // Queued/Stop terminals have separate ownership exceptions below. They
     // must not teach the current renderer another turn's generation identity.
     if (!isCurrentGenerationPayload(payloadObj, isCurrentTaskPayload(payloadObj))) return
+    const noticeTurnId = payloadObj.terminalOutcome?.turnId || payloadTurnId(payloadObj)
+    if (
+      (eventKind === 'turn-failed' || eventKind === 'task-failed' || eventKind === 'task-timed-out')
+      && noticeTurnId
+      && messages.value.some(message => message.role === 'error'
+        && message.terminalNotice && message.turnId === noticeTurnId)
+    ) {
+      if (!acceptStreamSeq(payloadObj)) return
+      messages.value = dedupeTerminalErrorNotices([...messages.value, {
+        role: 'error', text: eventSessionErrorMessage(payloadObj),
+        errorCode: payloadObj.error_class ?? payloadObj.code,
+        turnId: noticeTurnId, turnOutcome: payloadObj.terminalOutcome,
+        terminalNotice: true, ts: new Date().toISOString(),
+      }])
+      options.scheduleHistorySync()
+      return
+    }
     const taskSucceededFallback = eventKind === 'task-succeeded'
     const terminalStatus = eventTaskTerminalStatus(eventKind)
     const terminalEvent = isTerminalEvent(eventKind)
@@ -2200,7 +2218,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
     const normalized = normalizeTaskTerminalEvent(eventKind, payloadObj)
     if (normalized && isStaleEpoch(payloadObj)) return
-    if (normalized && !stream.isStreaming.value) {
+    if (normalized && !stream.isStreaming.value && normalized.kind !== 'turn-failed') {
       markTaskSettled(payloadObj)
       activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
       options.scheduleHistorySync()
@@ -2373,8 +2391,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       markTaskSettled(payload)
       options.clearPendingRouterDecision()
       clearLiveThinking()
-      const terminalTurnId = payloadTurnId(payload)
       const turnOutcome = rawPayload.terminalOutcome
+      const terminalTurnId = turnOutcome?.turnId || payloadTurnId(payload)
       if (turnOutcome?.statusHistory?.length) {
         stream.restoreStatusHistory?.(turnOutcome.statusHistory)
       }
@@ -2393,6 +2411,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           errorCode,
           serverMessage,
           turnOutcome?.replaySafe === true,
+          turnOutcome?.failureKind,
         ),
         errorCode,
         turnId: terminalTurnId || undefined,
@@ -2400,6 +2419,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         terminalNotice: true,
         ts: new Date().toISOString(),
       })
+      messages.value = dedupeTerminalErrorNotices(messages.value)
       options.scheduleHistorySync()
       if (activeTaskGroups.value.size > 0) {
         options.applySessionRunState(activeTaskGroupRunState(payload))

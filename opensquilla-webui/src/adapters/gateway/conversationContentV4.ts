@@ -303,7 +303,11 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
     if (typeof turnId === 'string') result.completedTurnId = turnId.trim()
   }
   if (kind === 'turn-failed' || kind === 'task-failed' || kind === 'task-timed-out' || kind === 'task-abandoned') {
-    result.terminalOutcome = normalizeTurnOutcome({ ...source, turn_id: taskId, status: 'failed' })
+    result.terminalOutcome = normalizeTurnOutcome({
+      ...source,
+      turn_id: source.turn_id ?? source.turnId ?? taskId,
+      status: kind === 'task-timed-out' ? 'timeout' : kind === 'task-abandoned' ? 'abandoned' : 'failed',
+    })
     const errorCode = usageAccountingErrorCode(source)
     if (errorCode) result.error_class = errorCode
   }

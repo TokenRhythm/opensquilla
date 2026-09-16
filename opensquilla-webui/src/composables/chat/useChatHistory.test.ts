@@ -3321,6 +3321,38 @@ describe('useChatHistory optimistic local rows', () => {
     expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
   })
 
+  it('recovers a provider card from outcome, then merges its durable row across pages', async () => {
+    const { api, historyFixture, messages } = makeHistory(true)
+    const outcome = {
+      turnId: 'provider-turn', taskId: 'provider-turn', status: 'failed',
+      outcome: { kind: 'failed', failure_kind: 'rate_limited', error_id: 'abcdef01', error_class: '429' },
+    }
+    historyFixture.mockResolvedValueOnce({
+      messages: [{
+        id: 'answer', messageId: 'answer', role: 'assistant', text: 'Partial answer',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId: 'provider-turn' },
+      }],
+      turnOutcomes: [outcome], hasMore: true, oldestCursor: 'answer', newestCursor: 'answer', scope: 'session',
+    }).mockResolvedValueOnce({
+      messages: [{
+        id: 'error', messageId: 'error', role: 'system', text: 'Error: safe fallback (ref: abcdef01)',
+        createdAt: '2026-07-07T10:00:00Z', turnContext: { turnId: 'provider-turn' },
+      }],
+      turnOutcomes: [outcome], hasMore: false, oldestCursor: 'error', newestCursor: 'error', scope: 'session',
+    })
+    await api.loadHistory()
+    const initial = messages.value.find(message => message.role === 'error')
+    expect(initial?.messageId).toBe('terminal-error:provider-turn')
+    expect(initial?.turnOutcome).toMatchObject({ failureKind: 'rate_limited', errorId: 'abcdef01' })
+    await api.loadEarlierHistory()
+    const errors = messages.value.filter(message => message.role === 'error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]?.messageId).toBe('error')
+    expect(errors[0]?.text).toBe(initial?.text)
+    expect(errors[0]?.turnOutcome?.errorId).toBe('abcdef01')
+    expect(messages.value.find(message => message.role === 'assistant')?.text).toBe('Partial answer')
+  })
+
   it('keeps exact-turn optimistic usage activity through repeated history catch-up', async () => {
     const pendingResponse: SessionReadHistoryPageFixture = {
       messages: [{

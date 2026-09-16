@@ -48,6 +48,7 @@ import {
   activitySnapshotMatchesMessage,
 } from '@/utils/chat/activitySnapshot'
 import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
+import { dedupeTerminalErrorNotices } from '@/utils/chat/terminalErrorNotices'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 import { normalizePromptAnnotationSnapshot } from '@/utils/chat/promptAnnotationHistory'
@@ -406,9 +407,10 @@ function attachHistoryTurnOutcomes(
         : { ...activitySnapshot, complete: false }
       : undefined
     const usageBarrier = isUsageAccountingBarrier(outcome.errorClass)
-    const durableLocalizedError = (usageBarrier || isImageInputUnsupported(outcome.errorClass))
-      && message.role === 'system'
-      && message.text.trimStart().startsWith('Error:')
+    const durableLocalizedError = (usageBarrier || isImageInputUnsupported(outcome.errorClass)
+      || Boolean(outcome.failureKind) || outcome.errorId !== undefined)
+      && (message.role === 'error' || (message.role === 'system'
+        && message.text.trimStart().startsWith('Error:')))
     return {
       ...message,
       ...(durableLocalizedError
@@ -418,6 +420,7 @@ function attachHistoryTurnOutcomes(
               outcome.errorClass,
               outcome.terminalMessage || message.text,
               outcome.replaySafe === true,
+              outcome.failureKind,
             ),
             errorCode: outcome.errorClass,
             terminalNotice: true,
@@ -494,14 +497,16 @@ function attachHistoryTurnOutcomes(
     enriched.splice(insertionIndex, 0, activityOnlyMessage)
   }
 
-  // The task outcome is the durable authority for a pre-provider usage
-  // barrier. Transcript error rows are best-effort and may be absent from a
-  // compacted or paginated window, so materialize the retry card whenever the
-  // outcome has no matching terminal row in this page.
+  // The task outcome is the durable authority for these terminal failures.
+  // Transcript error rows are best-effort and may be absent from a compacted
+  // or paginated window, so recover the notice when its identified turn is
+  // present but has no matching error row in this page.
   for (const outcome of outcomes) {
     if (
       !isUsageAccountingBarrier(outcome.errorClass)
       && !isImageInputUnsupported(outcome.errorClass)
+      && !outcome.failureKind
+      && outcome.errorId === undefined
     ) continue
     if (enriched.some(message =>
       message.turnId === outcome.turnId && message.role === 'error',
@@ -516,6 +521,7 @@ function attachHistoryTurnOutcomes(
         outcome.errorClass,
         outcome.terminalMessage || '',
         outcome.replaySafe === true,
+        outcome.failureKind,
       ),
       ts: outcome.finishedAt ?? null,
       turnId: outcome.turnId,
@@ -526,39 +532,7 @@ function attachHistoryTurnOutcomes(
       terminalNotice: true,
     })
   }
-  return enriched
-}
-
-function dedupeSyntheticUsageBarrierErrors(messages: ChatMessage[]): ChatMessage[] {
-  const durableErrorTurns = new Set(
-    messages
-      .filter(message =>
-        message.role === 'error'
-        && Boolean(message.turnId)
-        && (
-          isUsageAccountingBarrier(message.errorCode)
-          || isImageInputUnsupported(message.errorCode)
-        )
-        && !message.messageId?.startsWith('terminal-error:'),
-      )
-      .map(message => message.turnId!),
-  )
-  const seenSynthetic = new Set<string>()
-  return messages.filter(message => {
-    if (
-      message.role !== 'error'
-      || !message.turnId
-      || !(
-        isUsageAccountingBarrier(message.errorCode)
-        || isImageInputUnsupported(message.errorCode)
-      )
-      || !message.messageId?.startsWith('terminal-error:')
-    ) return true
-    if (durableErrorTurns.has(message.turnId)) return false
-    if (seenSynthetic.has(message.messageId)) return false
-    seenSynthetic.add(message.messageId)
-    return true
-  })
+  return dedupeTerminalErrorNotices(enriched)
 }
 
 type AcceptedEnsembleMode = 'ensemble' | 'llm_ensemble'
@@ -1315,7 +1289,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         const existing = new Set(previousTranscript.map(messageKey))
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
-            dedupeSyntheticUsageBarrierErrors([
+            dedupeTerminalErrorNotices([
               ...mapped.filter(msg => !existing.has(messageKey(msg))),
               ...previousTranscript,
             ]),
@@ -1340,7 +1314,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         )
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
-            dedupeSyntheticUsageBarrierErrors(
+            dedupeTerminalErrorNotices(
               reconcileClientTerminalNotices(previousTranscript, nextMessages),
             ),
           ),

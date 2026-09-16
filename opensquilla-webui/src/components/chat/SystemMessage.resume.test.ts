@@ -5,6 +5,9 @@ import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import SystemMessage from './SystemMessage.vue'
+import { copyTextWithFallback } from '@/utils/browser'
+
+vi.mock('@/utils/browser', () => ({ copyTextWithFallback: vi.fn().mockResolvedValue(undefined) }))
 
 function errorMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
   return {
@@ -50,13 +53,37 @@ beforeEach(() => {
 })
 
 describe('SystemMessage sandbox resume', () => {
+  it('copies only a validated diagnostic id and never offers provider replay', async () => {
+    const { app, el } = await mountMsg(errorMessage({
+      text: 'safe fallback', errorCode: '429', turnId: 't',
+      turnOutcome: { turnId: 't', status: 'failed', failureKind: 'rate_limited', errorId: 'abcdef01', retryable: true },
+    }), undefined, undefined, true)
+    expect(el.textContent).toContain('rate-limiting requests')
+    const button = el.querySelector<HTMLButtonElement>('.msg-error__copy')
+    expect(button?.textContent).toContain('Copy diagnostic ID')
+    button?.click()
+    await nextTick()
+    expect(copyTextWithFallback).toHaveBeenCalledWith('abcdef01')
+    expect(el.querySelectorAll('button')).toHaveLength(1)
+    app.unmount()
+  })
+
+  it.each([undefined, null, 'INVALID1'])('hides copy for absent or invalid reference %s', async errorId => {
+    const { app, el } = await mountMsg(errorMessage({
+      text: 'safe fallback (ref: abcdef01)', turnId: 't',
+      turnOutcome: { turnId: 't', status: 'failed', errorId },
+    }))
+    expect(el.querySelector('.msg-error__copy')).toBeNull()
+    app.unmount()
+  })
+
   it('renders a Resume button for a sandbox-pause error and emits resume once on click', async () => {
     const onResume = vi.fn()
     const { app, el } = await mountMsg(
       errorMessage({ errorCode: 'sandbox_threshold_exceeded' }),
       onResume,
     )
-    const btn = el.querySelector<HTMLButtonElement>('.msg-error-card__resume')
+    const btn = el.querySelector<HTMLButtonElement>('.msg-error__resume')
     expect(btn).not.toBeNull()
     expect(btn?.textContent).toContain('Resume execution')
 
@@ -73,13 +100,13 @@ describe('SystemMessage sandbox resume', () => {
 
   it('does not render a Resume button for other terminal error codes', async () => {
     const { app, el } = await mountMsg(errorMessage({ errorCode: 'iteration_timeout' }))
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
   it('does not render a Resume button when the error carries no code', async () => {
     const { app, el } = await mountMsg(errorMessage())
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
@@ -87,7 +114,7 @@ describe('SystemMessage sandbox resume', () => {
     const { app, el } = await mountMsg(
       errorMessage({ role: 'system', displayRole: 'system', errorCode: 'sandbox_threshold_exceeded' }),
     )
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
@@ -110,10 +137,10 @@ describe('SystemMessage sandbox resume', () => {
     })
     const { app, el } = await mountMsg(message, undefined, onRetry, true)
 
-    expect(el.querySelector('.msg-error-card__heading')?.textContent).toContain(
-      'Usage accounting temporarily unavailable',
+    expect(el.querySelector('.msg-error__text')?.textContent).toContain(
+      'The provider request was not sent',
     )
-    const btn = el.querySelector<HTMLButtonElement>('.msg-error-card__resume')
+    const btn = el.querySelector<HTMLButtonElement>('.msg-error__resume')
     expect(btn?.textContent).toContain('Retry')
     btn?.click()
     await nextTick()
@@ -145,10 +172,10 @@ describe('SystemMessage sandbox resume', () => {
       },
     }), undefined, undefined, true)
 
-    expect(el.querySelector('.msg-error-card__heading')?.textContent).toContain(
-      'Usage accounting temporarily unavailable',
+    expect(el.querySelector('.msg-error__text')?.textContent).toContain(
+      'Earlier work in this turn',
     )
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
@@ -317,7 +344,7 @@ describe('SystemMessage sandbox resume', () => {
       errorCode: 'usage_accounting_busy',
       turnOutcome,
     }), undefined, undefined, true)
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
@@ -373,7 +400,7 @@ describe('SystemMessage sandbox resume', () => {
       },
     }))
 
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 })

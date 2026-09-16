@@ -419,6 +419,9 @@ export interface ChatTurnOutcome {
   retryable?: boolean
   documentMutationOutcome?: DocumentMutationOutcome
   errorClass?: string
+  failureKind?: string
+  /** null retains invalid/conflicting evidence across notice merges. */
+  errorId?: string | null
   terminalMessage?: string
   retryAfterMs?: number
   statusHistory?: import('./parts').StatusPart[]

@@ -217,6 +217,48 @@ function createHarness(options: {
 }
 
 describe('live tool result actions', () => {
+  it.each([
+    ['session.event.error', 'task.failed'],
+    ['task.failed', 'session.event.error'],
+    ['task.failed', 'task.failed'],
+  ])('merges provider error delivery %s then %s into one card', (first, second) => {
+    const h = createHarness({ endStreaming: messages => {
+      messages.push({ role: 'assistant', text: 'Partial answer', ts: null })
+    } })
+    h.activeStreamTaskId.value = 'provider-turn'
+    const payload = {
+      key: h.sessionKey.value, task_id: 'provider-turn', turn_id: 'provider-turn', code: '429',
+      terminal_message: 'Safe provider error',
+      turn_outcome: { failure_kind: 'rate_limited', error_id: 'abcdef01', kind: 'failed' },
+    }
+    try {
+      h.api.handlers.onWireEventFixture(first!, { ...payload, stream_seq: 1 })
+      h.stream.isStreaming.value = false
+      h.api.handlers.onWireEventFixture(second!, { ...payload, stream_seq: 2 })
+      expect(h.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+      expect(h.messages.value.find(message => message.role === 'error')?.turnOutcome).toMatchObject({
+        turnId: 'provider-turn', failureKind: 'rate_limited', errorId: 'abcdef01', status: 'failed',
+      })
+      expect(h.messages.value.find(message => message.role === 'assistant')?.text).toBe('Partial answer')
+      expect(h.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(h.applySessionRunState.mock.calls.some(([state]) => state.run_status === 'idle')).toBe(false)
+    } finally { h.stop() }
+  })
+
+  it('renders a task failure fallback for its turn even without an active stream', () => {
+    const h = createHarness()
+    h.activeStreamTaskId.value = 'provider-turn'
+    h.stream.isStreaming.value = false
+    try {
+      h.api.handlers.onWireEventFixture('task.failed', {
+        key: h.sessionKey.value, task_id: 'provider-turn', turn_id: 'provider-turn', stream_seq: 1,
+        code: '401', terminal_message: 'Safe provider error',
+        turn_outcome: { failure_kind: 'auth_invalid', error_id: 'abcdef01', kind: 'failed' },
+      })
+      expect(h.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+    } finally { h.stop() }
+  })
+
   const payload = {
     key: 'agent:main:test', task_id: 'turn-preview', epoch: 0, stream_seq: 1,
     id: 'preview-1', name: 'open_workspace_preview', result: '{}',
