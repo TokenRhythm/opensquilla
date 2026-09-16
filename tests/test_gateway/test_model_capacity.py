@@ -506,3 +506,36 @@ async def test_custom_anthropic_listing_auth_and_malformed_response(monkeypatch,
     assert (
         requests[0].headers["Authorization" if auth_style == "bearer" else "x-api-key"] == expected
     )
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing_endpoint", "unauthorized", "unreachable", "malformed"],
+)
+async def test_custom_anthropic_listing_fallback_keeps_identity_without_declared_limits(
+    monkeypatch, failure,
+):
+    from opensquilla.provider.anthropic import AnthropicProvider
+    from opensquilla.provider.protocol import ProviderModelListingResponseError
+
+    def respond(request):
+        assert request.method == "GET"
+        assert request.url.path == "/v1/models"
+        if failure == "unreachable":
+            raise httpx.ConnectError("synthetic connection failure", request=request)
+        status = {"missing_endpoint": 404, "unauthorized": 401, "malformed": 200}[failure]
+        return httpx.Response(status, json={"unexpected": "synthetic response"})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda **kwargs: original(**kwargs, transport=httpx.MockTransport(respond)),
+    )
+    provider = AnthropicProvider(
+        "", model=MODEL, provider_id="custom_anthropic", base_url="https://capacity.invalid/v1",
+    )
+    rows = await provider.list_models()
+    assert [(row.provider, row.model_id) for row in rows] == [("custom_anthropic", MODEL)]
+    assert rows[0].context_window == rows[0].max_output_tokens == 0
+    assert rows[0].metadata is None
+    with pytest.raises((httpx.HTTPError, ProviderModelListingResponseError)):
+        await provider.list_models(raise_on_error=True)

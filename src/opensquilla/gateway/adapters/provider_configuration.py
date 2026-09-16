@@ -20,7 +20,10 @@ from opensquilla.gateway.model_routing import (
 from opensquilla.gateway.provider_runtime import resolve_provider_selector_config
 from opensquilla.gateway.provider_status_runtime import read_provider_status
 from opensquilla.gateway.setup_config_runtime import sync_media_runtime
+from opensquilla.provider.model_catalog import ModelCatalog as ProviderModelCatalog
 from opensquilla.provider.model_catalog import shared_catalog
+
+_catalog = ProviderModelCatalog()
 
 
 def _positive_int(value: object) -> int | None:
@@ -69,7 +72,9 @@ def model_info_to_projection(model: dict[str, Any]) -> dict[str, Any]:
 
     provider_id = str(model.get("provider", "") or "")
     model_id = str(model.get("model_id", "") or "")
-    entry = shared_catalog().resolve_entry(model_id, provider=provider_id)
+    # Capacity is enriched separately from the shared runtime resolver. Keep
+    # capability/source projection independent of mutable session overrides.
+    entry = _catalog.resolve_entry(model_id, provider=provider_id)
     capabilities: list[str] = ["chat"]
     context_window = model.get("context_window", 0)
     max_output_tokens = model.get("max_output_tokens", 0)

@@ -1336,7 +1336,10 @@ class AnthropicProvider:
             except (httpx.HTTPError, ValueError, TypeError, ProviderModelListingResponseError):
                 if raise_on_error:
                     raise
-                return []
+                # Some compatible servers implement messages but no model list.
+                # Preserve their configured model without inventing capacity
+                # metadata or treating it as a successful discovery result.
+                return [ModelInfo(provider=self.provider_id, model_id=self._model)]
         rows: list[ModelInfo] = []
         model_ids = (
             _LISTING_MODEL_IDS if self._listing_model_ids is None else self._listing_model_ids

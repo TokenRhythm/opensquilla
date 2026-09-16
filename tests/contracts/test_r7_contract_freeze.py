@@ -13,6 +13,7 @@ from opensquilla.contracts.generated.v4.gateway_contract_registry import (
 from scripts.contracts.generate_gateway_contracts import discover_contracts
 
 EXPECTED_METHOD_METADATA = {
+    "models.capacity.resolve": ("operator.read", "query", "read-only"),
     "memory.import.info": ("operator.read", "query", "read-only"),
     "memory.import.start": ("operator.admin", "command", "idempotent"),
     "memory.import.status": ("operator.admin", "query", "read-only"),
@@ -234,9 +235,9 @@ def _specs_by_wire_name():
 def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     specs = discover_contracts()
 
-    assert len(specs) == 224
+    assert len(specs) == 225
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 214,
+        "method": 215,
         "event": 10,
     }
     assert EXPECTED_METHOD_METADATA.keys() <= {spec.wire_name for spec in specs}
