@@ -144,7 +144,7 @@ const pausedMessage = computed(() => {
   return t(`settings.memoryImport.jobStates.${current?.status || 'failed'}.description`)
 })
 
-function rpcErrorCode(error: unknown): string {
+function memoryImportErrorCode(error: unknown): string {
   return error instanceof MemoryProfileImportError ? error.code : ''
 }
 
@@ -249,7 +249,7 @@ async function loadInfo() {
       state.value = 'unsupported'
       return
     }
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     state.value = 'error'
   }
 }
@@ -299,7 +299,7 @@ async function requestPreview() {
       state.value = 'unsupported'
       return
     }
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     previewErrorVisible.value = true
     state.value = 'input'
   }
@@ -336,7 +336,7 @@ async function pollJob() {
     const result = await memoryImport.status(current.jobId)
     await handleJob(result)
   } catch (error) {
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     state.value = 'error'
   }
 }
@@ -464,7 +464,7 @@ async function applyPreview() {
     applyIdempotencyKey.value = ''
     if (isNoChangeImport) focusPreviewHeadingAfterTransition()
   } catch (error) {
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     if (
       errorCode.value === 'MEMORY_IMPORT_PREVIEW_EXPIRED'
       || errorCode.value === 'MEMORY_IMPORT_STALE_PREVIEW'
@@ -522,7 +522,7 @@ async function undoRecent() {
       state.value = 'unsupported'
       return
     }
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     state.value = 'error'
   } finally {
     busy.value = false

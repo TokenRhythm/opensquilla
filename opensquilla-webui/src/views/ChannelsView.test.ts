@@ -306,10 +306,12 @@ async function mountChannelsView(options: {
       pairings = pairings.map(pairing => pairing.pairingId === params?.pairingId
         ? { ...pairing, status: 'approved', approvedAt: '2026-07-13T10:00:00Z' }
         : pairing)
+      const pairing = pairings.find(item => item.pairingId === params?.pairingId)
+      if (!pairing) throw new Error('pairing not found')
       // Mirrors the backend contract: the approval COMMITS even when the
       // admin grant fails, reported non-fatally via adminGranted + warnings.
       if (params?.asAdmin && options.adminGrantFails) {
-        return { status: 'approved', adminGranted: false, warnings: ['admin grant failed'] }
+        return { pairing, adminGranted: false, warnings: ['admin grant failed'] }
       }
       if (params?.asAdmin) {
         const target = pairings.find(pairing => pairing.pairingId === params?.pairingId)
@@ -319,11 +321,13 @@ async function mountChannelsView(options: {
           adminSendersMap['ops-slack'] = [...set]
         }
       }
-      return { status: 'approved', adminGranted: Boolean(params?.asAdmin) }
+      return { pairing, adminGranted: Boolean(params?.asAdmin) }
     }
     if (method === 'channels.pairing.revoke') {
+      const pairing = pairings.find(item => item.pairingId === params?.pairingId)
+      if (!pairing) throw new Error('pairing not found')
       pairings = pairings.filter(pairing => pairing.pairingId !== params?.pairingId)
-      return { status: 'revoked' }
+      return { pairing: { ...pairing, status: 'revoked' } }
     }
     if (method === 'channels.admin.set') {
       const channel = String(params?.channelName)
@@ -414,7 +418,7 @@ async function mountChannelsView(options: {
     ready: vi.fn(async () => undefined),
   }, {
     subscribe: vi.fn((_event: string, handler: (payload: unknown) => void) => {
-      emitStatus = () => handler(undefined)
+      emitStatus = () => handler({ name: 'ops-slack', status: 'running' })
       return { close: vi.fn() }
     }),
   })

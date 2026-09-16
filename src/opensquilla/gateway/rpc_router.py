@@ -22,11 +22,32 @@ import os
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
+from opensquilla.application.conversation_ancillary import (
+    RouteFeedbackPort,
+    RouteFeedbackResult,
+    SubmitRouteFeedback,
+)
+from opensquilla.application.observability import (
+    RouterLearningQuery,
+    RouterLearningStatus,
+    RouterLearningStatusPort,
+    RouterLearningStatusResult,
+)
 from opensquilla.engine.steps.router_decision_record import get_decision_writer
+from opensquilla.gateway.adapters.conversation_ancillary import (
+    GatewayConversationAncillaryAdapter,
+)
+from opensquilla.gateway.adapters.conversation_ancillary_contract import (
+    register_conversation_ancillary_contract,
+)
+from opensquilla.gateway.adapters.observability_contract import (
+    register_observability_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.protocol import ERROR_INVALID_REQUEST
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.persistence.router_decision_writer import sanitize_token
@@ -118,8 +139,7 @@ async def _handle_router_decisions_list(params: Any, ctx: RpcContext) -> dict[st
     return {"decisions": [_wire_decision(row) for row in rows]}
 
 
-@_d.method("router.feedback.submit", scope="operator.write")
-async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def _submit_route_feedback(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Record a user rating (up/down/neutral) for one routing decision.
 
     The F7 feedback intake, live: ``decisionId`` is resolved through the
@@ -133,14 +153,19 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
     The rating never mutates the ``router_decisions`` table or routing state;
     consumption happens offline at dataset-build time.
     """
-    p = params if isinstance(params, dict) else {}
-    decision_id = sanitize_token(p.get("decisionId") or p.get("decision_id"))
+    if isinstance(params, SubmitRouteFeedback):
+        decision_value: object = params.decision_id
+        rating: object = params.rating
+    else:
+        raw = params if isinstance(params, dict) else {}
+        decision_value = raw.get("decisionId") or raw.get("decision_id")
+        rating = raw.get("rating")
+    decision_id = sanitize_token(decision_value)
     if decision_id is None:
         raise RpcHandlerError(
             ERROR_INVALID_REQUEST,
             "decisionId must be an id token",
         )
-    rating = p.get("rating")
     if not isinstance(rating, str) or rating not in _FEEDBACK_RATINGS:
         raise RpcHandlerError(
             ERROR_INVALID_REQUEST,
@@ -215,8 +240,10 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
     return {"accepted": True, "recorded": rating}
 
 
-@_d.method("router.selflearning.status", scope="operator.read")
-async def _handle_selflearning_status(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def read_router_learning_status(
+    request: RouterLearningQuery | str,
+    ctx: RpcContext,
+) -> dict[str, Any]:
     """Read-only status of the router self-learning loop for one agent.
 
     Everything here is derived from on-disk state the loop already writes
@@ -225,12 +252,11 @@ async def _handle_selflearning_status(params: Any, ctx: RpcContext) -> dict[str,
     the single source the Web UI status card and CLI doctor consume, so gate
     reason codes are surfaced verbatim for the client to localize.
 
-    Params (optional): ``agentId`` (defaults to ``main``).
+    The Gateway Adapter supplies a normalized domain query.
     """
 
-    p = params if isinstance(params, dict) else {}
-    agent_raw = p.get("agentId") or p.get("agent_id") or "main"
-    agent_id = sanitize_token(agent_raw)
+    agent_id_value = request.agent_id if isinstance(request, RouterLearningQuery) else request
+    agent_id = sanitize_token(agent_id_value)
     if agent_id is None:
         raise RpcHandlerError(ERROR_INVALID_REQUEST, "agentId must be an id token")
 
@@ -355,3 +381,63 @@ async def _handle_selflearning_status(params: Any, ctx: RpcContext) -> dict[str,
         payload["error"] = "status_partial"
 
     return payload
+
+
+class _GatewayRouterLearningStatusRuntime(RouterLearningStatusPort):
+    """Read router-learning state from its persisted/runtime primitives."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def snapshot(self, query: RouterLearningQuery) -> RouterLearningStatusResult:
+        return cast(
+            RouterLearningStatusResult,
+            await read_router_learning_status(query, self._ctx),
+        )
+
+
+async def _router_selflearning_status_contract(
+    params: Any, ctx: RpcContext
+) -> dict[str, Any]:
+    p = params if isinstance(params, dict) else {}
+    agent_id = p.get("agentId") or p.get("agent_id") or "main"
+    status = RouterLearningStatus(_GatewayRouterLearningStatusRuntime(ctx))
+    return dict(await status.read(RouterLearningQuery(str(agent_id))))
+
+
+_handle_selflearning_status = register_observability_contract(
+    _d,
+    "router.selflearning.status",
+    _router_selflearning_status_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+class _GatewayRouteFeedbackPort(RouteFeedbackPort):
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult:
+        return cast(
+            RouteFeedbackResult,
+            await _submit_route_feedback(command, self._context),
+        )
+
+
+async def _handle_router_feedback_submit_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    adapter = GatewayConversationAncillaryAdapter(feedback=_GatewayRouteFeedbackPort(ctx))
+    return await adapter.submit_feedback(params)
+
+
+_handle_router_feedback_submit_generated_contract = (
+    register_conversation_ancillary_contract(
+        _d,
+        "router.feedback.submit",
+        _handle_router_feedback_submit_contract,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+)

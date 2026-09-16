@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/skills/skills-search.schema.json",
+  "title": "OpenSquilla skills.search Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": { "$ref": "#/$defs/Request" },
+    "response": { "$ref": "#/$defs/Response" }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "skills.search",
+    "kind": "query",
+    "scope": "operator.read",
+    "guestAllowed": false,
+    "idempotency": "read-only",
+    "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "skills.search" },
+    "request": "#/$defs/Request",
+    "params": "#/$defs/Params",
+    "response": "#/$defs/Response",
+    "result": "#/$defs/Result",
+    "errors": [
+      { "code": "INVALID_REQUEST" },
+      { "code": "UNAUTHORIZED" },
+      { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "Params": {
+      "type": "object", "additionalProperties": true, "required": ["query"],
+      "properties": {
+        "query": { "type": "string" },
+        "limit": { "type": ["integer", "string", "null"] },
+        "source": { "type": ["string", "null"] }
+      }
+    },
+    "Request": {
+      "type": "object", "additionalProperties": false, "required": ["type", "id", "method"],
+      "properties": {
+        "type": { "const": "req" }, "id": { "type": "string" },
+        "method": { "const": "skills.search" },
+        "params": { "anyOf": [{ "$ref": "#/$defs/Params" }, { "type": "null" }] }
+      }
+    },
+    "SearchResult": {
+      "type": "object", "additionalProperties": true,
+      "required": ["name", "description", "version", "author", "source", "trust_level", "identifier", "installReference", "installed"],
+      "properties": {
+        "name": { "type": "string" }, "description": { "type": "string" },
+        "version": { "type": ["string", "null"] }, "author": { "type": ["string", "null"] },
+        "source": { "type": "string" }, "trust_level": { "type": "string" },
+        "identifier": { "type": "string" }, "installReference": { "type": "string" },
+        "installed": { "type": "boolean" }
+      }
+    },
+    "Result": {
+      "type": "object", "additionalProperties": false, "required": ["results"],
+      "properties": {
+        "results": { "type": "array", "items": { "$ref": "#/$defs/SearchResult" } },
+        "diagnostics": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "message": { "type": "string" },
+        "partial": { "type": "boolean" },
+        "allSourcesUnavailable": { "type": "boolean" }
+      }
+    },
+    "RpcError": {
+      "type": "object", "additionalProperties": true, "required": ["code", "message"],
+      "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
+    },
+    "Ok": {
+      "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "payload"],
+      "properties": {
+        "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": true },
+        "payload": { "$ref": "#/$defs/Result" }
+      }
+    },
+    "Err": {
+      "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "error"],
+      "properties": {
+        "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": false },
+        "payload": { "type": "null" }, "error": { "$ref": "#/$defs/RpcError" }
+      }
+    },
+    "Response": { "oneOf": [{ "$ref": "#/$defs/Ok" }, { "$ref": "#/$defs/Err" }] }
+  }
+}

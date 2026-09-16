@@ -164,8 +164,11 @@ class _RecordingCompactionPersist:
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None:
         self.calls.append(
             {
@@ -185,8 +188,11 @@ class _RecordingCompactionPersist:
                 "removed_count": removed_count,
                 "source_entries": source_entries,
                 "source_preimage": source_preimage,
+                "source_context_fingerprint": source_context_fingerprint,
                 "source_boundary_message_id": source_boundary_message_id,
                 "source_boundary_entry_id": source_boundary_entry_id,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
             }
         )
         if self.raises is not None:
@@ -291,8 +297,11 @@ def _make_input(
     tool_context: Any | None = None,
     compaction_source_entries: tuple[Any, ...] | None = None,
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+    compaction_source_context_fingerprint: str | None = None,
     compaction_source_boundary_message_id: str | None = None,
     compaction_source_boundary_entry_id: int | None = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
     execution_context: TurnExecutionContext | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
@@ -318,10 +327,13 @@ def _make_input(
         tool_context=tool_context,
         compaction_source_entries=compaction_source_entries,
         compaction_source_preimage=compaction_source_preimage,
+        compaction_source_context_fingerprint=compaction_source_context_fingerprint,
         compaction_source_boundary_message_id=(
             compaction_source_boundary_message_id
         ),
         compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
         input_mode=input_mode,
         execution_context=execution_context,
     )
@@ -1432,10 +1444,23 @@ async def test_generated_artifact_adoption_failure_keeps_delivery() -> None:
 def test_error_handler_rewrites_timeout_envelope() -> None:
     state = _make_state()
     handler = _ErrorHandler()
-    result = handler.handle(ErrorEvent(message="x", code="timeout"), state)
+    event = ErrorEvent(
+        message="x", code="timeout", error_id="abcd1234",
+        failure_kind="transport_transient", generation_epoch=3,
+        retry_after_ms=8000, usage_call_index=2,
+        no_prior_provider_dispatch=False, replay_safe=False,
+    )
+    result = handler.handle(event, state)
     assert result is _SUPPRESS
     assert state.pending_error_event is not None
     assert state.pending_error_event.code == "llm_timeout"
+    assert state.pending_error_event.error_id == event.error_id
+    assert state.pending_error_event.failure_kind == event.failure_kind
+    assert state.pending_error_event.generation_epoch == event.generation_epoch
+    assert state.pending_error_event.retry_after_ms == event.retry_after_ms
+    assert state.pending_error_event.usage_call_index == event.usage_call_index
+    assert state.pending_error_event.no_prior_provider_dispatch is False
+    assert state.pending_error_event.replay_safe is False
 
 
 def test_error_handler_drops_unpaired_tool_use_on_incomplete_stream() -> None:
@@ -1676,8 +1701,11 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     inp = _make_input(
         compaction_source_entries=source_entries,
         compaction_source_preimage=source_preimage,
+        compaction_source_context_fingerprint="frozen-context",
         compaction_source_boundary_message_id="source-boundary",
         compaction_source_boundary_entry_id=7,
+        expected_session_id="session-admitted",
+        expected_session_epoch=7,
     )
     await handler.handle(
         CompactionEvent(
@@ -1695,8 +1723,11 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     assert persist.calls[0]["removed_count"] == 4
     assert persist.calls[0]["source_entries"] is source_entries
     assert persist.calls[0]["source_preimage"] is source_preimage
+    assert persist.calls[0]["source_context_fingerprint"] == "frozen-context"
     assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
     assert persist.calls[0]["source_boundary_entry_id"] == 7
+    assert persist.calls[0]["expected_session_id"] == "session-admitted"
+    assert persist.calls[0]["expected_session_epoch"] == 7
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
 
@@ -2310,6 +2341,42 @@ async def test_system_event_keeps_bare_marker_on_a_middle_tool_boundary() -> Non
         segment.get("type") == "text" and segment.get("text") == "NO_REPLY"
         for segment in inp.state.turn_segments
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_background_process_does_not_emit_stale_notice(returncode: int) -> None:
+    state = _make_state()
+    state.turn_segments.extend([
+        {
+            "type": "tool_result",
+            "name": "background_process",
+            "result": "session_id=process-a\ncommand: synthetic-job\nstatus: running",
+            "execution_status": {"status": "unknown", "reason": "background_running"},
+        },
+        {
+            "type": "tool_result",
+            "name": "process",
+            "result": json.dumps({
+                "status": "ok",
+                "action": "wait",
+                "exited": True,
+                "session": {"session_id": "process-a", "returncode": returncode},
+            }),
+            "execution_status": {"status": "success" if returncode == 0 else "error"},
+        },
+    ])
+    final_text = "Process completed." if returncode == 0 else "Process exited unsuccessfully."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(events=[DoneEvent(text=final_text, text_snapshot=final_text)])
+    )
+
+    yielded = await _drain(stage, _make_input(state=state))
+
+    assert all("could not confirm" not in getattr(event, "text", "") for event in yielded)
+    assert isinstance(yielded[-1], DoneEvent)
+    assert yielded[-1].text == final_text
+    assert yielded[-1].text_snapshot == final_text
 
 
 @pytest.mark.asyncio

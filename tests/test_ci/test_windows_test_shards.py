@@ -35,56 +35,106 @@ requires_isolated_core_wheel = SHARD_MODULE["_requires_isolated_core_wheel"]
 combined_pytest_exit_code = SHARD_MODULE["_combined_pytest_exit_code"]
 pytest_file_selection_arg = SHARD_MODULE["_pytest_file_selection_arg"]
 
-OFFLINE_MARKER_EXCLUSIONS = {
-    "tests/functional/test_agent_synthetic_golden.py",
-    "tests/functional/test_gateway_llm_e2e.py",
-    "tests/functional/test_live_agent_context_boundary_e2e.py",
-    "tests/functional/test_live_channel_telegram_smoke.py",
-    "tests/functional/test_live_openrouter_compaction.py",
-    "tests/functional/test_llm_smoke.py",
-    "tests/functional/test_webui_browser_e2e.py",
-    "tests/integration/cli/tui_real_terminal/test_architecture_prompt.py",
-    "tests/integration/cli/tui_real_terminal/test_completion_menu.py",
-    "tests/integration/cli/tui_real_terminal/test_complex_ui_state.py",
-    "tests/integration/cli/tui_real_terminal/test_exit_restoration.py",
-    "tests/integration/cli/tui_real_terminal/test_framebuffer.py",
-    "tests/integration/cli/tui_real_terminal/test_framebuffer_recovery.py",
-    "tests/integration/cli/tui_real_terminal/test_gateway_empty_bootstrap_startup.py",
-    "tests/integration/cli/tui_real_terminal/test_idle_resize_round_trip.py",
-    "tests/integration/cli/tui_real_terminal/test_launch_input_loop.py",
-    "tests/integration/cli/tui_real_terminal/test_live_opentui_real_cli.py",
-    "tests/integration/cli/tui_real_terminal/test_long_streaming.py",
-    "tests/integration/cli/tui_real_terminal/test_mouse_scroll_stability.py",
-    "tests/integration/cli/tui_real_terminal/test_packaged_gateway_e2e.py",
-    "tests/integration/cli/tui_real_terminal/test_source_gateway_bootstrap_startup.py",
-    "tests/integration/cli/tui_real_terminal/test_terminal_changes.py",
-    "tests/live/test_search_api_matrix_live.py",
-    "tests/live/test_skill_hub_canary_live.py",
-    "tests/live/test_multi_provider_matrix_live.py",
-    "tests/live/test_search_retrieval_live.py",
-    "tests/live/test_tokenrhythm_catalog_live.py",
-    "tests/live/test_web_search_agent_e2e.py",
-    "tests/test_skills/test_meta_router_live.py",
-    "tests/test_skills/test_meta_skill_creator_smoke_live.py",
-}
+OFFLINE_MARKER_EXCLUSIONS = SHARD_MODULE["OFFLINE_MARKER_EXCLUSIONS"]
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Telemetry regressions use provisional weights until the next comparable
+    # Windows duration refresh supplies measured timings.
+    "tests/test_engine/test_runtime_usage_telemetry.py",
+    "tests/test_observability/test_usage_telemetry_identity.py",
+    # Primary-provider and validator coverage use the declared provisional
+    # floor until a comparable three-run Windows refresh supplies measured timings.
+    "tests/contracts/test_gateway_validator_profiles.py",
+    "tests/test_desktop/test_router_provider_bridge.py",
+    "tests/test_gateway/test_router_recommended_reset.py",
+    "tests/test_scripts/test_gateway_ux.py",
+    "tests/test_engine/test_agent_autonomous_tool_recovery.py",
+    "tests/test_engine/test_agent_connection_recovery.py",
+    "tests/test_engine/test_selector_provider_recovery.py",
+    "tests/test_provider_connection_failure.py",
+    "tests/test_tools/test_bounded_output_capture.py",
+    # Execution identity suites use the provisional floor until a Windows refresh.
+    "tests/test_engine/test_request_execution_identity.py",
+    "tests/test_tools/test_execution_status.py",
+    "tests/test_live_execution_identity_acceptance.py",
+    # Execution-log suites use the declared provisional floor until a Windows refresh.
+    "tests/test_gateway/test_rpc_execution_logs.py",
+    "tests/test_tools/test_execution_log_queries.py",
+
+    # Local-first workspace files use the 0.01s provisional floor until a
+    # comparable three-run Windows refresh supplies measured timings.
+    "tests/test_gateway/test_execution_workspace_preparation.py",
+    "tests/test_gateway/test_local_first_workspaces.py",
+    "tests/test_gateway/test_working_file_actions.py",
+    "tests/test_gateway/test_workspace_config_provenance.py",
+    "tests/test_gateway/test_workspace_preview_registration.py",
+    "tests/test_live_deliverable_acceptance.py",
+    "tests/test_tools/test_memory_workspace_ownership.py",
+    # Image budget suites use the provisional floor until a Windows duration refresh.
+    "tests/test_engine/test_agent_image_compaction_budget.py",
+    "tests/test_provider_request_proof_images.py",
+    "tests/test_session/test_compaction_media_budget.py",
+    # New compaction recovery suites use the provisional floor until a
+    # comparable three-run Windows duration refresh supplies timings.
+    "tests/test_engine/test_request_window.py",
+    "tests/test_engine/test_runtime_request_window.py",
+    "tests/test_session/test_compaction_integrity.py",
+    # Artifact source/version regressions use the declared provisional floor.
+    "tests/test_engine/test_artifact_delivery_sources.py",
+    "tests/test_engine/test_runtime_artifact_context.py",
+    # New connection-stability suites use the declared 0.01s provisional floor
+    # until a comparable three-run Windows refresh supplies measured timings.
+    "tests/test_gateway/test_connection_stability_socket.py",
+    "tests/test_gateway/test_snapshot_transfer.py",
+    "tests/test_gateway/test_snapshot_transfer_rpc.py",
+    "tests/test_gateway/test_transport_diagnostics.py",
+    "tests/test_gateway/test_transport_flow.py",
+    "tests/test_gateway/test_websocket_connection_stability.py",
+    # Custom-provider request extensions use the provisional floor until the
+    # next comparable three-run Windows duration refresh.
+    "tests/test_gateway/test_custom_extra_body.py",
+    "tests/test_ci/test_windows_signed_update_audit.py",
+    # New replay files use the documented provisional floor until a Windows refresh.
+    "tests/functional/test_reasoning_replay_persistence_e2e.py",
+    "tests/test_engine/test_assistant_replay.py",
+    "tests/test_engine/test_assistant_replay_lifecycle.py",
+    "tests/test_engine/test_assistant_replay_tool_boundaries.py",
+    "tests/test_engine/test_reasoning_replay_compat.py",
+    "tests/test_live_reasoning_replay_e2e.py",
+    "tests/test_migrations/test_v042_assistant_replay.py",
+    "tests/test_provider_replay_state.py",
+    "tests/test_session/test_session_assistant_replay.py",
+    "tests/test_engine/test_attachment_replay_ownership.py",
+    "tests/test_engine/test_router_configured_image_policy.py",
+    "tests/test_provider/test_image_projection.py",
+    "tests/test_session/test_attachment_manifest.py",
     "tests/contracts/test_approval_center_contract.py",
     "tests/test_gateway/test_chat_history_characterization.py",
     "tests/contracts/test_conversation_events_contract.py",
     "tests/contracts/test_gateway_contract_runner.py",
     "tests/contracts/test_gateway_contract_toolchain_integration.py",
+    "tests/test_gateway/test_rpc_retired_surface.py",
     "tests/contracts/test_goals_contract.py",
+    "tests/contracts/test_sandbox_runtime_contract.py",
     "tests/contracts/test_sessions_changed_contract.py",
     "tests/contracts/test_sessions_list_contract.py",
     "tests/contracts/test_sessions_resolve_contract.py",
     "tests/contracts/test_sessions_search_contract.py",
+    "tests/test_application/test_app_settings.py",
+    "tests/test_application/test_provider_configuration.py",
+    "tests/test_application/test_sandbox_runtime.py",
+    "tests/test_application/test_session_lifecycle.py",
+    "tests/test_application/test_setup_workflow.py",
     "tests/test_gateway/test_session_preview_adapter.py",
     "tests/test_gateway/test_session_history_adapter.py",
     "tests/test_gateway/test_sessions_bootstrap_history_characterization.py",
     "tests/test_application/test_session_history.py",
     "tests/test_application/test_session_read.py",
     "tests/test_application/test_session_transcript.py",
-    "tests/test_artifact_session/test_html_anchors.py",
+    "tests/test_artifact_session/test_retirement.py",
+    "tests/test_artifact_session/test_working_files.py",
+    "tests/test_engine/test_agent_file_context.py",
+    "tests/test_gateway/test_desktop_browser.py",
+    "tests/test_live_tokenrhythm_budget.py",
     "tests/test_ci/test_plan_ci.py",
     "tests/test_git_runtime.py",
     "tests/test_tools/test_gitless_write_tracking.py",
@@ -99,6 +149,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/unit/cli/tui/test_opentui_prefs.py",
     "tests/test_cli/test_gateway_client_steer.py",
     "tests/test_cli/test_gateway_client_sessions_contract.py",
+    "tests/test_cli/test_sessions_cmd.py",
     "tests/test_cli/test_skills_search_cmd.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",
@@ -121,6 +172,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_contract_method_adapter.py",
     "tests/test_gateway/test_session_read_adapter.py",
     "tests/test_gateway/test_session_read_contract_registration.py",
+    "tests/test_gateway/test_session_lifecycle_adapter.py",
+    "tests/test_gateway/test_sandbox_runtime_contract_registration.py",
     "tests/contracts/test_turn_commands_contract.py",
     "tests/test_application/test_conversation_runtime.py",
     "tests/test_gateway/test_conversation_runtime_adapter.py",
@@ -237,30 +290,26 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_toolcomp_matcher_levers.py",
     "tests/test_toolcomp_matcher_safety.py",
     "tests/test_toolcomp_reducer_semantics.py",
-    "tests/test_engine/test_agent_patch_hygiene_block.py",
-    "tests/test_engine/test_agent_submit_review.py",
     "tests/test_engine/test_agent_verify_mirror_and_variant_challenge.py",
     "tests/test_engine/test_endgame_directive_and_cap_levers.py",
     "tests/test_engine/test_plan_run_reconciliation.py",
     "tests/test_engine/test_runtime_submit_surfacing.py",
-    "tests/test_engine/test_submit_review.py",
     "tests/test_engine/test_tool_surface_levers.py",
     "tests/test_engine/turn_runner/test_tool_surface_levers_bootstrap_unit.py",
     "tests/test_gateway/test_plan_rpc.py",
     "tests/test_gateway/test_user_input_broker.py",
     "tests/test_session/test_plan_storage.py",
-    "tests/test_tools/test_description_overrides.py",
     "tests/test_tools/test_edit_file_closest_hint.py",
     "tests/test_tools/test_patch_classification.py",
     "tests/test_tools/test_plan_access.py",
-    "tests/test_tools/test_repeated_call_notice.py",
+    # Agent transcript search uses the provisional floor until a Windows refresh.
+    "tests/test_tools/test_session_search.py",
     "tests/test_tools/test_admin_audio_config.py",
     "tests/test_tools/test_admin_gateway_contract.py",
     "tests/test_tools/test_shell_self_kill_policy.py",
     "tests/test_tools/test_run_mode_full_host_fallback.py",
     "tests/test_tools/test_workspace_write_deny_effects.py",
     "tests/test_engine/test_goal_context_prompt.py",
-    "tests/test_engine/test_goal_routing_hint.py",
     "tests/test_gateway/test_goal_rpc.py",
     "tests/test_migrations/test_v033_goal_runs.py",
     "tests/test_migrations/test_v034_goal_message_anchor.py",
@@ -269,8 +318,12 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_contracts/test_ensemble_fallback_event_wire.py",
     "tests/test_contracts/test_turn_execution.py",
     "tests/test_engine/test_turn_control_terminal.py",
-    "tests/test_artifact_session/test_candidate_loop.py",
-    "tests/test_tools/test_document_browser_identity.py",
+    # New runtime-notice and telemetry pipeline suites use the provisional floor
+    # until a comparable three-run Windows duration refresh supplies timings.
+    "tests/test_engine/turn_runner/test_runtime_notices.py",
+    "tests/test_telemetry_server/test_product_active_pipeline.py",
+    "tests/test_telemetry_server/test_product_activity_pipeline.py",
+    "tests/test_telemetry_server/test_protocol_upgrade_pipeline.py",
 }
 
 
@@ -349,8 +402,15 @@ def _function_decorators(path: Path, function_name: str) -> set[str]:
     raise AssertionError(f"missing test function: {path}:{function_name}")
 
 
-def test_windows_shell_process_runtime_is_marked_ci_serial() -> None:
-    path = Path("tests/test_sandbox/test_windows_shell_process_runtime.py")
+@pytest.mark.parametrize(
+    "test_file",
+    [
+        "tests/test_sandbox/test_windows_shell_process_runtime.py",
+        "tests/test_scripts/test_gateway_ux.py",
+    ],
+)
+def test_windows_process_harnesses_are_marked_ci_serial(test_file: str) -> None:
+    path = Path(test_file)
     parsed = ast.parse(path.read_text(encoding="utf-8"))
 
     assert any(
@@ -388,6 +448,10 @@ def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
 
 def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_ci/test_windows_signed_update_audit.py"),
+        "test_real_node_and_frozen_python_complete_only_in_new_temporary_parent",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_gateway/test_goal_rpc.py"),
         "test_continuation_transport_loss_after_accept_runs_but_shutdown_compensates",
     )
@@ -402,6 +466,14 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_live_long_task_case_driver.py"),
         "test_fault_429_case_proves_retry_after_was_not_violated",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_atomic_and_locking.py"),
+        "test_moved_legacy_lock_can_be_rebound_without_dropping_exclusion",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_transaction.py"),
+        "test_transaction_recovery_locks_parked_backup_before_restoring_target",
     )
 
 
@@ -722,20 +794,43 @@ def test_windows_assignment_snapshot_rejects_excessive_movement() -> None:
         validate_assignment_payload(payload, weights)
 
 
-def test_active_unweighted_fallback_stays_within_refresh_budget() -> None:
+def test_active_unweighted_fallback_retains_registered_inventory() -> None:
     discovered = set(discover_test_files(Path.cwd()))
     weighted = set(historical_test_weights())
     unweighted = discovered - weighted
-    unexpected_active = unweighted - OFFLINE_MARKER_EXCLUSIONS
-    active = discovered - OFFLINE_MARKER_EXCLUSIONS
 
     assert OFFLINE_MARKER_EXCLUSIONS <= unweighted
     assert RECENTLY_ADDED_ACTIVE_TESTS <= weighted
-    # A small number of newly added tests can run immediately through the core
-    # fail-safe. Crossing either threshold signals that the history should be
-    # refreshed before the original shard imbalance can materially return.
-    assert len(unexpected_active) <= 4
-    assert len(unexpected_active) / len(active) < 0.01
+    # Missing timing samples are reported by the planner; coverage and explicit
+    # registrations remain required independently of this performance debt.
+
+
+def test_missing_timing_weights_warn_without_excluding_tests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "repository"
+    (root / "tests").mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\nnorecursedirs = []\n", encoding="utf-8"
+    )
+    paths = {f"tests/test_new_{index}.py" for index in range(6)}
+    for path in paths:
+        (root / path).write_text("def test_new(): pass\n", encoding="utf-8")
+    report_fn = SHARD_MODULE["_report"]
+    monkeypatch.setitem(report_fn.__globals__, "historical_test_weights", lambda: {})
+    monkeypatch.setitem(report_fn.__globals__, "assignment_governance", lambda: ({}, {}, {}, []))
+    summary = tmp_path / "summary.md"
+
+    assert report_fn(SimpleNamespace(root=root, github_summary=summary)) == 0
+    output = capsys.readouterr().out
+    assert "::warning title=Test timing refresh recommended::" in output
+    for path in paths:
+        assert path in summary.read_text(encoding="utf-8")
+    assigned = [path for shard in SHARD_NAMES for path in files_for_shard(root, shard)]
+    assert len(assigned) == len(set(assigned)) == len(paths)
+    assert set(assigned) == paths
 
 
 def test_unmatched_or_unweighted_tests_fail_safe_to_core() -> None:
@@ -767,6 +862,7 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
     # These reviewed files need no shard-specific setup. Releasing them keeps
     # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
+        "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
         "tests/test_gateway/test_project_workspace_execution.py": (

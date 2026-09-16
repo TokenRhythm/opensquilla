@@ -4,8 +4,8 @@ import { createApp, nextTick } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import { SESSION_CONVERSATION_KEY } from '@/modules/sessionConversation'
-import { sessionConversationTestDouble } from '@/testing/sessionConversation.test-helper'
+import { PROMPT_CACHE_LEASE_KEY } from '@/modules/promptCacheLease'
+import { promptCacheLeaseTestDouble } from '@/testing/conversationAncillary.test-helper'
 import PromptCacheKeepaliveDialog from './PromptCacheKeepaliveDialog.vue'
 
 async function settle() {
@@ -47,9 +47,9 @@ describe('PromptCacheKeepaliveDialog', () => {
     } as const
     const promptCacheStatus = vi.fn().mockResolvedValue(scheduledStatus)
     const setPromptCacheStatus = vi.fn().mockResolvedValue(waitingStatus)
-    const conversation = sessionConversationTestDouble({
-      promptCacheStatus,
-      setPromptCacheStatus,
+    const promptCacheLease = promptCacheLeaseTestDouble({
+      status: promptCacheStatus,
+      setPolicy: setPromptCacheStatus,
     })
     const saved = vi.fn()
     const closed = vi.fn()
@@ -63,7 +63,7 @@ describe('PromptCacheKeepaliveDialog', () => {
       onClose: closed,
     })
     app.use(i18n)
-    app.provide(SESSION_CONVERSATION_KEY, conversation)
+    app.provide(PROMPT_CACHE_LEASE_KEY, promptCacheLease)
     app.mount(host)
     await settle()
 
@@ -132,9 +132,9 @@ describe('PromptCacheKeepaliveDialog', () => {
       state: 'off',
       reason: null,
     } as const
-    const conversation = sessionConversationTestDouble({
-      promptCacheStatus: vi.fn().mockResolvedValue(enabledStatus),
-      setPromptCacheStatus: vi.fn().mockResolvedValue(offStatus),
+    const promptCacheLease = promptCacheLeaseTestDouble({
+      status: vi.fn().mockResolvedValue(enabledStatus),
+      setPolicy: vi.fn().mockResolvedValue(offStatus),
     })
 
     const host = document.createElement('div')
@@ -144,7 +144,7 @@ describe('PromptCacheKeepaliveDialog', () => {
       sessionKey: 'agent:main:webchat:test',
     })
     app.use(i18n)
-    app.provide(SESSION_CONVERSATION_KEY, conversation)
+    app.provide(PROMPT_CACHE_LEASE_KEY, promptCacheLease)
     app.mount(host)
     await settle()
 
@@ -166,8 +166,8 @@ describe('PromptCacheKeepaliveDialog', () => {
   })
 
   it('blocks a keepalive window that cannot reach the next probe', async () => {
-    const conversation = sessionConversationTestDouble({
-      promptCacheStatus: vi.fn().mockResolvedValue({
+    const promptCacheLease = promptCacheLeaseTestDouble({
+      status: vi.fn().mockResolvedValue({
         enabled: true,
         ttlSeconds: 300,
         intervalSeconds: 240,
@@ -187,7 +187,7 @@ describe('PromptCacheKeepaliveDialog', () => {
       sessionKey: 'agent:main:webchat:test',
     })
     app.use(i18n)
-    app.provide(SESSION_CONVERSATION_KEY, conversation)
+    app.provide(PROMPT_CACHE_LEASE_KEY, promptCacheLease)
     app.mount(host)
     await settle()
 
@@ -214,8 +214,8 @@ describe('PromptCacheKeepaliveDialog', () => {
   })
 
   it('replaces a missing-session transport error with actionable copy', async () => {
-    const conversation = sessionConversationTestDouble({
-      promptCacheStatus: vi.fn().mockRejectedValue(new Error('Session not found')),
+    const promptCacheLease = promptCacheLeaseTestDouble({
+      status: vi.fn().mockRejectedValue(new Error('Session not found')),
     })
 
     const host = document.createElement('div')
@@ -225,7 +225,7 @@ describe('PromptCacheKeepaliveDialog', () => {
       sessionKey: 'agent:main:webchat:draft',
     })
     app.use(i18n)
-    app.provide(SESSION_CONVERSATION_KEY, conversation)
+    app.provide(PROMPT_CACHE_LEASE_KEY, promptCacheLease)
     app.mount(host)
     await settle()
 

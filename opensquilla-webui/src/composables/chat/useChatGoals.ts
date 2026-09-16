@@ -1,7 +1,7 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
-import { localizeGoalRpcError } from '@/lib/rpcErrors'
+import { goalErrorMessage as localizeGoalRpcError } from '@/utils/goalErrorPresentation'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
-import type { GoalCenter } from '@/modules/goalCenter'
+import { GoalCenterError, type GoalCenter } from '@/modules/goalCenter'
 import type { GoalContinuity, GoalEvent } from '@/modules/goalContinuity'
 
 export type GoalStatus = 'active' | 'paused' | 'blocked' | 'usage_limited' | 'complete'
@@ -101,6 +101,9 @@ export interface UseChatGoalsOptions {
   currentEpoch?: Ref<number>
   /** Current Gateway transport namespace, owned by the message subscription. */
   streamGeneration?: Readonly<Ref<string | null>>
+  /** Authenticated connection namespace; never a permission to take over. */
+  connectionEpoch?: Readonly<Ref<number>>
+  connectionAvailable?: () => boolean
   // A Goal may only be accepted after the target session is materialized and
   // its message subscription is registered. The host owns those two steps.
   ensureSessionKey?: () => Promise<string>
@@ -441,6 +444,12 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   const tombstones = new Map<string, number>()
   const reattachInFlight = new Set<string>()
   const automaticReattachWatermarks = new Map<string, number>()
+  let continuityRetryTimer: ReturnType<typeof setTimeout> | null = null
+  let continuityRetryAttempt = 0
+  function clearContinuityRetry() {
+    if (continuityRetryTimer !== null) clearTimeout(continuityRetryTimer)
+    continuityRetryTimer = null
+  }
   const continuityStorage = options.continuityStorage ?? browserContinuityStorage()
 
   const activeGoal = computed(() => {
@@ -455,6 +464,8 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   const lastGoalElapsed = computed(() => formatGoalDuration(lastGoal.value?.activeTimeMs))
 
   function resetGeneration(preserveStartAdmission = false) {
+    clearContinuityRetry()
+    continuityRetryAttempt = 0
     goal.value = null
     acceptedSessionId = ''
     acceptedEpoch = 0
@@ -874,16 +885,37 @@ export function useChatGoals(options: UseChatGoalsOptions) {
           || stillOwned?.token !== stored.token
         ) return
         if (applyReattachResponse(response, current)) rememberContinuityToken(response)
-      } catch {
-        // Network loss is precisely the case this token is meant to bridge.
-        // Keep it for explicit takeover or a later page bootstrap; never loop
-        // and never auto-Resume within this authenticated hydration.
+        continuityRetryAttempt = 0
+        clearContinuityRetry()
+      } catch (error) {
+        // Retry only the same scoped token after transient transport failures.
+        // A permission/identity conflict remains explicit; never auto-Resume
+        // or replace the owner by issuing takeover during recovery.
         const latest = goal.value
         if (
           latest?.goalId === current.goalId
           && latest.status === 'active'
           && latest.continuationDeferredReason === 'owner_disconnected'
-        ) connectionTakeoverAvailable.value = true
+        ) {
+          const retryable = error instanceof GoalCenterError
+            ? error.code === 'unavailable' || error.retryable === true
+            : error instanceof Error && /connection|socket|network|timeout/i.test(error.message)
+          connectionTakeoverAvailable.value = !retryable
+          if (retryable) {
+            automaticReattachWatermarks.delete(fence)
+            clearContinuityRetry()
+            const delay = Math.min(15_000, 500 * 2 ** Math.min(continuityRetryAttempt++, 5))
+            continuityRetryTimer = setTimeout(() => {
+              continuityRetryTimer = null
+              const active = goal.value
+              if (!active || active.sessionKey !== options.sessionKey.value
+                || active.sessionId !== current.sessionId || active.epoch !== current.epoch
+                || active.goalId !== current.goalId || readContinuityRecord(active)?.token !== stored.token) return
+              if (options.connectionAvailable?.() === false) return
+              reconcileContinuityAfterHydration(active, attemptWatermark)
+            }, delay)
+          }
+        }
       } finally {
         reattachInFlight.delete(fence)
         reattaching.value = false
@@ -1061,7 +1093,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     const normalized = String(objective || '').trim()
     if (!goalObjectiveIsValid(normalized)) {
       options.notify?.(localizeGoalRpcError(
-        Object.assign(new Error(), { code: 'INVALID_GOAL_OBJECTIVE' }),
+        new GoalCenterError('invalid', '', { reason: 'invalid-objective' }),
       ))
       return Promise.resolve(false)
     }
@@ -1104,7 +1136,11 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     }, { flush: 'sync' })
   }
 
-  onBeforeUnmount(() => goalSubscription.close())
+  if (options.connectionEpoch) watch(options.connectionEpoch, () => {
+    automaticReattachWatermarks.clear()
+    clearContinuityRetry()
+  }, { flush: 'sync' })
+  onBeforeUnmount(() => { goalSubscription.close(); clearContinuityRetry() })
 
   return {
     draftArmed,

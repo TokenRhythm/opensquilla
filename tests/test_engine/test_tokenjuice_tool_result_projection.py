@@ -6,6 +6,7 @@ import string
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 import opensquilla.engine.agent as agent_mod
@@ -13,7 +14,7 @@ import opensquilla.engine.tokenjuice_adapter as tokenjuice_adapter_mod
 from opensquilla.engine import Agent, AgentConfig, ToolCall, ToolResult
 from opensquilla.engine.session_sanitize import session_payload_chars
 from opensquilla.engine.tool_result_store import ToolResultStore
-from opensquilla.engine.types import ToolResultEvent, ToolUseDeltaEvent
+from opensquilla.engine.types import ErrorEvent, ToolResultEvent, ToolUseDeltaEvent
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.plugins.tokenjuice import reduce_tool_result as backend_reduce_tool_result
 from opensquilla.provider import (
@@ -28,6 +29,8 @@ from opensquilla.provider import DoneEvent as ProviderDoneEvent
 from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDeltaEvent
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEndEvent
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStartEvent
+from opensquilla.provider.openai import OpenAIProvider
+from opensquilla.tools.builtin.code_exec import _execution_result_json
 from opensquilla.tools.types import ToolContext
 
 
@@ -113,6 +116,158 @@ class _FinalizationCapturingProvider(_ToolCallingProvider):
     def chat(self, messages, tools=None, config=None):
         self.calls.append({"messages": messages, "tools": tools})
         return self._stream(len(self.calls))
+
+
+class _SearchCallingProvider(_ToolCallingProvider):
+    async def _stream(self, call_number: int):
+        if call_number == 1:
+            yield ProviderToolUseStartEvent(tool_use_id="search-1", tool_name="web_search")
+            yield ProviderToolUseEndEvent(
+                tool_use_id="search-1", tool_name="web_search", arguments={"query": "synthetic"},
+            )
+            yield ProviderDoneEvent(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield TextDeltaEvent(text="done")
+        yield ProviderDoneEvent(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+async def _canonical_search_fixture() -> str:
+    from opensquilla.search.canonical import run_canonical_web_search
+    from opensquilla.search.types import SearchOptions, SearchResult
+
+    class SearchProvider:
+        async def search(self, query, max_results):
+            return [SearchResult(
+                title=f"Source {i}", url=f"https://example.test/article/{i}",
+                snippet="Provider summary " * 50, content="Primary excerpt " * 60,
+                highlights=["Supporting highlight " * 60], provider="tavily",
+            ) for i in range(6)]
+
+    result = await run_canonical_web_search(
+        SearchOptions(query="synthetic", provider="tavily"),
+        provider_factory=lambda name: SearchProvider(),
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_search_preview_only_changes_provider_input(tmp_path):
+    raw = await _canonical_search_fixture()
+
+    async def handler(call):
+        return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content=raw)
+
+    _declare_available_tools(handler, "web_search", "retrieve_tool_result")
+    provider = _SearchCallingProvider()
+    agent = Agent(
+        provider=provider,
+        config=_recoverable_config(
+            tmp_path, context_window_tokens=1_000_000, max_iterations=2,
+            runtime_events_path=str(tmp_path / "events.jsonl"),
+            metadata={"tool_projection_tokenjuice_reducer": "previous_reducer"},
+        ),
+        tool_definitions=[_tool_def("web_search"), _tool_def("retrieve_tool_result")],
+        tool_handler=handler,
+    )
+    events = [event async for event in agent.run_turn("find synthetic sources")]
+    preview = _last_tool_result_content(provider.calls[1])
+    assert len(preview) < len(raw)
+    assert "Primary excerpt" in preview
+    assert "Supporting highlight" in preview
+    assert "Provider summary" not in preview
+    assert '"fetch_status":"not_requested"' in preview
+    assert next(event for event in events if isinstance(event, ToolResultEvent)).result == raw
+    assert _last_tool_result_content(agent.history_snapshot()) == raw
+    handle = _first_tool_result_handle(provider.calls[1])
+    record = ToolResultStore(str(tmp_path / "tool-results")).read(handle, session_id="session-1")
+    assert record.content == raw
+    assert agent.config.metadata["tool_projection_backend"] == "builtin_web_search"
+    assert agent.config.metadata["tool_projection_reducer"] == "builtin_web_search"
+    assert "tool_projection_tokenjuice_reducer" not in agent.config.metadata
+    runtime_events = [
+        json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    applied = next(event for event in runtime_events
+                   if event.get("feature") == "tool_result_projection"
+                   and event.get("outcome") == "applied")
+    assert applied["mechanism"] == "builtin_web_search"
+    assert applied["reducer"] == "builtin_web_search"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("excerpt,snippet,expected", [
+    ("existing excerpt", "summary", "existing excerpt"),
+    (" ", "summary", "summary"),
+    ("", "", "highlight"),
+])
+async def test_search_preview_uses_one_existing_excerpt(excerpt, snippet, expected):
+    from opensquilla.engine.web_search_projection import reduce_canonical_search
+
+    payload = json.loads(await _canonical_search_fixture())
+    payload["results"][0].update(excerpt=excerpt, snippet=snippet, highlights=["highlight"])
+    reduction = reduce_canonical_search(json.dumps(payload))
+    assert reduction is not None
+    hit = json.loads(reduction.inline_text)["results"][0]
+    assert hit["excerpt"] == expected
+    assert "snippet" not in hit
+    if expected == "highlight":
+        assert "highlights" not in hit
+    else:
+        assert hit["highlights"] == ["highlight"]
+    assert hit["url"] == payload["results"][0]["url"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("excerpt,highlights,expected", [
+    ("Background only", ["The answer is in a later section"],
+     ["The answer is in a later section"]),
+    ("An operation is allowed", ["An operation is not allowed"],
+     ["An operation is not allowed"]),
+    ("Before covered passage after", ["", " \n", "covered passage"], []),
+    ("Background", ["unique passage", "unique passage", "passage"], ["unique passage"]),
+    ("Background", [" \n独有证据 🔎\r\n", "独有证据 🔎"], [" \n独有证据 🔎\r\n"]),
+    ("line one\nline two", ["line one line two"], ["line one line two"]),
+    ("Background", ["first passage", "second passage"], ["first passage", "second passage"]),
+    ("", ["first passage", "second passage"], ["second passage"]),
+])
+async def test_search_preview_preserves_complementary_highlights(excerpt, highlights, expected):
+    from opensquilla.engine.web_search_projection import reduce_canonical_search
+
+    payload = json.loads(await _canonical_search_fixture())
+    payload["results"][0].update(excerpt=excerpt, snippet="", highlights=highlights)
+    original = json.dumps(payload, ensure_ascii=False)
+    reduction = reduce_canonical_search(original)
+    assert reduction is not None
+    hit = json.loads(reduction.inline_text)["results"][0]
+    assert hit.get("highlights", []) == expected
+    assert json.dumps(payload, ensure_ascii=False) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["no_store", "denied", "store_failure", "unknown", "error", "tiny"]
+)
+async def test_search_projection_preserves_raw_when_recovery_or_shape_unavailable(tmp_path, case):
+    raw = await _canonical_search_fixture()
+    config = _recoverable_config(tmp_path)
+    definitions = [_tool_def("retrieve_tool_result")]
+    if case == "no_store":
+        config.tool_result_store_dir = None
+    elif case == "denied":
+        definitions = []
+    elif case == "store_failure":
+        config.tool_result_store_max_bytes = 1
+    elif case == "unknown":
+        raw = json.dumps({"custom_results": ["custom " * 3000]})
+    elif case == "error":
+        raw = json.dumps({"ok": False, "error": "failure " * 3000})
+    elif case == "tiny":
+        raw = json.dumps({"ok": True, "query": "q", "mode": "auto", "provider_attempts": [],
+                          "diagnostics": {}, "sources": [], "results": []})
+    agent = Agent(provider=_Provider(), config=config, tool_definitions=definitions,
+                  tool_handler=_unused_retrieval_handler)
+    result = ToolResult(tool_use_id="search-1", tool_name="web_search", content=raw)
+    assert await agent._project_tool_result_for_llm(result) is result
 
 
 class _GuaranteedFinalizationCapturingProvider(_FinalizationCapturingProvider):
@@ -346,7 +501,7 @@ async def test_agent_projects_tokenjuice_without_context_window_gate(
         content="pytest output\n" + ("x" * 1000),
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -368,7 +523,7 @@ async def test_agent_projects_tokenjuice_without_context_window_gate(
 
 
 @pytest.mark.asyncio
-async def test_fresh_diagnostic_under_cap_is_preserved_to_next_provider_call(
+async def test_retired_fresh_diagnostic_flag_does_not_bypass_tokenjuice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -416,11 +571,12 @@ async def test_fresh_diagnostic_under_cap_is_preserved_to_next_provider_call(
     assert len(provider.calls) == 2
     second_call_tool_result = _last_tool_result_content(provider.calls[1])
     assert second_call_tool_result == raw_output
-    assert calls == []
+    assert len(calls) == 1
     projected_event = next(event for event in events if isinstance(event, ToolResultEvent))
     assert projected_event.result == raw_output
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_one_hop_preserves"] == 1
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_results"] == 1
+    # No retrieval surface means the raw result still survives by the normal
+    # Store/retrieval contract, not the retired one-hop diagnostic policy.
+    assert not any("fresh_diagnostic" in key for key in agent.config.metadata)
 
 
 @pytest.mark.asyncio
@@ -453,7 +609,7 @@ async def test_source_read_file_result_is_preserved_before_tokenjuice(
         content=source,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -516,7 +672,7 @@ async def test_exec_git_diff_result_is_preserved_before_tokenjuice(
         content=diff,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -567,7 +723,7 @@ async def test_exec_source_read_result_is_preserved_before_tokenjuice(
         content=source,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -614,7 +770,7 @@ async def test_broad_grep_result_is_not_semantically_preserved(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -648,7 +804,7 @@ async def test_tokenjuice_noop_preserves_tool_result(
         content="short output",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "short output"
@@ -678,7 +834,7 @@ async def test_tokenjuice_projection_preserves_raw_without_recovery_contract(
     )
     raw_output = "raw output\n" + ("x" * 8000)
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -896,9 +1052,7 @@ async def test_run_turn_feeds_tokenjuice_reduced_tool_result_to_next_provider_ca
     assert "AssertionError" in second_call_tool_result
     assert "rootdir:" not in second_call_tool_result
     assert agent.config.metadata["tool_projection_backend"] == "tokenjuice"
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_results"] == 1
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_projections"] == 1
-    assert "tool_projection_fresh_diagnostic_one_hop_preserves" not in agent.config.metadata
+    assert not any("fresh_diagnostic" in key for key in agent.config.metadata)
     projected_event = next(event for event in events if isinstance(event, ToolResultEvent))
     delta_fragments = [
         event.json_fragment for event in events if isinstance(event, ToolUseDeltaEvent)
@@ -910,7 +1064,7 @@ async def test_run_turn_feeds_tokenjuice_reduced_tool_result_to_next_provider_ca
 
 
 @pytest.mark.asyncio
-async def test_projected_diagnostic_requires_focused_retrieval_before_edit(
+async def test_retired_diagnostic_gate_does_not_force_retrieval_before_edit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -997,11 +1151,14 @@ async def test_projected_diagnostic_requires_focused_retrieval_before_edit(
         and event.is_error
         and "retrieve_tool_result" in event.result
     ]
-    assert blocked
-    assert executed_tool_names == ["exec_command", "retrieve_tool_result", "apply_patch"]
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_projections"] == 1
-    assert agent.config.metadata["tool_projection_diagnostic_retrieval_gate_blocks"] == 1
-    assert agent.config.metadata["tool_projection_diagnostic_retrievals"] == 1
+    assert not blocked
+    assert executed_tool_names == [
+        "exec_command",
+        "apply_patch",
+        "retrieve_tool_result",
+        "apply_patch",
+    ]
+    assert not any("diagnostic" in key for key in agent.config.metadata)
 
 
 @pytest.mark.asyncio
@@ -1104,7 +1261,7 @@ async def test_provider_call_without_retrieval_schema_restores_stored_raw_result
         session_key="agent:main:session-1",
     )
     raw = "diagnostic output\n" + ("x" * 10_000)
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-restore",
             tool_name="exec_command",
@@ -1581,27 +1738,6 @@ async def test_custom_provider_gate_counts_tool_schema_in_full_envelope(
         tool_handler=handler,
         session_key="agent:main:session-1",
     )
-    surface_builds = 0
-
-    def hide_retrieval_after_first_call(
-        tools,
-        gate_details,
-        *,
-        recovery_read_paths,
-        recovery_reads_remaining,
-    ):
-        nonlocal surface_builds
-        del gate_details, recovery_read_paths, recovery_reads_remaining
-        surface_builds += 1
-        if surface_builds == 1 or not tools:
-            return tools
-        return [tool for tool in tools if tool.name != "retrieve_tool_result"]
-
-    monkeypatch.setattr(
-        agent,
-        "_workspace_edit_gate_tool_definitions",
-        hide_retrieval_after_first_call,
-    )
     original_estimate_chars = agent._estimate_live_request_chars
     estimate_observations: list[tuple[int, int, int]] = []
 
@@ -1618,7 +1754,18 @@ async def test_custom_provider_gate_counts_tool_schema_in_full_envelope(
 
     monkeypatch.setattr(agent, "_estimate_live_request_chars", capture_estimate_chars)
 
-    events = [event async for event in agent.run_turn("run diagnostics")]
+    events = []
+    async for event in agent.run_turn("run diagnostics"):
+        events.append(event)
+        if isinstance(event, ToolResultEvent):
+            # Withdraw retrieval from the actual next-call tool schema only
+            # after a recoverable projection exists. The large tool remains,
+            # so admission must count its schema along with the restored raw result.
+            assert agent.config.metadata["tool_projection_applied"] is True
+            assert any(tool.name == "retrieve_tool_result" for tool in agent.tool_definitions)
+            agent.tool_definitions[:] = [
+                tool for tool in agent.tool_definitions if tool.name != "retrieve_tool_result"
+            ]
 
     assert len(provider.calls) == 1
     assert estimate_observations
@@ -1709,7 +1856,7 @@ async def test_runtime_events_record_tokenjuice_projection_applied(
         tool_handler=_unused_retrieval_handler,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -1780,7 +1927,7 @@ async def test_projection_envelope_includes_retrieval_hint_and_search_hints(
         + ("x" * 20_000)
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -1831,7 +1978,7 @@ async def test_tool_projection_noops_when_handle_envelope_would_grow_result(
         content="small output",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "small output"
@@ -1867,7 +2014,7 @@ async def test_full_trace_store_preserves_raw_snapshot_without_projection(
         content="line 1\nline 2\n",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "line 1\nline 2\n"
@@ -1907,8 +2054,8 @@ async def test_full_trace_store_reuses_snapshot_for_replayed_tool_result(
         content="same replayed output\n",
     )
 
-    first = await agent._canonicalize_tool_result(result)
-    second = await agent._canonicalize_tool_result(result)
+    first = await agent._project_tool_result_for_llm(result)
+    second = await agent._project_tool_result_for_llm(result)
 
     assert first is result
     assert second is result
@@ -1953,7 +2100,7 @@ async def test_tool_projection_noops_when_store_budget_rejects_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == content
@@ -1998,7 +2145,7 @@ async def test_large_compressible_projection_stores_retrievable_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is not result
     assert "[tool_result_projection]" in projected.content
@@ -2053,7 +2200,7 @@ async def test_json_guard_projection_includes_retrievable_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is not result
     assert "[tool_result_projection]" in projected.content
@@ -2104,7 +2251,7 @@ async def test_json_guard_preserves_raw_content_when_store_budget_rejects_snapsh
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == content
@@ -2230,6 +2377,106 @@ def test_typescript_runtime_directory_is_not_present() -> None:
     from pathlib import Path
 
     assert not (Path(__file__).resolve().parents[2] / "src/opensquilla/tokenjuice_runtime").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("line_count", [6_000, 12_000])
+@pytest.mark.parametrize("recovery", ["available", "unavailable", "store_failure"])
+async def test_code_error_preview_stays_bounded_in_final_provider_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, recovery: str, line_count: int,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/chat/completions"
+        requests.append(json.loads(request.content))
+        first = len(requests) == 1
+        delta = (
+            {"tool_calls": [{"index": 0, "id": "code-1", "type": "function", "function": {
+                "name": "execute_code", "arguments": '{"code":"synthetic"}',
+            }}]}
+            if first else {"content": "The synthetic command failed. Test finished."}
+        )
+        common = {
+            "id": "synthetic-response", "object": "chat.completion.chunk",
+            "model": "gpt-4o", "created": 1,
+        }
+        chunks = [
+            {**common, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+            {**common, "choices": [{
+                "index": 0, "delta": {}, "finish_reason": "tool_calls" if first else "stop",
+            }]},
+            {**common, "choices": [], "usage": {
+                "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+            }},
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=body + "data: [DONE]\n\n",
+        )
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+
+    def client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("proxy", None)
+        return real_client(*args, **{**kwargs, "transport": transport, "trust_env": False})
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", client)
+    output = "".join(
+        f"error {index:07d}: diagnostic detail alpha beta gamma delta\n"
+        for index in range(line_count)
+    )
+
+    async def handler(call: ToolCall) -> ToolResult:
+        assert call.tool_name == "execute_code"
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name,
+            content=_execution_result_json(
+                returncode=1, stdout="", stderr=output, timed_out=False, elapsed_ms=1,
+            ),
+            is_error=True,
+        )
+
+    names = ["execute_code"]
+    if recovery != "unavailable":
+        names.append("retrieve_tool_result")
+    _declare_available_tools(handler, *names)
+    definitions = [ToolDefinition(
+        name="execute_code", description="Run synthetic code",
+        input_schema=ToolInputSchema(properties={"code": {"type": "string"}}, required=["code"]),
+    )]
+    if recovery != "unavailable":
+        definitions.append(_tool_def("retrieve_tool_result"))
+    agent = Agent(
+        provider=OpenAIProvider(
+            api_key="public-dummy-key", model="gpt-4o", base_url="https://probe.invalid/v1",
+        ),
+        # Keep the default context window and final request admission checks.
+        config=_recoverable_config(tmp_path),
+        tool_definitions=definitions, tool_handler=handler,
+        session_key="agent:main:session-1",
+    )
+    if recovery == "store_failure":
+        monkeypatch.setattr(agent, "_store_tool_result_snapshot", lambda *args, **kwargs: None)
+
+    events = [event async for event in agent.run_turn(
+        "Run execute_code once, report its result, then finish.",
+    )]
+
+    assert not [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(requests) == 2
+    tool_messages = [message for message in requests[1]["messages"] if message["role"] == "tool"]
+    assert len(tool_messages) == 1
+    content = tool_messages[0]["content"]
+    # A 50k diagnostic preview plus its JSON/projection metadata must stay small
+    # even when projection cannot rely on retrieval. Inspect the actual HTTP body.
+    assert len(content) <= 55_000
+    assert "error 0000000" in content
+    assert f"error {line_count - 1:07d}" in content
+    assert "omitted" in content
 
 
 @pytest.mark.asyncio

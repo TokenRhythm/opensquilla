@@ -3,7 +3,7 @@ import { ref } from 'vue'
 
 import type { MetaSetupJob, MetaSetupReadiness } from '@/types/metaSetup'
 import type { HiddenControlDispatchResult } from '@/types/chat'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import { MetaRunCenterError, type MetaRunCenter } from '@/modules/metaRunCenter'
 import {
   META_SETUP_PROVIDER_HANDOFF_TTL_MS,
   metaSetupLaunchStorageKey,
@@ -96,14 +96,7 @@ function harness(
   const metaRunCenter: MetaRunCenter = {
     launch: async (input) => {
       await options.ready?.(15_000)
-      const raw = await call('meta.run', input) as Record<string, unknown>
-      return {
-        ok: raw.ok === true,
-        error: typeof raw.error === 'string' ? raw.error : undefined,
-        drafted: raw.drafted === true,
-        setupRequired: raw.setup_required === true,
-        readiness: raw.readiness as MetaSetupReadiness | undefined,
-      }
+      return await call('launch', input) as Awaited<ReturnType<MetaRunCenter['launch']>>
     },
     listDrafts: async () => ({ drafts: [], durable: true }),
     discardDraft: async () => ({ discarded: true, accepted: false }),
@@ -112,20 +105,15 @@ function harness(
     replay: async () => ({}),
     setupPlan: async name => {
       await options.ready?.(15_000)
-      return await call('meta.setup.plan', { name }) as Record<string, unknown>
+      return await call('setupPlan', { name }) as Awaited<ReturnType<MetaRunCenter['setupPlan']>>
     },
     setupStatus: async input => {
       await options.ready?.(15_000)
-      return await call('meta.setup.status', input) as Record<string, unknown>
+      return await call('setupStatus', input) as Awaited<ReturnType<MetaRunCenter['setupStatus']>>
     },
     setupInstall: async input => {
       await options.ready?.(15_000)
-      return await call('meta.setup.install', {
-        name: input.name,
-        sessionKey: input.sessionKey,
-        confirmed: input.confirmed,
-        action_ids: input.actionIds,
-      }) as Record<string, unknown>
+      return await call('setupInstall', input) as Awaited<ReturnType<MetaRunCenter['setupInstall']>>
     },
     subscribe: vi.fn(() => ({ close: vi.fn() })),
   }
@@ -162,8 +150,8 @@ describe('useMetaSkillSetup', () => {
   it('confirms, reports real phases, verifies readiness, and resumes exactly once', async () => {
     let statusCalls = 0
     const call = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
-      if (method === 'meta.setup.install') return { job: job({ status: 'queued', phase: 'queued' }) }
-      if (method === 'meta.setup.status') {
+      if (method === 'setupInstall') return { job: job({ status: 'queued', phase: 'queued' }) }
+      if (method === 'setupStatus') {
         statusCalls += 1
         if (statusCalls === 1) {
           return { job: job({ phase: 'verifying', message: 'Verifying installed capabilities' }) }
@@ -178,8 +166,8 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const storage = memoryStorage()
     const { api, dispatchHidden } = harness(call, { storage })
@@ -199,13 +187,13 @@ describe('useMetaSkillSetup', () => {
     await vi.advanceTimersByTimeAsync(750)
     await flushPromises()
 
-    expect(call).toHaveBeenCalledWith('meta.setup.install', {
+    expect(call).toHaveBeenCalledWith('setupInstall', {
       name: 'meta-paper-write',
       sessionKey: SESSION,
       confirmed: true,
-      action_ids: ['meta-paper-write:paper-toolchain'],
+      actionIds: ['meta-paper-write:paper-toolchain'],
     })
-    expect(call).toHaveBeenCalledWith('meta.run', {
+    expect(call).toHaveBeenCalledWith('launch', {
       name: 'meta-paper-write',
       sessionKey: SESSION,
       clientRequestId: expect.any(String),
@@ -227,9 +215,9 @@ describe('useMetaSkillSetup', () => {
   it('hides a running setup without polling or dispatching', async () => {
     const storage = memoryStorage()
     const call = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
-      if (method === 'meta.setup.install') return { job: job() }
-      if (method === 'meta.setup.status') return { job: job() }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupInstall') return { job: job() }
+      if (method === 'setupStatus') return { job: job() }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const restoreDraft = vi.fn()
     const { api, dispatchHidden } = harness(call, { storage, restoreDraft })
@@ -241,7 +229,7 @@ describe('useMetaSkillSetup', () => {
     await vi.advanceTimersByTimeAsync(2000)
 
     expect(api.setupState.value).toBeNull()
-    expect(call.mock.calls.filter(([method]) => method === 'meta.setup.status')).toHaveLength(0)
+    expect(call.mock.calls.filter(([method]) => method === 'setupStatus')).toHaveLength(0)
     expect(dispatchHidden).not.toHaveBeenCalled()
     expect(restoreDraft).not.toHaveBeenCalled()
     expect(storage.getItem(metaSetupStorageKey(SESSION))).toBe('job-1')
@@ -276,8 +264,8 @@ describe('useMetaSkillSetup', () => {
     const storage = memoryStorage()
     const restoreDraft = vi.fn()
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') return { job: job() }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupInstall') return { job: job() }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api } = harness(call, { storage, restoreDraft })
 
@@ -398,8 +386,8 @@ describe('useMetaSkillSetup', () => {
       [metaSetupStorageKey(SESSION)]: 'missing-job',
     })
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.status') return { ok: false, error: 'setup job not found' }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupStatus') throw new MetaRunCenterError('not-found', 'setup job not found')
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api } = harness(call, { storage, autoRestore: false })
 
@@ -424,10 +412,10 @@ describe('useMetaSkillSetup', () => {
       [metaSetupLaunchStorageKey(SESSION)]: oldLaunch,
     })
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.status') {
+      if (method === 'setupStatus') {
         return { job: job({ job_id: 'incumbent-job' }) }
       }
-      throw new Error(`Unexpected RPC: ${method}`)
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api, dispatchHidden } = harness(call, { storage, autoRestore: false })
 
@@ -454,8 +442,8 @@ describe('useMetaSkillSetup', () => {
       [metaSetupLaunchStorageKey(SESSION)]: launchText,
     })
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.status') return { job: job({ job_id: 'matching-job' }) }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupStatus') return { job: job({ job_id: 'matching-job' }) }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api } = harness(call, { storage, autoRestore: false })
 
@@ -477,7 +465,7 @@ describe('useMetaSkillSetup', () => {
     const storage = memoryStorage()
     const clientRequestId = 'still-not-ready-request'
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') {
+      if (method === 'setupPlan') {
         return {
           ok: true,
           readiness: readiness({
@@ -487,7 +475,7 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      throw new Error(`Unexpected RPC: ${method}`)
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api } = harness(call, { storage })
     await api.requestSetup(
@@ -526,9 +514,9 @@ describe('useMetaSkillSetup', () => {
     const launchText = '/meta meta-paper-write -- Keep this paper request through restart'
     const storage = memoryStorage()
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') return { job: job() }
-      if (method === 'meta.setup.status') throw new Error('meta setup job not found (404)')
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupInstall') return { job: job() }
+      if (method === 'setupStatus') throw new MetaRunCenterError('not-found', 'Setup job expired')
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api, dispatchHidden } = harness(call, { storage })
 
@@ -555,8 +543,8 @@ describe('useMetaSkillSetup', () => {
     const launchText = '/meta meta-paper-write -- Resume this exact request after remount'
     const storage = memoryStorage()
     const first = harness(vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') return { job: job() }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupInstall') return { job: job() }
+      throw new Error(`Unexpected domain operation: ${method}`)
     }), { storage })
 
     await first.api.requestSetup('meta-paper-write', readiness(), SESSION, launchText)
@@ -566,10 +554,10 @@ describe('useMetaSkillSetup', () => {
     first.api.dispose()
 
     const secondCall = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.status') {
-        return { ok: false, error: 'meta setup job not found' }
+      if (method === 'setupStatus') {
+        throw new MetaRunCenterError('not-found', 'meta setup job not found')
       }
-      throw new Error(`Unexpected RPC: ${method}`)
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const second = harness(secondCall, { storage })
     await flushPromises()
@@ -591,10 +579,10 @@ describe('useMetaSkillSetup', () => {
       [metaSetupLaunchStorageKey(SESSION)]: launchText,
     })
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.status') {
-        return { ok: false, error: 'Unknown setup job' }
+      if (method === 'setupStatus') {
+        throw new MetaRunCenterError('not-found', 'Unknown setup job')
       }
-      throw new Error(`Unexpected RPC: ${method}`)
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
 
     const { api, dispatchHidden } = harness(call, { storage })
@@ -615,7 +603,7 @@ describe('useMetaSkillSetup', () => {
     const launchText = '/meta meta-paper-write -- Do not lose this failed launch'
     const storage = memoryStorage()
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') {
+      if (method === 'setupInstall') {
         return {
           job: job({
             status: 'completed',
@@ -624,8 +612,8 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.run') return { ok: false, error: 'Provider is temporarily unavailable' }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: false, error: 'Provider is temporarily unavailable' }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const discardDraft = vi.fn(async () => true)
     const { api, dispatchHidden } = harness(call, { storage, discardDraft })
@@ -651,9 +639,9 @@ describe('useMetaSkillSetup', () => {
   it('surfaces a hidden background job instead of replacing it with a second setup', async () => {
     const storage = memoryStorage()
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') return { job: job() }
-      if (method === 'meta.setup.status') return { job: job() }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupInstall') return { job: job() }
+      if (method === 'setupStatus') return { job: job() }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api } = harness(call, { storage })
 
@@ -666,15 +654,15 @@ describe('useMetaSkillSetup', () => {
     expect(api.setupState.value?.phase).toBe('installing')
     expect(api.setupState.value?.jobId).toBe('job-1')
     expect(storage.getItem(metaSetupStorageKey(SESSION))).toBe('job-1')
-    expect(call.mock.calls.filter(([method]) => method === 'meta.setup.install')).toHaveLength(1)
+    expect(call.mock.calls.filter(([method]) => method === 'setupInstall')).toHaveLength(1)
     api.dispose()
   })
 
   it('keeps polling a visible background setup when another setup is requested', async () => {
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') return { job: job() }
-      if (method === 'meta.setup.status') return { job: job() }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupInstall') return { job: job() }
+      if (method === 'setupStatus') return { job: job() }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api } = harness(call)
 
@@ -686,7 +674,7 @@ describe('useMetaSkillSetup', () => {
 
     expect(api.setupState.value?.name).toBe('meta-paper-write')
     expect(api.setupState.value?.phase).toBe('installing')
-    expect(call.mock.calls.filter(([method]) => method === 'meta.setup.status')).toHaveLength(1)
+    expect(call.mock.calls.filter(([method]) => method === 'setupStatus')).toHaveLength(1)
     api.dispose()
   })
 
@@ -694,10 +682,10 @@ describe('useMetaSkillSetup', () => {
     let installCalls = 0
     let statusCalls = 0
     const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      if (method === 'meta.setup.install') {
+      if (method === 'setupInstall') {
         installCalls += 1
         if (installCalls === 2) {
-          expect(params?.action_ids).toEqual(['child:media-tools'])
+          expect(params?.actionIds).toEqual(['child:media-tools'])
           return {
             job: job({
               job_id: 'job-2',
@@ -713,7 +701,7 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.setup.status') {
+      if (method === 'setupStatus') {
         statusCalls += 1
         if (statusCalls === 1) {
           return {
@@ -737,8 +725,8 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const setupReadiness = readiness({
       setup_actions: [
@@ -789,7 +777,7 @@ describe('useMetaSkillSetup', () => {
   it('rechecks a manual requirement and launches the original request when it becomes ready', async () => {
     const launchText = '/meta meta-short-drama -- Create a three-scene product launch drama'
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') {
+      if (method === 'setupPlan') {
         return {
           ok: true,
           readiness: readiness({
@@ -801,8 +789,8 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const storage = memoryStorage()
     const { api, dispatchHidden } = harness(call, { storage })
@@ -819,7 +807,7 @@ describe('useMetaSkillSetup', () => {
 
     await api.retrySetup()
 
-    expect(call.mock.calls.map(([method]) => method)).toEqual(['meta.setup.plan', 'meta.run'])
+    expect(call.mock.calls.map(([method]) => method)).toEqual(['setupPlan', 'launch'])
     expect(dispatchHidden).toHaveBeenCalledOnce()
     expect(dispatchHidden).toHaveBeenCalledWith(launchText, launchText, expect.any(String))
     expect(api.setupState.value).toBeNull()
@@ -892,14 +880,14 @@ describe('useMetaSkillSetup', () => {
     // Opening provider settings unmounts ChatView and its setup composable.
     first.api.dispose()
     const secondCall = vi.fn(async (method: string) => {
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const second = harness(secondCall, { storage })
     await flushPromises()
 
-    expect(secondCall.mock.calls.map(([method]) => method)).toEqual(['meta.run'])
-    expect(secondCall).toHaveBeenCalledWith('meta.run', {
+    expect(secondCall.mock.calls.map(([method]) => method)).toEqual(['launch'])
+    expect(secondCall).toHaveBeenCalledWith('launch', {
       name: 'meta-short-drama',
       sessionKey: SESSION,
       clientRequestId,
@@ -941,15 +929,14 @@ describe('useMetaSkillSetup', () => {
     const clientRequestId = first.api.beginProviderHandoff('openrouter')
     first.api.dispose()
 
-    const discarded = Object.assign(new Error('The saved request was already discarded.'), {
-      code: 'META_DRAFT_DISCARDED',
-      retryable: false,
-      accepted: false,
-    })
+    const discarded = new MetaRunCenterError(
+      'draft-discarded',
+      'The saved request was already discarded.',
+    )
     const restoreDraft = vi.fn()
     const forgetHiddenControl = vi.fn()
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') {
+      if (method === 'setupPlan') {
         return {
           ok: true,
           readiness: readiness({
@@ -961,14 +948,14 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.run') throw discarded
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') throw discarded
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const second = harness(call, { storage, restoreDraft, forgetHiddenControl })
     await flushPromises()
 
-    expect(call.mock.calls.map(([method]) => method)).toEqual(['meta.run'])
-    expect(call).toHaveBeenCalledWith('meta.run', {
+    expect(call.mock.calls.map(([method]) => method)).toEqual(['launch'])
+    expect(call).toHaveBeenCalledWith('launch', {
       name: 'meta-short-drama',
       sessionKey: SESSION,
       clientRequestId,
@@ -999,7 +986,7 @@ describe('useMetaSkillSetup', () => {
     }
     const storage = memoryStorage()
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') {
+      if (method === 'setupInstall') {
         return {
           job: job({
             name: 'meta-short-drama',
@@ -1007,7 +994,7 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.setup.status') {
+      if (method === 'setupStatus') {
         return {
           job: job({
             name: 'meta-short-drama',
@@ -1024,7 +1011,7 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      throw new Error(`Unexpected RPC: ${method}`)
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api } = harness(call, { storage })
 
@@ -1065,7 +1052,7 @@ describe('useMetaSkillSetup', () => {
     }
     const storage = memoryStorage()
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') {
+      if (method === 'setupPlan') {
         return {
           ok: true,
           readiness: readiness({
@@ -1078,10 +1065,10 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.run') {
+      if (method === 'launch') {
         return {
           ok: false,
-          setup_required: true,
+          setupRequired: true,
           error: 'Provider configuration changed; review the requirement again.',
           readiness: readiness({
             missing_bins: [],
@@ -1091,7 +1078,7 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      throw new Error(`Unexpected RPC: ${method}`)
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api, dispatchHidden } = harness(call, { storage })
 
@@ -1144,9 +1131,9 @@ describe('useMetaSkillSetup', () => {
     first.api.dispose()
 
     const call = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
-      if (method === 'meta.setup.plan') return { ok: true, readiness: readyReadiness }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupPlan') return { ok: true, readiness: readyReadiness }
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const queued = harness(call, {
       storage,
@@ -1168,7 +1155,7 @@ describe('useMetaSkillSetup', () => {
     await flushPromises()
 
     const runRequestIds = call.mock.calls
-      .filter(([method]) => method === 'meta.run')
+      .filter(([method]) => method === 'launch')
       .map(([, params]) => params?.clientRequestId)
     expect(runRequestIds).toEqual([clientRequestId, clientRequestId])
     expect(accepted.dispatchHidden).toHaveBeenCalledWith(
@@ -1188,14 +1175,14 @@ describe('useMetaSkillSetup', () => {
     const launchText = '/meta meta-short-drama -- Keep this request after dispatch failure'
     const storage = memoryStorage()
     const call = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
-      if (method === 'meta.setup.plan') return { ok: true, readiness: readiness({
+      if (method === 'setupPlan') return { ok: true, readiness: readiness({
         ready: true,
         status: 'ready',
         missing_bins: [],
         setup_actions: [],
       }) }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     let dispatchCount = 0
     const instance = harness(call, {
@@ -1230,7 +1217,7 @@ describe('useMetaSkillSetup', () => {
     expect(instance.dispatchHidden.mock.calls.map((args) => args[2]))
       .toEqual([firstRequestId, firstRequestId])
     expect(call.mock.calls
-      .filter(([method]) => method === 'meta.run')
+      .filter(([method]) => method === 'launch')
       .map(([, params]) => params?.clientRequestId))
       .toEqual([firstRequestId, firstRequestId])
     expect(instance.api.setupState.value).toBeNull()
@@ -1241,14 +1228,14 @@ describe('useMetaSkillSetup', () => {
   it('clears a queued resume only after the pending queue reports acceptance', async () => {
     const storage = memoryStorage()
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') return { ok: true, readiness: readiness({
+      if (method === 'setupPlan') return { ok: true, readiness: readiness({
         ready: true,
         status: 'ready',
         missing_bins: [],
         setup_actions: [],
       }) }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const instance = harness(call, {
       storage,
@@ -1286,14 +1273,14 @@ describe('useMetaSkillSetup', () => {
     const storage = memoryStorage()
     let dispatchCount = 0
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') return { ok: true, readiness: readiness({
+      if (method === 'setupPlan') return { ok: true, readiness: readiness({
         ready: true,
         status: 'ready',
         missing_bins: [],
         setup_actions: [],
       }) }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const instance = harness(call, {
       storage,
@@ -1347,8 +1334,8 @@ describe('useMetaSkillSetup', () => {
     first.api.dispose()
 
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const second = harness(call, { storage, autoRestore: false })
     await flushPromises()
@@ -1357,7 +1344,7 @@ describe('useMetaSkillSetup', () => {
     expect(second.dispatchHidden).not.toHaveBeenCalled()
 
     await second.api.restoreSetupJob()
-    expect(call.mock.calls.map(([method]) => method)).toEqual(['meta.run'])
+    expect(call.mock.calls.map(([method]) => method)).toEqual(['launch'])
     expect(second.dispatchHidden).toHaveBeenCalledWith(
       launchText,
       launchText,
@@ -1386,15 +1373,15 @@ describe('useMetaSkillSetup', () => {
     first.api.dispose()
 
     const readyCall = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') return { ok: true, readiness: readiness({
+      if (method === 'setupPlan') return { ok: true, readiness: readiness({
         ready: true,
         status: 'ready',
         missing_bins: [],
         setup_actions: [],
         manual_setup_actions: [],
       }) }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const tabA = harness(readyCall, {
       storage: memoryStorage({ [storageKey]: copiedCheckpoint }),
@@ -1574,10 +1561,10 @@ describe('useMetaSkillSetup', () => {
     first.api.dispose()
 
     const secondCall = vi.fn(async (method: string) => {
-      if (method === 'meta.run') {
+      if (method === 'launch') {
         return {
           ok: false,
-          setup_required: true,
+          setupRequired: true,
           readiness: readiness({
             missing_bins: [],
             setup_actions: [],
@@ -1590,11 +1577,11 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      throw new Error(`Unexpected RPC: ${method}`)
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const second = harness(secondCall, { storage })
     await flushPromises()
-    expect(secondCall).toHaveBeenCalledWith('meta.run', {
+    expect(secondCall).toHaveBeenCalledWith('launch', {
       name: 'meta-short-drama',
       sessionKey: SESSION,
       clientRequestId,
@@ -1609,8 +1596,8 @@ describe('useMetaSkillSetup', () => {
     const launchText = '/meta meta-paper-write -- Preserve this request across a network error'
     const storage = memoryStorage()
     const first = harness(vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') throw new Error('Gateway disconnected')
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupInstall') throw new Error('Gateway disconnected')
+      throw new Error(`Unexpected domain operation: ${method}`)
     }), { storage })
 
     await first.api.requestSetup('meta-paper-write', readiness(), SESSION, launchText)
@@ -1629,7 +1616,7 @@ describe('useMetaSkillSetup', () => {
 
   it('keeps the manual recovery card actionable when a readiness recheck is still blocked', async () => {
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') {
+      if (method === 'setupPlan') {
         return {
           ok: true,
           readiness: readiness({
@@ -1640,7 +1627,7 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      throw new Error(`Unexpected RPC: ${method}`)
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api, dispatchHidden } = harness(call)
 
@@ -1654,7 +1641,7 @@ describe('useMetaSkillSetup', () => {
     expect(api.setupState.value?.phase).toBe('blocked')
     expect(api.setupState.value?.error).toContain('credentials are still missing')
     expect(api.setupState.value?.retryMode).toBe('readiness')
-    expect(call.mock.calls.filter(([method]) => method === 'meta.run')).toHaveLength(0)
+    expect(call.mock.calls.filter(([method]) => method === 'launch')).toHaveLength(0)
     expect(dispatchHidden).not.toHaveBeenCalled()
     api.dispose()
   })
@@ -1663,9 +1650,9 @@ describe('useMetaSkillSetup', () => {
     let resolvePlan: ((value: unknown) => void) | undefined
     const plan = new Promise(resolve => { resolvePlan = resolve })
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.plan') return plan
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupPlan') return plan
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api, currentSessionKey, dispatchHidden } = harness(call)
 
@@ -1684,7 +1671,7 @@ describe('useMetaSkillSetup', () => {
     })
     await retry
 
-    expect(call.mock.calls.filter(([method]) => method === 'meta.run')).toHaveLength(0)
+    expect(call.mock.calls.filter(([method]) => method === 'launch')).toHaveLength(0)
     expect(dispatchHidden).not.toHaveBeenCalled()
     expect(api.setupState.value).toBeNull()
     api.dispose()
@@ -1697,8 +1684,8 @@ describe('useMetaSkillSetup', () => {
       [metaSetupStorageKey(SESSION)]: 'job-1',
     })
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.status') return status
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'setupStatus') return status
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api, currentSessionKey, dispatchHidden } = harness(call, {
       autoRestore: false,
@@ -1719,14 +1706,14 @@ describe('useMetaSkillSetup', () => {
     expect(dispatchHidden).not.toHaveBeenCalled()
     expect(storage.getItem(metaSetupStorageKey(SESSION))).toBe('job-1')
     await vi.advanceTimersByTimeAsync(750)
-    expect(call.mock.calls.filter(([method]) => method === 'meta.setup.status')).toHaveLength(1)
+    expect(call.mock.calls.filter(([method]) => method === 'setupStatus')).toHaveLength(1)
     api.dispose()
   })
 
   it('never resumes into a session that is no longer current', async () => {
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.install') return { job: job() }
-      if (method === 'meta.setup.status') {
+      if (method === 'setupInstall') return { job: job() }
+      if (method === 'setupStatus') {
         return {
           job: job({
             status: 'completed',
@@ -1735,8 +1722,8 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api, currentSessionKey, dispatchHidden } = harness(call)
 
@@ -1746,7 +1733,7 @@ describe('useMetaSkillSetup', () => {
     await flushPromises()
     await vi.advanceTimersByTimeAsync(1000)
 
-    expect(call.mock.calls.filter(([method]) => method === 'meta.run')).toHaveLength(0)
+    expect(call.mock.calls.filter(([method]) => method === 'launch')).toHaveLength(0)
     expect(dispatchHidden).not.toHaveBeenCalled()
     expect(api.setupState.value).toBeNull()
     api.dispose()
@@ -1759,7 +1746,7 @@ describe('useMetaSkillSetup', () => {
       [metaSetupLaunchStorageKey(SESSION)]: launchText,
     })
     const call = vi.fn(async (method: string) => {
-      if (method === 'meta.setup.status') {
+      if (method === 'setupStatus') {
         return {
           job: job({
             job_id: 'restored-job',
@@ -1769,8 +1756,8 @@ describe('useMetaSkillSetup', () => {
           }),
         }
       }
-      if (method === 'meta.run') return { ok: true }
-      throw new Error(`Unexpected RPC: ${method}`)
+      if (method === 'launch') return { ok: true }
+      throw new Error(`Unexpected domain operation: ${method}`)
     })
     const { api, dispatchHidden } = harness(call, { storage })
     await flushPromises()
@@ -1789,7 +1776,7 @@ describe('useMetaSkillSetup', () => {
     let statusCalls = 0
     const call = vi.fn(async () => {
       statusCalls += 1
-      if (statusCalls === 1) throw new Error('Cannot call meta.setup.status: not connected')
+      if (statusCalls === 1) throw new Error('Setup service is not connected')
       return { job: job({ job_id: 'restored-job' }) }
     })
     const { api } = harness(call, { storage, ready })

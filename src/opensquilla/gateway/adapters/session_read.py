@@ -71,18 +71,18 @@ class GatewaySessionReadPorts:
         read_planning: PlanningStateReader,
     ) -> None:
         self._streams = streams
-        self._read_tasks = read_tasks
-        self._read_workspace = read_workspace
-        self._read_pending_inputs = read_pending_inputs
-        self._read_routing = read_routing
-        self._read_planning = read_planning
+        self._task_state_reader = read_tasks
+        self._workspace_state_reader = read_workspace
+        self._pending_input_reader = read_pending_inputs
+        self._routing_state_reader = read_routing
+        self._planning_state_reader = read_planning
 
     def current_stream_seq(self, session_key: str) -> int:
         replay = getattr(self._streams, "replay")(session_key, None)
         return int(getattr(replay, "current_stream_seq"))
 
     async def read_task_state(self, session_key: str) -> SessionTaskState:
-        return await self._read_tasks(session_key)
+        return await self._task_state_reader(session_key)
 
     async def read_workspace_state(
         self,
@@ -90,19 +90,19 @@ class GatewaySessionReadPorts:
         *,
         include_project_workspace: bool,
     ) -> SessionWorkspaceState:
-        return await self._read_workspace(session_key, include_project_workspace)
+        return await self._workspace_state_reader(session_key, include_project_workspace)
 
     async def read_pending_inputs(
         self,
         session_key: str,
     ) -> Sequence[JsonObject]:
-        return await self._read_pending_inputs(session_key)
+        return await self._pending_input_reader(session_key)
 
     async def read_routing(self, session_key: str) -> JsonObject:
-        return await self._read_routing(session_key)
+        return await self._routing_state_reader(session_key)
 
     async def read_planning_state(self, session_key: str) -> SessionPlanningState:
-        return await self._read_planning(session_key)
+        return await self._planning_state_reader(session_key)
 
 
 class _UnavailableSessionPreviewPorts:

@@ -67,6 +67,99 @@ def _remote_ctx(owner_ctx: RpcContext) -> RpcContext:
     )
 
 
+def _owner_ctx_without_storage() -> RpcContext:
+    return RpcContext(
+        conn_id="workspace-contract-errors",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.write"}),
+            is_owner=True,
+            authenticated=True,
+        ),
+        config=GatewayConfig(),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "params", "expected_code"),
+    (
+        ("_handle_workspaces_open", None, "INVALID_PARAMS"),
+        (
+            "_handle_workspaces_open",
+            {"path": ".", "trusted": False},
+            "WORKSPACE_TRUST_REQUIRED",
+        ),
+        (
+            "_handle_workspaces_open",
+            {"path": "", "trusted": True},
+            "INVALID_WORKSPACE_PATH",
+        ),
+        ("_handle_workspaces_update", {}, "INVALID_PARAMS"),
+        ("_handle_workspaces_pin", {}, "INVALID_PARAMS"),
+        ("_handle_workspaces_remove", {}, "INVALID_PARAMS"),
+        ("_handle_workspaces_history_delete", {}, "INVALID_PARAMS"),
+    ),
+)
+async def test_workspace_contract_error_metadata_has_real_handler_fixture(
+    handler_name: str,
+    params: dict[str, Any] | None,
+    expected_code: str,
+) -> None:
+    from opensquilla.gateway import rpc_workspaces
+    from opensquilla.gateway.rpc import RpcHandlerError
+
+    handler = getattr(rpc_workspaces, handler_name)
+
+    with pytest.raises(RpcHandlerError) as raised:
+        await handler(params, _owner_ctx_without_storage())
+
+    assert raised.value.code == expected_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "params"),
+    (
+        ("_handle_workspaces_update", {"workspaceId": "workspace", "name": "Name"}),
+        ("_handle_workspaces_pin", {"workspaceId": "workspace", "pinned": True}),
+        ("_handle_workspaces_remove", {"workspaceId": "workspace"}),
+        ("_handle_workspaces_history_delete", {"workspaceId": "workspace"}),
+    ),
+)
+async def test_workspace_contract_declares_real_storage_unavailable_error(
+    handler_name: str,
+    params: dict[str, Any],
+) -> None:
+    from opensquilla.gateway import rpc_workspaces
+    from opensquilla.gateway.rpc import RpcHandlerError
+
+    handler = getattr(rpc_workspaces, handler_name)
+
+    with pytest.raises(RpcHandlerError) as raised:
+        await handler(params, _owner_ctx_without_storage())
+
+    assert raised.value.code == "UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_workspace_open_contract_declares_real_storage_unavailable_error(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc import RpcHandlerError
+
+    project = tmp_path / "unavailable-storage"
+    project.mkdir()
+
+    with pytest.raises(RpcHandlerError) as raised:
+        await _handle_workspaces_open(
+            {"path": str(project), "trusted": True},
+            _owner_ctx_without_storage(),
+        )
+
+    assert raised.value.code == "UNAVAILABLE"
+
+
 async def _assert_workspace_unavailable(
     ctx: RpcContext,
     workspace_id: str,
@@ -871,7 +964,7 @@ async def test_history_delete_holds_sorted_session_locks_through_all_cleanup(
     release_cleanup = asyncio.Event()
     cleanup_calls: list[str] = []
 
-    async def cleanup(session: SessionNode) -> None:
+    async def cleanup(session: SessionNode, _material_cleanup: object) -> None:
         cleanup_calls.append(session.session_key)
         if len(cleanup_calls) == 1:
             cleanup_entered.set()
@@ -1465,7 +1558,7 @@ async def test_history_delete_real_quiescers_leave_no_late_rows_after_cancellati
     release_cleanup = asyncio.Event()
     cleanup_calls: list[str] = []
 
-    async def blocked_cleanup(node: SessionNode) -> None:
+    async def blocked_cleanup(node: SessionNode, _material_cleanup: object) -> None:
         cleanup_calls.append(node.session_key)
         if len(cleanup_calls) == 1:
             cleanup_started.set()

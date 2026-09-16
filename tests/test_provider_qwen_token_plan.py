@@ -405,7 +405,7 @@ async def test_qwen38_explicit_budget_does_not_conflict_with_reasoning_effort(
 
 
 @pytest.mark.asyncio
-async def test_non_forced_model_preserves_pinned_tool_by_disabling_thinking(
+async def test_non_forced_model_preserves_thinking_by_normalizing_pinned_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -439,11 +439,11 @@ async def test_non_forced_model_preserves_pinned_tool_by_disabling_thinking(
     )
 
     payload = captured["payload"]
-    assert payload["enable_thinking"] is False
-    assert payload["tool_choice"] == pinned
+    assert payload["enable_thinking"] is True
+    assert payload["tool_choice"] == "auto"
     assert "thinking_budget" not in payload
-    assert "preserve_thinking" not in payload
-    assert "reasoning_content" not in payload["messages"][0]
+    assert payload["preserve_thinking"] is True
+    assert payload["messages"][0]["reasoning_content"] == "private reasoning"
 
 
 @pytest.mark.asyncio

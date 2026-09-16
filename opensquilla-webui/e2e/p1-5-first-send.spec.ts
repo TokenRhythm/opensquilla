@@ -5,6 +5,7 @@ import {
   type Page,
   type WebSocketRoute,
 } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const RELEASE_ITERATIONS = Number(process.env.OPENSQUILLA_P1_5_ITERATIONS || '1')
@@ -74,7 +75,7 @@ function basePayload(method: string): unknown {
     },
     'models.routing.get': { mode: 'direct' },
     'onboarding.status': { audioConfigured: false },
-    'sessions.list': { sessions: [], has_more: false },
+    'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
     'sessions.messages.unsubscribe': { subscribed: false },
     'sessions.subscribe': { subscribed: true },
     'usage.status': { sessions: [] },
@@ -92,9 +93,8 @@ function hello(supportsPendingQueue = true) {
         'sessions.pending_inputs.reorder',
       ]
     : []
-  return JSON.stringify({
-    protocol: 3,
-    policy: { tick_interval_ms: 30_000, concurrent_history_reads: true },
+  return helloOkResponse({
+    policy: { concurrent_history_reads: true },
     features: {
       methods: [
         'sessions.messages.subscribe',

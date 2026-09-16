@@ -59,7 +59,14 @@ export interface ChannelStatusSubscription {
   close(): void
 }
 
-export interface ChannelAdministration {
+export interface ChannelPairingAdministration {
+  listPairings(name: string): Promise<readonly ChannelPairing[]>
+  approvePairing(name: string, pairingId: string, asAdmin: boolean): Promise<PairingApproval>
+  revokePairing(name: string, pairingId: string): Promise<void>
+  setAdmin(name: string, senderId: string, admin: boolean): Promise<void>
+}
+
+export interface ChannelAdministration extends ChannelPairingAdministration {
   status(): Promise<readonly Channel[]>
   get(name: string): Promise<{
     readonly entry: Record<string, unknown> | null
@@ -68,11 +75,6 @@ export interface ChannelAdministration {
   probe(name: string): Promise<ProbeResult>
   restart(name: string): Promise<void>
   logout(name: string): Promise<void>
-  listPairings(name: string): Promise<readonly ChannelPairing[]>
-  approvePairing(name: string, pairingId: string, asAdmin: boolean): Promise<PairingApproval>
-  revokePairing(name: string, pairingId: string): Promise<void>
-  setAdmin(name: string, senderId: string, admin: boolean): Promise<void>
-  ready(): Promise<void>
   subscribeStatus(listener: () => void): ChannelStatusSubscription
 }
 

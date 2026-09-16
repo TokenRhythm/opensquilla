@@ -16,7 +16,7 @@ const { t } = useI18n()
     </div>
 
     <div id="settings-gateway-connection" class="settings-composite" tabindex="-1">
-      <SetupConnectionPanel />
+      <SetupConnectionPanel :managed="isDesktop" />
     </div>
     <div
       v-if="isDesktop"

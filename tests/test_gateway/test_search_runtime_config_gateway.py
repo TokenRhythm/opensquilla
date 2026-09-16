@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from opensquilla.gateway import boot, rpc_onboarding
+import pytest
+
+from opensquilla.gateway import boot
+from opensquilla.gateway.adapters.setup_mutations import GatewaySetupRuntimePort
 
 
-def test_rpc_onboarding_sync_search_provider_passes_api_key_env(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_setup_runtime_sync_search_passes_api_key_env(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
 
     def fake_configure_search(**kwargs) -> None:
@@ -13,7 +17,7 @@ def test_rpc_onboarding_sync_search_provider_passes_api_key_env(monkeypatch) -> 
 
     monkeypatch.setattr("opensquilla.tools.builtin.web.configure_search", fake_configure_search)
 
-    rpc_onboarding._sync_search_provider(
+    await GatewaySetupRuntimePort(None, None).sync_search(
         SimpleNamespace(
             search_provider="exa",
             search_max_results=7,

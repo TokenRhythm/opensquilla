@@ -123,13 +123,18 @@ async def repair_json_stream(
 ) -> AsyncIterator[AgentEvent]:
     """Yield events unchanged except ToolUseStartEvent whose tool_name carries
     repaired JSON — and any future event that grows an ``arguments`` str field."""
-    async for event in stream:
-        # ToolUseStartEvent does not carry arguments (those arrive as deltas),
-        # but downstream code may attach them; handle generically via hasattr.
-        arguments = getattr(event, "arguments", None)
-        if isinstance(arguments, str):
-            setattr(event, "arguments", _repair_json(arguments))
-        yield event
+    try:
+        async for event in stream:
+            # ToolUseStartEvent does not carry arguments (those arrive as deltas),
+            # but downstream code may attach them; handle generically via hasattr.
+            arguments = getattr(event, "arguments", None)
+            if isinstance(arguments, str):
+                setattr(event, "arguments", _repair_json(arguments))
+            yield event
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 # ---------------------------------------------------------------------------
@@ -330,10 +335,15 @@ async def trim_tool_names_stream(
     stream: AsyncIterator[AgentEvent],
 ) -> AsyncIterator[AgentEvent]:
     """Strip leading/trailing whitespace from tool names in ToolUseStartEvent."""
-    async for event in stream:
-        if isinstance(event, ToolUseStartEvent) and event.tool_name != event.tool_name.strip():
-            event = dataclasses.replace(event, tool_name=event.tool_name.strip())
-        yield event
+    try:
+        async for event in stream:
+            if isinstance(event, ToolUseStartEvent) and event.tool_name != event.tool_name.strip():
+                event = dataclasses.replace(event, tool_name=event.tool_name.strip())
+            yield event
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 # ---------------------------------------------------------------------------

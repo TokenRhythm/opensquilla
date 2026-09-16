@@ -143,15 +143,6 @@ def _is_valid_hermes_home(path: Path) -> bool:
     )
 
 
-def _load_yaml(path: Path) -> dict[str, Any]:
-    # Returns ({}, None) on missing file or unparseable YAML so a hand-edited
-    # config.yaml with a syntax error cannot crash the entire migration.
-    # Callers that need to surface the parse failure should use
-    # _load_yaml_with_error.
-    data, _ = _load_yaml_with_error(path)
-    return data
-
-
 def _load_yaml_with_error(path: Path) -> tuple[dict[str, Any], str | None]:
     if not path.exists():
         return {}, None

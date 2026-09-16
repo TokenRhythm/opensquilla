@@ -1,5 +1,10 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
+import type {
+  ConfigureImageGeneration,
+  ConfigureMemoryEmbedding,
+  ConfigureSearch,
+} from '@/modules/setupWorkflow'
 
 interface ProviderSpec {
   providerId: string
@@ -249,8 +254,8 @@ export function imageModelRefForPayload(providerId: string, raw: string): string
   return provider && model ? `${provider}/${model}` : ''
 }
 
-export function buildSearchPayload(values: SearchFormValues): Record<string, unknown> {
-  const params: Record<string, unknown> = { providerId: values.providerId }
+export function buildSearchPayload(values: SearchFormValues): ConfigureSearch {
+  const params: ConfigureSearch = { providerId: values.providerId }
   if (values.apiKey) params.apiKey = values.apiKey
   else if (values.apiKeyEnv) params.apiKeyEnv = values.apiKeyEnv
   params.maxResults = values.maxResults
@@ -261,8 +266,8 @@ export function buildSearchPayload(values: SearchFormValues): Record<string, unk
   return params
 }
 
-export function buildMemoryPayload(values: MemoryFormValues): Record<string, unknown> {
-  const params: Record<string, unknown> = { providerId: values.providerId }
+export function buildMemoryPayload(values: MemoryFormValues): ConfigureMemoryEmbedding {
+  const params: ConfigureMemoryEmbedding = { providerId: values.providerId }
   if (values.model) params.model = values.model
   if (values.apiKey) params.apiKey = values.apiKey
   if (values.apiKeyEnv) params.apiKeyEnv = values.apiKeyEnv
@@ -275,10 +280,10 @@ export function buildImagePayload(
   values: ImageFormValues,
   touched: ReadonlySet<ImageTouchedField> = new Set(),
   options: ImagePayloadOptions = {},
-): Record<string, unknown> {
+): ConfigureImageGeneration {
   const apiKey = values.apiKey.trim()
   const apiKeyEnv = values.apiKeyEnv.trim()
-  const params: Record<string, unknown> = {
+  const params: ConfigureImageGeneration = {
     enabled: values.enabled,
     providerId: values.providerId.trim(),
   }
@@ -719,7 +724,7 @@ export function useSetupCapabilitiesForm() {
     }
   }
 
-  function searchPayload(): Record<string, unknown> {
+  function searchPayload(): ConfigureSearch {
     return buildSearchPayload({
       providerId: searchProvider.value,
       apiKey: searchApiKey.value,
@@ -732,7 +737,7 @@ export function useSetupCapabilitiesForm() {
     })
   }
 
-  function memoryPayload(): Record<string, unknown> {
+  function memoryPayload(): ConfigureMemoryEmbedding {
     return buildMemoryPayload({
       providerId: memoryProvider.value,
       model: memoryModel.value,
@@ -743,7 +748,7 @@ export function useSetupCapabilitiesForm() {
     })
   }
 
-  function imagePayload(): Record<string, unknown> {
+  function imagePayload(): ConfigureImageGeneration {
     const touchedFields = new Set([
       ...imageTouchedFields.value,
       ...imageGlobalTouchedFields.value,

@@ -29,13 +29,35 @@ export interface SessionInspectionHistory {
   ): Promise<SessionReadHistoryPage>
 }
 
+export interface ExecutionLogPage {
+  readonly handle: string
+  readonly content: string
+  readonly offset: number
+  readonly nextOffset: number | null
+  readonly chars: number
+  readonly complete: boolean
+}
+
 /** Read-only inspection seam. It never subscribes or creates a live lease. */
 export interface SessionInspection {
   preview(
     sessionKey: string,
     options?: SessionInspectionRequestOptions,
   ): Promise<SessionInspectionPreview | null>
+  readExecutionLog(
+    sessionKey: string,
+    handle: string,
+    offset: number,
+    options?: SessionInspectionRequestOptions,
+  ): Promise<ExecutionLogPage>
   readonly history: SessionInspectionHistory
+}
+
+export class SessionInspectionLogNotReadyError extends Error {
+  constructor() {
+    super('Execution log is still being saved.')
+    this.name = 'SessionInspectionLogNotReadyError'
+  }
 }
 
 export class SessionInspectionContractError extends Error {

@@ -1,0 +1,41 @@
+name: Download required artifact
+description: Retry one artifact transfer once, while keeping missing inputs a hard failure.
+inputs:
+  name:
+    description: Exact artifact name from this workflow run.
+    required: true
+  path:
+    description: Destination owned by this artifact consumer.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Download artifact
+      id: first
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+    - name: Retry failed artifact transfer once
+      id: retry
+      if: ${{ !cancelled() && steps.first.outcome == 'failure' }}
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+    - name: Require a successful artifact transfer
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        FIRST_OUTCOME: ${{ steps.first.outcome }}
+        RETRY_OUTCOME: ${{ steps.retry.outcome }}
+      run: |
+        if [[ "${FIRST_OUTCOME}" != "success" && "${RETRY_OUTCOME}" != "success" ]]; then
+          echo "::error::Required artifact transfer failed after at most two attempts."
+          exit 1
+        fi
+        if [[ "${FIRST_OUTCOME}" == "failure" ]]; then
+          echo "::warning::Required artifact transfer recovered on the second attempt."
+        fi

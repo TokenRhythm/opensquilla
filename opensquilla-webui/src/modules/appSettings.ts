@@ -25,6 +25,15 @@ export interface SettingsMutation {
 
 export interface SettingChange { readonly path: string; readonly value: SettingsValue }
 
+export type TelemetryConsentScope = 'reliability' | 'growth'
+
+export interface TelemetryConsentDecision {
+  readonly scope: TelemetryConsentScope
+  readonly enabled: boolean
+  readonly noticeVersion: string | null
+  readonly consentedAtUtc: string | null
+}
+
 export type AppSettingsErrorCode =
   | 'not-found' | 'unsupported' | 'forbidden' | 'conflict' | 'unavailable' | 'invalid'
 
@@ -44,6 +53,7 @@ export interface AppSettings {
   patch(changes: readonly SettingChange[], options?: { signal?: AbortSignal }): Promise<SettingsMutation>
   patchSafe(changes: readonly SettingChange[], options?: { signal?: AbortSignal }): Promise<SettingsMutation>
   merge(patch: SettingsObject, options?: { signal?: AbortSignal }): Promise<SettingsMutation>
+  setTelemetryConsent(scope: TelemetryConsentScope, enabled: boolean, options?: { signal?: AbortSignal }): Promise<TelemetryConsentDecision>
 }
 
 export const APP_SETTINGS_KEY: InjectionKey<AppSettings> = Symbol('AppSettings')

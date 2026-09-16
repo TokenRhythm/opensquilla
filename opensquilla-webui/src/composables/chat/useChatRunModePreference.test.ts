@@ -11,8 +11,8 @@ import {
 
 function createSandbox() {
   return {
-    runModePreference: vi.fn().mockResolvedValue({ runMode: 'full', source: 'preference' }),
-    setRunMode: vi.fn().mockResolvedValue({ runMode: 'full', source: 'preference' }),
+    preference: vi.fn().mockResolvedValue({ runMode: 'full' as const, source: 'preference' }),
+    selectMode: vi.fn().mockResolvedValue({ runMode: 'full' as const, source: 'preference' }),
   }
 }
 
@@ -79,12 +79,12 @@ describe('useChatRunModePreference', () => {
       allowedRunModes: ['safe', 'full'],
     })
     const sandbox = createSandbox()
-    sandbox.runModePreference.mockResolvedValueOnce({ runMode: 'trusted', source: 'preference' })
+    sandbox.preference.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
     const { api, scope } = runInScope(policy, sandbox)
 
     await api.hydrateRunModePreference()
 
-    expect(sandbox.runModePreference).toHaveBeenCalledWith({ timeoutMs: 10_000 })
+    expect(sandbox.preference).toHaveBeenCalledWith({ timeoutMs: 10_000 })
     expect(api.runMode.value).toBe('safe')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
@@ -96,13 +96,13 @@ describe('useChatRunModePreference', () => {
       allowedRunModes: ['safe', 'full'],
     })
     const sandbox = createSandbox()
-    sandbox.setRunMode.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
+    sandbox.selectMode.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
     const { api, scope } = runInScope(policy, sandbox)
 
     const selected = await api.setGlobalRunMode('safe')
 
     expect(selected).toBe('safe')
-    expect(sandbox.setRunMode).toHaveBeenCalledWith('safe', { timeoutMs: 5_000 })
+    expect(sandbox.selectMode).toHaveBeenCalledWith('safe', { timeoutMs: 5_000 })
     expect(api.runMode.value).toBe('safe')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
@@ -115,7 +115,7 @@ describe('useChatRunModePreference', () => {
     })
     const sandbox = createSandbox()
     let resolveWrite!: (payload: unknown) => void
-    sandbox.setRunMode.mockReturnValueOnce(new Promise(resolve => {
+    sandbox.selectMode.mockReturnValueOnce(new Promise(resolve => {
       resolveWrite = resolve
     }))
     const { api, scope } = runInScope(policy, sandbox)
@@ -124,9 +124,9 @@ describe('useChatRunModePreference', () => {
 
     expect(api.runMode.value).toBe('safe')
     await Promise.resolve()
-    expect(sandbox.setRunMode).toHaveBeenCalledWith('safe', { timeoutMs: 5_000 })
+    expect(sandbox.selectMode).toHaveBeenCalledWith('safe', { timeoutMs: 5_000 })
 
-    resolveWrite({ runMode: 'trusted', source: 'preference' })
+    resolveWrite({ runMode: 'safe', source: 'preference' })
     await expect(pending).resolves.toBe('safe')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
@@ -138,7 +138,7 @@ describe('useChatRunModePreference', () => {
       allowedRunModes: ['safe', 'full'],
     })
     const sandbox = createSandbox()
-    sandbox.setRunMode.mockRejectedValueOnce(new Error('write failed'))
+    sandbox.selectMode.mockRejectedValueOnce(new Error('write failed'))
     const { api, scope } = runInScope(policy, sandbox)
 
     await expect(api.setGlobalRunMode('safe')).rejects.toThrow('write failed')

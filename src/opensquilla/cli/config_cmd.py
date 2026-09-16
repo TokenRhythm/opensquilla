@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, get_args, get_origin
 
 import typer
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from rich.markup import escape
 from rich.table import Table
 
@@ -66,14 +66,33 @@ def config_set(
     config_path: Path | None = typer.Option(None, "--config", help="Persist to config path."),
 ) -> None:
     """Set a configuration value (env-var backed, prints export command)."""
+    from opensquilla.cli.port_validation import (
+        GATEWAY_PORT_MESSAGE,
+        has_gateway_port_error,
+        validate_gateway_port,
+    )
     from opensquilla.gateway.config import GatewayConfig
+
+    parsed_value = _parse_config_value(value)
+    if key == "port":
+        try:
+            validate_gateway_port(parsed_value)
+        except ValidationError:
+            console.print(f"[red]Invalid value for port:[/red] {GATEWAY_PORT_MESSAGE}")
+            raise typer.Exit(2) from None
 
     if config_path is not None:
         from opensquilla.onboarding.config_store import load_config, persist_config
 
-        cfg = load_config(config_path)
+        try:
+            cfg = load_config(config_path, persist_migrations=False)
+        except ValidationError as exc:
+            if not has_gateway_port_error(exc):
+                raise
+            console.print(f"[red]Invalid value for port:[/red] {GATEWAY_PORT_MESSAGE}")
+            raise typer.Exit(2) from None
         data = cfg.to_toml_dict()
-        if not _set_key(data, key, _parse_config_value(value)):
+        if not _set_key(data, key, parsed_value):
             console.print(f"[red]Key not found: {escape(key)}[/red]")
             raise typer.Exit(1)
         try:
@@ -87,6 +106,13 @@ def config_set(
         )
 
         reconcile_model_routing_write(updated, {key}, previous=cfg)
+        # Canonical mode reconciliation can enable Router after model validation.
+        # Resolve the same provider defaults a reload would apply before checking
+        # execution dependencies; explicit custom ladders remain untouched.
+        updated.initialize_router_profile_defaults()
+        from opensquilla.onboarding.router_policy import validate_router_reactivation
+
+        validate_router_reactivation(cfg, updated, explicit_paths={key})
         persist = persist_config(updated, path=config_path, restart_required=True)
         console.print(f"[{ACCENT_MARKUP}]Config:[/] {persist.path}")
         if persist.backup_path:

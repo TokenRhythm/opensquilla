@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import { RpcTransportError } from '@/lib/rpc'
 import type { WorkbenchResource } from '@/types/workbenchResources'
-import { artifactProductClientError } from '@/utils/artifactProductErrors'
+import {
+  ArtifactProductFailure,
+  artifactProductClientError,
+} from '@/utils/artifactProductErrors'
 import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import type { WorkbenchRuntimeContext } from '@/workbench/types'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
@@ -91,7 +93,10 @@ describe('Workbench resource collection provider', () => {
 
   it('keeps a failed open inline and allows the same row to retry', async () => {
     const { calls, context, definition, item, state } = harness()
-    calls.open.mockRejectedValueOnce(new RpcTransportError('Gateway disconnected', null))
+    calls.open.mockRejectedValueOnce(new ArtifactProductFailure(
+      'DOCUMENT_UNAVAILABLE',
+      'Gateway disconnected',
+    ))
     const runtime = await definition.createRuntime!(item, context)
 
     await runtime.handleComponentEvent?.({ type: 'resource-open', payload: attachment }, item)

@@ -113,6 +113,40 @@ async def test_windows_setup_promotes_runtime_backend_after_setup(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_ready_setup_is_idempotent_after_a_client_loses_the_response(monkeypatch) -> None:
+    from opensquilla.sandbox import integration, setup_runtime
+
+    config = SimpleNamespace()
+    setup_calls = 0
+    promotions = []
+
+    async def ready_setup(_config):
+        nonlocal setup_calls
+        setup_calls += 1
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="win32",
+            message="Windows default sandbox is ready.",
+            requires_admin=False,
+        )
+
+    monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", ready_setup)
+    monkeypatch.setattr(
+        integration,
+        "initialize_runtime_backend",
+        AsyncMock(side_effect=lambda: promotions.append("promoted")),
+        raising=False,
+    )
+
+    first = await setup_runtime.ensure_sandbox_setup_auto(config)
+    second = await setup_runtime.ensure_sandbox_setup_auto(config)
+
+    assert second is first
+    assert setup_calls == 1
+    assert promotions == ["promoted"]
+
+
+@pytest.mark.asyncio
 async def test_windows_setup_reports_failed_when_runtime_cannot_be_promoted(
     monkeypatch,
 ) -> None:

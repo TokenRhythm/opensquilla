@@ -363,6 +363,8 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
         assert task.details["fresh_user_session"] is True
         assert task.details["accepted_model_routing"]["effective_mode"] == "direct"
         assert task.details["accepted_model_routing"]["source"] == "session"
+        assert task.details["session_id"] == session.session_id
+        assert task.details["session_epoch"] == session.epoch
 
         receipt_result = await stack.storage.get_turn_ingress_receipt(
             source_scope=f"channel:slack:{ACCOUNT_ID}",
@@ -377,9 +379,12 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
         assert receipt.task_id == task.task_id
 
         assert len(stack.received_runs) == 1
-        assert stack.received_runs[0].persisted_user_message_id == message.message_id
-        assert stack.received_runs[0].fresh_user_session is True
-        assert stack.received_runs[0].accepted_config.session_mode == "direct"
+        run = stack.received_runs[0]
+        assert run.persisted_user_message_id == message.message_id
+        assert run.fresh_user_session is True
+        assert run.accepted_config.session_mode == "direct"
+        assert run.envelope.session_id == session.session_id
+        assert run.envelope.session_epoch == session.epoch
         assert _table_counts(stack.db_path) == {
             # The accepted channel session plus the post-acceptance main-delivery fallback.
             "sessions": 2,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,9 +19,8 @@ from opensquilla.artifact_session import (
     ArtifactSessionService,
     ArtifactValidationError,
     RevisionSource,
-    WriterLeaseConflictError,
-    WriterLeaseExpiredError,
 )
+from opensquilla.artifact_session.models import ChangeSetStatus, head_restore_receipt_state_revision
 from opensquilla.artifact_session.repository import ArtifactSessionRepository
 from opensquilla.session.storage import SessionStorage
 
@@ -202,12 +202,15 @@ async def test_adopt_document_is_atomic_and_rejects_preexisting_ambiguity(
         results = await asyncio.gather(*(_adopt() for _ in range(12)))
         assert sum(adopted for _result, adopted in results) == 1
         assert len({result.document.document_id for result, _adopted in results}) == 1
-        assert len(
-            await service.list_documents(
-                session_key="agent:main:webchat:adopt",
-                session_id="adopt-epoch",
+        assert (
+            len(
+                await service.list_documents(
+                    session_key="agent:main:webchat:adopt",
+                    session_id="adopt-epoch",
+                )
             )
-        ) == 1
+            == 1
+        )
 
         await service.create_document(
             session_key="agent:main:webchat:adopt",
@@ -276,7 +279,7 @@ async def test_document_rename_is_state_cas_audited_and_invalidates_stale_head_w
 
 
 @pytest.mark.asyncio
-async def test_restore_and_revert_append_new_revisions_instead_of_moving_head(
+async def test_restore_moves_head_and_revert_preserves_append_only_content_history(
     tmp_path: Path,
 ) -> None:
     service = await open_service(tmp_path / "artifacts.db", FakeClock())
@@ -311,16 +314,16 @@ async def test_restore_and_revert_append_new_revisions_instead_of_moving_head(
             actor=USER,
         )
 
-        assert restored.revision.source is RevisionSource.RESTORE
-        assert restored.revision.parent_revision_id == second.revision.revision_id
-        assert restored.revision.copied_from_revision_id == initial.revision.revision_id
-        assert restored.revision.artifact_id == initial.revision.artifact_id
+        assert restored.revision == initial.revision
+        assert restored.document.head_revision_id == initial.revision.revision_id
+        assert restored.document.generation == second.document.generation
+        assert restored.document.state_revision == second.document.state_revision + 1
         assert reverted.revision.source is RevisionSource.REVERT
         assert reverted.revision.parent_revision_id == restored.revision.revision_id
         assert reverted.revision.copied_from_revision_id == second.revision.revision_id
         assert [
             item.generation for item in await service.list_revisions(initial.document.document_id)
-        ] == [4, 3, 2, 1]
+        ] == [3, 2, 1]
 
         events = await service.list_audit_events(initial.document.document_id)
         assert [event.event_type for event in events] == [
@@ -330,6 +333,282 @@ async def test_restore_and_revert_append_new_revisions_instead_of_moving_head(
             "document.reverted",
         ]
         assert [event.sequence for event in events] == sorted(event.sequence for event in events)
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("no_op", [None, True, False])
+async def test_restore_current_head_keeps_content_and_records_exact_state(
+    tmp_path: Path, no_op: bool | None,
+) -> None:
+    service = await open_service(tmp_path / "no-op.db", FakeClock())
+    try:
+        initial = await service.create_document(
+            session_key="agent:main:webchat:no-op", name="Page",
+            kind=ArtifactKind.HTML, initial_artifact=blob("initial"), actor=USER,
+        )
+        events = await service.list_audit_events(initial.document.document_id)
+        restored = await service.restore_revision(
+            document_id=initial.document.document_id,
+            target_revision_id=initial.revision.revision_id,
+            expected_head_revision_id=initial.revision.revision_id,
+            expected_state_revision=initial.document.state_revision,
+            actor=USER, turn_id="revision-restore:no-op", no_op=no_op,
+        )
+        receipt = await service.get_change_set_by_turn(
+            document_id=initial.document.document_id, turn_id="revision-restore:no-op",
+        )
+        assert receipt is not None
+        assert restored.revision == initial.revision
+        assert restored.document.generation == 1
+        assert await service.list_revisions(initial.document.document_id) == (initial.revision,)
+        assert head_restore_receipt_state_revision(receipt, initial.revision) == (
+            restored.document.state_revision
+        )
+        if no_op is False:
+            # The working-file coordinator uses this when bytes, but not head, changed.
+            assert restored.document.state_revision == initial.document.state_revision + 1
+            assert len(await service.list_audit_events(initial.document.document_id)) == 2
+        else:
+            assert restored.document == initial.document
+            assert await service.list_audit_events(initial.document.document_id) == events
+        before_replay = await service.list_audit_events(initial.document.document_id)
+        replayed = await service.restore_revision(
+            document_id=initial.document.document_id,
+            target_revision_id=initial.revision.revision_id,
+            expected_head_revision_id=initial.revision.revision_id,
+            expected_state_revision=initial.document.state_revision,
+            actor=USER, turn_id="revision-restore:no-op",
+        )
+        assert replayed == restored
+        assert await service.list_audit_events(initial.document.document_id) == before_replay
+    finally:
+        await service.close()
+
+
+async def test_restore_receipt_replay_after_restart_preserves_later_edit_and_numbering(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "restore-replay.db"
+    service = await open_service(db_path, FakeClock())
+    try:
+        initial = await service.create_document(
+            session_key="agent:main:webchat:restore-replay", name="Page",
+            kind=ArtifactKind.HTML, initial_artifact=blob("initial"), actor=USER,
+        )
+        second = await service.commit_revision(
+            document_id=initial.document.document_id,
+            expected_head_revision_id=initial.revision.revision_id,
+            expected_state_revision=initial.document.state_revision,
+            artifact=blob("second"), actor=AGENT,
+        )
+        command = dict(
+            document_id=initial.document.document_id,
+            target_revision_id=initial.revision.revision_id,
+            expected_head_revision_id=second.revision.revision_id,
+            expected_state_revision=second.document.state_revision,
+            actor=USER, turn_id="revision-restore:once",
+        )
+        restored = await service.restore_revision(**command)
+        with pytest.raises(ArtifactConflictError, match="document head changed"):
+            await service.commit_revision(
+                document_id=initial.document.document_id,
+                expected_head_revision_id=initial.revision.revision_id,
+                expected_state_revision=initial.document.state_revision,
+                artifact=blob("stale"), actor=AGENT,
+            )
+        edited = await service.commit_revision(
+            document_id=initial.document.document_id,
+            expected_head_revision_id=restored.revision.revision_id,
+            expected_state_revision=restored.document.state_revision,
+            artifact=blob("edited"), actor=AGENT,
+        )
+        assert edited.revision.generation == 3
+        assert edited.revision.parent_revision_id == initial.revision.revision_id
+        revisions = await service.list_revisions(initial.document.document_id)
+        assert [revision.generation for revision in revisions] == [3, 2, 1]
+        events = await service.list_audit_events(initial.document.document_id)
+        await service.close()
+        service = await open_service(db_path, FakeClock())
+        replayed = await service.restore_revision(**command)
+        assert replayed.document == edited.document
+        assert replayed.revision == initial.revision
+        receipt = await service.get_change_set_by_turn(
+            document_id=initial.document.document_id, turn_id="revision-restore:once",
+        )
+        assert receipt is not None
+        assert head_restore_receipt_state_revision(receipt, replayed.revision) == (
+            restored.document.state_revision
+        )
+        assert await service.list_revisions(initial.document.document_id) == revisions
+        assert await service.list_audit_events(initial.document.document_id) == events
+        for changed in (
+            {"target_revision_id": second.revision.revision_id},
+            {"expected_head_revision_id": initial.revision.revision_id},
+            {"expected_state_revision": second.document.state_revision + 1},
+        ):
+            with pytest.raises(ArtifactConflictError, match="different document restore"):
+                await service.restore_revision(**(command | changed))
+    finally:
+        await service.close()
+
+
+async def test_restore_keeps_legacy_copy_revision_and_receipt_readable(tmp_path: Path) -> None:
+    service = await open_service(tmp_path / "legacy-restore.db", FakeClock())
+    try:
+        initial = await service.create_document(
+            session_key="agent:main:webchat:legacy-restore", name="Page",
+            kind=ArtifactKind.HTML, initial_artifact=blob("initial"), actor=USER,
+        )
+        second = await service.commit_revision(
+            document_id=initial.document.document_id,
+            expected_head_revision_id=initial.revision.revision_id,
+            expected_state_revision=initial.document.state_revision,
+            artifact=blob("second"), actor=AGENT,
+        )
+        legacy, legacy_receipt = await service.commit_change_set_atomically(
+            document_id=initial.document.document_id,
+            base_revision_id=second.revision.revision_id,
+            expected_document_state_revision=second.document.state_revision,
+            operations=({"op": "restore_revision",
+                         "target_revision_id": initial.revision.revision_id,
+                         "target_sha256": initial.revision.artifact_sha256,
+                         "expected_document_state_revision": second.document.state_revision},),
+            candidate_artifact=initial.revision.artifact,
+            validation={"status": "passed"}, actor=USER,
+            turn_id="revision-restore:legacy", source=RevisionSource.RESTORE,
+            copied_from_revision_id=initial.revision.revision_id,
+            revision_event_type="document.restored",
+        )
+        selected = await service.restore_revision(
+            document_id=initial.document.document_id,
+            target_revision_id=second.revision.revision_id,
+            expected_head_revision_id=legacy.revision.revision_id,
+            expected_state_revision=legacy.document.state_revision,
+            actor=USER,
+        )
+        replayed = await service.restore_revision(
+            document_id=initial.document.document_id,
+            target_revision_id=initial.revision.revision_id,
+            expected_head_revision_id=second.revision.revision_id,
+            expected_state_revision=second.document.state_revision,
+            actor=USER, turn_id="revision-restore:legacy",
+        )
+        assert replayed.document == selected.document
+        assert replayed.revision == legacy.revision
+        assert await service.get_change_set(legacy_receipt.change_set_id) == legacy_receipt
+        assert await service.list_revisions(initial.document.document_id) == (
+            legacy.revision, second.revision, initial.revision,
+        )
+        assert head_restore_receipt_state_revision(legacy_receipt, legacy.revision) is None
+    finally:
+        await service.close()
+
+
+async def test_restore_on_connection_rolls_back_head_receipt_and_audit_together(tmp_path: Path):
+    service = await open_service(tmp_path / "atomic-restore.db", FakeClock())
+    try:
+        initial = await service.create_document(
+            session_key="agent:main:webchat:atomic-restore", name="Page",
+            kind=ArtifactKind.HTML, initial_artifact=blob("initial"), actor=USER,
+        )
+        second = await service.commit_revision(
+            document_id=initial.document.document_id,
+            expected_head_revision_id=initial.revision.revision_id,
+            expected_state_revision=initial.document.state_revision,
+            artifact=blob("second"), actor=AGENT,
+        )
+        events = await service.list_audit_events(initial.document.document_id)
+        with pytest.raises(RuntimeError, match="binding persistence failed"):
+            async with service.repository._transaction("restore-coordination") as conn:
+                result, receipt, replayed = await service.repository._restore_revision_on_conn(
+                    conn, document_id=initial.document.document_id,
+                    target_revision_id=initial.revision.revision_id,
+                    expected_head_revision_id=second.revision.revision_id,
+                    expected_state_revision=second.document.state_revision,
+                    actor=USER, turn_id="revision-restore:atomic",
+                )
+                assert result.revision == initial.revision
+                assert receipt is not None and replayed is False
+                raise RuntimeError("binding persistence failed")
+        assert await service.get_document(initial.document.document_id) == second.document
+        assert await service.list_audit_events(initial.document.document_id) == events
+        assert await service.get_change_set_by_turn(
+            document_id=initial.document.document_id, turn_id="revision-restore:atomic",
+        ) is None
+        assert await service.list_revisions(initial.document.document_id) == (
+            second.revision, initial.revision,
+        )
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("invalid", ["target", "artifact", "state", "boolean-state", "no-op"])
+async def test_head_restore_receipt_rejects_inconsistent_results(tmp_path: Path, invalid: str):
+    service = await open_service(tmp_path / "receipt-validation.db", FakeClock())
+    try:
+        initial = await service.create_document(
+            session_key="agent:main:webchat:receipt-validation", name="Page",
+            kind=ArtifactKind.HTML, initial_artifact=blob("initial"), actor=USER,
+        )
+        await service.restore_revision(
+            document_id=initial.document.document_id,
+            target_revision_id=initial.revision.revision_id,
+            expected_head_revision_id=initial.revision.revision_id,
+            expected_state_revision=initial.document.state_revision,
+            actor=USER, turn_id="revision-restore:validation",
+        )
+        receipt = await service.get_change_set_by_turn(
+            document_id=initial.document.document_id, turn_id="revision-restore:validation",
+        )
+        assert receipt is not None and receipt.validation is not None
+        if invalid == "target":
+            receipt = replace(receipt, applied_revision_id="foreign-revision")
+        elif invalid == "artifact":
+            receipt = replace(receipt, candidate_artifact_id="foreign-artifact")
+        else:
+            changed = {"result_state_revision": True if invalid == "boolean-state" else 999}
+            if invalid == "no-op":
+                changed = {"no_op": "true"}
+            receipt = replace(receipt, validation=receipt.validation | changed)
+        with pytest.raises(ArtifactConflictError, match="receipt is inconsistent"):
+            head_restore_receipt_state_revision(receipt, initial.revision)
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("status", [None, ChangeSetStatus.APPLIED])
+async def test_restore_no_op_receipts_do_not_consume_change_history_limit(tmp_path: Path, status):
+    service = await open_service(tmp_path / "history-limit.db", FakeClock())
+    try:
+        initial = await service.create_document(
+            session_key="agent:main:webchat:history-limit", name="Page",
+            kind=ArtifactKind.HTML, initial_artifact=blob("initial"), actor=USER,
+        )
+        changed, visible_change = await service.commit_change_set_atomically(
+            document_id=initial.document.document_id,
+            base_revision_id=initial.revision.revision_id,
+            expected_document_state_revision=initial.document.state_revision,
+            operations=({"op": "update", "text": "Updated title"},),
+            candidate_artifact=blob("updated"), validation=None,
+            actor=AGENT, turn_id="edit:history-limit",
+        )
+        for index in range(3):
+            await service.restore_revision(
+                document_id=initial.document.document_id,
+                target_revision_id=changed.revision.revision_id,
+                expected_head_revision_id=changed.revision.revision_id,
+                expected_state_revision=changed.document.state_revision,
+                actor=USER, turn_id=f"revision-restore:no-op-{index}",
+            )
+        assert await service.list_change_sets(
+            initial.document.document_id, status=status, limit=1,
+        ) == (visible_change,)
+        receipt = await service.get_change_set_by_turn(
+            document_id=initial.document.document_id, turn_id="revision-restore:no-op-2",
+        )
+        assert receipt is not None
+        assert await service.get_change_set(receipt.change_set_id) == receipt
     finally:
         await service.close()
 
@@ -362,23 +641,32 @@ async def test_session_fork_copies_only_current_heads_with_provenance(tmp_path: 
             locator={"start": 0, "end": 1},
             actor=USER,
         )
-        await service.create_prompt_annotation(
-            annotation_id="parent-only-annotation",
-            session_key="agent:main:webchat:parent",
-            session_id="parent-epoch",
-            session_epoch=0,
-            document_id=initial.document.document_id,
-            revision_id=current.revision.revision_id,
-            anchor_id=parent_anchor.anchor_id,
-            body="Parent-only instruction",
-        )
-        await service.start_edit_session(
-            document_id=initial.document.document_id,
-            user_id="reviewer",
-            ttl_ms=60_000,
-            actor=USER,
-            edit_session_id="edit-parent-review",
-        )
+        # A migrated profile may still contain historical editor rows.
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """INSERT INTO artifact_prompt_annotations (
+                    annotation_id, session_key, session_id, session_epoch, document_id,
+                    revision_id, anchor_id, body, status, state_revision, created_at, updated_at
+                ) VALUES ('parent-annotation', 'agent:main:webchat:parent', 'parent-epoch',
+                          0, ?, ?, ?, 'Historical note', 'draft', 1, 1, 1)""",
+                (
+                    initial.document.document_id,
+                    current.revision.revision_id,
+                    parent_anchor.anchor_id,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO artifact_edit_sessions (
+                    edit_session_id, document_id, base_revision_id, last_saved_revision_id,
+                    mode, status, user_id, state_revision, expires_at,
+                    last_access_at, created_at, updated_at
+                ) VALUES ('parent-editor', ?, ?, ?, 'edit', 'closed', 'user', 1, 0, 1, 1, 1)""",
+                (
+                    initial.document.document_id,
+                    current.revision.revision_id,
+                    current.revision.revision_id,
+                ),
+            )
 
         snapshots = await service.snapshot_session_heads(session_id="parent-epoch")
         forked = await service.fork_session_heads(
@@ -400,11 +688,14 @@ async def test_session_fork_copies_only_current_heads_with_provenance(tmp_path: 
             revision.generation
             for revision in await service.list_revisions(child.document.document_id)
         ] == [1]
-        assert await service.list_prompt_annotations(
-            session_key="agent:main:webchat:child",
-            session_id="child-epoch",
-            session_epoch=0,
-        ) == ()
+        assert (
+            await service.list_prompt_annotations(
+                session_key="agent:main:webchat:child",
+                session_id="child-epoch",
+                session_epoch=0,
+            )
+            == ()
+        )
         assert await service.list_documents(
             session_key="agent:main:webchat:parent",
             session_id="parent-epoch",
@@ -455,86 +746,6 @@ async def test_session_fork_copies_only_current_heads_with_provenance(tmp_path: 
         assert edit_session_count == (0,)
     finally:
         conn.close()
-
-
-@pytest.mark.asyncio
-async def test_writer_fencing_tokens_are_monotonic_and_reject_stale_writers(
-    tmp_path: Path,
-) -> None:
-    clock = FakeClock()
-    service = await open_service(tmp_path / "artifacts.db", clock)
-    try:
-        created = await service.create_document(
-            session_key="agent:main:webchat:lease",
-            name="Lease test",
-            kind=ArtifactKind.DOCUMENT,
-            initial_artifact=blob("one"),
-            actor=USER,
-        )
-        first = await service.acquire_writer_lease(
-            document_id=created.document.document_id,
-            holder_id="desktop-a",
-            ttl_ms=60_000,
-            actor=USER,
-        )
-        with pytest.raises(WriterLeaseConflictError):
-            await service.acquire_writer_lease(
-                document_id=created.document.document_id,
-                holder_id="desktop-b",
-                ttl_ms=60_000,
-                actor=USER,
-            )
-        await service.release_writer_lease(lease=first, actor=USER)
-        second = await service.acquire_writer_lease(
-            document_id=created.document.document_id,
-            holder_id="desktop-b",
-            ttl_ms=60_000,
-            actor=USER,
-        )
-
-        assert second.fencing_token == first.fencing_token + 1
-        with pytest.raises(WriterLeaseExpiredError, match="stale"):
-            await service.commit_revision(
-                document_id=created.document.document_id,
-                expected_head_revision_id=created.revision.revision_id,
-                expected_state_revision=created.document.state_revision,
-                artifact=blob("stale"),
-                actor=USER,
-                lease=first,
-                require_lease=True,
-            )
-
-        committed = await service.commit_revision(
-            document_id=created.document.document_id,
-            expected_head_revision_id=created.revision.revision_id,
-            expected_state_revision=created.document.state_revision,
-            artifact=blob("valid"),
-            actor=USER,
-            lease=second,
-            require_lease=True,
-        )
-        assert committed.document.head_revision_id == committed.revision.revision_id
-
-        clock.advance(60_001)
-        with pytest.raises(WriterLeaseExpiredError, match="expired"):
-            await service.commit_revision(
-                document_id=created.document.document_id,
-                expected_head_revision_id=committed.revision.revision_id,
-                expected_state_revision=committed.document.state_revision,
-                artifact=blob("expired"),
-                actor=USER,
-                lease=second,
-                require_lease=True,
-            )
-        third = await service.acquire_writer_lease(
-            document_id=created.document.document_id,
-            holder_id="desktop-c",
-            ttl_ms=60_000,
-            actor=USER,
-        )
-        assert third.fencing_token == second.fencing_token + 1
-    finally:
-        await service.close()
 
 
 @pytest.mark.asyncio

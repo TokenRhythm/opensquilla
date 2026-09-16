@@ -1,5 +1,13 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
-import type { SetupDiscoveryResult, SetupWorkflow } from '@/modules/setupWorkflow'
+import type {
+  ConfigurePrimaryProvider,
+  DiscoverPrimaryModels,
+  ProbePrimaryProvider,
+  ProfileProbe,
+  SetupDiscoveryResult,
+  SetupWorkflow,
+  UpsertProfile,
+} from '@/modules/setupWorkflow'
 
 interface ProviderField {
   name: string
@@ -558,10 +566,23 @@ function camel(name: string): string {
   return String(name || '').replace(/_([a-z])/g, (_, c) => c.toUpperCase())
 }
 
-export function buildProviderPayload(providerId: string, values: Record<string, unknown>): Record<string, unknown> {
-  const payload: Record<string, unknown> = { providerId }
+type ProviderConfigurationCommand = ConfigurePrimaryProvider & UpsertProfile
+type ProviderConnectionCommand = ProbePrimaryProvider & DiscoverPrimaryModels & ProfileProbe
+
+export function buildProviderPayload(
+  providerId: string,
+  values: Record<string, unknown>,
+): ProviderConfigurationCommand {
+  const payload: ProviderConfigurationCommand = { providerId }
   Object.entries(values).forEach(([key, value]) => {
-    if (value !== '' && value !== undefined) payload[camel(key)] = value
+    if (value === '' || value === undefined) return
+    switch (camel(key)) {
+      case 'model': payload.model = String(value); break
+      case 'apiKey': payload.apiKey = String(value); break
+      case 'apiKeyEnv': payload.apiKeyEnv = String(value); break
+      case 'baseUrl': payload.baseUrl = String(value); break
+      case 'proxy': payload.proxy = String(value); break
+    }
   })
   return payload
 }
@@ -650,9 +671,9 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
   // Params for probe/discover: the CURRENT form values, including an unsaved
   // pasted key — this is what makes "test before save" possible. Empty values
   // are dropped (the gateway falls back to the stored config / spec env key).
-  function connectionParams(defaultModel = '', modelOverride?: string): Record<string, unknown> {
+  function connectionParams(defaultModel = '', modelOverride?: string): ProviderConnectionCommand {
     const p = payload()
-    const params: Record<string, unknown> = { providerId: providerSelected.value }
+    const params: ProviderConnectionCommand = { providerId: providerSelected.value }
     for (const key of ['apiKey', 'apiKeyEnv', 'baseUrl', 'proxy'] as const) {
       if (p[key] !== undefined) params[key] = p[key]
     }
@@ -663,7 +684,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     return params
   }
 
-  function profileDraftParams(defaultModel = '', modelOverride?: string): Record<string, unknown> {
+  function profileDraftParams(defaultModel = '', modelOverride?: string): ProfileProbe {
     const params = connectionParams(defaultModel, modelOverride)
     // Empty endpoint fields are meaningful in a draft: they mean “remove the
     // stored override and use the registry/global fallback”. buildProviderPayload
@@ -697,14 +718,14 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
       const draftParams = profileDraftParams(options.defaultModel, options.modelOverride)
       let res: SetupDiscoveryResult
       if (options.draftProfile) {
-        res = await setupWorkflow.profile.probeDraft(draftParams)
+        res = await setupWorkflow.profile.probeDraftProfile(draftParams)
       } else if (options.storedProfile) {
-        res = await setupWorkflow.profile.probe({
+        res = await setupWorkflow.profile.probeProfile({
           providerId: providerSelected.value,
           model: params.model || options.defaultModel || '',
         }) as SetupDiscoveryResult
       } else {
-        res = await setupWorkflow.provider.probe(params) as SetupDiscoveryResult
+        res = await setupWorkflow.provider.probePrimary(params) as SetupDiscoveryResult
       }
       if (epoch !== connectionEpoch) return
       const timings = normalizeProbeTimings(res)
@@ -771,13 +792,13 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
           ...(options.forceRefresh ? { forceRefresh: true } : {}),
         }
         const res = options.draftProfile
-          ? await setupWorkflow.profile.discoverDraftModels(payload)
+          ? await setupWorkflow.profile.discoverDraftProfileModels(payload)
           : (options.storedProfile
-              ? await setupWorkflow.profile.discoverModels({
+              ? await setupWorkflow.profile.discoverProfileModels({
                   providerId: providerSelected.value,
                   ...(options.forceRefresh ? { forceRefresh: true } : {}),
                 })
-              : await setupWorkflow.provider.discoverModels(payload))
+              : await setupWorkflow.provider.discoverPrimaryModels(payload))
         if (epoch !== connectionEpoch) return
         if (res?.ok) {
           const modelSource = res.source === 'live' ? 'live' : 'none'
@@ -961,7 +982,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     resetConnection()
   }
 
-  function payload(): Record<string, unknown> {
+  function payload(): ProviderConfigurationCommand {
     // Hard guard (independent of UI state): never submit both a pasted key and
     // an env reference. A non-empty pasted api_key wins; otherwise the env
     // reference is used. buildProviderPayload drops empty values.

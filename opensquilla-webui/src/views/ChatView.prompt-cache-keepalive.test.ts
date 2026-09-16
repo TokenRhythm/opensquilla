@@ -11,8 +11,8 @@ describe('ChatView prompt cache keepalive feedback', () => {
       '@refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"',
     )
     expect(chatViewSource).toContain('@saved="onPromptCacheKeepaliveSaved"')
-    expect(chatViewSource).toContain("sessionConversation.supports('prompt-cache-keepalive')")
-    expect(chatViewSource).toContain('sessionConversation.promptCacheStatus(key)')
+    expect(chatViewSource).toContain('promptCacheLease.isAvailable()')
+    expect(chatViewSource).toContain('promptCacheLease.status(key)')
     expect(chatViewSource).not.toContain("rpc.call('sessions.promptCacheKeepalive.status'")
     expect(chatViewSource).toContain(
       'if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next',

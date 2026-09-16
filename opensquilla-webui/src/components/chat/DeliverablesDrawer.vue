@@ -168,7 +168,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ArtifactPayload } from '@/types/artifacts'
@@ -176,10 +176,10 @@ import { useDialogLayer } from '@/composables/useDialogA11y'
 
 const { t } = useI18n()
 import {
-  createArtifactPreview,
+  ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewController,
   type ArtifactPreviewState,
-} from '@/composables/chat/useArtifactPreview'
+} from '@/modules/artifactWorkbench'
 import {
   artifactCategory,
   artifactFileSubtitle,
@@ -192,6 +192,10 @@ const props = defineProps<{
   artifacts: ArtifactPayload[]
   sessionKey?: string
 }>()
+
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
 
 const emit = defineEmits<{
   close: []
@@ -238,7 +242,7 @@ function tileController(artifact: ArtifactPayload): ArtifactPreviewController {
   const key = artifactKey(artifact)
   let controller = tileControllers.get(key)
   if (!controller) {
-    controller = createArtifactPreview({
+    controller = artifactWorkbench.previews.create({
       artifact: () => artifact,
       sessionKey: () => props.sessionKey,
       variant: 'thumbnail',
@@ -290,7 +294,7 @@ function disposeFull() {
 
 function loadFull(artifact: ArtifactPayload) {
   disposeFull()
-  fullController = createArtifactPreview({
+  fullController = artifactWorkbench.previews.create({
     artifact: () => artifact,
     sessionKey: () => props.sessionKey,
     variant: 'content',

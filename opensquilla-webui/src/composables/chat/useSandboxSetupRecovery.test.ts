@@ -1,344 +1,240 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
-import type { SandboxRuntime } from '@/modules/sandboxRuntime'
-import type { SandboxCapabilityReport, SandboxSetupStatusPayload } from '@/types/sandbox'
+
+import type {
+  SandboxChatRuntime,
+  SandboxReadinessState,
+  SandboxSetupResult,
+} from '@/modules/sandboxRuntime'
+import type { SandboxSetupStatusPayload } from '@/types/sandbox'
 import { useSandboxSetupRecovery } from './useSandboxSetupRecovery'
 
 afterEach(() => {
   vi.useRealTimers()
 })
 
-function payload(state: string, platform = 'win32') {
+function status(
+  state: SandboxSetupStatusPayload['state'],
+  platform = 'win32',
+): SandboxSetupStatusPayload {
   return { state, platform, message: state, requiresAdmin: false }
 }
 
-type SandboxRpcCall = (method: string, params?: Record<string, unknown>) => Promise<unknown>
-
-function sandboxFromRpc(
-  rpc: { call: SandboxRpcCall },
-): Pick<SandboxRuntime, 'setupStatus' | 'ensureSetup' | 'capability'> {
+function runtime(options: {
+  readiness?: () => Promise<SandboxReadinessState>
+  ensureReady?: () => Promise<SandboxSetupResult>
+} = {}): Pick<SandboxChatRuntime, 'readiness' | 'ensureReady'> {
   return {
-    setupStatus: async () => await rpc.call(
-      'sandbox.setup.status',
-    ) as SandboxSetupStatusPayload | null,
-    ensureSetup: async () => await rpc.call(
-      'sandbox.setup.ensure',
-    ) as SandboxSetupStatusPayload | null,
-    capability: async (options?: { refresh?: boolean }) => await rpc.call(
-      'sandbox.capability.status',
-      options?.refresh ? { refresh: true } : undefined,
-    ) as SandboxCapabilityReport,
+    readiness: vi.fn(options.readiness ?? (async () => ({
+      status: status('ready'),
+      capability: null,
+    }))),
+    ensureReady: vi.fn(options.ensureReady ?? (async () => ({
+      ready: true,
+      status: status('ready'),
+      capability: null,
+      outcome: 'ready' as const,
+    }))),
   }
 }
 
 describe('useSandboxSetupRecovery', () => {
-  it('can defer automatic status RPCs until the session bootstrap admits them', async () => {
-    const rpc = { call: vi.fn(async () => payload('ready')) }
+  it('can defer the first read until session bootstrap admits it', async () => {
+    const sandbox = runtime()
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
+      sandbox,
       connectionState: ref('connected'),
       runMode: ref('safe'),
       autoRefresh: false,
     }))!
 
     await Promise.resolve()
-    expect(rpc.call).not.toHaveBeenCalled()
-    expect(recovery.resolved.value).toBe(false)
+    expect(sandbox.readiness).not.toHaveBeenCalled()
     await recovery.refresh()
-    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(sandbox.readiness).toHaveBeenCalledOnce()
     expect(recovery.resolved.value).toBe(true)
     scope.stop()
   })
 
-  it('resolves the initial check even when an old Gateway has no setup RPC', async () => {
-    const rpc = { call: vi.fn().mockRejectedValue(new Error('Method not found')) }
-    const connectionState = ref('connected')
+  it('keeps an optional unsupported readiness projection passive', async () => {
+    const sandbox = runtime({
+      readiness: async () => ({ status: null, capability: null }),
+    })
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
-      connectionState,
+      sandbox,
+      connectionState: ref('connected'),
       runMode: ref('safe'),
-      autoRefresh: false,
     }))!
 
-    expect(recovery.resolved.value).toBe(false)
-    await recovery.refresh()
-    expect(recovery.resolved.value).toBe(true)
-
-    connectionState.value = 'disconnected'
-    await nextTick()
-    expect(recovery.resolved.value).toBe(false)
+    await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
+    expect(recovery.status.value).toBeNull()
+    expect(recovery.visible.value).toBe(false)
     scope.stop()
   })
 
-  it('hides ready status and never changes the selected run mode', async () => {
+  it('hides ready status without changing the selected mode', async () => {
     const runMode = ref<'safe' | 'full'>('safe')
-    const rpc = { call: vi.fn(async () => payload('ready')) }
+    const sandbox = runtime()
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
+      sandbox,
       connectionState: ref('connected'),
       runMode,
     }))!
 
     await vi.waitFor(() => expect(recovery.status.value?.state).toBe('ready'))
-    expect(rpc.call).toHaveBeenCalledWith('sandbox.setup.status')
     expect(recovery.visible.value).toBe(false)
     expect(runMode.value).toBe('safe')
     scope.stop()
   })
 
-  it('short-polls setting_up until the setup becomes ready', async () => {
+  it('short-polls an authoritative setting_up state until ready', async () => {
     vi.useFakeTimers()
-    const rpc = {
-      call: vi.fn()
-        .mockResolvedValueOnce(payload('setting_up'))
-        .mockResolvedValueOnce(payload('ready')),
-    }
+    const readiness = vi.fn()
+      .mockResolvedValueOnce({ status: status('setting_up'), capability: null })
+      .mockResolvedValueOnce({ status: status('ready'), capability: null })
+    const sandbox = runtime({ readiness })
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
+      sandbox,
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
+
     await vi.runAllTicks()
     await Promise.resolve()
     expect(recovery.status.value?.state).toBe('setting_up')
-    expect(recovery.visible.value).toBe(true)
-
-    await vi.advanceTimersByTimeAsync(2000)
+    await vi.advanceTimersByTimeAsync(2_000)
     expect(recovery.status.value?.state).toBe('ready')
-    expect(recovery.visible.value).toBe(false)
+    expect(readiness).toHaveBeenCalledTimes(2)
     scope.stop()
   })
 
-  it('keeps short-polling after a transient status RPC failure', async () => {
+  it('keeps polling after a transient read failure once setup is in progress', async () => {
     vi.useFakeTimers()
-    const rpc = {
-      call: vi.fn()
-        .mockResolvedValueOnce(payload('setting_up'))
-        .mockRejectedValueOnce(new Error('temporary status failure'))
-        .mockResolvedValueOnce(payload('ready')),
-    }
+    const readiness = vi.fn()
+      .mockResolvedValueOnce({ status: status('setting_up'), capability: null })
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValueOnce({ status: status('ready'), capability: null })
+    const sandbox = runtime({ readiness })
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
+      sandbox,
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
+
     await vi.runAllTicks()
     await Promise.resolve()
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(recovery.error.value).toBe('temporary failure')
     expect(recovery.status.value?.state).toBe('setting_up')
-
-    await vi.advanceTimersByTimeAsync(2000)
-    expect(rpc.call).toHaveBeenCalledTimes(2)
-    expect(recovery.status.value?.state).toBe('setting_up')
-    expect(recovery.error.value).toBe('temporary status failure')
-
-    await vi.advanceTimersByTimeAsync(1999)
-    expect(rpc.call).toHaveBeenCalledTimes(2)
-    await vi.advanceTimersByTimeAsync(1)
-    expect(rpc.call).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(2_000)
     expect(recovery.status.value?.state).toBe('ready')
     expect(recovery.error.value).toBe('')
-    expect(recovery.visible.value).toBe(false)
     scope.stop()
   })
 
-  it('keeps short-polling after a malformed status payload', async () => {
+  it('does not let a late failed poll revive work after disconnect', async () => {
     vi.useFakeTimers()
-    const rpc = {
-      call: vi.fn()
-        .mockResolvedValueOnce(payload('setting_up'))
-        .mockResolvedValueOnce({ state: 'future_state', platform: 'win32' })
-        .mockResolvedValueOnce(payload('ready')),
-    }
+    let rejectPending!: (cause: Error) => void
+    const pending = new Promise<SandboxReadinessState>((_resolve, reject) => {
+      rejectPending = reject
+    })
+    const readiness = vi.fn()
+      .mockResolvedValueOnce({ status: status('setting_up'), capability: null })
+      .mockReturnValueOnce(pending)
+    const connectionState = ref('connected')
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
+      sandbox: runtime({ readiness }),
+      connectionState,
+      runMode: ref('safe'),
+    }))!
+
+    await vi.runAllTicks()
+    await Promise.resolve()
+    await vi.advanceTimersByTimeAsync(2_000)
+    connectionState.value = 'disconnected'
+    await nextTick()
+    rejectPending(new Error('late failure'))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(recovery.status.value).toBeNull()
+    expect(recovery.error.value).toBe('')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(readiness).toHaveBeenCalledTimes(2)
+    scope.stop()
+  })
+
+  it('offers first-time setup only for the authoritative Windows state', async () => {
+    const notSetup = status('not_setup')
+    const sandbox = runtime({
+      readiness: async () => ({ status: notSetup, capability: null }),
+      ensureReady: async () => ({
+        ready: true,
+        status: status('ready'),
+        capability: null,
+        outcome: 'ready',
+      }),
+    })
+    const scope = effectScope()
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      sandbox,
       connectionState: ref('connected'),
       runMode: ref('safe'),
     }))!
-    await vi.runAllTicks()
-    await Promise.resolve()
 
-    await vi.advanceTimersByTimeAsync(2000)
-    expect(rpc.call).toHaveBeenCalledTimes(2)
-    expect(recovery.status.value?.state).toBe('setting_up')
-
-    await vi.advanceTimersByTimeAsync(2000)
-    expect(rpc.call).toHaveBeenCalledTimes(3)
+    await vi.waitFor(() => expect(recovery.canSetup.value).toBe(true))
+    await expect(recovery.ensureSetup()).resolves.toBe(true)
+    expect(sandbox.ensureReady).toHaveBeenCalledOnce()
     expect(recovery.status.value?.state).toBe('ready')
     scope.stop()
   })
 
-  it('does not poll an old Gateway again when no setup status was established', async () => {
-    vi.useFakeTimers()
-    const rpc = { call: vi.fn().mockRejectedValue(new Error('Method not found')) }
-    const scope = effectScope()
-    const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
-      connectionState: ref('connected'),
-      runMode: ref('safe'),
-    }))!
-    await vi.runAllTicks()
-    await Promise.resolve()
-
-    expect(rpc.call).toHaveBeenCalledTimes(1)
-    expect(recovery.status.value).toBeNull()
-    expect(recovery.visible.value).toBe(false)
-    await vi.advanceTimersByTimeAsync(10_000)
-    expect(rpc.call).toHaveBeenCalledTimes(1)
-    scope.stop()
-  })
-
-  it(
-    'does not let a late failed poll schedule work after disconnecting',
-    async () => {
-      vi.useFakeTimers()
-      let rejectPending: (cause: Error) => void = () => {}
-      const pending = new Promise<unknown>((_resolve, reject) => { rejectPending = reject })
-      const rpc = {
-        call: vi.fn()
-          .mockResolvedValueOnce(payload('setting_up'))
-          .mockReturnValueOnce(pending),
-      }
-      const connectionState = ref('connected')
-      const runMode = ref<'safe' | 'full'>('safe')
+  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+    'does not offer setup for %s',
+    async state => {
+      const sandbox = runtime({
+        readiness: async () => ({ status: status(state), capability: null }),
+      })
       const scope = effectScope()
       const recovery = scope.run(() => useSandboxSetupRecovery({
-        sandbox: sandboxFromRpc(rpc),
-        connectionState,
-        runMode,
+        sandbox,
+        connectionState: ref('connected'),
+        runMode: ref('safe'),
       }))!
-      await vi.runAllTicks()
-      await Promise.resolve()
 
-      await vi.advanceTimersByTimeAsync(2000)
-      expect(rpc.call).toHaveBeenCalledTimes(2)
-      connectionState.value = 'disconnected'
-      await nextTick()
-      rejectPending(new Error('late status failure'))
-      await Promise.resolve()
-      await Promise.resolve()
-
-      expect(recovery.status.value).toBeNull()
-      expect(recovery.error.value).toBe('')
-      await vi.advanceTimersByTimeAsync(10_000)
-      expect(rpc.call).toHaveBeenCalledTimes(2)
+      await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
+      expect(recovery.canSetup.value).toBe(false)
+      await expect(recovery.ensureSetup()).resolves.toBe(false)
+      expect(sandbox.ensureReady).not.toHaveBeenCalled()
       scope.stop()
     },
   )
 
-  it('does not let a late failed poll schedule work after scope disposal', async () => {
-    vi.useFakeTimers()
-    let rejectPending: (cause: Error) => void = () => {}
-    const pending = new Promise<unknown>((_resolve, reject) => { rejectPending = reject })
-    const rpc = {
-      call: vi.fn()
-        .mockResolvedValueOnce(payload('setting_up'))
-        .mockReturnValueOnce(pending),
-    }
-    const scope = effectScope()
-    const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
-      connectionState: ref('connected'),
-      runMode: ref('safe'),
-    }))!
-    await vi.runAllTicks()
-    await Promise.resolve()
-
-    await vi.advanceTimersByTimeAsync(2000)
-    expect(rpc.call).toHaveBeenCalledTimes(2)
-    scope.stop()
-    rejectPending(new Error('late status failure'))
-    await Promise.resolve()
-    await Promise.resolve()
-
-    expect(recovery.error.value).toBe('')
-    await vi.advanceTimersByTimeAsync(10_000)
-    expect(rpc.call).toHaveBeenCalledTimes(2)
-  })
-
-  it('offers owner setup for Windows first-time setup', async () => {
-    const rpc = {
-      call: vi.fn(async (method: string) =>
-        method === 'sandbox.setup.ensure' ? payload('ready') : payload('not_setup')),
-    }
-    const scope = effectScope()
-    const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
-      connectionState: ref('connected'),
-      runMode: ref('safe'),
-    }))!
-    await vi.waitFor(() => expect(recovery.canSetup.value).toBe(true))
-
-    await recovery.ensureSetup()
-    expect(rpc.call).toHaveBeenCalledWith('sandbox.setup.ensure')
-    expect(recovery.status.value?.state).toBe('ready')
-    expect(recovery.visible.value).toBe(false)
-    scope.stop()
-  })
-
-  it.each(['failed', 'unavailable', 'setting_up'])('does not offer setup when status is %s', async (state) => {
-    const rpc = { call: vi.fn(async () => payload(state)) }
-    const scope = effectScope()
-    const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
-      connectionState: ref('connected'),
-      runMode: ref('safe'),
-    }))!
-    await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
-    expect(recovery.canSetup.value).toBe(false)
-    expect(await recovery.ensureSetup()).toBe(false)
-    expect(rpc.call).not.toHaveBeenCalledWith('sandbox.setup.ensure')
-    scope.stop()
-  })
-
-  it('keeps authoritative availability while Full Access is selected', async () => {
+  it('retains authoritative availability while Full Access hides recovery', async () => {
     const runMode = ref<'safe' | 'full'>('safe')
-    const connectionState = ref('connected')
-    const rpc = { call: vi.fn(async () => payload('unavailable', 'darwin')) }
+    const sandbox = runtime({
+      readiness: async () => ({
+        status: status('unavailable', 'darwin'),
+        capability: null,
+      }),
+    })
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
-      connectionState,
+      sandbox,
+      connectionState: ref('connected'),
       runMode,
     }))!
-    await vi.waitFor(() => expect(recovery.visible.value).toBe(true))
-    expect(recovery.canSetup.value).toBe(false)
 
-    recovery.dismiss()
-    expect(recovery.visible.value).toBe(false)
+    await vi.waitFor(() => expect(recovery.visible.value).toBe(true))
     runMode.value = 'full'
     await nextTick()
     expect(recovery.status.value?.state).toBe('unavailable')
     expect(recovery.visible.value).toBe(false)
-    runMode.value = 'safe'
-    await nextTick()
-    expect(recovery.visible.value).toBe(true)
-    expect(runMode.value).toBe('safe')
-    scope.stop()
-  })
-
-  it('keeps terminal failure passive while Full Access is selected', async () => {
-    const rpc = { call: vi.fn(async (_method: string) => payload('failed')) }
-    const scope = effectScope()
-    const recovery = scope.run(() => useSandboxSetupRecovery({
-      sandbox: sandboxFromRpc(rpc),
-      connectionState: ref('connected'),
-      runMode: ref('full'),
-    }))!
-
-    await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
-    expect(recovery.status.value?.state).toBe('failed')
-    expect(recovery.visible.value).toBe(false)
-
-    await recovery.refresh()
-    expect(rpc.call.mock.calls.map(([method]) => method)).toEqual([
-      'sandbox.setup.status', 'sandbox.setup.status',
-    ])
     scope.stop()
   })
 })

@@ -7,7 +7,7 @@ import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import { useChatTextRendering } from './useChatTextRendering'
-import { buildShareDom } from './useChatShareExport'
+import { buildShareDom, staticAssetUrl } from './useChatShareExport'
 
 describe('buildShareDom protocol-shaped documentation', () => {
   it('clones the complete rendered message into the share image stage', () => {
@@ -255,6 +255,34 @@ describe('share export label localization', () => {
 
     expect(stage.querySelector('.chat-share-export-activity__label')?.textContent).toBe('活动')
     expect(stage.querySelector('.chat-share-export-thinking__label')?.textContent).toBe('思考中')
+  })
+})
+
+describe('share export static asset URLs', () => {
+  afterEach(() => {
+    document.getElementById('opensquilla-data')?.remove()
+  })
+
+  it('keeps Desktop root assets on the current origin', () => {
+    const data = document.createElement('div')
+    data.id = 'opensquilla-data'
+    data.dataset.basePath = '/'
+    document.body.appendChild(data)
+
+    const assetUrl = staticAssetUrl('img/QRcode.png')
+    expect(assetUrl).toBe('/static/img/QRcode.png')
+    expect(new URL(assetUrl, 'opensquilla-app://desktop/chat/new').href)
+      .toBe('opensquilla-app://desktop/static/img/QRcode.png')
+  })
+
+  it('preserves a trailing-slash gateway base path', () => {
+    const data = document.createElement('div')
+    data.id = 'opensquilla-data'
+    data.dataset.basePath = '/control/'
+    document.body.appendChild(data)
+
+    expect(staticAssetUrl('/img/opensquilla-mark.png'))
+      .toBe('/control/static/img/opensquilla-mark.png')
   })
 })
 

@@ -296,7 +296,7 @@ async def test_call_preserves_gateway_error_details_for_safe_fallback_decisions(
     client._ws = ws  # noqa: SLF001
 
     call_task = asyncio.create_task(
-        client._call("sessions.steer", {"key": "agent:main:x"})  # noqa: SLF001
+        client._call("sessions.steer.v2", {"key": "agent:main:x"})  # noqa: SLF001
     )
     await _wait_for(lambda: bool(ws.sent))
     request_id = json.loads(ws.sent[0])["id"]

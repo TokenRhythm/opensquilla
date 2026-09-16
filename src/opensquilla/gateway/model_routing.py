@@ -15,44 +15,64 @@ from typing import Any, Literal, cast
 from opensquilla.router_tiers import (
     CUSTOM_B5_SELECTION_MODE,
     HIGHEST_TEXT_TIER,
-    IMAGE_TIER,
     INDEPENDENT_ENSEMBLE_SELECTION_MODES,
     STATIC_B5_PROFILES,
+    TEXT_TIERS,
     effective_ensemble_selection_mode,
     ensemble_selection_configured,
     normalize_tier_mapping,
     static_b5_profile,
     tier_ensemble_active,
-    tier_index,
 )
 
 ModelRoutingMode = Literal["direct", "router", "ensemble"]
 
 
-def _router_image_route(config: Any) -> tuple[str, dict[str, Any]] | None:
+def _router_image_route(config: Any) -> tuple[str, dict[str, Any], str] | None:
+    """Return the first executable configured c-tier for an image turn.
+
+    This is a public admission snapshot of the runtime Router policy, not a
+    separate routing implementation: only user-configured c0-c3 deployments
+    participate, deployment capability denials are skipped, and proven support
+    is preferred over an unknown deployment that the execution layer may probe.
+    The legacy ``image_model`` row is intentionally non-executable.
+    """
+
     router = getattr(config, "squilla_router", None)
     tiers = normalize_tier_mapping(getattr(router, "tiers", {}) or {})
     c3_fusion_active = bool(
         getattr(getattr(config, "llm_ensemble", None), "enabled", False)
     ) or tier_ensemble_active(tiers, HIGHEST_TEXT_TIER)
-    image_tiers = {
-        name: tier
-        for name, tier in tiers.items()
-        if isinstance(tier, dict)
-        and bool(tier.get("supports_image", False))
-        and bool(str(tier.get("model") or "").strip())
-        and not (c3_fusion_active and name == HIGHEST_TEXT_TIER)
-    }
-    if not image_tiers:
+    llm = getattr(config, "llm", None)
+    active_provider = _clean(getattr(llm, "provider", ""))
+    cross_provider = bool(getattr(router, "cross_provider_tiers", False))
+    candidates: list[tuple[str, dict[str, Any], str]] = []
+    for name in TEXT_TIERS:
+        tier = tiers.get(name)
+        if not isinstance(tier, dict) or bool(tier.get("image_only", False)):
+            continue
+        model = str(tier.get("model") or "").strip()
+        if not model or (c3_fusion_active and name == HIGHEST_TEXT_TIER):
+            continue
+
+        tier_provider = _clean(tier.get("provider"))
+        provider = tier_provider if cross_provider and tier_provider else active_provider
+        provider = provider or tier_provider
+        use_active_authority = not provider or provider == active_provider
+        support = _deployment_vision_support(
+            model=model,
+            provider=provider,
+            api_key=(str(getattr(llm, "api_key", "") or "") if use_active_authority else ""),
+            base_url=(str(getattr(llm, "base_url", "") or "") if use_active_authority else ""),
+            proxy=(str(getattr(llm, "proxy", "") or "") if use_active_authority else ""),
+        )
+        if support in {"supported", "unknown"}:
+            candidates.append((name, tier, support))
+
+    if not candidates:
         return None
-    ordered = sorted(
-        image_tiers,
-        key=lambda name: (tier_index(name) < 0, tier_index(name)),
-    )
-    if IMAGE_TIER in image_tiers:
-        ordered = [IMAGE_TIER, *(name for name in ordered if name != IMAGE_TIER)]
-    selected = ordered[0]
-    return selected, image_tiers[selected]
+    candidates.sort(key=lambda item: item[2] != "supported")
+    return candidates[0]
 
 
 def _deployment_vision_support(
@@ -93,40 +113,20 @@ def _image_input_routing_snapshot(
     *,
     router_enabled: bool,
     ensemble_enabled: bool,
-    selection_mode: str,
 ) -> dict[str, str]:
-    independent_ensemble = bool(
-        ensemble_enabled and selection_mode in INDEPENDENT_ENSEMBLE_SELECTION_MODES
-    )
-    if independent_ensemble or (ensemble_enabled and not router_enabled):
+    if ensemble_enabled:
         return {
-            "admission": "blocked",
+            "admission": "allowed",
             "reason": "ensemble_mode_unsupported",
         }
     if router_enabled:
         image_route = _router_image_route(config)
         if image_route is None:
             return {
-                "admission": "blocked",
+                "admission": "allowed",
                 "reason": "router_image_route_unavailable",
             }
-        _, image_tier = image_route
-        llm = getattr(config, "llm", None)
-        active_provider = _clean(getattr(llm, "provider", ""))
-        tier_provider = _clean(image_tier.get("provider"))
-        cross_provider = bool(
-            getattr(getattr(config, "squilla_router", None), "cross_provider_tiers", False)
-        )
-        provider = tier_provider if cross_provider and tier_provider else active_provider
-        provider = provider or tier_provider
-        use_active_authority = not provider or provider == active_provider
-        vision_support = _deployment_vision_support(
-            model=_clean(image_tier.get("model")),
-            provider=provider,
-            api_key=str(getattr(llm, "api_key", "") or "") if use_active_authority else "",
-            base_url=str(getattr(llm, "base_url", "") or "") if use_active_authority else "",
-            proxy=str(getattr(llm, "proxy", "") or "") if use_active_authority else "",
-        )
+        _, _, vision_support = image_route
         if vision_support == "supported":
             return {
                 "admission": "allowed",
@@ -134,7 +134,7 @@ def _image_input_routing_snapshot(
             }
         if vision_support == "unsupported":
             return {
-                "admission": "blocked",
+                "admission": "allowed",
                 "reason": "model_vision_unsupported",
             }
         return {"admission": "unknown", "reason": "capability_unknown"}
@@ -153,7 +153,7 @@ def _image_input_routing_snapshot(
         return {"admission": "allowed", "reason": "model_vision_supported"}
     if vision_support == "unsupported":
         return {
-            "admission": "blocked",
+            "admission": "allowed",
             "reason": "model_vision_unsupported",
         }
     return {"admission": "unknown", "reason": "capability_unknown"}
@@ -442,7 +442,6 @@ def model_routing_snapshot(config: Any) -> dict[str, Any]:
             config,
             router_enabled=router_enabled,
             ensemble_enabled=ensemble_enabled,
-            selection_mode=selection_mode,
         ),
         "applies_to": "next_accepted_turn",
     }

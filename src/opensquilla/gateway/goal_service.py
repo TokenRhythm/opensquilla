@@ -492,6 +492,7 @@ class GoalService:
                 source_name=source_name,
                 channel_id=lease.output_surface,
                 session_id=goal.session_id,
+                session_epoch=goal.session_epoch,
                 principal_is_owner=bool(getattr(principal, "is_owner", False)),
                 principal_host_execute=principal_has_host_execute(principal),
             )
@@ -503,6 +504,7 @@ class GoalService:
                 conn_id=lease.owner_connection_id,
                 channel_id=lease.output_surface,
                 session_id=goal.session_id,
+                session_epoch=goal.session_epoch,
                 principal_is_owner=bool(getattr(principal, "is_owner", False)),
                 principal_host_execute=principal_has_host_execute(principal),
             )

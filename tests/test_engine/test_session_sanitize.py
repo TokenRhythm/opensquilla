@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult, ToolResultEvent
-from opensquilla.engine.history import limit_turns
+from opensquilla.engine.history import limit_turns, repair_tool_pairing
 from opensquilla.engine.session_sanitize import (
     project_historical_tool_payloads,
     recoverable_tool_result_reference,
@@ -40,7 +40,27 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
-from opensquilla.provider.types import ContentBlockImage
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+    ProviderReplayState,
+)
+
+
+def test_sanitizing_native_replay_keeps_opaque_block_and_carrier_unchanged():
+    native = [{"type": "redacted_thinking", "data": "synthetic-opaque"}]
+    message = Message(
+        role="assistant",
+        content=[ContentBlockRedactedThinking(data="synthetic-opaque")],
+        provider_replay=ProviderReplayState(
+            protocol="anthropic_messages", source="synthetic-route", model="synthetic-model",
+            native_content=native,
+        ),
+    )
+    before = message.model_dump(mode="json")
+    sanitized, _ = sanitize_session_messages([message])
+    assert sanitized[0].model_dump(mode="json") == before
+    assert message.model_dump(mode="json") == before
 
 
 def _tool_definition(name: str) -> ToolDefinition:
@@ -1851,6 +1871,8 @@ async def test_agent_uses_sanitized_request_view_and_records_context_stages() ->
 
 @pytest.mark.asyncio
 async def test_agent_provider_view_omits_loaded_history_tool_arguments() -> None:
+    from opensquilla.provider.openai import OpenAIProvider
+
     provider = CapturingProvider()
     large_argument = "STALE_HISTORY_ARGUMENT\n" + ("x" * 20_000)
     agent = Agent(
@@ -1893,9 +1915,24 @@ async def test_agent_provider_view_omits_loaded_history_tool_arguments() -> None
     )
     assert large_argument not in payload
     assert "x" * 1000 not in payload
-    assert "old reasoning" not in payload
+    # Engine history retains canonical reasoning; the concrete target adapter
+    # decides whether its wire protocol accepts it.
+    assert "old reasoning" in payload
     assert "historical_tool_argument_omitted" not in payload
     assert "invalid_provider_context_projection:write_file.content" in payload
+    adapter = OpenAIProvider(
+        api_key="synthetic-key", model="gpt-4.1", provider_kind="openai",
+        base_url="https://api.openai.com/v1",
+    )
+    wire, *_ = adapter._build_payload(
+        provider.calls[0]["messages"], provider.calls[0]["tools"], provider.calls[0]["config"],
+    )
+    wire_json = json.dumps(wire, ensure_ascii=False)
+    assert "old reasoning" not in wire_json
+    assert large_argument not in wire_json
+    assert "x" * 1000 not in wire_json
+    assert "invalid_provider_context_projection:write_file.content" in wire_json
+    assert all("reasoning_content" not in message for message in wire["messages"])
 
 
 @pytest.mark.asyncio
@@ -1983,6 +2020,42 @@ async def test_agent_runtime_context_is_request_only_and_not_system_prefix() -> 
     assert len(call["messages"]) == 1
     assert all(
         "[Runtime context for this turn]" not in message.content
+        for message in agent._history
+        if isinstance(message.content, str)
+    )
+
+
+@pytest.mark.asyncio
+async def test_execution_identity_reuses_runtime_context_without_extra_message() -> None:
+    from opensquilla.provider.types import ExecutionIdentity
+
+    provider = CapturingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            system_prompt="stable system",
+            execution_identity=ExecutionIdentity(provider="example", model="example/model"),
+            cache_breakpoints=[{"text": "stable system", "cache": "true"}],
+            cache_mode="auto",
+            max_iterations=1,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("which model?")]
+
+    assert any(event.kind == "done" for event in events)
+    call = provider.calls[0]
+    assert call["config"].system == "stable system"
+    assert call["config"].cache_breakpoints == [
+        {"text": "stable system", "cache": "true"}
+    ]
+    assert len(call["messages"]) == 1
+    assert call["messages"][0].content.startswith("which model?")
+    assert "[Runtime context for this turn]" in call["messages"][0].content
+    assert "Current response execution:" in call["messages"][0].content
+    assert '"model":"example/model"' in call["messages"][0].content
+    assert all(
+        "Current response execution:" not in message.content
         for message in agent._history
         if isinstance(message.content, str)
     )
@@ -2746,6 +2819,28 @@ async def test_agent_keeps_large_tool_arguments_during_tool_replay(tmp_path) -> 
     assert history_block.input["code"] == large_code
 
 
+def _assert_rejected_tool_pair_visible(
+    messages: list[Message], tool_use_id: str, rejection: str
+) -> None:
+    uses = [
+        block
+        for message in messages if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolUse) and block.id == tool_use_id
+    ]
+    results = [
+        block
+        for message in messages if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolResult) and block.tool_use_id == tool_use_id
+    ]
+    assert len(uses) == len(results) == 1
+    assert uses[0].input["_invalid_provider_context_arguments"] is True
+    assert results[0].is_error is True
+    assert results[0].content == rejection
+    assert repair_tool_pairing(messages) == messages
+
+
 @pytest.mark.asyncio
 async def test_agent_refuses_copied_tool_argument_projection_without_dispatch(
     tmp_path,
@@ -2815,7 +2910,11 @@ async def test_agent_refuses_copied_tool_argument_projection_without_dispatch(
         [message.model_dump(mode="json") for message in provider.calls[-1]["messages"]],
         ensure_ascii=False,
     )
-    assert "tool-2" not in replay_payload
+    _assert_rejected_tool_pair_visible(
+        provider.calls[-1]["messages"], "tool-2", result_event.result
+    )
+    assert "compaction placeholder" in result_event.result
+    assert "The tool was not run" in result_event.result
     assert "tool_use_argument_projection" not in replay_payload
 
 
@@ -2888,7 +2987,10 @@ async def test_agent_refuses_unrestorable_tool_argument_projection(tmp_path) -> 
         [message.model_dump(mode="json") for message in provider.calls[-1]["messages"]],
         ensure_ascii=False,
     )
-    assert "tool_use_id: tool-2" not in replay_payload
+    _assert_rejected_tool_pair_visible(
+        provider.calls[-1]["messages"], "tool-2", result_event.result
+    )
+    assert "tool_use_argument_projection" not in replay_payload
     stored_contents = [
         path.read_text(encoding="utf-8")
         for path in (tmp_path / "tool-results").rglob("content.txt")
@@ -2952,9 +3054,11 @@ async def test_agent_refuses_copied_provider_compacted_tool_arguments(tmp_path) 
         ensure_ascii=False,
     )
     assert "_opensquilla_compacted_tool_arguments" not in replay_payload
-    assert "_invalid_provider_context_arguments" not in replay_payload
-    assert "provider_context_omitted" not in replay_payload
-    assert "tool-compact" not in replay_payload
+    _assert_rejected_tool_pair_visible(
+        provider.calls[-1]["messages"], "tool-compact", result_event.result
+    )
+    assert "are not executable" in result_event.result
+    assert "The tool was not run" in result_event.result
 
 
 @pytest.mark.asyncio
@@ -3035,7 +3139,7 @@ async def test_agent_refuses_mid_string_compacted_marker_in_tool_argument(
 
 
 @pytest.mark.asyncio
-async def test_agent_repair_prompt_keeps_provider_request_from_ending_on_assistant(
+async def test_agent_rejection_result_keeps_provider_request_from_ending_on_assistant(
     tmp_path,
 ) -> None:
     provider = TextThenCompactedToolArgumentsProvider()
@@ -3061,18 +3165,24 @@ async def test_agent_repair_prompt_keeps_provider_request_from_ending_on_assista
     assert len(provider.calls) == 2
     repair_messages = provider.calls[1]["messages"]
     assert repair_messages[-1].role == "user"
-    assert isinstance(repair_messages[-1].content, str)
-    assert "Regenerate the complete tool arguments" in repair_messages[-1].content
+    assert isinstance(repair_messages[-1].content, list)
+    assert len(repair_messages[-1].content) == 1
+    assert isinstance(repair_messages[-1].content[0], ContentBlockToolResult)
+    assert len(repair_messages) == len(provider.calls[0]["messages"]) + 2
     replay_payload = json.dumps(
         [message.model_dump(mode="json") for message in repair_messages],
         ensure_ascii=False,
     )
-    assert "tool-compact" not in replay_payload
-    assert "_invalid_provider_context_arguments" not in replay_payload
-    assert "provider_context_omitted" not in replay_payload
+    result_event = next(
+        event for event in events
+        if isinstance(event, ToolResultEvent) and event.tool_use_id == "tool-compact"
+    )
+    _assert_rejected_tool_pair_visible(repair_messages, "tool-compact", result_event.result)
+    assert "_opensquilla_compacted_tool_arguments" not in replay_payload
+    assert "Regenerate the complete tool arguments" not in replay_payload
 
 
-def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
+def test_agent_preserves_missing_tool_result_as_history_without_extra_instruction() -> None:
     agent = Agent(provider=CapturingProvider(), config=AgentConfig())
     messages = [
         Message(role="user", content="make a deck"),
@@ -3094,15 +3204,49 @@ def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
 
     stripped = agent._strip_provider_context_marker_replay_for_provider(messages)
 
+    assert len(stripped) == len(messages)
+    assert stripped[0] == messages[0]
     assert stripped[-1].role == "user"
     assert isinstance(stripped[-1].content, str)
-    assert "Regenerate the complete tool arguments" in stripped[-1].content
+    assert stripped[-1].content.startswith("[Recorded tool history]")
+    assert "verify current state" in stripped[-1].content
     replay_payload = json.dumps(
         [message.model_dump(mode="json") for message in stripped],
         ensure_ascii=False,
     )
-    assert "tool-compact" not in replay_payload
-    assert "provider_context_omitted" not in replay_payload
+    assert "tool-compact" in replay_payload
+    assert "I will prepare the file." in replay_payload
+    assert "Missing results do not establish whether execution occurred" in replay_payload
+    assert "Regenerate the complete tool arguments" not in replay_payload
+    assert '"tool_result"' not in stripped[-1].content
+    assert "_opensquilla_compacted_tool_arguments" not in replay_payload
+    assert repair_tool_pairing(stripped) == stripped
+    assert not any(
+        isinstance(block, ContentBlockToolResult | ContentBlockToolUse)
+        for message in stripped if isinstance(message.content, list)
+        for block in message.content
+    )
+    assert len(messages) == 2
+    assert messages[-1].role == "assistant"
+    for context_index in (0, len(messages)):
+        request_messages = agent._provider_request_messages(
+            messages,
+            request_context_message=None,
+            request_context_insert_index=0,
+            runtime_context_message=Message(role="user", content="[Runtime context]"),
+            runtime_context_insert_index=context_index,
+        )
+        request_payload = json.dumps(
+            [message.model_dump(mode="json") for message in request_messages],
+            ensure_ascii=False,
+        )
+        assert "I will prepare the file." in request_payload
+        assert "Missing results do not establish whether execution occurred" in request_payload
+        assert "Regenerate the complete tool arguments" not in request_payload
+        assert request_payload.count("[Recorded tool history]") == 1
+        assert request_payload.count("[Runtime context]") == 1
+        assert request_messages[-1].role == "user"
+        assert repair_tool_pairing(request_messages) == request_messages
 
 
 def test_agent_strips_string_provider_context_marker_replay() -> None:
@@ -3142,9 +3286,15 @@ def test_agent_strips_string_provider_context_marker_replay() -> None:
         [message.model_dump(mode="json") for message in stripped],
         ensure_ascii=False,
     )
-    assert "tool-compact-string" not in replay_payload
+    _assert_rejected_tool_pair_visible(
+        stripped, "tool-compact-string", "missing required argument command"
+    )
+    assert len(stripped) == len(messages)
+    assert stripped[0] == messages[0]
+    assert stripped[-1] == messages[-1]
+    assert "I will inspect the repo." in replay_payload
     assert "_opensquilla_compacted_tool_arguments" not in replay_payload
-    assert "missing required argument command" not in replay_payload
+    assert "Regenerate the complete tool arguments" not in replay_payload
 
 
 @pytest.mark.asyncio
@@ -3332,7 +3482,9 @@ async def test_agent_preserves_reasoning_content_for_dashscope_qwen_replay() -> 
 
 
 @pytest.mark.asyncio
-async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> None:
+async def test_agent_keeps_reasoning_until_unsupported_provider_wire_projection() -> None:
+    from opensquilla.provider.openai import OpenAIProvider
+
     provider = CapturingProvider()
     agent = Agent(
         provider=provider,
@@ -3363,4 +3515,15 @@ async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> Non
     assert any(event.kind == "done" for event in events)
     assert provider.calls
     sent_assistant = provider.calls[0]["messages"][1]
-    assert sent_assistant.reasoning_content is None
+    assert sent_assistant.reasoning_content == "I reasoned before answering."
+    adapter = OpenAIProvider(
+        api_key="synthetic-key", model="custom-reasoning-model", provider_kind="openai",
+        base_url="https://api.openai.com/v1",
+    )
+    wire, *_ = adapter._build_payload(
+        provider.calls[0]["messages"], provider.calls[0]["tools"], provider.calls[0]["config"],
+    )
+    assert all("reasoning_content" not in message for message in wire["messages"])
+    assert "I reasoned before answering." not in json.dumps(wire)
+    # Request projection must not erase state kept for a future compatible target.
+    assert sent_assistant.reasoning_content == "I reasoned before answering."

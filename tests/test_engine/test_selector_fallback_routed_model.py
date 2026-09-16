@@ -10,6 +10,7 @@ computed for the abandoned model no longer apply.
 from __future__ import annotations
 
 import json
+from base64 import b64encode
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -23,11 +24,13 @@ from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.selector_override import apply_model_override
+from opensquilla.engine.turn_runner.agent_bootstrap_stage import _ResolvedCatalog
 from opensquilla.engine.types import (
     AgentConfig,
     RouterDecisionEvent,
 )
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import (
     ChatConfig,
     DoneEvent,
@@ -42,10 +45,17 @@ from opensquilla.provider import (
     ToolUseEndEvent,
     ToolUseStartEvent,
 )
+from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.protocol import IMAGE_INPUT_UNSUPPORTED_CODE
-from opensquilla.provider.types import ContentBlockImage
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockToolResult,
+    ContentBlockToolUse,
+)
 from opensquilla.tools.types import CallerKind, ToolContext
+from tests.helpers.image_bytes import image_bytes
 
 
 class _StubSelector:
@@ -68,6 +78,151 @@ class _SuccessfulProvider:
         del messages, tools, config
         yield TextDeltaEvent(text="ok")
         yield DoneEvent(model="cheap/fallback")
+
+
+def test_strict_router_chain_fails_closed_for_legacy_selector_hook() -> None:
+    class _LegacySelector:
+        def __init__(self) -> None:
+            self.resolved = False
+
+        def override_model_with_fallback_chain(
+            self,
+            model: str,
+            chain: list[object],
+        ) -> None:
+            del model, chain
+
+        def override_model(self, model: str) -> None:
+            del model
+
+        def resolve(self) -> object:
+            self.resolved = True
+            return object()
+
+    selector = _LegacySelector()
+
+    with pytest.raises(RuntimeError, match="strict router fallback isolation"):
+        apply_model_override(
+            selector,
+            "configured-c0",
+            turn_metadata={
+                "routing_applied": True,
+                "router_fallback_strict": True,
+                "router_fallback_chain": [],
+            },
+            realign_routed_model=False,
+        )
+
+    assert selector.resolved is False
+
+
+def test_strict_cross_provider_chain_fails_closed_without_provider_chain_hook() -> None:
+    class _LegacySelector:
+        def __init__(self) -> None:
+            self.overridden = False
+            self.resolved = False
+
+        def override_provider_config(
+            self,
+            config: object,
+            *,
+            preserve_existing_tail: bool = True,
+        ) -> None:
+            del config, preserve_existing_tail
+            self.overridden = True
+
+        def resolve(self) -> object:
+            self.resolved = True
+            return object()
+
+    selector = _LegacySelector()
+    primary = SimpleNamespace(provider="anthropic", model="configured-c0")
+    configured_fallback = SimpleNamespace(
+        provider="openrouter",
+        model="configured-c1",
+    )
+
+    with pytest.raises(RuntimeError, match="strict router fallback isolation"):
+        apply_model_override(
+            selector,
+            primary.model,
+            turn_metadata={
+                "routing_applied": True,
+                "router_fallback_strict": True,
+                "router_fallback_chain": [
+                    {
+                        "provider": configured_fallback.provider,
+                        "model": configured_fallback.model,
+                    }
+                ],
+            },
+            realign_routed_model=False,
+            tier_provider_config=primary,
+            strict_router_fallback_chain=[configured_fallback],
+        )
+
+    assert selector.overridden is False
+    assert selector.resolved is False
+
+
+def test_blocked_strict_route_replaces_opaque_selector_tail_before_resolve() -> None:
+    primary = SimpleNamespace(provider="openrouter", model="configured-primary")
+    configured_fallback = SimpleNamespace(provider="openrouter", model="configured-c1")
+    plugin_fallback = SimpleNamespace(provider="plugin", model="unconfigured-plugin")
+
+    class _StrictSelector:
+        active_provider_id = "openrouter"
+
+        def __init__(self) -> None:
+            self.current_config = primary
+            self.chain = [primary, plugin_fallback]
+            self.preserve_existing_tail: bool | None = None
+
+        def override_model_with_fallback_chain(
+            self,
+            model: str,
+            chain: list[object],
+            *,
+            preserve_existing_tail: bool = True,
+        ) -> None:
+            assert model == primary.model
+            assert chain == [configured_fallback]
+            self.preserve_existing_tail = preserve_existing_tail
+            self.chain = [primary, configured_fallback]
+
+        def resolve(self) -> object:
+            return "configured-provider"
+
+        def remaining_chain(self) -> list[object]:
+            return list(self.chain)
+
+    selector = _StrictSelector()
+    metadata: dict[str, Any] = {
+        "routing_applied": True,
+        "routed_provider": "foreign",
+        "routed_model": "foreign-model",
+        "routed_provider_blocked": "cross_provider_tiers_disabled",
+        "router_fallback_strict": True,
+        "router_fallback_chain": [
+            {"provider": "openrouter", "model": configured_fallback.model}
+        ],
+    }
+
+    provider = apply_model_override(
+        selector,
+        "foreign-model",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+        strict_router_fallback_chain=[configured_fallback],
+    )
+
+    assert provider == "configured-provider"
+    assert selector.preserve_existing_tail is False
+    assert plugin_fallback not in selector.chain
+    assert metadata["selector_execution_chain"] == [
+        {"provider": "openrouter", "model": "configured-primary"},
+        {"provider": "openrouter", "model": "configured-c1"},
+    ]
 
 
 async def test_fallback_realigns_only_when_provider_call_starts() -> None:
@@ -103,6 +258,349 @@ async def test_fallback_realigns_only_when_provider_call_starts() -> None:
     assert metadata["savings_pct"] == 0.0
     assert metadata["savings_max_price_per_m"] == 0.0
     assert metadata["savings_routed_price_per_m"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("through_agent", "primary_support"),
+    [
+        (False, "unsupported"),
+        (True, "unsupported"),
+        (True, "unknown"),
+        (True, "tool_then_unsupported"),
+    ],
+)
+@pytest.mark.parametrize("fallback_support", ["supported", "unknown", "unsupported"])
+async def test_each_selector_leg_projects_canonical_images(
+    through_agent: bool,
+    primary_support: str,
+    fallback_support: str,
+    fallback_rejects_images: bool = False,
+) -> None:
+    from opensquilla.provider.protocol import count_provider_image_blocks
+
+    class _Provider:
+        provider_name = "openai"
+
+        def __init__(self, *, primary: bool) -> None:
+            self.primary = primary
+            self.calls: list[list[Message]] = []
+
+        async def chat(self, messages, tools=None, config=None):
+            del tools, config
+            self.calls.append(messages)
+            if self.primary:
+                if primary_support == "tool_then_unsupported" and len(self.calls) == 1:
+                    yield ToolUseStartEvent(tool_use_id="observe-1", tool_name="observe")
+                    yield ToolUseEndEvent(
+                        tool_use_id="observe-1", tool_name="observe", arguments={}
+                    )
+                    yield DoneEvent(stop_reason="tool_use")
+                elif primary_support == "unknown" and count_provider_image_blocks(messages):
+                    yield ErrorEvent(
+                        code="image_input_unsupported",
+                        message="This deployment does not support image input.",
+                    )
+                else:
+                    yield ErrorEvent(code="503", message="Provider unavailable")
+                return
+            if fallback_rejects_images and count_provider_image_blocks(messages):
+                yield ErrorEvent(
+                    code="image_input_unsupported",
+                    message="This fallback deployment does not support image input.",
+                )
+                return
+            yield TextDeltaEvent(text="configured fallback reply")
+            yield DoneEvent(model="configured-fallback")
+
+    primary_config = SimpleNamespace(provider="openai", model="configured-primary")
+    fallback_config = SimpleNamespace(provider="openai", model="configured-fallback")
+    primary = _Provider(primary=True)
+    fallback = _Provider(primary=False)
+
+    class _Selector:
+        current_config = primary_config
+
+        def next_fallback_after_failure(self, _error):
+            self.current_config = fallback_config
+            return fallback
+
+    metadata: dict[str, Any] = {}
+    wrapper = _SelectorFallbackProvider(primary, _Selector(), turn_metadata=metadata)
+    wrapper.configure_fallback_deployment_vision_support(
+        [(fallback_config, fallback_support)]
+    )
+    wrapper.configure_fallback_deployment_limits(
+        [
+            (
+                fallback_config,
+                0,
+                0,
+                ModelCapabilities(supports_vision=fallback_support == "supported"),
+            )
+        ]
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+        )
+    ]
+    tool_calls: list[str] = []
+
+    async def handle_tool(call):
+        tool_calls.append(call.tool_use_id)
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="observed"
+        )
+
+    if through_agent:
+        agent = Agent(
+            provider=wrapper,
+            config=AgentConfig(
+                model_id="configured-primary",
+                model_vision_support=(
+                    "unknown" if primary_support == "unknown" else "unsupported"
+                ),
+                max_provider_retries=0,
+                metadata=metadata,
+            ),
+            tool_definitions=(
+                [
+                    ToolDefinition(
+                        name="observe",
+                        description="Observe once.",
+                        input_schema=ToolInputSchema(properties={}, required=[]),
+                    )
+                ]
+                if primary_support == "tool_then_unsupported"
+                else None
+            ),
+            tool_handler=handle_tool,
+        )
+        events = [event async for event in agent.run_turn("Describe it.", extra_messages=messages)]
+    else:
+        # Wrapper callers supply canonical input directly; precise image
+        # rejection retries are owned by Agent.
+        events = [
+            event async for event in wrapper.chat(
+                messages, config=ChatConfig(model_vision_support="unsupported")
+            )
+        ]
+
+    assert not any(getattr(event, "kind", "") == "error" for event in events)
+    assert len(fallback.calls) == (2 if fallback_rejects_images else 1)
+    assert count_provider_image_blocks(primary.calls[-1]) == 0
+    expected_native = fallback_support != "unsupported" and not (
+        primary_support == "tool_then_unsupported" and fallback_support == "unknown"
+    )
+    assert count_provider_image_blocks(fallback.calls[0]) == int(expected_native)
+    if fallback_rejects_images:
+        assert [count_provider_image_blocks(call) for call in primary.calls] == [1, 0]
+        assert [count_provider_image_blocks(call) for call in fallback.calls] == [1, 0]
+        expected_native = False
+    assert count_provider_image_blocks(messages) == 1
+    assert metadata["image_input_mode"] == (
+        "native" if expected_native else "marker"
+    )
+    assert metadata["image_input_stage"] == "fallback"
+    assert tool_calls == (["observe-1"] if primary_support == "tool_then_unsupported" else [])
+    if through_agent and expected_native:
+        assert wrapper.active_model_vision_support(ChatConfig()) == "supported"
+
+
+async def test_each_unknown_deployment_gets_its_own_safe_marker_retry() -> None:
+    await test_each_selector_leg_projects_canonical_images(
+        through_agent=True,
+        primary_support="unknown",
+        fallback_support="unknown",
+        fallback_rejects_images=True,
+    )
+
+
+async def test_precise_image_rejection_bypasses_generic_selector_fallback() -> None:
+    class _Primary:
+        provider_name = "openai"
+
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def chat(self, messages, tools=None, config=None):
+            del tools, config
+            self.calls.append(messages)
+            has_image = any(
+                isinstance(block, ContentBlockImage)
+                for message in messages
+                if isinstance(message.content, list)
+                for block in message.content
+            )
+            if has_image:
+                yield ErrorEvent(
+                    code="400",
+                    message="This model does not support image input.",
+                )
+                return
+            yield TextDeltaEvent(text="marker handled by configured primary")
+            yield DoneEvent(model="configured-primary")
+
+    class _UnconfiguredFallback(_SuccessfulProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            yield TextDeltaEvent(text="must not run")
+            yield DoneEvent(model="unconfigured-model")
+
+    class _Selector:
+        active_provider_id = "openai"
+        current_config = SimpleNamespace(provider="openai", model="configured-primary")
+
+        def __init__(self, fallback: _UnconfiguredFallback) -> None:
+            self.fallback = fallback
+            self.generic_fallback_calls = 0
+
+        def next_fallback_after_failure(self, _exc: Exception) -> object:
+            self.generic_fallback_calls += 1
+            self.current_config = SimpleNamespace(
+                provider="unconfigured-provider",
+                model="unconfigured-model",
+            )
+            return self.fallback
+
+    primary = _Primary()
+    unconfigured = _UnconfiguredFallback()
+    selector = _Selector(unconfigured)
+    wrapper = _SelectorFallbackProvider(primary, selector)
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            max_iterations=1,
+            model_id="configured-primary",
+            provider_id="openai",
+            model_vision_support="unknown",
+        ),
+    )
+    image_message = Message(
+        role="user",
+        content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+    )
+
+    events = [
+        event
+        async for event in agent.run_turn(
+            "Describe it.",
+            extra_messages=[image_message],
+        )
+    ]
+
+    assert len(primary.calls) == 2
+    assert selector.generic_fallback_calls == 0
+    assert unconfigured.calls == 0
+    assert any(isinstance(event, EngineDoneEvent) for event in events)
+
+
+async def test_router_image_rejection_uses_only_strict_configured_probe() -> None:
+    primary_config = SimpleNamespace(provider="openai", model="configured-c0")
+    fallback_config = SimpleNamespace(provider="openai", model="configured-c1")
+
+    class _Primary:
+        provider_name = "openai"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            yield ErrorEvent(
+                code="400",
+                message="This model does not support image input.",
+            )
+
+    class _ConfiguredFallback:
+        provider_name = "openai"
+
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def chat(self, messages, tools=None, config=None):
+            del tools, config
+            self.calls.append(messages)
+            yield TextDeltaEvent(text="configured vision probe succeeded")
+            yield DoneEvent(model="configured-c1")
+
+    class _Selector:
+        def __init__(self, fallback: _ConfiguredFallback) -> None:
+            self.current_config = primary_config
+            self.fallback = fallback
+            self.image_probe_calls = 0
+            self.generic_fallback_calls = 0
+
+        @property
+        def active_provider_id(self) -> str:
+            return str(self.current_config.provider)
+
+        def next_fallback_matching(self, *, predicate):
+            assert predicate(fallback_config)
+            self.image_probe_calls += 1
+            self.current_config = fallback_config
+            return self.fallback
+
+        def next_fallback_after_failure(self, _exc: Exception) -> object:
+            self.generic_fallback_calls += 1
+            raise AssertionError("generic fallback must not own image rejection")
+
+    metadata: dict[str, Any] = {
+        "routing_source": "image_route",
+        "router_fallback_strict": True,
+        "image_input_mode": "native",
+    }
+    primary = _Primary()
+    configured_fallback = _ConfiguredFallback()
+    selector = _Selector(configured_fallback)
+    wrapper = _SelectorFallbackProvider(
+        primary,
+        selector,
+        turn_metadata=metadata,
+    )
+    wrapper.configure_fallback_deployment_vision_support(
+        [(fallback_config, "unknown")]
+    )
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            max_iterations=1,
+            model_id="configured-c0",
+            provider_id="openai",
+            model_vision_support="unknown",
+            metadata=metadata,
+        ),
+    )
+    image_message = Message(
+        role="user",
+        content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+    )
+
+    events = [
+        event
+        async for event in agent.run_turn(
+            "Describe it.",
+            extra_messages=[image_message],
+        )
+    ]
+
+    assert primary.calls == 1
+    assert selector.image_probe_calls == 1
+    assert selector.generic_fallback_calls == 0
+    assert len(configured_fallback.calls) == 1
+    assert any(
+        isinstance(block, ContentBlockImage)
+        for message in configured_fallback.calls[0]
+        if isinstance(message.content, list)
+        for block in message.content
+    )
+    assert any(isinstance(event, EngineDoneEvent) for event in events)
 
 
 def test_fallback_to_same_model_keeps_savings() -> None:
@@ -350,7 +848,7 @@ def test_global_context_window_override_prevents_catalog_only_escalation(
     wrapper = _SelectorFallbackProvider(object(), _Selector())
     config = ChatConfig(context_window_tokens_global_override=8_192)
 
-    assert wrapper._can_escalate_local_admission_failure(config) is False
+    assert wrapper._local_admission_fallback_index(config) == 0
     assert seen == [("small-model", 8_192), ("large-model", 8_192)]
 
 
@@ -883,6 +1381,7 @@ class _ProjectingScriptProvider:
                 "canonical_before": canonical_before,
                 "canonical_after": canonical_after,
                 "payload": projection.payload,
+                "config": config,
             }
         )
         events = self._streams[call_index]
@@ -1171,16 +1670,16 @@ async def test_unknown_primary_capability_defers_to_provider_image_validation() 
 def _fallback_tool_definitions() -> list[ToolDefinition]:
     return [
         ToolDefinition(
-            name="document_apply",
-            description="Apply a document mutation.",
+            name="write_file",
+            description="Write a file.",
             input_schema=ToolInputSchema(
                 properties={"html": {"type": "string"}},
                 required=["html"],
             ),
         ),
         ToolDefinition(
-            name="document_patch",
-            description="Patch a document mutation.",
+            name="apply_patch",
+            description="Apply a file patch.",
             input_schema=ToolInputSchema(
                 properties={"patch": {"type": "string"}},
                 required=["patch"],
@@ -1616,7 +2115,7 @@ async def test_unknown_primary_uses_known_vision_fallback_for_image() -> None:
 
 
 @pytest.mark.parametrize("fallback_vision_support", ["unsupported", "unknown"])
-async def test_image_request_does_not_call_text_only_fallback(
+async def test_image_request_projects_or_probes_configured_fallback(
     monkeypatch: Any,
     fallback_vision_support: str,
 ) -> None:
@@ -1640,18 +2139,19 @@ async def test_image_request_does_not_call_text_only_fallback(
         def __init__(self, *, fails: bool) -> None:
             self.fails = fails
             self.calls = 0
+            self.messages: list[list[Message]] = []
 
         async def chat(self, messages, tools=None, config=None):
-            del messages, tools, config
+            del tools, config
+            self.messages.append(messages)
             self.calls += 1
             if self.fails:
                 yield ErrorEvent(
-                    message="rate limited",
-                    code="429",
-                    retry_after_s=901.0,
+                    message="provider unavailable",
+                    code="503",
                 )
                 return
-            yield TextDeltaEvent(text="fallback must not run")
+            yield TextDeltaEvent(text="configured fallback reply")
             yield DoneEvent(model="text-fallback")
 
     class _Selector:
@@ -1713,31 +2213,43 @@ async def test_image_request_does_not_call_text_only_fallback(
     ]
 
     assert selector.primary.calls == 1
-    assert selector.fallback.calls == 0
-    assert not any(
+    assert selector.fallback.calls == 1
+    assert any(
         isinstance(event, ProviderActivityEvent)
-        and event.phase in {"retry_wait", "fallback"}
+        and event.phase == "fallback"
         for event in events
     )
-    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
-        IMAGE_INPUT_UNSUPPORTED_CODE
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "configured fallback reply"
     ]
-    assert not any(isinstance(event, TextDeltaEvent) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert metadata["image_input_mode"] == "rejected"
+    assert any(isinstance(event, DoneEvent) for event in events)
+    fallback_has_image = any(
+        isinstance(block, ContentBlockImage)
+        for sent_message in selector.fallback.messages[0]
+        if isinstance(sent_message.content, list)
+        for block in sent_message.content
+    )
+    assert fallback_has_image is (fallback_vision_support == "unknown")
+    if fallback_vision_support == "unsupported":
+        assert "图片未分析" in str(selector.fallback.messages[0])
+    assert metadata["image_input_mode"] == (
+        "native" if fallback_vision_support == "unknown" else "marker"
+    )
     assert metadata["image_input_reason"] == (
-        "capability_unknown"
+        "capability_probe"
         if fallback_vision_support == "unknown"
         else "model_vision_unsupported"
     )
     assert metadata["image_input_stage"] == "fallback"
-    assert metadata["routed_model"] == "vision-primary"
-    assert metadata["executed_model"] == "vision-primary"
-    assert "router_fallback_hops" not in metadata
-    assert "router_fallback_reason" not in metadata
-    assert metadata["savings_pct"] == 17.0
+    assert metadata["routed_model"] == "text-fallback"
+    assert metadata["executed_model"] == "text-fallback"
+    assert metadata["router_fallback_hops"] == 1
+    assert metadata["router_fallback_reason"] == "selector_fallback"
+    assert metadata["savings_pct"] == 0.0
     assert [leg["model"] for leg in metadata["execution_legs"]] == [
-        "vision-primary"
+        "vision-primary",
+        "text-fallback",
     ]
 
 
@@ -1890,9 +2402,9 @@ async def test_invalid_response_fallback_preserves_empty_response_without_vision
         assert done_events[-1].input_tokens == 3
         assert done_events[-1].output_tokens == 1024
         assert done_events[-1].reasoning_tokens == 1023
-    assert "image_input_mode" not in metadata
-    assert "image_input_reason" not in metadata
-    assert "image_input_stage" not in metadata
+    assert metadata["image_input_mode"] == "native"
+    assert metadata["image_input_reason"] == "model_vision_supported"
+    assert metadata["image_input_stage"] == "primary"
     assert metadata["routed_model"] == "vision-primary"
     assert metadata["executed_model"] == "vision-primary"
     assert "router_fallback_hops" not in metadata
@@ -2598,3 +3110,412 @@ async def test_blocked_cross_provider_route_passes_primary_model_to_agent_reques
     [done_event] = [event for event in events if isinstance(event, EngineDoneEvent)]
     assert done_event.model == PRIMARY_MODEL
     assert done_event.routed_model == foreign_model
+
+
+def _image_continuation_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    automatic: bool = True,
+    vision_support: str = "supported",
+    target_provider: str = "openrouter",
+) -> SimpleNamespace:
+    """Exercise real selection and routing with credential-free physical legs."""
+
+    primary_model = "synthetic/text-small"
+    image_model = "synthetic/image-large"
+    gateway = GatewayConfig()
+    gateway.llm.provider = "openrouter"
+    gateway.llm.model = primary_model
+    gateway.llm.api_key = "synthetic-key"
+    gateway.llm.base_url = "https://openrouter.ai/api/v1"
+    gateway.llm.max_tokens = 16_000
+    gateway.squilla_router.enabled = True
+    gateway.squilla_router.rollout_phase = "full"
+    gateway.squilla_router.default_tier = "c0"
+    gateway.squilla_router.tiers = {
+        "c0": {"provider": "openrouter", "model": primary_model},
+        "c1": {"provider": target_provider, "model": image_model},
+    }
+    catalog = ModelCatalog()
+    catalog._populate_from_data([
+        {
+            "id": primary_model,
+            "context_length": 32_000,
+            "top_provider": {"max_completion_tokens": 16_000},
+            "architecture": {"input_modalities": ["text"]},
+        },
+        {
+            "id": image_model,
+            "context_length": 96_000,
+            "top_provider": {"max_completion_tokens": 16_000},
+            "supported_parameters": ["tools"],
+            **({"architecture": {"input_modalities": ["text", "image"]}}
+               if vision_support == "supported" else {}),
+        },
+    ])
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.squilla_router._get_strategy",
+        lambda _: pytest.fail("typed tool images must use image routing"),
+    )
+    built: list[_ProjectingScriptProvider] = []
+
+    def build_provider(deployment: ProviderConfig) -> _ProjectingScriptProvider:
+        provider = _ProjectingScriptProvider(
+            provider_name=deployment.provider,
+            wire_provider=OpenAIProvider(
+                api_key="synthetic-key",
+                model=deployment.model,
+                base_url=deployment.base_url,
+                provider_kind="openrouter",
+                provider_id=deployment.provider,
+            ),
+            streams=[[TextDeltaEvent(text="image answer"), DoneEvent(model=deployment.model)]],
+        )
+        built.append(provider)
+        return provider
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", build_provider)
+    selector = ModelSelector(SelectorConfig(primary=ProviderConfig(
+        provider="openrouter",
+        model=primary_model,
+        api_key="synthetic-key",
+        base_url=gateway.llm.base_url,
+    )))
+    primary = selector.resolve()
+    metadata: dict[str, Any] = {}
+    wrapper = _SelectorFallbackProvider(
+        primary,
+        selector,
+        metadata,
+        image_routing_config=gateway if automatic else None,
+        image_routing_session_key="agent:main:synthetic-image-continuation",
+    )
+    lookup_calls: list[ProviderConfig] = []
+    capabilities = ModelCapabilities(
+        supports_vision=vision_support == "supported", supports_tools=True,
+    )
+
+    def lookup(deployment: ProviderConfig, *, include_global_overrides: bool) -> _ResolvedCatalog:
+        assert include_global_overrides is True
+        lookup_calls.append(deployment)
+        return _ResolvedCatalog(
+            max_tokens=8_192,
+            context_window=64_000,
+            capabilities=capabilities,
+            vision_support=vision_support,
+        )
+
+    wrapper.configure_image_continuation_catalog(lookup)
+    image_data = b64encode(image_bytes()).decode("ascii")
+    messages = [
+        Message(role="user", content="Inspect the sample image."),
+        Message(role="assistant", content=[ContentBlockToolUse(
+            id="synthetic-read", name="read_file", input={"path": "assets/sample.png"},
+        )]),
+        Message(role="user", content=[
+            ContentBlockToolResult(tool_use_id="synthetic-read", content="assets/sample.png"),
+            ContentBlockImage(media_type="image/png", data=image_data),
+        ]),
+    ]
+    config = ChatConfig(
+        max_tokens=16_000,
+        model_vision_support="unsupported",
+        model_capabilities=ModelCapabilities(supports_vision=False),
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="synthetic-session",
+            turn_id="synthetic-turn",
+            execution_id="synthetic-execution",
+            call_kind="agent.chat",
+        ),
+    )
+    return SimpleNamespace(
+        wrapper=wrapper, selector=selector, primary=primary, gateway=gateway,
+        config=config, messages=messages, metadata=metadata, built=built,
+        image_model=image_model, image_data=image_data, lookup_calls=lookup_calls,
+        capabilities=capabilities,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_image_upgrade_rebinds_owned_execution_facts(monkeypatch) -> None:
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
+
+    runtime = _image_continuation_runtime(monkeypatch)
+    selected = ExecutionIdentity(provider="openrouter", model="synthetic/text-small")
+    runtime.config = runtime.config.model_copy(update={"execution_identity": selected})
+    runtime.messages[0] = with_execution_identity(runtime.messages[0], selected)
+    canonical = [message.model_dump(mode="json") for message in runtime.messages]
+
+    rebound = await runtime.wrapper.prepare_image_continuation(runtime.messages, runtime.config)
+    assert rebound is not None
+    events = [event async for event in runtime.wrapper.chat(runtime.messages, config=rebound)]
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    call = runtime.built[-1].calls[0]
+    assert call["config"].execution_identity.model == runtime.image_model
+    text = call["payload"]["messages"][0]["content"]
+    assert '"model":"synthetic/image-large"' in text
+    assert '"model":"synthetic/text-small"' not in text
+    assert text.count("Current response execution:") == 1
+    assert runtime.config.execution_identity == selected
+    assert [message.model_dump(mode="json") for message in runtime.messages] == canonical
+
+
+@pytest.mark.asyncio
+async def test_tool_image_upgrade_binds_real_selector_catalog_budget_and_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _image_continuation_runtime(monkeypatch)
+    runtime.metadata.update({
+        "executed_provider": "openrouter",
+        "executed_model": "synthetic/text-small",
+        "routed_model": "synthetic/text-small",
+        "savings_pct": 30.0,
+    })
+    canonical = [message.model_dump(mode="json") for message in runtime.messages]
+
+    rebound = await runtime.wrapper.prepare_image_continuation(runtime.messages, runtime.config)
+
+    assert rebound is not None
+    assert runtime.wrapper.active_deployment_config().model == runtime.image_model
+    assert runtime.selector.current_config.model == "synthetic/text-small"
+    assert runtime.lookup_calls == [runtime.wrapper.active_deployment_config()]
+    assert runtime.wrapper.active_context_window_tokens() == 64_000
+    assert rebound.max_tokens == 8_192
+    assert rebound.model_capabilities == runtime.capabilities
+    assert rebound.model_vision_support == "supported"
+    assert rebound.provider_request_max_chars == ContextBudgetGovernor.from_values(
+        context_window_tokens=64_000,
+        max_output_tokens=8_192,
+        thinking_budget_tokens=0,
+        context_overflow_threshold=AgentConfig().context_overflow_threshold,
+    ).snapshot().provider_request_max_chars
+
+    events = [event async for event in runtime.wrapper.chat(runtime.messages, config=rebound)]
+
+    assert any(isinstance(event, DoneEvent) for event in events), events
+    call = runtime.built[-1].calls[0]
+    assert call["payload"]["model"] == runtime.image_model
+    assert call["payload"]["max_tokens"] == 8_192
+    assert f"data:image/png;base64,{runtime.image_data}" in json.dumps(call["payload"])
+    assert call["config"].model_capabilities == runtime.capabilities
+    assert (
+        call["config"].provider_request_correlation
+        == runtime.config.provider_request_correlation
+    )
+    assert call["canonical_before"] == call["canonical_after"] == canonical
+    assert isinstance(events[-1], DoneEvent)
+    assert runtime.wrapper._used_fallback is False
+    assert runtime.metadata["executed_model"] == runtime.image_model
+    assert runtime.metadata["executed_provider"] == "openrouter"
+    assert runtime.metadata["routed_model"] == runtime.image_model
+    assert runtime.metadata["savings_pct"] == 0.0
+    assert runtime.metadata["execution_legs"][-1]["kind"] == "primary"
+    assert not runtime.metadata.get("router_fallback_hops")
+    assert not runtime.primary.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["fixed", "disabled", "observe", "subagent"])
+async def test_tool_images_cannot_upgrade_without_active_smart_routing_authority(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    runtime = _image_continuation_runtime(monkeypatch, automatic=mode != "fixed")
+    if mode == "disabled":
+        runtime.gateway.squilla_router.enabled = False
+    elif mode == "observe":
+        runtime.gateway.squilla_router.rollout_phase = "observe"
+    elif mode == "subagent":
+        runtime.wrapper._image_routing_session_key = "agent:main:subagent:synthetic-child"
+
+    assert await runtime.wrapper.prepare_image_continuation(
+        runtime.messages, runtime.config,
+    ) is None
+    assert runtime.wrapper._selector is runtime.selector
+    assert runtime.wrapper._provider is runtime.primary
+    assert runtime.lookup_calls == []
+    assert len(runtime.built) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_image_upgrade_preserves_unknown_capability_for_native_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _image_continuation_runtime(monkeypatch, vision_support="unknown")
+
+    rebound = await runtime.wrapper.prepare_image_continuation(runtime.messages, runtime.config)
+
+    assert rebound is not None
+    assert rebound.model_vision_support == "unknown"
+    assert rebound.model_capabilities.supports_vision is False
+    assert runtime.wrapper.active_model_vision_support(rebound) == "unknown"
+    events = [event async for event in runtime.wrapper.chat(runtime.messages, config=rebound)]
+    assert any(isinstance(event, DoneEvent) for event in events), events
+    assert f"data:image/png;base64,{runtime.image_data}" in json.dumps(
+        runtime.built[-1].calls[0]["payload"],
+    )
+    assert runtime.wrapper._used_fallback is False
+
+
+@pytest.mark.asyncio
+async def test_tool_image_cross_provider_continuity_rejection_preserves_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _image_continuation_runtime(monkeypatch, target_provider="openai")
+    runtime.gateway.squilla_router.cross_provider_tiers = True
+    runtime.metadata["provider_state_continuity"] = {
+        "decision": "discard_provider_state", "active_state_provider": "openrouter",
+    }
+
+    assert await runtime.wrapper.prepare_image_continuation(
+        runtime.messages, runtime.config,
+    ) is None
+    assert runtime.wrapper._selector is runtime.selector
+    assert runtime.wrapper._provider is runtime.primary
+    assert runtime.selector.current_config.model == "synthetic/text-small"
+    assert runtime.lookup_calls == []
+    assert len(runtime.built) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("catalog_result", ["failure", "unsupported"])
+async def test_tool_image_catalog_rejection_does_not_commit_candidate_selector(
+    monkeypatch: pytest.MonkeyPatch, catalog_result: str,
+) -> None:
+    runtime = _image_continuation_runtime(monkeypatch)
+
+    def unavailable(*args: Any, **kwargs: Any) -> Any:
+        if catalog_result == "failure":
+            raise RuntimeError("synthetic catalog failure")
+        return _ResolvedCatalog(
+            max_tokens=8_192,
+            context_window=64_000,
+            capabilities=ModelCapabilities(supports_vision=False),
+            vision_support="unsupported",
+        )
+
+    runtime.wrapper.configure_image_continuation_catalog(unavailable)
+    assert await runtime.wrapper.prepare_image_continuation(
+        runtime.messages, runtime.config,
+    ) is None
+    assert runtime.wrapper._selector is runtime.selector
+    assert runtime.wrapper._provider is runtime.primary
+    assert runtime.selector.current_config.model == "synthetic/text-small"
+    assert runtime.wrapper._used_fallback is False
+
+
+@pytest.mark.asyncio
+async def test_tool_image_upgrade_checks_complete_retained_history_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _image_continuation_runtime(monkeypatch)
+    runtime.messages[0] = Message(role="user", content="sample context " * 60_000)
+
+    assert await runtime.wrapper.prepare_image_continuation(
+        runtime.messages, runtime.config,
+    ) is None
+    assert runtime.wrapper._selector is runtime.selector
+    assert runtime.wrapper._provider is runtime.primary
+    assert runtime.lookup_calls == []
+    assert len(runtime.built) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["router", "fixed_text", "fixed_vision", "ensemble", "no_vision", "call_budget"],
+)
+async def test_downloaded_image_runs_through_dispatch_and_main_model_capability(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    from opensquilla.provider.protocol import count_provider_image_blocks
+    from opensquilla.tools.builtin import media
+    from opensquilla.tools.dispatch import build_tool_handler
+    from opensquilla.tools.registry import ToolRegistry, get_default_registry
+
+    runtime = _image_continuation_runtime(
+        monkeypatch, automatic=mode in {"router", "no_vision", "call_budget"},
+    )
+    if mode == "ensemble":
+        runtime.primary.provider_name = "ensemble"
+    if mode == "no_vision":
+        runtime.gateway.squilla_router.tiers.pop("c1")
+    target = "https://images.example.test/sample.png"
+    downloads = []
+
+    async def fetch(url):
+        downloads.append(url)
+        return image_bytes(), "image/png"
+
+    async def forbidden_analysis(*args):
+        pytest.fail("The image tool must not make its own provider call")
+
+    monkeypatch.setattr(media, "_fetch_image_url", fetch)
+    monkeypatch.setattr(media, "_call_vision_provider", forbidden_analysis)
+    runtime.primary._streams = [
+        [
+            ToolUseStartEvent(tool_use_id="load-url", tool_name="image"),
+            ToolUseEndEvent(tool_use_id="load-url", tool_name="image", arguments={
+                "path": target, "prompt": "Inspect this resource",
+            }),
+            DoneEvent(stop_reason="tool_use"),
+        ],
+        [TextDeltaEvent(text="finished"), DoneEvent()],
+    ]
+    registered = get_default_registry().get("image")
+    assert registered is not None
+    registry = ToolRegistry()
+    registry.register(registered.spec, registered.handler)
+    context = ToolContext(is_owner=True)
+    agent = Agent(
+        provider=runtime.wrapper,
+        config=AgentConfig(
+            model_id="synthetic/text-small", max_iterations=2, max_provider_retries=0,
+            max_turn_llm_calls=1 if mode == "call_budget" else 0,
+            model_vision_support="supported" if mode == "fixed_vision" else "unsupported",
+            model_capabilities=ModelCapabilities(
+                supports_vision=mode == "fixed_vision", supports_tools=True,
+            ),
+        ),
+        tool_context=context,
+        tool_handler=build_tool_handler(registry, context),
+        tool_definitions=[ToolDefinition(
+            name="image", description=registered.spec.description,
+            input_schema=ToolInputSchema(
+                properties=registered.spec.parameters, required=registered.spec.required,
+            ),
+        )],
+    )
+
+    events = [event async for event in agent.run_turn("Inspect the linked image.")]
+
+    assert downloads == [target]
+    if mode == "call_budget":
+        assert any(
+            event.kind == "error" and event.code == "turn_llm_call_budget_exceeded"
+            for event in events
+        )
+        assert sum(len(provider.calls) for provider in runtime.built) == 1
+        return
+    assert not [event for event in events if event.kind == "error"], events
+    assert any(event.kind == "done" for event in events)
+    assert count_provider_image_blocks(runtime.primary.calls[0]["messages"]) == 0
+    if mode == "router":
+        assert len(runtime.primary.calls) == 1
+        assert runtime.wrapper.active_deployment_config().model == runtime.image_model
+        call = runtime.built[-1].calls[0]
+    else:
+        assert len(runtime.primary.calls) == 2
+        assert runtime.wrapper.active_deployment_config().model == "synthetic/text-small"
+        assert len(runtime.built) == 1
+        call = runtime.primary.calls[-1]
+    expected_images = int(mode in {"router", "fixed_vision"})
+    assert count_provider_image_blocks(call["messages"]) == expected_images
+    if expected_images:
+        assert f"data:image/png;base64,{runtime.image_data}" in json.dumps(call["payload"])
+    else:
+        assert runtime.metadata["image_input_mode"] == "marker"
+        assert runtime.metadata["image_input_output_count"] == 0
+        assert runtime.metadata["image_input_marker_count"] == 1
+    assert context.tool_result_media == {}

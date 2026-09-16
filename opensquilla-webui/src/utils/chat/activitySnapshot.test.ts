@@ -9,6 +9,7 @@ import {
   normalizeActivitySnapshot,
   restoreActivityInterruptTimeline,
 } from './activitySnapshot'
+import { projectAssistantActivityTimeline } from './assistantActivity'
 
 const snapshot: ActivitySnapshotV2 = {
   version: 2,
@@ -38,6 +39,46 @@ const snapshot: ActivitySnapshotV2 = {
 }
 
 describe('activitySnapshot v2', () => {
+  it('restores temporary maintenance without promoting it to a saved summary', () => {
+    const normalized = normalizeActivitySnapshot({
+      version: 2, task_id: 'turn-1', turn_id: 'turn-1',
+      complete: true, reasoning_utf16_length: 0,
+      entries: [{
+        type: 'maintenance', id: 'cmp-temporary', order: 1,
+        maintenance_type: 'context_compaction', state: 'completed',
+        at: 1_000, ended_at: 2_000, source: 'automatic', durability: 'request_scoped',
+      }],
+    }, 'turn-1', 'turn-1')
+
+    expect(normalized).toBeDefined()
+    const history = activityStatusHistory(normalized!)
+    expect(history).toMatchObject([{ state: 'completed', durability: 'request_scoped' }])
+    const projection = projectAssistantActivityTimeline([], { lifecycle: 'settled', statusHistory: history })
+    expect(projection.statusSteps[0]).toMatchObject({
+      isCurrent: false, label: { code: 'chat.compact.temporarilyReduced' },
+    })
+  })
+
+  it('restores connection recovery with its attempt and no artificial retry limit', () => {
+    const normalized = normalizeActivitySnapshot({
+      version: 2,
+      task_id: 'turn-1',
+      turn_id: 'turn-1',
+      complete: false,
+      reasoning_utf16_length: 0,
+      entries: [{
+        type: 'phase', id: 'provider:retrying:7', order: 7, kind: 'provider',
+        phase: 'retrying', at: 7_000, ended_at: 8_000,
+        retry_attempt: 7, retry_limit: 0,
+      }],
+    }, 'turn-1', 'turn-1')
+
+    expect(normalized).toBeDefined()
+    expect(activityStatusHistory(normalized!)).toMatchObject([
+      { action: 'provider:retrying:7:0', label: 'Retrying · attempt 7', activityOrder: 7 },
+    ])
+  })
+
   it('restores phase, UTF-16 reasoning, text, and tool order without timestamps', () => {
     const normalized = normalizeActivitySnapshot({
       version: 2,

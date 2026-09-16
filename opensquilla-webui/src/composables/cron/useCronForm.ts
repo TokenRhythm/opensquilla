@@ -7,7 +7,7 @@ import type { CronJob, CronJobFormModel, CronPanelTemplate } from '@/types/cron'
 import { buildDeliveryFromValues, normalizeDeliveryFields } from '@/utils/cron/delivery'
 import { DEFAULT_CRON_EXPRESSION, explainCron, nextRuns, parseCron } from '@/utils/cron/schedule'
 import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
-import type { CronScheduler } from '@/modules/cronScheduler'
+import type { CronJobMutation, CronScheduler } from '@/modules/cronScheduler'
 
 interface UseCronFormOptions {
   afterSaved: () => void
@@ -197,7 +197,7 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
       : payloadKind === 'reminder'
         ? 'isolated'
         : form.sessionTarget
-    const payload: Record<string, unknown> = {
+    const payload: CronJobMutation = {
       name,
       enabled: form.enabled,
       payloadKind,
@@ -238,8 +238,8 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
     const tz = form.tz.trim()
     if (tz) {
       payload.tz = tz
-      const sched = payload.schedule as Record<string, unknown>
-      if (sched?.kind === 'cron') sched.tz = tz
+      const sched = payload.schedule
+      if (sched?.kind === 'cron') payload.schedule = { ...sched, tz }
     }
     if (form.wakeMode && form.wakeMode !== 'now') payload.wakeMode = form.wakeMode
 

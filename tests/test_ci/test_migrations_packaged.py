@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -106,7 +107,10 @@ def test_usage_query_client_source_is_part_of_webui_build_inputs() -> None:
         REPO_ROOT / "opensquilla-webui" / "scripts" / "check-runtime-bundle.mjs"
     ).read_text(encoding="utf-8")
 
-    assert "import type { Observability } from '@/modules/observability'" in source
+    assert re.search(
+        r"import type\s*\{[^}]*\bObservability\b[^}]*\}\s*from '@/modules/observability'",
+        source,
+    )
     assert "return observability.usage(range, options)" in source
     assert "check-runtime-bundle.mjs" in package["scripts"]["build:artifact"]
     assert "usage.query" in bundle_guard

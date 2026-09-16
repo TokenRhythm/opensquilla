@@ -878,7 +878,6 @@ async function loadHomeFacts(only?: string[]): Promise<void> {
   if (names.length === 0) return
   const id = ++homeFactsRequest
   try {
-    await channelAdministration.ready()
     // {} = known-empty (no admins configured anywhere); null = unknown (the
     // read failed) — the two must not be conflated, or a transient failure
     // would zero the admin count and re-arm the first-pairing bootstrap.

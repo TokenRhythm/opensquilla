@@ -1,11 +1,14 @@
 {
   "schema_version": 1,
   "merge_critical_inputs": [
+    ".github/actions/download-required-artifact/action.yml",
     ".github/ci/suites.v1.json",
     ".github/ci/trust-policy.v1.json",
     ".github/scripts/check_ci_results.py",
     ".github/scripts/ci_attestation.py",
     ".github/scripts/plan_ci.py",
+    ".github/scripts/prepare-electron.mjs",
+    ".github/scripts/test-prepare-electron.mjs",
     ".github/scripts/verify-sandbox-package.mjs",
     ".github/scripts/windows_test_assignments.json",
     ".github/scripts/windows_test_shards.py",

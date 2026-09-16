@@ -664,6 +664,8 @@ def validate_scenario_evidence(case: CaseSpec, result: DriverResult) -> None:
         if dom_nodes is None or int(dom_nodes) > 15_000:
             raise ValueError("scenario evidence requires counts.dom_nodes <= 15000")
     elif scenario == "fault_429_retry_after":
+        if result.physical_requests < 2:
+            raise ValueError("rate-limit recovery requires at least two physical requests")
         _require_count(result, "retry_legs")
         _require_count(result, "retry_after_honored")
         _require_metric_at_least(result, "retry_wait_ms", 8_000)

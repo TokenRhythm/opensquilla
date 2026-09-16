@@ -24,6 +24,13 @@ from opensquilla.contracts.generated.v4.plans_cancel_run import (
 from opensquilla.contracts.generated.v4.plans_cancel_run_metadata import (
     PLANS_CANCEL_RUN_METHOD,
 )
+from opensquilla.contracts.generated.v4.plans_capabilities import (
+    PlansCapabilitiesParams,
+    PlansCapabilitiesResult,
+)
+from opensquilla.contracts.generated.v4.plans_capabilities_metadata import (
+    PLANS_CAPABILITIES_METHOD,
+)
 from opensquilla.contracts.generated.v4.plans_implement import (
     Params as PlansImplementParams,
 )
@@ -144,6 +151,17 @@ _CANCEL_RUN_BINDING: GatewayContractBinding[dict[str, Any]] = GatewayContractBin
     request_mismatch_event="plans.cancelRun.request_contract_mismatch",
     response_violation_event="plans.cancelRun.contract_violation",
 )
+_CAPABILITIES_BINDING: GatewayContractBinding[dict[str, Any]] = GatewayContractBinding(
+    descriptor=GATEWAY_METHOD_CONTRACTS[PLANS_CAPABILITIES_METHOD],
+    observe_params=lambda params: _observe(params, PlansCapabilitiesParams),
+    validate_result=lambda payload: _validate_result(
+        payload, PlansCapabilitiesResult, PLANS_CAPABILITIES_METHOD
+    ),
+    result_validation_errors=(PlansContractError,),
+    response_error_message="plans.capabilities response violated its v4 contract",
+    request_mismatch_event="plans.capabilities.request_contract_mismatch",
+    response_violation_event="plans.capabilities.contract_violation",
+)
 
 
 def _register[ContextT](
@@ -227,8 +245,25 @@ def register_plans_cancel_run_contract[ContextT](
     )
 
 
+def register_plans_capabilities_contract[ContextT](
+    registry: MethodRegistry[ContextT],
+    implementation: Callable[[Any, ContextT], Awaitable[dict[str, Any]]],
+    *,
+    internal_error: ErrorFactory,
+    guest_allowed_checker: GuestAllowedChecker,
+) -> Callable[[Any, ContextT], Awaitable[dict[str, Any]]]:
+    return _register(
+        registry,
+        _CAPABILITIES_BINDING,
+        implementation,
+        internal_error=internal_error,
+        guest_allowed_checker=guest_allowed_checker,
+    )
+
+
 __all__ = [
     "register_plans_cancel_run_contract",
+    "register_plans_capabilities_contract",
     "register_plans_implement_contract",
     "register_plans_revise_contract",
     "register_plans_set_mode_contract",

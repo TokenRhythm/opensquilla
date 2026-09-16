@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -66,6 +67,23 @@ class _CapturingTurnLog:
         self.records.append({"kind": kind, "payload": payload})
 
 
+@pytest.fixture
+async def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+        await original_sleep(0)
+
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
+    return sleeps
+
+
 def test_provider_retry_delay_uses_larger_provider_hint() -> None:
     assert _provider_retry_delay_seconds(
         local_delay_s=2.0,
@@ -77,10 +95,11 @@ def test_provider_retry_delay_uses_larger_provider_hint() -> None:
     ) == 12.0
 
 
-def test_provider_retry_delay_does_not_clamp_an_excessive_hint_and_retry_early() -> None:
+@pytest.mark.parametrize("hint", [901.0, float("inf")])
+def test_provider_retry_delay_does_not_clamp_an_excessive_hint_and_retry_early(hint: float) -> None:
     assert _provider_retry_delay_seconds(
         local_delay_s=1.0,
-        provider_retry_after_s=901.0,
+        provider_retry_after_s=hint,
     ) is None
 
 
@@ -173,8 +192,8 @@ def test_selector_buffer_coalesces_tool_deltas_and_rejects_oversized_content() -
 
 
 @pytest.mark.asyncio
-async def test_agent_emits_structured_activity_and_honors_retry_after(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_agent_retries_rate_limit_on_same_deployment_after_provider_wait(
+    retry_sleeps: list[float],
 ) -> None:
     provider = _SequenceProvider(
         [
@@ -182,12 +201,6 @@ async def test_agent_emits_structured_activity_and_honors_retry_after(
             [TextDeltaEvent(text="ok"), DoneEvent(stop_reason="stop")],
         ]
     )
-    sleeps: list[float] = []
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -201,16 +214,53 @@ async def test_agent_emits_structured_activity_and_honors_retry_after(
     activity = [event for event in events if isinstance(event, ProviderActivityEvent)]
 
     assert provider.calls == 2
-    assert sleeps == [8.0]
+    assert retry_sleeps == [8.0]
     assert [event.phase for event in activity] == [
         "requesting",
         "retry_wait",
         "retrying",
         "requesting",
     ]
-    assert activity[1].reason == "rate_limited"
+    assert activity[1].reason == ProviderFailureKind.RATE_LIMITED.value
     assert activity[1].retry_after_ms == 8_000
+    assert activity[1].retry_attempt == activity[1].retry_limit == 1
+    assert not any(isinstance(event, EngineErrorEvent) for event in events)
     assert not any("synthetic rate limit" in repr(event) for event in activity)
+
+
+@pytest.mark.asyncio
+async def test_agent_retries_same_deployment_provider_overload(
+    retry_sleeps: list[float],
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [ErrorEvent(message="synthetic overload", code="503", retry_after_s=8.0)],
+            [TextDeltaEvent(text="ok"), DoneEvent(stop_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=1_000,
+            retry_max_backoff_ms=1_000,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    activity = [event for event in events if isinstance(event, ProviderActivityEvent)]
+
+    assert provider.calls == 2
+    assert retry_sleeps == [8.0]
+    assert [event.phase for event in activity] == [
+        "requesting",
+        "retry_wait",
+        "retrying",
+        "requesting",
+    ]
+    assert activity[1].reason == ProviderFailureKind.PROVIDER_OVERLOADED.value
+    assert activity[1].retry_after_ms == 8_000
+    assert not any("synthetic overload" in repr(event) for event in activity)
 
 
 @pytest.mark.asyncio
@@ -259,17 +309,11 @@ async def test_agent_normalizes_untrusted_provider_activity_fields() -> None:
 
 @pytest.mark.asyncio
 async def test_retry_after_that_exceeds_turn_deadline_does_not_retry_early(
-    monkeypatch: pytest.MonkeyPatch,
+    retry_sleeps: list[float],
 ) -> None:
     provider = _SequenceProvider(
-        [[ErrorEvent(message="synthetic rate limit", code="429", retry_after_s=8.0)]]
+        [[ErrorEvent(message="synthetic overload", code="503", retry_after_s=8.0)]]
     )
-    sleeps: list[float] = []
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -283,13 +327,13 @@ async def test_retry_after_that_exceeds_turn_deadline_does_not_retry_early(
     events = [event async for event in agent.run_turn("hello")]
 
     assert provider.calls == 1
-    assert sleeps == []
+    assert retry_sleeps == []
     assert not any(
         isinstance(event, ProviderActivityEvent)
         and event.phase in {"retry_wait", "retrying"}
         for event in events
     )
-    assert any(isinstance(event, EngineErrorEvent) and event.code == "429" for event in events)
+    assert any(isinstance(event, EngineErrorEvent) and event.code == "503" for event in events)
 
 
 @pytest.mark.asyncio
@@ -574,7 +618,9 @@ async def test_selector_reasoning_commits_primary_and_suppresses_fallback() -> N
 
 
 @pytest.mark.asyncio
-async def test_selector_fallback_discards_failed_leg_tool_frames() -> None:
+async def test_selector_fallback_discards_failed_leg_tool_frames(
+    retry_sleeps: list[float],
+) -> None:
     primary = _SequenceProvider(
         [[
             ToolUseStartEvent(tool_use_id="ghost", tool_name="echo"),

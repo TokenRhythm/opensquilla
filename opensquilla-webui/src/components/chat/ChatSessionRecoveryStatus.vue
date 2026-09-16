@@ -3,8 +3,8 @@
     ref="statusRef"
     class="chat-session-recovery-status"
     :class="`chat-session-recovery-status--${state}`"
-    :role="isFailure ? 'alert' : 'status'"
-    :aria-live="isFailure ? 'assertive' : 'polite'"
+    :role="isFailure && actionKey ? 'alert' : 'status'"
+    :aria-live="isFailure && actionKey ? 'assertive' : 'polite'"
     aria-atomic="true"
     :data-recovery-state="state"
     data-testid="chat-session-recovery-status"
@@ -26,7 +26,7 @@
       <span v-if="description">{{ description }}</span>
     </span>
     <button
-      v-if="isRetryableFailure"
+      v-if="actionKey"
       type="button"
       class="chat-session-recovery-status__retry btn btn--ghost"
       data-testid="chat-session-recovery-retry"
@@ -47,6 +47,7 @@ import type { ChatSessionRecoveryState } from '@/utils/chat/sessionLoadState'
 const props = defineProps<{
   state: ChatSessionRecoveryState
   transportState?: 'disconnected' | 'connecting' | 'connected'
+  action?: 'retry-history' | 'retry-live'
 }>()
 
 const emit = defineEmits<{
@@ -60,9 +61,7 @@ const isFailure = computed(() => (
   || props.state === 'live-degraded'
   || props.state === 'session-missing'
 ))
-const isRetryableFailure = computed(() => (
-  props.state === 'history-error' || props.state === 'live-degraded'
-))
+const actionKey = computed(() => props.action)
 const isBusy = computed(() => !isFailure.value)
 const title = computed(() => {
   switch (props.state) {
@@ -104,11 +103,9 @@ const description = computed(() => {
       return ''
     }
   })
-const action = computed(() => (
-  props.state === 'live-degraded'
-    ? t('chat.reconnectLive')
-    : t('chat.reloadSession')
-))
+const action = computed(() => props.action === 'retry-live'
+  ? t('chat.reconnectLive')
+  : t('chat.reloadSession'))
 
 function requestRetry() {
   emit('retry')

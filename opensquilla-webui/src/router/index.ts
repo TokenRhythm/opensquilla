@@ -2,7 +2,6 @@ import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw, RouteLocationNormalized } from 'vue-router'
 import { getPlatform } from '@/platform'
 import i18n from '@/i18n'
-import { desktopRoutes } from './desktopRoutes'
 import { sharedRoutes } from './sharedRoutes'
 import { webRoutes } from './webRoutes'
 import { captureContentScroll, contentScrollBehavior } from './scrollMemory'
@@ -25,7 +24,6 @@ const NotFoundView = () => import('@/views/NotFoundView.vue')
 export const routes: RouteRecordRaw[] = [
   ...sharedRoutes,
   ...(platform.capabilities.hasWebConfig ? webRoutes : []),
-  ...(platform.capabilities.hasDesktopOnboarding ? desktopRoutes : []),
   { path: '/:pathMatch(.*)*', name: 'not-found', component: NotFoundView, meta: { title: 'Not Found', platforms: ['web', 'desktop'] } },
 ]
 

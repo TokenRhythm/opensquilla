@@ -412,14 +412,6 @@ def _passive_archive_bin_dirs(
     return activation.bin_dirs if activation is not None else None
 
 
-def _validated_component_bin_dirs(
-    root: Path,
-    descriptor: registry.ToolchainDescriptor,
-) -> tuple[Path, ...] | None:
-    activation = _validated_activation(root, descriptor, verify_payload=True)
-    return activation.bin_dirs if activation is not None else None
-
-
 def list_active_components(*, root: Path | None = None) -> tuple[ActiveComponentStatus, ...]:
     """List only catalog- and marker-validated activations without exposing paths."""
     state_root = toolchains_root(root)
@@ -811,23 +803,6 @@ def _validated_activation_receipt(
         package=package,
         bin_dirs=directories,
         resources=resources,
-    )
-
-
-def _marker_matches(
-    path: Path,
-    descriptor: registry.ToolchainDescriptor,
-    *,
-    require_payload_manifest: bool = False,
-) -> bool:
-    marker = _read_mapping(path)
-    return bool(
-        marker is not None
-        and _marker_mapping_matches(
-            marker,
-            descriptor,
-            require_payload_manifest=require_payload_manifest,
-        )
     )
 
 

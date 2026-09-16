@@ -1,4 +1,10 @@
+// @vitest-environment happy-dom
+
 import { describe, expect, it, vi } from 'vitest'
+import {
+  httpTransportTestDouble,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
 
 import { createV4ArtifactWorkbench } from './artifactWorkbenchV4'
 
@@ -18,6 +24,20 @@ function harness(responses: unknown[], supported = true) {
   const markUnsupported = vi.fn()
   const handlers = new Map<string, (payload: unknown) => void>()
   const close = vi.fn()
+  const previewBlob = new Blob(['preview'], { type: 'image/png' })
+  const requestBinary = vi.fn(async () => ({
+    metadata: {
+      status: 200,
+      contentLength: previewBlob.size,
+      contentType: previewBlob.type,
+    },
+    blob: async () => previewBlob,
+    stream: () => previewBlob.stream(),
+  }))
+  const http: TestHttpTransport = httpTransportTestDouble({
+    requestBinary,
+    requestBlob: vi.fn(async () => new Blob()),
+  })
   const workbench = createV4ArtifactWorkbench({
     request: request as unknown as Parameters<typeof createV4ArtifactWorkbench>[0]['request'],
     ready,
@@ -28,15 +48,29 @@ function harness(responses: unknown[], supported = true) {
       handlers.set(event, handler)
       return { close }
     }),
-  }, {
-    requestJson: vi.fn(async () => ({})) as unknown as Parameters<
-      typeof createV4ArtifactWorkbench
-    >[2]['requestJson'],
-  })
-  return { close, handlers, markUnsupported, ready, request, workbench }
+  }, http)
+  return { close, handlers, markUnsupported, ready, request, requestBinary, workbench }
 }
 
 describe('ArtifactWorkbench v4 Adapter', () => {
+  it('binds preview loading to its private HTTP dependency', async () => {
+    const { requestBinary, workbench } = harness([])
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+
+    const preview = workbench.previews.create({
+      artifact: () => artifact('preview'),
+    })
+    preview.load()
+    await vi.waitFor(() => expect(preview.state.value).toBe('loaded'))
+
+    expect(requestBinary).toHaveBeenCalledWith(
+      '/api/v1/artifacts/preview',
+      expect.objectContaining({ timeoutMs: 0 }),
+    )
+    preview.dispose()
+  })
+
   it('validates canonical artifact pages and preserves oldest-first session order', async () => {
     const { ready, request, workbench } = harness([
       {
@@ -92,6 +126,28 @@ describe('ArtifactWorkbench v4 Adapter', () => {
     expect(request).not.toHaveBeenCalled()
   })
 
+  it('keeps connection readiness private to semantic Workbench operations', async () => {
+    const { ready, request, workbench } = harness([{
+      resources: [],
+      totalCount: 0,
+    }])
+
+    await expect(workbench.resources.list('agent:main:webchat:test'))
+      .resolves.toMatchObject({ resources: [], totalCount: 0 })
+
+    expect('ready' in workbench).toBe(false)
+    expect(ready).toHaveBeenCalledWith(expect.objectContaining({
+      timeoutMs: 10_000,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    }))
+    expect(request).toHaveBeenCalledWith(
+      'workbench.resources.list',
+      expect.objectContaining({ sessionKey: 'agent:main:webchat:test' }),
+      expect.any(Object),
+    )
+  })
+
   it('shares one event lease and dedupes canonical/legacy document changes by sequence', () => {
     const { close, handlers, workbench } = harness([])
     const listener = vi.fn()
@@ -109,6 +165,11 @@ describe('ArtifactWorkbench v4 Adapter', () => {
       documentId: 'document-1',
       artifactEventSeq: 5,
     })
+    handlers.get('document.state_changed')?.({
+      documentId: 'document-1',
+      artifactEventSeq: 0,
+    })
+    handlers.get('session.event.artifact_state')?.({ document_id: 'document-2' })
 
     expect(listener).toHaveBeenCalledTimes(2)
     expect(listener).toHaveBeenLastCalledWith({ documentId: 'document-1' })

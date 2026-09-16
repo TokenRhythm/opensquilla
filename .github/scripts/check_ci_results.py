@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Final
 
 PLANNER_RESULT: Final[tuple[str, str]] = ("RESULT_PLANNER", "Plan CI suites")
@@ -20,6 +21,7 @@ JOB_RESULT_LABELS: Final[dict[str, str]] = {
     "RESULT_FRONTEND_ARTIFACT": "Frontend artifact",
     "RESULT_FRONTEND": "Frontend validation and wheel WebUI roundtrip",
     "RESULT_CONTRACT_WINDOWS": "Gateway Contract determinism on Windows",
+    "RESULT_CONTRACT_VERIFICATION_LINUX": "Complete Gateway Contract verification on Linux",
     "RESULT_TUI": "OpenTUI package tests",
     "RESULT_DESKTOP": "Desktop Electron unit tests",
     "RESULT_UBUNTU": "Ubuntu quality gate",
@@ -61,7 +63,9 @@ SUITE_RESULT_REQUIREMENTS: Final[dict[str, tuple[str, ...]]] = {
     "desktop-recovery-e2e": ("RESULT_DESKTOP_RECOVERY_E2E",),
     "desktop-static": ("RESULT_DESKTOP",),
     "frontend-artifact": ("RESULT_FRONTEND_ARTIFACT",),
-    "frontend-validation": ("RESULT_FRONTEND", "RESULT_CONTRACT_WINDOWS"),
+    "frontend-validation": (
+        "RESULT_FRONTEND", "RESULT_CONTRACT_WINDOWS", "RESULT_CONTRACT_VERIFICATION_LINUX",
+    ),
     "macos-recovery": ("RESULT_MACOS_RECOVERY",),
     "managed-toolchain": ("RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",),
     "python-full": ("RESULT_UBUNTU", "RESULT_UBUNTU_FULL"),
@@ -155,6 +159,14 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
 
     _validate_suite_result_contract(errors)
     required_suites = _read_required_suites(env, errors)
+    if env.get("QUEUE_PARTIAL") == "true":
+        _check_partial_coverage(env, required_suites, errors)
+    elif env.get("GITHUB_EVENT_NAME") == "merge_group":
+        try:
+            if required_suites != _full_queue_suites():
+                errors.append("Queue without partial proof must execute the full matrix.")
+        except (OSError, ValueError, KeyError, TypeError):
+            errors.append("Full queue coverage manifest is invalid.")
 
     required_results = {
         variable
@@ -171,6 +183,41 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         )
 
     return errors
+
+
+def _full_queue_suites() -> set[str]:
+    manifest = Path(__file__).resolve().parents[1] / "ci" / "suites.v1.json"
+    return set(json.loads(manifest.read_text(encoding="utf-8"))["full_suites"])
+
+
+def _check_partial_coverage(
+    env: Mapping[str, str], executed: set[str], errors: list[str]
+) -> None:
+    """A partial run still owes EVERY full-matrix suite, by proof or execution."""
+    if env.get("GITHUB_EVENT_NAME") != "merge_group":
+        errors.append("Partial evidence is valid only for merge_group.")
+    if env.get("QUEUE_EVIDENCE_RESULT") != "success":
+        errors.append("Partial evidence verifier must succeed.")
+    if env.get("QUEUE_CANARY_RESULT") != "success":
+        errors.append("Partial queue combined-tree canary must succeed.")
+    if not env.get("QUEUE_SOURCE_RUN_ID", "").isdigit() or int(
+        env.get("QUEUE_SOURCE_RUN_ID", "0")
+    ) <= 0:
+        errors.append("Partial evidence source run is missing.")
+    try:
+        reused = json.loads(env.get("QUEUE_REUSED_SUITES", ""))
+        if (
+            not isinstance(reused, list) or not reused
+            or any(not isinstance(suite, str) for suite in reused)
+            or reused != sorted(set(reused))
+            or not set(reused) <= {"frontend-validation", "tui"}
+        ):
+            raise ValueError("invalid reused suites")
+        full = _full_queue_suites()
+        if executed & set(reused) or executed | set(reused) != full:
+            errors.append("Executed and reused suites must partition the full queue matrix.")
+    except (OSError, ValueError, KeyError, TypeError):
+        errors.append("Partial queue coverage is invalid.")
 
 
 def main() -> int:

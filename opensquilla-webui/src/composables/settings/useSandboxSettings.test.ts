@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { EffectScope } from 'vue'
 import type {
+  SandboxRuntimeActionReceipt,
+  SandboxSettingsRuntime,
+} from '@/modules/sandboxRuntime'
+import type {
   SandboxPolicy,
+  SandboxRuntimeOperation,
   SandboxRuntimePackStatus,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
@@ -78,70 +83,121 @@ async function createSandboxSettings(options: {
   setupState?: SandboxSetupStatusPayload['state']
   setupStatus?: () => SandboxSetupStatusPayload
   policyUpdate?: (params: Record<string, unknown>) => unknown | Promise<unknown>
+  policyConflict?: SandboxPolicy
+  policyConflictGate?: Promise<unknown>
   runModeSetError?: Error
-  runtimeStatus?: unknown | (() => unknown | Promise<unknown>)
+  runtimeStatus?: SandboxRuntimePackStatus | null | (() => SandboxRuntimePackStatus | null | Promise<SandboxRuntimePackStatus | null>)
   runtimeStatusError?: Error
-  runtimeAction?: (method: string, params?: Record<string, unknown>) => unknown
+  runtimeAction?: (
+    action: 'install' | 'cancel' | 'discard' | 'remove',
+    componentId: string,
+    operationId?: string,
+  ) => SandboxRuntimeActionReceipt
 } = {}) {
   vi.resetModules()
   const pushToast = vi.fn()
-  const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-    if (method === 'sandbox.policy.get') return structuredClone(policy)
-    if (method === 'sandbox.policy.defaults') {
-      return {
+  const { SandboxError } = await import('@/modules/sandboxRuntime')
+  const setupStatus = vi.fn(async () => {
+    if (options.setupStatus) return options.setupStatus()
+    const state = options.setupState ?? 'not_setup'
+    return {
+      state,
+      platform: 'win32',
+      message: state === 'ready' ? 'ready' : 'setup required',
+      requiresAdmin: state !== 'ready',
+    } satisfies SandboxSetupStatusPayload
+  })
+  const capability = vi.fn(async (_refreshCapability = false) => {
+    if (options.capabilityError) throw new Error('probe failed')
+    return await (options.capabilityResult ?? unavailableReport) as typeof unavailableReport
+  })
+  const loadSettings = vi.fn(async () => ({
+    policy: structuredClone(policy),
+    defaults: {
         runtimeTarget: 'windows-x64',
         runtimeVersions: { python: { version: '3.13.14', available: true } },
-      }
-    }
-    if (method === 'sandbox.run_mode.preference.get') return { runMode: 'full' }
-    if (method === 'sandbox.runtime.status') {
-      if (options.runtimeStatusError) throw options.runtimeStatusError
-      if (typeof options.runtimeStatus === 'function') return options.runtimeStatus()
-      if (options.runtimeStatus !== undefined) return options.runtimeStatus
-      throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
-    }
-    if (
-      method === 'sandbox.runtime.install'
-      || method === 'sandbox.runtime.cancel'
-      || method === 'sandbox.runtime.discard_download'
-      || method === 'sandbox.runtime.remove'
-    ) {
-      return options.runtimeAction?.(method, params) ?? { status: readyRuntimeStatus }
-    }
-    if (method === 'sandbox.capability.status') {
-      if (options.capabilityError) throw new Error('probe failed')
-      return options.capabilityResult ?? unavailableReport
-    }
-    if (method === 'sandbox.setup.status') {
-      if (options.setupStatus) return options.setupStatus()
-      const state = options.setupState ?? 'not_setup'
-      return {
-        state,
-        platform: 'win32',
-        message: state === 'ready' ? 'ready' : 'setup required',
-        requiresAdmin: state !== 'ready',
-      }
-    }
-    if (method === 'sandbox.setup.ensure') {
-      return {
+    },
+    preference: { runMode: 'full' as const },
+  }))
+  const readiness = vi.fn(async (request?: { refreshCapability?: boolean }) => {
+    const status = await setupStatus()
+    const report = status.state === 'ready' || options.desktop !== true
+      ? await capability(request?.refreshCapability === true)
+      : null
+    return { status, capability: report }
+  })
+  const ensureReady = vi.fn(async () => {
+    const status: SandboxSetupStatusPayload = {
         state: 'ready',
         platform: 'win32',
         message: 'ready',
         requiresAdmin: false,
-      }
     }
-    if (method === 'sandbox.run_mode.preference.set') {
-      if (options.runModeSetError) throw options.runModeSetError
-      return { runMode: params?.runMode, source: 'preference' }
-    }
-    if (method === 'sandbox.policy.update') {
-      if (options.policyUpdate) return options.policyUpdate(params ?? {})
-      const saved = structuredClone(params?.policy as typeof policy)
-      saved.policyVersion = Number(params?.basePolicyVersion) + 1
-      return saved
-    }
-    throw new Error(`unexpected method: ${method} ${JSON.stringify(params)}`)
+    const report = await capability(true)
+    return report.available
+      ? { ready: true, status, capability: report, outcome: 'ready' as const }
+      : { ready: false, status, capability: report, outcome: 'verification_failed' as const }
   })
+  let pendingPolicyConflict = options.policyConflict
+  const updatePolicy = vi.fn(async (basePolicyVersion: number, candidate: SandboxPolicy) => {
+    if (pendingPolicyConflict) {
+      if (options.policyConflictGate) await options.policyConflictGate
+      const currentPolicy = pendingPolicyConflict
+      pendingPolicyConflict = undefined
+      throw new SandboxError('conflict', 'policy version conflict', {
+        currentPolicy: structuredClone(currentPolicy),
+        retryable: true,
+      })
+    }
+    if (options.policyUpdate) {
+      return await options.policyUpdate({ basePolicyVersion, policy: candidate }) as SandboxPolicy
+    }
+    const saved = structuredClone(candidate)
+    saved.policyVersion = basePolicyVersion + 1
+    return saved
+  })
+  const selectMode = vi.fn(async (mode: 'safe' | 'full') => {
+    if (options.runModeSetError) throw options.runModeSetError
+    return { runMode: mode, source: 'preference' }
+  })
+  const runtimeStatus = vi.fn(async () => {
+    if (options.runtimeStatusError) throw options.runtimeStatusError
+    if (typeof options.runtimeStatus === 'function') return await options.runtimeStatus()
+    return options.runtimeStatus ?? null
+  })
+  const runtimeAction = (
+    action: 'install' | 'cancel' | 'discard' | 'remove',
+    componentId: string,
+    operationId?: string,
+  ) => options.runtimeAction?.(action, componentId, operationId)
+    ?? { kind: 'status' as const, status: structuredClone(readyRuntimeStatus) }
+  const installRuntime = vi.fn(async (componentId: 'python' | 'node' | 'gitBash') => (
+    runtimeAction('install', componentId)
+  ))
+  const cancelRuntime = vi.fn(async (
+    componentId: 'python' | 'node' | 'gitBash',
+    operationId: string,
+  ) => runtimeAction('cancel', componentId, operationId))
+  const discardRuntimeDownload = vi.fn(async (componentId: 'python' | 'node' | 'gitBash') => (
+    runtimeAction('discard', componentId)
+  ))
+  const removeRuntime = vi.fn(async (componentId: 'python' | 'node' | 'gitBash') => (
+    runtimeAction('remove', componentId)
+  ))
+  const sandbox: SandboxSettingsRuntime = {
+    readiness,
+    ensureReady,
+    loadSettings,
+    updatePolicy,
+    preference: vi.fn(async () => ({ runMode: 'full' as const, source: 'preference' })),
+    selectMode,
+    onPreferenceChanged: vi.fn(() => () => undefined),
+    runtimeStatus,
+    installRuntime,
+    cancelRuntime,
+    removeRuntime,
+    discardRuntimeDownload,
+  }
   vi.doMock('@/platform', () => ({
     usePlatform: () => ({
       capabilities: { isDesktop: options.desktop === true },
@@ -154,22 +210,28 @@ async function createSandboxSettings(options: {
 
   const { createApp, effectScope, h } = await import('vue')
   const { SANDBOX_RUNTIME_KEY } = await import('@/modules/sandboxRuntime')
-  const { createV4SandboxRuntime } = await import('@/adapters/gateway/sandboxRuntimeV4')
   const { useSandboxSettings } = await import('./useSandboxSettings')
   const app = createApp({ render: () => h('div') })
-  app.provide(SANDBOX_RUNTIME_KEY, createV4SandboxRuntime({
-    request: async (method, params) => params === undefined
-      ? await call(method)
-      : await call(method, params),
-    ready: vi.fn(async () => undefined),
-  }))
+  app.provide(SANDBOX_RUNTIME_KEY, sandbox as never)
   const scope: EffectScope = effectScope()
   const settings = app.runWithContext(() => scope.run(() => useSandboxSettings()))!
-  return { call, pushToast, scope, settings }
-}
-
-function capabilityCalls(call: ReturnType<typeof vi.fn>) {
-  return call.mock.calls.filter(([method]) => method === 'sandbox.capability.status')
+  return {
+    operations: {
+      readiness,
+      ensureReady,
+      loadSettings,
+      updatePolicy,
+      selectMode,
+      runtimeStatus,
+      installRuntime,
+      cancelRuntime,
+      discardRuntimeDownload,
+      removeRuntime,
+    },
+    pushToast,
+    scope,
+    settings,
+  }
 }
 
 afterEach(() => {
@@ -182,60 +244,59 @@ afterEach(() => {
 describe('useSandboxSettings auto-save', () => {
   it.each(['failed', 'unavailable', 'setting_up'] as const)(
     'does not offer first-time setup for %s', async setupState => {
-      const { call, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
+      const { operations, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
       await settings.load()
       await settle()
       expect(settings.sandboxSetupStatus.value?.state).toBe(setupState)
       expect(settings.canRequestSandboxSetup.value).toBe(false)
       expect(await settings.ensureSandboxSetupForSafeMode()).toBe(false)
-      expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+      expect(operations.ensureReady).not.toHaveBeenCalled()
       scope.stop()
     },
   )
 
   it('persists a default mode selection without a separate save action', async () => {
-    const { call, scope, settings } = await createSandboxSettings()
+    const { operations, scope, settings } = await createSandboxSettings()
     await settings.load()
 
     await settings.setDefaultRunMode('safe')
 
-    expect(call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', { runMode: 'safe' })
+    expect(operations.selectMode).toHaveBeenCalledWith('safe')
     expect(settings.defaultRunMode.value).toBe('safe')
     expect(settings.defaultRunModeBaseline.value).toBe('safe')
     scope.stop()
   })
 
   it('adopts a mode already persisted by the shared setup task without writing it twice', async () => {
-    const { call, scope, settings } = await createSandboxSettings()
+    const { operations, scope, settings } = await createSandboxSettings()
     await settings.load()
 
     settings.adoptSavedDefaultRunMode('safe')
 
     expect(settings.defaultRunMode.value).toBe('safe')
     expect(settings.defaultRunModeBaseline.value).toBe('safe')
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.run_mode.preference.set'))
-      .toHaveLength(0)
+    expect(operations.selectMode).not.toHaveBeenCalled()
     scope.stop()
   })
 
   it('debounces free-form section edits for 500 milliseconds', async () => {
     vi.useFakeTimers()
-    const { call, scope, settings } = await createSandboxSettings()
+    const { operations, scope, settings } = await createSandboxSettings()
     await settings.load()
     settings.draft.value!.network.blockAllNetwork = true
 
     settings.scheduleSectionSave('network')
     await vi.advanceTimersByTimeAsync(499)
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(false)
+    expect(operations.updatePolicy).not.toHaveBeenCalled()
 
     await vi.advanceTimersByTimeAsync(1)
     await settle()
-    expect(call).toHaveBeenCalledWith('sandbox.policy.update', expect.objectContaining({
-      basePolicyVersion: 0,
-      policy: expect.objectContaining({
+    expect(operations.updatePolicy).toHaveBeenCalledWith(
+      0,
+      expect.objectContaining({
         network: expect.objectContaining({ blockAllNetwork: true }),
       }),
-    }))
+    )
     scope.stop()
   })
 
@@ -260,7 +321,7 @@ describe('useSandboxSettings auto-save', () => {
     let resolveFirst!: (value: unknown) => void
     const first = new Promise(resolve => { resolveFirst = resolve })
     let updateCount = 0
-    const { call, scope, settings } = await createSandboxSettings({
+    const { operations, scope, settings } = await createSandboxSettings({
       policyUpdate: async (params) => {
         updateCount += 1
         if (updateCount === 1) return first
@@ -284,16 +345,15 @@ describe('useSandboxSettings auto-save', () => {
     await settle()
 
     expect(settings.draft.value!.network.denyDomains).toEqual(['telemetry.example.com'])
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.policy.update')).toHaveLength(2)
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.policy.update')[1]?.[1])
-      .toEqual(expect.objectContaining({
-        basePolicyVersion: 1,
-        policy: expect.objectContaining({
+    expect(operations.updatePolicy).toHaveBeenCalledTimes(2)
+    expect(operations.updatePolicy.mock.calls[1]).toEqual([
+      1,
+      expect.objectContaining({
           network: expect.objectContaining({
             denyDomains: ['telemetry.example.com'],
           }),
-        }),
-      }))
+      }),
+    ])
     scope.stop()
   })
 
@@ -324,19 +384,8 @@ describe('useSandboxSettings auto-save', () => {
     const currentPolicy = structuredClone(policy)
     currentPolicy.policyVersion = 1
     currentPolicy.network.denyDomains = ['desktop.example.com']
-    const conflict = Object.assign(new Error('policy version conflict'), {
-      code: 'POLICY_VERSION_CONFLICT',
-      details: { currentPolicy },
-    })
-    let updateCount = 0
-    const { call, scope, settings } = await createSandboxSettings({
-      policyUpdate: async (params) => {
-        updateCount += 1
-        if (updateCount === 1) throw conflict
-        const saved = structuredClone(params.policy as typeof policy)
-        saved.policyVersion = Number(params.basePolicyVersion) + 1
-        return saved
-      },
+    const { operations, scope, settings } = await createSandboxSettings({
+      policyConflict: currentPolicy,
     })
     await settings.load()
     settings.draft.value!.network.blockAllNetwork = true
@@ -349,32 +398,28 @@ describe('useSandboxSettings auto-save', () => {
     settings.draft.value!.network.blockAllNetwork = true
     await expect(settings.flushSectionSave('network')).resolves.toBe(true)
 
-    const updates = call.mock.calls.filter(([method]) => method === 'sandbox.policy.update')
-    expect(updates).toHaveLength(2)
-    expect(updates[1]?.[1]).toEqual(expect.objectContaining({
-      basePolicyVersion: 1,
-      policy: expect.objectContaining({
+    expect(operations.updatePolicy).toHaveBeenCalledTimes(2)
+    expect(operations.updatePolicy.mock.calls[1]).toEqual([
+      1,
+      expect.objectContaining({
         network: expect.objectContaining({
           blockAllNetwork: true,
           denyDomains: ['desktop.example.com'],
         }),
       }),
-    }))
+    ])
     scope.stop()
   })
 
   it('keeps concurrent local drafts while adopting a conflict baseline', async () => {
-    let rejectFirst!: (reason?: unknown) => void
-    const first = new Promise((_resolve, reject) => { rejectFirst = reject })
+    let releaseConflict!: () => void
+    const first = new Promise<void>((resolve) => { releaseConflict = resolve })
     const currentPolicy = structuredClone(policy)
     currentPolicy.policyVersion = 1
     currentPolicy.network.denyDomains = ['desktop.example.com']
-    const conflict = Object.assign(new Error('policy version conflict'), {
-      code: 'POLICY_VERSION_CONFLICT',
-      details: { currentPolicy },
-    })
     const { scope, settings } = await createSandboxSettings({
-      policyUpdate: async () => first,
+      policyConflict: currentPolicy,
+      policyConflictGate: first,
     })
     await settings.load()
     settings.draft.value!.network.blockAllNetwork = true
@@ -383,7 +428,7 @@ describe('useSandboxSettings auto-save', () => {
 
     settings.draft.value!.network.denyDomains.push('web.example.com')
     settings.draft.value!.files.customDenyWritePaths.push('/keep-local')
-    rejectFirst(conflict)
+    releaseConflict()
 
     await expect(saving).resolves.toBe(false)
     expect(settings.baseline.value).toEqual(currentPolicy)
@@ -398,12 +443,32 @@ describe('useSandboxSettings auto-save', () => {
 })
 
 describe('useSandboxSettings capability checks', () => {
+  it('loads ready desktop setup and capability with one domain read', async () => {
+    const { operations, scope, settings } = await createSandboxSettings({
+      desktop: true,
+      setupState: 'ready',
+      capabilityResult: {
+        ...unavailableReport,
+        available: true,
+        code: 'ready',
+      },
+    })
+
+    await settings.load()
+    await settle()
+
+    expect(settings.sandboxSetupStatus.value?.state).toBe('ready')
+    expect(settings.capability.value?.available).toBe(true)
+    expect(operations.readiness).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
   it.each(['ready', 'failed'] as const)(
     'updates a pending startup to %s without reopening settings or retrying initialization',
     async (finalState) => {
       vi.useFakeTimers()
       let state: SandboxSetupStatusPayload['state'] = 'setting_up'
-      const { call, scope, settings } = await createSandboxSettings({
+      const { operations, scope, settings } = await createSandboxSettings({
         desktop: true,
         setupStatus: () => ({ state, platform: 'win32', message: '', requiresAdmin: false }),
         capabilityResult: {
@@ -418,31 +483,30 @@ describe('useSandboxSettings capability checks', () => {
       await settle()
       expect(settings.sandboxSetupStatus.value?.state).toBe(finalState)
       expect(settings.capability.value?.available === true).toBe(finalState === 'ready')
-      const statusCalls = () => call.mock.calls.filter(([method]) => method === 'sandbox.setup.status')
-      const completedReads = statusCalls().length
+      const completedReads = operations.readiness.mock.calls.length
       await vi.advanceTimersByTimeAsync(60_000)
-      expect(statusCalls()).toHaveLength(completedReads)
-      expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+      expect(operations.readiness).toHaveBeenCalledTimes(completedReads)
+      expect(operations.ensureReady).not.toHaveBeenCalled()
       scope.stop()
     },
   )
 
   it('stops reading pending startup status when settings closes', async () => {
     vi.useFakeTimers()
-    const { call, scope, settings } = await createSandboxSettings({
+    const { operations, scope, settings } = await createSandboxSettings({
       desktop: true, setupState: 'setting_up',
     })
     await settings.load()
     await settle()
     scope.stop()
     await vi.advanceTimersByTimeAsync(60_000)
-    expect(call.mock.calls.filter(([method]) => method === 'sandbox.setup.status')).toHaveLength(1)
+    expect(operations.readiness).toHaveBeenCalledOnce()
   })
 
   it('follows pending startup in a browser without initiating setup', async () => {
     vi.useFakeTimers()
     let initialized = false
-    const { call, scope, settings } = await createSandboxSettings({
+    const { operations, scope, settings } = await createSandboxSettings({
       get capabilityResult() {
         return {
           ...unavailableReport,
@@ -459,8 +523,8 @@ describe('useSandboxSettings capability checks', () => {
     await vi.advanceTimersByTimeAsync(1_000)
     expect(settings.capability.value?.available).toBe(true)
     await vi.advanceTimersByTimeAsync(60_000)
-    expect(capabilityCalls(call)).toHaveLength(2)
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+    expect(operations.readiness).toHaveBeenCalledTimes(2)
+    expect(operations.ensureReady).not.toHaveBeenCalled()
     scope.stop()
   })
 
@@ -468,7 +532,7 @@ describe('useSandboxSettings capability checks', () => {
     vi.useFakeTimers()
     let state: SandboxSetupStatusPayload['state'] = 'setting_up'
     let disconnected = false
-    const { call, scope, settings } = await createSandboxSettings({
+    const { operations, scope, settings } = await createSandboxSettings({
       desktop: true,
       setupStatus: () => {
         if (disconnected) throw new Error('connection interrupted')
@@ -488,7 +552,7 @@ describe('useSandboxSettings capability checks', () => {
     await vi.advanceTimersByTimeAsync(1_000)
     expect(settings.sandboxSetupStatus.value?.state).toBe('ready')
     expect(settings.capability.value?.available).toBe(true)
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+    expect(operations.ensureReady).not.toHaveBeenCalled()
     scope.stop()
   })
 
@@ -497,16 +561,16 @@ describe('useSandboxSettings capability checks', () => {
     ['failed report', { capabilityError: true }],
   ])('does not automatically retry a %s after 10, 30, or 60 seconds', async (_label, options) => {
     vi.useFakeTimers()
-    const { call, scope, settings } = await createSandboxSettings(options)
+    const { operations, scope, settings } = await createSandboxSettings(options)
 
     await settings.load()
     await settle()
-    expect(capabilityCalls(call)).toHaveLength(1)
+    expect(operations.readiness).toHaveBeenCalledOnce()
 
     for (const elapsed of [10_000, 20_000, 30_000]) {
       await vi.advanceTimersByTimeAsync(elapsed)
       await settle()
-      expect(capabilityCalls(call)).toHaveLength(1)
+      expect(operations.readiness).toHaveBeenCalledOnce()
     }
 
     scope.stop()
@@ -514,38 +578,36 @@ describe('useSandboxSettings capability checks', () => {
 
   it('performs exactly one forced check for an explicit retry', async () => {
     vi.useFakeTimers()
-    const { call, scope, settings } = await createSandboxSettings()
+    const { operations, scope, settings } = await createSandboxSettings()
 
     await settings.load()
     await settle()
     await settings.loadCapability(true)
 
-    expect(capabilityCalls(call)).toEqual([
-      ['sandbox.capability.status'],
-      ['sandbox.capability.status', { refresh: true }],
+    expect(operations.readiness.mock.calls).toEqual([
+      [{ refreshCapability: false }],
+      [{ refreshCapability: true }],
     ])
     await vi.advanceTimersByTimeAsync(60_000)
     await settle()
-    expect(capabilityCalls(call)).toHaveLength(2)
+    expect(operations.readiness).toHaveBeenCalledTimes(2)
 
     scope.stop()
   })
 
   it('performs exactly one forced refresh after successful setup', async () => {
-    const { call, scope, settings } = await createSandboxSettings({
+    const { operations, scope, settings } = await createSandboxSettings({
       desktop: true,
       capabilityResult: { ...unavailableReport, available: true, code: 'ready' },
     })
 
     await settings.load()
     await settle()
-    expect(capabilityCalls(call)).toHaveLength(0)
+    expect(operations.ensureReady).not.toHaveBeenCalled()
 
     await settings.ensureSandboxSetupForSafeMode()
 
-    expect(capabilityCalls(call)).toEqual([
-      ['sandbox.capability.status', { refresh: true }],
-    ])
+    expect(operations.ensureReady).toHaveBeenCalledOnce()
     scope.stop()
   })
 
@@ -555,7 +617,7 @@ describe('useSandboxSettings capability checks', () => {
     const pendingCapability = new Promise<unknown>((resolve) => {
       resolveCapability = resolve
     })
-    const { call, scope, settings } = await createSandboxSettings({
+    const { operations, scope, settings } = await createSandboxSettings({
       capabilityResult: pendingCapability,
     })
 
@@ -567,7 +629,7 @@ describe('useSandboxSettings capability checks', () => {
     await vi.advanceTimersByTimeAsync(60_000)
 
     expect(settings.capability.value).toBeNull()
-    expect(capabilityCalls(call)).toHaveLength(1)
+    expect(operations.readiness).toHaveBeenCalledOnce()
   })
 })
 
@@ -600,7 +662,7 @@ describe('useSandboxSettings runtime packs', () => {
   })
 
   it('uses exact action payloads and accepts direct operations or wrapped status', async () => {
-    const queuedOperation = {
+    const queuedOperation: SandboxRuntimeOperation = {
       operationId: 'operation-1',
       componentId: 'python',
       kind: 'install',
@@ -613,11 +675,11 @@ describe('useSandboxSettings runtime packs', () => {
       updatedAtMs: 1,
       error: null,
     }
-    const { call, scope, settings } = await createSandboxSettings({
+    const { operations, scope, settings } = await createSandboxSettings({
       runtimeStatus: readyRuntimeStatus,
-      runtimeAction: method => method === 'sandbox.runtime.install'
-        ? queuedOperation
-        : { status: structuredClone(readyRuntimeStatus) },
+      runtimeAction: action => action === 'install'
+        ? { kind: 'operation', operation: queuedOperation }
+        : { kind: 'status', status: structuredClone(readyRuntimeStatus) },
     })
     await settings.load()
     await settle()
@@ -629,15 +691,10 @@ describe('useSandboxSettings runtime packs', () => {
     await expect(settings.discardRuntimeDownload('python')).resolves.toBe(true)
     await expect(settings.removeRuntime('python')).resolves.toBe(true)
 
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.install', { componentId: 'python' })
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.cancel', {
-      componentId: 'python',
-      operationId: 'operation-1',
-    })
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.discard_download', {
-      componentId: 'python',
-    })
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })
+    expect(operations.installRuntime).toHaveBeenCalledWith('python')
+    expect(operations.cancelRuntime).toHaveBeenCalledWith('python', 'operation-1')
+    expect(operations.discardRuntimeDownload).toHaveBeenCalledWith('python')
+    expect(operations.removeRuntime).toHaveBeenCalledWith('python')
     expect(settings.runtimeStatus.value?.catalogVersion).toBe('2026-08-21.2')
     scope.stop()
   })
@@ -663,14 +720,14 @@ describe('useSandboxSettings runtime packs', () => {
       },
     }
     let statusCalls = 0
-    const { call, scope, settings } = await createSandboxSettings({
+    const { operations, scope, settings } = await createSandboxSettings({
       runtimeStatus: () => {
         statusCalls += 1
         return statusCalls === 1 ? paused : readyRuntimeStatus
       },
-      runtimeAction: method => {
-        if (method === 'sandbox.runtime.discard_download') throw new Error('cache is busy')
-        return { status: readyRuntimeStatus }
+      runtimeAction: action => {
+        if (action === 'discard') throw new Error('cache is busy')
+        return { kind: 'status', status: readyRuntimeStatus }
       },
     })
     await settings.load()
@@ -679,13 +736,13 @@ describe('useSandboxSettings runtime packs', () => {
     await expect(settings.discardRuntimeDownload('python')).resolves.toBe(false)
     await settle()
 
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.status')
+    expect(operations.runtimeStatus).toHaveBeenCalledTimes(2)
     expect(statusCalls).toBe(2)
     expect(settings.runtimeStatus.value?.components[0]?.resumeBytes).toBe(0)
     expect(settings.runtimeActionError.python).toBe('cache is busy')
     expect(settings.runtimeActionPending.python).toBe(false)
     await expect(settings.removeRuntime('python')).resolves.toBe(true)
-    expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })
+    expect(operations.removeRuntime).toHaveBeenCalledWith('python')
     scope.stop()
   })
 
@@ -695,7 +752,7 @@ describe('useSandboxSettings runtime packs', () => {
       resolveStaleStatus = resolve
     })
     let statusCalls = 0
-    const queuedOperation = {
+    const queuedOperation: SandboxRuntimeOperation = {
       operationId: 'operation-1',
       componentId: 'python',
       kind: 'install',
@@ -713,7 +770,7 @@ describe('useSandboxSettings runtime packs', () => {
         statusCalls += 1
         return statusCalls === 1 ? readyRuntimeStatus : staleStatus
       },
-      runtimeAction: () => queuedOperation,
+      runtimeAction: () => ({ kind: 'operation', operation: queuedOperation }),
     })
     await settings.load()
     await settle()

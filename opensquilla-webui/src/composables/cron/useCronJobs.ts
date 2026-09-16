@@ -111,8 +111,7 @@ export function useCronJobs(scheduler: CronScheduler) {
 
   async function recoverAfterConnectionRecycle(): Promise<void> {
     try {
-      await scheduler.ready({ timeoutMs: 10_000 })
-      await refresh()
+      cronData.value = await scheduler.listJobs()
       pushToast(t('cronSkills.jobs.toastConnectionRecovered'), { tone: 'info' })
     } catch {
       pushToast(t('cronSkills.jobs.toastConnectionRetry'), { tone: 'warn' })
@@ -243,30 +242,11 @@ export function nextRunText(job: CronJob, now = Date.now()): string {
   return humanCountdown(ts, now)
 }
 
-export function nextRunAbs(job: CronJob, now = Date.now()): string {
-  if (!job.enabled || job.status === 'running' || !job.next_run) return ''
-  const ts = new Date(job.next_run)
-  if (isNaN(ts.getTime()) || ts.getTime() <= now) return ''
-  return humanTime(ts)
-}
-
 export function dotClass(job: CronJob): string {
   if (!job.enabled) return 'is-off'
   const lastStatus = job.lastStatus || job.last_status || (job.last_run ? 'ok' : null)
   if (lastStatus === 'error' || lastStatus === 'fail') return 'is-error'
   return 'is-on'
-}
-
-export function jobKindLabel(job: CronJob): string {
-  const kind = job.payloadKind || job.payload_kind
-  if (kind === 'reminder') return i18n.global.t('cronSkills.jobs.kindReminder')
-  if (kind === 'system_event') return i18n.global.t('cronSkills.jobs.kindSystemEvent')
-  return i18n.global.t('cronSkills.jobs.kindAgentTask')
-}
-
-export function jobKindClass(job: CronJob): string {
-  const kind = job.payloadKind || job.payload_kind
-  return kind === 'reminder' ? 'is-reminder' : 'is-agent'
 }
 
 export function isImminent(job: CronJob, now = Date.now()): boolean {

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.attachment_refs import make_attachment_ref
 from opensquilla.gateway.transcripts import (
     build_transcript_attachment_envelope,
     rebuild_attachments_for_replay,
@@ -152,6 +153,26 @@ def test_transcript_envelope_uses_sha256_ref_not_file_uuid(tmp_path: Path) -> No
     assert "sha256_ref" in envelope
 
 
+def test_enabled_persistence_keeps_material_reference_shape(tmp_path: Path) -> None:
+    attachment = make_attachment_ref(
+        sha256="c" * 64, name="sample.pdf", mime="application/pdf", size=17,
+        session_id="s1", source="upload",
+    )
+
+    envelope, writes = build_transcript_attachment_envelope(
+        text="inspect", attachments=[attachment], session_id="s1", media_root=tmp_path,
+        persist_enabled=True,
+    )
+
+    persisted = json.loads(envelope)["attachments"][0]
+    attachment_id = persisted.pop("attachment_id")
+    assert attachment_id.startswith("att_")
+    assert persisted == {
+        "sha256_ref": "c" * 64, "name": "sample.pdf", "mime": "application/pdf", "size": 17,
+    }
+    assert writes == []
+
+
 # ---------------------------------------------------------------------------
 # Test 3 — persist disabled keeps staged material out of the envelope.
 # ---------------------------------------------------------------------------
@@ -182,6 +203,80 @@ def test_persist_transcripts_disabled_skips_disk_copy(tmp_path: Path) -> None:
     assert "data" not in persisted
     assert "sha256_ref" not in persisted
     assert writes == []
+
+
+@pytest.mark.parametrize("shape", ["inline", "staged", "material_ref"])
+def test_disabled_persistence_redacts_all_attachment_shapes_without_touching_material(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str,
+) -> None:
+    payload = b"synthetic image material"
+    sha = hashlib.sha256(payload).hexdigest()
+    stored = tmp_path / "transcripts" / "s1" / sha
+    stored.parent.mkdir(parents=True)
+    stored.write_bytes(payload)
+    attachment = {
+        "type": "image/png", "name": "sample.png", "data": _b64(payload),
+    }
+    if shape == "staged":
+        attachment["_was_staged"] = True
+    elif shape == "material_ref":
+        attachment = make_attachment_ref(
+            sha256=sha, name="sample.png", mime="image/png", size=len(payload),
+            session_id="s1", source="upload",
+        )
+    original = dict(attachment)
+
+    def fail_allocation() -> str:
+        pytest.fail("disabled attachment persistence must not allocate an occurrence id")
+
+    monkeypatch.setattr("opensquilla.gateway.transcripts._new_attachment_id", fail_allocation)
+    envelope, writes = build_transcript_attachment_envelope(
+        text="inspect", attachments=[attachment], session_id="s1", media_root=tmp_path,
+        persist_enabled=False, disk_budget_bytes=0,
+    )
+
+    assert json.loads(envelope) == {
+        "text": "inspect",
+        "attachments": [{
+            "name": "sample.png", "mime": "image/png", "size": len(payload),
+            "missing_reason": "attachment persistence disabled",
+        }],
+    }
+    assert writes == []
+    assert attachment == original
+    assert stored.read_bytes() == payload
+    assert list(stored.parent.iterdir()) == [stored]
+    replay_text, replay_attachments = rebuild_attachments_for_replay(
+        envelope, session_id="s1", media_root=tmp_path,
+    )
+    assert "attachment persistence disabled" in replay_text
+    assert replay_attachments == []
+
+
+@pytest.mark.parametrize("shape", ["inline", "staged", "metadata"])
+@pytest.mark.parametrize("declared_size", [17, None])
+def test_disabled_persistence_keeps_unavailable_attachment_metadata(
+    tmp_path: Path, shape: str, declared_size: int | None,
+) -> None:
+    attachment = {"mime": "application/pdf", "name": "sample.pdf"}
+    if declared_size is not None:
+        attachment["size"] = declared_size
+    if shape != "metadata":
+        attachment["data"] = "not valid base64"
+    if shape == "staged":
+        attachment["_was_staged"] = True
+
+    envelope, writes = build_transcript_attachment_envelope(
+        text="inspect", attachments=[attachment], session_id="s1", media_root=tmp_path,
+        persist_enabled=False,
+    )
+
+    assert json.loads(envelope)["attachments"] == [{
+        "name": "sample.pdf", "mime": "application/pdf", "size": declared_size,
+        "missing_reason": "attachment persistence disabled",
+    }]
+    assert writes == []
+    assert not (tmp_path / "transcripts").exists()
 
 
 # ---------------------------------------------------------------------------

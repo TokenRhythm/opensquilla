@@ -11,6 +11,19 @@ import {
   artifactDocumentWorkspaceKey,
   useArtifactDocumentsStore,
 } from './artifactDocuments'
+import { ArtifactProductFailure } from '@/utils/artifactProductErrors'
+
+function ambiguousArtifactFailure(message: string): ArtifactProductFailure {
+  return new ArtifactProductFailure(
+    'DOCUMENT_UNAVAILABLE',
+    message,
+    undefined,
+    false,
+    null,
+    null,
+    true,
+  )
+}
 
 const artifact: ArtifactPayload = {
   id: 'artifact-1',
@@ -36,7 +49,6 @@ function providerWithLoad(
     restoreRevision: vi.fn(),
     revertChangeSet: vi.fn(),
     readSource: vi.fn(),
-    patchSource: vi.fn(),
   }
 }
 
@@ -104,6 +116,80 @@ function editableWorkspace(): ArtifactDocumentWorkspace {
 beforeEach(() => setActivePinia(createPinia()))
 
 describe('artifact documents store', () => {
+  it('restores the current revision on each explicit request to discard unsaved file changes', async () => {
+    const workspace = editableWorkspace()
+    const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
+    vi.mocked(provider.restoreRevision).mockResolvedValue(workspace.revisions[0]!)
+    const store = useArtifactDocumentsStore()
+    store.setProvider(provider)
+    await store.load(artifact, 'session-a')
+
+    const first = await store.restoreRevision(artifact, 'session-a', 'revision-head')
+    const second = await store.restoreRevision(artifact, 'session-a', 'revision-head')
+
+    expect(provider.restoreRevision).toHaveBeenCalledTimes(2)
+    const requests = vi.mocked(provider.restoreRevision).mock.calls.map(call => call[0])
+    expect(requests[0]).toMatchObject({
+      revisionId: 'revision-head',
+      expectedHeadRevisionId: 'revision-head',
+      expectedStateRevision: workspace.document.stateRevision,
+    })
+    expect(requests[1]?.clientRequestId).not.toBe(requests[0]?.clientRequestId)
+    expect(first.revisions).toEqual(workspace.revisions)
+    expect(second.revisions).toEqual(workspace.revisions)
+    expect(provider.loadWorkspace).toHaveBeenCalledTimes(3)
+  })
+
+  it('uses the restored head without adding a local revision or losing newer history', async () => {
+    const workspace = editableWorkspace()
+    const restored: ArtifactDocumentWorkspace = {
+      ...workspace,
+      document: {
+        ...workspace.document,
+        headRevisionId: 'revision-old',
+        stateRevision: workspace.document.stateRevision + 1,
+      },
+      headArtifact: { ...workspace.headArtifact, id: 'artifact-old' },
+    }
+    const provider = providerWithLoad(vi.fn()
+      .mockResolvedValueOnce(workspace)
+      .mockResolvedValue(restored))
+    vi.mocked(provider.restoreRevision).mockResolvedValue(workspace.revisions[1]!)
+    const store = useArtifactDocumentsStore()
+    store.setProvider(provider)
+    await store.load(artifact, 'session-a')
+
+    const result = await store.restoreRevision(artifact, 'session-a', 'revision-old')
+    expect(result.document.headRevisionId).toBe('revision-old')
+    expect(result.revisions.map(item => item.revisionId)).toEqual(['revision-head', 'revision-old'])
+    expect(store.headArtifact(artifact, 'session-a').id).toBe('artifact-old')
+
+    await store.restoreRevision(artifact, 'session-a', 'revision-old')
+    expect(provider.restoreRevision).toHaveBeenLastCalledWith(expect.objectContaining({
+      revisionId: 'revision-old',
+      expectedHeadRevisionId: 'revision-old',
+      expectedStateRevision: restored.document.stateRevision,
+    }))
+  })
+
+  it('replays an ambiguous current-revision restore with the same request identity', async () => {
+    const workspace = editableWorkspace()
+    const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
+    vi.mocked(provider.restoreRevision)
+      .mockRejectedValueOnce(ambiguousArtifactFailure('response lost'))
+      .mockResolvedValueOnce(workspace.revisions[0]!)
+    const store = useArtifactDocumentsStore()
+    store.setProvider(provider)
+    await store.load(artifact, 'session-a')
+
+    await expect(store.restoreRevision(artifact, 'session-a', 'revision-head'))
+      .rejects.toMatchObject({ code: 'MUTATION_OUTCOME_PENDING' })
+    await store.restoreRevision(artifact, 'session-a', 'revision-head')
+    const requests = vi.mocked(provider.restoreRevision).mock.calls.map(call => call[0])
+    expect(requests).toHaveLength(2)
+    expect(requests[1]).toEqual(requests[0])
+  })
+
   it('provides a safe download-only snapshot before document RPC is configured', async () => {
     const store = useArtifactDocumentsStore()
 
@@ -308,10 +394,7 @@ describe('artifact documents store', () => {
   it('keeps restore and revert request identities stable across ambiguous retries', async () => {
     const workspace = editableWorkspace()
     const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
-    const responseLost = () => Object.assign(new Error('response lost'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = () => ambiguousArtifactFailure('response lost')
     vi.mocked(provider.restoreRevision).mockRejectedValue(responseLost())
     vi.mocked(provider.revertChangeSet).mockRejectedValue(responseLost())
     const store = useArtifactDocumentsStore()
@@ -342,10 +425,7 @@ describe('artifact documents store', () => {
 
   it('accepts a durable applied restore resolution without replaying the write', async () => {
     const workspace = editableWorkspace()
-    const responseLost = Object.assign(new Error('private transport detail'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = ambiguousArtifactFailure('private transport detail')
     const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
     vi.mocked(provider.restoreRevision).mockRejectedValue(responseLost)
     provider.resolveMutation = vi.fn(async () => ({
@@ -370,10 +450,7 @@ describe('artifact documents store', () => {
 
   it('releases a not-applied restore identity before the next retry', async () => {
     const workspace = editableWorkspace()
-    const responseLost = Object.assign(new Error('private transport detail'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = ambiguousArtifactFailure('private transport detail')
     const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
     vi.mocked(provider.restoreRevision)
       .mockRejectedValueOnce(responseLost)

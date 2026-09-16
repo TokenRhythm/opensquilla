@@ -44,6 +44,17 @@ export function recentDraftSessionKey(): string {
   }
 }
 
+/** Return a specific recoverable draft without changing the recent pointer. */
+export function recoverableDraftSessionKey(key: string): string {
+  try {
+    return validDraftSessionKey(key) && Boolean(localStorage.getItem(draftKey(key)))
+      ? key
+      : ''
+  } catch {
+    return ''
+  }
+}
+
 export interface UseChatDraftPersistenceOptions {
   sessionKey: Ref<string>
   inputText: Ref<string>

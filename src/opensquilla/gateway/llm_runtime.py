@@ -7,6 +7,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +46,7 @@ class LlmRuntimeConfig:
     api_key_from_env: bool = False
     api_key_env_name: str = ""
     base_url_from_env: bool = False
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -339,6 +341,11 @@ def resolve_llm_runtime_config(config: Any) -> LlmRuntimeConfig:
         provider_routing=_resolve_provider_routing(
             provider,
             getattr(llm, "provider_routing", {}),
+        ),
+        extra_body=(
+            deepcopy(dict(getattr(llm, "extra_body", {}) or {}))
+            if provider == "custom"
+            else {}
         ),
         api_key_from_env=credential.source == "env",
         api_key_env_name=credential.env_name,

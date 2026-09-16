@@ -23,7 +23,7 @@
     "name": "artifacts.list",
     "kind": "query",
     "scope": "operator.read",
-    "guestAllowed": false,
+    "guestAllowed": true,
     "idempotency": "read-only",
     "timeout": { "policy": "caller" },
     "capability": { "kind": "method-availability", "name": "artifacts.list" },

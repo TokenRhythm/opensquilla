@@ -79,6 +79,7 @@ export function useSkillProposals(
   }
 
   async function setAutoEnableRisk(value: string) {
+    if (value !== 'low' && value !== 'medium' && value !== 'high') return
     if (!mutationGate.acquire('proposal')) return
     try {
       const out = await catalog.updateProposalSettings({ auto_enable_max_risk: value })

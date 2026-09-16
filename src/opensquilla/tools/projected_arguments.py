@@ -18,13 +18,13 @@ COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
     }
 )
 # Matches instantiated provider-request compaction markers anywhere inside a
-# string argument, not only at char 0. Requires the numeric fields the marker
-# producers always fill in ("<n> chars", "original_chars=<n>", ":<n>:<hash>")
-# so template literals in this codebase (braces, no digits) and prose that
-# merely names a marker prefix do not match.
+# string argument, not only at char 0. Recognizes fixed media markers and the
+# numeric fields in older or text markers ("<n> chars", "original_chars=<n>",
+# ":<n>:<hash>"). Templates and prose that merely name a marker prefix do not match.
 _COMPACTED_MARKER_SUBSTRING_RE = re.compile(
     r"\[provider_request_[a-z0-9_]*(?:compacted|omitted):"
     r"[^\]\n]*(?:\d+ chars|original_chars=\d+)"
+    r"|\[provider_request_(?:image_url|base64_image|base64_media)_omitted\]"
     r"|\[opensquilla_compacted:[A-Za-z0-9_.-]+:\d+:[0-9a-f]{8,64}\]"
 )
 

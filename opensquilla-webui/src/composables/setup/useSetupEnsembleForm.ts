@@ -1,4 +1,5 @@
 import { computed, ref, type ComputedRef } from 'vue'
+import type { ConfigureEnsemble } from '@/modules/setupWorkflow'
 import {
   CUSTOM_B5_MAX_PROPOSERS,
   CUSTOM_B5_MIN_PROPOSERS,
@@ -897,8 +898,8 @@ export function useSetupEnsembleForm() {
 
   // Partial by design: only user-changed keys are sent; the gateway keeps the
   // current value for every omitted key.
-  function payload(): Record<string, unknown> {
-    const params: Record<string, unknown> = {}
+  function payload(): ConfigureEnsemble {
+    const params: ConfigureEnsemble = {}
     if (enabledDirty.value) params.enabled = enabled.value
     if (selectionModeDirty.value) params.selectionMode = selectionMode.value
     if (effectiveModelOptionsDirty.value) params.modelOptions = [...modelOptions.value]

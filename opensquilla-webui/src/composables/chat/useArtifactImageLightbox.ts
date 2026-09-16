@@ -7,10 +7,16 @@ import {
   type ShallowRef,
 } from 'vue'
 import type { ArtifactPayload } from '@/types/artifacts'
+import type { DisplayAttachment } from '@/types/chat'
+import { isImageDisplayAttachment } from '@/utils/chat/attachments'
+
+export type ImageLightboxItem =
+  | { kind: 'artifact', artifact: ArtifactPayload }
+  | { kind: 'attachment', attachment: DisplayAttachment }
 
 export interface ArtifactImageLightboxRequest {
-  artifact: ArtifactPayload
-  navigationArtifacts: readonly ArtifactPayload[]
+  image: ImageLightboxItem
+  navigationImages: readonly ImageLightboxItem[]
   sessionKey: string
   invoker: HTMLElement | null
 }
@@ -24,7 +30,12 @@ export interface ArtifactImageLightboxOpenRequest {
 export interface ArtifactImageLightboxController {
   request: Readonly<ShallowRef<ArtifactImageLightboxRequest | null>>
   open(request: ArtifactImageLightboxOpenRequest): void
-  show(artifact: ArtifactPayload): void
+  openAttachments(request: {
+    attachment: DisplayAttachment
+    navigationAttachments: readonly DisplayAttachment[]
+    sessionKey: string
+  }): void
+  show(image: ImageLightboxItem): void
   updateNavigation(navigationArtifacts: readonly ArtifactPayload[], sessionKey: string): void
   close(): void
 }
@@ -39,25 +50,38 @@ export function provideArtifactImageLightbox(): ArtifactImageLightboxController 
     request: shallowReadonly(request),
     open(nextRequest) {
       request.value = {
-        ...nextRequest,
-        navigationArtifacts: [...nextRequest.navigationArtifacts],
+        image: { kind: 'artifact', artifact: nextRequest.artifact },
+        navigationImages: nextRequest.navigationArtifacts.map(artifact => ({ kind: 'artifact', artifact })),
+        sessionKey: nextRequest.sessionKey,
         invoker: document.activeElement instanceof HTMLElement
           ? document.activeElement
           : null,
       }
     },
-    show(artifact) {
+    openAttachments(nextRequest) {
+      if (!isImageDisplayAttachment(nextRequest.attachment)) return
+      request.value = {
+        image: { kind: 'attachment', attachment: nextRequest.attachment },
+        navigationImages: nextRequest.navigationAttachments
+          .filter(isImageDisplayAttachment)
+          .map(attachment => ({ kind: 'attachment', attachment })),
+        sessionKey: nextRequest.sessionKey,
+        invoker: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+      }
+    },
+    show(image) {
       if (!request.value) return
       request.value = {
         ...request.value,
-        artifact,
+        image,
       }
     },
     updateNavigation(navigationArtifacts, sessionKey) {
-      if (!request.value || request.value.sessionKey !== sessionKey) return
+      if (!request.value || request.value.sessionKey !== sessionKey
+        || request.value.image.kind !== 'artifact') return
       request.value = {
         ...request.value,
-        navigationArtifacts: [...navigationArtifacts],
+        navigationImages: navigationArtifacts.map(artifact => ({ kind: 'artifact', artifact })),
       }
     },
     close() {

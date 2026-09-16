@@ -999,7 +999,7 @@ async def _manual_compaction(gateway: GatewayProcess, session_key: str) -> bool:
     await client.connect(gateway.ws_url)
     try:
         payload = await client.call(
-            "sessions.compact",
+            "sessions.contextCompact",
             {
                 "key": session_key,
                 "wait": True,
@@ -1694,21 +1694,22 @@ def _run_rpc_case(
     )
     counts["output_bytes"] = assistant_bytes
     counts["compactions"] = observation.compactions
+    if case.scenario == "fault_429_retry_after":
+        proxy_records = proxy.records if proxy is not None else ()
+        retry_wait_ms = 0.0
+        if (
+            len(proxy_records) >= 2
+            and proxy_records[0].scenario == FaultScenario.RATE_LIMITED.value
+        ):
+            retry_wait_ms = (
+                proxy_records[1].received_monotonic_ns - proxy_records[0].received_monotonic_ns
+            ) / 1_000_000
+        # This synthetic fault sends Retry-After: 8. Arrival timestamps prove
+        # the HTTP retry respected it, independently of UI activity labels.
+        metrics["retry_wait_ms"] = max(0.0, retry_wait_ms)
+        counts["retry_after_honored"] = int(retry_wait_ms >= 8_000)
     if case.scenario == "router":
         counts["router_decisions"] = asyncio.run(_router_decision_count(gateway, session_key))
-    if case.scenario == "fault_429_retry_after" and proxy is not None:
-        records_snapshot = proxy.records
-        if len(records_snapshot) >= 2:
-            retry_wait_ms = max(
-                0.0,
-                (
-                    records_snapshot[1].received_monotonic_ns
-                    - records_snapshot[0].received_monotonic_ns
-                )
-                / 1_000_000,
-            )
-            metrics["retry_wait_ms"] = retry_wait_ms
-            counts["retry_after_honored"] = int(retry_wait_ms >= 8_000)
     if case.scenario == "fallback":
         assert case.fallback_provider is not None
         counts["fallback_before_request"] = int(
@@ -1744,6 +1745,8 @@ def _run_rpc_case(
         and observation.text_chunks > 0
     )
     if not partial_terminal_is_expected and assistant_markers < 1:
+        passed = False
+    if case.scenario == "fault_429_retry_after" and not counts["retry_after_honored"]:
         passed = False
     if case.scenario == "tool_compaction" and observation.compactions < 1:
         passed = False

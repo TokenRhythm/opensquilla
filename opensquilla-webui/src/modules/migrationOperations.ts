@@ -53,6 +53,24 @@ export interface GatewayMigrationPreview {
   }
 }
 
+export type MigrationOperationsErrorKind =
+  | 'unsupported'
+  | 'forbidden'
+  | 'unavailable'
+  | 'invalid'
+
+/** Migration discovery failure projected by the Gateway Adapter. */
+export class MigrationOperationsError extends Error {
+  constructor(
+    readonly kind: MigrationOperationsErrorKind,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'MigrationOperationsError'
+  }
+}
+
 export interface MigrationOperations {
   listSources(options?: { signal?: AbortSignal }): Promise<GatewayMigrationSources>
   preview(candidateId: string, options?: { signal?: AbortSignal }): Promise<GatewayMigrationPreview>

@@ -2,6 +2,7 @@ import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { createV4MetaRunCenter } from '@/adapters/gateway/metaRunCenterV4'
+import { createConversationRuntime, type ConversationCursorSignal } from '@/modules/conversationRuntime'
 import { useMetaRuns } from './useMetaRuns'
 import { counterText, ribbonCopy } from '@/utils/chat/metaRibbon'
 
@@ -12,7 +13,7 @@ type RpcCall = (
 
 function makeOptions(
   call: RpcCall,
-  extra: { observeStreamGeneration?: (payload: unknown) => boolean } = {},
+  extra: { observeStreamGeneration?: (signal: ConversationCursorSignal) => boolean } = {},
 ) {
   const sendComposerText = vi.fn()
   const sendHiddenReplay = vi.fn()
@@ -58,6 +59,90 @@ function makeOptions(
 }
 
 describe('useMetaRuns stream generation', () => {
+  it('uses projected cursor facts without advancing or repeatedly resetting the shared cursor', () => {
+    const runtime = createConversationRuntime()
+    let cursor = runtime.createCursor('agent:main:replay-session', {
+      sessionEpoch: 1,
+      streamGeneration: 'generation-1',
+      streamSeq: 700,
+    })
+    const resets: boolean[] = []
+    const observeStreamGeneration = vi.fn((signal: ConversationCursorSignal) => {
+      const transition = runtime.observeGeneration(cursor, signal)
+      cursor = transition.cursor
+      lastStreamSeq.value = cursor.streamSeq
+      resets.push(transition.reset)
+      return transition.reset
+    })
+    const { api, handlers, lastStreamSeq } = makeOptions(async () => ({}), { observeStreamGeneration })
+    lastStreamSeq.value = 700
+    const unsubscribe = api.subscribe()
+    const announce = (runId: string, sequence: number, generation: string | null) => {
+      handlers.get('session.event.meta_run_announced')?.({
+        session_key: 'agent:main:replay-session',
+        epoch: 1,
+        stream_generation: generation,
+        stream_seq: sequence,
+        run_id: runId,
+        meta_skill_name: 'meta-paper-write',
+        language: 'en',
+        steps: [],
+        total: 0,
+      })
+    }
+    try {
+      announce('new-generation', 1, 'generation-2')
+      expect(api.ribbons.value.has('new-generation')).toBe(true)
+      expect(observeStreamGeneration).toHaveBeenLastCalledWith(expect.objectContaining({
+        sessionKey: 'agent:main:replay-session', sessionEpoch: 1,
+        streamGeneration: 'generation-2', streamSeq: 1,
+      }))
+      expect(lastStreamSeq.value).toBe(0)
+      cursor = runtime.createCursor(cursor.sessionKey, { ...cursor, streamSeq: 1 })
+      lastStreamSeq.value = 1
+
+      announce('duplicate-sequence', 1, 'generation-2')
+      expect(api.ribbons.value.has('duplicate-sequence')).toBe(false)
+      expect(lastStreamSeq.value).toBe(1)
+
+      announce('without-generation', 2, null)
+      expect(api.ribbons.value.has('without-generation')).toBe(true)
+      expect(lastStreamSeq.value).toBe(1)
+      expect(cursor.streamGeneration).toBe('generation-2')
+      expect(resets).toEqual([true, false, false])
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it.each([
+    ['another session', 'agent:main:another-session', 1],
+    ['an older epoch', 'agent:main:replay-session', 0],
+  ])('does not let %s reset the shared generation', (_label, sessionKey, epoch) => {
+    const observeStreamGeneration = vi.fn((_signal: ConversationCursorSignal) => true)
+    const { api, handlers, lastStreamSeq } = makeOptions(async () => ({}), { observeStreamGeneration })
+    lastStreamSeq.value = 700
+    const unsubscribe = api.subscribe()
+    try {
+      handlers.get('session.event.meta_run_announced')?.({
+        session_key: sessionKey,
+        epoch,
+        stream_generation: 'generation-2',
+        stream_seq: 1,
+        run_id: 'stale-announcement',
+        meta_skill_name: 'meta-paper-write',
+        language: 'en',
+        steps: [],
+        total: 0,
+      })
+      expect(observeStreamGeneration).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(700)
+      expect(api.ribbons.value.size).toBe(0)
+    } finally {
+      unsubscribe()
+    }
+  })
+
   it('observes a new generation before its independent stale-seq gate', () => {
     let cursor = ref(0)
     const observeStreamGeneration = vi.fn((payload: unknown) => {

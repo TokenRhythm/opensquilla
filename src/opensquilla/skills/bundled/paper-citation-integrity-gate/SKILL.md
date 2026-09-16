@@ -1,5 +1,9 @@
 ---
 name: paper-citation-integrity-gate
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Deterministic citation-count and provenance gate for meta-paper-write. Checks the citation_map summary against the numeric paper citation target without trusting an LLM verdict."
 user-invocable: false
 disable-model-invocation: true

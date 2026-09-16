@@ -1217,16 +1217,6 @@ async def _provider_complete(
     )
 
 
-async def _provider_complete_text(
-    provider: Any,
-    *,
-    messages: list[Message],
-    max_tokens: int,
-) -> str:
-    result = await _provider_complete(provider, messages=messages, max_tokens=max_tokens)
-    return result.text
-
-
 @dataclass(frozen=True)
 class FlushProposal:
     """Pure SessionFlush extraction result.

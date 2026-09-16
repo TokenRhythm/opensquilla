@@ -4,19 +4,19 @@ import { inject, ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import {
-  ensureSandboxReady,
+  SANDBOX_RUNTIME_KEY,
+  type SandboxChatRuntime,
   type SandboxSetupOutcome,
-} from '@/composables/sandboxSetupCoordinator'
+} from '@/modules/sandboxRuntime'
 import type {
   SandboxRunMode,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
-import { SANDBOX_RUNTIME_KEY } from '@/modules/sandboxRuntime'
 
 export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
   const injectedSandbox = inject(SANDBOX_RUNTIME_KEY)
   if (!injectedSandbox) throw new Error('SandboxRuntime was not provided')
-  const sandbox = injectedSandbox
+  const sandbox: Pick<SandboxChatRuntime, 'ensureReady' | 'selectMode'> = injectedSandbox
   const { pushToast } = useToasts()
   const ensuring = ref(false)
   const outcome = ref<SandboxSetupOutcome>('idle')
@@ -34,23 +34,18 @@ export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
 
   async function runSetup(): Promise<boolean> {
     try {
-      const result = await ensureSandboxReady(
-        {
-          ensureSetup: () => sandbox.ensureSetup(),
-          setupStatus: () => sandbox.setupStatus(),
-          capability: () => sandbox.capability({ refresh: true }),
-        },
-      )
+      const result = await sandbox.ensureReady()
       status.value = result.status
       outcome.value = result.outcome
       if (!result.ready) {
+        if (result.outcome === 'in_progress') return false
         pushToast(String(i18n.global.t('settings.sandbox.setup.failedToast')), {
           tone: 'danger',
         })
         return false
       }
       if (intendedMode.value === 'safe') {
-        await sandbox.setRunMode('safe')
+        await sandbox.selectMode('safe')
       }
       pushToast(String(i18n.global.t('settings.sandbox.setup.readyToast')), {
         tone: 'ok',

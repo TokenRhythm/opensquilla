@@ -1,19 +1,17 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
-import {
-  ensureSandboxReady,
-  normalizeSandboxSetupStatus,
-  type SandboxSetupOutcome,
-} from '@/composables/sandboxSetupCoordinator'
+import type {
+  SandboxChatRuntime,
+  SandboxSetupOutcome,
+} from '@/modules/sandboxRuntime'
 import type {
   SandboxRunMode,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
-import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 
 const SETUP_POLL_MS = 2000
 
 export interface UseSandboxSetupRecoveryOptions {
-  sandbox: Pick<SandboxRuntime, 'setupStatus' | 'ensureSetup' | 'capability'>
+  sandbox: Pick<SandboxChatRuntime, 'readiness' | 'ensureReady'>
   connectionState: Ref<string>
   runMode: Ref<SandboxRunMode>
   autoRefresh?: boolean
@@ -67,9 +65,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     loading.value = status.value === null
     clearPoll()
     try {
-      const payload = normalizeSandboxSetupStatus(
-        await options.sandbox.setupStatus(),
-      )
+      const payload = (await options.sandbox.readiness()).status
       if (generation !== requestGeneration) return
       if (!payload) {
         // Keep following an already-authoritative setting_up state when a
@@ -104,13 +100,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     error.value = ''
     clearPoll()
     try {
-      const result = await ensureSandboxReady(
-        {
-          ensureSetup: () => options.sandbox.ensureSetup(),
-          setupStatus: () => options.sandbox.setupStatus(),
-          capability: () => options.sandbox.capability({ refresh: true }),
-        },
-      )
+      const result = await options.sandbox.ensureReady()
       if (generation !== requestGeneration) return false
       if (result.status) applyStatus(result.status)
       outcome.value = result.outcome

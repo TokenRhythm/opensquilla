@@ -150,14 +150,8 @@ describe('native Workbench platform bridge', () => {
     const showOverlay = vi.fn(async () => ({ ok: true }))
     const closeOverlay = vi.fn(async () => ({ ok: true }))
     const screenshot = vi.fn(async () => ({
-      ok: true,
-      method: 'screenshot',
-      value: {
-        mime: 'image/png',
-        data: new Uint8Array([137, 80, 78, 71]),
-        width: 320,
-        height: 180,
-      },
+      targetRef: 'target-1', mimeType: 'image/png' as const,
+      dataBase64: 'iVBORw==', width: 320, height: 180,
     }))
     setDesktopApi({
       createWorkbenchSurface: async () => ({ ok: true }),
@@ -179,7 +173,7 @@ describe('native Workbench platform bridge', () => {
       setArtifactAnnotationMode: setMode,
       showArtifactAnnotationOverlay: showOverlay,
       closeArtifactAnnotationOverlay: closeOverlay,
-      screenshot,
+      captureWorkbenchScreenshot: screenshot,
     })
     const native = createDesktopPlatform().workbench.native!
 
@@ -191,17 +185,15 @@ describe('native Workbench platform bridge', () => {
       overlayCopyVersion: 1,
       atomicCloseRearm: true,
     })
-    await expect(native.screenshot?.({ version: 3 })).resolves.toEqual({
-      ok: true,
-      method: 'screenshot',
-      value: {
-        mime: 'image/png',
-        data: new Uint8Array([137, 80, 78, 71]),
-        width: 320,
-        height: 180,
-      },
+    await expect(native.captureWorkbenchScreenshot?.({
+      surfaceId: 'artifact:fixture', targetRef: 'target-1',
+    })).resolves.toEqual({
+      targetRef: 'target-1', mimeType: 'image/png', dataBase64: 'iVBORw==', width: 320, height: 180,
     })
-    expect(screenshot).toHaveBeenCalledWith({ version: 3 })
+    expect(screenshot).toHaveBeenCalledWith({ surfaceId: 'artifact:fixture', targetRef: 'target-1' })
+    await expect(native.captureWorkbenchScreenshot?.({
+      surfaceId: 'artifact:fixture', targetRef: 'another-target',
+    })).rejects.toThrow('invalid')
     const listener = vi.fn()
     native.onSurfaceEvent(listener)
     emit?.({
@@ -219,7 +211,7 @@ describe('native Workbench platform bridge', () => {
           selectionId: 'selection-1',
           tagName: 'BUTTON',
           elementPath: '[["","button",1]]',
-          elementProofSha256: 'b'.repeat(64),
+          targetRef: 'target-1', locatorHint: 'button',
           rect: { x: 1, y: 2, width: 30, height: 40 },
           sourceSha256: 'must-be-dropped',
         },
@@ -252,7 +244,7 @@ describe('native Workbench platform bridge', () => {
           selectionId: 'selection-1',
           tagName: 'button',
           elementPath: '[["","button",1]]',
-          elementProofSha256: 'b'.repeat(64),
+          targetRef: 'target-1', locatorHint: 'button',
           rect: { x: 1, y: 2, width: 30, height: 40 },
         },
       },

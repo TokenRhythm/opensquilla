@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from opensquilla.engine import runtime as runtime_module
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.steps import squilla_router as squilla_router_step
@@ -272,38 +275,67 @@ async def test_squilla_router_timeout_does_not_late_mutate_history_entries(
 async def test_squilla_router_timeout_fails_open_for_blocking_router(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    observed_timeouts: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
     async def blocking_router(ctx: TurnContext) -> TurnContext:
-        time.sleep(0.08)
-        ctx.model = "should-not-route"
-        return ctx
+        try:
+            loop.call_soon_threadsafe(entered.set)
+            # The finite wait also bounds a regression that runs this directly
+            # on the event loop, where an asyncio watchdog cannot fire.
+            release.wait(5)
+            ctx.model = "should-not-route"
+            return ctx
+        finally:
+            completed.set()
+
+    async def wait_for_started_router(awaitable: Any, timeout: float | None) -> Any:
+        observed_timeouts.append(timeout)
+        # Start the real timeout only once the worker is blocked. Host thread
+        # scheduling is not part of the configured router deadline contract.
+        await real_wait_for(entered.wait(), timeout=5)
+        return await real_wait_for(awaitable, timeout=timeout)
 
     blocking_router.__name__ = "apply_squilla_router"
     monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", blocking_router)
+    monkeypatch.setattr(
+        runtime_module,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"wait_for": wait_for_started_router})),
+    )
     runner = TurnRunner(
         provider_selector=None,
         config=_config_with_router_timeout(),
     )
     provider = _Provider()
-    started = time.monotonic()
+    try:
+        turn, resolved_provider = await real_wait_for(
+            runner._run_pipeline(
+                "hello",
+                "agent:main:test",
+                provider,
+                None,
+                [],
+                "system prompt",
+                [],
+            ),
+            timeout=5,
+        )
 
-    turn, resolved_provider = await asyncio.wait_for(
-        runner._run_pipeline(
-            "hello",
-            "agent:main:test",
-            provider,
-            None,
-            [],
-            "system prompt",
-            [],
-        ),
-        timeout=0.25,
-    )
-    elapsed = time.monotonic() - started
+        assert observed_timeouts == [0.01]
+        assert not completed.is_set()
+        assert resolved_provider is provider
+        assert turn.model != "should-not-route"
+    finally:
+        release.set()
+        assert await asyncio.to_thread(completed.wait, 5)
 
-    assert elapsed < 0.075
-    assert resolved_provider is provider
-    assert turn.model != "should-not-route"
-    await asyncio.sleep(0.1)
+    # The timed-out worker has now mutated its copy; it cannot change the
+    # already returned turn even after it completes.
     assert turn.model != "should-not-route"
     router_record = next(
         record

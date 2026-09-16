@@ -36,6 +36,9 @@ def _enable_telemetry_for_test(monkeypatch):
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv(telemetry.TELEMETRY_TESTING_ENV, raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv(network_policy.DO_NOT_TRACK_ENV, raising=False)
+    monkeypatch.delenv(network_policy.PRODUCT_ANALYTICS_DISABLED_ENV, raising=False)
 
 
 def _set_stable_sources(
@@ -199,12 +202,20 @@ def test_disabled_env_skips_without_creating_state(tmp_path, monkeypatch):
     assert not state_path.exists()
 
 
-def test_privacy_config_disable_skips_without_creating_state(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("disable_network_observability", True),
+        ("reliability_diagnostics_enabled", False),
+        ("product_analytics_enabled", False),
+    ],
+)
+def test_privacy_config_disable_skips_without_creating_state(tmp_path, monkeypatch, field, value):
     _enable_telemetry_for_test(monkeypatch)
     monkeypatch.setenv(telemetry.TELEMETRY_ENDPOINT_ENV, TEST_ENDPOINT)
     state_path = tmp_path / "install_telemetry.json"
     config = SimpleNamespace(
-        privacy=SimpleNamespace(disable_network_observability=True),
+        privacy=SimpleNamespace(**{field: value}),
     )
 
     result = telemetry.collect_install_telemetry(
@@ -217,6 +228,43 @@ def test_privacy_config_disable_skips_without_creating_state(tmp_path, monkeypat
     assert result.sent is False
     assert result.skipped_reason == "disabled"
     assert not state_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "reason"),
+    [
+        ("CI", "environment:CI"),
+        (network_policy.DO_NOT_TRACK_ENV, "env:DO_NOT_TRACK"),
+        (
+            network_policy.PRODUCT_ANALYTICS_DISABLED_ENV,
+            "env:OPENSQUILLA_PRIVACY_DISABLE_PRODUCT_ANALYTICS",
+        ),
+        (network_policy.LEGACY_UPDATE_CHECK_DISABLED_ENV, "disabled"),
+    ],
+)
+def test_reporting_veto_skips_background_worker_and_state(
+    tmp_path, monkeypatch, env_name, reason
+):
+    _enable_telemetry_for_test(monkeypatch)
+    monkeypatch.setenv(env_name, "true")
+    monkeypatch.setenv(telemetry.TELEMETRY_ENDPOINT_ENV, TEST_ENDPOINT)
+    state_path = tmp_path / "install_telemetry.json"
+    results: list[telemetry.InstallTelemetryResult] = []
+    post_calls: list[object] = []
+    monkeypatch.setattr(
+        telemetry, "_post_payload", lambda *args, **kwargs: post_calls.append(args)
+    )
+
+    thread = telemetry.start_background_install_telemetry(
+        state_path=state_path, version="1.0.0", on_result=results.append
+    )
+
+    assert thread is None
+    assert post_calls == []
+    assert not state_path.exists()
+    assert len(results) == 1
+    assert results[0].disabled is True
+    assert results[0].skipped_reason == reason
 
 
 def test_hot_privacy_opt_out_before_post_starts_no_request(tmp_path, monkeypatch):

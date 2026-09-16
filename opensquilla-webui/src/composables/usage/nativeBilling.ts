@@ -2,7 +2,13 @@ import type { NativeBilledByCurrency, UsageSnapshot } from '@/types/usage'
 
 const NANOS_PER_USD = 1_000_000_000
 
-type NativeBillingSource = Record<string, unknown> | undefined
+type NativeBillingSource = {
+  readonly nativeBilledByCurrency?: NativeBilledByCurrency
+  readonly pendingBillingReceiptCount?: number
+  readonly costSource?: string
+  readonly nativeBillingExpectedReceiptCount?: number
+  readonly nativeBillingMissingConfirmedReceiptCount?: number
+} | undefined
 
 export interface NativeBillingDisplay {
   exactCny: number | null
@@ -12,29 +18,13 @@ export interface NativeBillingDisplay {
   subtotalText: string
 }
 
-function value(source: Record<string, unknown>, ...keys: string[]): unknown {
-  for (const key of keys) {
-    if (source[key] != null) return source[key]
-  }
-  return undefined
-}
-
 function nativeByCurrency(source: NativeBillingSource): NativeBilledByCurrency {
-  if (!source) return {}
-  const native = value(source, 'native_billed_by_currency', 'nativeBilledByCurrency')
-  return native && typeof native === 'object' && !Array.isArray(native)
-    ? native as NativeBilledByCurrency
-    : {}
+  return source?.nativeBilledByCurrency || {}
 }
 
-function nonNegativeInteger(
-  source: NativeBillingSource,
-  ...keys: string[]
-): number | null {
-  if (!source) return null
-  const rawCount = value(source, ...keys)
-  if (rawCount == null) return null
-  const count = Number(rawCount)
+function nonNegativeInteger(value: number | undefined): number | null {
+  if (value == null) return null
+  const count = Number(value)
   return Number.isInteger(count) && count >= 0 ? count : null
 }
 
@@ -72,21 +62,11 @@ export function nativeBillingDisplay(
   const entries = Object.entries(native)
     .filter(([, entry]) => Number(entry?.receiptCount || 0) > 0)
     .sort(([left], [right]) => left.localeCompare(right))
-  const pendingReceiptCount = Number(
-    source ? value(source, 'pending_billing_receipt_count', 'pendingBillingReceiptCount') || 0 : 0,
-  )
-  const costSource = String(
-    source ? value(source, 'cost_source', 'costSource') || 'none' : 'none',
-  )
-  const expectedReceiptCount = nonNegativeInteger(
-    source,
-    'native_billing_expected_receipt_count',
-    'nativeBillingExpectedReceiptCount',
-  )
+  const pendingReceiptCount = Number(source?.pendingBillingReceiptCount || 0)
+  const costSource = String(source?.costSource || 'none')
+  const expectedReceiptCount = nonNegativeInteger(source?.nativeBillingExpectedReceiptCount)
   const missingReceiptCount = nonNegativeInteger(
-    source,
-    'native_billing_missing_confirmed_receipt_count',
-    'nativeBillingMissingConfirmedReceiptCount',
+    source?.nativeBillingMissingConfirmedReceiptCount,
   )
 
   let exactCny: number | null = null

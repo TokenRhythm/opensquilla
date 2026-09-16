@@ -313,7 +313,7 @@ def build_gateway_consumer_admission(
     fingerprint = hashlib.sha256(
         json.dumps(
             {
-                "schema": "gateway_manual_durable_consumer_v2",
+                "schema": "gateway_manual_durable_consumer_v3",
                 "provider": budget.provider_id,
                 "model": budget.model,
                 "context_window_tokens": budget.context_window_tokens,
@@ -1246,6 +1246,7 @@ def _manual_consumer_messages(
     """Rebuild the provider-visible durable portion of the next request."""
 
     from opensquilla.engine.history import (
+        AssistantReplayError,
         reconstruct_messages_from_entry,
         repair_tool_pairing,
     )
@@ -1259,19 +1260,24 @@ def _manual_consumer_messages(
     for entry in kept_entries:
         if not isinstance(entry, dict):
             return None
-        history.extend(
-            reconstruct_messages_from_entry(
+        try:
+            replay_messages = reconstruct_messages_from_entry(
                 _text(entry.get("role")),
                 entry.get("content") or "",
                 entry.get("tool_calls"),
                 entry.get("reasoning_content"),
+                assistant_replay=entry.get("assistant_replay"),
                 turn_context=(
                     entry.get("turn_context")
                     if isinstance(entry.get("turn_context"), dict)
                     else None
                 ),
             )
-        )
+        except AssistantReplayError:
+            # Unknown or malformed native state cannot be proved by falling
+            # back to a smaller display aggregate. No private payload is logged.
+            return None
+        history.extend(replay_messages)
     history, _ = sanitize_session_messages(history)
     history, _ = project_historical_tool_payloads(
         history,

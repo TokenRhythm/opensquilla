@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.managed_artifacts import (
     DownloadVerificationError,
     ManagedArtifactError,
@@ -127,7 +128,7 @@ def managed_toolchain_state_scope(configured_state_dir: str | Path | None):
     try:
         yield
     finally:
-        _configured_state_dir.reset(token)
+        reset_contextvar_token(_configured_state_dir, token)
 
 
 def toolchains_root(root: Path | None = None) -> Path:

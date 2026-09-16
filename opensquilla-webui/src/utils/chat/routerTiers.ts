@@ -49,11 +49,6 @@ export function sortRouterTiers(list: string[]): string[] {
   })
 }
 
-export function routerTierLabel(tier: string): string {
-  const normalized = normalizeRouterTier(tier)
-  return normalized || DEFAULT_TEXT_TIER
-}
-
 export function routerTierLabelKey(tier: string): string {
   const normalized = normalizeRouterTier(tier)
   return `setup.router.tiers.${normalized || DEFAULT_TEXT_TIER}`

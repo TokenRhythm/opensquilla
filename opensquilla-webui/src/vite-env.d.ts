@@ -3,6 +3,7 @@
 import type {
   ArtifactNativeOpenResult,
   ArtifactOpenRequest,
+  PlatformFilesApi,
   DesktopMainWindowCloseBehavior,
   DesktopGatewayConnection,
   DesktopPreferences,
@@ -49,6 +50,7 @@ declare global {
     onUpdateState?: (callback: (payload: unknown) => void) => () => void
     getGatewayStatus: () => Promise<DesktopSettings['gateway']>
     getGatewayConnection?: () => Promise<DesktopGatewayConnection>
+    onSystemResume?: (callback: () => void) => () => void
     onGatewayConnectionChanged?: (
       callback: (payload: DesktopGatewayConnection) => void,
     ) => () => void
@@ -92,6 +94,8 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    saveArtifact?: PlatformFilesApi['saveArtifact']
+    sourceFileAction?: PlatformFilesApi['sourceFileAction']
     chooseProjectDirectory: (
       request?: ProjectDirectoryPickerRequest,
     ) => Promise<{ path: string } | null>
@@ -118,8 +122,14 @@ declare global {
     closeArtifactAnnotationOverlay?: (
       payload: import('./platform/types').NativeArtifactAnnotationOverlayCloseRequest,
     ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
-    screenshot?: (
-      payload: import('./platform/types').NativeArtifactScreenshotRequest,
+    getWorkbenchBrowserTarget?: (
+      payload: { surfaceId: string },
+    ) => Promise<import('./platform/types').NativeWorkbenchBrowserTarget>
+    focusWorkbenchAnnotation?: (
+      payload: { surfaceId: string; targetRef: string; locatorHint: string },
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    captureWorkbenchScreenshot?: (
+      payload: { surfaceId: string; targetRef: string },
     ) => Promise<unknown>
     navigateWorkbenchSurface?: (
       payload: NativeWorkbenchNavigateRequest,

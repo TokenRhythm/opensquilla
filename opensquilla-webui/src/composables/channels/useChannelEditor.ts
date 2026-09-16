@@ -214,7 +214,6 @@ export function useChannelEditor(
     fieldErrors.value = {}
     resetProbe()
     try {
-      await channelAdministration.ready()
       const [channels, res] = await Promise.all([
         ensureCatalog(),
         channelAdministration.get(name),

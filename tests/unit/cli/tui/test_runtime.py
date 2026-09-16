@@ -110,6 +110,59 @@ def _runtime_hooks(**kwargs: Any) -> TuiRuntimeHooks:
 
 
 @pytest.mark.asyncio
+async def test_surface_ready_runs_only_after_surface_context_enters() -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    inputs.put_nowait(None)
+    surface = _FakeSurface(inputs)
+    observations: list[str] = []
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[_FakeSurface]:
+        observations.append("entered")
+        yield surface
+
+    async def ready() -> None:
+        observations.append("ready")
+
+    await run_tui_runtime(
+        dispatch=lambda _value: asyncio.sleep(0, result=True),
+        surface_factory=factory,
+        config=_runtime_config(),
+        hooks=_runtime_hooks(on_surface_ready=ready),
+    )
+
+    assert observations == ["entered", "ready"]
+
+
+@pytest.mark.parametrize("activity_fails", [False, True])
+async def test_user_activity_observes_input_without_content(activity_fails: bool) -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    for value in (" ", "synthetic task", "/help", None):
+        inputs.put_nowait(value)
+    surface = _FakeSurface(inputs)
+    observed: list[str] = []
+    dispatched: list[str] = []
+
+    async def activity() -> None:
+        observed.append("active")
+        if activity_fails:
+            raise RuntimeError("synthetic unavailable")
+
+    async def dispatch(value: str) -> bool:
+        dispatched.append(value)
+        return True
+
+    await run_tui_runtime(
+        dispatch=dispatch,
+        surface_factory=_surface_factory(surface),
+        config=_runtime_config(concurrent_input_during_turn=False),
+        hooks=_runtime_hooks(on_user_activity=activity),
+    )
+    assert observed == ["active", "active"]
+    assert dispatched == ["synthetic task", "/help"]
+
+
+@pytest.mark.asyncio
 async def test_runtime_ignores_blank_input_lines() -> None:
     """A blank Enter is never a message: no dispatch, no echo, no queue entry.
 
@@ -915,7 +968,7 @@ async def test_runtime_ambiguous_steer_retries_with_same_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_legacy_method_missing_steer_uses_visible_queue() -> None:
+async def test_runtime_method_missing_steer_uses_visible_queue() -> None:
     inputs: asyncio.Queue[Any] = asyncio.Queue()
     surface = _FakeSurface(inputs)
     state = TuiRuntimeState()
@@ -932,7 +985,7 @@ async def test_runtime_legacy_method_missing_steer_uses_visible_queue() -> None:
         return True
 
     async def _missing(_text: str) -> bool:
-        raise MethodMissingError("sessions.steer is unavailable")
+        raise MethodMissingError("sessions.steer.v2 is unavailable")
 
     task = asyncio.create_task(
         run_tui_runtime(
@@ -1432,8 +1485,10 @@ async def test_gateway_routing_does_not_overtake_typed_ahead_input() -> None:
     await _wait_until(lambda: state.pending_items == ("second",))
     await inputs.put("/routing ensemble")
     await _wait_until(
-        lambda: "/routing ensemble" in dispatched
-        or any("requires an empty input queue" in notice for notice in notices)
+        lambda: (
+            "/routing ensemble" in dispatched
+            or any("requires an empty input queue" in notice for notice in notices)
+        )
     )
 
     assert "/routing ensemble" not in dispatched
@@ -1506,8 +1561,10 @@ async def test_standalone_routing_does_not_overtake_pending_ambiguous_steer() ->
 
     await inputs.put("/routing ensemble")
     await _wait_until(
-        lambda: "/routing ensemble" in dispatched
-        or any("requires an empty input queue" in notice for notice in notices)
+        lambda: (
+            "/routing ensemble" in dispatched
+            or any("requires an empty input queue" in notice for notice in notices)
+        )
     )
 
     assert "/routing ensemble" not in dispatched

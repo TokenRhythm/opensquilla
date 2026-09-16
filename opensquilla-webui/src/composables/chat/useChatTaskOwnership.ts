@@ -15,6 +15,7 @@ function normalizedStatus(value: unknown): string {
 }
 
 export function chatTaskId(task: ChatRunTask | null | undefined): string {
+  if (typeof task?.ownershipTaskId === 'string') return task.ownershipTaskId
   return String(
     task?.task_id
     || task?.taskId

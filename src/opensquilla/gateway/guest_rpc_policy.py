@@ -32,9 +32,12 @@ GUEST_RPC_ALLOWLIST = frozenset(
         SESSIONS_RENAME_METHOD,
         SESSIONS_DELETE_METHOD,
         "sessions.bootstrap",
+        "sessions.executionLog.read",
         "sessions.messages.subscribe",
         "sessions.messages.hydrate",
         "sessions.messages.snapshot",
+        "sessions.messages.snapshot.read",
+        "transport.flow.update",
         "sessions.messages.unsubscribe",
         "sessions.pending_inputs.enqueue",
         "sessions.pending_inputs.list",
@@ -52,10 +55,12 @@ _SESSION_KEY_FIELDS = {
     "chat.abort": ("sessionKey", "key"),
     "chat.clarify_submit": ("sessionKey", "key"),
     "sessions.bootstrap": ("key", "sessionKey"),
+    "sessions.executionLog.read": ("sessionKey",),
     SESSIONS_RENAME_METHOD: ("key", "sessionKey"),
     "sessions.messages.subscribe": ("key", "sessionKey"),
     "sessions.messages.hydrate": ("key", "sessionKey"),
     "sessions.messages.snapshot": ("key", "sessionKey"),
+    "sessions.messages.snapshot.read": ("key",),
     "sessions.messages.unsubscribe": ("key", "sessionKey"),
     "sessions.pending_inputs.enqueue": ("key", "sessionKey"),
     "sessions.pending_inputs.list": ("key", "sessionKey"),
@@ -170,6 +175,12 @@ class GuestRpcPolicy:
             params.pop("initial_routing_mode", None)
 
         if method == SESSIONS_LIST_METHOD:
+            return params
+
+        if method == "transport.flow.update":
+            # The handler operates on ctx.conn_id only and checks every key
+            # against that connection's existing subscriptions. No authority
+            # or subscription can be acquired through consumption feedback.
             return params
 
         if method == "chat.send":

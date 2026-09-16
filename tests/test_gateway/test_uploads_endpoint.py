@@ -25,9 +25,12 @@ import pytest
 from opensquilla.contracts.attachments import MAX_STAGED_TEXT_BYTES
 from opensquilla.gateway.attachment_ingest import (
     IMAGE_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_BYTES,
     MAX_STAGED_PDF_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,
     TEXT_ATTACHMENT_BYTES,
+    resolve_attachments,
+    validate_attachments,
 )
 from opensquilla.gateway.uploads import (
     AttachmentLostInRestartError,
@@ -37,6 +40,7 @@ from opensquilla.gateway.uploads import (
     UploadStoreFullError,
     UploadUnsupportedMimeError,
 )
+from tests.helpers.image_bytes import image_bytes
 
 # ---------------------------------------------------------------------------
 # Direct unit tests against UploadStore (no network).
@@ -66,8 +70,8 @@ def _exact_pdf(size: int) -> bytes:
 
 
 def _exact_png(size: int) -> bytes:
-    header = b"\x89PNG\r\n\x1a\n"
-    return header + b"a" * (size - len(header))
+    payload = image_bytes()
+    return payload + b"a" * (size - len(payload))
 
 
 def test_upload_round_trip(store: UploadStore) -> None:
@@ -236,25 +240,21 @@ def test_file_uuid_resolved_via_store_returns_material_ref(
     material ref; it must not carry the upload uuid or long-lived base64 data.
     """
 
-    from opensquilla.gateway.rpc_sessions import (
-        _resolve_attachments,
-        _validate_attachments,
-    )
-
     pdf = b"%PDF-1.4\nbody\n"
     file_uuid = asyncio.run(store.put("r.pdf", "application/pdf", pdf))
 
-    validated = _validate_attachments(
+    validated, _failures = validate_attachments(
         [{"file_uuid": file_uuid, "mime": "application/pdf", "name": "r.pdf"}]
     )
-    resolved = asyncio.run(
-        _resolve_attachments(
+    resolved, consumed = asyncio.run(
+        resolve_attachments(
             validated,
             store=store,
             material_root=tmp_path,
             session_id="s1",
         )
     )
+    assert consumed == [file_uuid]
     assert len(resolved) == 1
     item = resolved[0]
     assert "file_uuid" not in item
@@ -273,37 +273,27 @@ def test_file_uuid_resolved_via_store_returns_material_ref(
 
 
 def test_file_uuid_resolution_requires_material_target(store: UploadStore) -> None:
-    from opensquilla.gateway.rpc_sessions import (
-        _resolve_attachments,
-        _validate_attachments,
-    )
-
     file_uuid = asyncio.run(store.put("r.pdf", "application/pdf", b"%PDF-1.4\nbody\n"))
-    validated = _validate_attachments(
+    validated, _failures = validate_attachments(
         [{"file_uuid": file_uuid, "mime": "application/pdf", "name": "r.pdf"}]
     )
 
     with pytest.raises(ValueError, match="material target"):
-        asyncio.run(_resolve_attachments(validated, store=store))
+        asyncio.run(resolve_attachments(validated, store=store))
 
 
 def test_file_uuid_resolution_revalidates_mime_from_staged_bytes(
     store: UploadStore,
     tmp_path: Path,
 ) -> None:
-    from opensquilla.gateway.rpc_sessions import (
-        _resolve_attachments,
-        _validate_attachments,
-    )
-
     pdf = b"%PDF-1.4\nbody\n"
     file_uuid = asyncio.run(store.put("misnamed.txt", "text/plain", pdf))
 
-    validated = _validate_attachments(
+    validated, _failures = validate_attachments(
         [{"file_uuid": file_uuid, "mime": "text/plain", "name": "misnamed.txt"}]
     )
-    resolved = asyncio.run(
-        _resolve_attachments(
+    resolved, consumed = asyncio.run(
+        resolve_attachments(
             validated,
             store=store,
             material_root=tmp_path,
@@ -311,6 +301,7 @@ def test_file_uuid_resolution_revalidates_mime_from_staged_bytes(
         )
     )
 
+    assert consumed == [file_uuid]
     item = resolved[0]
     assert item["type"] == "application/pdf"
     assert item["mime"] == "application/pdf"
@@ -322,22 +313,15 @@ def test_file_uuid_resolution_allows_large_staged_pdf(
     store: UploadStore,
     tmp_path: Path,
 ) -> None:
-    from opensquilla.gateway.rpc_sessions import (
-        _MAX_ATTACHMENT_BYTES,
-        _MAX_STAGED_PDF_BYTES,
-        _resolve_attachments,
-        _validate_attachments,
-    )
-
-    pdf = b"%PDF-1.4\n" + b"a" * (_MAX_ATTACHMENT_BYTES + 1)
-    assert len(pdf) < _MAX_STAGED_PDF_BYTES
+    pdf = b"%PDF-1.4\n" + b"a" * (MAX_ATTACHMENT_BYTES + 1)
+    assert len(pdf) < MAX_STAGED_PDF_BYTES
     file_uuid = asyncio.run(store.put("large.pdf", "application/pdf", pdf))
 
-    validated = _validate_attachments(
+    validated, _failures = validate_attachments(
         [{"file_uuid": file_uuid, "mime": "application/pdf", "name": "large.pdf"}]
     )
-    resolved = asyncio.run(
-        _resolve_attachments(
+    resolved, consumed = asyncio.run(
+        resolve_attachments(
             validated,
             store=store,
             material_root=tmp_path,
@@ -345,6 +329,7 @@ def test_file_uuid_resolution_allows_large_staged_pdf(
         )
     )
 
+    assert consumed == [file_uuid]
     item = resolved[0]
     assert item["type"] == "application/pdf"
     assert item["_was_staged"] is True
@@ -354,11 +339,6 @@ def test_file_uuid_resolution_allows_large_staged_pdf(
 
 
 def test_file_uuid_resolution_rejects_large_staged_image() -> None:
-    from opensquilla.gateway.rpc_sessions import (
-        _resolve_attachments,
-        _validate_attachments,
-    )
-
     payload = _exact_png(IMAGE_ATTACHMENT_BYTES + 1)
     store = _FakeUploadStore(
         {
@@ -374,12 +354,12 @@ def test_file_uuid_resolution_rejects_large_staged_image() -> None:
         }
     )
 
-    validated = _validate_attachments(
+    validated, _failures = validate_attachments(
         [{"file_uuid": "u-large-image", "mime": "image/png", "name": "large.png"}]
     )
     with pytest.raises(ValueError, match="exceeds"):
         asyncio.run(
-            _resolve_attachments(
+            resolve_attachments(
                 validated,
                 store=store,
                 material_root=Path.cwd(),
@@ -393,11 +373,6 @@ def test_file_uuid_resolution_accepts_staged_text_above_inline_threshold(
 ) -> None:
     # Text is stageable: a clean-UTF-8 text file above the 2MB inline threshold
     # resolves instead of dead-ending (the inline cap only bounds inline sends).
-    from opensquilla.gateway.rpc_sessions import (
-        _resolve_attachments,
-        _validate_attachments,
-    )
-
     payload = b"a" * (TEXT_ATTACHMENT_BYTES + 1)
     store = _FakeUploadStore(
         {
@@ -413,28 +388,24 @@ def test_file_uuid_resolution_accepts_staged_text_above_inline_threshold(
         }
     )
 
-    validated = _validate_attachments(
+    validated, _failures = validate_attachments(
         [{"file_uuid": "u-large-text", "mime": "text/csv", "name": "large.csv"}]
     )
-    resolved = asyncio.run(
-        _resolve_attachments(
+    resolved, consumed = asyncio.run(
+        resolve_attachments(
             validated,
             store=store,
             material_root=tmp_path,
             session_id="s1",
         )
     )
+    assert consumed == ["u-large-text"]
     assert resolved[0]["kind"] == "attachment_ref"
     assert resolved[0]["mime"] == "text/csv"
     assert resolved[0]["size"] == len(payload)
 
 
 def test_file_uuid_resolution_rejects_aggregate_raw_bytes_above_cap(tmp_path: Path) -> None:
-    from opensquilla.gateway.rpc_sessions import (
-        _resolve_attachments,
-        _validate_attachments,
-    )
-
     one_pdf = _exact_pdf(MAX_TOTAL_ATTACHMENT_BYTES // 3 + 1)
     assert len(one_pdf) < MAX_STAGED_PDF_BYTES
     entries = {
@@ -450,7 +421,7 @@ def test_file_uuid_resolution_rejects_aggregate_raw_bytes_above_cap(tmp_path: Pa
         for index in range(3)
     }
     store = _FakeUploadStore(entries)
-    validated = _validate_attachments(
+    validated, _failures = validate_attachments(
         [
             {"file_uuid": file_uuid, "mime": "application/pdf", "name": meta["name"]}
             for file_uuid, (_payload, meta) in entries.items()
@@ -459,7 +430,7 @@ def test_file_uuid_resolution_rejects_aggregate_raw_bytes_above_cap(tmp_path: Pa
 
     with pytest.raises(ValueError, match="total raw bytes"):
         asyncio.run(
-            _resolve_attachments(
+            resolve_attachments(
                 validated,
                 store=store,
                 material_root=tmp_path,
@@ -642,7 +613,7 @@ def test_upload_route_normalizes_windows_zip_spelling() -> None:
 
 
 def test_upload_route_sniffs_rendered_type_for_generic_claim() -> None:
-    png = b"\x89PNG\r\n\x1a\n" + b"fake image body"
+    png = image_bytes()
     with _route_client() as client:
         response = client.post(
             "/api/v1/files/upload",
@@ -651,6 +622,53 @@ def test_upload_route_sniffs_rendered_type_for_generic_claim() -> None:
 
     assert response.status_code == 200
     assert response.json()["mime"] == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("payload", "mime"),
+    [
+        (b"\x89PNG\r\n\x1a\ninvalid image body", "image/png"),
+        (b"plain text renamed to a photograph", "image/jpeg"),
+        (b"\xff\xd8\xffinvalid image body", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\ninvalid image body", "application/octet-stream"),
+    ],
+)
+def test_upload_route_rejects_invalid_image_without_staging(store, payload, mime) -> None:
+    with _route_client(store=store) as client:
+        response = client.post(
+            "/api/v1/files/upload", files={"file": ("sample.jpg", payload, mime)},
+        )
+    assert response.status_code == 415
+    assert response.json()["code"] == "UNSUPPORTED_MEDIA_TYPE"
+    assert "upload a valid image" in response.json()["error"]
+    assert not store._entries
+    assert not list(store.marker_dir.glob("*.meta"))
+
+
+def test_upload_route_corrects_valid_image_format_before_staging(store) -> None:
+    with _route_client(store=store) as client:
+        response = client.post(
+            "/api/v1/files/upload", files={"file": ("sample.jpg", image_bytes(), "image/jpeg")},
+        )
+    assert response.status_code == 200
+    assert response.json()["mime"] == "image/png"
+    _, metadata = asyncio.run(store.get(response.json()["file_uuid"]))
+    assert metadata["mime"] == "image/png"
+
+
+def test_legacy_staged_image_is_revalidated_on_send(tmp_path) -> None:
+    store = _FakeUploadStore({
+        "u-legacy-image": (
+            b"\x89PNG\r\n\x1a\ninvalid image body",
+            {"name": "sample.png", "mime": "image/png"},
+        ),
+    })
+    with pytest.raises(ValueError, match="upload a valid image"):
+        asyncio.run(resolve_attachments(
+            [{"file_uuid": "u-legacy-image", "type": "image/png"}],
+            store=store, material_root=tmp_path / "media", session_id="sample-session",
+        ))
+    assert not (tmp_path / "media").exists()
 
 
 def test_upload_route_sniffs_text_for_missing_claim() -> None:
@@ -793,7 +811,7 @@ def test_upload_route_response_exposes_expires_at_and_ttl() -> None:
 
 
 def test_upload_route_sniffs_png_for_empty_claim() -> None:
-    png = b"\x89PNG\r\n\x1a\n" + b"fake image body"
+    png = image_bytes()
     with _route_client() as client:
         response = client.post(
             "/api/v1/files/upload",
@@ -857,11 +875,6 @@ def test_app_factory_wires_strict_admission_into_route_and_store(tmp_path: Path)
 def test_file_uuid_opaque_reference_resolves_with_store_mime(tmp_path: Path) -> None:
     # An opaque staged upload referenced WITHOUT a declared mime resolves via
     # the store's own metadata into a content-addressed attachment_ref.
-    from opensquilla.gateway.rpc_sessions import (
-        _resolve_attachments,
-        _validate_attachments,
-    )
-
     payload = b"PK\x03\x04" + b"\x00" * 128
     store = _FakeUploadStore(
         {
@@ -877,17 +890,18 @@ def test_file_uuid_opaque_reference_resolves_with_store_mime(tmp_path: Path) -> 
         }
     )
 
-    validated = _validate_attachments([{"file_uuid": "u-zip", "name": "paper.zip"}])
+    validated, _failures = validate_attachments([{"file_uuid": "u-zip", "name": "paper.zip"}])
     assert validated[0].get("type") is None
 
-    resolved = asyncio.run(
-        _resolve_attachments(
+    resolved, consumed = asyncio.run(
+        resolve_attachments(
             validated,
             store=store,
             material_root=tmp_path,
             session_id="s1",
         )
     )
+    assert consumed == ["u-zip"]
     assert resolved[0]["kind"] == "attachment_ref"
     assert resolved[0]["mime"] == "application/zip"
     assert resolved[0]["size"] == len(payload)

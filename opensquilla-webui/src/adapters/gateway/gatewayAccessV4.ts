@@ -5,6 +5,10 @@ import type {
   GatewayRunModePolicy,
 } from '@/modules/gatewayAccess'
 import { SESSIONS_MESSAGES_HYDRATE_METHOD } from '@/contracts/generated/v4/sessionsMessagesHydrate'
+import {
+  CONVERSATION_EVENT_WIRE_NAMES,
+  conversationSemanticEventKind,
+} from './conversationEventsV4'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 
@@ -17,10 +21,15 @@ interface GatewayAccessSource {
   readonly auth: Record<string, unknown> | null
   readonly policy: Record<string, unknown> | null
   readonly connectionGeneration: number
+  hasRpcEvent(event: string): boolean
   connect(url: string, token?: string): Promise<void>
   disconnect(): void
   recoverConnectionGeneration(expectedGeneration: number, reason: string): boolean
 }
+
+const TURN_COMMITTED_EVENT_NAMES = CONVERSATION_EVENT_WIRE_NAMES.filter(
+  name => conversationSemanticEventKind(name) === 'turn-committed',
+)
 
 function defaultGatewayEndpoint(): string {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -105,6 +114,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     get detachedSessionHydration() {
       const methods = source.policy?.concurrent_optional_read_methods
       return Array.isArray(methods) && methods.includes(SESSIONS_MESSAGES_HYDRATE_METHOD)
+    },
+    get turnCommittedEvents() {
+      return TURN_COMMITTED_EVENT_NAMES.some(name => source.hasRpcEvent(name))
     },
     get subscriptionEpoch() {
       return source.connectionGeneration

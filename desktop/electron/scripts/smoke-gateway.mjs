@@ -206,6 +206,29 @@ function verifyGatewayFilesystemWorker(gatewayBinary, env, targetPath) {
   }
 }
 
+function verifyGatewayToolSearch(gatewayBinary, env) {
+  const result = spawnSync(gatewayBinary, ['--_desktop-tool-search-probe'], {
+    cwd: dirname(gatewayBinary),
+    env,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 20_000,
+  })
+  if (result.error) throw result.error
+  if (
+    result.status !== 0
+    || result.stdout.trim() !== 'opensquilla-desktop-tool-search-ok'
+  ) {
+    throw new Error(
+      `Packaged gateway tool-search resource probe failed with exit ${result.status ?? 'null'}.`
+        + formatTail(
+          result.stdout ? result.stdout.trim().split(/\r?\n/) : [],
+          result.stderr ? result.stderr.trim().split(/\r?\n/) : [],
+        ),
+    )
+  }
+}
+
 async function findFreePort() {
   return await new Promise((resolvePort, reject) => {
     const server = createServer()
@@ -433,6 +456,7 @@ async function main() {
 
     const env = smokeEnv(tempHome, config, runtimeGatewayDir)
     verifyGatewayCaStore(gatewayBinary, env)
+    verifyGatewayToolSearch(gatewayBinary, env)
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
 
     const port = await findFreePort()

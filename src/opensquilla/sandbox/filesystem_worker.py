@@ -411,6 +411,9 @@ def _read_file(payload: dict[str, Any]) -> dict[str, object]:
         raise IsADirectoryError(f"Path is a directory: {display_path}")
 
     sample = filesystem_tool._read_binary_sample(path)
+    image_result = filesystem_tool._read_image_file_result(path, sample)
+    if image_result is not None:
+        return image_result
     if not sample:
         return {"message": ""}
     binary_reason = filesystem_tool._looks_binary(sample, path)

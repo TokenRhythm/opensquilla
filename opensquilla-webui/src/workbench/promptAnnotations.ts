@@ -2,8 +2,8 @@ export const ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT =
   'opensquilla:artifact-prompt-annotation-focus'
 export const ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT =
   'opensquilla:artifact-prompt-annotation-reuse'
-export const ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT =
-  'opensquilla:artifact-prompt-annotations-accepted'
+export const PAGE_ANNOTATIONS_SENT_EVENT =
+  'opensquilla:page-annotations-sent'
 
 interface ArtifactPromptAnnotationActivationCallbacks {
   /** Synchronously proves that the trusted Control UI accepted the request. */
@@ -26,8 +26,8 @@ export interface ArtifactPromptAnnotationReuseDetail
   sessionKey: string
 }
 
-export interface ArtifactPromptAnnotationsAcceptedDetail {
-  acceptedIds: string[]
+export interface PageAnnotationsSentDetail {
+  draftIds: string[]
   sessionKey: string
   /** The key used by the send request before a draft/session was materialized. */
   requestSessionKey?: string
@@ -80,14 +80,14 @@ export function reuseArtifactPromptAnnotation(
   )
 }
 
-export function notifyArtifactPromptAnnotationsAccepted(
-  detail: ArtifactPromptAnnotationsAcceptedDetail,
+export function notifyPageAnnotationsSent(
+  detail: PageAnnotationsSentDetail,
 ): void {
-  if (typeof window === 'undefined' || !detail.sessionKey || detail.acceptedIds.length === 0) return
+  if (typeof window === 'undefined' || !detail.sessionKey || detail.draftIds.length === 0) return
   const requestSessionKey = detail.requestSessionKey?.trim()
-  window.dispatchEvent(new CustomEvent(ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT, {
+  window.dispatchEvent(new CustomEvent(PAGE_ANNOTATIONS_SENT_EVENT, {
     detail: {
-      acceptedIds: [...detail.acceptedIds],
+      draftIds: [...detail.draftIds],
       sessionKey: detail.sessionKey,
       ...(requestSessionKey && requestSessionKey !== detail.sessionKey
         ? { requestSessionKey }

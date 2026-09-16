@@ -8,7 +8,16 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ROOT / "src" / "opensquilla" / "skills"
 BUNDLED = SKILLS_DIR / "bundled"
 EXP = SKILLS_DIR / "exp"
-DEFAULTS = {"skill-creator", "pptx", "memory", "cron", "github"}
+DEFAULTS = {
+    "deep-research",
+    "docx",
+    "github",
+    "html-coder",
+    "pdf-toolkit",
+    "pptx",
+    "skill-creator",
+    "xlsx",
+}
 
 
 def test_default_bundled_skills_have_release_provenance(tmp_path: Path) -> None:
