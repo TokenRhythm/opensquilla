@@ -2,6 +2,15 @@ export type CompactionSkippedLabelCode =
   | 'chat.compact.withinBudget'
   | 'chat.compact.skipped'
 
+export function compactionCompletedLabelCode(durability: unknown):
+  | 'chat.compact.temporarilyReduced'
+  | 'chat.compact.summarySaved'
+  | 'chat.compact.compacted' {
+  if (durability === 'request_scoped') return 'chat.compact.temporarilyReduced'
+  if (durability === 'durable') return 'chat.compact.summarySaved'
+  return 'chat.compact.compacted'
+}
+
 const BENIGN_SKIP_REASONS = new Set([
   'within_budget',
   'within_compaction_budget',

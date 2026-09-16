@@ -4210,6 +4210,8 @@
     "compact": {
       "compacting": "正在整理上下文…",
       "compacted": "上下文已整理",
+      "temporarilyReduced": "已临时精简历史，继续处理",
+      "summarySaved": "摘要已保存",
       "historyPreserved": "更早的上下文已汇总；原始消息仍可在历史记录中查看",
       "historyIncomplete": "更早的上下文已汇总；部分原始消息不可用",
       "historySummarized": "更早的上下文已汇总",

@@ -2333,7 +2333,7 @@ async def test_inline_overflow_compaction_preserves_original_structured_tail(
 
 
 @pytest.mark.asyncio
-async def test_inline_overflow_refuses_when_protected_current_turn_alone_is_too_large(
+async def test_soft_pressure_keeps_protected_current_turn_when_final_request_fits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def _unexpected_compaction(_request: Any) -> CompactionResult:
@@ -2360,8 +2360,8 @@ async def test_inline_overflow_refuses_when_protected_current_turn_alone_is_too_
         protected_turn_start_index=2,
     )
 
-    assert outcome is None
-    assert agent._last_compaction_refusal_reason == "provider_recent_tail_too_large"
+    assert outcome is not None and not outcome.compacted
+    assert outcome.messages == messages
 
 
 @pytest.mark.asyncio
