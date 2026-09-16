@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
     UsageExecutionContext,
@@ -40,6 +41,16 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionTarget,
     build_compaction_llm_plan_from_provider_config,
 )
+
+
+@pytest.fixture(params=("default-tokenizer", "fallback-tokenizer"))
+def _compaction_tokenizer(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if request.param == "fallback-tokenizer":
+        monkeypatch.setattr(
+            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
+        )
 
 
 class _Stream:
@@ -734,7 +745,9 @@ async def test_rolling_summary_replaces_previous_checkpoint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rolling_summary_can_replace_oversized_checkpoint_without_raw_entries() -> None:
+async def test_rolling_summary_can_replace_oversized_checkpoint_without_raw_entries(
+    _compaction_tokenizer: None,
+) -> None:
     provider = _Provider(
         lambda: _Stream(
             [
@@ -757,9 +770,9 @@ async def test_rolling_summary_can_replace_oversized_checkpoint_without_raw_entr
             config=config,
             # Keep the checkpoint oversized for the 500-token consumer window
             # while remaining within the provider target's input budget even
-            # when tiktoken is unavailable and the portable len//4 estimator
+            # when tiktoken is unavailable and the conservative UTF-8 fallback
             # is used (as on a fresh Windows runner).
-            previous_summary="oversized checkpoint " * 800,
+            previous_summary="oversized checkpoint " * 400,
         )
     )
 
@@ -767,6 +780,7 @@ async def test_rolling_summary_can_replace_oversized_checkpoint_without_raw_entr
     assert result.removed_count == 0
     assert result.replaced_previous_summary is True
     assert result.summary == "small replacement"
+    assert result.tokens_before > 500
     assert result.tokens_after < result.tokens_before
     assert result.summary_payload is not None
     assert result.summary_payload["source_coverage"]["replaces_prior_context"] is True
@@ -939,11 +953,14 @@ async def test_suffix_reads_selected_source_including_new_assistant_and_preserve
 @pytest.mark.parametrize("stream_reasoning", [True, False])
 async def test_suffix_reasoning_uses_generation_budget_not_summary_body_budget(
     monkeypatch: pytest.MonkeyPatch, stream_reasoning: bool,
+    _compaction_tokenizer: None,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
     events: list[Any] = []
     if stream_reasoning:
-        events.append(ReasoningDeltaEvent(text="reasoning " * 1600))
+        # Both estimators count this above the 1024-token summary cap and
+        # below the 4096-token generation cap.
+        events.append(ReasoningDeltaEvent(text="r " * 1600))
     events.extend([
         TextDeltaEvent(text="A short valid checkpoint."),
         DoneEvent(output_tokens=3000, reasoning_tokens=2990),
@@ -1138,6 +1155,7 @@ async def test_suffix_input_reserves_full_generation_budget_before_sending(
 @pytest.mark.asyncio
 async def test_suffix_multiple_chunks_read_each_complete_source_round_once(
     monkeypatch: pytest.MonkeyPatch,
+    _compaction_tokenizer: None,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
     provider = _Provider(lambda: _Stream([
@@ -1146,7 +1164,7 @@ async def test_suffix_multiple_chunks_read_each_complete_source_round_once(
     ]))
     entries = _entries(6)
     for entry in entries[:4]:
-        entry["content"] += " background" * 180
+        entry["content"] += " b" * 180
 
     result = await compact_context(CompactionRequest(
         session_id="two-source-rounds",
@@ -1176,6 +1194,7 @@ async def test_suffix_multiple_chunks_read_each_complete_source_round_once(
 ])
 async def test_suffix_later_chunk_failure_preserves_the_entire_source(
     monkeypatch: pytest.MonkeyPatch, failure: list[Any],
+    _compaction_tokenizer: None,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
     provider = _Provider(lambda: _Stream(
@@ -1184,7 +1203,7 @@ async def test_suffix_later_chunk_failure_preserves_the_entire_source(
     ))
     entries = _entries(6)
     for entry in entries[:4]:
-        entry["content"] += " background" * 180
+        entry["content"] += " b" * 180
 
     result = await compact_context(CompactionRequest(
         session_id="second-chunk-failure",
