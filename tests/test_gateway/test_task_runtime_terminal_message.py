@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.types import AgentState, ErrorEvent, RouterDecisionEvent, StateChangeEvent
 from opensquilla.gateway.boot import (
     TaskRuntimeStreamError,
@@ -18,6 +19,7 @@ from opensquilla.gateway.boot import (
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.task_runtime import SubagentCompletionEvent, TaskRuntime
+from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 from opensquilla.session.storage import SessionStorage
 from opensquilla.silent_reply import (
@@ -96,6 +98,56 @@ def _make_runtime(
         event_emitter=event_emitter,
         terminal_listener=terminal_listener,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("reasoning", "stop_reason", "expected"), [
+    (False, "stop", "The model provider returned an empty response."),
+    (True, "stop", "The model returned reasoning without a visible answer."),
+    (True, "length", "The model used its output budget for reasoning"),
+])
+async def test_agent_empty_response_keeps_cause_through_task_terminal(
+    reasoning: bool, stop_reason: str, expected: str,
+) -> None:
+    class EmptyProvider:
+        provider_name = "synthetic"
+        calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            self.calls += 1
+            yield ProviderDone(
+                stop_reason=stop_reason, input_tokens=3,
+                output_tokens=2 if reasoning else 0,
+                reasoning_tokens=2 if reasoning else 0,
+                reasoning_content="Synthetic reasoning" if reasoning else None,
+            )
+
+    provider = EmptyProvider()
+    agent = Agent(provider=provider, config=AgentConfig(
+        max_provider_retries=1, retry_base_backoff_ms=0, retry_max_backoff_ms=0,
+    ))
+    emitted: list[tuple[str, dict[str, Any]]] = []
+
+    async def emitter(_session: str, name: str, payload: dict[str, Any]) -> None:
+        emitted.append((name, payload))
+
+    async def handler(run: Any) -> None:
+        await _emit_task_runtime_stream_events(
+            agent.run_turn("Synthetic request"), run.envelope.session_key, emitter,
+            task_id=run.task_id, idle_timeout=1.0, heartbeat_interval=0.0,
+        )
+
+    runtime = _make_runtime(handler, event_emitter=emitter)
+    handle = await runtime.enqueue(_make_envelope(), "Synthetic request")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+    assert provider.calls == 2
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.details["turn_outcome"]["failure_kind"] == "empty_response"
+    for name in ("session.event.error", "task.failed"):
+        payload = next(payload for event, payload in emitted if event == name)
+        assert payload["turn_outcome"]["failure_kind"] == "empty_response"
+        assert payload["terminal_message"].startswith(expected)
+        assert payload["code"] == "empty_response"
 
 
 @pytest.mark.asyncio

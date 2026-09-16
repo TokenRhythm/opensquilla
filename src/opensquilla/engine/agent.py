@@ -9941,6 +9941,7 @@ class Agent:
                         terminal_error = ErrorEvent(
                             message=terminal_message,
                             code="empty_response",
+                            failure_kind=ProviderFailureKind.EMPTY_RESPONSE.value,
                         )
                         yield terminal_error
                         break
