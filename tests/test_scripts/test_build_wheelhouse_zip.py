@@ -231,6 +231,7 @@ def test_cross_platform_wheelhouse_requires_target_host(tmp_path: Path) -> None:
             target_platform_tag="windows-x64",
             python_major=3,
             python_minor=12,
+            constraints_path=tmp_path / "constraints.txt",
         )
 
 
@@ -247,10 +248,39 @@ def test_portable_recommended_wheelhouse_uses_recommended_extra_only(tmp_path: P
         target_platform_tag="windows-x64",
         python_major=3,
         python_minor=12,
+        constraints_path=tmp_path / "constraints.txt",
     )
 
     assert str(wheel_path) + "[recommended]" in command
     assert str(wheel_path) + "[recommended,feishu]" not in command
+    assert command[command.index("--constraint") + 1] == str(tmp_path / "constraints.txt")
+    assert "--locked" in command
+    assert command[command.index("--group") + 1] == "wheelhouse-build"
+
+
+def test_wheelhouse_build_tool_is_bound_to_repo_with_external_work_dir(tmp_path, monkeypatch):
+    module = load_script()
+    monkeypatch.chdir(tmp_path)
+    command = module.pip_command(sys.version_info.major, sys.version_info.minor, "--version")
+    assert command[command.index("--project") + 1] == str(module.repo_root_from_script())
+    assert "--locked" in command
+
+
+@pytest.mark.parametrize("profile", ["core", "recommended"])
+def test_wheelhouse_constraints_export_only_selected_locked_profile(tmp_path: Path, profile: str):
+    module = load_script()
+    calls = []
+    module.run = lambda args, **kwargs: calls.append((args, kwargs))
+    output = tmp_path / "constraints.txt"
+    module.export_locked_constraints(tmp_path, profile, output, {})
+    command, options = calls[0]
+    assert {"--locked", "--no-dev", "--no-emit-project", "--no-hashes"} <= set(command)
+    assert options["cwd"] == tmp_path
+    assert command[command.index("--output-file") + 1] == str(output)
+    if profile == "core":
+        assert "--extra" not in command
+    else:
+        assert command[command.index("--extra") + 1] == profile
 
 def test_release_wheel_allows_router_provenance_markdown() -> None:
     module = load_script()

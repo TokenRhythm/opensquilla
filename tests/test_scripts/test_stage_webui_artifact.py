@@ -14,6 +14,60 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 STAGER = REPO_ROOT / "opensquilla-webui" / "scripts" / "stage-dist.mjs"
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_normalizer_excludes_only_music_maintainer_readme_before_manifest_and_stage(
+    tmp_path: Path,
+) -> None:
+    webui = tmp_path / "opensquilla-webui"
+    scripts = webui / "scripts"
+    dist = webui / "dist"
+    scripts.mkdir(parents=True)
+    for script in ("normalize-dist.mjs", "verify-dist.mjs", "stage-dist.mjs"):
+        shutil.copyfile(STAGER.parent / script, scripts / script)
+    (webui / "public/music").mkdir(parents=True)
+    source_readme = webui / "public/music/README.md"
+    source_readme.write_text("Music maintainer guide\n", encoding="utf-8")
+    (dist / "music").mkdir(parents=True)
+    shutil.copyfile(source_readme, dist / "music/README.md")
+    playlist = b'{"tracks": []}\n'
+    (dist / "music/playlist.json").write_bytes(playlist)
+    (dist / "assets").mkdir()
+    (dist / "assets/app.js").write_text("export {};\n", encoding="utf-8")
+    (dist / "assets/app.css").write_text("body{}\n", encoding="utf-8")
+    # Identically named files outside the exact music path remain untouched.
+    (dist / "assets/README.md").write_text("Unrelated asset documentation\n", encoding="utf-8")
+    entrypoint = (
+        '<script type="module" src="assets/app.js"></script>'
+        '<link rel="stylesheet" href="assets/app.css">'
+    )
+    for name in ("index.html", "desktop.html"):
+        (dist / name).write_text(entrypoint, encoding="utf-8")
+
+    for script, options in (
+        ("normalize-dist.mjs", []), ("verify-dist.mjs", ["--write"]), ("stage-dist.mjs", []),
+    ):
+        completed = subprocess.run(
+            ["node", str(scripts / script), *options],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    assert source_readme.read_text(encoding="utf-8") == "Music maintainer guide\n"
+    staged = tmp_path / "src/opensquilla/gateway/static/dist"
+    for artifact in (dist, staged):
+        assert not (artifact / "music/README.md").exists()
+        assert (artifact / "music/playlist.json").read_bytes() == playlist
+        assert (artifact / "assets/README.md").read_text(encoding="utf-8") == (
+            "Unrelated asset documentation\n"
+        )
+        manifest_path = artifact / "webui-artifact-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert "music/README.md" not in {entry["path"] for entry in manifest["files"]}
+    assert (staged / "webui-artifact-manifest.json").read_bytes() == (
+        dist / "webui-artifact-manifest.json"
+    ).read_bytes()
+
+
 def _write_manifest(webui_root: Path, dist: Path) -> None:
     records = []
     for path in sorted(dist.rglob("*")):

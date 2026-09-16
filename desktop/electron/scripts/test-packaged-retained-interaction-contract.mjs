@@ -246,6 +246,10 @@ test('provider rejects wrong, duplicate, malformed or extra execution identity',
     prefix + '\nCurrent response execution: {bad json}',
     prefix + '\nCurrent response execution: ' + JSON.stringify(expected).replace('"kind":', '"kind":"wrong","kind":'),
     messages.first + executionSuffix(model),
+    messages.first + executionSuffix(model) + runtimeSuffix,
+    prefix + runtimeSuffix + executionSuffix(model),
+    prefix + '\nCurrent response execution: ' + JSON.stringify(expected, null, 1),
+    prefix + executionSuffix(model, { provider: 'ollama', model, kind: 'single_model' }),
     auditMessages('d'.repeat(32)).first + ' ' + runtimeSuffix + executionSuffix(model),
   ]) {
     const response = await post(content)
