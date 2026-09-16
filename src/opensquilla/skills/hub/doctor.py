@@ -44,6 +44,7 @@ from opensquilla.skills.hub.lockfile import (
 )
 from opensquilla.skills.hub.source import SourceResolution
 from opensquilla.skills.hub.transaction import inspect_pending_skill_transaction
+from opensquilla.skills.hub.tree_io import MAX_TREE_ENTRIES, validate_entry_count
 from opensquilla.skills.manifest import SkillCompileProfile, compile_skill_manifest
 from opensquilla.skills.types import SkillLayer, SkillSpec
 
@@ -64,7 +65,7 @@ _RESERVED_INTERNAL_NAMES = frozenset(
         "__macosx",
     }
 )
-_MAX_TREE_ENTRIES = 2_048
+_MAX_TREE_ENTRIES = MAX_TREE_ENTRIES
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _DEGRADED_CAPABILITIES_KEY = "degraded_capabilities"
 _SCOPED_TOOL_PERMISSIONS_CAPABILITY = "scoped_tool_permissions"
@@ -1340,7 +1341,9 @@ def _scan_static_tree(skill_dir: Path) -> list[SkillDiagnostic]:
                     )
                 )
                 continue
-            if entry_count > _MAX_TREE_ENTRIES:
+            try:
+                validate_entry_count(entry_count, _MAX_TREE_ENTRIES)
+            except ValueError:
                 diagnostics.append(
                     _diagnostic(
                         "RESOURCE_ENTRY_LIMIT_EXCEEDED",
