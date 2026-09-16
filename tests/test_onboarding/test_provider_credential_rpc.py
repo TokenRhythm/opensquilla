@@ -226,6 +226,67 @@ async def test_primary_reachability_fallback_uses_saved_model_when_request_omits
     assert calls == ["list", "chat"]
 
 
+@pytest.mark.parametrize("provider_id", ["openai", "custom"])
+@pytest.mark.parametrize("model_fields", [{}, {"model": ""}], ids=["omitted", "empty"])
+@pytest.mark.parametrize(
+    ("status_code", "body", "expected_kind"),
+    [
+        (200, {"data": [{"id": "synthetic-model"}]}, ""),
+        (200, {"data": []}, ""),
+        (401, {"error": {"message": "Invalid API key"}}, "auth_invalid"),
+        (404, {"error": {"message": "Not Found"}}, "unsupported_feature"),
+    ],
+    ids=["models", "empty-catalog", "invalid-key", "unsupported-listing"],
+)
+async def test_primary_reachability_without_model_uses_live_listing(
+    tmp_path,
+    monkeypatch: Any,
+    provider_id: str,
+    model_fields: dict[str, str],
+    status_code: int,
+    body: dict[str, Any],
+    expected_kind: str,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "GET"
+        assert str(request.url) == "https://model-list.example.test/v1/models"
+        assert request.headers["authorization"] == "Bearer synthetic-probe-key"
+        return httpx.Response(status_code, json=body)
+
+    real_client = httpx.AsyncClient
+
+    def client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(respond)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", client)
+    ctx = _ctx(tmp_path, is_owner=True, llm=LlmProviderConfig())
+    before = ctx.config.model_dump(mode="python")
+    payload = await rpc_onboarding._provider_probe(
+        {
+            "providerId": provider_id,
+            "apiKey": "synthetic-probe-key",
+            "baseUrl": "https://model-list.example.test/v1",
+            "mode": "reachability",
+            **model_fields,
+        },
+        ctx,
+    )
+
+    assert len(seen) == 1
+    assert payload["ok"] is (status_code == 200)
+    assert payload["model"] == ""
+    assert payload["failureKind"] == expected_kind
+    assert payload["verificationLevel"] == "reachable"
+    assert payload["failureStage"] == "reachability"
+    assert payload["firstResponseMs"] is None
+    assert ctx.config.model_dump(mode="python") == before
+    assert not (tmp_path / "opensquilla.toml").exists()
+
+
 @pytest.mark.parametrize("mode_fields", [{}, {"mode": None}])
 async def test_legacy_primary_probe_still_requires_an_explicit_model(
     tmp_path,
