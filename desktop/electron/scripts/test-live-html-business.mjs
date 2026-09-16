@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { after, before, test } from 'node:test'
+import { runInNewContext } from 'node:vm'
 import { chromium } from 'playwright'
 import { createBusinessDriver, verifyBusinessCase } from './live-html-journey-business.mjs'
 import { createSupplementalClient } from './live-html-supplemental-client.mjs'
@@ -47,6 +48,104 @@ test('moving modal close waits for actionability and receives a real pointer cli
     assert.equal(await f.page.locator('#panel').isVisible(), false)
     assert.equal(f.inputs.filter(command => command === 'Input.dispatchMouseEvent').length, 6)
   } finally { await f.close() }
+})
+
+function controlledFrameDriver({ renderFrames = true, covered = false } = {}) {
+  let now = 0, frame = 0, nextId = 0, pumping = false
+  const tasks = new Map(), inputs = [], deadlines = [], cancelledFrames = []
+  const pump = () => {
+    if (pumping || ![...tasks.values()].some(task => Number.isFinite(task.at))) return
+    pumping = true
+    setImmediate(() => {
+      pumping = false
+      const next = [...tasks.entries()].filter(([, task]) => Number.isFinite(task.at)).sort((a, b) => a[1].at - b[1].at)[0]
+      if (!next) return
+      const [id, task] = next
+      tasks.delete(id)
+      now = task.at
+      if (task.frame) frame++
+      task.callback(now)
+      pump()
+    })
+  }
+  const schedule = (callback, at, isFrame = false) => {
+    const id = ++nextId
+    tasks.set(id, { callback, at, frame: isFrame })
+    pump()
+    return id
+  }
+  const clock = {
+    Date: { now: () => now },
+    setTimeout(callback, milliseconds) { deadlines.push(now + milliseconds); return schedule(callback, now + milliseconds) },
+    clearTimeout(id) { tasks.delete(id) },
+    // At 30 fps, a 16 ms timer can run without a new rendering frame.
+    requestAnimationFrame(callback) { return schedule(callback, renderFrames ? now + 1000 / 30 : Infinity, true) },
+    cancelAnimationFrame(id) { cancelledFrames.push(id); tasks.delete(id) },
+  }
+  class Control {
+    tagName = 'BUTTON'
+    innerText = 'Close'
+    isConnected = true
+    getBoundingClientRect() {
+      const x = Math.max(100, 300 - frame * 100)
+      return { x, y: 100, width: 40, height: 20, left: x, right: x + 40, top: 100, bottom: 120 }
+    }
+    getAttribute() { return null }
+    hasAttribute() { return false }
+    scrollIntoView() {}
+    matches() { return false }
+    contains(other) { return other === this }
+  }
+  const button = new Control()
+  const renderer = {
+    ...clock, Element: Control,
+    document: { getElementById: () => null, querySelectorAll: () => [button], elementFromPoint: () => covered ? null : button },
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    innerWidth: 800, innerHeight: 700,
+  }
+  const contents = {
+    isDestroyed: () => false,
+    focus() {},
+    executeJavaScript: expression => runInNewContext(expression, renderer),
+    debugger: { isAttached: () => true, async sendCommand(command, args) { inputs.push({ command, ...args }) } },
+  }
+  const app = {
+    evaluate: (fn, request) => runInNewContext(`(${fn.toString()})(environment, request)`, {
+      ...clock, request, environment: { webContents: { fromId: () => contents } },
+    }),
+  }
+  return {
+    driver: createBusinessDriver(app, () => 1, async () => {}),
+    inputs, deadlines, cancelledFrames,
+    elapsed: () => now,
+    pending: () => tasks.size,
+  }
+}
+
+test('timer samples within one rendering frame do not make moving controls actionable', async () => {
+  const f = controlledFrameDriver()
+  const point = await f.driver.click('Close')
+  assert.equal(point.x, 120, 'click must use the position after movement stops between frames')
+  assert.equal(f.inputs.length, 3)
+  assert.ok(f.inputs.every(input => input.command === 'Input.dispatchMouseEvent' && input.x === 120))
+  assert.ok(f.deadlines.every(deadline => deadline === 4000), 'frame waits must share the action deadline')
+  assert.equal(f.pending(), 0, 'successful frame samples must clear their watchdogs')
+})
+
+test('a renderer that stops producing frames fails within the action budget without input', async () => {
+  const f = controlledFrameDriver({ renderFrames: false })
+  await assert.rejects(f.driver.click('Close'), /SEMANTIC_CONTROL_UNAVAILABLE/)
+  assert.equal(f.elapsed(), 4000)
+  assert.deepEqual(f.inputs, [])
+  assert.equal(f.cancelledFrames.length, 1)
+  assert.equal(f.pending(), 0, 'timed-out frame callbacks must be cancelled')
+})
+
+test('the action deadline preserves the last confirmed covered-control failure', async () => {
+  const f = controlledFrameDriver({ covered: true })
+  await assert.rejects(f.driver.click('Close'), /SEMANTIC_CONTROL_COVERED/)
+  assert.deepEqual(f.inputs, [])
+  assert.equal(f.pending(), 0)
 })
 
 for (const kind of ['disabled', 'covered']) {
