@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -406,6 +407,12 @@ def test_concurrent_callers_share_one_timed_out_load(
     start = threading.Event()
     calls: list[int] = []
     results: list[tuple[int, str]] = []
+    load_join_timeouts: list[float | None] = []
+
+    class _RecordingLoadThread(threading.Thread):
+        def join(self, timeout: float | None = None) -> None:
+            load_join_timeouts.append(timeout)
+            super().join(timeout)
 
     def _wedged():
         calls.append(1)
@@ -420,20 +427,27 @@ def test_concurrent_callers_share_one_timed_out_load(
     monkeypatch.setattr(token_estimation, "_load_encoding", _wedged)
     monkeypatch.setenv(token_estimation._ENCODING_LOAD_TIMEOUT_ENV, "0.05")
     threads = [threading.Thread(target=_caller) for _ in range(8)]
+    # Record only this module's loader without patching the shared threading module.
+    monkeypatch.setattr(
+        token_estimation,
+        "threading",
+        SimpleNamespace(**(vars(threading) | {"Thread": _RecordingLoadThread})),
+    )
     for thread in threads:
         thread.start()
 
-    started = time.monotonic()
     try:
         start.set()
         for thread in threads:
             thread.join(2)
-        elapsed = time.monotonic() - started
 
         assert all(not thread.is_alive() for thread in threads)
         assert results == [(200, "utf8_unicode_conservative")] * 8
         assert len(calls) == 1
-        assert elapsed < 0.5
+        # Check the actual shared load budget, independent of caller scheduling.
+        assert load_join_timeouts == [0.05]
+        assert not completed.is_set()
+        assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
     finally:
         release.set()
         assert completed.wait(1)

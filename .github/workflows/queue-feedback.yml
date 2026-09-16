@@ -1,0 +1,58 @@
+name: Merge queue feedback
+
+"on":
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: queue-feedback-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: ${{ github.event.workflow_run.event == 'merge_group' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      # workflow_run uses the default-branch workflow. Never check out or run
+      # candidate code/artifacts with this token; report GitHub metadata only.
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            if (run.repository?.full_name !== repository ||
+                run.head_repository?.full_name !== repository ||
+                run.path !== '.github/workflows/ci.yml' ||
+                run.status !== 'completed') return;
+            const match = /^gh-readonly-queue\/main\/pr-([1-9][0-9]*)-[0-9a-f]{40}$/.exec(run.head_branch);
+            if (!match) return;
+            const pull_number = Number(match[1]);
+            const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number});
+            if (pr.base.ref !== 'main') return;
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              ...context.repo, run_id: run.id, filter: 'latest', per_page: 100,
+            });
+            const marker = `<!-- opensquilla-queue-result:${run.id}:${run.run_attempt} -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: pull_number, per_page: 100,
+            });
+            if (comments.some(c => c.user.type === 'Bot' && c.body?.includes(marker))) return;
+            const failed = jobs.filter(j => !['success', 'skipped'].includes(j.conclusion));
+            const lines = failed.map(j => `- [${j.name}](${j.html_url}): ${j.conclusion || j.status}`);
+            const body = [
+              marker,
+              `Merge queue CI: **${run.conclusion}** — [run ${run.id}, attempt ${run.run_attempt}](${run.html_url}).`,
+              `Tested queue candidate: \`${run.head_sha}\`. This result belongs to that combined tree, not necessarily the PR's current head.`,
+              '',
+              ...lines,
+              '',
+              'The run summary lists reused suites and executed checks. A green PR check alone does not mean queue validation has passed.',
+            ].join('\n');
+            await github.rest.issues.createComment({...context.repo, issue_number: pull_number, body});

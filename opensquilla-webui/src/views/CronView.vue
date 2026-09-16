@@ -233,7 +233,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onActivated, ref } from 'vue'
+import { computed, inject, nextTick, onActivated, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
@@ -251,10 +251,13 @@ import type { CronJob, CronPanelTemplate } from '@/types/cron'
 import type { IconName } from '@/utils/icons'
 import { humanCountdown } from '@/utils/cron/time'
 import { localizedCronJobName, localizedCronTemplate } from '@/utils/cron/templateNames'
+import { CRON_SCHEDULER_KEY } from '@/modules/cronScheduler'
 
 const router = useRouter()
 const { t } = useI18n()
 const { pushToast } = useToasts()
+const cronScheduler = inject(CRON_SCHEDULER_KEY)
+if (!cronScheduler) throw new Error('CronScheduler was not provided')
 const selectedId = ref<string | null>(null)
 const deleteModalOpen = ref(false)
 const deleteTarget = ref<CronJob | null>(null)
@@ -264,9 +267,9 @@ const bulkMode = ref(false)
 const bulkWorking = ref(false)
 const selectedJobIds = ref<Set<string>>(new Set())
 
-const cronJobs = useCronJobs()
-const cronRuns = useCronRuns(selectedId)
-const cronForm = useCronForm({ afterSaved: cronJobs.loadData })
+const cronJobs = useCronJobs(cronScheduler)
+const cronRuns = useCronRuns(cronScheduler, selectedId)
+const cronForm = useCronForm(cronScheduler, { afterSaved: cronJobs.loadData })
 
 onActivated(() => {
   void cronForm.loadProjectWorkspaces().catch(() => undefined)

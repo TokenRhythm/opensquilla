@@ -221,7 +221,10 @@ def test_synthesized_presets_bind_all_text_tiers_to_provider_default() -> None:
             else:
                 assert entry["model"]
             assert entry["description"]
-            assert entry["supports_image"] is False
+            # Synthesized rows do not carry authoritative capability evidence.
+            # Omission remains probeable; only an operator-authored false may
+            # be treated as a definitive negative declaration.
+            assert "supports_image" not in entry
 
 
 def test_curated_synthesized_presets_pin_live_verified_ladders() -> None:

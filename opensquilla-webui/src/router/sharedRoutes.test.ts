@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RouteLocationNormalized } from 'vue-router'
-import i18n, { loadLocaleMessages } from '@/i18n'
+import i18n from '@/i18n'
 import { LAST_ROUTE_KEY } from './lastRoute'
 import { defaultRootRedirect } from './sharedRoutes'
 import { routeTitle, routes } from './index'
@@ -25,7 +25,7 @@ beforeEach(() => {
 describe('defaultRootRedirect', () => {
   it('opens the desktop app on Chat even when a previous route was saved', () => {
     window.opensquillaDesktop = {} as never
-    localStorage.setItem(LAST_ROUTE_KEY, '/sessions')
+    localStorage.setItem(LAST_ROUTE_KEY, '/chat')
 
     expect(defaultRootRedirect()).toBe('/chat')
   })
@@ -104,15 +104,9 @@ describe('route hubs', () => {
     expect(titles).toEqual(['Status', 'Usage', 'Logs'])
   })
 
-  it('uses the localized task title for the sessions ledger', async () => {
-    await loadLocaleMessages('zh-Hans')
-    i18n.global.locale.value = 'zh-Hans'
+  it('keeps the removed sessions page as a chat compatibility redirect', () => {
     const sessions = routeAt('/sessions')
-
-    expect(sessions.meta?.titleKey).toBe('sessions.title')
-    expect(routeTitle({
-      name: sessions.name,
-      meta: sessions.meta,
-    } as unknown as RouteLocationNormalized)).toBe('任务')
+    expect(sessions.redirect).toBe('/chat')
+    expect(sessions.component).toBeUndefined()
   })
 })

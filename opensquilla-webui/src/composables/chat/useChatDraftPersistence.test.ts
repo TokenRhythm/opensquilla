@@ -6,6 +6,7 @@ import { effectScope, nextTick, ref } from 'vue'
 import {
   RECENT_DRAFT_SESSION_KEY,
   recentDraftSessionKey,
+  recoverableDraftSessionKey,
   useChatDraftPersistence,
 } from './useChatDraftPersistence'
 
@@ -99,6 +100,19 @@ describe('useChatDraftPersistence', () => {
 
     expect(recentDraftSessionKey()).toBe('agent:main:webchat:b')
     expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:a')).toBe('draft A')
+  })
+
+  it('validates a scoped draft without changing the recent pointer', () => {
+    const scopedKey = 'agent:main:webchat:scoped'
+    const recentKey = 'agent:main:webchat:recent'
+    localStorage.setItem(`opensquilla.chat.draft:${scopedKey}`, 'scoped draft')
+    localStorage.setItem(`opensquilla.chat.draft:${recentKey}`, 'recent draft')
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, recentKey)
+
+    expect(recoverableDraftSessionKey(scopedKey)).toBe(scopedKey)
+    expect(recoverableDraftSessionKey('agent:main:webchat:missing')).toBe('')
+    expect(recoverableDraftSessionKey('not-a-session')).toBe('')
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBe(recentKey)
   })
 
   it('explicitly discards the recoverable draft without scanning other drafts', async () => {

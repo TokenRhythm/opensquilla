@@ -1,5 +1,6 @@
+import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import type { Attachment } from '@/types/chat'
-import type { ChatSendParams } from '@/types/rpc'
+import type { TurnSendParams } from '@/modules/turnCommands'
 
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
 const DATABASE_VERSION = 2
@@ -21,7 +22,11 @@ export interface PendingInputWalRecord {
   clientMessageId: string
   text: string
   /** Annotation batch retained across IndexedDB/WAL queue recovery. */
+  draftIds?: string[]
+  /** Read-only upgrade input; never sent to Gateway. */
   promptAnnotationIds?: string[]
+  retiredAnnotationInput?: boolean
+  pageContext?: ChatPageContext
   attachments: Attachment[]
   intent: string | null
   confirmedPlainText?: boolean
@@ -47,7 +52,7 @@ export interface ResponseHandoffWalRecord {
   requestSessionKey: string
   clientRequestId: string
   clientMessageId: string
-  params: ChatSendParams
+  params: TurnSendParams
   composerText: string
   recoveryAttachments: Attachment[]
   /** A protocol-owned replay must never be restored into the user composer. */
@@ -120,7 +125,7 @@ const WAL_STATES = new Set<PendingInputWalState>([
   'cancelling',
 ])
 
-function validPromptAnnotationIds(value: unknown): boolean {
+function validAnnotationDraftIds(value: unknown): boolean {
   if (value === undefined) return true
   if (!Array.isArray(value) || value.length > 16) return false
   return value.every((item, index) => (
@@ -143,7 +148,8 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
     && typeof record.clientMessageId === 'string'
     && record.clientMessageId.length > 0
     && typeof record.text === 'string'
-    && validPromptAnnotationIds(record.promptAnnotationIds)
+    && validAnnotationDraftIds(record.draftIds)
+    && (record.pageContext === undefined || normalizePageContext(record.pageContext) !== null)
     && Array.isArray(record.attachments)
     && record.attachments.every(attachment => (
       attachment !== null && typeof attachment === 'object'
@@ -180,7 +186,7 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
 function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWalRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const record = value as Partial<ResponseHandoffWalRecord>
-  const params = record.params as Partial<ChatSendParams> | undefined
+  const params = record.params as Partial<TurnSendParams> | undefined
   return record.schemaVersion === 1
     && typeof record.ownerRequestId === 'string'
     && record.ownerRequestId.length > 0
@@ -235,10 +241,13 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
 }
 
 function cloneRecord(record: PendingInputWalRecord): PendingInputWalRecord {
+  const { promptAnnotationIds, ...current } = record
   return {
-    ...record,
-    ...(record.promptAnnotationIds
-      ? { promptAnnotationIds: [...record.promptAnnotationIds] }
+    ...current,
+    ...(promptAnnotationIds?.length ? { retiredAnnotationInput: true } : {}),
+    ...(record.pageContext ? { pageContext: normalizePageContext(record.pageContext)! } : {}),
+    ...(record.draftIds
+      ? { draftIds: [...record.draftIds] }
       : {}),
     attachments: record.attachments.map(attachment => ({ ...attachment })),
   }

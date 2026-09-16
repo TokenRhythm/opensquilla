@@ -1,7 +1,7 @@
 """RPC layer must let users set webhook delivery on a cron job.
 
 Webhook delivery is plumbed through ``scheduler.delivery``, but the RPC
-``cron.add`` payload originally only parsed channel-mode overrides. These
+The cron creation payload originally only parsed channel-mode overrides. These
 tests assert the wire payload can carry webhook mode end-to-end.
 """
 
@@ -13,8 +13,12 @@ import pytest
 
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_cron import (
-    _handle_cron_add,
-    _handle_cron_update,
+    _cron_create_contract as _handle_cron_add,
+)
+from opensquilla.gateway.rpc_cron import (
+    _cron_update_contract as _handle_cron_update,
+)
+from opensquilla.gateway.rpc_cron import (
     _job_to_wire,
 )
 from opensquilla.scheduler.payloads import AGENT_TURN_KIND, SYSTEM_EVENT_KIND

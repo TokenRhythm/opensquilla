@@ -1,4 +1,4 @@
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 
 const ARTIFACT_CARD_SELECTOR = [
   '.msg-media-card',

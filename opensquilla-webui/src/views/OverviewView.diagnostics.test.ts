@@ -81,6 +81,9 @@ async function mountOverview(options: MountOptions = {}) {
     params?: unknown,
     callOptions?: { signal?: AbortSignal },
   ) => {
+    if (method === 'status') {
+      return { ready: true, version: 'test' }
+    }
     if (method === 'doctor.status') {
       if (options.report === null) throw new Error('doctor unavailable')
       if (options.doctorHandler) {
@@ -108,7 +111,7 @@ async function mountOverview(options: MountOptions = {}) {
         return options.sessionsListHandler(sessionsListCallIndex++, callOptions)
       }
       if (options.sessionsList === null) throw new Error('sessions unavailable')
-      return options.sessionsList ?? { sessions: [], count: 0 }
+      return options.sessionsList ?? { sessions: [], count: 0, ts: 1 }
     }
     throw new Error(`unexpected rpc method: ${method}`)
   })
@@ -119,28 +122,12 @@ async function mountOverview(options: MountOptions = {}) {
       isConnected: true,
       isConnecting: false,
       on: rpcOn,
-      waitForConnection: vi.fn(async () => {}),
+      ready: vi.fn(async () => {}),
       call: rpcCall,
-      supportsMethod: vi.fn(() => true),
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: vi.fn(() => true),
+      rememberUnsupportedMethod: vi.fn(),
     }),
   }))
-  const useRequestMethods: string[] = []
-  vi.doMock('@/composables/useRequest', async () => {
-    const { ref } = await import('vue')
-    return {
-      useRequest: (method: string) => {
-        useRequestMethods.push(method)
-        return {
-          data: ref(null),
-          error: ref(null),
-          loading: ref(false),
-          execute: vi.fn(async () => null),
-          refresh: vi.fn(async () => null),
-        }
-      },
-    }
-  })
   vi.doMock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
   vi.doMock('@/utils/browser', () => ({ copyTextWithFallback: copyText }))
   vi.doMock('@/components/Icon.vue', () => ({
@@ -160,6 +147,10 @@ async function mountOverview(options: MountOptions = {}) {
   const { createV4SessionDirectory } = await import('@/adapters/gateway/sessionDirectoryV4')
   type SessionDirectoryTransport = Parameters<typeof createV4SessionDirectory>[0]
   const { SESSION_DIRECTORY_KEY } = await import('@/modules/sessionDirectory')
+  const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
+  const { OBSERVABILITY_KEY } = await import('@/modules/observability')
+  const { CHANNEL_ADMINISTRATION_KEY } = await import('@/modules/channelAdministration')
+  const { createV4Observability } = await import('@/adapters/gateway/observabilityV4')
   const active = ref(true)
   const TestHost = defineComponent({
     name: 'OverviewTestHost',
@@ -182,6 +173,51 @@ async function mountOverview(options: MountOptions = {}) {
     request: rpcCall,
     ready: vi.fn(async () => {}),
   } as unknown as SessionDirectoryTransport))
+  app.provide(PROVIDER_CONFIGURATION_KEY, {
+    status: vi.fn(async () => {
+      const rawResponse = await rpcCall('providers.status', {}) as unknown
+      const raw = rawResponse && typeof rawResponse === 'object'
+        ? rawResponse as { providers?: unknown[] }
+        : { providers: [] }
+      const providers = Array.isArray(raw.providers)
+        ? raw.providers
+          .filter((row): row is Record<string, unknown> => Boolean(row && typeof row === 'object'))
+          .map(row => ({
+            providerId: String(row.providerId ?? ''),
+            active: row.active === true,
+            configured: row.configured === true,
+            buildable: row.buildable !== false,
+            model: typeof row.model === 'string' ? row.model : null,
+            requiresApiKey: row.requiresApiKey === true,
+            apiKeyEnv: typeof row.apiKeyEnv === 'string' ? row.apiKeyEnv : null,
+            apiKeyConfigured: row.apiKeyConfigured === true,
+            apiKeyShape: typeof row.apiKeyShape === 'string' ? row.apiKeyShape : null,
+            baseUrlConfigured: row.baseUrlConfigured === true,
+            error: typeof row.error === 'string' ? row.error : null,
+            modelProbe: typeof row.modelProbe === 'string' ? row.modelProbe : null,
+            latency: row.latency && typeof row.latency === 'object' ? row.latency as Record<string, unknown> : null,
+          }))
+        : []
+      return {
+        activeProvider: providers.find(row => row.active)?.providerId || null,
+        providerResolution: {},
+        providers,
+        count: providers.length,
+      }
+    }),
+  } as unknown as import('@/modules/providerConfiguration').ProviderConfiguration)
+  app.provide(OBSERVABILITY_KEY, createV4Observability({
+    request: rpcCall,
+    ready: vi.fn(async () => {}),
+    supports: vi.fn(() => true),
+    markUnsupported: vi.fn(),
+  }, {
+    requestJson: vi.fn(),
+    requestBinary: vi.fn(),
+  }))
+  app.provide(CHANNEL_ADMINISTRATION_KEY, {
+    status: vi.fn(async () => []),
+  } as unknown as import('@/modules/channelAdministration').ChannelAdministration)
   app.mount(el)
   mountedApps.push({ app, el })
 
@@ -211,7 +247,6 @@ async function mountOverview(options: MountOptions = {}) {
     copyText,
     rpcCall,
     rpcOn,
-    useRequestMethods,
     flush,
     setActive,
     unmount,
@@ -232,7 +267,6 @@ afterEach(() => {
   }
   vi.doUnmock('vue-router')
   vi.doUnmock('@/stores/rpc')
-  vi.doUnmock('@/composables/useRequest')
   vi.doUnmock('@/composables/useToasts')
   vi.doUnmock('@/utils/browser')
   vi.doUnmock('@/components/Icon.vue')
@@ -248,13 +282,13 @@ const DIAGNOSE_SELECTOR = '[title="Diagnose with agent"]'
 
 describe('OverviewView status lifecycle', () => {
   it('drops the old activity panels and their data sources', async () => {
-    const { el, rpcCall, rpcOn, useRequestMethods } = await mountOverview()
+    const { el, rpcCall, rpcOn } = await mountOverview()
 
     expect(el.querySelector('.ov-grid')).toBeNull()
     expect(el.querySelector('.ov-recent')).toBeNull()
     expect(el.querySelector('.conn-pill')).toBeNull()
     expect(el.querySelector('.ov-event-log')).toBeNull()
-    expect(useRequestMethods).toEqual(['status'])
+    expect(rpcCall).toHaveBeenCalledWith('status', {}, expect.any(Object))
     // The Total sessions KPI reads sessions.list (same source as the Sessions
     // page) so sessions without usage records still count.
     const sessionsListCalls = rpcCall.mock.calls.filter(
@@ -273,6 +307,7 @@ describe('OverviewView status lifecycle', () => {
           { key: 'unknown', title: 'ignored' },
         ],
         count: 2,
+        ts: 1,
       },
     })
     await flush()
@@ -288,6 +323,7 @@ describe('OverviewView status lifecycle', () => {
           title: `Session ${index}`,
         })),
         count: 200,
+        ts: 1,
         totalCount: 201,
       },
     })
@@ -297,10 +333,11 @@ describe('OverviewView status lifecycle', () => {
   })
 
   it('lets an authoritative stored-session count decrease after deletion', async () => {
-    const { el, flush } = await mountOverview({
+    const { el, flush, rpcCall } = await mountOverview({
       sessionsListHandler: (callIndex) => ({
         sessions: [{ key: 'agent:main:webchat:remaining', title: 'Remaining' }],
         count: callIndex === 0 ? 200 : 1,
+        ts: callIndex + 1,
         totalCount: callIndex === 0 ? 201 : 1,
       }),
     })
@@ -309,16 +346,19 @@ describe('OverviewView status lifecycle', () => {
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
 
     el.querySelector<HTMLButtonElement>('.ov-status-actions .btn--ghost')!.click()
+    await vi.waitFor(() => {
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'sessions.list')).toHaveLength(2)
+    })
     await flush()
 
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
   })
 
-  it('treats a legacy bounded page as a lower bound, not an exact decrease', async () => {
+  it('keeps the prior exact total when a later legacy keys-only result is rejected', async () => {
     const { el, flush } = await mountOverview({
       sessionsListHandler: (callIndex) => (
         callIndex === 0
-          ? { sessions: [], count: 200, totalCount: 201 }
+          ? { sessions: [], count: 200, totalCount: 201, ts: 1 }
           : { keys: ['agent:main:webchat:remaining'], count: 1 }
       ),
     })
@@ -332,7 +372,7 @@ describe('OverviewView status lifecycle', () => {
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
   })
 
-  it('accepts the legacy keys-only sessions.list response', async () => {
+  it('rejects a legacy keys-only sessions.list response', async () => {
     const { el, flush } = await mountOverview({
       sessionsList: {
         keys: ['agent:main:webchat:legacy-without-usage'],
@@ -341,7 +381,7 @@ describe('OverviewView status lifecycle', () => {
     })
     await flush()
     const card = el.querySelector('[title="Total sessions across all statuses"]')
-    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('0')
   })
 
   it('keeps the last exact total across a transient sessions.list failure', async () => {
@@ -351,6 +391,7 @@ describe('OverviewView status lifecycle', () => {
           return {
             sessions: [{ key: 'agent:main:webchat:persisted', title: 'Persisted' }],
             count: 1,
+            ts: 1,
             totalCount: 1,
           }
         }
@@ -425,7 +466,7 @@ describe('OverviewView status lifecycle', () => {
         if (callOptions?.signal) countSignals.push(callOptions.signal)
         return callIndex === 0
           ? firstCount
-          : { sessions: [], totalCount: 2 }
+          : { sessions: [], count: 0, totalCount: 2, ts: 2 }
       },
     })
 
@@ -440,7 +481,7 @@ describe('OverviewView status lifecycle', () => {
     const card = el.querySelector('[title="Total sessions across all statuses"]')
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('2')
 
-    resolveFirst({ sessions: [], totalCount: 99 })
+    resolveFirst({ sessions: [], count: 0, totalCount: 99, ts: 1 })
     await flush()
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('2')
   })
@@ -461,7 +502,7 @@ describe('OverviewView status lifecycle', () => {
     expect(countSignal?.aborted).toBe(false)
     await unmount()
     expect(countSignal?.aborted).toBe(true)
-    resolveCount({ sessions: [], totalCount: 1 })
+    resolveCount({ sessions: [], count: 0, totalCount: 1, ts: 1 })
   })
 })
 

@@ -5,6 +5,11 @@ profile. This module only canonicalizes those spellings on disk when doing so
 is possible. It deliberately has no persistent backup or permission-hardening
 dependency: failure to normalize an optional compatibility field must never
 make the gateway unavailable.
+
+Writes are atomic per store, but the profile has more than one store.  A
+later Windows file-sharing failure can therefore leave an earlier store
+canonicalized; reports mark that case as ``partial_commit`` so it is visible
+to diagnostics while the legacy decoder keeps startup safe.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +45,11 @@ class UpgradeMigrationReport:
     journal_path: Path
     snapshot_path: Path | None
     stores: tuple[str, ...]
+    # Files that were durably replaced before a later write failed.  A
+    # migration is intentionally best effort because legacy spellings remain
+    # readable, but exposing this distinction prevents a partial commit from
+    # being mistaken for an all-or-nothing retry.
+    committed_stores: tuple[str, ...] = ()
     error: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -49,6 +60,7 @@ class UpgradeMigrationReport:
             "journalPath": str(self.journal_path),
             "snapshotPath": str(self.snapshot_path) if self.snapshot_path else None,
             "stores": list(self.stores),
+            "committedStores": list(self.committed_stores),
             "error": self.error,
         }
 
@@ -83,7 +95,18 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+        # Windows readers can briefly hold the destination open (virus
+        # scanners and the desktop shell are common examples).  Retry only
+        # the documented sharing/permission contention errors; unrelated
+        # failures must remain visible to the coordinator.
+        for attempt in range(5):
+            try:
+                os.replace(temporary_path, path)
+                break
+            except OSError as exc:
+                if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 4:
+                    raise
+                time.sleep(0.02 * (2**attempt))
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -217,6 +240,23 @@ def _cleanup_legacy_artifacts(home: Path) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def _legacy_cleanup_block_reason(home: Path) -> str | None:
+    """Keep recovery material when its provenance cannot be validated."""
+
+    journal = home / JOURNAL_NAME
+    if not _path_exists_no_follow(journal):
+        return None
+    try:
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"{JOURNAL_NAME}: unreadable ({type(exc).__name__}: {exc})"
+    if not isinstance(payload, dict) or payload.get("migrationVersion") != MIGRATION_VERSION:
+        return f"{JOURNAL_NAME}: unsupported migration version"
+    if payload.get("status") not in {"prepared", "committed"}:
+        return f"{JOURNAL_NAME}: unknown migration status"
+    return None
+
+
 def inventory_sandbox_stores(home: str | Path) -> tuple[Path, ...]:
     """Return only configuration files that this migrator may rewrite."""
 
@@ -245,6 +285,7 @@ class SandboxUpgradeCoordinator:
         status: str,
         canonical_mode: str | None = None,
         stores: tuple[str, ...] = (),
+        committed_stores: tuple[str, ...] = (),
         error: str | None = None,
     ) -> UpgradeMigrationReport:
         return UpgradeMigrationReport(
@@ -256,6 +297,7 @@ class SandboxUpgradeCoordinator:
                 self.snapshot_path if _path_exists_no_follow(self.snapshot_path) else None
             ),
             stores=stores,
+            committed_stores=committed_stores,
             error=error,
         )
 
@@ -278,6 +320,7 @@ class SandboxUpgradeCoordinator:
                 canonical_mode=canonical_mode,
             )
 
+        committed_stores: list[str] = []
         try:
             from opensquilla.recovery.locking import acquire_profile_locks
 
@@ -290,13 +333,25 @@ class SandboxUpgradeCoordinator:
                     _validate_payload(planned)
                 for planned in planned_writes:
                     _atomic_write(planned.path, planned.payload)
-                cleanup_errors = _cleanup_legacy_artifacts(self.home)
+                    committed_stores.append(planned.path.name)
+                cleanup_block = _legacy_cleanup_block_reason(self.home)
+                cleanup_errors = (
+                    (cleanup_block,)
+                    if cleanup_block is not None
+                    else _cleanup_legacy_artifacts(self.home)
+                )
         except Exception as exc:
+            # os.replace is atomic per file, not across the complete set of
+            # profile stores.  If a later store is locked (common on Windows),
+            # report the files already committed so recovery tooling and logs
+            # can distinguish a partial commit from a clean retry.
+            committed = tuple(committed_stores)
             return self._report(
                 ok=False,
-                status="retry_required",
+                status="partial_commit" if committed else "retry_required",
                 canonical_mode=canonical_mode,
                 stores=tuple(item.path.name for item in initial_writes),
+                committed_stores=committed,
                 error=f"{type(exc).__name__}: {exc}",
             )
 

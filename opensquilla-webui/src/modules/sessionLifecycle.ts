@@ -23,6 +23,17 @@ export interface CreatedSession {
   note?: string
 }
 
+/** Fork a conversation, optionally including one complete terminal turn. */
+export interface SessionForkRequest extends SessionLifecycleRequestOptions {
+  key: string
+  throughTurnId?: string
+}
+
+/** Durable child identity; wire acknowledgement details stay in the Adapter. */
+export interface ForkedSession {
+  key: string
+}
+
 export interface SessionRenameRequest extends SessionLifecycleRequestOptions {
   key: string
   title: string
@@ -69,6 +80,7 @@ export class SessionLifecycleError extends Error {
  */
 export interface SessionLifecycle {
   create(request?: SessionCreateRequest): Promise<CreatedSession>
+  fork(request: SessionForkRequest): Promise<ForkedSession>
   rename(request: SessionRenameRequest): Promise<SessionRenameResult>
   remove(
     keys: readonly string[],

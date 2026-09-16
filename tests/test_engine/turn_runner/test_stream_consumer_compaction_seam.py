@@ -108,7 +108,11 @@ async def test_persist_compaction_result_invoked_with_event_args(
 
     case = _baseline_case()
     runner = _setup_runner(monkeypatch, case)
-    await _drive(runner)
+    await _drive(
+        runner,
+        expected_session_id="session-admitted",
+        expected_session_epoch=7,
+    )
 
     sm = runner._session_manager
     assert isinstance(sm, _RecordingSessionManager)
@@ -117,6 +121,8 @@ async def test_persist_compaction_result_invoked_with_event_args(
     assert persist_calls[0][1] == "agent:main:s1"
     assert persist_calls[0][2] == "THE_SUMMARY"
     assert persist_calls[0][3] == [10, 20, 30]
+    assert persist_calls[0][4]["expected_session_id"] == "session-admitted"
+    assert persist_calls[0][4]["expected_session_epoch"] == 7
 
 
 @pytest.mark.asyncio

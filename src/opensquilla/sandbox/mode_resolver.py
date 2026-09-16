@@ -52,14 +52,7 @@ def resolve_mode(
 
     if capability.available:
         return ResolvedMode(desired_mode=desired, effective_mode=RunMode.SAFE)
-    if host_execute:
-        return ResolvedMode(
-            desired_mode=desired,
-            effective_mode=RunMode.FULL,
-            fallback_reason=capability.code,
-            confirmation_required=True,
-        )
-    raise ModeResolutionError("sandbox_unavailable_for_guest")
+    raise ModeResolutionError("sandbox_unavailable")
 
 
 __all__ = [

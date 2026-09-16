@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from .errors import ArtifactConflictError
+
 
 class ArtifactKind(StrEnum):
     """Logical editor family for a document."""
@@ -226,6 +228,38 @@ class ChangeSet:
         )
 
 
+def head_restore_receipt_state_revision(change_set: ChangeSet, revision: Revision) -> int | None:
+    """Validate a head-restoration receipt; leave legacy copy receipts to their validator."""
+
+    validation = change_set.validation or {}
+    mode = validation.get("restore_mode")
+    if mode is None:
+        return None
+    operation = change_set.operations[0] if len(change_set.operations) == 1 else {}
+    expected = operation.get("expected_document_state_revision")
+    result_state = validation.get("result_state_revision")
+    no_op = validation.get("no_op")
+    if (
+        mode != "head_pointer"
+        or change_set.status is not ChangeSetStatus.APPLIED
+        or operation.get("op") != "restore_revision"
+        or operation.get("target_revision_id") != revision.revision_id
+        or operation.get("target_sha256") != revision.artifact_sha256
+        or change_set.applied_revision_id != revision.revision_id
+        or change_set.document_id != revision.document_id
+        or change_set.candidate_artifact_id != revision.artifact_id
+        or change_set.candidate_artifact_sha256 != revision.artifact_sha256
+        or type(expected) is not int
+        or expected < 1
+        or type(result_state) is not int
+        or type(no_op) is not bool
+        or result_state != expected + (0 if no_op else 1)
+        or (no_op and change_set.base_revision_id != revision.revision_id)
+    ):
+        raise ArtifactConflictError("head restoration receipt is inconsistent")
+    return result_state
+
+
 @dataclass(frozen=True, slots=True)
 class Anchor:
     """Revision-scoped structured locator for an annotation or change set."""
@@ -263,30 +297,6 @@ class PromptAnnotation:
     created_at: int
     updated_at: int
     schema_version: int = 1
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedPromptAnnotationTarget:
-    """Send-time anchor replacement fenced by one immutable draft snapshot.
-
-    HTML parsing happens before turn acceptance.  This bounded value is then
-    applied inside SessionStorage's acceptance transaction, where the document
-    head and draft CAS are checked again before any transcript, task, or
-    request receipt becomes visible.
-    """
-
-    expected_annotation: PromptAnnotation
-    previous_anchor_id: str
-    anchor_id: str
-    audit_event_id: str
-    revision_id: str
-    kind: AnchorKind
-    locator: dict[str, Any]
-    quote: str | None
-    context: dict[str, Any]
-    state: AnchorState
-    actor_kind: ActorKind
-    actor_id: str
 
 
 @dataclass(frozen=True, slots=True)

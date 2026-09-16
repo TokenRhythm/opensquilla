@@ -26,7 +26,11 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
         stream=True,
     )
     recorder.record_request(
-        payload={"model": "qwen3.6-flash", "messages": [{"role": "user", "content": "hi"}]},
+        payload={
+            "model": "qwen3.6-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "vendor_options": {"api_key": "nested-secret"},
+        },
         headers={
             "Authorization": "Bearer secret",
             "Content-Type": "application/json",
@@ -55,6 +59,7 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
         "llm.response",
     ]
     assert rows[0]["payload"]["messages"][0]["content"] == "hi"
+    assert rows[0]["payload"]["vendor_options"]["api_key"] == "[REDACTED]"
     assert rows[0]["headers"]["Authorization"] == "[REDACTED]"
     assert rows[0]["headers"]["X-OpenSquilla-Install-Id"] == "[PRESENT]"
     assert rows[0]["headers"]["X-OpenSquilla-Session-Id"] == "[PRESENT]"

@@ -12,12 +12,9 @@ import pytest
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
-    AnchorKind,
     ArtifactBlobRef,
-    ArtifactConflictError,
     ArtifactKind,
     ArtifactSessionService,
-    PromptAnnotationStatus,
 )
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
@@ -33,6 +30,7 @@ from opensquilla.session.models import (
 from opensquilla.session.storage import (
     MetaLaunchDraftDiscardedError,
     SessionStorage,
+    StaleEpochError,
     StorageBusyError,
     TurnIngressConflictError,
 )
@@ -125,131 +123,10 @@ async def _receipt_rows(storage: SessionStorage) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-async def _prompt_annotation_draft(storage: SessionStorage):
-    service = await ArtifactSessionService.from_session_storage(storage)
-    created = await service.create_document(
-        session_key=SESSION_KEY,
-        session_id=SESSION_ID,
-        name="page.html",
-        kind=ArtifactKind.HTML,
-        initial_artifact=ArtifactBlobRef(
-            artifact_id="artifact-html-1",
-            sha256="a" * 64,
-            filename="page.html",
-            media_type="text/html",
-            byte_size=13,
-        ),
-        actor=Actor(ActorKind.USER, "user-1"),
-    )
-    anchor = await service.create_anchor(
-        document_id=created.document.document_id,
-        revision_id=created.revision.revision_id,
-        kind=AnchorKind.DOM_SOURCE,
-        locator={"start_offset": 0, "start_tag_end_offset": 6, "tag_name": "main"},
-        quote="<main>",
-        actor=Actor(ActorKind.USER, "user-1"),
-    )
-    draft = await service.create_prompt_annotation(
-        annotation_id="annotation-acceptance-1",
-        session_key=SESSION_KEY,
-        session_id=SESSION_ID,
-        session_epoch=0,
-        document_id=created.document.document_id,
-        revision_id=created.revision.revision_id,
-        anchor_id=anchor.anchor_id,
-        body="Make this concise.",
-    )
-    return service, draft
 
 
-@pytest.mark.asyncio
-async def test_accept_turn_consumes_prompt_annotation_with_message_and_receipt(
-    tmp_path: Path,
-) -> None:
-    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
-    try:
-        await storage.upsert_session(_session())
-        service, draft = await _prompt_annotation_draft(storage)
-
-        accepted = await storage.accept_turn(
-            _entry("annotation-message"),
-            expected_epoch=0,
-            updated_at=300,
-            task_record=_task("annotation-turn", updated_at=300),
-            source_scope="webui",
-            request_session_key=SESSION_KEY,
-            client_request_id="annotation-request",
-            request_fingerprint="sha256:annotation-request",
-            expected_prompt_annotations=(draft,),
-            prompt_annotation_turn_id="annotation-turn",
-        )
-
-        sent = await service.get_prompt_annotation(draft.annotation_id)
-        assert accepted.replayed is False
-        assert sent.status is PromptAnnotationStatus.SENT
-        assert sent.sent_message_id == "annotation-message"
-        assert sent.sent_turn_id == "annotation-turn"
-        assert [item.message_id for item in await storage.get_transcript(SESSION_ID)] == [
-            "annotation-message"
-        ]
-
-        replay = await storage.accept_turn(
-            _entry("annotation-message"),
-            expected_epoch=0,
-            updated_at=301,
-            task_record=_task("annotation-turn", updated_at=301),
-            source_scope="webui",
-            request_session_key=SESSION_KEY,
-            client_request_id="annotation-request",
-            request_fingerprint="sha256:annotation-request",
-            expected_prompt_annotations=(draft,),
-            prompt_annotation_turn_id="annotation-turn",
-        )
-        assert replay.replayed is True
-    finally:
-        await storage.close()
 
 
-@pytest.mark.asyncio
-async def test_accept_turn_annotation_cas_failure_rolls_back_all_ingress_writes(
-    tmp_path: Path,
-) -> None:
-    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
-    try:
-        await storage.upsert_session(_session())
-        service, draft = await _prompt_annotation_draft(storage)
-        updated = await service.update_prompt_annotation(
-            annotation_id=draft.annotation_id,
-            expected_state_revision=draft.state_revision,
-            body="Changed after preflight.",
-        )
-
-        with pytest.raises(ArtifactConflictError, match="changed after preflight"):
-            await storage.accept_turn(
-                _entry("rejected-annotation-message"),
-                expected_epoch=0,
-                updated_at=300,
-                task_record=_task("rejected-annotation-turn", updated_at=300),
-                source_scope="webui",
-                request_session_key=SESSION_KEY,
-                client_request_id="rejected-annotation-request",
-                request_fingerprint="sha256:rejected-annotation-request",
-                expected_prompt_annotations=(draft,),
-                prompt_annotation_turn_id="rejected-annotation-turn",
-            )
-
-        assert await storage.get_transcript(SESSION_ID) == []
-        assert await storage.get_agent_task("rejected-annotation-turn") is None
-        assert await storage.get_turn_ingress_receipt(
-            source_scope="webui",
-            request_session_key=SESSION_KEY,
-            client_request_id="rejected-annotation-request",
-        ) is None
-        still_draft = await service.get_prompt_annotation(updated.annotation_id)
-        assert still_draft.status is PromptAnnotationStatus.DRAFT
-        assert still_draft.body == "Changed after preflight."
-    finally:
-        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -776,6 +653,8 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
         assert task.details["persisted_user_message_id"] == "message-one"
         assert task.details["persisted_user_message_ids"] == ["message-one"]
         assert task.details["message_count"] == 1
+        assert task.details["session_id"] == SESSION_ID
+        assert task.details["session_epoch"] == 0
         assert len(receipts) == 1
         receipt = receipts[0]
         assert receipt["receipt_id"]
@@ -807,6 +686,75 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
         assert _result_value(result, "message_id") == "message-one"
         assert _result_value(result, "task_id") == "task-one"
         assert _result_value(result, "session_id") == SESSION_ID
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_details",
+    [
+        {"session_id": None},
+        {"session_id": ""},
+        {"session_id": 17},
+        {"session_epoch": None},
+        {"session_epoch": True},
+        {"session_epoch": -1},
+    ],
+)
+async def test_accept_turn_rejects_present_invalid_task_owner_fields(
+    tmp_path: Path,
+    invalid_details: dict[str, Any],
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        task = _task("task-invalid-owner")
+        task.details = invalid_details
+
+        with pytest.raises(ValueError, match="session owner"):
+            await storage.accept_turn(
+                _entry("message-invalid-owner"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-invalid-owner",
+                request_fingerprint="sha256:request-invalid-owner",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("task-invalid-owner") is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rejects_mismatched_task_owner(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        task = _task("task-stale-owner")
+        task.details = {
+            "session_id": "retired-session",
+            "session_epoch": 0,
+        }
+
+        with pytest.raises(StaleEpochError, match="owner"):
+            await storage.accept_turn(
+                _entry("message-stale-owner"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-stale-owner",
+                request_fingerprint="sha256:request-stale-owner",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("task-stale-owner") is None
     finally:
         await storage.close()
 
@@ -1268,6 +1216,8 @@ async def test_accept_turn_collects_into_existing_task_in_the_same_transaction(
         ]
         assert task.details["fresh_user_session"] is True
         assert task.details["existing_only"] == "preserved"
+        assert task.details["session_id"] == SESSION_ID
+        assert task.details["session_epoch"] == 0
         assert [
             entry.message_id for entry in await storage.get_transcript(SESSION_ID)
         ] == ["message-collected"]

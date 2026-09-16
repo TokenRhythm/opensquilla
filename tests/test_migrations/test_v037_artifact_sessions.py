@@ -19,6 +19,7 @@ ARTIFACT_MIGRATION_IDS = (
     "V038__artifact_prompt_annotations",
     "V039__artifact_mutation_attempts",
     "V040__document_resources",
+    "V041__retire_html_editor",
 )
 
 TABLES = {
@@ -39,8 +40,7 @@ def _artifact_schema(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
         SCHEMA_OBJECTS,
     ).fetchall()
     return {
-        str(name): (str(kind), re.sub(r"\s+", " ", str(sql)).strip())
-        for name, kind, sql in rows
+        str(name): (str(kind), re.sub(r"\s+", " ", str(sql)).strip()) for name, kind, sql in rows
     }
 
 
@@ -48,7 +48,7 @@ def _apply_origin_main_profile(db_path: Path) -> None:
     backend = get_backend("sqlite:///" + str(db_path))
     try:
         migrations = read_migrations(str(MIGRATIONS_DIR)).filter(
-            lambda item: item.id not in ARTIFACT_MIGRATION_IDS
+            lambda item: item.id < MIGRATION_ID
         )
         with backend.lock():
             backend.apply_migrations(backend.to_apply(migrations))
@@ -68,7 +68,9 @@ def test_v037_through_v040_upgrade_origin_main_profile(tmp_path: Path) -> None:
     assert "V035__pending_chat_inputs" in applied_before
     assert not set(ARTIFACT_MIGRATION_IDS) & applied_before
 
-    assert apply_pending(str(db_path), MIGRATIONS_DIR) == list(ARTIFACT_MIGRATION_IDS)
+    assert apply_pending(str(db_path), MIGRATIONS_DIR) == sorted(
+        path.stem for path in MIGRATIONS_DIR.glob("V*.py") if path.stem >= MIGRATION_ID
+    )
 
 
 def test_v037_creates_complete_artifact_session_schema_and_guards_revisions(

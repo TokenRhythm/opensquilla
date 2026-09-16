@@ -41,6 +41,7 @@ from opensquilla.provider.types import (
     DoneEvent,
     ErrorEvent,
     Message,
+    ProviderReplayState,
     ReasoningDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -292,6 +293,9 @@ CASES: list[GoldenCase] = [
 
 def _event_to_dict(event: Any) -> dict[str, Any]:
     payload = dataclasses.asdict(event)
+    replay = payload.get("provider_replay")
+    if isinstance(replay, ProviderReplayState):
+        payload["provider_replay"] = replay.model_dump(mode="json")
     payload.pop("kind", None)
     if payload.get("billing_receipt") is None:
         payload.pop("billing_receipt", None)
@@ -345,6 +349,29 @@ def _assert_lifecycle_invariants(events: list[Any]) -> None:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_event_serialization_retains_native_replay_state() -> None:
+    expected = {
+        "protocol": "openai_chat_completions",
+        "source": "synthetic-route",
+        "model": "synthetic-request-model",
+        "native_reasoning_content": "Synthetic native reasoning.",
+        "native_content": None,
+        "reasoning_details": [
+            {"type": "reasoning.text", "text": "Synthetic reasoning",
+             "signature": "dummy-signature"},
+            {"type": "reasoning.encrypted", "data": "dummy-opaque", "index": 0},
+            {"type": "reasoning.summary", "summary": "Synthetic summary", "index": 0},
+        ],
+    }
+    state = ProviderReplayState.model_validate(expected)
+    event = DoneEvent(model="synthetic-resolved-model", provider_replay=state)
+    rendered = json.loads(_render_events([event]))
+    assert rendered[0]["provider_replay"] == expected
+    assert rendered[0]["model"] == "synthetic-resolved-model"
+    rendered[0]["provider_replay"]["reasoning_details"].clear()
+    assert state.model_dump(mode="json") == expected
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.case_id)

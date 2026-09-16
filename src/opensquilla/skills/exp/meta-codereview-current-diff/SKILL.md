@@ -1,5 +1,8 @@
 ---
 name: meta-codereview-current-diff
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Read the current uncommitted diff, run three independent reviewers (safety + tests-coverage + style) in parallel, then arbitrate a single BLOCK / BLOCK_WITH_OVERRIDE / PASS_WITH_NOTES verdict. Use before commit when you want a multi-perspective second-opinion instead of a single-reviewer agent loop."
 kind: meta
 meta_priority: 65

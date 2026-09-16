@@ -11,10 +11,17 @@ import { _electron as electron } from 'playwright'
 import {
   loadDesktopGatewayOwnershipRecord,
   requestVerifiedDesktopGatewayShutdown,
+  sameDesktopGatewayOwnershipInstance,
   verifyDesktopGatewayOwnership,
   waitForDesktopGatewayOwnershipRelease,
 } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  desktopShutdownEvidenceSince,
+  gatewayProcessSnapshot,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -35,6 +42,7 @@ const ORPHAN_RECOVERY_STARTUP_BUDGET_MS = (
 )
 const GATEWAY_CHILD_CRASH_RECOVERY_BUDGET_MS = INITIAL_DESKTOP_STARTUP_BUDGET_MS + 10_000
 const CRASH_EXIT_BUDGET_MS = 15_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 const WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS = 20_000
 const WINDOWS_ELECTRON_CHILD_CLEANUP_BUDGET_MS = 30_000
 
@@ -112,6 +120,24 @@ async function phaseDiagnostics(app, userDataDir, phase) {
     process: appProcessState(app),
     windows,
     ownership: await ownershipDiagnostics(userDataDir),
+    gatewayProcesses: ownedInstances.map(({ record }) => gatewayProcessSnapshot(record)),
+  }
+}
+
+async function closeDesktopForPhase(app, userDataDir, phaseName) {
+  const phase = createPhaseBudget(phaseName, ELECTRON_SHUTDOWN_TIMEOUT_MS)
+  const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdown = await closeElectronWithDeadline({
+    app,
+    phase: phase.name,
+    timeoutMs: phase.timeoutMs,
+    diagnostics: () => phaseDiagnostics(app, userDataDir, phase),
+  })
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  return {
+    ...shutdown,
+    shutdownEvidence: desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog),
   }
 }
 
@@ -199,15 +225,6 @@ async function ownershipDirectory(userDataDir, app, phase) {
   }, 'Desktop Gateway ownership record', phase.remainingMs('ownership-record'), () => (
     phaseDiagnostics(app, userDataDir, phase)
   ))
-}
-
-function processAlive(pid) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return error?.code !== 'ESRCH'
-  }
 }
 
 async function waitForDesktopRenderer(app, userDataDir, phase) {
@@ -388,15 +405,11 @@ try {
     firstApp,
     userDataDir,
   )
-  assert.equal(
-    await withPhaseDeadline(
-      verifyDesktopGatewayOwnership(firstRecord),
-      electronChildCleanup,
-      'verify-orphan-survived',
-      firstApp,
-      userDataDir,
-    ),
-    true,
+  await waitFor(
+    () => verifyDesktopGatewayOwnership(firstRecord),
+    'orphan Desktop Gateway ownership verification',
+    electronChildCleanup.remainingMs('verify-orphan-survived'),
+    () => phaseDiagnostics(firstApp, userDataDir, electronChildCleanup),
   )
   firstApp = null
 
@@ -415,7 +428,10 @@ try {
   const secondRecord = await waitFor(async () => {
     assertAppRunning(secondApp, orphanRecoveryStartup, 'replacement-ownership-record')
     const loaded = loadDesktopGatewayOwnershipRecord(secondOwnershipDir)
-    if (loaded.status !== 'valid' || loaded.record.pid === firstRecord.pid) return null
+    if (
+      loaded.status !== 'valid'
+      || sameDesktopGatewayOwnershipInstance(loaded.record, firstRecord)
+    ) return null
     return await verifyDesktopGatewayOwnership(loaded.record)
       ? loaded.record
       : null
@@ -424,10 +440,10 @@ try {
   ), () => phaseDiagnostics(secondApp, userDataDir, orphanRecoveryStartup))
   ownedInstances.push({ ownershipDir: secondOwnershipDir, record: secondRecord })
 
-  assert.notEqual(secondRecord.pid, firstRecord.pid)
+  assert.notEqual(secondRecord.instance_nonce, firstRecord.instance_nonce)
   await waitFor(() => {
     assertAppRunning(secondApp, orphanRecoveryStartup, 'orphan-process-exit')
-    return !processAlive(firstRecord.pid)
+    return !gatewayProcessSnapshot(firstRecord).alive
   }, 'orphan Gateway process exit', orphanRecoveryStartup.remainingMs(
     'orphan-process-exit',
   ), () => phaseDiagnostics(secondApp, userDataDir, orphanRecoveryStartup))
@@ -459,7 +475,10 @@ try {
   const thirdRecord = await waitFor(() => {
     assertAppRunning(secondApp, childCrashRecovery, 'replacement-after-child-crash')
     const loaded = loadDesktopGatewayOwnershipRecord(secondOwnershipDir)
-    if (loaded.status !== 'valid' || loaded.record.pid === secondRecord.pid) return null
+    if (
+      loaded.status !== 'valid'
+      || sameDesktopGatewayOwnershipInstance(loaded.record, secondRecord)
+    ) return null
     return verifyDesktopGatewayOwnership(loaded.record).then(verified => (
       verified ? loaded.record : null
     ))
@@ -481,7 +500,7 @@ try {
     secondApp,
     userDataDir,
   )
-  assert.notEqual(thirdRecord.pid, secondRecord.pid)
+  assert.notEqual(thirdRecord.instance_nonce, secondRecord.instance_nonce)
   assert.equal(thirdRecord.port, secondRecord.port)
   assert.equal(secondPage.url(), rendererUrlBeforeCrash)
   assert.equal(
@@ -496,20 +515,38 @@ try {
   )
   await waitFor(() => {
     assertAppRunning(secondApp, childCrashRecovery, 'crashed-gateway-process-exit')
-    return !processAlive(secondRecord.pid)
+    return !gatewayProcessSnapshot(secondRecord).alive
   }, 'crashed Gateway process exit', childCrashRecovery.remainingMs(
     'crashed-gateway-process-exit',
   ), () => phaseDiagnostics(secondApp, userDataDir, childCrashRecovery))
 
-  await secondApp.close()
+  const successShutdown = await closeDesktopForPhase(
+    secondApp,
+    userDataDir,
+    'successful-electron-shutdown',
+  )
   secondApp = null
-  assert.equal(
-    await waitForDesktopGatewayOwnershipRelease(secondOwnershipDir, thirdRecord, {
+  const ownershipReleased = await waitForDesktopGatewayOwnershipRelease(
+    secondOwnershipDir,
+    thirdRecord,
+    {
       timeoutMs: 15_000,
       pollIntervalMs: 100,
-    }),
-    true,
+    },
   )
+  assert.equal(ownershipReleased, true)
+  if (successShutdown.error) {
+    const fallbackAccepted = canAcceptWindowsElectronShutdownFallback({
+      shutdown: successShutdown,
+      ...successShutdown.shutdownEvidence,
+    }) && ownershipReleased && !gatewayProcessSnapshot(thirdRecord).alive
+    if (!fallbackAccepted) throw successShutdown.error
+    console.warn(JSON.stringify({
+      event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+      phase: 'successful-electron-shutdown',
+      pid: thirdRecord.pid,
+    }))
+  }
 
   console.log(JSON.stringify({
     ok: true,
@@ -519,10 +556,21 @@ try {
   }))
   flowSucceeded = true
 } finally {
-  if (secondApp) await secondApp.close().catch(() => null)
-  if (firstApp) await firstApp.close().catch(() => null)
+  if (secondApp) {
+    const app = secondApp
+    secondApp = null
+    await closeDesktopForPhase(app, userDataDir, 'finally-second-electron-shutdown')
+  }
+  if (firstApp) {
+    const app = firstApp
+    firstApp = null
+    await closeDesktopForPhase(app, userDataDir, 'finally-first-electron-shutdown')
+  }
   for (const { ownershipDir, record } of ownedInstances.reverse()) {
-    if (processAlive(record.pid) && await verifyDesktopGatewayOwnership(record).catch(() => false)) {
+    if (
+      gatewayProcessSnapshot(record).alive
+      && await verifyDesktopGatewayOwnership(record).catch(() => false)
+    ) {
       await requestVerifiedDesktopGatewayShutdown(record).catch(() => false)
       await waitForDesktopGatewayOwnershipRelease(ownershipDir, record, {
         timeoutMs: 10_000,
@@ -532,7 +580,7 @@ try {
   }
   // Never remove a synthetic profile from underneath a process that did not
   // accept the bounded cleanup request; retain it for CI diagnostics instead.
-  const stillLive = ownedInstances.filter(({ record }) => processAlive(record.pid))
+  const stillLive = ownedInstances.filter(({ record }) => gatewayProcessSnapshot(record).alive)
   if (flowSucceeded && stillLive.length === 0) {
     // Chromium can retain DIPS briefly after Electron exits on Windows.
     await removeSyntheticProfile(isolationRoot)

@@ -36,13 +36,31 @@ function completeOutcome(): SkillDependencyInstallOutcome {
   }
 }
 
-function mountController(options: Parameters<typeof useSkillDetailController>[0]) {
+function mountController(options: Parameters<typeof useSkillDetailController>[0] | {
+  rpc: { call(method: string, params?: Record<string, unknown>): Promise<unknown> }
+  installDeps: Parameters<typeof useSkillDetailController>[0]['installDeps']
+  closeDelayMs?: number
+}) {
+  const normalized = 'rpc' in options
+    ? {
+        catalog: {
+          detail: (skill: Skill) => options.rpc.call('skills.get', {
+            name: skill.name,
+            includeLifecycle: true,
+            ...(skill.instance_id ? { instanceId: skill.instance_id } : {}),
+            ...(skill.install_id ? { installId: skill.install_id } : {}),
+          }),
+        } as Parameters<typeof useSkillDetailController>[0]['catalog'],
+        installDeps: options.installDeps,
+        closeDelayMs: options.closeDelayMs,
+      }
+    : options
   let controller!: SkillDetailController
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp(defineComponent({
     setup() {
-      controller = useSkillDetailController(options)
+      controller = useSkillDetailController(normalized)
       return () => h('div')
     },
   }))

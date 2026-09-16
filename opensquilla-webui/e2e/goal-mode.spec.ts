@@ -1,7 +1,14 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 import { startRealGoalGateway } from './real-goal-gateway'
 import { test as isolatedGatewayTest } from './real-gateway.fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-goal-mode'
@@ -13,6 +20,14 @@ const REAL_FIRST_REPLY = 'The release inputs are inspected; final verification s
 const REAL_FINAL_REPLY = 'The deterministic release report is complete and verified.'
 const LIFECYCLE_FIRST_REPLY = 'Task one completed after the lifecycle checks.'
 const LIFECYCLE_SECOND_REPLY = 'Task two completed after Goal removal.'
+
+function expectNegotiatedGoalFlow(frames: Array<Record<string, unknown>>, enabled: boolean) {
+  const hello = frames.find(frame => frame.direction === 'received' && frame.type === 'hello-ok')
+  expect(hello).toBeTruthy()
+  const policy = hello?.policy as Record<string, unknown> | undefined
+  if (enabled) expect(policy?.transport_flow).toMatchObject({ delivery_epoch: expect.any(String) })
+  else expect(policy?.transport_flow).toBeUndefined()
+}
 
 type GoalProgress = {
   explanation: string | null
@@ -79,7 +94,7 @@ async function installStableHttpStubs(page: Page): Promise<void> {
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.route('**/api/elevated-mode', route => route.fulfill({
     status: 200,
@@ -126,14 +141,16 @@ async function installFakeGoalGateway(
       } catch {
         return
       }
+      if (frame.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }))
+        return
+      }
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
       methods.push(method)
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          type: 'hello-ok',
-          protocol: 3,
+        ws.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'goal-mode-fake-gateway' },
           features: {
             methods: [
@@ -173,11 +190,7 @@ async function installFakeGoalGateway(
 
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
-        'chat.history': {
-          messages: [],
-          has_more: false,
-          canonical_complete: true,
-        },
+        'chat.history': chatHistoryPayload(),
         'commands.list_for_surface': {
           commands: [{
             name: '/goal',
@@ -202,34 +215,24 @@ async function installFakeGoalGateway(
         },
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.snapshot': {
-          key: SESSION_KEY,
-          events: [],
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY, {
           current_stream_seq: 0,
-        },
-        'sessions.messages.subscribe': {
-          key: SESSION_KEY,
+        }),
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, {
           sessionId: SESSION_ID,
           epoch: 1,
-          subscribed: true,
           hydration_complete: false,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
           goal: null,
           goalSnapshotStreamSeq: null,
           deferred_fields: ['goal', 'goalSnapshotStreamSeq'],
-        },
-        'sessions.messages.hydrate': {
-          key: SESSION_KEY,
+        }),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY, {
           sessionId: SESSION_ID,
           epoch: 1,
-          hydration_complete: true,
-          run_status: 'idle',
           goal: null,
           goalSnapshotStreamSeq: 0,
-        },
+        }),
         'sessions.routing.get': {
           sessionKey: SESSION_KEY,
           mode: 'direct',
@@ -642,6 +645,7 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
 
     await page.goto(CONTROL_URL + 'chat')
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    expectNegotiatedGoalFlow(rpcFrames, gateway.flowEnabled)
     const composer = page.locator('.chat-textarea')
     await expect(composer).toBeEditable({ timeout: 15_000 })
     await composer.fill('/goal')
@@ -815,6 +819,7 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
     ).toEqual([1, 2, 3])
     const completedCalls = await gateway.readProviderCalls()
     expect(completedCalls[2]?.toolNames).toEqual([])
+    if (gateway.flowEnabled) expect(sentRpcMethods).toContain('transport.flow.update')
   } finally {
     await gateway.stop()
   }
@@ -899,6 +904,7 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
 
     await page.goto(CONTROL_URL + 'chat')
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    expectNegotiatedGoalFlow(rpcFrames, gateway.flowEnabled)
     const composer = page.locator('.chat-textarea')
     await expect(composer).toBeEditable({ timeout: 15_000 })
     await composer.fill('/goal')
@@ -1023,6 +1029,7 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
       .toHaveCount(1)
     await expect.poll(providerCallNumbers).toEqual([1, 2])
     expect(sentRequests('goals.reattach')).toHaveLength(0)
+    if (gateway.flowEnabled) expect(sentRequests('transport.flow.update').length).toBeGreaterThan(0)
   } finally {
     await gateway.stop()
   }
@@ -1144,6 +1151,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
 
     await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    expectNegotiatedGoalFlow(frames, isolatedRealGateway.flowEnabled)
     expect(socketUrls).toContain(
       isolatedRealGateway.webuiOrigin.replace(/^http:/, 'ws:') + '/ws',
     )

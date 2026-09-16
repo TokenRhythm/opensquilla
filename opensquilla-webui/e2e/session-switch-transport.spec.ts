@@ -4,6 +4,14 @@ import {
   type Page,
   type WebSocketRoute,
 } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
+
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-workspace-a'
@@ -71,10 +79,8 @@ function session(key: string, title: string, workspaceId: string, path: string, 
 
 function subscriptionPayload(key: string) {
   const isA = key === SESSION_A
-  return {
-    subscribed: true,
+  return sessionMessagesSubscribePayload(key, {
     hydration_complete: true,
-    replay_complete: true,
     current_stream_seq: isA ? 10 : 20,
     stream_generation: 'workspace-switch-generation',
     run_status: 'idle',
@@ -82,17 +88,15 @@ function subscriptionPayload(key: string) {
     projectWorkspace: isA
       ? workspace(WORKSPACE_A, 'Workspace A', '/fixtures/workspace-a')
       : workspace(WORKSPACE_B, 'Workspace B', '/fixtures/workspace-b'),
-  }
+  })
 }
 
 function snapshotPayload(key: string) {
-  return {
-    key,
-    events: [],
+  return sessionMessagesSnapshotPayload(key, {
     current_stream_seq: key === SESSION_A ? 10 : 20,
     stream_generation: 'workspace-switch-generation',
     run_status: 'idle',
-  }
+  })
 }
 
 function basePayload(method: string): unknown {
@@ -116,9 +120,8 @@ async function preparePage(page: Page) {
   await page.addInitScript(() => {
     window.localStorage.setItem('opensquilla-locale', 'en')
     const surfaceOk = async () => ({ ok: true })
-    // Exercise the release-default prompt-annotation path, not a browser-only
-    // feature override. The complete native v3 bridge enables the same eager
-    // per-session annotations.list read used by packaged Desktop.
+    // Keep the Desktop bridge available while session-scoped annotation drafts
+    // stay local and the ordinary chat transport changes subscriptions.
     window.opensquillaDesktop = {
       getOsLocale: async () => 'en',
       isAutoUpdateEnabled: async () => false,
@@ -201,10 +204,8 @@ test('workspace navigation keeps one transport while the target subscription rec
       wire.push({ key, method, socketIndex })
 
       if (method === 'connect') {
-        socket.send(JSON.stringify({
-          protocol: 3,
+        socket.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'workspace-switch-conn' },
-          policy: { tick_interval_ms: 30_000 },
           features: {
             methods: [
               'sessions.messages.subscribe',
@@ -215,7 +216,6 @@ test('workspace navigation keeps one transport while the target subscription rec
               'sessions.routing.set',
               'workspaces.list',
               'artifacts.list',
-              'artifacts.prompt_annotations.list',
               'config.patch.safe',
             ],
             events: ['session.event.text_delta'],
@@ -233,6 +233,8 @@ test('workspace navigation keeps one transport while the target subscription rec
             session(SESSION_B, 'Workspace B task', WORKSPACE_B, '/fixtures/workspace-b', 200),
             session(SESSION_A, 'Workspace A task', WORKSPACE_A, '/fixtures/workspace-a', 100),
           ],
+          count: 2,
+          ts: 1_800_000_000,
           has_more: false,
         }))
         return
@@ -250,21 +252,13 @@ test('workspace navigation keeps one transport while the target subscription rec
         socket.send(response(frame.id, { artifacts: [], has_more: false }))
         return
       }
-      if (method === 'artifacts.prompt_annotations.list') {
-        socket.send(response(frame.id, { annotations: [] }))
-        return
-      }
       if (method === 'chat.history') {
-        socket.send(response(frame.id, {
-          messages: [{
+        socket.send(response(frame.id, chatHistoryPayload([{
             role: 'user',
             text: key === SESSION_A ? 'Workspace A history' : 'Workspace B history',
             message_id: key === SESSION_A ? 'history-a' : 'history-b',
             timestamp: '2026-08-26T00:00:00.000Z',
-          }],
-          has_more: false,
-          canonical_complete: true,
-        }))
+          }])))
         return
       }
       if (method === 'sessions.messages.subscribe' && key === SESSION_A) {
@@ -296,7 +290,10 @@ test('workspace navigation keeps one transport while the target subscription rec
         return
       }
       if (method === 'sessions.messages.hydrate') {
-        socket.send(response(frame.id, subscriptionPayload(key)))
+        socket.send(response(frame.id, sessionMessagesHydratePayload(
+          key,
+          subscriptionPayload(key),
+        )))
         return
       }
       if (method === 'sessions.routing.get') {
@@ -353,9 +350,6 @@ test('workspace navigation keeps one transport while the target subscription rec
     entry.method === 'artifacts.list' && entry.key === SESSION_B
   ))).toBe(true)
   await expect.poll(() => wire.some(entry => (
-    entry.method === 'artifacts.prompt_annotations.list' && entry.key === SESSION_B
-  ))).toBe(true)
-  await expect.poll(() => wire.some(entry => (
     entry.method === 'sessions.routing.get' && entry.key === SESSION_B
   ))).toBe(true)
   expect(sockets).toHaveLength(1)
@@ -369,7 +363,6 @@ test('workspace navigation keeps one transport while the target subscription rec
   for (const optionalMethod of [
     'sessions.routing.get',
     'artifacts.list',
-    'artifacts.prompt_annotations.list',
   ]) {
     const optionalIndex = wire.findIndex(entry => (
       entry.method === optionalMethod && entry.key === SESSION_B
@@ -399,8 +392,10 @@ test('workspace navigation keeps one transport while the target subscription rec
     '[data-testid="chat-session-recovery-status"][data-recovery-state="live-connecting"]',
   )
   await expect(liveRecovery).toContainText(
-    'Gateway connected. Restoring live updates for this session',
+    'Gateway connected. Restoring live updates for this session…',
   )
+  await expect(liveRecovery).toHaveAttribute('role', 'status')
+  await expect(liveRecovery.getByRole('button')).toHaveCount(0)
 
   const composer = page.locator('.chat-textarea')
   const sendButton = page.locator('.chat-send-btn.btn--primary')

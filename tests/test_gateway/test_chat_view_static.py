@@ -1,5 +1,6 @@
 """Focused Vue chat wiring contracts retained after the vanilla UI removal."""
 
+import re
 from pathlib import Path
 
 CHAT_VIEW = Path("opensquilla-webui/src/views/ChatView.vue")
@@ -34,7 +35,10 @@ def test_chat_view_wires_middle_edit_branch_fork_id() -> None:
     send_end = view.index("\n})", send_start)
     assert "pendingForkBeforeMessageId," in view[send_start:send_end]
 
-    assert "watch(sessionKey, () => {\n  pendingForkBeforeMessageId.value = null" in view
+    assert re.search(
+        r"watch\(sessionKey, \(\) => \{[^}]*\n  pendingForkBeforeMessageId\.value = null",
+        view,
+    )
 
     assert "pendingForkBeforeMessageId: Ref<string | null>" in send
     assert "params.forkBeforeMessageId = forkBeforeMessageId" in send

@@ -1,26 +1,26 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import Icon from './Icon.vue'
-import { useRpcCall } from '@/composables/useRpc'
 import {
   optionalSessionRpcAllowed,
-  optionalSessionRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import {
   onReadinessInvalidated,
   useReadinessSummary,
   type ReadinessStatus,
 } from '@/composables/setup/useReadinessSummary'
+import { useSetupStatus } from '@/composables/setup/useSetupStatus'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 
 const { t } = useI18n()
 const router = useRouter()
-const { data: status, loading, execute } = useRpcCall<ReadinessStatus>(
-  'onboarding.status',
-  undefined,
-  { callOptions: optionalSessionRpcCallOptions },
-)
+const setupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!setupWorkflow) throw new Error('SetupWorkflow was not provided')
+const { data: status, loading, execute } = useSetupStatus<ReadinessStatus>(setupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 const { needsAction, actionCount } = useReadinessSummary(status)
 
 // This banner outlives the Settings dialog (it is mounted once in App.vue), so

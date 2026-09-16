@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/opensquilla/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/TokenRhythm/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
   <a href="https://opensquilla.ai/"><img src="https://img.shields.io/badge/website-opensquilla.ai-blue?style=for-the-badge" alt="Website"></a>
-  <a href="https://github.com/opensquilla/opensquilla/releases"><img src="https://img.shields.io/github/v/release/opensquilla/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/releases"><img src="https://img.shields.io/github/v/release/TokenRhythm/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=for-the-badge" alt="Python 3.12+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge" alt="Apache 2.0 License"></a>
 </p>
@@ -31,8 +31,6 @@
 ## 最新动态
 
 - 📢 **2026-08-22** —— 技术报告英文版已登陆 aiXiv：[aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)，中文版已登陆 ChinaXiv：[202608.00176](https://chinaxiv.org/abs/202608.00176)。如何引用 OpenSquilla 请见[引用](#引用)。
-
-- 📢 **2026-08-21** —— 技术报告的 PDF 版本现已收录在本仓库中：[English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf)。
 
 - 📢 **2026-07-14** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** 已登陆 arXiv。报告展示了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮，以及**多模型集成路由如何超越 Fable 5**。
 
@@ -106,8 +104,8 @@ PowerShell 安装器会通过 `winget` 自动装好它；而**终端快速安装
 
 0.5.4 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
 
-- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
-- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
+- macOS Apple Silicon:<https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64:<https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 中国大陆下载可直接使用 OSS 的固定安装包链接：
 
@@ -150,7 +148,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. 安装 OpenSquilla**——所有平台命令相同。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 这会从 release URL 安装 OpenSquilla wheel，再由 `uv` 下载所选 extra 所声明的依赖。
@@ -171,7 +169,7 @@ opensquilla gateway run
 > PATH 设置命令。
 
 如需完全锁定版本的安装，请使用带版本号的 wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`。
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 
@@ -185,7 +183,7 @@ opensquilla gateway run
 
    ```sh
    git lfs install
-   git clone https://github.com/opensquilla/opensquilla.git
+   git clone https://github.com/TokenRhythm/opensquilla.git
    cd opensquilla
    git lfs pull --include="src/opensquilla/squilla_router/models/**"
    ```
@@ -337,10 +335,13 @@ opensquilla uninstall --purge-all      # 全部（会要求你输入确认）
 
 ## 安装隐私
 
-OpenSquilla 使用伪匿名安装遥测来估算安装数量、版本采纳情况和运行时兼容性。数据只在网关
-首次启动时上报，并且每个 OpenSquilla 版本只上报一次。它还会在本地按 UTC 日期汇总已完成
-的顶层对话次数和 token 用量，并在启动时及此后每小时尝试向遥测服务上报待发送的 UTC
-当日累计快照。OpenSquilla 也可能执行被动更新检查，包括桌面启动时以及应用持续运行期间
+OpenSquilla 保留 V1 安装／版本和每日用量统计，并与 V2 的可靠性、客户端活跃和功能使用
+统计并行运行。V1 在网关监听和运行时就绪后后台上报首次安装，每个新版本只上报一次。
+它还会在本地按 UTC 日期汇总已完成的顶层对话次数和 token 用量，并在就绪后及此后每小时
+尝试上传已结束日期的待发送汇总；当日数据等到 UTC 日期结束后再上传，以保证每日总量完整。
+安装状态继续保留；每日事件使用各汇总数据库持久保存的随机标识生成去重键，避免同一机器
+不同 profile 相互覆盖，重启、移动数据库和重试时保持稳定。旧待上传记录的升级边界见隐私政策。
+OpenSquilla 也可能执行被动更新检查，包括桌面启动时以及应用持续运行期间
 最多每日一次的自动更新检查。上传设了很短的超时，绝不会阻塞启动。
 
 发送的内容:
@@ -358,12 +359,8 @@ OpenSquilla 使用伪匿名安装遥测来估算安装数量、版本采纳情�
 `install_id` 是一个本地单向 SHA-256 摘要，由可用的 MAC 地址派生；无 MAC 时使用本地 IP
 地址，并以一个随机持久化值兜底。原始 MAC/IP 值不会被上传。
 
-默认情况下，直接发往 TokenRhythm 官方 HTTPS API 的请求还可能通过可选的
-`X-OpenSquilla-Install-Id` 请求头携带同一个跨会话伪匿名安装标识。只有端口 443 上严格匹配
-`tokenrhythm.studio` 和 `api.tokenrhythm.studio` 的 HTTPS 主机才符合条件；自定义代理、
-OpenRouter、其他提供商、浏览器页面、重定向后的非官方目标，以及返回的图片/CDN 下载均不
-携带该请求头。原始 MAC/IP 值绝不会发送。若后台解析尚未完成或失败，请求头会被省略，API
-请求仍会正常继续。
+上述安装标识仅用于 V1 统计，与 V2 的独立随机标识分开。
+`X-OpenSquilla-Install-Id` 提供商请求头仍处于停用状态，不向模型提供商附加此安装标识。
 
 不发送的内容:用户名、主机名、路径、API key、提供商配置、聊天/会话/记忆/Agent 内容、
 文件名或文件内容。源 IP 在传输层可能会被 HTTP 服务器看到，但它不在上传的数据内。
@@ -381,10 +378,11 @@ OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
 disable_network_observability = true
 ```
 
-这个统一开关覆盖自动安装遥测、每日汇总用量遥测、被动更新检查、桌面启动时和应用持续
-运行期间的自动更新检查，以及 TokenRhythm 安装标识请求头。只要统一或兼容退出开关仍启用，
-用户显式触发的更新可用性检查也不会绕过它。CI 和测试环境也会自动抑制安装标识请求头与
-安装遥测。其他用户主动操作仍可能在明确意图后访问网络服务，例如打开发布页、下载发布
+这个统一开关覆盖 V1、V2 统计、被动更新检查，以及桌面启动时和应用持续运行期间的自动
+更新检查。关闭统计会停止采集并暂停上传，保留已有状态；重新开启后可继续上传待发送数据。
+此前保存的任一分项拒绝设置也会迁移为统一关闭。只要统一或兼容更新退出开关仍启用，
+用户显式触发的更新可用性检查也不会绕过它。CI、测试和 `DO_NOT_TRACK` 环境会自动抑制
+统计。其他用户主动操作仍可能在明确意图后访问网络服务，例如打开发布页、下载发布
 资产，以及使用已配置的提供商、搜索或渠道。
 
 旧环境变量仍兼容:
@@ -394,10 +392,8 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-旧遥测退出开关会抑制 TokenRhythm 安装标识请求头；仅启用更新检查退出开关则不会。
-TokenRhythm 必须将此请求头视为可选且不可信，不得将其用于认证、授权、计费、限流或反滥用
-决策。完整的目标校验与数据处理规则见
-[`PRIVACY.md`](PRIVACY.md#tokenrhythm-installation-identifier)。
+旧遥测退出开关同时关闭 V1 和 V2。旧更新检查退出开关继续按 V1 兼容规则关闭安装／每日
+用量上传，但不关闭 V2。完整的数据处理规则见 [`PRIVACY.md`](PRIVACY.md)。
 
 进阶部署可以使用自己的安装遥测端点:
 
@@ -533,11 +529,11 @@ opensquilla gateway run --listen 0.0.0.0 --port 18791
 **Docker**
 
 预构建的多架构镜像(`amd64`/`arm64`)会随每个发布标签发布到
-`ghcr.io/opensquilla/opensquilla`——完整的容器部署指南见
+`ghcr.io/tokenrhythm/opensquilla`——完整的容器部署指南见
 [`docs/docker.md`](docs/docker.md)(家庭服务器与 NAS、带 token 认证的局域网访问、升级):
 
 ```sh
-OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/opensquilla/opensquilla:latest docker compose up -d
+OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/tokenrhythm/opensquilla:latest docker compose up -d
 ```
 
 不设置 `OPENSQUILLA_GATEWAY_IMAGE` 时,compose 路径运行一个你自己构建的
@@ -652,8 +648,8 @@ OpenSquilla 的灵感来自
 感谢所有为 OpenSquilla 做出贡献的人。
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  <a href="https://github.com/TokenRhythm/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TokenRhythm/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
   </a>
 </p>
 
@@ -663,7 +659,7 @@ OpenSquilla 的灵感来自
 
 我们欢迎各种形式的贡献——bug 报告、功能想法、文档、新的提供商或渠道适配器、技能，以及
 核心运行时方面的开发。请参阅 [`CONTRIBUTING.md`](CONTRIBUTING.md)，然后到
-[GitHub](https://github.com/opensquilla/opensquilla) 上提 issue 或 pull request。
+[GitHub](https://github.com/TokenRhythm/opensquilla) 上提 issue 或 pull request。
 
 [行为准则](CODE_OF_CONDUCT.md) · [安全](SECURITY.md) ·
 [支持](SUPPORT.md) · [许可证](LICENSE)（Apache-2.0）

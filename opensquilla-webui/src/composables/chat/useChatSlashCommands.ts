@@ -1,30 +1,23 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { RpcCallOptions, RpcClientError, RpcConnectionWaitOptions } from '@/lib/rpc'
+import {
+  MetaRunCenterError,
+  type MetaLaunchDraftPayload,
+  type MetaRunCenter,
+} from '@/modules/metaRunCenter'
+import type { CommandCatalog } from '@/modules/commandCatalog'
+import type {
+  UsageReporting,
+  UsageReportingRequestOptions,
+} from '@/modules/usageReporting'
+import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
-import type { MetaLaunchDraftPayload } from '@/types/rpc'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
-import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
 import {
   formatGoalDuration,
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
-
-type RpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
 
 export interface ArgumentChoice {
   value: string
@@ -72,14 +65,6 @@ interface SlashCommandPayload extends Record<string, unknown> {
   }
 }
 
-interface UsageStatusResult {
-  totals?: {
-    tokens?: number
-  }
-  totalTokens?: number
-  total_tokens?: number
-}
-
 const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
   '/coding',
   '/compact',
@@ -103,8 +88,12 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 ])
 
 export interface UseChatSlashCommandsOptions {
-  rpc: RpcClient
-  catalogCallOptions?: RpcCallOptions
+  commandCatalog: CommandCatalog
+  usageReporting: UsageReporting
+  sessionMaintenance: SessionMaintenance
+  /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
+  metaRunCenter?: MetaRunCenter
+  catalogCallOptions?: UsageReportingRequestOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
@@ -298,6 +287,9 @@ function localizedMetaDescription(choice: ArgumentChoice): string {
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
+  const commandCatalog = options.commandCatalog
+  const usageReporting = options.usageReporting
+  const maintenance = options.sessionMaintenance
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])
@@ -356,13 +348,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', { error }))
     }
     try {
-      const result = await options.rpc.call<{
-        ok?: boolean
-        error?: string
-        drafted?: boolean
-        setup_required?: boolean
-        readiness?: MetaSetupReadiness
-      }>('meta.run', {
+      if (!options.metaRunCenter) throw new Error('MetaRunCenter is unavailable')
+      const result = await options.metaRunCenter.launch({
         name: skillName,
         sessionKey: originatingSessionKey,
         clientRequestId,
@@ -389,7 +376,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         }
         return dispatchResult?.status === 'queued' ? 'queued' : 'accepted'
       }
-      if (result?.setup_required) {
+      if (result?.setupRequired) {
         const readiness = result.readiness || {}
         if (options.requestMetaSetup) {
           const disposition = await options.requestMetaSetup(
@@ -431,12 +418,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       )
       return 'failed'
     } catch (err: unknown) {
-      const rpcError = err as RpcClientError | undefined
-      if (rpcError?.code === 'META_DRAFT_DISCARDED') {
+      if (err instanceof MetaRunCenterError && err.code === 'draft-discarded') {
         // Another tab already committed the user's cancellation. This identity
         // is terminal: never recreate a setup card or a sendable composer copy.
         options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
-          error: rpcError.message,
+          error: err.message,
         }))
         return 'discarded'
       }
@@ -480,18 +466,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   async function loadSlashCommands() {
     try {
-      await waitForSessionRpcConnection(options.rpc, options.catalogCallOptions)
-      const params = { surface: 'web_chat' }
-      const res = options.catalogCallOptions
-        ? await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-            options.catalogCallOptions,
-          )
-        : await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-          )
+      const res = await commandCatalog.list('web_chat', options.catalogCallOptions)
       if (
         !Array.isArray(res?.commands)
         || !res.commands.every(isValidSlashCommandPayload)
@@ -738,7 +713,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'reset_session':
       case 'sessions.reset':
       case '/reset':
-        options.rpc.call('sessions.reset', { key: options.sessionKey.value })
+        maintenance.reset({ key: options.sessionKey.value })
           .then(() => {
             options.resetCurrentSession()
           })
@@ -753,13 +728,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
           tone: 'info',
           source: 'manual',
         })
-        options.rpc.call<Record<string, unknown>>('sessions.contextCompact', {
-          key: compactKey,
-          wait: false,
-        })
+        maintenance.compact({ key: compactKey, wait: false })
           .then((result) => {
             if (compactKey !== options.sessionKey.value) return
-            options.showCompactionToast({ key: compactKey, source: 'manual', ...result })
+            options.showCompactionToast({ ...result, key: compactKey, source: 'manual' })
           })
           .catch((err: unknown) => {
             if (compactKey !== options.sessionKey.value) return
@@ -775,11 +747,9 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'usage_status':
       case 'usage.status':
       case '/usage':
-        options.rpc.call<UsageStatusResult>('usage.status')
-          .then((result: UsageStatusResult) => {
-            const totals = result?.totals || {}
-            const tokens = Number(result?.totalTokens ?? result?.total_tokens ?? totals.tokens ?? 0)
-            console.info(`Usage: ${tokens.toLocaleString()} tokens`)
+        usageReporting.status()
+          .then((result) => {
+            console.info(`Usage: ${result.totalTokens.toLocaleString()} tokens`)
           })
           .catch((err: unknown) => console.warn('Usage failed:', err instanceof Error ? err.message : String(err)))
         break

@@ -1,20 +1,11 @@
-import type { RpcEventHandler } from '@/lib/rpc'
 import {
-  createConversationEventHub,
   type ConversationEventHandle,
   type ConversationEventHub,
+  type ConversationEventListener,
+  type ConversationRecoveryScope,
 } from '@/modules/conversationEventHub'
 import type { ConversationSessionRuntime } from '@/modules/conversationSessionRuntime'
-import {
-  createConversationEventTransport,
-  conversationEventSessionKey,
-  type ConversationEventTransportHandlers,
-  type ConversationEventTransportMessage,
-} from '@/adapters/gateway/conversationEventTransport'
-
-type RpcSubscriptionClient = {
-  on(event: string, handler: RpcEventHandler): () => void
-}
+import type { ConversationEvent } from '@/modules/conversationEvents'
 
 /**
  * Composition-root bridge for the Conversation event lane.
@@ -26,35 +17,30 @@ type RpcSubscriptionClient = {
  * runtime is supplied.
  */
 export type ChatRpcSubscriptionHandlers = {
-  onEvent: (message: ConversationEventTransportMessage) => void
-  onAny?: ConversationEventTransportHandlers['onAny']
-  onConnectionState?: ConversationEventTransportHandlers['onConnectionState']
-  onDecodeError?: ConversationEventTransportHandlers['onDecodeError']
+  onEvent: ConversationEventListener<ConversationEvent>
+  onRecoveryRequired?: (scope: ConversationRecoveryScope) => Promise<boolean>
+  onConnectionState?: (state: string) => void
+  onDecodeError?: (error: unknown) => void
 }
 
 export interface ChatRpcSubscriptionOptions {
   /** Return the currently visible session key for logical event fencing. */
   getSessionKey?: () => string
   /** Shared runtime owner; avoids a second event source for this composition root. */
-  runtime?: Pick<ConversationSessionRuntime<ConversationEventTransportMessage, never>, 'events'>
+  runtime: Pick<ConversationSessionRuntime<ConversationEvent, never>, 'events'>
 }
 
 export function useChatRpcSubscriptions(
-  rpc: RpcSubscriptionClient,
   handlers: ChatRpcSubscriptionHandlers,
-  options: ChatRpcSubscriptionOptions = {},
+  options: ChatRpcSubscriptionOptions,
 ) {
-  const hub: ConversationEventHub<ConversationEventTransportMessage> =
-    options.runtime?.events
-    ?? createConversationEventHub(createConversationEventTransport(rpc), {
-      sessionKey: conversationEventSessionKey,
-    })
-  let activeHandle: ConversationEventHandle<ConversationEventTransportMessage> | null = null
+  const hub: ConversationEventHub<ConversationEvent> = options.runtime.events
+  let activeHandle: ConversationEventHandle<ConversationEvent> | null = null
   let activeKey = ''
   let detachEvent: (() => void) | null = null
-  let detachAny: (() => void) | null = null
   let detachState: (() => void) | null = null
   let detachDecodeError: (() => void) | null = null
+  let detachRecovery: (() => void) | null = null
 
   function subscribe(): () => void {
     unsubscribe()
@@ -65,12 +51,14 @@ export function useChatRpcSubscriptions(
     activeKey = String(options.getSessionKey?.() || '')
     activeHandle = hub.open(activeKey)
     detachEvent = activeHandle.observe(handlers.onEvent)
-    if (handlers.onAny) detachAny = hub.observeAny(handlers.onAny)
     if (handlers.onConnectionState) {
       detachState = hub.observeConnectionState(handlers.onConnectionState)
     }
     if (handlers.onDecodeError) {
       detachDecodeError = hub.observeDecodeError(handlers.onDecodeError)
+    }
+    if (handlers.onRecoveryRequired) {
+      detachRecovery = hub.observeRecoveryRequired(handlers.onRecoveryRequired)
     }
     return unsubscribe
   }
@@ -78,12 +66,12 @@ export function useChatRpcSubscriptions(
   function unsubscribe() {
     detachEvent?.()
     detachEvent = null
-    detachAny?.()
-    detachAny = null
     detachState?.()
     detachState = null
     detachDecodeError?.()
     detachDecodeError = null
+    detachRecovery?.()
+    detachRecovery = null
     activeHandle?.close()
     activeHandle = null
   }
@@ -102,7 +90,7 @@ export function useChatRpcSubscriptions(
   /** Open an additional logical stream without acquiring another WebSocket. */
   function open(
     key: string,
-    listener: (message: ConversationEventTransportMessage) => void = handlers.onEvent,
+    listener: ConversationEventListener<ConversationEvent> = handlers.onEvent,
   ) {
     const handle = hub.open(key)
     const detach = handle.observe(listener)

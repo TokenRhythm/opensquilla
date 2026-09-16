@@ -6,11 +6,10 @@ import {
   type PendingQueueOwnerContext,
 } from '@/composables/chat/useChatPendingQueue'
 import type { Attachment, ChatMessage } from '@/types/chat'
-import type { FoldLiveTurnMode } from './useChatTurnLog'
 import {
   useChatSend,
   type ChatSendOutcome,
-  type UseChatSendOptions,
+  type UseChatSendOptions as DomainUseChatSendOptions,
 } from './useChatSend'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
@@ -24,6 +23,10 @@ import type {
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast: vi.fn() }),
 }))
+
+interface UseChatSendOptions extends DomainUseChatSendOptions {
+  rpc: { call: any }
+}
 
 function memoryPendingWal(): PendingInputWal {
   const records = new Map<string, PendingInputWalRecord>()
@@ -92,7 +95,6 @@ describe('chat send session handoff', () => {
         resetInputHistory: vi.fn(),
         hasComposer: () => true,
         pendingInputWal,
-        supportsMethod: () => false,
       })
 
       // The child terminal replay can precede both history hydration and the
@@ -200,7 +202,6 @@ describe('chat send session handoff', () => {
       dispatchHiddenControl: (item, ownerSessionKey) =>
         dispatchHiddenControl(item, ownerSessionKey),
       pendingInputWal,
-      supportsMethod: () => false,
     })
     inputText.value = 'existing parent follow-up'
     await pendingQueueRuntime.enqueuePendingInput(
@@ -274,14 +275,15 @@ describe('chat send session handoff', () => {
       showThinkingIndicator: vi.fn(),
       hideThinkingIndicator: vi.fn(),
       appendFrame: vi.fn(),
-      useReducer: ref<FoldLiveTurnMode>(false),
     }
     const rpc = {
       call: vi.fn(<T = unknown>() => new Promise<T>((resolve) => {
         resolveSend = resolve as (value: unknown) => void
       })) as UseChatSendOptions['rpc']['call'],
     }
-    const turnCommands = createV4TurnCommandsFromRpcClient(rpc)
+    const turnCommands = createV4TurnCommandsFromRpcClient(
+      rpc as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
+    )
     const scheduleHistorySync = vi.fn()
     const steerDelivery = useChatSteerDelivery({
       messages,
@@ -290,7 +292,6 @@ describe('chat send session handoff', () => {
       scheduleHistorySync,
     })
     const send = useChatSend({
-      rpc,
       turnCommands,
       inputText,
       messages,

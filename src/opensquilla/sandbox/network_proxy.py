@@ -406,10 +406,6 @@ async def _relay_stream(
         return
 
 
-def _extract_request_host(header: bytes) -> str:
-    return _parse_request(header).host
-
-
 def _protocol_for_request(request: _ParsedRequest) -> NetworkProtocol:
     if request.method == "CONNECT":
         return NetworkProtocol.HTTPS_CONNECT
@@ -503,11 +499,6 @@ def _parse_request(header: bytes) -> _ParsedRequest:
     )
 
 
-def _host_from_absolute_url(target: str) -> str:
-    _scheme, host, _port, _origin_form = _parts_from_absolute_url(target)
-    return host
-
-
 def _parts_from_absolute_url(target: str) -> tuple[str, str, int, str]:
     try:
         parsed = urlsplit(target)
@@ -536,24 +527,10 @@ def _default_port_for_scheme(scheme: str) -> int:
     return 443 if scheme == "https" else 80
 
 
-def _host_from_connect_target(target: str) -> str:
-    host, _port = _host_port_from_connect_target(target)
-    return host
-
-
 def _host_port_from_connect_target(target: str) -> tuple[str, int]:
     if "://" in target or any(char in target for char in "/?#"):
         raise ValueError("malformed_connect_target")
     return _host_port_from_authority(target, require_port=True)
-
-
-def _host_from_authority(authority: str, *, require_port: bool) -> str:
-    host, _port = _host_port_from_authority(
-        authority,
-        require_port=require_port,
-        default_port=None if require_port else 80,
-    )
-    return host
 
 
 def _host_port_from_authority(
@@ -679,10 +656,6 @@ def _normalize_nonempty_host(host: str) -> str:
     if not normalized:
         raise ValueError("empty_host")
     return normalized
-
-
-def _identity_resolver(host: str, port: int) -> tuple[str, int]:
-    return host, port
 
 
 def _upstream_proxy_for_connect(

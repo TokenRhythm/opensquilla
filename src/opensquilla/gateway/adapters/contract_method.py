@@ -1,10 +1,9 @@
 """Small registration seam for generated Gateway method Contracts.
 
-The generated descriptor owns method identity and scope.  A per-method
-binding supplies only the compatibility behavior that cannot be generated:
-observe-only request drift and fail-closed response validation.  Business
-Implementations still receive the original params/context and are invoked
-exactly once.
+The generated descriptor owns method identity and scope.  A per-method binding
+supplies only the compatibility behavior that cannot be generated:
+observe-only request drift and fail-closed response validation.  Business Implementations
+still receive the original params/context and are invoked exactly once.
 """
 
 from __future__ import annotations
@@ -173,5 +172,6 @@ def register_gateway_contract_method[ContextT, ResultT](
         return result
 
     registered = cast(RegisteredHandler[ContextT, ResultT], handle_contract_method)
+    setattr(registered, "_opensquilla_generated_contract_name", binding.descriptor.name)
     registry.register(binding.descriptor.name, registered, binding.descriptor.scope)
     return registered

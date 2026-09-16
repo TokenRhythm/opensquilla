@@ -1019,6 +1019,7 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
                         "name": "DeepSeek V4 Flash",
                         "context_length": 128000,
                         "top_provider": {"max_completion_tokens": 8192},
+                        "architecture": {"input_modalities": ["text", "image"]},
                     }
                 ]
             },
@@ -1037,6 +1038,7 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
     assert captured["url"] == "https://openrouter.ai/api/v1/models"
     assert rows[0].provider == "openrouter"
     assert rows[0].model_id == "deepseek/deepseek-v4-flash"
+    assert rows[0].supports_vision is True
 
 
 def test_openrouter_http_error_names_provider_request(monkeypatch: Any) -> None:
@@ -1430,7 +1432,7 @@ def test_llm_trace_request_metadata_carries_compaction_proof(
     request_proof = rows[0]["metadata"]["request_proof"]
     assert request_proof["compaction_tier"] == 0
     assert request_proof["retry_count"] == 0
-    assert "compaction_tiny_guard_chars" in request_proof
+    assert "compaction_tiny_guard_chars" not in request_proof
     assert "compaction_protect_recent_assistant" in request_proof
 
 

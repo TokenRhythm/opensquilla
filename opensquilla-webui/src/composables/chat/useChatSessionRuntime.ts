@@ -59,6 +59,7 @@ export interface UseChatSessionRuntimeOptions {
     includeHistory?: boolean
     force?: boolean
   }) => SessionBootstrapRun
+  currentSessionBootstrap?: () => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void | Promise<void>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   setCompactInFlight: (active: boolean, key?: string) => void
@@ -78,6 +79,7 @@ export interface UseChatSessionRuntimeOptions {
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
+  retireAttachments?: () => void
   resetDraftComposer?: () => void
 }
 
@@ -170,6 +172,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   }
 
   function resetCurrentSessionAfterSlash() {
+    options.retireAttachments?.()
     resetSessionRuntimeState()
     resetCompactState()
     options.clearPendingQueue()
@@ -221,6 +224,9 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     // pinned frame before cancelSessionBootstrap returns, so B never waits for
     // A's ACK and no connected event can observe a half-switched route.
     options.cancelSessionBootstrap()
+    // Server adoption still belongs to the current composer. Only an actual
+    // navigation retires its files and outstanding reads/uploads.
+    if (pendingQueuePolicy.kind === 'navigate') options.retireAttachments?.()
     resetCompactState()
     options.beginSessionResolution?.(key)
     options.persistSession(key, { source: 'runtime.switchToSession' })
@@ -240,13 +246,44 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     }
     // Usage is optional metadata. Start it once the critical request frames are
     // queued; a slow history response must not withhold the rest of the UI.
-    void bootstrap.criticalRequestsQueued.then(() => {
-      if (
-        handoffEpoch === epoch
-        && options.sessionKey.value === key
-      ) void options.loadCurrentSessionUsage()
-    })
-    const subscriptionOutcome = await bootstrap.live
+    const admissionGeneration = bootstrap.generation
+    void bootstrap.criticalRequestsQueued.then(
+      () => {
+        if (
+          handoffEpoch === epoch
+          && options.sessionKey.value === key
+        ) {
+          void Promise.resolve()
+            .then(() => options.loadCurrentSessionUsage())
+            .catch(error => {
+              console.warn('Failed to load current session usage after bootstrap:', error)
+            })
+        }
+      },
+      error => {
+        const current = options.currentSessionBootstrap?.()
+        // A connected transition can supersede this predecessor before its
+        // critical frames are admitted. Only that proven replacement is an
+        // expected rejection; every other admission failure remains visible.
+        if (current && current.generation !== admissionGeneration) return
+        console.warn('Session bootstrap critical admission failed:', error)
+      },
+    )
+    let subscriptionOutcome = await bootstrap.live
+    if (
+      subscriptionOutcome.cancelled === true
+      && handoffEpoch === epoch
+      && options.sessionKey.value === key
+    ) {
+      const current = options.currentSessionBootstrap?.()
+      if (current && current.generation !== bootstrap.generation) {
+        // A physical connected transition replaced the complete lease while
+        // this logical handoff was awaiting its predecessor. Follow that one
+        // already-current run; never start or recursively chase generations.
+        bootstrap = current
+        subscriptionOutcome = await current.live
+      }
+    }
     if (handoffEpoch !== epoch || options.sessionKey.value !== key) return
     return {
       authoritative: subscriptionOutcome?.authoritative === true,
@@ -341,6 +378,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       return
     }
     options.cancelSessionBootstrap()
+    options.retireAttachments?.()
     resetCompactState()
     options.sessionKey.value = key
     resetSessionRuntimeState()

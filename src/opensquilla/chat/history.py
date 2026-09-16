@@ -280,6 +280,7 @@ def transcript_entries_to_chat_messages(
         attachments = None
         artifacts = None
         prompt_annotations = None
+        page_context = None
         if content and content.startswith("{"):
             try:
                 parsed = json.loads(content)
@@ -287,6 +288,9 @@ def transcript_entries_to_chat_messages(
                     display_text = parsed.get("display_text")
                     content = display_text if isinstance(display_text, str) else parsed["text"]
                     attachments = _public_attachment_projection(parsed.get("attachments"))
+                    raw_page_context = parsed.get("page_context")
+                    if isinstance(raw_page_context, dict):
+                        page_context = raw_page_context
                     from opensquilla.prompt_annotations import (
                         PromptAnnotationSnapshotError,
                         normalize_prompt_annotation_snapshots,
@@ -380,6 +384,8 @@ def transcript_entries_to_chat_messages(
             msg["artifacts"] = artifacts
         if prompt_annotations:
             msg["promptAnnotations"] = prompt_annotations
+        if page_context:
+            msg["pageContext"] = page_context
         usage = getattr(projected_entry, "turn_usage", None)
         if isinstance(usage, dict):
             msg["usage"] = usage

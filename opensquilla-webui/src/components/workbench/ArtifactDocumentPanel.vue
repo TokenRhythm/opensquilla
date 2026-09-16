@@ -124,9 +124,7 @@
       <ArtifactPreviewPanel
         v-else
         ref="previewRef"
-        :agent-edit-in-progress="agentEditInProgress"
         :artifact="headArtifact"
-        :auth-token="authToken"
         :base-origin="baseOrigin"
         :native-html="nativeHtml"
         :native-surface-state="nativeSurfaceState"
@@ -152,13 +150,11 @@
       role="tabpanel"
       :aria-labelledby="tabId('source')"
     >
-      <ArtifactHtmlStudio
+      <ArtifactSourcePreview
         :key="documentModel.documentId"
         ref="sourceRef"
-        :artifact="artifact"
         :document="documentModel"
         :session-key="sessionKey"
-        @source-saved="onSourceSaved"
       />
     </div>
 
@@ -175,20 +171,28 @@
         {{ t('workbench.artifactDocument.noVersions') }}
       </p>
       <ol v-else class="artifact-document__list artifact-document__versions">
-        <li v-for="revision in revisions" :key="revision.revisionId">
+        <li
+          v-for="revision in revisions"
+          :key="revision.revisionId"
+          :class="{ 'artifact-document__version--current': revision.revisionId === documentModel?.headRevisionId }"
+          :aria-current="revision.revisionId === documentModel?.headRevisionId ? 'true' : undefined"
+        >
           <span class="artifact-document__list-main">
-            <strong>{{ revisionLabel(revision) }}</strong>
+            <span class="artifact-document__version-title">
+              <strong>{{ revisionLabel(revision) }}</strong>
+              <span
+                v-if="revision.revisionId === documentModel?.headRevisionId"
+                class="artifact-document__badge"
+              >
+                <Icon name="check" :size="14" aria-hidden="true" />
+                {{ t('workbench.artifactDocument.current') }}
+              </span>
+            </span>
             <small>
               {{ t('workbench.artifactDocument.versionNumber', { generation: revision.generation }) }}
             </small>
           </span>
           <span class="artifact-document__list-meta">
-            <span
-              v-if="revision.revisionId === documentModel?.headRevisionId"
-              class="artifact-document__badge"
-            >
-              {{ t('workbench.artifactDocument.current') }}
-            </span>
             <time v-if="revision.createdAt" :datetime="dateTime(revision.createdAt)">
               {{ formatDate(revision.createdAt) }}
             </time>
@@ -271,7 +275,7 @@ import type {
   ArtifactDocumentActions,
   ArtifactDocumentWorkspaceSnapshot,
 } from '@/types/artifactDocuments'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   PROMPT_ANNOTATION_MAX_BODY_LENGTH,
   promptAnnotationBodyWithinLimit,
@@ -280,29 +284,25 @@ import { isMacPlatform } from '@/utils/browser'
 import { isOfficeArtifact } from '@/utils/chat/artifacts'
 import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import type {
-  WorkbenchBeforeCloseOptions,
   WorkbenchComponentEvent,
 } from '@/workbench/types'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
-import ArtifactHtmlStudio from './ArtifactHtmlStudio.vue'
+import ArtifactSourcePreview from './ArtifactSourcePreview.vue'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
 
 type DocumentTab = 'preview' | 'source' | 'versions' | 'changes'
 type PreviewHandle = { reload: () => Promise<void> }
 type SourceHandle = {
-  beforeClose: (options?: WorkbenchBeforeCloseOptions) => Promise<boolean>
   reload: () => Promise<void>
 }
 
 const props = withDefaults(defineProps<{
-  agentEditInProgress?: boolean
   artifact: ArtifactPayload
   documentActions?: ArtifactDocumentActions | null
   documentFeatures?: boolean
   documentSnapshot?: ArtifactDocumentWorkspaceSnapshot
   initialSection?: 'preview' | 'source'
   initialSectionRequestId?: number
-  authToken?: string
   baseOrigin?: string
   nativeHtml?: boolean
   nativeSurfaceState?: 'crashed' | 'error' | 'loading' | 'ready'
@@ -324,7 +324,6 @@ const props = withDefaults(defineProps<{
     screenshotUrl?: string
   } | null
 }>(), {
-  agentEditInProgress: false,
   documentSnapshot: () => ({
     key: '',
     loading: false,
@@ -337,7 +336,6 @@ const props = withDefaults(defineProps<{
   documentFeatures: true,
   initialSection: 'preview',
   initialSectionRequestId: 0,
-  authToken: '',
   baseOrigin: '',
   nativeHtml: false,
   nativeSurfaceState: 'loading',
@@ -546,13 +544,6 @@ function forwardWorkbenchEvent(event: WorkbenchComponentEvent) {
   emit('workbench-event', event)
 }
 
-function onSourceSaved(revisionId: string) {
-  emit('workbench-event', {
-    type: 'artifact-head-changed',
-    payload: { revisionId },
-  })
-}
-
 function downloadHead() {
   emit('workbench-event', {
     type: 'artifact-download',
@@ -574,7 +565,6 @@ function canRestoreRevision(revisionId: string): boolean {
   return Boolean(
     actionsAvailable.value
     && documentModel.value?.capabilities.revisions
-    && revisionId !== documentModel.value.headRevisionId
     && revisions.value.some(item => (
       item.revisionId === revisionId
       && item.documentId === documentModel.value?.documentId
@@ -686,8 +676,8 @@ async function reload() {
   else await previewRef.value?.reload()
 }
 
-async function beforeClose(options?: WorkbenchBeforeCloseOptions): Promise<boolean> {
-  return await sourceRef.value?.beforeClose(options) ?? true
+async function beforeClose(): Promise<boolean> {
+  return true
 }
 
 defineExpose({ beforeClose, reload })
@@ -809,8 +799,7 @@ defineExpose({ beforeClose, reload })
   border-bottom-color: var(--accent);
 }
 
-.artifact-document__count,
-.artifact-document__badge {
+.artifact-document__count {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -822,6 +811,23 @@ defineExpose({ beforeClose, reload })
   color: var(--text-muted);
   font-size: 10px;
   line-height: 1;
+}
+
+.artifact-document__badge {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  color: color-mix(in srgb, var(--accent) 75%, var(--text));
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
 }
 
 .artifact-document__loading {
@@ -930,6 +936,23 @@ defineExpose({ beforeClose, reload })
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg);
+}
+
+.artifact-document__list li.artifact-document__version--current {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg));
+}
+
+.artifact-document__version-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.artifact-document__version-title strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .artifact-document__list-main,

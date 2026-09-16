@@ -34,6 +34,7 @@ from .codex_auth import (
     refresh_codex_credentials,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .openai_responses import _responses_input
 from .protocol import ProviderConnectionConfig, ProviderMetadata
@@ -389,6 +390,9 @@ class OpenAICodexProvider:
                                     max_len=2000,
                                 ),
                                 code=str(response.status_code),
+                                retry_after_s=retry_after_from_headers(
+                                    response.status_code, getattr(response, "headers", None)
+                                ),
                             )
                             return
 
@@ -406,7 +410,7 @@ class OpenAICodexProvider:
                     api_key=credentials.access_token,
                     max_len=2000,
                 ),
-                code="timeout",
+                code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout",
             )
         except httpx.RequestError as exc:
             yield ErrorEvent(
@@ -415,7 +419,7 @@ class OpenAICodexProvider:
                     api_key=credentials.access_token,
                     max_len=2000,
                 ),
-                code="request_error",
+                code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error",
             )
         except CandidateArtifactLimitError as exc:
             log.warning(

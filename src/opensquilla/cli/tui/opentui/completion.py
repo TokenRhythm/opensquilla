@@ -6,11 +6,14 @@ import fnmatch
 import os
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from opensquilla.engine.commands import CommandPresentation, Surface
 from opensquilla.git_runtime import run_git
+from opensquilla.skills.catalog_policy import is_public_ordinary
+from opensquilla.skills.eligibility import live_eligibility_context
 from opensquilla.tools.builtin.filesystem import _is_sensitive_access_path
 
 from .messages import (
@@ -25,6 +28,15 @@ _SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "__pycache__"})
 
 class SkillCompletionLoader(Protocol):
     def get_user_invocable(self) -> Sequence[Any]: ...
+
+
+@dataclass(frozen=True)
+class _ConfiguredSkillCompletionLoader:
+    loader: SkillCompletionLoader
+    skills_config: object
+
+    def get_user_invocable(self) -> Sequence[Any]:
+        return self.loader.get_user_invocable()
 
 
 def fuzzy_rank(query: str, candidates: Sequence[str]) -> list[tuple[int, float]]:
@@ -379,15 +391,18 @@ def _skill_candidates(
             else _build_skill_loader(workspace_dir=workspace_dir)
         )
         skills = loader.get_user_invocable()
+        eligibility = live_eligibility_context(getattr(loader, "skills_config", None))
     except Exception:
         return []
 
     candidates: list[CompletionCandidate] = []
     for skill in sorted(skills, key=lambda item: getattr(item, "name", "")):
-        if getattr(skill, "disable_model_invocation", False):
+        if not is_public_ordinary(
+            skill, coding_mode="code-task" not in eligibility.disabled_set
+        ):
             continue
         name = str(getattr(skill, "name", "")).strip()
-        if not name:
+        if not name or name in eligibility.disabled_set:
             continue
         candidates.append(
             CompletionCandidate(
@@ -424,13 +439,16 @@ def _build_skill_loader(*, workspace_dir: Path | None = None) -> SkillCompletion
         managed_override=config.skills.managed_dir,
         extra_dirs=[Path(d) for d in config.skills.extra_dirs],
     )
-    return SkillLoader(
-        bundled_dir=layer_dirs.bundled_dir,
-        workspace_dir=layer_dirs.workspace_dir,
-        managed_dir=layer_dirs.managed_dir,
-        personal_agents_dir=layer_dirs.personal_agents_dir,
-        project_agents_dir=layer_dirs.project_agents_dir,
-        extra_dirs=layer_dirs.extra_dirs,
+    return _ConfiguredSkillCompletionLoader(
+        loader=SkillLoader(
+            bundled_dir=layer_dirs.bundled_dir,
+            workspace_dir=layer_dirs.workspace_dir,
+            managed_dir=layer_dirs.managed_dir,
+            personal_agents_dir=layer_dirs.personal_agents_dir,
+            project_agents_dir=layer_dirs.project_agents_dir,
+            extra_dirs=layer_dirs.extra_dirs,
+        ),
+        skills_config=config.skills,
     )
 
 

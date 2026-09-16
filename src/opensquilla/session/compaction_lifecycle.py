@@ -8,6 +8,16 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal
 from uuid import uuid4
 
+from opensquilla.compaction_status import (
+    BENIGN_AUTOMATIC_COMPACTION_SKIP_REASONS as BENIGN_AUTOMATIC_COMPACTION_SKIP_REASONS,
+)
+from opensquilla.compaction_status import (
+    STALE_COMPACTION_REASONS as STALE_COMPACTION_REASONS,
+)
+from opensquilla.compaction_status import (
+    compaction_failure_status as compaction_failure_status,
+)
+
 FlushCompactionDecision = Literal[
     "safe_destructive",
     "degraded_forensic",
@@ -41,17 +51,6 @@ COMPACTION_SUMMARY_VERIFIED_EVENT: Final[str] = "compaction.summary_verified"
 COMPACTION_PERSISTED_EVENT: Final[str] = "compaction.persisted"
 COMPACTION_REPLAYED_EVENT: Final[str] = "compaction.replayed"
 COMPACTION_COVERAGE_UNKNOWN: Final[str] = "unknown"
-BENIGN_AUTOMATIC_COMPACTION_SKIP_REASONS: Final[frozenset[str]] = frozenset(
-    {
-        "already_attempted_this_turn",
-        "already_compacted_this_turn",
-        "no_entries",
-        "stale_preimage",
-        "structured_content_noop",
-        "within_budget",
-        "within_compaction_budget",
-    }
-)
 NOOP_FLUSH_RESULT_STATUSES: Final[frozenset[str]] = frozenset({"ok_noop_no_memory"})
 ARCHIVE_ONLY_FLUSH_RESULT_STATUSES: Final[frozenset[str]] = frozenset(
     {"ok_archive_only"}
@@ -111,6 +110,10 @@ class CompactionTimeoutError(TimeoutError):
             else ""
         )
         super().__init__(f"Compaction timed out during {self.phase}{detail}")
+
+
+class ConsumerAdmissionStaleError(RuntimeError):
+    """The frozen consumer envelope no longer describes the active request."""
 
 
 def new_compaction_id() -> str:

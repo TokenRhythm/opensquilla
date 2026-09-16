@@ -86,7 +86,6 @@ async def test_extended_length_state_keeps_gateway_services_operational(
             "ttl_sweep_interval_minutes": 0.0,
             "capture_assistant": True,
         },
-        sandbox={"auto_setup": False},
     )
     session_db = state_dir / "gateway-startup-smoke.db"
     services = None

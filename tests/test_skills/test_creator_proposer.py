@@ -76,8 +76,8 @@ def test_meta_skill_fill_slots_with_stub_llm(monkeypatch) -> None:
         "meta_priority": 50,
         "triggers": ["synth test"],
         "steps": [
-            {"id": "a", "skill": "summarize", "task": "process", "with_keys": {}},
-            {"id": "b", "skill": "memory", "task": "save", "with_keys": {}},
+            {"id": "a", "skill": "deep-research", "task": "process", "with_keys": {}},
+            {"id": "b", "skill": "docx", "task": "save", "with_keys": {}},
         ],
     })
 
@@ -96,7 +96,8 @@ def test_meta_skill_fill_slots_with_stub_llm(monkeypatch) -> None:
     assert data["name"] == "synth-pipeline"
     assert len(call_log) == 1
     # Catalog injection: skill names must appear in prompt
-    assert "summarize" in call_log[0]
+    assert "deep-research" in call_log[0]
+    assert "docx" in call_log[0]
 
 
 def test_creator_package_import_registers_tools() -> None:
@@ -166,14 +167,14 @@ def test_creator_tools_hidden_from_owner_default() -> None:
 
     reg = get_default_registry()
     # Use the default owner context (is_owner=True, no allowed_tools override).
-    # _iter_visible_tools with this context filters out exposed_by_default=False.
+    # _iter_visible_tools with this context filters out default_access="deny".
     ctx = ToolContext(is_owner=True)
     visible_names = {rt.spec.name for rt in reg._iter_visible_tools(ctx)}
 
     for tool_name in ("meta_skill_assemble", "meta_skill_fill_slots"):
         assert tool_name not in visible_names, (
             f"{tool_name} is visible in the default owner tool catalog; "
-            "N1 fix requires exposed_by_default=False so C1 lazy import "
+            "N1 fix requires default_access=deny so C1 lazy import "
             "does not leak it into normal owner turns."
         )
 

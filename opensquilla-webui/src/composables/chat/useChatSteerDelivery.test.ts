@@ -2,7 +2,7 @@ import { effectScope, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage, ChatPendingItem, PendingSteerPhase } from '@/types/chat'
-import type { SessionSteerV2Params } from '@/types/rpc'
+import type { SessionSteerV2Params } from '@/types/chat'
 import { useChatSteerDelivery } from './useChatSteerDelivery'
 
 const REQUEST: SessionSteerV2Params = {

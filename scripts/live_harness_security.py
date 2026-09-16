@@ -229,12 +229,6 @@ class ProviderKeysInventory:
     permission_warning: str | None
 
 
-def provider_model_metadata_names() -> frozenset[str]:
-    """Return model metadata names accepted from a provider-key data file."""
-
-    return _MODEL_METADATA_NAMES
-
-
 def _parse_literal_assignment(raw_line: str) -> tuple[str, str] | None:
     line = raw_line.strip()
     if not line or line.startswith("#"):

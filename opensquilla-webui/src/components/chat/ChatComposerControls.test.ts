@@ -119,7 +119,7 @@ describe('ChatComposer model routing contract', () => {
     expect(viewSource).toContain(':session-routing-busy="modelRoutingSettingsBusy"')
     expect(viewSource).toContain(':session-routing-control-blocked="goalBusy"')
     expect(viewSource).toContain(':session-routing-available="sessionRoutingAvailable"')
-    expect(viewSource).toContain("auth?.principal?.authState === 'authenticated'")
+    expect(viewSource).toContain('gatewayAccess.isAuthenticated')
     expect(viewSource).toContain('sessionRouting.available()')
     expect(composerSource).toContain('v-if="sessionRoutingAvailable"')
     expect(viewSource).toContain('@set-session-routing-mode="setComposerSessionRoutingMode"')

@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/opensquilla/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/TokenRhythm/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
   <a href="https://opensquilla.ai/"><img src="https://img.shields.io/badge/website-opensquilla.ai-blue?style=for-the-badge" alt="Website"></a>
-  <a href="https://github.com/opensquilla/opensquilla/releases"><img src="https://img.shields.io/github/v/release/opensquilla/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/releases"><img src="https://img.shields.io/github/v/release/TokenRhythm/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=for-the-badge" alt="Python 3.12+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge" alt="Apache 2.0 License"></a>
 </p>
@@ -26,8 +26,6 @@
 ## News
 
 - 📢 **2026-08-22** — The English version of our technical report is now on aiXiv: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001), and the Chinese version is on ChinaXiv: [202608.00176](https://chinaxiv.org/abs/202608.00176). See [Citation](#citation) for how to cite OpenSquilla.
-
-- 📢 **2026-08-21** — PDF versions of our technical report are now available in this repo: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
 
 - 📢 **2026-07-14** — Our technical report **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** is now on arXiv. It shows how the harness-native router turns everyday agent traffic into a self-improving data flywheel, and how **multi-model ensemble routing surpasses Fable 5**.
 
@@ -120,8 +118,8 @@ Install links: [Git](https://git-scm.com/downloads) ·
 The 0.5.4 desktop installers package the Vue control console and
 gateway runtime in an Electron shell.
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 For faster Mainland China downloads, use the OSS direct-download aliases:
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -147,10 +145,11 @@ profile data during a normal uninstall.
 Code signing policy: [`docs/code-signing-policy.md`](docs/code-signing-policy.md).
 
 > [!NOTE]
-> Windows builds are currently unsigned. If SmartScreen appears, choose
-> **More info** → **Run anyway**. If Smart App Control or enterprise policy
-> blocks the unsigned app, use [Quick terminal install](#quick-terminal-install)
-> instead.
+> The published v0.5.4 Windows installer remains unsigned. The current Release
+> Assets workflow Authenticode signs new Windows installers as Beijing
+> TokenRhythm Technologies Co., Ltd. SmartScreen reputation can still take time
+> to build for a new publisher or application. If enterprise policy blocks the
+> Desktop app, use [Quick terminal install](#quick-terminal-install) instead.
 
 ### Quick terminal install
 
@@ -179,7 +178,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Install OpenSquilla** — the same command on every platform.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 This installs the OpenSquilla wheel from the release URL, then lets
@@ -203,7 +202,7 @@ opensquilla gateway run
 > a new terminal, or re-run the PATH line from step 1.
 
 For a fully pinned install, use the versioned wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
 
 ### Install from source
 
@@ -217,7 +216,7 @@ modify the code.
 
    ```sh
    git lfs install
-   git clone https://github.com/opensquilla/opensquilla.git
+   git clone https://github.com/TokenRhythm/opensquilla.git
    cd opensquilla
    git lfs pull --include="src/opensquilla/squilla_router/models/**"
    ```
@@ -389,54 +388,42 @@ full reference.
 
 ---
 
-## Installation Privacy
+## Telemetry Privacy
 
-OpenSquilla uses pseudonymous installation telemetry to estimate install
-counts, version adoption, and runtime compatibility. Data is sent on first
-gateway startup and once per OpenSquilla version. It also records content-free daily
-aggregates of completed top-level conversations and token usage by UTC date,
-and attempts to upload pending cumulative UTC-day snapshots to the telemetry
-service at startup and once per hour. OpenSquilla may also make
-passive update checks, including automatic desktop update checks at startup
-and, while the app remains open, at most once per day. Uploads use a short
-timeout and never block startup.
+OpenSquilla uses the existing **Network reporting** switch for V1 statistics and
+both V2 telemetry streams. Reporting is enabled by default and can be turned off in Privacy
+settings, without separate onboarding choices or consent popups:
 
-See [`PRIVACY.md`](PRIVACY.md) for the full privacy policy covering local data,
-provider requests, network observability, logs, release downloads, and deletion.
+- **Reliability diagnostics** records bounded operation results for app and
+  Gateway startup, crashes, turns, tools, file parsing, updates, and session
+  performance.
+- **Product and growth analytics** records client launches, actual MetaSkill
+  and Coding Mode executions, and one-time acquisition, onboarding,
+  app-readiness, registration, and first-successful-turn milestones. Existing
+  installations do not become new-user cohorts just by enabling reporting.
 
-What is sent:
+The streams retain separate purpose-specific identifiers, durable queues,
+upload endpoints, and retention policies. Reliability events
+go to `/v1/reliability/events`; growth events go to `/v1/growth/events`.
+Retries reuse `event_id` for server-side deduplication, and growth events are
+not sampled.
 
-- schema version
-- locally generated stable `install_id` digest
-- OpenSquilla version
-- event type (`install`, `version_seen`, or `daily_usage`)
-- install method (`pip`, `source`, `docker`, `desktop`, or `unknown`)
-- operating system, OS version, CPU architecture, and Python major/minor
-  version
-- first-seen and sent timestamps
-- CI/test-environment marker (`ci_environment`)
-- completed UTC day, conversation count, and aggregate input/output/cache/cache-write
-  token counts for daily-usage events
+V2 telemetry never includes prompts, responses, file names, file paths, file
+contents, tool arguments, task parameters, provider configuration, raw account
+IDs, order data, MAC addresses, IP addresses, or device fingerprints. Complete
+crash stacks stay local unless the user explicitly prepares and shares a
+support bundle.
 
-The `install_id` is a local one-way SHA-256 digest derived from usable MAC
-addresses, then local IP addresses when no MAC is available, with a random
-persisted fallback. Raw MAC/IP values are not uploaded.
+V1 installation/version reporting at `/v1/install` and daily conversation/token
+totals at `/v1/usage` run alongside V2 after Gateway readiness. Only completed
+UTC days are uploaded; pending days retry hourly. Existing installation state
+is retained. Daily event IDs use a persistent random identity per aggregate
+database to separate profiles while keeping retries stable. V1 retains its pseudonymous installation
+ID derived locally from MAC/IP data, with a persisted random fallback; raw MAC/IP
+values are not uploaded. The `X-OpenSquilla-Install-Id` provider header remains
+retired, and V2 keeps its independent identities.
 
-By default, requests sent directly to the official TokenRhythm HTTPS API may
-also carry the same pseudonymous, cross-session installation identifier in the
-optional `X-OpenSquilla-Install-Id` header. Only the exact official
-`tokenrhythm.studio` and `api.tokenrhythm.studio` HTTPS hosts on port 443 are
-eligible; custom proxies, OpenRouter, other providers, browser pages,
-redirected nonofficial targets, and returned image/CDN downloads are excluded.
-The raw MAC/IP values are never sent. The header is omitted if its background
-resolution is not ready or fails, so requests continue normally.
-
-What is not sent: usernames, hostnames, paths, API keys, provider config,
-chat/session/memory/agent content, file names, or file contents. Source IP may
-be visible to HTTP servers at the transport layer, but is not part of the
-payload.
-
-To disable non-user-initiated network observability before startup:
+To force all non-user-initiated network observability off before startup:
 
 ```sh
 OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
@@ -449,15 +436,15 @@ or set:
 disable_network_observability = true
 ```
 
-That unified switch covers automatic install telemetry, daily aggregate usage
-telemetry, passive update checks, and automatic desktop update checks at
-startup and during long-running app sessions, as well as the TokenRhythm
-installation header. Explicit update-availability checks remain disabled while
-the unified or legacy opt-out is active. CI and test environments also
-suppress the installation header and installation telemetry automatically.
-Other user-initiated actions may still
-contact network services after user intent, including release downloads and
-configured providers, search, or channels.
+This is a hard veto over V1 and both V2 telemetry scopes, passive update checks, and
+automatic desktop update checks. Disabling Network reporting pauses pending uploads and
+stops collection without deleting local telemetry state. Previously saved
+per-scope declines are migrated to the unified switch being off; users can
+then change that one setting. CI, test, and `DO_NOT_TRACK` environments
+also fail closed for telemetry. Other user-initiated actions may still contact
+configured providers, search services, channels, or release hosts.
+Explicit update-availability checks remain disabled while the unified or
+legacy update opt-out controls are active.
 
 Legacy opt-out environment variables remain honored:
 
@@ -466,18 +453,10 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-The legacy telemetry opt-out suppresses the TokenRhythm installation header;
-the update-check opt-out by itself does not. TokenRhythm must treat the header
-as optional and untrusted, and must not use it for authentication,
-authorization, billing, rate limiting, or anti-abuse decisions. See
-[`PRIVACY.md`](PRIVACY.md#tokenrhythm-installation-identifier) for the complete
-target and data-handling rules.
-
-Advanced deployments can use their own installation telemetry endpoint:
-
-```sh
-OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install
-```
+The legacy telemetry variable disables V1 and V2 reporting. The legacy update
+variable also suppresses V1 uploads for compatibility, but does not disable V2.
+See [`PRIVACY.md`](PRIVACY.md) for the complete data, reporting, deletion, update,
+and external-producer rules.
 
 ---
 
@@ -668,13 +647,13 @@ to allow inbound TCP on that port. Do not expose the gateway with
 **Docker**
 
 Prebuilt multi-arch images (`amd64`/`arm64`) are published to
-`ghcr.io/opensquilla/opensquilla` on release tags. 0.5.4 is published as
+`ghcr.io/tokenrhythm/opensquilla` on release tags. 0.5.4 is published as
 both `v0.5.4` and the moving `latest` tag —
 [`docs/docker.md`](docs/docker.md) is the full container guide
 (home servers and NAS, LAN exposure with token auth, upgrades):
 
 ```sh
-OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/opensquilla/opensquilla:latest docker compose up -d
+OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/tokenrhythm/opensquilla:latest docker compose up -d
 ```
 
 Without `OPENSQUILLA_GATEWAY_IMAGE`, the compose path runs an
@@ -813,8 +792,8 @@ notes for squash-merged or replayed work.
 Thanks to all the people who contribute to OpenSquilla.
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  <a href="https://github.com/TokenRhythm/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TokenRhythm/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
   </a>
 </p>
 
@@ -826,7 +805,7 @@ Contributions of every kind are welcome — bug reports, feature ideas,
 documentation, new provider or channel adapters, skills, and core
 runtime work. See [`CONTRIBUTING.md`](CONTRIBUTING.md), then open an
 issue or pull request on
-[GitHub](https://github.com/opensquilla/opensquilla).
+[GitHub](https://github.com/TokenRhythm/opensquilla).
 
 [Code of Conduct](CODE_OF_CONDUCT.md) · [Security](SECURITY.md) ·
 [Privacy](PRIVACY.md) · [Code signing policy](docs/code-signing-policy.md) ·

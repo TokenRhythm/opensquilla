@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -103,8 +104,12 @@ async def test_code_exec_exact_elevation_runs_host_once(
         pid = 6201
         returncode = 0
 
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"approved\n", b""
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_data(b"approved\n")
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
 
         def kill(self) -> None:
             raise AssertionError("approved code should not time out")

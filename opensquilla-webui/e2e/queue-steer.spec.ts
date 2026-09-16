@@ -1,4 +1,12 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
+
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-queue-steer'
@@ -109,9 +117,8 @@ async function installMockGateway(
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30000, concurrent_history_reads: true },
+        ws.send(helloOkResponse({
+          policy: { concurrent_history_reads: true },
           features: { methods: ['sessions.steer.v2'] },
           auth: {
             principal: { isOwner: true },
@@ -123,47 +130,33 @@ async function installMockGateway(
 
       if (method === 'chat.history') {
         state.historyCalls += 1
-        ws.send(successResponse(frame.id, {
-          messages: state.historyMessages,
-          has_more: false,
-          canonical_available: true,
-          canonical_complete: true,
-        }))
+        ws.send(successResponse(frame.id, chatHistoryPayload(state.historyMessages)))
         return
       }
 
       if (method === 'sessions.messages.snapshot') {
-        ws.send(successResponse(frame.id, {
-          key: SESSION_KEY,
-          events: [],
+        ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(SESSION_KEY, {
           current_stream_seq: 0,
-        }))
+        })))
         return
       }
 
       if (method === 'sessions.messages.subscribe') {
-        ws.send(successResponse(frame.id, {
-          subscribed: true,
+        ws.send(successResponse(frame.id, sessionMessagesSubscribePayload(SESSION_KEY, {
           hydration_complete: false,
-          replay_complete: true,
-          current_stream_seq: 0,
           run_status: 'running',
           active_task: activeTask(!options.capabilityFromHydration),
-        }))
+        })))
         return
       }
 
       if (method === 'sessions.messages.hydrate') {
         state.hydrateCalls += 1
-        ws.send(successResponse(frame.id, {
-          subscribed: true,
-          hydration_complete: true,
-          replay_complete: true,
-          current_stream_seq: 0,
+        ws.send(successResponse(frame.id, sessionMessagesHydratePayload(SESSION_KEY, {
           run_status: 'running',
           active_task: activeTask(true),
           workspaceId: null,
-        }))
+        })))
         return
       }
 
@@ -210,6 +203,8 @@ async function installMockGateway(
             status: 'ok',
             runStatus: 'running',
           }],
+          count: 1,
+          ts: 1_800_000_000,
           has_more: false,
         },
         'sessions.messages.unsubscribe': { subscribed: false },

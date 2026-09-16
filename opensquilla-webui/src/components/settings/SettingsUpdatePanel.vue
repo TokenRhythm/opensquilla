@@ -3,9 +3,11 @@ import { computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDesktopUpdate } from '@/composables/useDesktopUpdate'
+import { useDesktopUpdatePresentation } from '@/composables/useDesktopUpdatePresentation'
 
 const { t } = useI18n()
 const update = useDesktopUpdate()
+const { canInstall, retryError } = useDesktopUpdatePresentation(update)
 
 onMounted(update.init)
 
@@ -22,6 +24,7 @@ const sourceLabel = computed(() => {
 })
 
 const statusTone = computed(() => {
+  if (retryError.value) return 'control-pill--danger'
   if (status.value === 'downloaded') return 'control-pill--ok'
   if (status.value === 'available' || status.value === 'downloading' || status.value === 'checking') return 'control-pill--accent'
   if (status.value === 'error') return 'control-pill--danger'
@@ -30,6 +33,7 @@ const statusTone = computed(() => {
 
 const statusLabel = computed(() => {
   if (!state.value.canCheck) return t('updates.desktop.unavailableStatus')
+  if (retryError.value) return t('updates.desktop.errorStatus')
   if (status.value === 'downloaded' && manualInstall.value) return t('updates.desktop.manualDownloadedStatus')
   if (status.value === 'available' && manualInstall.value) return t('updates.desktop.manualAvailableStatus')
   if (status.value === 'available') return t('updates.desktop.availableStatus')
@@ -38,24 +42,25 @@ const statusLabel = computed(() => {
   if (status.value === 'checking') return t('updates.desktop.checkingStatus')
   if (status.value === 'not-available') return t('updates.desktop.upToDateStatus')
   if (status.value === 'error') return t('updates.desktop.errorStatus')
-  if (status.value === 'applying') return t('updates.desktop.applyingStatus')
+  if (status.value === 'applying') return t(manualInstall.value ? 'updates.desktop.manualApplyingStatus' : 'updates.desktop.applyingStatus')
   return t('updates.desktop.idleStatus')
 })
 
 const description = computed(() => {
   if (!state.value.canCheck) return t('updates.desktop.unsupported')
+  if (retryError.value) return update.localizedError.value
   if (status.value === 'available' && manualInstall.value) return t('updates.desktop.manualAvailableDesc')
   if (status.value === 'available') return t('updates.desktop.availableDesc')
   if (status.value === 'downloaded') {
     return manualInstall.value
-      ? t('updates.desktop.manualDownloadedDesc', { version: latestVersion.value })
+      ? t(canInstall.value ? 'updates.desktop.signedDownloadedDesc' : 'updates.desktop.manualDownloadedDesc', { version: latestVersion.value })
       : t('updates.desktop.downloadedDesc', { version: latestVersion.value })
   }
   if (status.value === 'downloading') return t('updates.desktop.downloadingDesc')
   if (status.value === 'not-available') return t('updates.desktop.upToDateDesc', { version: currentVersion.value })
   if (status.value === 'error') return update.localizedError.value
   if (status.value === 'checking') return t('updates.desktop.checkingDesc')
-  if (status.value === 'applying') return t('updates.desktop.applyingDesc')
+  if (status.value === 'applying') return t(manualInstall.value ? 'updates.desktop.manualApplyingDesc' : 'updates.desktop.applyingDesc')
   if (manualInstall.value) return t('updates.desktop.manualIdleDesc')
   return t('updates.desktop.idleDesc')
 })
@@ -63,7 +68,7 @@ const description = computed(() => {
 const showDownload = computed(() => state.value.canCheck && state.value.installMode !== 'unsupported' && (
   status.value === 'available' || (manualInstall.value && status.value === 'downloaded')
 ))
-const showRelaunch = computed(() => state.value.installMode === 'native' && status.value === 'downloaded')
+const showRelaunch = computed(() => canInstall.value && status.value === 'downloaded')
 const showLater = computed(() => state.value.canCheck && (status.value === 'available' || status.value === 'downloaded' || status.value === 'error'))
 </script>
 
@@ -105,7 +110,8 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
       <button
         v-if="showDownload"
         type="button"
-        class="btn btn--primary"
+        class="btn"
+        :class="showRelaunch ? 'btn--ghost' : 'btn--primary'"
         data-testid="settings-update-download"
         :disabled="busy"
         @click="update.download"
@@ -128,7 +134,7 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
         @click="update.relaunch"
       >
         <Icon name="refresh" :size="15" aria-hidden="true" />
-        <span>{{ t('updates.desktop.relaunch') }}</span>
+        <span>{{ t(manualInstall ? 'updates.desktop.quitAndInstall' : 'updates.desktop.relaunch') }}</span>
       </button>
       <button
         v-if="showLater"
@@ -170,6 +176,7 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
 }
 
 .settings-update__actions {
+  flex-wrap: wrap;
   justify-content: flex-start;
 }
 </style>

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, Self
 
+from opensquilla.observability.log_privacy import log_metadata
 from opensquilla.paths import default_opensquilla_home
 
 TRACE_SCHEMA_VERSION = 1
@@ -238,7 +239,10 @@ def _append_trace_event(event: TraceEvent, log_dir: Path, *, allow_raw: bool) ->
     day = datetime.now(UTC).strftime("%Y%m%d")
     path = log_dir / f"traces-{day}.jsonl"
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+        payload = event.to_dict()
+        if event.privacy != "raw":
+            payload = log_metadata(payload)
+        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return path
 
 

@@ -276,6 +276,10 @@ class SandboxBackendError(RuntimeError):
     """
 
 
+class SandboxSetupRequiredError(SandboxBackendError):
+    """The host supports the backend, but its first-time setup has not run."""
+
+
 class DenialReason(StrEnum):
     """Why a request was denied.
 
@@ -389,6 +393,7 @@ __all__ = [
     "ResourceLimits",
     "SANDBOX_WORKSPACE_PATH",
     "SandboxBackendError",
+    "SandboxSetupRequiredError",
     "SandboxPolicy",
     "SandboxRequest",
     "SandboxResult",

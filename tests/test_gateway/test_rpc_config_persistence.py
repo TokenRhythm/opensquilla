@@ -21,6 +21,7 @@ import structlog.testing
 
 import opensquilla.gateway.rpc_config as rpc_config
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_config import (
     _handle_config_apply,
@@ -494,6 +495,6 @@ def test_rpc_config_persist_delegates_to_sparse_persister(
 
     monkeypatch.setattr(config_store, "persist_config", _record)
 
-    rpc_config._persist_config(cfg)
+    persist_gateway_config(cfg)
 
     assert calls == [(cfg, cfg.config_path)]

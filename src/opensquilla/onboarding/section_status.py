@@ -24,7 +24,6 @@ from collections.abc import Callable, Collection
 from enum import StrEnum
 from typing import Any
 
-from opensquilla.endpoint_identity import credential_env_for_endpoint
 from opensquilla.gateway.config import GatewayConfig, ImageGenerationConfig
 from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
 from opensquilla.onboarding.image_generation_specs import (
@@ -365,44 +364,6 @@ def _image_generation_provider_config(
     return getattr(providers, provider_id, None) if providers is not None else None
 
 
-def _image_generation_effective_env_key(
-    cfg: GatewayConfig,
-    provider_id: str,
-    spec: Any,
-) -> tuple[str, bool]:
-    """Resolve the env source using the same endpoint provenance as runtime."""
-
-    providers = getattr(getattr(cfg, "image_generation", None), "providers", None)
-    provider_cfg = getattr(providers, provider_id, None) if providers is not None else None
-    cfg_env_key = (
-        str(getattr(provider_cfg, "api_key_env", "") or "").strip()
-        if provider_cfg is not None
-        else ""
-    )
-    fields_set = getattr(provider_cfg, "model_fields_set", None)
-    env_was_explicitly_configured = (
-        isinstance(fields_set, set) and "api_key_env" in fields_set
-    )
-    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
-    if endpoint is None:
-        return "", False
-    default_base_url, effective_base_url = endpoint
-    spec_env_key = str(getattr(spec, "env_key", "") or "").strip()
-    resolved_env_key = credential_env_for_endpoint(
-        configured_env=cfg_env_key,
-        configured_explicitly=env_was_explicitly_configured,
-        default_env=spec_env_key,
-        default_base_url=default_base_url,
-        effective_base_url=effective_base_url,
-    )
-    env_is_explicit = bool(
-        resolved_env_key
-        and cfg_env_key
-        and (cfg_env_key != spec_env_key or env_was_explicitly_configured)
-    )
-    return resolved_env_key, env_is_explicit
-
-
 def _image_generation_endpoint_conflict_provider(
     cfg: GatewayConfig,
     provider_id: str,
@@ -456,32 +417,6 @@ def _image_generation_llm_key_reusable(
     if resolution.owner in {"primary", "profile"} and resolution.reason == "endpoint_mismatch":
         return False
     return None
-
-
-def _image_generation_llm_env_key(
-    cfg: GatewayConfig,
-    provider_id: str,
-) -> str:
-    """Return the active same-provider LLM env reference, if one is authored."""
-
-    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
-    if endpoint is None:
-        return ""
-    try:
-        spec = get_image_generation_provider_setup_spec(provider_id)
-    except KeyError:
-        return ""
-    providers = getattr(getattr(cfg, "image_generation", None), "providers", None)
-    provider_cfg = getattr(providers, provider_id, None) if providers is not None else None
-    resolution = resolve_image_generation_credential(
-        provider_id=provider_id,
-        provider_config=provider_cfg,
-        default_env_key=spec.env_key,
-        default_base_url=endpoint[0],
-        effective_base_url=endpoint[1],
-        gateway_config=cfg,
-    )
-    return resolution.env_key if resolution.owner in {"primary", "profile"} else ""
 
 
 def _image_generation_effective_endpoint(

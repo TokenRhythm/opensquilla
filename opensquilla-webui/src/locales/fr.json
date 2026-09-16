@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "Actions du fichier", "preview": "Aperçu dans l’application", "openSource": "Ouvrir avec l’application par défaut",
+    "reveal": "Afficher dans le gestionnaire de fichiers", "revealFinder": "Afficher dans le Finder", "revealExplorer": "Afficher dans l’Explorateur de fichiers",
+    "openCopy": "Ouvrir une copie locale", "saveAs": "Enregistrer sous…", "copyPath": "Copier le chemin",
+    "copyGatewayPath": "Copier le chemin serveur", "copyContents": "Copier le contenu", "saved": "Fichier enregistré",
+    "singleFile": "Enregistrer uniquement ce HTML, sans les styles, images et pages liés.",
+    "textOnly": "La copie prend en charge le texte UTF-8 jusqu’à 1 MiB. Enregistrez plutôt le fichier.",
+    "unavailable": "Le fichier source est indisponible. Les aperçus et téléchargements existants sont inchangés.", "failed": "L’opération sur le fichier a échoué."
+  },
   "workspaces": {
     "projects": "Projets",
     "createProject": "Créer un projet",
@@ -67,6 +76,13 @@
     "viewRelease": "Voir la version",
     "dismiss": "Ignorer",
     "desktop": {
+      "installErrorTitle": "Impossible de démarrer l’installation",
+      "quitAndInstall": "Quitter et installer",
+      "signedDownloadedDesc": "OpenSquilla {version} est vérifié et prêt. « Quitter et installer » arrête les services en arrière-plan et ouvre le programme d’installation.",
+      "manualApplyingStatus": "Arrêt des services en arrière-plan",
+      "manualApplyingDesc": "OpenSquilla arrête ses services en arrière-plan. Le programme d’installation s’ouvrira ensuite.",
+      "errorSignatureInvalid": "La signature du programme d’installation est invalide ou son éditeur ne correspond pas à OpenSquilla. L’installation a été bloquée. Téléchargez à nouveau la mise à jour.",
+      "errorSignatureUnavailable": "OpenSquilla n’a pas pu vérifier la signature du programme d’installation. L’installation a été bloquée. Réessayez plus tard.",
       "indicatorAvailable": "Mise à jour {version}",
       "indicatorDownloaded": "Mise à jour prête",
       "indicatorInstallerReady": "Installateur vérifié",
@@ -77,7 +93,7 @@
       "availableDesc": "Téléchargez-la quand vous êtes prêt. OpenSquilla ne l'installera qu'après relance.",
       "manualAvailableDesc": "Téléchargez l’installateur Windows correspondant à cette version. Windows vous guidera pour terminer l’installation.",
       "manualDownloadedTitle": "Installateur vérifié prêt",
-      "manualDownloadedDesc": "OpenSquilla {version} a été vérifié avec la somme de contrôle GitHub officielle et affiché dans son dossier. Exécutez l’installateur lorsque vous êtes prêt.",
+      "manualDownloadedDesc": "Le programme d’installation d’OpenSquilla {version} a été vérifié. Choisissez « Afficher l’installateur » pour localiser le fichier, puis exécutez-le manuellement lorsque vous êtes prêt.",
       "downloadedTitle": "Prête à installer",
       "downloadedDesc": "Relancez OpenSquilla pour terminer la mise à jour vers {version}.",
       "downloadingTitle": "Téléchargement de la mise à jour",
@@ -88,8 +104,8 @@
       "errorFallback": "Réessayez depuis les paramètres.",
       "errorSourceUnreachable": "Les sources de mise à jour sont temporairement inaccessibles. Réessayez plus tard.",
       "errorManifestInvalid": "Les données du canal de publication sont invalides ; OpenSquilla ne peut pas confirmer la mise à jour en toute sécurité.",
-      "errorChecksumUnavailable": "Le programme d’installation ne peut pas être vérifié car la somme de contrôle GitHub officielle est indisponible. Aucun programme n’a été ouvert.",
-      "errorIntegrityFailed": "Le programme d’installation téléchargé a échoué au contrôle d’intégrité et a été supprimé.",
+      "errorChecksumUnavailable": "Le programme d’installation ne peut pas être vérifié car la somme de contrôle officielle de la mise à jour est indisponible. Aucun programme d’installation n’a été ouvert.",
+      "errorIntegrityFailed": "Le programme d’installation a échoué au contrôle d’intégrité. Téléchargez à nouveau la mise à jour.",
       "errorDownloadFailed": "OpenSquilla n’a pas pu télécharger la mise à jour. Vérifiez votre connexion et réessayez.",
       "errorInstallFailed": "OpenSquilla n’a pas pu préparer ou ouvrir l’installateur. Réessayez ou utilisez la page de publication.",
       "idleDesc": "Rechercher une nouvelle version desktop.",
@@ -166,11 +182,33 @@
       "failedDetail": "Rechargez le navigateur isolé pour continuer."
     },
     "artifactAnnotation": {
-      "start": "Annoter l’aperçu", "stop": "Arrêter l’annotation", "selectElement": "Sélectionnez un élément de page à annoter", "selectElementShort": "Choisir un élément", "unavailable": "L’annotation de l’aperçu est indisponible.", "desktopEditingOnly": "Sélectionnez et modifiez les éléments de la page avec l’IA dans l’application de bureau.",
-      "createFailed": "L’élément sélectionné n’a pas pu être joint.", "elementChanged": "L’élément sélectionné a changé avant d’être joint. Sélectionnez-le à nouveau dans l’aperçu actuel.", "rearmFailed": "Le mode annotation s’est arrêté, car le sélecteur n’a pas pu redémarrer. Réactivez-le pour réessayer.", "updateFailed": "Le brouillon d’annotation n’a pas pu être enregistré.", "discardFailed": "L’annotation n’a pas pu être supprimée. Elle reste ouverte pour réessayer.", "closeFailed": "L’éditeur d’annotation n’a pas pu être fermé. Réessayez.", "replacementCleanupFailed": "La nouvelle annotation a été conservée, mais l’ancien brouillon n’a pas pu être supprimé.",
+      "start": "Annoter l’aperçu",
+      "stop": "Arrêter l’annotation",
+      "selectElement": "Sélectionnez un élément de page à annoter",
+      "selectElementShort": "Choisir un élément",
+      "unavailable": "L’annotation de l’aperçu est indisponible.",
+      "desktopEditingOnly": "Sélectionnez et modifiez les éléments de la page avec l’IA dans l’application de bureau.",
+      "createFailed": "L’élément sélectionné n’a pas pu être joint.",
+      "elementChanged": "L’élément sélectionné a changé avant d’être joint. Sélectionnez-le à nouveau dans l’aperçu actuel.",
+      "rearmFailed": "Le mode annotation s’est arrêté, car le sélecteur n’a pas pu redémarrer. Réactivez-le pour réessayer.",
+      "updateFailed": "Le brouillon d’annotation n’a pas pu être enregistré.",
+      "discardFailed": "L’annotation n’a pas pu être supprimée. Elle reste ouverte pour réessayer.",
+      "closeFailed": "L’éditeur d’annotation n’a pas pu être fermé. Réessayez.",
+      "replacementCleanupFailed": "La nouvelle annotation a été conservée, mais l’ancien brouillon n’a pas pu être supprimé.",
       "overlayFallback": "Continuez l’annotation ci-dessous.",
-      "fallbackTitle": "Continuer l’annotation", "fallbackDetail": "L’aperçu est temporairement masqué. Votre annotation est toujours là.", "frozenPreview": "Aperçu de la zone de page sélectionnée",
-      "placeholder": "Décrivez la modification de cette zone…", "newlineHint": "{shortcut} pour aller à la ligne", "keepDraft": "Conserver l’annotation", "submit": "Ajouter l’annotation", "contextLabel": "Sélection actuelle", "bodyLabel": "Annotation de page", "emptyBody": "Décrivez la modification souhaitée.", "reselectHint": "Sélectionnez la zone correspondante sur la page.", "reuseHint": "La demande de modification a été copiée. Sélectionnez la zone correspondante sur la page."
+      "fallbackTitle": "Continuer l’annotation",
+      "fallbackDetail": "L’aperçu est temporairement masqué. Votre annotation est toujours là.",
+      "frozenPreview": "Aperçu de la zone de page sélectionnée",
+      "placeholder": "Décrivez la modification de cette zone…",
+      "newlineHint": "{shortcut} pour aller à la ligne",
+      "keepDraft": "Conserver l’annotation",
+      "submit": "Ajouter l’annotation",
+      "contextLabel": "Sélection actuelle",
+      "bodyLabel": "Annotation de page",
+      "emptyBody": "Décrivez la modification souhaitée.",
+      "reselectHint": "Sélectionnez la zone correspondante sur la page.",
+      "reuseHint": "La demande de modification a été copiée. Sélectionnez la zone correspondante sur la page.",
+      "screenshotUploadFailed": "La capture n’a pas pu être jointe. Votre annotation est conservée ; vous pouvez ajouter une image manuellement."
     },
     "artifactPreview": {
       "refresh": "Actualiser l’aperçu",
@@ -180,7 +218,6 @@
       "readyWithWarnings": "L’aperçu fonctionne avec des avertissements.",
       "warningsShort": "Avertissements",
       "suspended": "Aperçu en pause",
-      "agentEditInProgress": "La modification se poursuit en arrière-plan.",
       "nativePreview": "Aperçu interactif",
       "allowRemoteResources": "Autoriser les images, styles et médias en ligne",
       "blockRemoteResources": "Bloquer les images, styles et médias en ligne",
@@ -199,7 +236,6 @@
       "setDefaultMode": "Utiliser ce mode par défaut",
       "restoreDefaultMode": "Rétablir le mode d’aperçu par défaut",
       "defaultModeSaved": "Mode d’aperçu par défaut enregistré.",
-      "fullModeNotice": "L’aperçu interactif peut charger du contenu en ligne, sans partager l’identité OpenSquilla, les fichiers locaux ni les connexions du navigateur système.",
       "offlineWebLimits": "Certains contenus externes et certaines fonctions web avancées peuvent être indisponibles dans l’aperçu restreint.",
       "compatibilityFallback": "Cette version Desktop ne prend en charge que l’ancien aperçu à fichier unique.",
       "upgradeDesktopShort": "Mettre Desktop à jour",
@@ -222,7 +258,6 @@
     },
     "artifactErrors": {
       "documentChanged": "La page a changé. Actualisez-la avant de réessayer.",
-      "editSessionRenewalRequired": "L’édition se reconnecte. Vos modifications non enregistrées sont conservées.",
       "writeBusy": "La page est en cours de mise à jour. Patientez un instant puis réessayez.",
       "mutationNotApplied": "La page n’a pas été mise à jour. Vous pouvez réessayer.",
       "mutationOutcomePending": "Impossible de confirmer le résultat de la mise à jour. Ouvrez la page pour vérifier.",
@@ -231,10 +266,12 @@
       "permissionDenied": "Vous n’êtes pas autorisé à mettre à jour cette page.",
       "previewCapabilityExpired": "L’aperçu doit être rouvert.",
       "previewRendererFailed": "Impossible d’afficher l’aperçu. Essayez de le rouvrir.",
+      "previewPageUnsupported": "Ce client ou Gateway ne permet pas d’ouvrir directement cette sous-page. Effectuez une mise à jour, puis réessayez.",
       "annotationUnavailable": "Cette annotation est temporairement indisponible.",
       "annotationBusy": "Les annotations sont en cours de mise à jour. Patientez un instant puis réessayez.",
       "invalidRequest": "Impossible de terminer la requête. Vérifiez la saisie puis réessayez.",
-      "internalError": "Impossible de terminer l’opération. Réessayez."
+      "internalError": "Impossible de terminer l’opération. Réessayez.",
+      "documentEditingRetired": "Mettez à jour le client et rouvrez la page pour envoyer vos annotations dans la conversation."
     },
     "artifactDocument": {
       "sections": "Sections du document de l’artefact",
@@ -283,16 +320,7 @@
       "revertFailed": "Cette modification n’a pas pu être annulée. Vérifiez la version la plus récente et réessayez.",
       "commentCreateFailed": "Le commentaire n’a pas pu être ajouté. Vérifiez l’état actuel du document et réessayez.",
       "commentResolveFailed": "Le commentaire n’a pas pu être résolu. Vérifiez son état actuel et réessayez.",
-      "noElementSelected": "Placez le curseur dans un élément HTML",
-      "saving": "Enregistrement…",
-      "saveSource": "Enregistrer",
-      "sourceUnavailable": "La source HTML est indisponible.",
-      "sourceConflict": "Le document a été modifié ailleurs. Vérifiez-le ou rechargez-le avant d’enregistrer.",
-      "copyUnsavedSource": "Copier la source non enregistrée",
-      "unsavedSourceCopied": "Source non enregistrée copiée",
-      "copyUnsavedSourceFailed": "Impossible de copier la source non enregistrée.",
-      "discardAndLoadLatest": "Ignorer et charger la dernière version",
-      "sourceStatus": {"ready":"Prêt","saving":"Enregistrement…","dirty":"Non enregistré","saved":"Enregistré","error":"Action requise"}
+      "sourceUnavailable": "La source HTML est indisponible."
     }
   },
   "nav": {
@@ -559,7 +587,7 @@
       "builtin": "Intégré",
       "actions": { "add": "Ajouter", "remove": "Retirer", "retry": "Réessayer", "copy": "Copier", "saving": "Enregistrement…", "redetect": "Détecter à nouveau" },
       "mode": {
-        "title": "Mode d’accès par défaut", "description": "Choisissez le mode initial des nouvelles tâches. Le mode sûr reste indisponible si la vérification échoue.",
+        "title": "Mode d’accès par défaut", "description": "Définissez le mode d’accès global. La première sélection du mode sûr ouvre la configuration du bac à sable. Ce mode est désactivé si l’initialisation échoue ou si le bac à sable n’est pas pris en charge.",
         "default": "Mode par défaut", "safe": "Sûr", "full": "Accès complet", "resetWarning": "Réafficher l’avertissement au démarrage"
       },
       "setup": {
@@ -758,6 +786,11 @@
       "memoryOptions": "Options de mémoire"
     },
     "provider": {
+      "moreActions": "Autres actions pour {provider}",
+      "routerOutcomeSynchronized": "Les recommandations du Router suivent le fournisseur principal enregistré.",
+      "routerOutcomePreserved": "Les niveaux enregistrés du Router ont été conservés.",
+      "routerOutcomeDisabled": "Le routage des modèles est désactivé ; les niveaux enregistrés ont été conservés.",
+      "primarySavedAdditionalFailed": "Le fournisseur a été enregistré, mais les paramètres supplémentaires n’ont pas pu l’être. Vérifiez-les avant de réessayer.",
       "title": "Fournisseur",
       "pageTitle": "Service de modèles",
       "pageDesc": "Connectez des fournisseurs et gérez leurs identifiants et modèles.",
@@ -766,6 +799,7 @@
       "configuredSummary": "{ready} sur {count} prêts. Le test envoie une petite requête.",
       "configuredDesc": "Les fournisseurs enregistrés restent disponibles pour le routage jusqu’à leur suppression. La vérification de la configuration envoie une petite requête au modèle avec les réglages enregistrés ; des frais du fournisseur peuvent s’appliquer.",
       "activeBadge": "Actif",
+      "currentPrimary": "Fournisseur principal actuel",
       "editingBadge": "En cours d’édition",
       "profileReady": "Identifiants prêts",
       "profileNeedsCredentials": "Identifiants requis",
@@ -1039,12 +1073,47 @@
       "modelNoMatches": "Aucun modèle correspondant — vous pouvez garder votre saisie.",
       "modelListTruncated": "{shown} modèles sur {total} — continuez à taper pour affiner.",
       "modelProvenance": "Liste fournisseur en direct · source des capacités : {sources}",
-      "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue"
+      "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Accepte les entrées d’image",
+      "saveAndStart": "Enregistrer et commencer",
+      "saveAndMakeActive": "Enregistrer et définir comme principal",
+      "saveActivateUpgradeHint": "Mettez le Gateway à jour pour enregistrer et activer le fournisseur en une opération.",
+      "primaryRoleHint": "Le fournisseur principal gère les requêtes directes par défaut et le repli. Les stratégies personnalisées conservent leur configuration.",
+      "activationCredentialRequired": "Ajoutez des identifiants utilisables avant de définir ce fournisseur comme principal.",
+      "routerConflictTitle": "Choisir le traitement des routes existantes",
+      "routerConflictBody": "Le Router enregistré utilise {conflicts}, en conflit avec {provider}. Les recommandations de {provider} remplacent les niveaux enregistrés et non enregistrés. Si proposé, désactivez le routage en conservant les niveaux. Annuler conserve le mode et les brouillons.",
+      "routerUseRecommended": "Utiliser les routes recommandées du fournisseur cible",
+      "routerDisablePreserve": "Conserver les routes et désactiver Router",
+      "alreadyActive": "Le fournisseur cible est déjà principal. Cette modification des identifiants n’a pas été enregistrée.",
+      "primarySaveUncertain": "Le résultat de l’enregistrement est incertain. Le brouillon a été conservé. Vérifiez la configuration avant de réessayer ; un fournisseur actif ne confirme pas la sauvegarde des identifiants."
     },
     "preset": {
       "modeCustom": "personnalisé"
     },
     "modelStrategy": {
+      "summaryPrimary": "Fournisseur principal enregistré",
+      "summaryRouter": "Routage des modèles",
+      "summaryOn": "Activé",
+      "summaryOff": "Désactivé",
+      "bindingFollowPrimary": "Recommandé · suit le principal",
+      "bindingCustom": "Niveaux personnalisés",
+      "bindingLegacy": "Niveaux existants · suivi non défini",
+      "resetRecommended": "Utiliser les niveaux recommandés de {provider}",
+      "resettingRecommended": "Mise à jour des niveaux recommandés…",
+      "resetKeepsOff": "Met à jour les niveaux ; le routage reste désactivé.",
+      "resetKeepsMode": "Remplace les niveaux et conserve le mode actuel.",
+      "retainedDrafts": "Modifications de routage non enregistrées",
+      "crossProviderDisabledMismatch": "Les niveaux enregistrés utilisent d’autres fournisseurs ; l’exécution entre fournisseurs est désactivée.",
+      "resetUpgradeHint": "Mettez à jour le Gateway pour appliquer les niveaux recommandés en une seule opération.",
+      "operationPending": "Une opération de fournisseur ou de routage est en cours.",
+      "activationUpgradeHint": "Ce Gateway ne peut pas confirmer une activation sûre du Router. Mettez-le à jour pour examiner et résoudre les conflits de fournisseurs.",
+      "savedRefreshFailed": "Enregistré, mais les paramètres n’ont pas pu être actualisés. Rechargez-les avant toute autre modification.",
+      "resultUncertain": "Le résultat de l’enregistrement est inconnu. Vérifiez les paramètres actualisés avant de réessayer.",
+      "resetTitle": "Utiliser les niveaux recommandés de {provider} ?",
+      "resetBody": "Remplacer les modifications enregistrées et non enregistrées des niveaux du Router par les recommandations de {provider} ? Le mode et l’interrupteur du Router restent inchangés. Les autres paramètres non enregistrés sont conservés.",
+      "resetConfirm": "Remplacer par les recommandations",
+      "resetSaved": "Niveaux recommandés de {provider} enregistrés ; mode inchangé.",
       "title": "Routage des modèles",
       "desc": "Choisissez comment le modèle est sélectionné pour chaque requête.",
       "newSessionDefault": "C’est la valeur par défaut des nouveaux chats. Les chats existants conservent leur propre mode de routage.",
@@ -1063,7 +1132,7 @@
       "advancedDesc": "Niveau de repli et affichage du routage dans le chat.",
       "visualModeLabel": "Style du panneau de décision de routage",
       "visualModeDesc": "Affichage de la décision de routage dans les réponses.",
-      "crossProviderNotice": "Le routage inter-fournisseurs est actif. Vérifie chaque niveau avant d’enregistrer.",
+      "crossProviderNotice": "L’exécution entre fournisseurs est activée.",
       "cards": {
         "router": {
           "title": "Routage intelligent des modèles",
@@ -1109,6 +1178,7 @@
       "removeCandidateAria": "Retirer {model}",
       "ensembleEmpty": "Aucun modèle candidat pour le moment. Enregistrez les paramètres du service de modèles pour générer les niveaux de routage, ou ajoutez des candidats manuellement.",
       "ensemblePipeline": "Fonctionnement : les modèles proposants rédigent en parallèle, puis l'agrégateur fusionne les brouillons en réponse finale. Seul l'agrégateur peut appeler des outils.",
+      "candidateModelHint": "L’ensemble de modèles ne prend pas encore en charge l’analyse d’images. Pour analyser des images, passez à « Routage intelligent des modèles » et configurez un modèle compatible avec les images, ou sélectionnez-en un dans « Modèle fixe ».",
       "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle ; un agrégateur les fusionne en une réponse. Plus d'appels.",
       "legacyDynamicNotice": "Cet ancien plan de fusion suit les niveaux de modèle enregistrés. Convertissez-le en composition personnalisée pour modifier ses membres.",
       "legacyDynamicMigrate": "Convertir en composition personnalisée",
@@ -1191,6 +1261,7 @@
       "colModel": "Modèle",
       "colThinking": "Réflexion",
       "colImage": "Image",
+      "imageCapabilityAutomatic": "La prise en charge des images est détectée automatiquement à partir des métadonnées du fournisseur et des résultats des requêtes ; aucun réglage manuel n’est nécessaire.",
       "tierProviderAria": "Entrée de requête {tier}",
       "tierProviderManagedByEnsemble": "Déterminée par la fusion multimodèle",
       "tierProviderManagedByEnsembleAria": "L’entrée de requête {tier} est déterminée par le plan de fusion multimodèle",
@@ -1221,7 +1292,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "Utilise le plan de fusion enregistré qui suit les niveaux de modèle ; en cas d’échec, utilise le modèle fixe et de repli.",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "Utilise le plan de fusion enregistré qui suit les niveaux de modèle ; aucun modèle fixe et de repli utilisable n’est encore configuré.",
       "tierSingleModelAnnouncement": "C3 utilise un seul modèle : {model}.",
-      "tierEnsembleImageRouting": "La fusion C3 ne traite pas les images ; les requêtes d’image utilisent toujours la configuration du modèle d’image.",
+      "tierEnsembleImageRouting": "La fusion C3 reçoit des indications textuelles pour les images. Router utilise uniquement les modèles C0–C3 configurés pour traiter les images.",
+      "tierLegacyImageRouting": "Ancien réglage de compatibilité : ce modèle est conservé mais n’est pas utilisé pour les images en entrée. Configurez un modèle acceptant les images dans C0–C3.",
       "tierThinkingManagedByEnsemble": "Déterminée par le plan de fusion",
       "tierThinkingManagedByEnsembleAria": "La réflexion {tier} est déterminée par le plan de fusion multimodèle",
       "tierThinkingAria": "Niveau de réflexion {tier}",
@@ -1638,9 +1710,6 @@
       "descReloadSuffix": "prennent effet après un rafraîchissement de la page.",
       "experimentsGroup": "Expériences",
       "managementGroup": "Gestion",
-      "foldLabel": "Nouveau rendu des tours en direct",
-      "foldDesc": "Construit la carte de travail en streaming à partir d'un journal d'événements ordonné. Désactivez-le uniquement pour rétablir temporairement le rendu compatible.",
-      "foldAria": "Nouveau rendu des tours en direct (prend effet après rechargement)",
       "revealLabel": "Fenêtre de révélation de la réponse (ms)",
       "revealDesc": "Maintient la révélation de la réponse en direct dans une fenêtre [min, max] pour que le routeur puisse décider en premier. min ≤ max.",
       "revealMinAria": "Millisecondes minimales de révélation de la réponse",
@@ -1665,8 +1734,13 @@
     },
     "privacy": {
       "statusDisabledByEnv": "Désactivés par un paramètre d’environnement.",
-      "networkReportingLabel": "Diagnostics et mises à jour",
-      "networkReportingDesc": "Partage des données de diagnostic produit limitées et recherche les mises à jour. Le contenu des conversations, les fichiers et les requêtes de modèle ne sont pas envoyés."
+      "statusNotChosen": "Aucun choix n’a encore été enregistré. Aucune donnée n’est envoyée avant l’activation.",
+      "reliabilityDiagnosticsLabel": "Diagnostics de stabilité",
+      "reliabilityDiagnosticsDesc": "Partagez les résultats d’opération, les durées et des empreintes d’erreur respectueuses de la vie privée afin de diagnostiquer les plantages et les échecs. Le contenu des conversations et des fichiers n’est jamais inclus.",
+      "productAnalyticsLabel": "Analyse du produit et de la croissance",
+      "productAnalyticsDesc": "Partagez les jalons d’activation et le nombre d’exécutions de MetaSkill et du mode programmation après leur démarrage effectif, afin de mesurer la conversion et l’utilisation des fonctions. Le contenu des conversations, les paramètres de tâche, les fichiers et les identifiants de compte bruts ne sont jamais inclus ; un identifiant analytique aléatoire et dédié est utilisé.",
+      "networkReportingLabel": "Envoi des diagnostics et statistiques d’utilisation",
+      "networkReportingDesc": "Envoie des diagnostics et statistiques d’utilisation anonymes, dont le nombre d’exécutions effectives de MetaSkill et du mode programmation. Contrôle aussi la recherche de mises à jour. Le contenu des conversations, les paramètres de tâche et les fichiers sont exclus."
     },
     "toast": {
       "loadFailed": "Échec du chargement des paramètres : {error}",
@@ -1718,7 +1792,10 @@
       "channelEnabled": "Canal activé. Redémarrage requis.",
       "channelEnabledLive": "Canal activé et démarré.",
       "channelDisabled": "Canal désactivé. Redémarrage requis.",
-      "channelDisabledLive": "Canal désactivé et arrêté."
+      "channelDisabledLive": "Canal désactivé et arrêté.",
+      "providerSavedAndActivated": "{provider} a été enregistré et défini comme principal.",
+      "modelStrategyPartialSaved": "Certains paramètres ont été enregistrés. Le changement de fournisseur principal n’a pas abouti ; les modifications restantes sont conservées.",
+      "modelStrategyPartialSaveUncertain": "Certains paramètres ont été enregistrés. Le changement de fournisseur principal n’a pas pu être confirmé ; vérifiez l’état enregistré. Les modifications restantes sont conservées."
     },
     "needs": {
       "noApiKey": "Aucune clé API requise.",
@@ -2982,7 +3059,16 @@
       "clearActivity": "Effacer l’activité",
       "expandActivity": "Développer l’activité d’installation",
       "collapseActivity": "Réduire l’activité d’installation",
+      "selectSkillDirectory": "Sélectionnez un dossier de compétence",
+      "installPhase": {
+        "resolving": "Résolution de la source",
+        "downloading": "Téléchargement des fichiers",
+        "scanning": "Analyse du contenu",
+        "committing": "Enregistrement de l’installation"
+      },
       "queueStatus": {
+        "waiting": "En attente du résultat de l’installation",
+        "selection_required": "Choisir un dossier",
         "queued": "En attente",
         "installing": "Installation",
         "cancelling": "Annulation",
@@ -3404,7 +3490,7 @@
     "loadingSession": "Restauration de l’historique de la conversation…",
     "loadingSessionDescription": "Vous pouvez continuer à utiliser la conversation pendant le chargement.",
     "loadSessionFailed": "Historique de la conversation temporairement indisponible",
-    "loadSessionDescription": "La connexion a peut-être été interrompue ou le service d’historique est temporairement indisponible. Rechargez pour réessayer.",
+    "loadSessionDescription": "L’historique de la conversation est temporairement indisponible.",
     "reloadSession": "Recharger l’historique",
     "retryingSession": "Rechargement de l’historique…",
     "retryingSessionDescription": "Restauration de l’historique de la conversation…",
@@ -3412,12 +3498,13 @@
     "liveConnecting": "Restauration des mises à jour en direct…",
     "liveConnectingConnected": "Gateway connecté. Restauration des mises à jour en direct de cette session…",
     "gatewayReconnecting": "Reconnexion au Gateway…",
+    "automaticRecoveryDescription": "La récupération est automatique. Vous pouvez continuer à écrire ; le texte et les pièces jointes non envoyés restent ici.",
     "liveUnavailable": "Les mises à jour en direct sont temporairement indisponibles",
-    "liveUnavailableDescription": "L’historique reste disponible. Reconnectez-vous avant d’envoyer.",
-    "liveUnavailableConnectedDescription": "Le Gateway est connecté et l’historique reste disponible. L’envoi reprendra après le rétablissement des mises à jour en direct.",
+    "liveUnavailableDescription": "L’historique reste disponible. L’envoi reprendra une fois les mises à jour en direct rétablies.",
+    "liveUnavailableConnectedDescription": "La Gateway est connectée. Les mises à jour en direct de cette session sont temporairement indisponibles.",
     "reconnectLive": "Se reconnecter",
     "liveSendBlockedConnecting": "Les mises à jour en direct se reconnectent. Votre brouillon est conservé.",
-    "liveSendBlockedDegraded": "Reconnectez les mises à jour en direct avant d’envoyer. Votre brouillon est conservé.",
+    "liveSendBlockedDegraded": "Les mises à jour en direct sont temporairement indisponibles. Votre brouillon est conservé.",
     "noMessagesYet": "Aucun message pour l'instant.",
     "newChat": "Nouvelle tâche",
     "chatWithSuffix": "Chat {suffix}",
@@ -3460,7 +3547,7 @@
     "audioUnsupported": "Ce navigateur ne peut pas lire ce format audio. Téléchargez plutôt le fichier.",
     "playVideo": "Lire la vidéo",
     "videoLoadFailed": "Impossible de charger la vidéo.",
-    "videoUnsupported": "Ce navigateur ne peut pas lire ce format vidéo. Téléchargez plutôt le fichier.",
+    "videoUnsupported": "Ce navigateur ne peut pas lire cette vidéo. Téléchargez-la à la place.",
     "previewOf": "Aperçu : {title}",
     "closePreview": "Fermer l'aperçu",
     "previousImage": "Image précédente",
@@ -3469,7 +3556,6 @@
     "previewDownload": "Télécharger l'aperçu",
     "previewTimedOut": "L'aperçu a expiré.",
     "previewFailed": "Échec du chargement de l'aperçu.",
-    "videoUnsupported": "Ce navigateur ne peut pas lire cette vidéo. Téléchargez-la à la place.",
     "loadVideoPreview": "Charger l’aperçu vidéo",
     "loadVideoPreviewFor": "Charger l’aperçu vidéo de {title}",
     "videoPreviewLoading": "Chargement de l’aperçu vidéo. Vous pouvez annuler le téléchargement.",
@@ -3515,6 +3601,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Planifié",
+      "scheduledTrigger": "Déclenchement planifié",
       "cronSource": "Planifié par {tool}"
     },
     "sandboxSetup": {
@@ -3602,6 +3689,7 @@
         "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
         "retryWait": "Nouvel essai dans {seconds}s",
         "retrying": "Nouvel essai {attempt}/{limit}",
+        "retryingWithoutLimit": "Nouvel essai · tentative {attempt}",
         "fallback": "Passage au modèle de secours"
       },
       "purpose": {
@@ -3663,11 +3751,23 @@
       "cancelled": "Annulé"
     },
     "toolModal": {
+      "retry": "Réessayer",
+      "logPending": "Le journal d’exécution est en cours d’enregistrement. Réessayez une fois la commande terminée.",
+      "copyPage": "Copier cette page",
       "tree": "Arborescence",
       "raw": "Brut",
       "wrapLines": "Retour à la ligne",
       "preserveLines": "Conserver la largeur des lignes",
-      "contentMeta": "{type} · {lines} lignes · {chars} caractères"
+      "contentMeta": "{type} · {lines} lignes · {chars} caractères",
+      "executionLog": "Voir le journal d’exécution",
+      "toolResult": "Résultat de l’outil",
+      "characterOffset": "Position du caractère",
+      "go": "Aller",
+      "previous": "Précédent",
+      "next": "Suivant",
+      "logRange": "Caractères {start}–{end} sur {total}",
+      "logReadFailed": "Impossible de charger le journal d’exécution. Réessayez.",
+      "logIncomplete": "Le journal est incomplet. Seule la sortie enregistrée est disponible."
     },
     "approval": {
       "required": "Approbation requise",
@@ -3785,11 +3885,13 @@
       "answerPlanQuestionnaire": "Répondez à la question du plan ci-dessus",
       "previousQuestion": "Précédent",
       "nextQuestion": "Suivant",
-      "outcomeDoneTitle": "Réponse envoyée · exécution reprise",
+      "outcomeDoneTitle": "Réponse reçue",
       "outcomeBusyDetail": "Votre réponse est en cours de traitement.",
-      "outcomeDoneDetail": "L'agent a accepté cette réponse et est passé à la suite.",
+      "outcomeDoneDetail": "L’agent a reçu votre réponse.",
       "replyReceived": "Réponse reçue · poursuite de l'exécution…",
       "sendingReply": "Envoi de la réponse…",
+      "expiredTitle": "Question expirée",
+      "expiredDetail": "Cette question n’est plus active. Vous pouvez envoyer un nouveau message.",
       "sendReply": "Envoyer la réponse",
       "sendingContinuing": "Envoi de la réponse · poursuite de l'exécution…"
     },
@@ -3875,7 +3977,7 @@
         "busy": "L'état de l'objectif est encore en cours de règlement. Son dernier état est affiché ci-dessus.",
         "notResumable": "Cet objectif ne peut pas être repris depuis son état actuel.",
         "executionDisabled": "L'exécution des objectifs est désactivée dans cet espace de travail.",
-        "connectionRequired": "Reconnectez cette tâche avant de poursuivre l'objectif.",
+        "connectionRequired": "Cette tâche n’est pas encore prête à continuer.",
         "planModeActive": "L'objectif attendra la fin du mode Plan.",
         "planRunActive": "L'objectif attendra la fin de l'exécution Plan active.",
         "requestConflict": "Cette action a déjà été utilisée pour une autre demande. Réessayez."
@@ -3956,7 +4058,8 @@
         "generic": "La réorientation n'est pas disponible pour la tâche actuelle. Le message reste en file d'attente."
       },
       "clearQueue": "Vider la file",
-      "removeMessage": "Supprimer le message en attente {index}"
+      "removeMessage": "Supprimer le message en attente {index}",
+      "annotationUpgradeRequired": "Cette annotation utilise l’ancien éditeur. Modifiez le message et sélectionnez à nouveau la page avant de l’envoyer."
     },
     "metaRuns": {
       "draft": "Brouillon",
@@ -4030,6 +4133,8 @@
     "compact": {
       "compacting": "Compactage du contexte",
       "compacted": "Contexte compacté",
+      "temporarilyReduced": "Historique temporairement réduit ; traitement en cours",
+      "summarySaved": "Résumé enregistré",
       "historyPreserved": "Contexte antérieur résumé ; les messages d’origine restent disponibles dans l’historique",
       "historyIncomplete": "Contexte antérieur résumé ; certains messages d’origine ne sont pas disponibles",
       "historySummarized": "Contexte antérieur résumé",
@@ -4184,7 +4289,7 @@
       "unknownProviderCalls": "{count} appel fournisseur a une utilisation inconnue | {count} appels fournisseur ont une utilisation inconnue"
     },
     "modelRouting": {
-      "updateFailed": "Impossible de changer le routage des modèles — rétabli. Vérifiez la connexion à la passerelle et réessayez.",
+      "updateFailed": "Impossible de changer le routage des modèles — rétabli. La modification est temporairement indisponible.",
       "sessionUpdateFailed": "Impossible de mettre à jour le routage des modèles de ce chat : {error}"
     },
     "routeFeedback": {
@@ -4321,7 +4426,7 @@
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "résultat",
       "sectionError": "erreur",
-      "viewFull": "voir en entier",
+      "viewFull": "développer le contenu",
       "activityViewDetails": "voir les détails",
       "activityDetailsTitle": "détails",
       "activityBytesWritten": "{size} écrits",

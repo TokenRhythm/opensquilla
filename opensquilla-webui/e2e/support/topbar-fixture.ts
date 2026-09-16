@@ -1,4 +1,5 @@
 import { expect, type Page, type WebSocketRoute } from '@playwright/test'
+import { helloOkResponse } from './gateway-fixture'
 
 export const CONTROL_URL = '/control/'
 export const TOPBAR_FIXED_TIME = new Date('2024-01-15T08:00:00.000Z')
@@ -341,9 +342,7 @@ async function installMockGateway(
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000 },
+        ws.send(helloOkResponse({
           auth: {
             runModePolicy: {
               allowedRunModes: ['safe', 'full'],
@@ -395,6 +394,8 @@ async function installMockGateway(
             status: 'ok',
             runStatus: 'idle',
           }],
+          count: 1,
+          ts: 1_800_000_000,
           has_more: false,
         },
         'sessions.messages.unsubscribe': { subscribed: false },

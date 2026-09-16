@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ChatStreamTimelineItem } from '@/types/chat'
-import type { ChatHistoryMessage } from '@/types/rpc'
-import { nodeStepsFromHistoryMessage, nodeStepsFromTimeline } from './runTrace'
+import type { SessionReadMessage } from '@/modules/sessionReadLifecycle'
+import {
+  nodeStepsFromHistoryMessage,
+  nodeStepsFromSessionReadMessage,
+  nodeStepsFromTimeline,
+} from './runTrace'
 
 describe('run trace tool identity', () => {
   it('preserves the original tool name when flattening chat timeline items', () => {
@@ -42,17 +46,32 @@ describe('run trace tool identity', () => {
 
   it('preserves the original tool name when flattening persisted history', () => {
     const message = {
-      role: 'assistant',
       tool_calls: [{
         tool_use_id: 'search-1',
         name: 'MCPURLSearch',
         result: 'Found 7 results.',
       }],
-    } as ChatHistoryMessage
+    } satisfies Parameters<typeof nodeStepsFromHistoryMessage>[0]
 
     expect(nodeStepsFromHistoryMessage(message)[0]).toMatchObject({
       toolName: 'MCPURLSearch',
       operationKey: 'tool.mcpurlsearch',
+    })
+  })
+
+  it('reads tool calls from the domain session history projection', () => {
+    const message = {
+      toolCalls: [{
+        tool_use_id: 'search-2',
+        name: 'MCPURLSearch',
+        result: 'Found 9 results.',
+      }],
+    } as Pick<SessionReadMessage, 'toolCalls'>
+
+    expect(nodeStepsFromSessionReadMessage(message)[0]).toMatchObject({
+      toolName: 'MCPURLSearch',
+      operationKey: 'tool.mcpurlsearch',
+      output: 'Found 9 results.',
     })
   })
 })

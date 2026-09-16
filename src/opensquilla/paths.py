@@ -21,6 +21,16 @@ _PROFILES_ROOT_ENV = "OPENSQUILLA_HOME"
 _PROFILE_ENV = "OPENSQUILLA_PROFILE"
 _DEFAULT_PROFILE = "default"
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_DESKTOP_PROFILE_KINDS = frozenset({"desktop-primary", "desktop-recovery"})
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def desktop_profile_lifecycle_active() -> bool:
+    """Return whether lifecycle bookkeeping belongs to a Desktop profile."""
+    profile_kind = os.environ.get("OPENSQUILLA_PROFILE_KIND", "").strip().lower()
+    if profile_kind:
+        return profile_kind in _DESKTOP_PROFILE_KINDS
+    return os.environ.get("OPENSQUILLA_DESKTOP", "").strip().lower() in _TRUTHY
 
 
 def _home_dir() -> Path:

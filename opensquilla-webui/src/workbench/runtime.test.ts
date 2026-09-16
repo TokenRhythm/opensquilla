@@ -621,21 +621,15 @@ describe('workbench runtime registry', () => {
     const showOverlay = vi.fn(async () => ({ ok: true as const }))
     const closeOverlay = vi.fn(async () => ({ ok: true as const }))
     const screenshot = vi.fn(async () => ({
-      ok: true as const,
-      method: 'screenshot' as const,
-      value: {
-        mime: 'image/png' as const,
-        data: new Uint8Array([1, 2, 3]),
-        width: 10,
-        height: 10,
-      },
+      targetRef: 'target-1', mimeType: 'image/png' as const,
+      dataBase64: 'iVBORw==', width: 320, height: 180,
     }))
     const nativeApi: NativeWorkbenchApi = {
       getArtifactAnnotationCapabilities: getCapabilities,
       setArtifactAnnotationMode: setMode,
       showArtifactAnnotationOverlay: showOverlay,
       closeArtifactAnnotationOverlay: closeOverlay,
-      screenshot,
+      captureWorkbenchScreenshot: screenshot,
       createSurface: vi.fn(async () => ({ ok: true })),
       setSurfaceRect: vi.fn(async () => ({ ok: true })),
       activateSurface: vi.fn(async () => ({ ok: true })),
@@ -685,10 +679,9 @@ describe('workbench runtime registry', () => {
       surfaceId: descriptor.id,
       annotationId: 'annotation-1',
     })
-    await expect(scoped?.screenshot?.({ version: 3 })).resolves.toMatchObject({
-      ok: true,
-      method: 'screenshot',
-    })
+    await expect(scoped?.captureWorkbenchScreenshot?.({
+      surfaceId: descriptor.id, targetRef: 'target-1',
+    })).resolves.toMatchObject({ targetRef: 'target-1', mimeType: 'image/png' })
     expect(getCapabilities).toHaveBeenCalledOnce()
     expect(setMode).toHaveBeenCalledOnce()
     expect(showOverlay).toHaveBeenCalledOnce()

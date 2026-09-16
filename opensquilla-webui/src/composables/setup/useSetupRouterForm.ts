@@ -16,12 +16,14 @@ import {
   type RouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
 import type { DiscoveredModelsByProvider } from '@/composables/setup/useSetupProviderForm'
+import type { ConfigureRouter } from '@/modules/setupWorkflow'
 
 export interface SetupTierValue {
   provider: string
   model: string
   thinkingLevel: string
-  supportsImage: boolean
+  /** Accepted for older clients; image capability is resolved by the gateway. */
+  supportsImage?: boolean
   ensembleEnabled?: boolean
   ensembleSelectionMode?: string
 }
@@ -82,7 +84,7 @@ export function buildRouterPayload(
   mode: string,
   defaultTier: string,
   tierValues: Record<string, SetupTierValue>,
-): Record<string, unknown> {
+): ConfigureRouter {
   const tiers: Record<string, Record<string, unknown>> = {}
   Object.entries(tierValues).forEach(([name, tier]) => {
     const tierName = normalizeRouterTier(name) || name
@@ -91,7 +93,6 @@ export function buildRouterPayload(
       provider: tier.provider,
       model: tier.model,
       thinkingLevel: tier.thinkingLevel,
-      supportsImage: tier.supportsImage,
     }
     if (sharedEnsembleTier && typeof tier.ensembleEnabled === 'boolean') {
       tierPayload.ensembleEnabled = tier.ensembleEnabled
@@ -357,6 +358,7 @@ export function useSetupRouterForm() {
   const tierProviderIds = computed(() => {
     const ids = new Set<string>()
     Object.entries(tierValues.value).forEach(([name, tier]) => {
+      if (name === IMAGE_TIER) return
       if (!routerTierProviderParticipates(name, tier, routerProviderRoles.value)) return
       const provider = String(tier.provider || '').trim().toLowerCase()
       if (provider) ids.add(provider)
@@ -446,7 +448,6 @@ export function useSetupRouterForm() {
         provider: tier.provider || '',
         model: tier.model || '',
         thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
-        supportsImage: tier.supportsImage || tier.supports_image || false,
         ensembleEnabled: tierName === 'c3'
           ? typeof tier.ensembleEnabled === 'boolean'
             ? tier.ensembleEnabled
@@ -464,6 +465,7 @@ export function useSetupRouterForm() {
   }
 
   function updateTierField(name: string, key: keyof SetupTierValue, value: string | boolean) {
+    if (name === IMAGE_TIER || key === 'supportsImage') return
     const tier = tierValues.value[name]
     if (!tier) return
     if (key === 'ensembleEnabled' && (normalizeRouterTier(name) || name) !== 'c3') return
@@ -495,8 +497,10 @@ export function useSetupRouterForm() {
       }
       return
     }
-    if (key === 'supportsImage') {
-      tier.supportsImage = Boolean(value)
+    if (key === 'model') {
+      const model = String(value)
+      if (model === tier.model) return
+      tier.model = model
     } else if (key === 'ensembleEnabled') {
       tier.ensembleEnabled = Boolean(value)
     } else {
@@ -521,13 +525,12 @@ export function useSetupRouterForm() {
 
   function tierRows(textTiers: readonly string[]): SetupTierRow[] {
     return Object.entries(tierValues.value)
-      .filter(([name]) => textTiers.includes(name) || name === IMAGE_TIER)
+      .filter(([name]) => name !== IMAGE_TIER && textTiers.includes(name))
       .map(([name, tier]) => ({
         name,
         provider: tier.provider,
         model: tier.model,
         thinkingLevel: tier.thinkingLevel,
-        supportsImage: tier.supportsImage,
         ensembleEnabled: tier.ensembleEnabled,
         ensembleSelectionMode: tier.ensembleSelectionMode,
       }))
@@ -583,7 +586,11 @@ export function useSetupRouterForm() {
     routerVisualMode.value = normalizeRouterVisualMode(value)
   }
 
-  function payload(): Record<string, unknown> {
+  function acceptSavedVisualMode(value: unknown) {
+    visualModeBaseline.value = normalizeRouterVisualMode(value)
+  }
+
+  function payload(): ConfigureRouter {
     const mode = routerMode.value === 'disabled'
       ? 'disabled'
       : hasMixedTierProviders.value
@@ -592,10 +599,7 @@ export function useSetupRouterForm() {
           ? 'recommended'
           : 'custom'
     const body = buildRouterPayload(mode, routerDefaultTier.value, tierValues.value)
-    if (hasMixedTierProviders.value) {
-      body.crossProviderTiers = true
-      body.tierProviderMismatch = 'veto'
-    } else if (crossProviderTiers.value) {
+    if (crossProviderTiers.value) {
       body.crossProviderTiers = true
       body.tierProviderMismatch = tierProviderMismatch.value
     }
@@ -661,6 +665,7 @@ export function useSetupRouterForm() {
     enableFromSavedBinding,
     setRouterDefaultTier,
     setRouterVisualMode,
+    acceptSavedVisualMode,
     updateTierField,
     setEnsembleContext,
     payload,

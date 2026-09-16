@@ -4,6 +4,17 @@ import type { useSetupEnsembleForm } from '@/composables/setup/useSetupEnsembleF
 import type { DiscoveredModelCatalog } from '@/composables/setup/useSetupProviderForm'
 
 export type ModelStrategy = 'router' | 'ensemble' | 'single'
+export interface SavedRoutingSummary {
+  providerId: string
+  providerLabel: string
+  enabled: boolean
+  binding: 'follow_primary' | 'custom' | 'legacy'
+  crossProviderEnabled: boolean
+  hasForeignTierProviders: boolean
+  hasUnsavedChanges: boolean
+  resetPending: boolean
+  resetDisabledReason: string
+}
 
 type RouterForm = ReturnType<typeof useSetupRouterForm>
 type EnsembleForm = ReturnType<typeof useSetupEnsembleForm>
@@ -25,6 +36,7 @@ interface ModelStrategyPanelContext {
   ensemblePanel: ComputedRef<EnsemblePanel>
   routerTemplateState: ComputedRef<string>
   fixedModelCatalog: ComputedRef<DiscoveredModelCatalog>
+  routingSummary?: ComputedRef<SavedRoutingSummary>
 }
 
 export function useSetupModelStrategyForm(
@@ -125,6 +137,7 @@ export function useSetupModelStrategyForm(
       )
       return {
       activeStrategy: activeStrategy.value,
+      routingSummary: context.routingSummary?.value,
       hasSavedProvider: context.hasSavedProvider.value,
       profileSaveSupported: context.profileSaveSupported.value,
       providerLabel: context.providerLabel.value,

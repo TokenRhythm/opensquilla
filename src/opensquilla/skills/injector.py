@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from opensquilla.skills.types import SkillSpec
 
@@ -17,22 +18,15 @@ DEFAULT_DESCRIPTION_LIMIT = 240
 # Header preambles, kept as constants so every render path (full / compact /
 # budgeted) emits byte-identical guidance and the meta instructions can't drift.
 _FULL_META_LINE = (
-    'Meta-skills (kind="meta"): When a kind="meta" entry clearly matches '
-    "and the task benefits from multi-skill orchestration, prefer "
-    '`meta_invoke(name="<name>")` over answering directly. Do not call '
-    '`skill_view` for kind="meta" entries; call `meta_invoke` directly '
-    "without preamble. The framework drives the multi-step DAG; do NOT "
-    "call skill_view for sub-skills inside. On success the meta-skill's "
-    "deliverable IS the assistant's reply for this turn — no further "
-    "commentary needed."
+    'For a clearly matching kind="meta" entry, call '
+    '`meta_invoke(name="META_SKILL_NAME")` without preamble. Do not call '
+    '`skill_view` for kind="meta" entries or their dependencies; the framework runs the DAG '
+    "and returns its deliverable. Otherwise continue normally."
 )
 _COMPACT_META_LINE = (
-    'For kind="meta" entries: When a kind="meta" entry clearly matches '
-    "and the task benefits from multi-skill orchestration, prefer "
-    '`meta_invoke(name="<name>")` over answering directly. Do not call '
-    '`skill_view` for kind="meta" entries; call `meta_invoke` directly '
-    "without preamble. "
-    "The framework runs the DAG and the deliverable is the turn reply."
+    'For a clearly matching kind="meta" entry, call '
+    '`meta_invoke(name="META_SKILL_NAME")`. Do not call `skill_view` for kind="meta" entries; '
+    "the framework runs its DAG."
 )
 
 
@@ -75,12 +69,26 @@ def _skill_location(skill: SkillSpec) -> str:
     return ""
 
 
+def _skill_source(skill: SkillSpec, generation: int) -> str:
+    return f"skill://{skill.layer.value}/{skill.name}#g{generation}"
+
+
 def _is_meta(skill: SkillSpec) -> bool:
     return getattr(skill, "kind", "skill") == "meta"
 
 
+@dataclass(frozen=True)
+class SkillRenderReport:
+    total: int = 0
+    rendered: int = 0
+    omitted: int = 0
+
+
 class SkillInjector:
     """Injects skill content into system prompts with budget control."""
+
+    def __init__(self) -> None:
+        self.last_render_report = SkillRenderReport()
 
     # ── shared rendering primitives ──────────────────────────────────────────
 
@@ -92,7 +100,7 @@ class SkillInjector:
                 "clearly matches the user's current request.",
                 "Skill names are identifiers for `skill_view`; they are not callable tools.",
                 "Review <available_skills> before answering.",
-                'When one entry is clearly relevant, call skill_view(name="<skill_name>") '
+                'When one entry is clearly relevant, call skill_view(name="SKILL_NAME") '
                 "to load that skill's instructions, then use only the tools available "
                 "in this session.",
             ]
@@ -101,10 +109,8 @@ class SkillInjector:
             lines.append("When no entry is relevant, answer without loading a skill.")
         else:
             lines = [
-                "\n\nSkills are optional task playbooks for specific request types.",
-                "Skill names are identifiers for `skill_view`; they are not callable tools.",
-                'Call skill_view(name="<skill_name>") only when the current request '
-                "matches a listed entry.",
+                "\n\n## Skills",
+                'Call skill_view(name="SKILL_NAME") only for a matching listed entry.',
             ]
             if has_meta:
                 lines.append(_COMPACT_META_LINE)
@@ -118,9 +124,11 @@ class SkillInjector:
         with_desc: bool,
         desc_limit: int,
         with_location: bool,
+        generation: int = 0,
     ) -> list[str]:
         kind = _escape_xml(getattr(skill, "kind", "skill"))
         lines = [f'  <skill kind="{kind}">', f"    <name>{_escape_xml(skill.name)}</name>"]
+        lines.append(f"    <source>{_escape_xml(_skill_source(skill, generation))}</source>")
         if with_desc:
             # Never truncate meta descriptions — they drive the auto-trigger choice.
             limit = 0 if _is_meta(skill) else desc_limit
@@ -141,6 +149,8 @@ class SkillInjector:
         with_desc: Callable[[SkillSpec], bool],
         desc_limit: int,
         with_location: bool,
+        generation: int = 0,
+        omitted_count: int = 0,
     ) -> str:
         visible = [s for s in skills if not s.disable_model_invocation]
         if not visible:
@@ -156,8 +166,11 @@ class SkillInjector:
                     with_desc=with_desc(s),
                     desc_limit=desc_limit,
                     with_location=with_location,
+                    generation=generation,
                 )
             )
+        if omitted_count:
+            lines.append(f'  <omitted count="{omitted_count}" reason="metadata_budget" />')
         lines.append("</available_skills>")
         return system_prompt + "\n".join(lines)
 
@@ -170,6 +183,7 @@ class SkillInjector:
         *,
         desc_limit: int = 0,
         include_location: bool = False,
+        generation: int = 0,
     ) -> str:
         """Full mode: name + description, without host paths by default.
 
@@ -177,13 +191,17 @@ class SkillInjector:
         opt-in. Production prompt assembly must keep the default so absolute
         host paths are disclosed only when ``skill_view`` loads the body.
         """
-        return self._render(
+        rendered = self._render(
             system_prompt,
             skills,
             with_desc=lambda _s: True,
             desc_limit=desc_limit,
             with_location=include_location,
+            generation=generation,
         )
+        count = rendered.count("</name>")
+        self.last_render_report = SkillRenderReport(len(skills), count, len(skills) - count)
+        return rendered
 
     def inject_compact(
         self,
@@ -191,15 +209,20 @@ class SkillInjector:
         skills: list[SkillSpec],
         *,
         include_location: bool = False,
+        generation: int = 0,
     ) -> str:
         """Compact name-only mode, without host paths by default."""
-        return self._render(
+        rendered = self._render(
             system_prompt,
             skills,
             with_desc=lambda _s: False,
             desc_limit=0,
             with_location=include_location,
+            generation=generation,
         )
+        count = rendered.count("</name>")
+        self.last_render_report = SkillRenderReport(len(skills), count, len(skills) - count)
+        return rendered
 
     def inject_skills(
         self,
@@ -209,6 +232,7 @@ class SkillInjector:
         *,
         desc_limit: int = DEFAULT_DESCRIPTION_LIMIT,
         pinned_count: int = 0,
+        generation: int = 0,
     ) -> str:
         """Fit skills into ``max_chars`` with meta-preserving, graded degradation.
 
@@ -235,10 +259,21 @@ class SkillInjector:
         overhead here and that budget is better spent on descriptions.
         """
         if not skills:
+            self.last_render_report = SkillRenderReport()
             return system_prompt
         visible = [s for s in skills if not s.disable_model_invocation]
         if not visible:
+            self.last_render_report = SkillRenderReport(total=len(skills))
             return system_prompt
+
+        def finish(rendered: str) -> str:
+            count = rendered.count("</name>")
+            self.last_render_report = SkillRenderReport(
+                total=len(visible),
+                rendered=count,
+                omitted=max(len(visible) - count, 0),
+            )
+            return rendered
 
         def fits(rendered: str) -> bool:
             return len(rendered) - len(system_prompt) <= max_chars
@@ -250,16 +285,44 @@ class SkillInjector:
             with_desc=lambda _s: True,
             desc_limit=desc_limit,
             with_location=False,
+            generation=generation,
         )
         if fits(full):
-            return full
+            return finish(full)
+
+        # A1. Divide the remaining description budget evenly instead of
+        # allowing early entries to crowd out the tail. Meta boundary
+        # descriptions remain complete because they drive the trigger choice.
+        lo_limit, hi_limit, best_fair = 16, max(desc_limit, 16), None
+        while lo_limit <= hi_limit:
+            mid = (lo_limit + hi_limit) // 2
+            candidate = self._render(
+                system_prompt,
+                visible,
+                with_desc=lambda _s: True,
+                desc_limit=mid,
+                with_location=False,
+                generation=generation,
+            )
+            if fits(candidate):
+                best_fair = candidate
+                lo_limit = mid + 1
+            else:
+                hi_limit = mid - 1
+        if best_fair is not None:
+            return finish(best_fair)
 
         # A'. meta keep full descriptions; everyone else becomes name-only.
         meta_priority = self._render(
-            system_prompt, visible, with_desc=_is_meta, desc_limit=desc_limit, with_location=False
+            system_prompt,
+            visible,
+            with_desc=_is_meta,
+            desc_limit=desc_limit,
+            with_location=False,
+            generation=generation,
         )
         if fits(meta_priority):
-            return meta_priority
+            return finish(meta_priority)
 
         # A''. budget too tight for all non-meta names alongside the meta
         # descriptions — keep EVERY meta description and trim the non-meta name
@@ -280,6 +343,8 @@ class SkillInjector:
                         with_desc=_is_meta,
                         desc_limit=desc_limit,
                         with_location=False,
+                        generation=generation,
+                        omitted_count=len(nonmetas) - mid,
                     )
                 ):
                     best = mid
@@ -292,9 +357,11 @@ class SkillInjector:
                 with_desc=_is_meta,
                 desc_limit=desc_limit,
                 with_location=False,
+                generation=generation,
+                omitted_count=len(nonmetas) - best,
             )
             if fits(meta_kept):
-                return meta_kept
+                return finish(meta_kept)
 
         # B. no descriptions at all (reached only if meta descriptions alone
         # overflow, or there are no meta skills) — every name still listed.
@@ -304,9 +371,10 @@ class SkillInjector:
             with_desc=lambda _s: False,
             desc_limit=desc_limit,
             with_location=False,
+            generation=generation,
         )
         if fits(names_only):
-            return names_only
+            return finish(names_only)
 
         # C. budget too small even for all names — emit the largest name-only run
         # that FITS the hard ceiling. Pinned + meta entries are reordered to the
@@ -326,16 +394,22 @@ class SkillInjector:
                 with_desc=lambda _s: False,
                 desc_limit=desc_limit,
                 with_location=False,
+                generation=generation,
+                omitted_count=len(ordered) - mid,
             )
             if fits(test):
                 best = mid
                 lo = mid + 1
             else:
                 hi = mid - 1
-        return self._render(
-            system_prompt,
-            ordered[:best],
-            with_desc=lambda _s: False,
-            desc_limit=desc_limit,
-            with_location=False,
+        return finish(
+            self._render(
+                system_prompt,
+                ordered[:best],
+                with_desc=lambda _s: False,
+                desc_limit=desc_limit,
+                with_location=False,
+                generation=generation,
+                omitted_count=len(ordered) - best,
+            )
         )

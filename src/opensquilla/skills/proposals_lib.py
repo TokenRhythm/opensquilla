@@ -1,10 +1,7 @@
 """Library functions for the ``~/.opensquilla/proposals/`` directory.
 
-Lifted out of ``skills/bundled/skill-creator-proposals/scripts/proposals.py``
-so the gateway RPC layer (Path 3) can call them in-process — the
-bundled script's hyphenated path is not importable.
-
-The bundled script now delegates here so there's one source of truth.
+The Skill creator and gateway call this module directly; proposal storage is
+runtime infrastructure rather than a model-visible helper Skill.
 
 Path layout::
 

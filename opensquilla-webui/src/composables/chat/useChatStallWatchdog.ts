@@ -1,4 +1,6 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
+import type { ConversationSemanticEventKind } from '@/modules/conversationEvents'
+import type { ConversationEventData } from '@/modules/conversationEventContent'
 import { taskTerminalStatus } from '@/utils/chat/streamEvents'
 
 // Soft content-silence watchdog for the live chat stream.
@@ -23,27 +25,17 @@ const EVALUATE_MIN_INTERVAL_MS = 500
 // Events that prove the provider/agent is actually making progress. Everything
 // outside this set (run_heartbeat, state_change, transport ticks, …) is
 // liveness-only and must NOT reset the content-silence clock.
-const CONTENT_EVENTS = new Set([
-  'session.event.text_delta',
-  'session.event.thinking',
-  'session.event.tool_use_start',
-  'session.event.tool_use_delta',
-  'session.event.tool_result',
-  'session.event.router_decision',
+const CONTENT_EVENTS = new Set<ConversationSemanticEventKind>([
+  'text-delta',
+  'thinking-delta',
+  'tool-use-started',
+  'tool-use-delta',
+  'tool-result',
+  'router-decision',
   // Long compaction or ensemble phases emit only these frames; they prove
   // forward progress and must keep the banner down.
-  'session.event.compaction',
-  'session.event.ensemble_progress',
-])
-
-const APPROVAL_REQUESTED_EVENTS = new Set([
-  'exec.approval.requested',
-  'plugin.approval.requested',
-])
-
-const APPROVAL_RESOLVED_EVENTS = new Set([
-  'exec.approval.resolved',
-  'plugin.approval.resolved',
+  'compaction-progress',
+  'ensemble-progress',
 ])
 
 export type StallSuspendReason = 'tool-running' | 'approval-pending' | 'ensemble-running' | null
@@ -57,27 +49,16 @@ export interface UseChatStallWatchdogOptions {
   now?: () => number
 }
 
-function payloadToolId(payload: Record<string, unknown>): string {
-  const id = payload.tool_use_id ?? payload.toolUseId ?? payload.id
-  return typeof id === 'string' ? id : ''
+function payloadToolId(payload: ConversationEventData): string {
+  return payload.watchdogToolId ?? ''
 }
 
-function payloadApprovalId(payload: Record<string, unknown>): string {
-  const id = payload.approval_id ?? payload.approvalId
-  return typeof id === 'string' ? id : ''
+function payloadApprovalId(payload: ConversationEventData): string {
+  return payload.approval_id ?? ''
 }
 
-function ensembleMemberId(payload: Record<string, unknown>): string {
-  const eventType = String(payload.event_type || '')
-  const role = eventType.startsWith('aggregator_') ? 'aggregator' : 'proposer'
-  return [
-    role,
-    String(payload.proposer_index ?? ''),
-    String(payload.sample_index ?? ''),
-    String(payload.proposer_label ?? ''),
-    String(payload.proposer_provider ?? ''),
-    String(payload.proposer_model ?? ''),
-  ].join(':')
+function ensembleMemberId(payload: ConversationEventData): string {
+  return payload.watchdogMemberId ?? ''
 }
 
 function ensemblePhase(phase: unknown): 'proposers' | 'aggregator' | '' {
@@ -88,13 +69,9 @@ function ensemblePhase(phase: unknown): 'proposers' | 'aggregator' | '' {
 }
 
 // Terminal events end the turn, so the banner clears and per-turn tracking
-// resets. Mirrors handleRpcAny's terminal detection: `*.done` / `chat.done` /
-// `*.error` plus TaskRuntime terminals (via the shared taskTerminalStatus
-// helper); task_group frames are mid-turn checkpoints, not turn terminals,
-// and are excluded upstream.
-function isTerminalEvent(event: string): boolean {
-  if (event.endsWith('.done') || event === 'chat.done') return true
-  if (event.endsWith('.error')) return true
+// resets. Task-group checkpoints remain mid-turn progress.
+function isTerminalEvent(event: ConversationSemanticEventKind): boolean {
+  if (event === 'turn-completed' || event === 'turn-failed') return true
   return taskTerminalStatus(event) !== ''
 }
 
@@ -203,7 +180,7 @@ export function useChatStallWatchdog(options: UseChatStallWatchdogOptions) {
     ensemblePhaseActive.value = true
   }
 
-  function noteEnsembleProgress(record: Record<string, unknown>) {
+  function noteEnsembleProgress(record: ConversationEventData) {
     const eventType = String(record.event_type || '')
     const id = ensembleMemberId(record)
     if (eventType === 'proposer_start' || eventType === 'aggregator_start') {
@@ -248,42 +225,40 @@ export function useChatStallWatchdog(options: UseChatStallWatchdogOptions) {
    * generic run_heartbeat remains liveness-only; ensemble phase heartbeats
    * suspend the soft warning while the backend deadline owns the phase.
    */
-  function noteEvent(eventName: string, payload?: unknown) {
-    if (typeof eventName !== 'string' || !eventName) return
-    const record = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
+  function noteEvent(eventKind: ConversationSemanticEventKind, record: ConversationEventData = {}) {
+    if (eventKind === 'unknown') return
 
-    if (APPROVAL_REQUESTED_EVENTS.has(eventName)) {
+    if (eventKind === 'approval-requested') {
       addApproval(payloadApprovalId(record))
       return
     }
-    if (APPROVAL_RESOLVED_EVENTS.has(eventName)) {
+    if (eventKind === 'approval-resolved') {
       removeApproval(payloadApprovalId(record))
       return
     }
 
-    // Task-group checkpoints end with `.done`/`.failed` but the turn goes on.
-    if (eventName.startsWith('session.event.task_group.')) return
+    if (eventKind.startsWith('task-group-')) return
 
-    if (isTerminalEvent(eventName)) {
+    if (isTerminalEvent(eventKind)) {
       clearTurn()
       return
     }
 
-    if (eventName === 'session.event.run_heartbeat') {
+    if (eventKind === 'run-heartbeat') {
       const phase = ensemblePhase(record.phase)
       if (phase) setEnsemblePhase(phase)
       evaluate()
       return
     }
 
-    if (eventName === 'session.event.ensemble_progress') {
+    if (eventKind === 'ensemble-progress') {
       noteEnsembleProgress(record)
       return
     }
 
-    if (!CONTENT_EVENTS.has(eventName)) return
-    if (eventName === 'session.event.tool_use_start') addTool(payloadToolId(record))
-    else if (eventName === 'session.event.tool_result') removeTool(payloadToolId(record))
+    if (!CONTENT_EVENTS.has(eventKind)) return
+    if (eventKind === 'tool-use-started') addTool(payloadToolId(record))
+    else if (eventKind === 'tool-result') removeTool(payloadToolId(record))
     noteContent()
   }
 

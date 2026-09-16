@@ -1,5 +1,8 @@
 ---
 name: meta-knowledge-base-bootstrap
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Bootstrap a domain knowledge base from a single seed (URL / PDF path / git repo / free-text topic): classify source → ingest with the right tool → persist to memory + xlsx index."
 kind: meta
 meta_priority: 40

@@ -30,6 +30,24 @@ from opensquilla.contracts.generated.v4.sessions_delete_metadata import (
     SESSIONS_DELETE_METHOD,
     SESSIONS_DELETE_SCOPE,
 )
+from opensquilla.contracts.generated.v4.sessions_fork import (
+    SessionsForkRequestFrame,
+    SessionsForkResponseFrame,
+    SessionsForkResult,
+)
+from opensquilla.contracts.generated.v4.sessions_fork_metadata import (
+    SESSIONS_FORK_METHOD,
+    SESSIONS_FORK_SCOPE,
+)
+from opensquilla.contracts.generated.v4.sessions_fork_through_turn import (
+    SessionsForkThroughTurnRequestFrame,
+    SessionsForkThroughTurnResponseFrame,
+    SessionsForkThroughTurnResult,
+)
+from opensquilla.contracts.generated.v4.sessions_fork_through_turn_metadata import (
+    SESSIONS_FORK_THROUGH_TURN_METHOD,
+    SESSIONS_FORK_THROUGH_TURN_SCOPE,
+)
 from opensquilla.contracts.generated.v4.sessions_rename import (
     SessionsRenameRequestFrame,
     SessionsRenameResponseFrame,
@@ -61,6 +79,14 @@ def _wire_cases(directory: str, filename: str) -> list[tuple[str, dict[str, Any]
         (SESSIONS_CREATE_METHOD, SESSIONS_CREATE_SCOPE, "sessions-create", "command", False),
         (SESSIONS_RENAME_METHOD, SESSIONS_RENAME_SCOPE, "sessions-rename", "command", True),
         (SESSIONS_DELETE_METHOD, SESSIONS_DELETE_SCOPE, "sessions-delete", "command", True),
+        (SESSIONS_FORK_METHOD, SESSIONS_FORK_SCOPE, "sessions-fork", "command", False),
+        (
+            SESSIONS_FORK_THROUGH_TURN_METHOD,
+            SESSIONS_FORK_THROUGH_TURN_SCOPE,
+            "sessions-fork-through-turn",
+            "command",
+            False,
+        ),
     ],
 )
 def test_lifecycle_metadata_matches_gateway_semantics(
@@ -92,6 +118,8 @@ def test_lifecycle_metadata_matches_gateway_semantics(
         (SessionsCreateRequestFrame, "sessions-create"),
         (SessionsRenameRequestFrame, "sessions-rename"),
         (SessionsDeleteRequestFrame, "sessions-delete"),
+        (SessionsForkRequestFrame, "sessions-fork"),
+        (SessionsForkThroughTurnRequestFrame, "sessions-fork-through-turn"),
     ],
 )
 def test_request_fixtures_round_trip_exact_json_tree(model: type[Any], directory: str) -> None:
@@ -106,6 +134,8 @@ def test_request_fixtures_round_trip_exact_json_tree(model: type[Any], directory
         (SessionsCreateResponseFrame, "sessions-create"),
         (SessionsRenameResponseFrame, "sessions-rename"),
         (SessionsDeleteResponseFrame, "sessions-delete"),
+        (SessionsForkResponseFrame, "sessions-fork"),
+        (SessionsForkThroughTurnResponseFrame, "sessions-fork-through-turn"),
     ],
 )
 def test_response_and_error_fixtures_round_trip_exact_json_tree(
@@ -147,3 +177,59 @@ def test_rename_and_delete_results_keep_partial_contract_shape() -> None:
     }
     with pytest.raises(ValidationError):
         SessionsDeleteResult.model_validate({"deleted": []})
+
+
+def test_fork_result_requires_identity_and_complete_through_turn_acknowledgement() -> None:
+    legacy_payload = {
+        "key": "agent:main:webchat:child",
+        "parentKey": "agent:main:webchat:parent",
+        "future": {"accepted": True},
+    }
+    assert SessionsForkResult.model_validate(legacy_payload).model_dump(
+        mode="json", exclude_unset=True
+    ) == legacy_payload
+
+    through_payload = {
+        "key": "agent:main:webchat:child",
+        "parentKey": "agent:main:webchat:parent",
+        "forkMode": "through_turn",
+        "throughTurnId": "turn-terminal",
+    }
+    assert SessionsForkResult.model_validate(through_payload).model_dump(
+        mode="json", exclude_unset=True
+    ) == through_payload
+    assert SessionsForkThroughTurnResult.model_validate(through_payload).model_dump(
+        mode="json", exclude_unset=True
+    ) == through_payload
+
+    invalid_payloads = (
+        {"key": "agent:main:webchat:child"},
+        {
+            "key": "agent:main:webchat:child",
+            "parentKey": "agent:main:webchat:parent",
+            "forkMode": "through_turn",
+        },
+        {
+            "key": "agent:main:webchat:child",
+            "parentKey": "agent:main:webchat:parent",
+            "throughTurnId": "turn-terminal",
+        },
+        {
+            "key": "agent:main:webchat:child",
+            "parentKey": "agent:main:webchat:parent",
+            "forkMode": "full",
+            "throughTurnId": "turn-terminal",
+        },
+    )
+    for payload in invalid_payloads:
+        with pytest.raises(ValidationError):
+            SessionsForkResult.model_validate(payload)
+
+    with pytest.raises(ValidationError):
+        SessionsForkThroughTurnResult.model_validate(
+            {
+                "key": "agent:main:webchat:child",
+                "parentKey": "agent:main:webchat:parent",
+                "forkMode": "through_turn",
+            }
+        )

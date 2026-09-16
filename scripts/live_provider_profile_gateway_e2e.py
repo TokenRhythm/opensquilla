@@ -53,9 +53,9 @@ from opensquilla.provider.preset_registry import (  # noqa: E402
 )
 from opensquilla.provider.registry import get_provider_spec  # noqa: E402
 from opensquilla.provider.request_proof import estimate_provider_media_tokens  # noqa: E402
-from opensquilla.session.compaction import estimate_entry_model_replay_tokens  # noqa: E402
 from opensquilla.session.manager import SessionManager  # noqa: E402
 from opensquilla.session.storage import SessionStorage  # noqa: E402
+from opensquilla.token_estimation import estimate_tokens  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
     child_environment,
     classify_failure,
@@ -125,8 +125,8 @@ ATTACHMENT_CAPACITY_GATEWAY_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 # read plus its half-second interval after its own deadline check.
 ATTACHMENT_CAPACITY_ASSISTANT_POLL_OVERRUN_SECONDS = 4.0
 ATTACHMENT_CAPACITY_MIN_RAW_MARGIN_TOKENS = 4_096
-ATTACHMENT_CAPACITY_EXPECTED_HISTORY_TURNS = 1
-ATTACHMENT_CAPACITY_EXPECTED_MEDIA_BLOCKS = 3
+ATTACHMENT_CAPACITY_EXPECTED_HISTORY_TURNS = 3
+ATTACHMENT_CAPACITY_EXPECTED_MEDIA_BLOCKS = 5
 _PUBLIC_RESULT_KEYS = frozenset(
     {
         "provider",
@@ -166,7 +166,7 @@ _PUBLIC_USAGE_KEYS = frozenset(
         "raw_history_fits_at_zero_thinking",
         "reasoning_tokens",
         "reasoningTokens",
-        "route_max_history_turns",
+        "request_history_user_turn_count",
         "router_admission_token_limit",
         "router_max_thinking_admission_token_limit",
         "source",
@@ -406,6 +406,12 @@ def _write_config(
             int(model_context_window_tokens),
         )
     if model_supports_vision_override is not None:
+        # The offline single-call fixture supplies deployment facts for every
+        # configured leg; retired tier switches cannot stand in for metadata.
+        for tier in (tier_overrides or {}).values():
+            tier_model = str(tier.get("model") or "").strip()
+            if tier_model and tier_model != model_supports_vision_override:
+                model_override_fields.setdefault(tier_model, {})["supports_vision"] = False
         model_override_fields.setdefault(model_supports_vision_override, {})[
             "supports_vision"
         ] = True
@@ -493,17 +499,18 @@ def _tokenrhythm_attachment_tiers() -> dict[str, dict[str, Any]]:
         raise RuntimeError("TokenRhythm preset has no image_model tier")
     if image_tier.get("model") != ATTACHMENT_CAPACITY_MODEL:
         raise RuntimeError("TokenRhythm image_model does not match the verified live fixture")
-    unsafe_fallback_slots = [
+    missing_slots = [
         slot
         for slot in TEXT_PROFILE_SLOTS
         if not isinstance(tiers.get(slot), dict)
-        or tiers[slot].get("supports_image") is not False
+        or not str(tiers[slot].get("model") or "").strip()
     ]
-    if unsafe_fallback_slots:
-        raise RuntimeError(
-            "TokenRhythm attachment gate requires every text fallback to be explicitly "
-            "non-vision before any live request"
-        )
+    if missing_slots:
+        raise RuntimeError("TokenRhythm attachment gate requires configured c0-c3 models")
+    tiers["c2"] = {**image_tier, "image_only": False}
+    del tiers["image_model"]
+    for tier in tiers.values():
+        tier.pop("supports_image", None)
     return tiers
 
 
@@ -647,6 +654,8 @@ def _attachment_capacity_fixture() -> dict[str, Any]:
             _inline_image("history-3a.png", payloads[2]),
             _inline_image("history-3b.png", payloads[3]),
         ]
+        images[2]["attachment_id"] = "att_capacity_history_3a"
+        images[3]["attachment_id"] = "att_capacity_history_3b"
         turns = [
             {
                 "user": _inline_history_envelope("Historical image turn one.", [images[0]]),
@@ -667,16 +676,18 @@ def _attachment_capacity_fixture() -> dict[str, Any]:
         estimator_output = StringIO()
         with redirect_stdout(estimator_output), redirect_stderr(estimator_output):
             raw_tokens = sum(
-                estimate_entry_model_replay_tokens({"content": turn[role]})
+                estimate_tokens(turn[role])
                 for turn in turns
                 for role in ("user", "assistant")
             )
-        retained_media_tokens = sum(
-            estimate_provider_media_tokens("image", len(payload)) for payload in payloads[2:]
+        history_media_tokens = sum(
+            estimate_provider_media_tokens("image", len(payload), encoded_data=image["data"])
+            for payload, image in zip(payloads, images, strict=True)
         )
         current_payload = _deterministic_png(71, 71, seed=55)
-        projected_media_tokens = retained_media_tokens + estimate_provider_media_tokens(
-            "image", len(current_payload)
+        current_attachment = _inline_image("current.png", current_payload)
+        projected_media_tokens = history_media_tokens + estimate_provider_media_tokens(
+            "image", len(current_payload), encoded_data=current_attachment["data"]
         )
         raw_fits = _attachment_capacity_request_fits(
             raw_tokens,
@@ -688,9 +699,8 @@ def _attachment_capacity_fixture() -> dict[str, Any]:
         )
         fixture = {
             "turns": turns,
-            "current_attachment": _inline_image("current.png", current_payload),
-            "excluded_base64": [images[0]["data"], images[1]["data"]],
-            "retained_base64": [images[2]["data"], images[3]["data"]],
+            "current_attachment": current_attachment,
+            "history_base64": [image["data"] for image in images],
             "metrics": {
                 "history_turn_count": len(turns),
                 "history_image_count": len(images),
@@ -826,13 +836,13 @@ def _provider_proof_from_logs(paths: list[Path]) -> dict[str, Any]:
                 "estimated_tokens",
                 "effective_proof_token_budget",
             ):
-                match = re.search(rf"\b{field}=(\d+)", line)
+                match = re.search(rf'\b{field}"?\s*[:=]\s*(\d+)\b', line)
                 if match:
                     current[field] = int(match.group(1))
-            match = re.search(r"\bmedia_blocks_reserved=(\d+)", line)
+            match = re.search(r'\bmedia_blocks_reserved"?\s*[:=]\s*(\d+)\b', line)
             if match:
                 current["media_blocks"] = int(match.group(1))
-            match = re.search(r"\bfits=(True|False|true|false)", line)
+            match = re.search(r'\bfits"?\s*[:=]\s*(True|False|true|false)\b', line)
             if match:
                 current["fits"] = match.group(1).lower() == "true"
             if current:
@@ -849,6 +859,7 @@ def _request_projection_evidence(
     if not isinstance(messages, list):
         messages = []
     history_texts: set[str] = set()
+    assistant_history_texts: set[str] = set()
     for turn in fixture.get("turns") or []:
         if not isinstance(turn, dict):
             continue
@@ -859,6 +870,9 @@ def _request_projection_evidence(
         text = envelope.get("text") if isinstance(envelope, dict) else None
         if isinstance(text, str) and text:
             history_texts.add(text)
+        assistant_text = turn.get("assistant")
+        if isinstance(assistant_text, str) and assistant_text:
+            assistant_history_texts.add(assistant_text)
 
     def _message_text_parts(message: dict[str, Any]) -> list[str]:
         content = message.get("content")
@@ -905,10 +919,8 @@ def _request_projection_evidence(
             if isinstance(data, str):
                 typed_image_payloads.append(data)
 
-    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    excluded_absent = all(value not in serialized for value in fixture["excluded_base64"])
     expected_payloads = [
-        *fixture["retained_base64"],
+        *fixture["history_base64"],
         fixture["current_attachment"]["data"],
     ]
     expected_present = sorted(typed_image_payloads) == sorted(expected_payloads)
@@ -920,7 +932,10 @@ def _request_projection_evidence(
     return {
         "history_user_turn_count": history_user_turns,
         "media_blocks": len(typed_image_payloads),
-        "excluded_old_media_absent": excluded_absent,
+        "expected_history_text_present": all(
+            any(history_text in text_part for text_part in text_parts)
+            for history_text in history_texts | assistant_history_texts
+        ),
         "expected_media_present": expected_present,
         "expected_media_text_absent": expected_media_text_absent,
     }
@@ -1011,7 +1026,7 @@ def _attachment_capacity_llm_error_failure_kind(
 
 
 _ATTACHMENT_CAPACITY_HTTP_ERROR_RE = re.compile(
-    r"provider\.chat_http_error\b.*?\bstatus_code=(\d{3})\b"
+    r'\bstatus_code"?\s*[:=]\s*(\d{3})\b'
 )
 
 
@@ -1023,6 +1038,8 @@ def _attachment_capacity_provider_http_statuses(paths: list[Path]) -> list[int]:
         if not path.is_file():
             continue
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "provider.chat_http_error" not in line:
+                continue
             match = _ATTACHMENT_CAPACITY_HTTP_ERROR_RE.search(line)
             if match is None:
                 continue
@@ -1077,7 +1094,7 @@ def _evaluate_attachment_capacity_evidence(
             decision.get("image_route_reason") == "current_turn",
             projection.get("history_user_turn_count") == ATTACHMENT_CAPACITY_EXPECTED_HISTORY_TURNS,
             projection.get("media_blocks") == ATTACHMENT_CAPACITY_EXPECTED_MEDIA_BLOCKS,
-            projection.get("excluded_old_media_absent") is True,
+            projection.get("expected_history_text_present") is True,
             projection.get("expected_media_present") is True,
             projection.get("expected_media_text_absent") is True,
             session_metrics.get("compaction_count") == 0,
@@ -1696,9 +1713,10 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
                             {
                                 "sessionKey": session_key,
                                 "message": (
-                                    "请简短描述当前图片，不要调用工具，最后单独输出 "
+                                    "Briefly compare the current image with the earlier images "
+                                    "in this conversation. Do not call tools. End with "
                                     + marker
-                                    + "。"
+                                    + "."
                                 ),
                                 "attachments": [
                                     {
@@ -1768,7 +1786,7 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
             "physical_request_count": session_metrics["physical_request_count"],
             "physical_response_count": session_metrics["physical_response_count"],
             "compaction_count": session_metrics["compaction_count"],
-            "route_max_history_turns": evidence["request_projection"].get(
+            "request_history_user_turn_count": evidence["request_projection"].get(
                 "history_user_turn_count"
             ),
             "provider_proof_fits": proof.get("fits"),

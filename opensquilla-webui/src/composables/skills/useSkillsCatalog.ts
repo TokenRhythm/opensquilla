@@ -1,6 +1,6 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
-import type { useRpcStore } from '@/stores/rpc'
+import type { SkillCatalog } from '@/modules/skillCatalog'
 import type {
   AutoEnabledSkill,
   ProposalsSettings,
@@ -11,10 +11,6 @@ import type {
   SkillLayerGroup,
   SkillStatTile,
 } from '@/types/skills'
-
-interface SkillsListData {
-  skills?: Skill[]
-}
 
 export interface SkillsCatalogOptions {
   proposals: Ref<unknown[]>
@@ -455,7 +451,7 @@ export function skillLayerHelp(layer: string | undefined): string {
 }
 
 export function useSkillsCatalog(
-  rpc: ReturnType<typeof useRpcStore>,
+  catalog: SkillCatalog,
   options: SkillsCatalogOptions,
 ): SkillsCatalog {
   const t = i18n.global.t
@@ -538,13 +534,8 @@ export function useSkillsCatalog(
 
   async function loadData() {
     try {
-      await rpc.waitForConnection()
-    } catch {
-      return false
-    }
-    try {
-      const data = await rpc.call<SkillsListData>('skills.list', { includeLifecycle: true })
-      allSkills.value = (data.skills || []).map(normalizeSkill)
+      const skills = await catalog.list()
+      allSkills.value = skills.map(normalizeSkill)
       await options.loadProposals()
       return true
     } catch (err) {

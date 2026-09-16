@@ -110,11 +110,15 @@ import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { useUsageData } from '@/composables/usage/useUsageData'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
 
 const { t } = useI18n()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
+const injectedObservability = inject(OBSERVABILITY_KEY)
+if (!injectedObservability) throw new Error('Observability was not provided')
+const observability = injectedObservability
 
 const {
   currency,
@@ -164,7 +168,7 @@ const {
   rowBreakdownTotalTokens,
   rowBreakdownTotalCost,
   rowBreakdownAnyProrated,
-} = useUsageData(sessionDirectory)
+} = useUsageData(sessionDirectory, observability)
 
 // Manual refresh shows a busy state; loadData (also the poll/mount handler) now
 // returns the refresh promise, so a local flag spans just the user-driven load.

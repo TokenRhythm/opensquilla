@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { markRaw, ref, shallowRef } from 'vue'
 
+import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
 import type {
   ArtifactMutationOperation,
   ArtifactMutationResolution,
@@ -22,7 +23,6 @@ import {
 } from '@/utils/artifactProductErrors'
 import { PendingMutationRequestIds } from '@/utils/mutationRequestIdentity'
 import { resolveArtifactMutationBounded } from '@/workbench/artifactMutationRecovery'
-import type { WorkbenchResourceProvider } from '@/workbench/workbenchResourceProvider'
 import { canonicalWorkbenchResources } from '@/workbench/workbenchResourceItems'
 
 export interface WorkbenchResourceSnapshot {
@@ -486,7 +486,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     idempotencyKey?: string,
   ): Promise<DocumentImportResponse> {
     const currentProvider = provider.value
-    if (!currentProvider || !resource.capabilities.manualEdit) {
+    if (!currentProvider || !resource.capabilities.edit) {
       throw new Error('This resource cannot be imported as an editable document.')
     }
     if (!resource.sha256) {

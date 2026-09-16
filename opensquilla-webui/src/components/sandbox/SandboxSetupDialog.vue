@@ -30,7 +30,7 @@
         </p>
         <div class="sandbox-setup-dialog__actions">
           <button
-            v-if="pending"
+          v-if="setupActive"
             type="button"
             class="btn"
             data-testid="sandbox-setup-background"
@@ -45,7 +45,7 @@
             type="button"
             class="btn btn--primary"
             data-testid="sandbox-setup-continue"
-            :disabled="pending"
+            :disabled="setupActive"
             @click="$emit('confirm')"
           >
             {{ confirmLabel }}
@@ -60,7 +60,7 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
-import type { SandboxSetupOutcome } from '@/composables/sandboxSetupCoordinator'
+import type { SandboxSetupOutcome } from '@/modules/sandboxRuntime'
 
 const props = defineProps<{
   open: boolean
@@ -77,6 +77,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const elapsedSeconds = ref(0)
 let progressInterval: ReturnType<typeof setInterval> | null = null
+const setupActive = computed(() => props.pending || props.outcome === 'in_progress')
 
 function clearProgress(): void {
   if (progressInterval !== null) clearInterval(progressInterval)
@@ -92,13 +93,13 @@ function startProgress(): void {
 }
 
 watch(
-  () => props.open && props.pending,
+  () => props.open && setupActive.value,
   active => active ? startProgress() : clearProgress(),
   { immediate: true },
 )
 
 const progressMessage = computed(() => {
-  if (!props.pending) return ''
+  if (!setupActive.value) return ''
   const phase = elapsedSeconds.value >= 15
     ? t('settings.sandbox.setup.takingLonger')
     : elapsedSeconds.value >= 5
@@ -115,13 +116,13 @@ const outcomeMessage = computed(() => {
 })
 
 const confirmLabel = computed(() => {
-  if (props.pending) return t('settings.sandbox.setup.configuring')
+  if (setupActive.value) return t('settings.sandbox.setup.configuring')
   if (outcomeMessage.value) return t('settings.sandbox.actions.retry')
   return t('settings.sandbox.setup.continue')
 })
 
 function cancel(): void {
-  if (!props.pending) emit('cancel')
+  if (!setupActive.value) emit('cancel')
 }
 
 onUnmounted(clearProgress)

@@ -10,7 +10,7 @@ function setDesktopApi(api: unknown): void {
 }
 
 interface RpcHandles {
-  data?: { value: unknown }
+  response?: unknown
   execute?: ReturnType<typeof vi.fn>
 }
 
@@ -20,22 +20,9 @@ async function mountBanner(status: unknown, { desktop = false }: { desktop?: boo
   // A truthy preload bridge flips platform detection to desktop.
   setDesktopApi(desktop ? { getOsLocale: async () => 'en' } : undefined)
   vi.doMock('vue-router', () => ({ useRouter: () => ({ push: routerPush }) }))
-  const handles: RpcHandles = {}
-  vi.doMock('@/composables/useRpc', async () => {
-    const { ref } = await import('vue')
-    const data = ref(status)
-    const execute = vi.fn()
-    handles.data = data
-    handles.execute = execute
-    return {
-      useRpcCall: () => ({
-        data,
-        loading: ref(false),
-        error: ref(null),
-        execute,
-      }),
-    }
-  })
+  const handles: RpcHandles = { response: status }
+  const execute = vi.fn(async () => handles.response as Record<string, unknown>)
+  handles.execute = execute
   const { createApp, nextTick } = await import('vue')
   const i18n = (await import('@/i18n')).default
   i18n.global.locale.value = 'en'
@@ -43,6 +30,10 @@ async function mountBanner(status: unknown, { desktop = false }: { desktop?: boo
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(Component)
+  const { SETUP_WORKFLOW_KEY } = await import('@/modules/setupWorkflow')
+  app.provide(SETUP_WORKFLOW_KEY, {
+    status: execute,
+  } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
   app.use(i18n)
   app.mount(el)
   await settle()
@@ -79,9 +70,7 @@ describe('SidebarSetupBanner readiness refresh', () => {
     // A save hot-applies config, re-loads the Settings dialog data, and
     // signals invalidation; the banner must re-fetch instead of holding its
     // mount-time snapshot until the next full page reload.
-    handles.execute!.mockImplementation(async () => {
-      handles.data!.value = { needsOnboarding: false }
-    })
+    handles.response = { needsOnboarding: false }
     const { invalidateReadiness } = await import('@/composables/setup/useReadinessSummary')
     invalidateReadiness()
     await settle()
@@ -93,6 +82,7 @@ describe('SidebarSetupBanner readiness refresh', () => {
 
   it('stops listening for readiness invalidations after unmount', async () => {
     const { app, handles } = await mountBanner({ needsOnboarding: true })
+    handles.execute!.mockClear()
     app.unmount()
 
     const { invalidateReadiness } = await import('@/composables/setup/useReadinessSummary')
