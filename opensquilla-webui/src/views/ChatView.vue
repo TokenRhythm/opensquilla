@@ -2536,6 +2536,7 @@ const {
   copyMessage,
   regenerateMessage,
   editMessage,
+  cancelEdit,
 } = chatMessageActions
 
 async function handleRegenerateMessage(
@@ -3306,6 +3307,7 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   popPendingTail,
   enqueuePendingInput,
   sendCurrentInput: () => sendCurrentInput(),
+  cancelMessageEdit: () => cancelEdit(),
 })
 const {
   onTextareaBeforeInput,
@@ -7159,6 +7161,7 @@ watch(optionalSessionRpcAllowed, admitted => {
 
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  chatMessageActions.discardEditRestorePoint()
   // Retire any in-flight page walk and clear the old Session before starting
   // the new one, so a late response cannot leak deliverables across tabs/routes.
   resetSessionArtifacts()
