@@ -203,24 +203,45 @@ describe('useChatCompaction replay compatibility', () => {
     }
   })
 
-  it('settles emergency_ephemeral without claiming durable completion in state', () => {
+  it.each([false, true])('settles emergency_ephemeral truthfully after replay=%s', replayed => {
     const h = createHarness()
     try {
-      h.api.showCompactionToast({ status: 'started', source: 'manual' })
+      h.api.showCompactionToast({ status: 'started', source: 'manual', compaction_id: 'cmp-temporary' })
       h.api.showCompactionToast({
         status: 'emergency_ephemeral',
         source: 'automatic',
-      })
+        compaction_id: 'cmp-temporary',
+      }, { replayed })
 
       expect(h.api.compactStatus.value).toMatchObject({
         visible: true,
         status: 'emergency_ephemeral',
+        message: 'History temporarily reduced; continuing',
+        durability: 'request_scoped',
         tone: 'warn',
         detail: 'Request-scoped; session history was not rewritten',
         isBusy: false,
       })
       expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
       expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it('labels a committed summary as saved', () => {
+    const h = createHarness()
+    try {
+      h.api.showCompactionToast({ status: 'started', source: 'manual' })
+      h.api.showCompactionToast({ status: 'completed', source: 'manual', durability: 'durable' })
+
+      expect(h.api.compactStatus.value).toMatchObject({
+        message: 'Summary saved',
+        status: 'completed',
+        durability: 'durable',
+        isBusy: false,
+      })
     } finally {
       h.api.cleanup()
       h.stop()

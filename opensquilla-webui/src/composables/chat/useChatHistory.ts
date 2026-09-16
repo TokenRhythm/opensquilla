@@ -169,7 +169,7 @@ function historyActivityMarkers(
     const id = String(data.id || '').trim()
     if (!id || suppressedCompactionIds.has(id)) return []
     const rawStatus = String(data.status || 'completed').toLowerCase()
-    const state = rawStatus === 'completed'
+    const state = rawStatus === 'completed' || rawStatus === 'emergency_ephemeral'
       ? 'completed'
       : rawStatus === 'failed' ? 'failed' : 'running'
     const at = Number(data.at)
@@ -181,7 +181,9 @@ function historyActivityMarkers(
       category: 'maintenance',
       state,
       source: 'automatic',
-      durability: 'durable',
+      durability: rawStatus === 'emergency_ephemeral'
+        ? 'request_scoped'
+        : String(data.durability || 'durable'),
     }]
   })
 }

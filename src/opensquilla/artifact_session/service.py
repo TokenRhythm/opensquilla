@@ -265,6 +265,7 @@ class ArtifactSessionService:
         deliverable: ArtifactBlobRef,
         actor: Actor,
         working_source: dict[str, str] | None = None,
+        publication_id: str = "",
     ) -> tuple[CommitResult, DocumentSourceBinding, bool]:
         """Adopt one immutable generated deliverable as a stable Document.
 
@@ -282,6 +283,10 @@ class ArtifactSessionService:
             deliverable=_blob(deliverable),
             actor=_actor(actor),
             working_source=working_source,
+            publication_id=(
+                _bounded_text(publication_id, "publication_id", max_bytes=512)
+                if publication_id else ""
+            ),
         )
 
     async def reserve_document_import_attempt(

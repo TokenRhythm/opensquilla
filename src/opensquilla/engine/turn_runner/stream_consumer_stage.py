@@ -198,6 +198,7 @@ class CompactionPersistPort(Protocol):
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
         expected_session_id: str | None = None,
@@ -381,6 +382,7 @@ class StreamConsumerStageInput:
     # adapter compares it atomically and preserves later append-only queue rows.
     compaction_source_entries: tuple[Any, ...] | None = None
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+    compaction_source_context_fingerprint: str | None = None
     compaction_source_boundary_message_id: str | None = None
     compaction_source_boundary_entry_id: int | None = None
     expected_session_id: str | None = None
@@ -1510,6 +1512,7 @@ class _CompactionHandler:
                     "removed_count": event.removed_count,
                     "source_entries": inp.compaction_source_entries,
                     "source_preimage": inp.compaction_source_preimage,
+                    "source_context_fingerprint": inp.compaction_source_context_fingerprint,
                     "source_boundary_message_id": (
                         inp.compaction_source_boundary_message_id
                     ),

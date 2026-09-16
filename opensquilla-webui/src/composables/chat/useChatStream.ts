@@ -426,7 +426,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       category: 'maintenance',
       state,
       source: String(payload.source || 'automatic'),
-      durability: String(payload.durability || ''),
+      durability: rawStatus === 'emergency_ephemeral'
+        ? 'request_scoped'
+        : String(payload.durability || ''),
       detail: String(payload.detail || payload.phase || ''),
       reason: String(payload.reason || payload.skip_reason || ''),
     })

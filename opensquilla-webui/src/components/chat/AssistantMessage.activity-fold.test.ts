@@ -744,6 +744,25 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
   })
 
+  it.each([
+    ['request_scoped', 'History temporarily reduced; continuing'],
+    ['durable', 'Summary saved'],
+  ])('keeps %s wording in the folded activity summary', async (durability, label) => {
+    const el = mountMessage(baseMessage({
+      timelineItems: [],
+      statusHistory: [{
+        action: 'context_compaction', label: '', at: 1_000,
+        id: 'cmp-folded', category: 'maintenance', state: 'completed',
+        source: 'automatic', durability,
+      }],
+    }))
+    await nextTick()
+
+    const summary = el.querySelector('.assistant-activity__summary')
+    expect(summary?.textContent).toContain(label)
+    if (durability === 'request_scoped') expect(summary?.textContent).not.toContain('Summary saved')
+  })
+
   it('restores routine phase rows and reopens settled reasoning content', async () => {
     const startedAt = Date.parse('2026-01-01T00:00:00.000Z')
     const el = mountMessage(baseMessage({

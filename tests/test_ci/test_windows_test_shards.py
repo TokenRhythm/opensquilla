@@ -68,6 +68,10 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Telemetry regressions use provisional weights until the next comparable
+    # Windows duration refresh supplies measured timings.
+    "tests/test_engine/test_runtime_usage_telemetry.py",
+    "tests/test_observability/test_usage_telemetry_identity.py",
     # Primary-provider and validator coverage use the declared provisional
     # floor until a comparable three-run Windows refresh supplies measured timings.
     "tests/contracts/test_gateway_validator_profiles.py",
@@ -100,6 +104,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_agent_image_compaction_budget.py",
     "tests/test_provider_request_proof_images.py",
     "tests/test_session/test_compaction_media_budget.py",
+    # New compaction recovery suites use the provisional floor until a
+    # comparable three-run Windows duration refresh supplies timings.
+    "tests/test_engine/test_request_window.py",
+    "tests/test_engine/test_runtime_request_window.py",
+    "tests/test_session/test_compaction_integrity.py",
     # Artifact source/version regressions use the declared provisional floor.
     "tests/test_engine/test_artifact_delivery_sources.py",
     "tests/test_engine/test_runtime_artifact_context.py",

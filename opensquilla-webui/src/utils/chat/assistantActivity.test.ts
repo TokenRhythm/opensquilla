@@ -1304,7 +1304,7 @@ describe('projectAssistantActivityTimeline', () => {
     expect(projection.statusSteps[0]?.label.code).toBe('chat.compact.skipped')
   })
 
-  it('merges adjacent automatic completions and keeps durable metadata', () => {
+  it('keeps request-scoped reductions distinct from adjacent saved summaries', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
       statusHistory: [
@@ -1331,13 +1331,20 @@ describe('projectAssistantActivityTimeline', () => {
       ],
     })
 
-    expect(projection.statusSteps).toHaveLength(1)
+    expect(projection.statusSteps).toHaveLength(2)
     expect(projection.statusSteps[0]).toMatchObject({
+      id: 'cmp-request-scoped',
+      state: 'completed',
+      isCurrent: false,
+      durability: 'request_scoped',
+      label: { code: 'chat.compact.temporarilyReduced' },
+    })
+    expect(projection.statusSteps[1]).toMatchObject({
       id: 'cmp-durable',
       state: 'completed',
       source: 'automatic',
       durability: 'durable',
-      label: { code: 'chat.compact.compacted' },
+      label: { code: 'chat.compact.summarySaved' },
     })
   })
 
