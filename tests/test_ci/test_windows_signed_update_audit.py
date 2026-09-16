@@ -1251,3 +1251,88 @@ def test_real_node_and_frozen_python_complete_only_in_new_temporary_parent(tmp_p
     assert result["retainedPaths"] == []
     assert list(roaming.iterdir()) == []
     assert not (roaming / "OpenSquilla").exists()
+
+
+@pytest.mark.ci_serial
+@pytest.mark.parametrize("text_blocks", [False, True], ids=["string", "text-blocks"])
+def test_retained_provider_accepts_real_python_runtime_envelope(
+    tmp_path: Path, text_blocks: bool,
+) -> None:
+    from datetime import UTC, datetime
+
+    from opensquilla.engine.agent import Agent
+    from opensquilla.engine.steps.inject_time_prefix import stamp
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.ollama import _build_ollama_messages
+    from opensquilla.provider.types import ContentBlockText, ExecutionIdentity, Message
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the retained provider protocol bridge")
+    audit_id = uuid.uuid4().hex
+    model = "opensquilla-release-session-recovery-smoke"
+    prompt = stamp(f"Retained profile first send {audit_id}", datetime.now(UTC), "UTC")
+    # This renderer only reads the clock; no Agent, profile, or Gateway is started.
+    runtime_context = Agent._runtime_context_block(None)
+    context = with_execution_identity(
+        Message(role="user", content=runtime_context),
+        ExecutionIdentity(kind="single_model", provider="ollama", model=model),
+    )
+    message = Agent._append_runtime_context_to_user_message(
+        Message(
+            role="user",
+            content=[ContentBlockText(text=prompt)] if text_blocks else prompt,
+        ),
+        context,
+    )
+    fixture = ROOT / "desktop/electron/scripts/fixtures/packaged-retained-interaction"
+    payload = {
+        "auditId": audit_id,
+        "model": model,
+        "messages": _build_ollama_messages(message, {}),
+        "providerUri": (fixture / "provider.mjs").as_uri(),
+        "contractUri": (fixture / "contract.mjs").as_uri(),
+        "sentinelPath": str(tmp_path / "unused-synthetic-sentinel.txt"),
+    }
+    script = r"""
+import assert from 'node:assert/strict';
+let input = '';
+for await (const chunk of process.stdin) input += chunk;
+const wire = JSON.parse(input);
+const { startRetainedProvider } = await import(wire.providerUri);
+const { auditMessages, sha256 } = await import(wire.contractUri);
+const messages = auditMessages(wire.auditId);
+const provider = await startRetainedProvider({
+  baseUrl: 'http://127.0.0.1:0', model: wire.model, messages,
+  sentinelPath: wire.sentinelPath, sentinelTokenSha256: sha256('unused-synthetic-token'),
+});
+try {
+  const response = await fetch(`${provider.baseUrl}/api/chat`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: wire.model, messages: wire.messages }),
+  });
+  assert.equal(response.status, 200, JSON.stringify(provider.snapshot()));
+  const chunks = (await response.text()).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(chunks[0].message.content, messages.firstAnswer);
+  assert.equal(chunks.at(-1).done, true);
+  assert.equal(provider.snapshot().first, 1);
+  assert.deepEqual(provider.snapshot().errors, []);
+  console.log(JSON.stringify(provider.snapshot()));
+} finally {
+  await provider.close();
+}
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["first"] == 1
+    assert observed["errors"] == []
+    assert not list(tmp_path.iterdir()), "The protocol bridge must not create a profile or sentinel"

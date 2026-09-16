@@ -11,7 +11,7 @@ import { captureElectronProcessIdentity, closeElectronAndObserveExit } from './p
 import { desktopShutdownEvidenceSince, gatewayProcessSnapshot } from './e2e-shutdown-helpers.mjs'
 import { desktopProfileFingerprint, loadDesktopGatewayOwnershipRecord, verifyDesktopGatewayOwnership } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
-import { assertPreservedInputs, assertStopEvidence, auditMessages, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
+import { assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
 
@@ -53,12 +53,9 @@ async function preserved(stageName) {
   const result = await runFile(python, args, { windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 })
   await writeFile(join(plan.outputDir, `preservation-${stageName}.log`), result.stdout + result.stderr)
 }
-async function noExistingDesktop() {
-  // Deliberately conservative: any installed Desktop process prevents this
-  // probe from accidentally joining an existing single-instance owner.
-  const source = "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process -Filter \"Name='OpenSquilla.exe'\").Count"
-  const result = await runFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')], { windowsHide: true, timeout: 15_000 })
-  assert.equal(result.stdout.trim(), '0', 'Close existing Desktop instances before this isolated probe')
+async function noExistingDesktop(name) {
+  await stage(`${name}-desktop-process-preflight`)
+  await assertNoExistingDesktop(runFile)
 }
 async function snapshot(page) {
   return page.evaluate(() => JSON.parse(JSON.stringify(globalThis.__retainedAuditRpc)))
@@ -74,7 +71,8 @@ async function ready(page) {
 }
 async function launch(name) {
   await assertPreservedInputs(plan)
-  await noExistingDesktop()
+  await noExistingDesktop(name)
+  await stage(`${name}-desktop-launch`)
   const env = environmentWithoutProviderSecrets(process.env)
   for (const key of Object.keys(env)) {
     if (/^OPENSQUILLA_/i.test(key) || /^ELECTRON_RUN_AS_NODE$/i.test(key)) delete env[key]
@@ -173,8 +171,8 @@ try {
   outputCreated = true
   Object.assign(report, { auditId: plan.auditId, sourceSha: plan.sourceSha, executableSha256: plan.executableSha256, credentialSha256: plan.credentialSha256, configSha256: plan.configSha256, markerSha256: plan.markerSha256 })
   report.probeSources = await Promise.all(['test-packaged-retained-interaction.mjs', 'fixtures/packaged-retained-interaction/contract.mjs', 'fixtures/packaged-retained-interaction/provider.mjs', 'fixtures/packaged-retained-interaction/browser-probe.mjs'].map(async file => ({ file, sha256: sha256(await readFile(join(scriptDir, file))) })))
+  await noExistingDesktop('retained-profile')
   await stage('preservation-before')
-  await noExistingDesktop()
   await preserved('before')
   const messages = auditMessages(plan.auditId)
   const sentinelToken = `OPENSQUILLA_RETAINED_${randomBytes(32).toString('hex')}`
@@ -242,7 +240,7 @@ try {
   await persist()
   console.log(JSON.stringify({ ok: true, report: join(plan.outputDir, 'report.json') }))
 } catch (error) {
-  Object.assign(report, { ok: false, status: 'failed', error: error.message, failedAt: new Date().toISOString(), provider: provider?.snapshot(), activeProcess: active?.identity })
+  Object.assign(report, { ok: false, status: 'failed', error: error.message, errorCode: error.code, errorSignal: error.signal, errorKilled: error.killed, failedAt: new Date().toISOString(), provider: provider?.snapshot(), activeProcess: active?.identity })
   if (active?.page) {
     try { await screenshot(active.page, 'failure') } catch { /* Keep the primary failure. */ }
   }
