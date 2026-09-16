@@ -63,6 +63,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Restored V1 installation/version reporting and daily conversation/token
+  aggregation and uploads alongside V2 telemetry. Uploads start after Gateway
+  readiness, retain existing deduplication state, and honor reporting opt-outs.
+  V2 events and the retired provider install-ID header are unchanged.
 - Default Gateway, CLI, decision, trace and safety logs no longer retain
   prompt/conversation previews, tool output or exception payloads. Gateway
   operational logs keep their level prefix and use JSON metadata with event
