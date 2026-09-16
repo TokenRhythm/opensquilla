@@ -1524,6 +1524,8 @@
       "tokenLabel": "Jeton",
       "optional": "facultatif",
       "tokenDesc": "Jeton Bearer pour les passerelles qui requièrent une authentification. Stocké dans cet onglet uniquement.",
+      "tokenRequired": "Jeton requis",
+      "reasonTokenRequired": "Échec de l’authentification. Les tentatives automatiques sont suspendues. Saisissez un jeton de passerelle valide, puis choisissez Connecter.",
       "reconnect": "Reconnecter",
       "connect": "Connecter",
       "disconnect": "Déconnecter"

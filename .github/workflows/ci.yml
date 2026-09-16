@@ -787,8 +787,12 @@ jobs:
         run: >-
           npm run test:e2e --
           assistant-activity.spec.ts
+          auth-connection-recovery.spec.ts
+          chat-send-lifecycle.spec.ts
+          chat-send-lifecycle.real.spec.ts
           composer-paste.spec.ts
           history-hydration.spec.ts
+          idle-chat-recovery.spec.ts
           provider-error-experience.spec.ts
           user-message-newlines.spec.ts
           session-created-card.spec.ts
@@ -1731,10 +1735,14 @@ jobs:
             else
               unset OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND
             fi
+            local case_args=()
+            if [[ "${name}" == "window-background-flow" && "${RUNNER_OS}" == "macOS" ]]; then
+              case_args=(--connection-faults --flow-control --idle-send --background-ms=65000)
+            fi
             if [[ "${RUNNER_OS}" == "Linux" ]]; then
-              "${telemetry[@]}" xvfb-run -a node "${script}" 2>&1 | tee "${log_path}"
+              "${telemetry[@]}" xvfb-run -a node "${script}" "${case_args[@]}" 2>&1 | tee "${log_path}"
             else
-              "${telemetry[@]}" node "${script}" 2>&1 | tee "${log_path}"
+              "${telemetry[@]}" node "${script}" "${case_args[@]}" 2>&1 | tee "${log_path}"
             fi
           }
 

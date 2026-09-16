@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 
@@ -17,9 +17,16 @@ const gatewayAccess = injectedGatewayAccess
 
 const wsUrl = ref('')
 const wsToken = ref('')
+const tokenInput = ref<HTMLInputElement | null>(null)
+const requiresCredential = computed(() => !props.managed && gatewayAccess.requiresCredential)
+
+watch(requiresCredential, required => {
+  if (required) tokenInput.value?.focus()
+}, { flush: 'post' })
 
 onMounted(() => {
   if (!props.managed) wsUrl.value = gatewayAccess.loadConnectionEndpoint()
+  if (requiresCredential.value) tokenInput.value?.focus()
 })
 
 const statusState = computed(() => {
@@ -35,12 +42,14 @@ const statusPillClass = computed(() => {
 })
 
 const statusLabel = computed(() => {
+  if (requiresCredential.value) return t('setup.connection.tokenRequired')
   if (statusState.value === 'connected') return t('setup.connection.connected')
   if (statusState.value === 'connecting') return t('setup.connection.connecting')
   return t('setup.connection.disconnected')
 })
 
 const statusReason = computed(() => {
+  if (requiresCredential.value) return t('setup.connection.reasonTokenRequired')
   if (gatewayAccess.connectionError) {
     return t('setup.connection.reasonFailed', { error: gatewayAccess.connectionError })
   }
@@ -92,17 +101,20 @@ function disconnect() {
 
     <div v-if="!managed" class="control-row control-row--stack">
       <div class="control-row__label-block">
-        <label class="control-row__label" for="conn-ws-token">{{ t('setup.connection.tokenLabel') }} <span class="conn-optional">{{ t('setup.connection.optional') }}</span></label>
+        <label class="control-row__label" for="conn-ws-token">{{ t('setup.connection.tokenLabel') }} <span v-if="!requiresCredential" class="conn-optional">{{ t('setup.connection.optional') }}</span></label>
         <span class="control-row__desc">{{ t('setup.connection.tokenDesc') }}</span>
       </div>
       <div class="control-row__control">
         <input
           id="conn-ws-token"
+          ref="tokenInput"
           v-model="wsToken"
+          :data-settings-initial-focus="requiresCredential ? '' : undefined"
           class="control-input"
           type="password"
           placeholder="&mdash;"
           autocomplete="off"
+          @keydown.enter.prevent="connect"
         >
       </div>
     </div>

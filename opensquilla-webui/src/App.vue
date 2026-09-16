@@ -631,9 +631,9 @@ const effectiveConnectionState = computed(() => effectiveChatConnectionState(
   appStore.chatLivePhase,
   isChatRoute.value,
 ))
-const connectionStateLabel = computed(() => t(
-  `chrome.connectionState.${effectiveConnectionState.value}`,
-))
+const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewayAccess.requiresCredential
+  ? t('setup.connection.tokenRequired')
+  : t(`chrome.connectionState.${effectiveConnectionState.value}`))
 const router = useRouter()
 
 // afterEach only fires on navigation, so a same-route language switch needs an

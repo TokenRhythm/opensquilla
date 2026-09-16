@@ -2176,10 +2176,14 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     }
     required_specs = {
         "assistant-activity.spec.ts",
+        "auth-connection-recovery.spec.ts",
+        "chat-send-lifecycle.spec.ts",
+        "chat-send-lifecycle.real.spec.ts",
         "composer-paste.spec.ts",
         "ensemble-new-task-legacy-turn.spec.ts",
         "goal-mode.spec.ts",
         "history-hydration.spec.ts",
+        "idle-chat-recovery.spec.ts",
         "new-task-ensemble-race.spec.ts",
         "plan-questionnaire-lifecycle.spec.ts",
         "provider-error-experience.spec.ts",

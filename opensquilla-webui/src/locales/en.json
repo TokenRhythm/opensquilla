@@ -1607,6 +1607,8 @@
       "tokenLabel": "Token",
       "optional": "optional",
       "tokenDesc": "Bearer token for gateways that require auth. Stored in this tab only.",
+      "tokenRequired": "Token required",
+      "reasonTokenRequired": "Authentication failed. Automatic retries are paused. Enter a valid gateway token and choose Connect.",
       "reconnect": "Reconnect",
       "connect": "Connect",
       "disconnect": "Disconnect"

@@ -97,4 +97,24 @@ describe('createV4GatewayAccess', () => {
     expect(access.runModePolicy).toBeNull()
     expect(access.streamIdleTimeoutMs).toBeNull()
   })
+
+  it.each(['authentication_failed', 'authentication_mismatch'])(
+    'makes an explicit credential rejection actionable: %s', error => {
+      const raw = source()
+      raw.error = error
+      expect(createV4GatewayAccess(raw).requiresCredential).toBe(true)
+    },
+  )
+
+  it('does not request credentials for guests, scope denials, or transport policy failures', () => {
+    const raw = source()
+    const access = createV4GatewayAccess(raw)
+    raw.state = 'connected'
+    raw.auth = { principal: { authState: 'guest', authenticated: false } }
+    expect(access.requiresCredential).toBe(false)
+    for (const error of ['UNAUTHORIZED', '1008', 'protocol_rejected', 'Connection closed']) {
+      raw.error = error
+      expect(access.requiresCredential).toBe(false)
+    }
+  })
 })

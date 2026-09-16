@@ -21,10 +21,12 @@ afterEach(() => {
 async function mountPanel(options: {
   managed?: boolean
   availability?: GatewayAvailability
+  requiresCredential?: boolean
 } = {}) {
   const gatewayAccess = reactive({
     availability: options.availability ?? 'unavailable',
     connectionError: null as string | null,
+    requiresCredential: options.requiresCredential ?? false,
     isAvailable: options.availability === 'available',
     isLocalOwner: false,
     isAuthenticated: false,
@@ -135,5 +137,50 @@ describe('SetupConnectionPanel', () => {
         error: 'Runtime descriptor unavailable',
       }))
     expect(gatewayAccess.disconnect).not.toHaveBeenCalled()
+  })
+
+  it('focuses credential recovery on entry and submits without a preliminary disconnect', async () => {
+    const { el, gatewayAccess } = await mountPanel({ requiresCredential: true })
+    const credential = el.querySelector<HTMLInputElement>('#conn-ws-token')!
+    expect(el.querySelector('.conn-status__pill')?.textContent).toBe('Token required')
+    expect(el.textContent).toContain('Automatic retries are paused')
+    expect(document.activeElement).toBe(credential)
+    expect(el.querySelector('.conn-optional')).toBeNull()
+
+    credential.value = '  synthetic-replacement-token  '
+    credential.dispatchEvent(new Event('input'))
+    credential.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    await nextTick()
+    expect(gatewayAccess.connect).toHaveBeenCalledExactlyOnceWith({
+      endpoint: 'ws://saved-gateway.example/ws',
+      credential: 'synthetic-replacement-token',
+    })
+    expect(gatewayAccess.disconnect).not.toHaveBeenCalled()
+  })
+
+  it('keeps a partially entered token and focus stable while showing a failed attempt', async () => {
+    const { el, gatewayAccess } = await mountPanel()
+    const credential = el.querySelector<HTMLInputElement>('#conn-ws-token')!
+    credential.value = 'synthetic-partial-token'
+    credential.dispatchEvent(new Event('input'))
+    gatewayAccess.requiresCredential = true
+    await nextTick()
+    expect(document.activeElement).toBe(credential)
+
+    const endpoint = el.querySelector<HTMLInputElement>('#conn-ws-url')!
+    endpoint.focus()
+    gatewayAccess.connectionError = 'authentication_mismatch'
+    await nextTick()
+    expect(document.activeElement).toBe(endpoint)
+    expect(credential.value).toBe('synthetic-partial-token')
+    expect(gatewayAccess.connect).not.toHaveBeenCalled()
+    expect(gatewayAccess.disconnect).not.toHaveBeenCalled()
+  })
+
+  it('keeps Desktop credential recovery under the managed runtime controls', async () => {
+    const { el } = await mountPanel({ managed: true, requiresCredential: true })
+    expect(el.querySelectorAll('input')).toHaveLength(0)
+    expect(el.textContent).not.toContain('Token required')
+    expect(el.textContent).not.toContain('Automatic retries are paused')
   })
 })

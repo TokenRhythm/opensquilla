@@ -1524,6 +1524,8 @@
       "tokenLabel": "Token",
       "optional": "optional",
       "tokenDesc": "Bearer-Token für Gateways, die eine Authentifizierung erfordern. Wird nur in diesem Tab gespeichert.",
+      "tokenRequired": "Token erforderlich",
+      "reasonTokenRequired": "Authentifizierung fehlgeschlagen. Automatische Versuche sind pausiert. Geben Sie ein gültiges Gateway-Token ein und wählen Sie Verbinden.",
       "reconnect": "Erneut verbinden",
       "connect": "Verbinden",
       "disconnect": "Trennen"

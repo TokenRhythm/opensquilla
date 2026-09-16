@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -8,7 +9,9 @@ import { _electron as electron } from 'playwright'
 import {
   canAcceptWindowsElectronShutdownFallback,
   closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
+  trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -17,6 +20,12 @@ const repoRoot = resolve(packageRoot, '../..')
 const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 const flowControl = process.argv.includes('--flow-control')
 const connectionFaults = process.argv.includes('--connection-faults')
+const idleSend = process.argv.includes('--idle-send')
+const backgroundOption = process.argv.find(value => value.startsWith('--background-ms='))
+const backgroundMs = backgroundOption ? Number(backgroundOption.split('=')[1]) : 65_000
+if (!Number.isInteger(backgroundMs) || backgroundMs < 5_000 || backgroundMs > 600_000) {
+  throw new Error('background-ms must be an integer between 5000 and 600000')
+}
 const outageOption = process.argv.find(value => value.startsWith('--outage-ms='))
 const outageMs = outageOption ? Number(outageOption.split('=')[1]) : 5_000
 if (!Number.isInteger(outageMs) || outageMs < 5_000 || outageMs > 600_000) {
@@ -71,8 +80,54 @@ let negotiatedFlow = false
 let warmRecoveryMs = null
 let continuityPage
 let continuityDiagnostics = null
+let syntheticProvider
+let acceptedIdleSends = 0
+let sentIdleMessages = 0
+let idleSendReceipt = null
+let hiddenIdleMs = null
+let idleRecoveryMs = null
+const idleSendIds = new Set()
 const routedClients = new Set()
 const routedServers = new WeakMap()
+
+async function startSyntheticProvider() {
+  let chatRequests = 0
+  const server = createServer((request, response) => {
+    request.resume()
+    request.once('end', () => {
+      if (request.method !== 'POST' || request.url !== '/api/chat') {
+        response.writeHead(404)
+        response.end()
+        return
+      }
+      chatRequests++
+      response.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      response.end(JSON.stringify({
+        model: 'opensquilla-window-close-test-model',
+        created_at: '2026-01-01T00:00:00Z',
+        message: { role: 'assistant', content: 'Synthetic background recovery complete.' },
+        done: true,
+        done_reason: 'stop',
+        prompt_eval_count: 8,
+        eval_count: 3,
+      }) + '\n')
+    })
+  })
+  const sockets = trackHttpServerConnections(server)
+  await new Promise((resolveListen, rejectListen) => {
+    server.once('error', rejectListen)
+    server.listen(0, '127.0.0.1', resolveListen)
+  })
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    chatRequests: () => chatRequests,
+    close: () => closeHttpServerWithDeadline(server, sockets, {
+      label: 'background-flow synthetic provider shutdown',
+    }),
+  }
+}
 
 // Observe only lifecycle/element categories, never text, values, URLs or keys.
 // The ring is bounded and records transitions, not every DOM mutation/poll.
@@ -170,6 +225,7 @@ try {
   await mkdir(isolatedHome, { recursive: true })
   await mkdir(isolatedRoaming, { recursive: true })
   await mkdir(isolatedLocal, { recursive: true })
+  if (idleSend) syntheticProvider = await startSyntheticProvider()
 
   // Use a synthetic keyless profile so the lifecycle test reaches the Control
   // UI without reading developer credentials or requiring an external model.
@@ -177,7 +233,7 @@ try {
   await writeFile(join(userDataDir, 'desktop-credential.json'), JSON.stringify({
     provider: 'ollama',
     model: 'opensquilla-window-close-test-model',
-    baseUrl: 'http://127.0.0.1:11434',
+    baseUrl: syntheticProvider?.baseUrl || 'http://127.0.0.1:11434',
     apiKeyEnv: '',
     encryptedApiKey: '',
     modelRoutingMode: 'direct',
@@ -188,7 +244,7 @@ try {
     searchApiKeyEnv: '',
     encryptedSearchApiKey: '',
     encryption: 'plain',
-    disableNetworkObservability: false,
+    disableNetworkObservability: idleSend,
     createdAt: now,
     updatedAt: now,
   }, null, 2), { mode: 0o600 })
@@ -213,6 +269,13 @@ try {
       OPENSQUILLA_AUTH_MODE: 'token',
       OPENSQUILLA_AUTH_TOKEN: 'synthetic-window-flow-operator-token',
       OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED: flowControl ? 'true' : 'false',
+      ...(idleSend ? {
+        // Match the synthetic first-send gate's model budget so bundled tool
+        // schemas do not exhaust Ollama's small fallback context before HTTP.
+        OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS: '131072',
+        NO_PROXY: '127.0.0.1,localhost,::1',
+        no_proxy: '127.0.0.1,localhost,::1',
+      } : {}),
     },
   })
 
@@ -241,10 +304,25 @@ try {
         routedClients.delete(client)
         void client.close({ code, reason })
       })
+      client.onMessage(message => {
+        try {
+          const frame = JSON.parse(String(message))
+          if (frame.type === 'req' && frame.method === 'chat.send') {
+            sentIdleMessages++
+            idleSendIds.add(frame.id)
+          }
+        } catch { /* Non-JSON frames remain transparent. */ }
+        server.send(message)
+      })
       server.onMessage(message => {
         try {
           const frame = JSON.parse(String(message))
           if (frame?.policy?.transport_flow?.delivery_epoch) negotiatedFlow = true
+          if (frame?.type === 'res' && idleSendIds.has(frame.id)) {
+            idleSendIds.delete(frame.id)
+            idleSendReceipt = { ok: frame.ok, accepted: frame.payload?.accepted }
+            if (frame.ok === true && frame.payload?.accepted === true) acceptedIdleSends++
+          }
         } catch { /* Non-JSON frames remain transparent. */ }
         client.send(message)
       })
@@ -269,7 +347,7 @@ try {
   )
   // Fixture setup only: install interception before the measured connection.
   // No reload, refresh or navigation is permitted during fault recovery.
-  if (connectionFaults) {
+  if (connectionFaults || idleSend) {
     await installFaultRoute()
     await page.reload({ waitUntil: 'domcontentloaded' })
   }
@@ -290,7 +368,7 @@ try {
   // the developer's computer. The signal must preserve the live renderer.
   const composer = page.locator('.chat-textarea').first()
   await composer.waitFor({ state: 'visible', timeout: 60_000 })
-  const draft = 'isolated stability draft - never send'
+  const draft = idleSend ? 'Synthetic background recovery request.' : 'isolated stability draft - never send'
   await composer.fill(draft)
   await composer.focus()
   const resumeUrl = page.url()
@@ -358,6 +436,7 @@ try {
 
   const backgroundSupported = runtimeIsolation.platform === 'darwin'
     || runtimeIsolation.platform === 'win32'
+  assert.ok(!idleSend || backgroundSupported, 'idle-send requires native background-window support')
   assert.equal(preferences.canRunInBackground, backgroundSupported)
   assert.equal(
     preferences.mainWindowCloseBehavior,
@@ -413,6 +492,24 @@ try {
     )
     assert.equal(page.isClosed(), false)
 
+    if (idleSend) {
+      // Exercise real native hide/activate and an interrupted transport. This
+      // deliberately does not claim to suspend the physical host computer.
+      outage = true
+      for (const client of [...routedClients]) {
+        routedClients.delete(client)
+        await client.close({ code: 1013, reason: 'Synthetic hidden-window interruption' })
+        await routedServers.get(client)?.close({ code: 1013, reason: 'Synthetic hidden-window interruption' })
+      }
+      const hiddenStarted = Date.now()
+      console.log(JSON.stringify({ event: 'desktop_idle_send_phase', phase: 'hidden', backgroundMs }))
+      await delay(backgroundMs)
+      hiddenIdleMs = Date.now() - hiddenStarted
+      assert.equal(await composer.inputValue(), draft, 'hidden idle must retain the draft')
+      outage = false
+    }
+
+    const revealStarted = Date.now()
     await desktopApp.evaluate(({ app }) => {
       app.emit('activate')
     })
@@ -435,6 +532,23 @@ try {
       marker,
       'revealing a hidden desktop window must preserve renderer state',
     )
+
+    if (idleSend) {
+      const sendButton = page.locator('.chat-send-btn.btn--primary')
+      await waitFor(async () => !await sendButton.isDisabled(), 'send after native background return', 30_000)
+      idleRecoveryMs = Date.now() - revealStarted
+      assert.equal(await composer.inputValue(), draft, 'native return must retain the unsent draft')
+      assert.equal(await page.evaluate(() => window.__stabilityComposer === document.querySelector('.chat-textarea')), true)
+      await sendButton.click()
+      await waitFor(() => idleSendReceipt, 'real Gateway background-return admission')
+      assert.deepEqual(idleSendReceipt, { ok: true, accepted: true }, 'real Gateway must admit the send')
+      await waitFor(async () => (
+        await page.locator('.msg-ai-text').last().textContent({ timeout: 1_000 })
+      )?.includes('Synthetic background recovery complete.'), 'synthetic provider response')
+      assert.equal(sentIdleMessages, 1, 'background return must submit the draft exactly once')
+      assert.equal(syntheticProvider.chatRequests(), 1, 'accepted send must reach the local provider once')
+      assert.equal(await composer.inputValue(), '', 'accepted send must clear the draft')
+    }
 
     await desktopApp.evaluate(({ app, BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows().find((candidate) => (
@@ -586,6 +700,12 @@ try {
       reconnectAttempts,
       warmRecoveryMs,
       continuityDiagnostics,
+      idleSend,
+      backgroundMs: idleSend ? backgroundMs : null,
+      hiddenIdleMs,
+      idleRecoveryMs,
+      acceptedIdleSends,
+      syntheticProviderRequests: syntheticProvider?.chatRequests() ?? null,
     }, null, 2))
   }
   flowSucceeded = true
@@ -610,6 +730,9 @@ try {
     routedConnectionCount: routedClients.size,
     acceptedSockets,
     negotiatedFlow,
+    sentIdleMessages,
+    idleSendReceipt,
+    syntheticProviderRequests: syntheticProvider?.chatRequests() ?? null,
     continuityDiagnostics,
     windows,
     desktopLog,
@@ -755,5 +878,6 @@ try {
   } else {
     await rm(isolationRoot, { recursive: true, force: true }).catch(() => {})
   }
+  await syntheticProvider?.close()
   if (flowSucceeded && shutdownError) throw shutdownError
 }
