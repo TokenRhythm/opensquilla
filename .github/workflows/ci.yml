@@ -24,6 +24,44 @@ env:
   OPENSQUILLA_TESTING: "true"
 
 jobs:
+  dependency-audit:
+    name: Fresh dependency security audit
+    # Advisory databases change even when the source tree does not. This job
+    # deliberately has no planner/attestation dependency or path filter.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.15"
+      - name: Install pinned npm audit tool
+        run: npm install --global npm@11.12.1 --ignore-scripts
+      - name: Audit all locked dependency variants
+        run: python .github/scripts/audit_dependencies.py --repo . --output-dir "${RUNNER_TEMP}/dependency-audit"
+      - name: Exercise WeasyPrint presentational hints security regression
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libpango-1.0-0 libpangoft2-1.0-0
+          uv run --locked --extra dev --extra document-extras python -c 'import weasyprint'
+          uv run --no-sync pytest tests/test_security/test_weasyprint_presentational_hints.py -q
+      - name: Preserve dependency security evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dependency-audit/
+          if-no-files-found: error
+          retention-days: 30
+
   queue-attestation:
     name: Verify reusable PR CI evidence
     if: ${{ github.event_name == 'merge_group' }}
@@ -2326,6 +2364,7 @@ jobs:
   ci-result:
     name: CI result
     needs:
+      - dependency-audit
       - queue-attestation
       - plan-ci
       - workflow-lint
@@ -2358,6 +2397,16 @@ jobs:
         run: |
           echo "ERROR: cancelled workflow cannot satisfy required CI checks." >&2
           exit 1
+
+      - name: Require fresh dependency security evidence
+        env:
+          RESULT_DEPENDENCY_AUDIT: ${{ needs.dependency-audit.result }}
+        shell: bash
+        run: |
+          if [[ "${RESULT_DEPENDENCY_AUDIT}" != "success" ]]; then
+            echo "ERROR: fresh dependency security audit must succeed; got ${RESULT_DEPENDENCY_AUDIT:-missing}." >&2
+            exit 1
+          fi
 
       - name: Accept verified queue or main fast path
         if: >-
@@ -2422,6 +2471,7 @@ jobs:
                 || (github.event_name == 'push'
                     && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
         env:
+          RESULT_DEPENDENCY_AUDIT: ${{ needs.dependency-audit.result }}
           RESULT_PLANNER: ${{ needs.plan-ci.result }}
           RESULT_WORKFLOW_LINT: ${{ needs.workflow-lint.result }}
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}

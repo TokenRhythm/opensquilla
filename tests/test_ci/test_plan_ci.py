@@ -68,7 +68,7 @@ def test_docs_only_plan_is_small_and_canonical(
 ) -> None:
     plan = _plan(tmp_path, suite_config, "docs/architecture.md", "docs/ci.md")
 
-    assert plan["required_suites"] == ["readme-locale", "workflow-lint"]
+    assert plan["required_suites"] == ["dependency-audit", "readme-locale", "workflow-lint"]
     assert plan["desktop_matrix"] == []
     assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
     assert _platform_cells(plan, "readme-locale") == {
@@ -98,6 +98,7 @@ def test_root_readmes_select_release_packaging_contract(
     plan = _plan(tmp_path, suite_config, path)
 
     assert plan["required_suites"] == [
+        "dependency-audit",
         "readme-locale",
         "release-packaging",
         "workflow-lint",
@@ -168,6 +169,7 @@ def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
     }
     assert plan["desktop_matrix"] == []
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "macos-recovery",
         "python-targeted",
         "readme-locale",
@@ -1193,6 +1195,7 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
 
     assert plan["full_fallback"] is False
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "desktop-recovery-e2e",
         "frontend-artifact",
         "frontend-validation",
@@ -1247,6 +1250,7 @@ def test_webui_dependency_changes_stay_in_webui_ecosystem(
 
     assert plan["full_fallback"] is False
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "frontend-artifact",
         "frontend-validation",
         "readme-locale",
@@ -1273,6 +1277,7 @@ def test_electron_dependency_changes_select_full_desktop_matrix_only(
 
     assert plan["full_fallback"] is False
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "desktop-recovery-e2e",
         "desktop-static",
         "frontend-artifact",
@@ -1302,6 +1307,7 @@ def test_tui_dependency_changes_add_ubuntu_host_companion_contract(
 
     assert plan["full_fallback"] is False
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "python-targeted",
         "readme-locale",
         "tui",

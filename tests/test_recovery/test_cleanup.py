@@ -87,16 +87,22 @@ def _hold_profile_lock(home: str, state_root: str, ready, release) -> None:
 
 
 def _hold_gateway(home: str, ready, release) -> None:
-    from opensquilla.gateway.pidlock import GatewayPidLock
+    from opensquilla.recovery.locking import (
+        acquire_gateway_legacy_lease,
+        release_gateway_legacy_lease,
+    )
 
+    # Cleanup checks the OS lock authority, not gateway.pid metadata. Use the
+    # same lease as GatewayPidLock without importing the entire Gateway app in
+    # this Windows spawn child before it can signal readiness.
     state = Path(home) / "state"
-    lock = GatewayPidLock(state)
-    lock.acquire()
+    lease = acquire_gateway_legacy_lease(state)
+    assert lease is not None
     try:
         ready.set()
         release.wait(10)
     finally:
-        lock.release()
+        release_gateway_legacy_lease(lease)
 
 
 def _hold_recreated_legacy_gateway(home: str, ready, release) -> None:
@@ -824,6 +830,42 @@ def test_cleanup_releases_legacy_handles_before_deleting_profile_tombstone(
     assert observed_tombstone_delete is True
     assert captured_locks
     assert not primary.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows MAX_PATH regression")
+def test_cleanup_removes_backup_when_quarantine_pushes_child_past_max_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.paths import native_io_path
+
+    user_data = tmp_path / "user-data"
+    _desktop_primary(user_data)
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "lock-state"))
+    backup = user_data / "backups"
+    nested = backup / "profile-consolidation" / "synthetic-transaction"
+    nested.mkdir(parents=True)
+    # The original file fits MAX_PATH; the transaction's quarantine prefix
+    # pushes it past that boundary before recursive removal.
+    filename = "x" * (245 - len(str(nested)) - len("/.txt")) + ".txt"
+    marker = nested / filename
+    assert len(str(marker)) == 245
+    native_io_path(marker).write_text("synthetic backup\n", encoding="utf-8")
+    outside = tmp_path / "unrelated.txt"
+    outside.write_text("keep\n", encoding="utf-8")
+
+    inspected = cleanup_inspect(user_data, mode="delete-all-user-data", profile_kind="primary")
+    assert inspected.outcome == "ready", inspected.stable_code
+    result = cleanup_apply(
+        user_data, mode="delete-all-user-data", profile_kind="primary",
+        transaction_id=inspected.transaction_id, expected_revision=inspected.revision,
+        confirm_user_data=user_data,
+    )
+
+    assert result.outcome == "complete", result.stable_code
+    assert not backup.exists()
+    assert not list(user_data.glob(".*.cleanup.*"))
+    assert outside.read_text(encoding="utf-8") == "keep\n"
 
 
 def test_cleanup_rolls_back_directory_swapped_at_no_replace_boundary(

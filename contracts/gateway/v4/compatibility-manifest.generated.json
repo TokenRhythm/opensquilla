@@ -842,7 +842,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.draft.probe",
       "schema": "platform/onboarding-llm-profile-draft-probe.schema.json",
-      "schemaSha256": "b87c847bb7a4116bad627baafb3d17b205d59bc46b6cceaf2cafcfee1e0e4e06"
+      "schemaSha256": "e02caab5c5cc592ba57b0f2205912f9400b1d0eb31c322ceef7a72ab4350c51f"
     },
     {
       "lifecycle": "stable",
@@ -854,7 +854,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.probe",
       "schema": "platform/onboarding-llm-profile-probe.schema.json",
-      "schemaSha256": "1d906e26d4631a43464c148552c8372555b91c6a51b8ddeb233db083c9c3a6f0"
+      "schemaSha256": "8e552abda066add5f5275b42a313746f80c7757d1f345d22762b039f6b8b007b"
     },
     {
       "lifecycle": "stable",
@@ -908,7 +908,7 @@
       "lifecycle": "stable",
       "name": "onboarding.provider.probe",
       "schema": "platform/onboarding-provider-probe.schema.json",
-      "schemaSha256": "4bba8e8fbca95f2c8343a94dde1000b1b9724d447992d7b391317ca0469e565e"
+      "schemaSha256": "ffa4d9b4a0f662c2660de521b9bc7c27f9373c762c8cd4eafb2127b872c54e66"
     },
     {
       "lifecycle": "stable",
@@ -1466,7 +1466,7 @@
     "generatorSha256": "f781c6d8e31b336c2d2e342784935b3d327c9947cb35e56de8e44a0a83bffae6",
     "methodCount": 215,
     "schemaCount": 225,
-    "schemaTreeSha256": "7fc7e6e297c58a2ecb2ade6b0b51b8a474af806242facb04beba313a0a0a2ff3"
+    "schemaTreeSha256": "ecef928334e2ed47be4fee8de109d2de74ab2cbc22d26e8691d47e6754cdbc7e"
   },
   "wireVersion": 4
 }

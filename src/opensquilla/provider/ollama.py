@@ -23,6 +23,7 @@ from .error_redaction import (
     redacted_httpx_error,
 )
 from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .protocol import ProviderModelListingResponseError
 from .request_proof import (
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
@@ -787,6 +788,7 @@ class OllamaProvider:
         so callers that must distinguish an unreachable/secured host from an
         empty catalog (e.g. onboarding discovery) can classify it.
         """
+        resp: httpx.Response | None = None
         try:
             async with httpx.AsyncClient(
                 timeout=5.0,
@@ -799,6 +801,10 @@ class OllamaProvider:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                if not isinstance(data, dict) or not isinstance(
+                    data.get("models", []), list
+                ):
+                    raise TypeError("Provider model catalog had an unexpected shape")
                 return [
                     ModelInfo(
                         provider=self.provider_id,
@@ -814,5 +820,10 @@ class OllamaProvider:
             return []
         except Exception:
             if raise_on_error:
+                if resp is not None:
+                    raise ProviderModelListingResponseError(
+                        "Provider model catalog response could not be parsed",
+                        status_code=resp.status_code,
+                    ) from None
                 raise
             return []

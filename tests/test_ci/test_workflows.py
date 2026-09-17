@@ -169,6 +169,99 @@ def test_partial_queue_wiring_preserves_canary_gate_and_does_not_mint_root_evide
     )["if"]
 
 
+def test_dependency_audit_runs_outside_planner_and_reuse_on_every_ci_trigger() -> None:
+    workflow = _workflow("ci.yml")
+    assert _trigger_keys(workflow) == {
+        "pull_request", "merge_group", "push", "schedule", "workflow_dispatch",
+    }
+    jobs = workflow["jobs"]
+    audit = jobs["dependency-audit"]
+    assert "if" not in audit and "needs" not in audit
+    assert "continue-on-error" not in audit
+    steps = jobs["ci-result"]["steps"]
+    cancelled, fresh = steps[:2]
+    assert cancelled["name"] == "Reject cancelled workflow"
+    assert cancelled["if"] == "${{ cancelled() }}"
+    assert fresh["name"] == "Require fresh dependency security evidence"
+    # The unconditional job reaches this gate on every live event; cancellation
+    # already fails the preceding guard and must not bypass its success() guard.
+    assert "if" not in fresh and not fresh.get("continue-on-error")
+    assert "dependency-audit" in jobs["ci-result"]["needs"]
+    assert fresh["env"] == {"RESULT_DEPENDENCY_AUDIT": "${{ needs.dependency-audit.result }}"}
+    for step in steps[2:]:
+        if step.get("id") == "attestation":
+            assert "always()" not in step["if"]
+    raw_policy = Path(".github/ci/dependency-audit.v1.json").read_text(encoding="utf-8")
+    policy = json.loads(raw_policy)
+    uv_step = next(
+        step for step in audit["steps"]
+        if step.get("uses", "").startswith("astral-sh/setup-uv@")
+    )
+    assert uv_step["with"]["version"] == policy["uv_version"]
+    npm_step = next(
+        step for step in audit["steps"] if step.get("name") == "Install pinned npm audit tool"
+    )
+    assert f"npm@{policy['npm_version']}" in npm_step["run"]
+    upload = next(
+        step for step in audit["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert upload["if"] == "always()"
+    assert upload["with"]["if-no-files-found"] == "error"
+    regression = next(
+        step for step in audit["steps"]
+        if step.get("name") == "Exercise WeasyPrint presentational hints security regression"
+    )
+    assert "if" not in regression and "continue-on-error" not in regression
+    assert "libpango-1.0-0 libpangoft2-1.0-0" in regression["run"]
+    assert "uv run --locked --extra dev --extra document-extras python -c 'import weasyprint'" in (
+        regression["run"]
+    )
+    regression_command = (
+        "uv run --no-sync pytest tests/test_security/test_weasyprint_presentational_hints.py -q"
+    )
+    assert regression_command in regression["run"]
+
+
+@pytest.mark.parametrize(
+    "event", ["pull_request", "merge_group", "push", "schedule", "workflow_dispatch"],
+)
+@pytest.mark.parametrize("result", ["success", "failure", "cancelled", "skipped", ""])
+def test_fresh_dependency_gate_cannot_be_bypassed_by_queue_or_main_fast_path(
+    event: str, result: str,
+) -> None:
+    gate = next(
+        step for step in _workflow("ci.yml")["jobs"]["ci-result"]["steps"]
+        if step.get("name") == "Require fresh dependency security evidence"
+    )
+    completed = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", gate["run"]],
+        env={**os.environ, "GITHUB_EVENT_NAME": event, "RESULT_DEPENDENCY_AUDIT": result,
+             "QUEUE_RESULT": "success", "QUEUE_REUSABLE": "true", "MAIN_CANARY_RESULT": "success"},
+        text=True, capture_output=True, check=False,
+    )
+    assert completed.returncode == (0 if result == "success" else 1)
+
+
+def test_dependabot_keeps_major_version_updates_separate_from_weekly_compatible_groups() -> None:
+    config = yaml.safe_load(Path(".github/dependabot.yml").read_text(encoding="utf-8"))
+    assert config["version"] == 2
+    assert {(item["package-ecosystem"], item["directory"]) for item in config["updates"]} == {
+        ("uv", "/"), ("npm", "/opensquilla-webui"), ("npm", "/desktop/electron"),
+    }
+    for item in config["updates"]:
+        assert item["schedule"] == {"interval": "weekly"}
+        assert "ignore" not in item
+        assert "target-branch" not in item
+        groups = item["groups"]
+        assert groups["compatible-updates"] == {
+            "applies-to": "version-updates", "patterns": ["*"], "update-types": ["minor", "patch"],
+        }
+        assert groups["security-updates"] == {
+            "applies-to": "security-updates", "patterns": ["*"], "update-types": ["minor", "patch"],
+        }
+
+
 @pytest.mark.parametrize("scenario", ["failure", "duplicate", "foreign", "bad-branch"])
 def test_queue_feedback_reports_metadata_without_executing_candidate_code(
     tmp_path: Path, scenario: str,
@@ -1520,6 +1613,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     setup_python = next(step for step in gate["steps"] if step.get("name") == "Set up Python")
     assert setup_python["with"]["python-version"] == "3.12"
     assert set(gate["needs"]) == {
+        "dependency-audit",
         "plan-ci",
         "workflow-lint",
         "readme-locale-check",
@@ -1562,6 +1656,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     assert gate_step["env"]["RESULT_SKILL_HUB"] == "${{ needs.skill-hub.result }}"
     assert not any(key.startswith("FLAG_") for key in gate_step["env"])
     assert set(gate_step["env"]) == {
+        "RESULT_DEPENDENCY_AUDIT",
         "QUEUE_PARTIAL",
         "QUEUE_EVIDENCE_RESULT",
         "QUEUE_REUSED_SUITES",

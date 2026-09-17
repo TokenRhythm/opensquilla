@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
+import opensquilla.gateway.websocket as websocket_module
 from opensquilla.gateway import rpc_sessions
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.event_bridge import EventBridge
@@ -19,8 +20,10 @@ from opensquilla.gateway.protocol import make_ok_res
 from opensquilla.gateway.rpc import get_dispatcher
 from opensquilla.gateway.session_streams import SessionStreamRegistry
 from opensquilla.gateway.websocket import (
+    _MAX_CANCELLABLE_REQUESTS_PER_CONNECTION,
     _MAX_DETACHED_REQUESTS_PER_CONNECTION,
     SubscriptionManager,
+    _should_detach_rpc_request,
     get_registry,
     handle_ws_connection,
 )
@@ -34,6 +37,22 @@ _CONNECT_FRAME = json.dumps(
         "params": {"minProtocol": 1, "role": "operator", "auth": {}},
     }
 )
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "onboarding.provider.probe",
+        "onboarding.llmProfile.probe",
+        "onboarding.llmProfile.draft.probe",
+    ],
+)
+def test_only_explicit_valid_probe_modes_are_detached(method: str) -> None:
+    assert _should_detach_rpc_request(method, {"mode": "reachability"}) is True
+    assert _should_detach_rpc_request(method, {"mode": "model"}) is True
+    assert _should_detach_rpc_request(method, {}) is False
+    assert _should_detach_rpc_request(method, {"mode": None}) is False
+    assert _should_detach_rpc_request(method, {"mode": ""}) is False
 
 
 class _HistoryDispatcher:
@@ -118,6 +137,29 @@ class _ConcurrentOptionalReadDispatcher:
     def release(self, *req_ids: str) -> None:
         for req_id in req_ids:
             self.release_request[req_id].set()
+
+
+class _CancellableProviderProbeDispatcher:
+    def __init__(self) -> None:
+        self.save_dispatched = asyncio.Event()
+
+    def list_methods(self) -> list[str]:
+        return ["onboarding.provider.probe", "onboarding.provider.configure"]
+
+    async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+        if method == "onboarding.provider.probe":
+            from opensquilla.onboarding.probe import probe_llm_provider
+
+            result = await probe_llm_provider(
+                provider_id="openai",
+                model="gpt-test",
+                api_key="synthetic-test-key",
+                mode=str(params["mode"]),
+                timeout=60.0,
+            )
+            return make_ok_res(req_id, result.to_payload())
+        self.save_dispatched.set()
+        return make_ok_res(req_id, {"saved": True})
 
 
 class _SessionHandoffDispatcher:
@@ -239,6 +281,502 @@ class _HistoryWebSocket:
     def has_response(self, req_id: str) -> bool:
         event = self._response_events.get(req_id)
         return event is not None and event.is_set()
+
+
+@pytest.mark.parametrize("writer_queue_enabled", [False, True])
+async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_save(
+    monkeypatch: Any,
+    writer_queue_enabled: bool,
+) -> None:
+    probe_started = asyncio.Event()
+    stream_close_started = asyncio.Event()
+    release_stream_close = asyncio.Event()
+    stream_closed = asyncio.Event()
+    observed: dict[str, bool] = {}
+
+    class _BlockingStream:
+        def __aiter__(self) -> _BlockingStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            probe_started.set()
+            await asyncio.Future()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            stream_close_started.set()
+            try:
+                await release_stream_close.wait()
+            finally:
+                stream_closed.set()
+
+    class _BlockingProvider:
+        provider_name = "openai"
+
+        def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            return _BlockingStream()
+
+        async def list_models(self, *, raise_on_error: bool = False) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.build_provider",
+        lambda *args, **kwargs: _BlockingProvider(),
+    )
+    dispatcher = _CancellableProviderProbeDispatcher()
+
+    async def wait_for_probe_before_cancel(frame: str) -> None:
+        decoded = json.loads(frame)
+        if decoded.get("type") == "cancel":
+            await asyncio.wait_for(probe_started.wait(), timeout=1)
+
+    async def finish_after_save(socket: _HistoryWebSocket) -> None:
+        await asyncio.wait_for(stream_close_started.wait(), timeout=1)
+        await socket.wait_for_response("save")
+        observed["save_finished_during_cleanup"] = not stream_closed.is_set()
+        release_stream_close.set()
+        await asyncio.wait_for(stream_closed.wait(), timeout=1)
+
+    ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "probe",
+                "method": "onboarding.provider.probe",
+                "params": {
+                    "providerId": "openai",
+                    "model": "gpt-test",
+                    "mode": "model",
+                },
+            }),
+            json.dumps({"type": "cancel", "id": "probe"}),
+            json.dumps({
+                "type": "req",
+                "id": "save",
+                "method": "onboarding.provider.configure",
+                "params": {"providerId": "openai", "model": "gpt-test"},
+            }),
+        ],
+        dispatcher,
+        before_frame=wait_for_probe_before_cancel,
+        after_frames=finish_after_save,
+    )
+
+    await asyncio.wait_for(
+        handle_ws_connection(
+            ws,
+            GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
+            dispatcher=dispatcher,
+        ),
+        timeout=2,
+    )
+
+    responses = {frame["id"]: frame for frame in ws.responses()}
+    assert "probe" not in responses
+    assert responses["save"]["payload"] == {"saved": True}
+    assert observed["save_finished_during_cleanup"] is True
+    assert stream_closed.is_set()
+    assert dispatcher.save_dispatched.is_set()
+    assert ws.hello()["policy"]["cancellable_request_methods"] == [
+        "onboarding.llmProfile.draft.probe",
+        "onboarding.llmProfile.probe",
+        "onboarding.provider.probe",
+    ]
+    assert ws.close_codes == []
+
+
+@pytest.mark.parametrize("writer_queue_enabled", [False, True])
+async def test_cancellable_provider_probes_respect_connection_limit(
+    writer_queue_enabled: bool,
+) -> None:
+    held_ids = tuple(
+        f"probe-{index}" for index in range(_MAX_CANCELLABLE_REQUESTS_PER_CONNECTION)
+    )
+    overflow_id = "probe-overflow"
+    dispatcher = _ConcurrentOptionalReadDispatcher({*held_ids, overflow_id})
+
+    async def wait_for_active_probes(frame: str) -> None:
+        if json.loads(frame).get("id") == overflow_id:
+            await dispatcher.wait_for_requests(*held_ids)
+
+    async def finish_after_limit_response(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response(overflow_id)
+
+    frames = [_CONNECT_FRAME]
+    frames.extend(
+        json.dumps({
+            "type": "req",
+            "id": req_id,
+            "method": "onboarding.provider.probe",
+            "params": {"providerId": "openai", "mode": "reachability"},
+        })
+        for req_id in (*held_ids, overflow_id)
+    )
+    frames.extend(json.dumps({"type": "cancel", "id": req_id}) for req_id in held_ids)
+    ws = _HistoryWebSocket(
+        frames,
+        dispatcher,
+        before_frame=wait_for_active_probes,
+        after_frames=finish_after_limit_response,
+    )
+
+    await asyncio.wait_for(
+        handle_ws_connection(
+            ws,
+            GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
+            dispatcher=dispatcher,
+        ),
+        timeout=2,
+    )
+
+    responses = {frame["id"]: frame for frame in ws.responses()}
+    assert overflow_id not in dispatcher.request_started or not dispatcher.request_started[
+        overflow_id
+    ].is_set()
+    assert responses[overflow_id]["ok"] is False
+    assert responses[overflow_id]["error"]["code"] == "UNAVAILABLE"
+    assert responses[overflow_id]["error"]["retryable"] is True
+    assert ws.close_codes == []
+
+
+async def test_cancellable_provider_probe_global_limit_spans_connections_and_frees_slot(
+    monkeypatch: Any,
+) -> None:
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    disconnect_first = asyncio.Event()
+    dispatched_ids: list[str] = []
+
+    class _Dispatcher:
+        def list_methods(self) -> list[str]:
+            return ["onboarding.provider.probe"]
+
+        async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+            dispatched_ids.append(req_id)
+            if req_id == "probe-first":
+                first_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    first_cancelled.set()
+            return make_ok_res(req_id, {"requestId": req_id})
+
+    dispatcher = _Dispatcher()
+    monkeypatch.setattr(websocket_module, "_ACTIVE_PROVIDER_PROBE_LEASES", set())
+    monkeypatch.setattr(websocket_module, "_MAX_ACTIVE_PROVIDER_PROBES", 1)
+    monkeypatch.setattr(
+        websocket_module,
+        "_active_provider_probe_cleanup_tasks",
+        lambda: 0,
+    )
+
+    async def hold_first_connection(_socket: _HistoryWebSocket) -> None:
+        await disconnect_first.wait()
+
+    first_ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "probe-first",
+                "method": "onboarding.provider.probe",
+                "params": {"providerId": "openai", "mode": "reachability"},
+            }),
+        ],
+        dispatcher,
+        after_frames=hold_first_connection,
+    )
+    first_connection = asyncio.create_task(
+        handle_ws_connection(
+            first_ws,
+            GatewayConfig(ws_writer_queue_enabled=False),
+            dispatcher=dispatcher,
+        )
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    async def finish_after_second_response(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("probe-second")
+
+    second_ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "probe-second",
+                "method": "onboarding.provider.probe",
+                "params": {"providerId": "openai", "mode": "reachability"},
+            }),
+        ],
+        dispatcher,
+        after_frames=finish_after_second_response,
+    )
+    await asyncio.wait_for(
+        handle_ws_connection(
+            second_ws,
+            GatewayConfig(ws_writer_queue_enabled=False),
+            dispatcher=dispatcher,
+        ),
+        timeout=2,
+    )
+
+    second_response = next(
+        frame for frame in second_ws.responses() if frame["id"] == "probe-second"
+    )
+    assert "probe-second" not in dispatched_ids
+    assert second_response["ok"] is False
+    assert second_response["error"]["code"] == "UNAVAILABLE"
+
+    disconnect_first.set()
+    await asyncio.wait_for(first_connection, timeout=2)
+    await asyncio.wait_for(first_cancelled.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert not websocket_module._ACTIVE_PROVIDER_PROBE_LEASES
+
+    async def finish_after_third_response(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("probe-third")
+
+    third_ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "probe-third",
+                "method": "onboarding.provider.probe",
+                "params": {"providerId": "openai", "mode": "reachability"},
+            }),
+        ],
+        dispatcher,
+        after_frames=finish_after_third_response,
+    )
+    await asyncio.wait_for(
+        handle_ws_connection(
+            third_ws,
+            GatewayConfig(ws_writer_queue_enabled=False),
+            dispatcher=dispatcher,
+        ),
+        timeout=2,
+    )
+
+    third_response = next(
+        frame for frame in third_ws.responses() if frame["id"] == "probe-third"
+    )
+    assert third_response["ok"] is True
+    assert third_response["payload"] == {"requestId": "probe-third"}
+    assert dispatched_ids == ["probe-first", "probe-third"]
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "onboarding.provider.probe",
+        "onboarding.llmProfile.probe",
+        "onboarding.llmProfile.draft.probe",
+    ],
+)
+@pytest.mark.parametrize("legacy_mode", [{}, {"mode": None}], ids=["omitted", "null"])
+async def test_legacy_provider_probe_respects_global_limit_without_becoming_cancellable(
+    monkeypatch: Any,
+    method: str,
+    legacy_mode: dict[str, Any],
+) -> None:
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    release_first = asyncio.Event()
+    disconnect_first = asyncio.Event()
+    dispatched_ids: list[str] = []
+
+    class _Dispatcher:
+        def list_methods(self) -> list[str]:
+            return [method]
+
+        async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+            dispatched_ids.append(req_id)
+            if req_id == "probe-first":
+                first_started.set()
+                try:
+                    await release_first.wait()
+                except asyncio.CancelledError:
+                    first_cancelled.set()
+                    raise
+            return make_ok_res(req_id, {"requestId": req_id})
+
+    dispatcher = _Dispatcher()
+    monkeypatch.setattr(websocket_module, "_ACTIVE_PROVIDER_PROBE_LEASES", set())
+    monkeypatch.setattr(websocket_module, "_MAX_ACTIVE_PROVIDER_PROBES", 1)
+    monkeypatch.setattr(
+        websocket_module,
+        "_active_provider_probe_cleanup_tasks",
+        lambda: 0,
+    )
+
+    def probe_frame(request_id: str) -> str:
+        return json.dumps({
+            "type": "req",
+            "id": request_id,
+            "method": method,
+            "params": {
+                "providerId": "openai",
+                "model": "gpt-test",
+                **legacy_mode,
+            },
+        })
+
+    async def hold_first_connection(_socket: _HistoryWebSocket) -> None:
+        await disconnect_first.wait()
+
+    async def wait_for_first_probe(frame: str) -> None:
+        if json.loads(frame).get("type") == "cancel":
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    first_ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            probe_frame("probe-first"),
+            json.dumps({"type": "cancel", "id": "probe-first"}),
+        ],
+        dispatcher,
+        after_frames=hold_first_connection,
+        before_frame=wait_for_first_probe,
+    )
+    first_connection = asyncio.create_task(
+        handle_ws_connection(
+            first_ws,
+            GatewayConfig(ws_writer_queue_enabled=False),
+            dispatcher=dispatcher,
+        )
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert not first_ws.has_response("probe-first")
+    assert not first_cancelled.is_set()
+
+    async def finish_after_response(socket: _HistoryWebSocket, request_id: str) -> None:
+        await socket.wait_for_response(request_id)
+
+    second_ws = _HistoryWebSocket(
+        [_CONNECT_FRAME, probe_frame("probe-second")],
+        dispatcher,
+        after_frames=lambda socket: finish_after_response(socket, "probe-second"),
+    )
+    await asyncio.wait_for(
+        handle_ws_connection(
+            second_ws,
+            GatewayConfig(ws_writer_queue_enabled=False),
+            dispatcher=dispatcher,
+        ),
+        timeout=2,
+    )
+    second_response = next(
+        frame for frame in second_ws.responses() if frame["id"] == "probe-second"
+    )
+    assert second_response["ok"] is False
+    assert second_response["error"]["code"] == "UNAVAILABLE"
+    assert dispatched_ids == ["probe-first"]
+
+    release_first.set()
+    await first_ws.wait_for_response("probe-first")
+    for _ in range(10):
+        if not websocket_module._ACTIVE_PROVIDER_PROBE_LEASES:
+            break
+        await asyncio.sleep(0)
+    assert not websocket_module._ACTIVE_PROVIDER_PROBE_LEASES
+
+    third_ws = _HistoryWebSocket(
+        [_CONNECT_FRAME, probe_frame("probe-third")],
+        dispatcher,
+        after_frames=lambda socket: finish_after_response(socket, "probe-third"),
+    )
+    await asyncio.wait_for(
+        handle_ws_connection(
+            third_ws,
+            GatewayConfig(ws_writer_queue_enabled=False),
+            dispatcher=dispatcher,
+        ),
+        timeout=2,
+    )
+    third_response = next(
+        frame for frame in third_ws.responses() if frame["id"] == "probe-third"
+    )
+    assert third_response["ok"] is True
+    assert dispatched_ids == ["probe-first", "probe-third"]
+
+    disconnect_first.set()
+    await asyncio.wait_for(first_connection, timeout=2)
+
+
+@pytest.mark.parametrize(
+    "mode_fields",
+    [{"mode": "model"}, {}, {"mode": None}],
+    ids=["explicit", "legacy-omitted", "legacy-null"],
+)
+async def test_provider_probe_cleanup_tasks_count_toward_global_limit(
+    monkeypatch: Any,
+    mode_fields: dict[str, Any],
+) -> None:
+    cleanup_count = 1
+    dispatched_ids: list[str] = []
+
+    class _Dispatcher:
+        def list_methods(self) -> list[str]:
+            return ["onboarding.provider.probe"]
+
+        async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+            dispatched_ids.append(req_id)
+            return make_ok_res(req_id, {"requestId": req_id})
+
+    dispatcher = _Dispatcher()
+    monkeypatch.setattr(websocket_module, "_ACTIVE_PROVIDER_PROBE_LEASES", set())
+    monkeypatch.setattr(websocket_module, "_MAX_ACTIVE_PROVIDER_PROBES", 1)
+    monkeypatch.setattr(
+        websocket_module,
+        "_active_provider_probe_cleanup_tasks",
+        lambda: cleanup_count,
+    )
+
+    async def run_probe(request_id: str) -> _HistoryWebSocket:
+        async def finish_after_response(socket: _HistoryWebSocket) -> None:
+            await socket.wait_for_response(request_id)
+
+        socket = _HistoryWebSocket(
+            [
+                _CONNECT_FRAME,
+                json.dumps({
+                    "type": "req",
+                    "id": request_id,
+                    "method": "onboarding.provider.probe",
+                    "params": {
+                        "providerId": "openai",
+                        "model": "gpt-test",
+                        **mode_fields,
+                    },
+                }),
+            ],
+            dispatcher,
+            after_frames=finish_after_response,
+        )
+        await asyncio.wait_for(
+            handle_ws_connection(
+                socket,
+                GatewayConfig(ws_writer_queue_enabled=False),
+                dispatcher=dispatcher,
+            ),
+            timeout=2,
+        )
+        return socket
+
+    blocked_ws = await run_probe("probe-cleanup-blocked")
+    blocked_response = blocked_ws.responses()[-1]
+    assert blocked_response["ok"] is False
+    assert blocked_response["error"]["code"] == "UNAVAILABLE"
+    assert dispatched_ids == []
+
+    cleanup_count = 0
+    accepted_ws = await run_probe("probe-after-cleanup")
+    accepted_response = accepted_ws.responses()[-1]
+    assert accepted_response["ok"] is True
+    assert accepted_response["payload"] == {"requestId": "probe-after-cleanup"}
+    assert dispatched_ids == ["probe-after-cleanup"]
 
 
 @pytest.mark.parametrize("writer_queue_enabled", [False, True])
