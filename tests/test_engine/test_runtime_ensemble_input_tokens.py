@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,22 @@ from opensquilla.tools.types import CallerKind, ToolContext
 
 _ANSWER = "The requested answer."
 _REQUEST_INPUT_TOKENS = 10_000
+
+
+@pytest.fixture(autouse=True)
+def _fixed_session_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Transcripts sort by (created_at, id); wall-clock adjustments are unrelated
+    # to recovery or usage accounting. Equal timestamps retain insertion order.
+    fixed_time = datetime(2024, 1, 1, tzinfo=UTC)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            if tz is None:
+                return fixed_time.replace(tzinfo=None)
+            return fixed_time.astimezone(tz)
+
+    monkeypatch.setattr("opensquilla.session.models.datetime", FixedDateTime)
 
 
 def _visible_response(model: str, text: str = _ANSWER) -> list[StreamEvent]:

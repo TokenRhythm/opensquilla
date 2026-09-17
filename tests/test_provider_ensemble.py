@@ -6725,6 +6725,9 @@ async def test_aggregator_error_finish_fallback_retains_reported_usage_without_r
         aggregator_stream=reported_error_then_stall,
         fallback_stream=successful_fallback,
         proposer_done=DoneEvent(input_tokens=7, output_tokens=3, model="p1"),
+        # Exercise the error-finish path with the normal request budget so
+        # asynchronous usage receipts can commit before Done is forwarded.
+        timeout_seconds=3600.0,
     )
 
     sink = _RecordingUsageSink()
@@ -6751,6 +6754,7 @@ async def test_aggregator_error_finish_fallback_retains_reported_usage_without_r
     assert retry_row["usage_reported"] is True
     assert done.usage_missing_count == 0
     assert done.ensemble_trace is not None
+    assert done.ensemble_trace["fallback_code"] == "ensemble_aggregator_error_finish_reason"
     assert done.ensemble_trace["llm_request_count"] == 3
     assert done.ensemble_trace["primary_request"].get("retry_count", 0) == 0
 
