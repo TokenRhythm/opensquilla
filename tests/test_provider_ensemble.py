@@ -455,6 +455,10 @@ async def test_agent_tool_failure_finalization_keeps_ensemble_usage_and_trace(
     from opensquilla.engine import Agent, AgentConfig, ToolResult
     from opensquilla.engine import DoneEvent as AgentDoneEvent
 
+    # Usage comes from the fake provider; tokenizer downloads must not consume
+    # the agent's execution budget in this offline finalization test.
+    monkeypatch.setattr("opensquilla.token_estimation._get_encoding", lambda: None)
+
     succeeds = outcome == "success"
     failed_calls: list[StreamEvent] = []
     for index in range(3):
