@@ -121,6 +121,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # moonshot      MOONSHOT_API_KEY         https://api.moonshot.ai/v1
 # mistral       MISTRAL_API_KEY          https://api.mistral.ai/v1
 # groq          GROQ_API_KEY             https://api.groq.com/openai/v1
+# ionet         IONET_API_KEY            https://api.intelligence.io.solutions/api/v1
 # zhipu         ZAI_API_KEY              https://open.bigmodel.cn/api/paas/v4
 # siliconflow   SILICONFLOW_API_KEY      https://api.siliconflow.cn/v1
 # volcengine    VOLCENGINE_API_KEY       https://ark.cn-beijing.volces.com/api/v3

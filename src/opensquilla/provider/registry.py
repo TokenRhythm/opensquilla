@@ -425,6 +425,14 @@ for _provider_spec in [
         catalog_source=("groq",),
     ),
     _spec(
+        "ionet",
+        "openai_compat",
+        "ionet",
+        "IONET_API_KEY",
+        "https://api.intelligence.io.solutions/api/v1",
+        catalog_source=("io-net",),
+    ),
+    _spec(
         "zhipu",
         "openai_compat",
         "zhipu",
