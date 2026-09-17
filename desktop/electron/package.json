@@ -83,7 +83,7 @@
   "devDependencies": {
     "@types/node": "^24.13.5",
     "@typescript/typescript6": "6.0.2",
-    "electron": "^42.5.1",
+    "electron": "^44.3.0",
     "electron-builder": "^26.15.3",
     "gsap": "^3.15.0",
     "lottie-web": "^5.13.0",
