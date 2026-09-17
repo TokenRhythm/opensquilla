@@ -82,7 +82,8 @@ class CompactionReport(BaseModel):
 _MAX_OBLIGATION_VALUE_CHARS = 240
 _MAX_CRITICAL_CARRY_FORWARD = 32
 _PATH_RE = re.compile(
-    r"(?<![\w.-])(?:[A-Za-z]:[\\/]|\.{1,2}/|/|[A-Za-z0-9_.@()+-]+/)"
+    # The slash in a closing markup tag is not an absolute filesystem path.
+    r"(?<![\w.-])(?:[A-Za-z]:[\\/]|\.{1,2}/|(?<!<)/|[A-Za-z0-9_.@()+-]+/)"
     r"(?:[A-Za-z0-9_.@()+-]+(?: [A-Za-z0-9_.@()+-]+)*/)*"
     r"[A-Za-z0-9_.@()+-]+(?: [A-Za-z0-9_.@()+-]+)*"
     r"(?:\.[A-Za-z0-9][A-Za-z0-9_.-]{0,15})?"
@@ -94,10 +95,13 @@ _COMMAND_RE = re.compile(
 _ERROR_MARKERS = ("error", "failed", "failure", "traceback", "exit code", "exception")
 _CONSTRAINT_PREFIXES = ("constraint:", "constraints:", "限制:", "要求:")
 _GOAL_PREFIXES = ("goal:", "objective:", "目标:")
-_NEXT_ACTION_MARKERS = ("next i will", "next step", "下一步", "i will ", "我会")
 _DO_NOT_REPEAT_MARKERS = ("do not repeat", "don't repeat", "不要重复", "不要再")
 _ARTIFACT_MARKERS = ("artifact", "generated artifact", "附件", "产物")
 _DECISION_PREFIXES = ("decision:", "rationale:", "reason:", "decided:", "决定:", "原因:")
+# These legacy obligation kinds describe state that newer turns can resolve.
+# The summarizer updates them from the complete source; substring extraction
+# cannot prove that an old promise or question is still pending.
+_MODEL_UPDATED_STATE_KINDS = frozenset({"current_plan_or_next_action", "unresolved_question"})
 _IDENTIFIER_RE = re.compile(
     r"(?<![A-Za-z0-9_-])att_[A-Za-z0-9_-]{8,160}(?![A-Za-z0-9_-])"
     r"|\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -138,10 +142,8 @@ _OBLIGATION_CONTINUITY_PRIORITY: dict[str, int] = {
     "user_goal": 0,
     "user_constraint_or_preference": 1,
     "pending_tool_or_approval_id": 2,
-    "current_plan_or_next_action": 3,
     "failed_command_or_error": 4,
     "do_not_repeat_action": 5,
-    "unresolved_question": 6,
     "decision_or_rationale": 7,
     "command": 8,
     "tool_result_fact": 9,
@@ -309,8 +311,6 @@ def _add_obligation(
 
 _STRUCTURED_SECTION_KINDS: dict[str, str] = {
     "Goal": "user_goal",
-    "Next Action": "current_plan_or_next_action",
-    "Open Steps": "current_plan_or_next_action",
     "Files and Artifacts": "file_path",
     "Tool Results To Remember": "tool_result_fact",
     "Decisions and Rationale": "decision_or_rationale",
@@ -320,7 +320,6 @@ _STRUCTURED_SECTION_KINDS: dict[str, str] = {
     "Important Identifiers": "important_identifier",
     "Constraints and Preferences": "user_constraint_or_preference",
     "Do Not Repeat": "do_not_repeat_action",
-    "Unresolved Questions": "unresolved_question",
 }
 
 
@@ -352,7 +351,6 @@ def _extract_rendered_structured_obligations(
             kind = raw_kind.strip()
             if kind in {
                 "user_goal",
-                "current_plan_or_next_action",
                 "file_path",
                 "artifact_path_or_name",
                 "tool_result_id",
@@ -364,7 +362,6 @@ def _extract_rendered_structured_obligations(
                 "important_identifier",
                 "user_constraint_or_preference",
                 "do_not_repeat_action",
-                "unresolved_question",
             }:
                 _add_obligation(
                     obligations,
@@ -472,16 +469,6 @@ def extract_compaction_obligations(
                     source_entry_id=source_entry_id,
                     max_obligations=max_obligations,
                 )
-            if role == "assistant" and any(marker in lower for marker in _NEXT_ACTION_MARKERS):
-                _add_obligation(
-                    obligations,
-                    seen,
-                    kind="current_plan_or_next_action",
-                    value=line,
-                    source_role=role,
-                    source_entry_id=source_entry_id,
-                    max_obligations=max_obligations,
-                )
             if any(marker in lower for marker in _DO_NOT_REPEAT_MARKERS):
                 _add_obligation(
                     obligations,
@@ -505,16 +492,6 @@ def extract_compaction_obligations(
                         source_entry_id=source_entry_id,
                         max_obligations=max_obligations,
                     )
-            if "?" in line or "？" in line:
-                _add_obligation(
-                    obligations,
-                    seen,
-                    kind="unresolved_question",
-                    value=line,
-                    source_role=role,
-                    source_entry_id=source_entry_id,
-                    max_obligations=max_obligations,
-                )
             if any(marker in lower for marker in _ERROR_MARKERS):
                 _add_obligation(
                     obligations,
@@ -724,8 +701,9 @@ def verify_summary_coverage(
     backfill_missing: bool = True,
     block_missing_critical: bool = False,
 ) -> CoverageResult:
-    """Compare obligations with summary text without blocking by default."""
+    """Check extracted continuity facts, not the semantic completeness of prose."""
 
+    obligations = [item for item in obligations if item.kind not in _MODEL_UPDATED_STATE_KINDS]
     search_text = summary_text.casefold()
     missing_obligations = [
         obligation for obligation in obligations if obligation.value.casefold() not in search_text
@@ -763,6 +741,7 @@ def build_structured_summary_from_text(
 ) -> tuple[StructuredCompactionSummary, CoverageResult]:
     """Build portable structured state from existing summary text plus obligations."""
 
+    obligations = [item for item in obligations if item.kind not in _MODEL_UPDATED_STATE_KINDS]
     initial_coverage = verify_summary_coverage(
         summary_text,
         obligations,
@@ -781,8 +760,6 @@ def build_structured_summary_from_text(
     summary = StructuredCompactionSummary(
         user_goal=first_by_kind.get("user_goal", ""),
         current_status=summary_text,
-        next_action=first_by_kind.get("current_plan_or_next_action"),
-        open_steps=values_by_kind.get("current_plan_or_next_action", []),
         files_and_artifacts=[{"path": value} for value in values_by_kind.get("file_path", [])]
         + [{"artifact": value} for value in values_by_kind.get("artifact_path_or_name", [])],
         tool_results_to_remember=[
@@ -803,7 +780,6 @@ def build_structured_summary_from_text(
         important_identifiers=values_by_kind.get("important_identifier", []),
         constraints_and_preferences=values_by_kind.get("user_constraint_or_preference", []),
         do_not_repeat=values_by_kind.get("do_not_repeat_action", []),
-        unresolved_questions=values_by_kind.get("unresolved_question", []),
         critical_carry_forward=initial_coverage.critical_carry_forward,
         source_coverage={
             "status": initial_coverage.status,

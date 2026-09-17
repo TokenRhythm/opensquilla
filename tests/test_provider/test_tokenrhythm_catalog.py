@@ -223,6 +223,8 @@ def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
         131_072,
     )
     assert (limits_b.context_window, limits_b.max_output_tokens) == (64_000, 8_192)
+    assert limits_a.context_window_known is True
+    assert limits_b.context_window_known is True
     caps_a = catalog.resolve_deployment_capabilities(
         "qwen3.8-max",
         provider="tokenrhythm",
@@ -294,8 +296,10 @@ def test_custom_tokenrhythm_deployment_never_uses_website_projection() -> None:
     )
     assert (official.context_window, official.max_output_tokens) == (900_000, 77_777)
     assert official.max_output_tokens_known is True
+    assert official.context_window_known is True
     assert (custom.context_window, custom.max_output_tokens) == (200_000, 16_384)
     assert custom.max_output_tokens_known is False
+    assert custom.context_window_known is False
     assert custom_caps.supports_tools is True
     assert custom_caps.supports_vision is False
 

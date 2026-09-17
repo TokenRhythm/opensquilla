@@ -40,6 +40,8 @@ from .request_proof import (
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
 from .trace_recorder import LLMTraceRecorder
@@ -310,7 +312,8 @@ class OpenAIResponsesProvider:
         return project_final_request_payload(
             payload,
             projection_adapter="openai_responses",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=wire_active_user_index,
@@ -376,7 +379,8 @@ class OpenAIResponsesProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="openai_responses",
-            proof_budget=config.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, config),
+            token_budget=provider_request_token_budget(payload, config),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=config.active_user_message_index,
@@ -402,6 +406,7 @@ class OpenAIResponsesProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, config),
                 projection_adapter="openai_responses",
                 status_projection_mode="content_envelope",
                 envelope_shape=RESPONSES_REQUEST_ENVELOPE,
@@ -1020,7 +1025,8 @@ class OpenAIResponsesProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="openai_responses_compact",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=cfg.active_user_message_index,
@@ -1034,6 +1040,7 @@ class OpenAIResponsesProvider:
         payload = budget_decision.payload or payload
         prove_provider_payload_from_env(
             payload,
+            token_budget=provider_request_token_budget(payload, cfg),
             projection_adapter="openai_responses_compact",
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,

@@ -53,6 +53,7 @@ class DeploymentModelLimits:
     context_window: int
     max_output_tokens: int
     max_output_tokens_known: bool
+    context_window_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +475,10 @@ class ModelCatalog:
                 continue
             top_provider = m.get("top_provider") or {}
             max_completion = top_provider.get("max_completion_tokens") or 0
+            context_windows = [
+                value for value in (m.get("context_length"), top_provider.get("context_length"))
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            ]
             supported = set(m.get("supported_parameters", []))
             architecture = m.get("architecture") or {}
             modalities = architecture.get("input_modalities")
@@ -491,7 +496,7 @@ class ModelCatalog:
                 provider="openrouter",
                 model_id=model_id,
                 display_name=m.get("name", model_id),
-                context_window=m.get("context_length", 0),
+                context_window=min(context_windows) if context_windows else 0,
                 max_output_tokens=max_completion,
                 supports_reasoning="reasoning" in supported or "reasoning_effort" in supported,
                 supports_tools="tools" in supported or "tool_choice" in supported,
@@ -990,10 +995,17 @@ class ModelCatalog:
                 user_override=0,
                 provider=provider_id,
             )
+            context_window, context_source = self.resolve_context_window_with_source(
+                model_id, provider_id,
+            )
             return DeploymentModelLimits(
-                context_window=self.resolve_context_window(model_id, provider_id),
+                context_window=context_window,
                 max_output_tokens=max_tokens,
                 max_output_tokens_known=source in {"catalog", "override"},
+                context_window_known=(
+                    context_source in {"catalog", "override"}
+                    or provider_id in LOCAL_RUNTIME_PROVIDERS
+                ),
             )
 
         model_l = str(model_id or "").strip().lower()
@@ -1050,6 +1062,7 @@ class ModelCatalog:
         )
 
         context_override = self.user_context_window_override(model_id, provider_id)
+        context_known = True
         if context_override is not None:
             context_window = context_override
         elif official_contexts := [
@@ -1066,6 +1079,7 @@ class ModelCatalog:
             context_window = generic_budget[1]
         else:
             context_window = DEFAULT_CONTEXT_WINDOW
+            context_known = False
 
         override_fields = self._user_override_fields(model_id, provider_id)
         override_max = override_fields.get("max_output_tokens")
@@ -1155,6 +1169,7 @@ class ModelCatalog:
             context_window=context_window,
             max_output_tokens=effective_max,
             max_output_tokens_known=max_known,
+            context_window_known=context_known,
         )
 
     def resolve_vision_support(

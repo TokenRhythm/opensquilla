@@ -142,7 +142,8 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     request = CompactionRequest(
         session_id="agent-flattened-boundary-test",
         entries=entries,
-        context_window_tokens=500,
+        # Keep q1's complete tool round within the 20% raw-tail target.
+        context_window_tokens=750,
         config=synthetic_compaction_config(safety_margin=1.0),
     )
     result = await compact_context_new(request)

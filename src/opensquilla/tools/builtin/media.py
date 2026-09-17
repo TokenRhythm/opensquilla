@@ -511,9 +511,14 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
             update={
                 "max_tokens": budget.max_output_tokens,
                 "provider_request_max_chars": budget.provider_request_max_chars,
+                "provider_context_window_tokens": budget.context_window_tokens,
+                "provider_request_max_chars_explicit_cap": (
+                    budget.provider_request_max_chars_explicit_cap
+                ),
             }
         )
     if budget is None:
+        explicit_cap = getattr(config, "provider_request_max_chars_explicit_cap", None)
         budget = resolve_auxiliary_request_budget(
             provider,
             max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
@@ -521,13 +526,18 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
                 getattr(config, "context_window_tokens_global_override", 0) or 0
             ),
             provider_request_max_chars=int(
-                getattr(config, "provider_request_max_chars", 0) or 0
+                (getattr(config, "provider_request_max_chars", 0) or 0)
+                if explicit_cap is None else explicit_cap
             ),
         )
     config = config.model_copy(
         update={
             "max_tokens": budget.max_output_tokens,
             "provider_request_max_chars": budget.provider_request_max_chars,
+            "provider_context_window_tokens": budget.context_window_tokens,
+            "provider_request_max_chars_explicit_cap": (
+                budget.provider_request_max_chars_explicit_cap
+            ),
         }
     )
     ensure_auxiliary_text_fits(

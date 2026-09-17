@@ -24,6 +24,8 @@ from .request_proof import (
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import (
     ReasoningAccumulator,
@@ -489,7 +491,8 @@ class AnthropicProvider:
         return project_final_request_payload(
             payload,
             projection_adapter="anthropic",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="native_is_error",
             active_user_message_index=cfg.active_user_message_index,
             message_limit=message_limit,
@@ -524,7 +527,8 @@ class AnthropicProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="anthropic",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="native_is_error",
             active_user_message_index=cfg.active_user_message_index,
             protected_tool_result_indexes=protected_result_indexes,
@@ -550,6 +554,7 @@ class AnthropicProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, cfg),
                 projection_adapter="anthropic",
                 status_projection_mode="native_is_error",
                 active_user_message_index=cfg.active_user_message_index,

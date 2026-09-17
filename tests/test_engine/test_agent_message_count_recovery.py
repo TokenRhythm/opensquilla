@@ -544,6 +544,7 @@ class _CountAwareEnsembleMemberProvider:
                 "request_cap": int(
                     getattr(config, "provider_request_max_chars", 0) or 0
                 ),
+                "max_tokens": int(getattr(config, "max_tokens", 0) or 0),
                 "aggregator": is_aggregator,
             }
         )
@@ -1394,6 +1395,29 @@ async def test_protected_current_turn_over_limit_refuses_without_summary(
     )
 
 
+@pytest.mark.parametrize(
+    ("content", "execution_status", "is_error", "requires_raw"),
+    [
+        ("completed diagnostic", {"status": "error"}, True, False),
+        ('{"status":"timed_out","reason":"deadline_exceeded"}', None, True, False),
+        ("still running", {"status": "success", "reason": "background_running"}, False, True),
+        ('{"status":"awaiting_approval","approval_id":"approval-synthetic"}', None, False, True),
+        ("retry in progress", {"status": "error", "reason": "running"}, True, True),
+        ('{"status":"success","reason":"background_running"}', None, False, True),
+    ],
+)
+def test_request_window_preserves_live_tool_state_without_pinning_terminal_errors(
+    content, execution_status, is_error, requires_raw,
+) -> None:
+    result = Message(role="user", content=[ContentBlockToolResult(
+        tool_use_id="synthetic-operation", content=content, is_error=is_error,
+        execution_status=(
+            normalize_execution_status(execution_status) if execution_status is not None else None
+        ),
+    )])
+    assert Agent._tool_result_requires_raw_preservation(result) is requires_raw
+
+
 @pytest.mark.asyncio
 async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_cannot_fit(
     monkeypatch: pytest.MonkeyPatch,
@@ -1480,21 +1504,22 @@ async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_
     )
     assert outcome.messages[2] is active_user
     assert outcome.messages[2].content == active_text
-    # The error and pending-approval rounds force the raw tail to begin at
-    # round four; the newest two rounds therefore remain raw as well.
-    assert outcome.messages[-12:] == [
-        message for pair in rounds[4:] for message in pair
+    # The approval is still live. The preceding completed error can be
+    # summarized; it must not permanently anchor the raw request window.
+    assert outcome.messages[-10:] == [
+        message for pair in rounds[5:] for message in pair
     ]
     assert outcome.messages[-2] is rounds[-1][0]
     assert outcome.messages[-1] is rounds[-1][1]
     assert "approval-live-5" in str(outcome.messages)
-    assert "result-4" in str(outcome.messages)
+    assert rounds[4][1] not in outcome.messages
+    assert "result-4" in str(compact_requests[0].entries)
     assert messages == canonical_snapshot
     assert all(
         entry["content"] != active_text
         for entry in compact_requests[0].entries
     )
-    assert compact_requests[0].forced_prefix_cut == 8
+    assert compact_requests[0].forced_prefix_cut == 10
 
 
 @pytest.mark.asyncio
@@ -1805,11 +1830,15 @@ async def test_member_budget_rebinding_and_exact_count_recovery_compose_once(
     assert sum(call["wire_messages"] <= 90 for call in member_calls) == 5
     assert sum(call["aggregator"] for call in member_calls) == 1
     assert any(
-        call["model"] == "kimi-k2.7-code" and call["request_cap"] == 367_200
+        call["model"] == "kimi-k2.7-code"
+        and call["max_tokens"] == 16_000
+        and call["request_cap"] == 880_000
         for call in member_calls
     )
     assert any(
-        call["model"] == "glm-5.2" and call["request_cap"] == 2_896_800
+        call["model"] == "glm-5.2"
+        and call["max_tokens"] == 128_000
+        and call["request_cap"] == 3_408_000
         for call in member_calls
     )
     assert any(getattr(event, "kind", None) == "done" for event in events)

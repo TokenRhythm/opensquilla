@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import pytest
+
 from opensquilla.session.compaction_state import (
+    CompactionObligation,
     StructuredCompactionSummary,
     build_structured_summary_from_text,
     extract_compaction_obligations,
     render_structured_summary,
+    verify_summary_coverage,
 )
 
 
@@ -118,6 +122,41 @@ def test_extract_compaction_obligations_keeps_high_signal_facts_bounded() -> Non
     assert all(len(item.value) <= 240 for item in obligations)
 
 
+@pytest.mark.parametrize("role", ["assistant", "tool"])
+def test_closing_markup_tags_do_not_become_compaction_file_facts(role: str) -> None:
+    obligations = extract_compaction_obligations([
+        {
+            "role": role,
+            "content": (
+                "<think>Review the parser.</think>\n"
+                "<analysis>Keep the verified source.</analysis>\n"
+                "<task-state>Done.</task-state>\n"
+                "Verified source: `src/parser/scan.py`."
+            ),
+        },
+    ])
+    summary, _coverage = build_structured_summary_from_text(
+        "The verified source is src/parser/scan.py.", obligations,
+    )
+
+    assert [item.value for item in obligations if item.kind == "file_path"] == [
+        "src/parser/scan.py",
+    ]
+    assert summary.files_and_artifacts == [{"path": "src/parser/scan.py"}]
+
+
+@pytest.mark.parametrize("path", [
+    "/think", "/tmp/synthetic-state.txt", "./state.txt", "../state.txt",
+    "src/parser/scan.py", "C:/synthetic/state.txt", r"C:\state.txt",
+])
+def test_real_paths_remain_compaction_file_facts(path: str) -> None:
+    obligations = extract_compaction_obligations([
+        {"role": "assistant", "content": f"Verified source: `{path}`."},
+    ])
+
+    assert [item.value for item in obligations if item.kind == "file_path"] == [path]
+
+
 def test_structured_summary_exposes_command_and_pending_tool_workset() -> None:
     entries = [
         {
@@ -146,10 +185,73 @@ def test_structured_summary_exposes_command_and_pending_tool_workset() -> None:
         for command in summary.executed_commands_and_tests
     )
     assert summary.pending_tool_and_approval_ids == ["call_waiting"]
-    assert summary.open_steps == [
-        "Next I will run uv run pytest tests/test_session/test_compaction.py."
-    ]
+    # A historical promise does not establish that this command is still pending.
+    assert summary.open_steps == []
+    assert summary.next_action is None
     assert "call_done" not in summary.pending_tool_and_approval_ids
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_resolved_plans_and_questions_are_not_backfilled_as_current_state(structured) -> None:
+    old_plan = "Next I will compare the two adapters."
+    old_question = "Which adapter is active?"
+    prior = (
+        render_structured_summary(StructuredCompactionSummary(
+            next_action=old_plan,
+            open_steps=[old_plan],
+            unresolved_questions=[old_question],
+            critical_carry_forward=[
+                f"current_plan_or_next_action: {old_plan}",
+                f"unresolved_question: {old_question}",
+            ],
+        ))
+        if structured else f"{old_plan}\n{old_question}"
+    )
+    entries = [
+        {"role": "assistant", "content": prior},
+        {
+            "role": "assistant",
+            "content": "Both adapters were compared. The silver adapter is active. "
+            "The next task is to prepare the release note for src/synthetic/main.py.",
+            "tool_calls": [{"id": "call_release_note", "type": "function"}],
+        },
+    ]
+    updated = "Adapter comparison is complete; silver is active. The release note is underway."
+    obligations = extract_compaction_obligations(entries)
+    summary, coverage = build_structured_summary_from_text(
+        updated, obligations, block_missing_critical=True,
+    )
+    rendered = render_structured_summary(summary)
+
+    assert summary.current_status == updated
+    assert summary.next_action is None
+    assert summary.open_steps == []
+    assert summary.unresolved_questions == []
+    assert old_plan not in rendered
+    assert old_question not in rendered
+    assert "src/synthetic/main.py" in rendered
+    assert summary.pending_tool_and_approval_ids == ["call_release_note"]
+    assert coverage.status == "pass"
+
+
+def test_legacy_obligation_callers_cannot_force_superseded_state_back_into_summary() -> None:
+    obligations = [
+        CompactionObligation(kind="current_plan_or_next_action", value="Next I will compare."),
+        CompactionObligation(kind="unresolved_question", value="Which route is active?"),
+        CompactionObligation(kind="important_identifier", value="att_synthetic123"),
+    ]
+    updated = "Comparison is complete; the silver route is active. Keep att_synthetic123."
+    summary, coverage = build_structured_summary_from_text(
+        updated, obligations, block_missing_critical=True,
+    )
+    assert summary.critical_carry_forward == []
+    assert summary.next_action is None
+    assert summary.unresolved_questions == []
+    assert coverage.status == "pass"
+    assert coverage.checked_obligations == 1
+    assert verify_summary_coverage(
+        render_structured_summary(summary), obligations, block_missing_critical=True,
+    ).status == "pass"
 
 
 def test_canonical_nested_tool_results_populate_failure_and_pending_workset() -> None:

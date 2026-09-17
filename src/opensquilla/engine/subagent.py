@@ -38,6 +38,7 @@ class SubagentExecutionTarget:
     model_capabilities: Any = field(default=None, repr=False, compare=False)
     compaction_plan: Any = field(default=None, repr=False, compare=False)
     model_vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
+    context_window_known: bool = True
 
 
 @dataclass
@@ -130,6 +131,7 @@ def resolve_subagent_execution_target(
         provider_connection_config,
         provider_metadata,
     )
+    from opensquilla.provider.registry import LOCAL_RUNTIME_PROVIDERS
     from opensquilla.session.compaction_deployment import (
         build_compaction_execution_plan_from_provider,
     )
@@ -232,6 +234,7 @@ def resolve_subagent_execution_target(
     )
     if deployment_matches_parent_config:
         context_window = max(1, int(getattr(parent_config, "context_window_tokens", 0) or 0))
+        context_window_known = bool(getattr(parent_config, "context_window_known", True))
         max_output = max(1, int(getattr(parent_config, "max_tokens", 0) or 0))
         max_output = min(max_output, context_window)
         capabilities = getattr(parent_config, "model_capabilities", None)
@@ -243,11 +246,33 @@ def resolve_subagent_execution_target(
         catalog = shared_catalog()
         entry = catalog.resolve_entry(model_id, provider=provider_id)
         context_window = max(1, int(entry.context_window or 0))
+        resolve_with_source = getattr(catalog, "resolve_context_window_with_source", None)
+        context_window_known = True
+        if callable(resolve_with_source):
+            _resolved_window, context_window_source = resolve_with_source(
+                model_id, provider=provider_id,
+            )
+            context_window_known = (
+                context_window_source != "default" or provider_id in LOCAL_RUNTIME_PROVIDERS
+            )
+        deployment_output: int | None = None
+        resolve_limits = getattr(catalog, "resolve_deployment_limits", None)
+        if callable(resolve_limits):
+            connection = provider_connection_config(child_provider)
+            limits = resolve_limits(
+                model_id, provider=provider_id, api_key=connection.api_key,
+                base_url=connection.base_url,
+            )
+            context_window_known = bool(getattr(limits, "context_window_known", True))
+            if context_window_known:
+                context_window = max(1, int(limits.context_window))
+            deployment_output = int(limits.max_output_tokens)
         max_output = max(
             1,
             min(
                 int(
-                    catalog.resolve_max_tokens(
+                    deployment_output if deployment_output is not None
+                    else catalog.resolve_max_tokens(
                         model_id,
                         user_override=0,
                         provider=provider_id,
@@ -289,7 +314,7 @@ def resolve_subagent_execution_target(
         else build_compaction_execution_plan_from_provider(
             child_provider,
             model=model_id or None,
-            context_window_tokens=context_window,
+            context_window_tokens=context_window if context_window_known else 0,
             provider_request_max_chars=request_max_chars,
             source="subagent_deployment",
         )
@@ -309,6 +334,7 @@ def resolve_subagent_execution_target(
         model_capabilities=capabilities,
         compaction_plan=compaction_plan,
         model_vision_support=model_vision_support,
+        context_window_known=context_window_known,
     )
 
 

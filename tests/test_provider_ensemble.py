@@ -49,6 +49,7 @@ from opensquilla.provider.ensemble import (
     ENSEMBLE_FIXED_TERMINAL_MESSAGE,
     EnsembleMemberConfig,
     EnsembleProvider,
+    _member_budget_key,
     _member_chat_config,
     _member_from_ref,
     _MemberRequestBudgetBinding,
@@ -60,8 +61,13 @@ from opensquilla.provider.ensemble import (
 )
 from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.image_projection import count_image_blocks
+from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.request_proof import project_final_request_payload
 from opensquilla.provider.selector import ProviderConfig
+from opensquilla.provider.tokenrhythm_catalog import (
+    parse_tokenrhythm_declared,
+    tokenrhythm_authority_identity,
+)
 from opensquilla.provider.types import (
     ContentBlockImage,
     EnsembleProgressEvent,
@@ -422,6 +428,52 @@ class _BudgetCatalog:
         return self._resolve(model_id)[0]
 
 
+@pytest.mark.parametrize("base_url", ["", "https://tokenrhythm.studio/v1"])
+def test_ensemble_budget_uses_each_tokenrhythm_authority_window(
+    monkeypatch: pytest.MonkeyPatch, base_url: str,
+) -> None:
+    model = "qwen3.7-max"
+    catalog = ModelCatalog()
+    declared_by_authority = {}
+    members = []
+    for name, window, output in (("large", 1_000_000, 16_384), ("small", 64_000, 8192)):
+        key = f"synthetic-authority-{name}"
+        authority = tokenrhythm_authority_identity(
+            provider="tokenrhythm", base_url="https://tokenrhythm.studio/v1", api_key=key,
+        )
+        assert authority is not None
+        declared_by_authority[authority] = parse_tokenrhythm_declared({"data": [{
+            "id": model, "context_length": window, "max_completion_tokens": output,
+        }]})
+        members.append(EnsembleMemberConfig(
+            provider_config=ProviderConfig(
+                provider="tokenrhythm", model=model, api_key=key, base_url=base_url,
+            ),
+            thinking="off",
+        ))
+    catalog.set_tokenrhythm_snapshot_sidecars(
+        published={}, declared_by_authority=declared_by_authority,
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble.shared_catalog", lambda: catalog)
+    bindings = _runtime_member_request_budget_bindings(
+        config=GatewayConfig(llm={"provider": "tokenrhythm"}),
+        members=members, model_catalog=catalog, context_overflow_threshold=0.85,
+    )
+    assert len(bindings) == 2
+    assert "synthetic-authority" not in repr(bindings)
+    windows = []
+    outputs = []
+    for member in members:
+        binding = bindings[_member_budget_key(member)]
+        config = _member_chat_config(
+            ChatConfig(), member, role="proposer", request_budget_binding=binding,
+        )
+        windows.append(config.provider_context_window_tokens)
+        outputs.append(config.max_tokens)
+    assert windows == [1_000_000, 64_000]
+    assert outputs == [16_384, 8192]
+
+
 def _tokenrhythm_budget_registry() -> _FakeRegistry:
     models = ("deepseek-v4-pro", "glm-5.2", "kimi-k2.7-code", "qwen3.7-max")
     return _FakeRegistry(
@@ -444,7 +496,7 @@ def _tokenrhythm_ensemble_config(
             "provider": "tokenrhythm",
             "model": "kimi-k2.7-code",
             "api_key": "fake",
-            "base_url": "https://tokenrhythm.example/v1",
+            "base_url": "https://tokenrhythm.studio/v1",
             "provider_request_proof_max_chars": explicit_cap,
             "context_window_tokens": context_window_tokens,
         },
@@ -473,7 +525,7 @@ def _build_tokenrhythm_budget_provider(
             provider="tokenrhythm",
             model="kimi-k2.7-code",
             api_key="fake",
-            base_url="https://tokenrhythm.example/v1",
+            base_url="https://tokenrhythm.studio/v1",
         ),
         fallback_provider=None,
         _enable_member_request_budget_rebinding=enable_rebinding,
@@ -3194,10 +3246,9 @@ async def test_ensemble_resolves_max_tokens_per_openrouter_member(
 
     by_model = {call["model"]: call["config"].max_tokens for call in registry.calls}
     assert by_model == {
-        "deepseek/deepseek-v4-pro": 384000,
-        # models.dev's 2026-07-08 refresh lowered openrouter z-ai/glm-5.2 max
-        # output from 131072 to 32768.
-        "z-ai/glm-5.2": 32768,
+        "deepseek/deepseek-v4-pro": 393216,
+        # The current public OpenRouter catalog supersedes the older snapshot.
+        "z-ai/glm-5.2": 131072,
         "moonshotai/kimi-k2.7-code": 16384,
         "qwen/qwen3.7-max": 65536,
         "agg": 123,
@@ -3212,7 +3263,7 @@ async def test_ensemble_resolves_max_tokens_per_openrouter_member(
     assert done.ensemble_trace["final_request"]["execution"]["effective_max_tokens"] == 123
 
 
-@pytest.mark.parametrize("outer_cap", [367_200, 2_896_800])
+@pytest.mark.parametrize("outer_cap", [432_000, 3_408_000])
 @pytest.mark.parametrize("attachment_input_tokens", [0, 1_000])
 @pytest.mark.asyncio
 async def test_tokenrhythm_ensemble_rebinds_request_cap_per_member_context(
@@ -3237,11 +3288,11 @@ async def test_tokenrhythm_ensemble_rebinds_request_cap_per_member_context(
     ]
 
     calls_by_model = {call["model"]: call["config"] for call in registry.calls}
-    # Kimi's 256k window yields 367,200 chars; GLM's 1m window yields
-    # 2,896,800. Parameterizing the inherited cap pins both widening and
+    # Kimi's 256k window and 16k output yield 880,000 chars; GLM's 1m window yields
+    # 3,408,000. Parameterizing the inherited cap pins both widening and
     # tightening instead of relying on the outer route's model.
-    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 367_200
-    assert calls_by_model["glm-5.2"].provider_request_max_chars == 2_896_800
+    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 880_000
+    assert calls_by_model["glm-5.2"].provider_request_max_chars == 3_408_000
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
@@ -3252,18 +3303,18 @@ async def test_tokenrhythm_ensemble_rebinds_request_cap_per_member_context(
     )
     assert kimi_trace["effective_context_window_tokens"] == 256_000
     assert kimi_trace["effective_context_window_source"] == "catalog"
-    assert kimi_trace["effective_provider_request_max_chars"] == 367_200
+    assert kimi_trace["effective_provider_request_max_chars"] == 880_000
     assert kimi_trace["provider_request_max_chars_source"] == "member_context"
     aggregator_trace = done.ensemble_trace["final_request"]["execution"]
     assert aggregator_trace["effective_context_window_tokens"] == 1_000_000
     assert aggregator_trace["effective_context_window_source"] == "catalog"
-    assert aggregator_trace["effective_provider_request_max_chars"] == 2_896_800
+    assert aggregator_trace["effective_provider_request_max_chars"] == 3_408_000
     assert aggregator_trace["provider_request_max_chars_source"] == "member_context"
 
 
 @pytest.mark.parametrize(
     ("attachment_input_tokens", "explicit_cap"),
-    [(10_000_000, 0), (10_000_000, 100_000_000), (1_000, 2_000)],
+    [(10_000_000, 0), (10_000_000, 100_000_000)],
 )
 @pytest.mark.asyncio
 async def test_ensemble_skips_all_members_when_frozen_request_exceeds_capacity(
@@ -3376,14 +3427,14 @@ async def test_ensemble_member_context_precedence_is_override_then_global_then_c
             config=ChatConfig(
                 max_tokens=128_000,
                 thinking=False,
-                provider_request_max_chars=367_200,
+                provider_request_max_chars=432_000,
             ),
         )
     ]
 
     calls_by_model = {call["model"]: call["config"] for call in registry.calls}
-    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 516_800
-    assert calls_by_model["glm-5.2"].provider_request_max_chars == 1_196_800
+    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 1_056_000
+    assert calls_by_model["glm-5.2"].provider_request_max_chars == 1_408_000
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
     kimi_trace = next(
@@ -3487,7 +3538,7 @@ def test_all_lineup_modes_rebind_global_context_without_catalog(
 
 @pytest.mark.parametrize(
     ("thinking", "expected_cap"),
-    [("high", 567_800), ("off", 584_800)],
+    [("high", 668_000), ("off", 688_000)],
 )
 def test_member_request_cap_uses_effective_max_tokens_and_thinking_reserve(
     thinking: str,
@@ -3515,7 +3566,7 @@ def test_member_request_cap_uses_effective_max_tokens_and_thinking_reserve(
             max_tokens=128_000,
             thinking=False,
             thinking_budget_tokens=5_000,
-            provider_request_max_chars=367_200,
+            provider_request_max_chars=432_000,
         ),
         member,
         request_budget_binding=binding,
@@ -3929,7 +3980,7 @@ def test_member_request_cap_rebinds_without_base_chat_config() -> None:
 
     assert effective.max_tokens == 64_000
     assert effective.thinking is True
-    assert effective.provider_request_max_chars == 567_800
+    assert effective.provider_request_max_chars == 668_000
 
 
 @pytest.mark.parametrize(
@@ -3937,7 +3988,7 @@ def test_member_request_cap_rebinds_without_base_chat_config() -> None:
     [
         (123_456, 123_456, True, 123_456, "explicit"),
         (0, 0, True, None, "member_context"),
-        (0, 367_200, False, 367_200, "inherited"),
+        (0, 432_000, False, 432_000, "inherited"),
     ],
 )
 @pytest.mark.asyncio
@@ -4014,7 +4065,10 @@ async def test_ensemble_default_context_rebinds_but_catalog_failure_retains_oute
     ]
 
     calls_by_model = {call["model"]: call["config"] for call in registry.calls}
-    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 367_200
+    # Automatic output follows this deployment's fallback, without borrowing
+    # a different authority's catalog. The member's context is still rebound.
+    assert calls_by_model["kimi-k2.7-code"].max_tokens == 16_000
+    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 880_000
     assert calls_by_model["glm-5.2"].provider_request_max_chars == 555_555
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
@@ -4074,7 +4128,7 @@ async def test_rebinding_rebinds_fallback_chat_config(
             provider="tokenrhythm",
             model="kimi-k2.7-code",
             api_key="fake",
-            base_url="https://tokenrhythm.example/v1",
+            base_url="https://tokenrhythm.studio/v1",
         ),
         fallback_provider=fallback,
         _enable_member_request_budget_rebinding=True,
@@ -4099,8 +4153,8 @@ async def test_rebinding_rebinds_fallback_chat_config(
     assert len(fallback.configs) == 1
     assert fallback.configs[0] is not outer
     assert fallback.configs[0] is not None
-    assert fallback.configs[0].provider_request_max_chars == 367_200
-    assert fallback.configs[0].max_tokens == 128_000
+    assert fallback.configs[0].provider_request_max_chars == 880_000
+    assert fallback.configs[0].max_tokens == 16_000
     assert fallback.configs[0].model_capabilities is not None
     assert outer.provider_request_max_chars == 900_000
 
@@ -8736,3 +8790,48 @@ async def test_step3_configured_minimum_is_the_effective_runtime_floor(
     assert done.ensemble_trace["effective_min_successful_proposers"] == 3
     assert done.ensemble_trace["min_successful_proposers"] == 3
     assert done.ensemble_trace["successful_proposers"] == 4
+
+
+def test_ensemble_summary_uses_aggregator_config_without_proposer_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.types import ExecutionIdentity
+
+    registry = _tokenrhythm_budget_registry()
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = _build_tokenrhythm_budget_provider(context_window_tokens=500_000)
+    base = ChatConfig(
+        execution_identity=ExecutionIdentity(provider="tokenrhythm", model="kimi-k2.7-code"),
+        max_tokens=8_192,
+        provider_context_window_tokens=8_192,
+        provider_request_max_chars=16_000,
+        provider_request_max_chars_explicit_cap=0,
+    )
+    summary_config = provider.compaction_chat_config(base)
+    assert summary_config.provider_context_window_tokens == 500_000
+    assert summary_config.max_tokens == provider._aggregator_chat_config(base, ()).max_tokens
+    assert summary_config.execution_identity.model == provider.aggregator.provider_config.model
+    assert summary_config.provider_request_max_chars_explicit_cap == 0
+    assert registry.calls == []
+    assert base.provider_context_window_tokens == 8_192
+
+
+def test_unknown_ensemble_window_retains_legacy_character_guard() -> None:
+    binding = _MemberRequestBudgetBinding(
+        context_window_tokens=128_000,
+        context_window_source="default",
+        context_overflow_threshold=0.85,
+        cap_source="inherited",
+        rederive=False,
+        inherit_top_level_cap=True,
+    )
+    config = _member_chat_config(
+        ChatConfig(
+            provider_context_window_tokens=1_000_000,
+            provider_request_max_chars=2_000_000,
+        ),
+        _member("custom-deployment"),
+        request_budget_binding=binding,
+    )
+    assert config.provider_context_window_tokens == 0
+    assert config.provider_request_max_chars == 2_000_000
