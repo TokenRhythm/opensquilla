@@ -9,7 +9,7 @@ not know about RPC frames, scopes, or ``RpcContext``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
@@ -129,13 +129,15 @@ class SessionDirectory:
         now_ms: int,
         project: Callable[[Any, str], SessionSearchProjection],
         derive_transcript_title: Callable[[str], str] | None = None,
+        read_transcript_titles: Callable[
+            [Sequence[Any]], Awaitable[Mapping[str, str]]
+        ] | None = None,
     ) -> SessionSearchResult:
         """Run the session directory query behind storage-independent ports.
 
-        ``project`` is the only presentation hook.  It is supplied by the
-        Gateway adapter and returns a small domain projection; the application
-        module never imports Gateway view or RPC code.  Transcript index and
-        enrichment failures remain best-effort, while title-index failures
+        The Gateway supplies presentation projection and optional batched title
+        reads; the application never imports Gateway view or RPC code. Transcript
+        index and enrichment failures remain best-effort, while title-index failures
         retain the historical propagation semantics of the v4 handler.
         """
 
@@ -168,7 +170,9 @@ class SessionDirectory:
                 ).lower()
             ][:normalized_limit]
 
-        title_inputs = await self._transcript_titles(title_sessions, derive_transcript_title)
+        title_inputs = await self._transcript_titles(
+            title_sessions, derive_transcript_title, read_transcript_titles
+        )
         title_hits: list[SessionSearchSessionHit] = []
         title_keys: set[str] = set()
         for session in title_sessions:
@@ -217,7 +221,9 @@ class SessionDirectory:
                     session = None
                 if session is not None:
                     enriched_sessions.append(session)
-        enriched_titles = await self._transcript_titles(enriched_sessions, derive_transcript_title)
+        enriched_titles = await self._transcript_titles(
+            enriched_sessions, derive_transcript_title, read_transcript_titles
+        )
         title_by_key: dict[str, str] = {}
         for session in enriched_sessions:
             key = str(getattr(session, "session_key", "") or "")
@@ -247,9 +253,12 @@ class SessionDirectory:
         self,
         sessions: Sequence[Any],
         derive_title: Callable[[str], str] | None,
+        reader: Callable[[Sequence[Any]], Awaitable[Mapping[str, str]]] | None = None,
     ) -> dict[str, str]:
         """Read a bounded amount of user transcript content for enrichment."""
 
+        if reader is not None:
+            return dict(await reader(sessions))
         if derive_title is None:
             return {}
         session_ids = [

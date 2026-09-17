@@ -472,6 +472,57 @@ async def test_concurrent_first_source_publications_create_one_document(
         assert (await cursor.fetchone())[0] == 1
 
 
+@pytest.mark.parametrize("changed", [False, True])
+async def test_initial_source_receipt_survives_a_concurrent_later_publication(
+    source_environment, monkeypatch: pytest.MonkeyPatch, changed: bool,
+):
+    import opensquilla.gateway.generated_artifact_adoption as adoption
+
+    env = source_environment
+    adopters, events = [], []
+    for index in range(2):
+        context, adopter = _turn(env.service, env.store, env.workspace, env.media, env.preview)
+        if index and changed:
+            env.style.write_text("h1{color:crimson}")
+        token = current_tool_context.set(context)
+        try:
+            await publish_artifact(path="index.html")
+        finally:
+            current_tool_context.reset(token)
+        adopters.append(adopter)
+        events.append(ArtifactEvent(**context.published_artifacts[0]))
+
+    created, release = asyncio.Event(), asyncio.Event()
+    original = adoption.adopt_generated_deliverable_if_editable
+
+    async def pause_after_creation(**kwargs):
+        result = await original(**kwargs)
+        if result is not None and result[3]:
+            created.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(adoption, "adopt_generated_deliverable_if_editable", pause_after_creation)
+    first = asyncio.create_task(adopters[0](events[0]))
+    try:
+        await asyncio.wait_for(created.wait(), timeout=5)
+        await adopters[1](events[1])
+    finally:
+        release.set()
+        await first
+
+    binding = await _binding(env)
+    revisions = await env.service.list_revisions(binding.document_id)
+    assert len(revisions) == (2 if changed else 1)
+    head = await env.service.get_document_head(binding.document_id)
+    assert head.revision.artifact_id == events[1 if changed else 0].id
+    # Replaying either completed occurrence must not revert the newer version.
+    await adopters[0](events[0])
+    await adopters[1](events[1])
+    assert await env.service.get_document_head(binding.document_id) == head
+    assert await env.service.list_revisions(binding.document_id) == revisions
+
+
 async def test_source_identity_is_scoped_to_session_and_workspace(source_environment):
     env = source_environment
     await _publish(env.context, env.adopter)

@@ -208,6 +208,8 @@
           :scroll-epoch="scrollEpoch"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
+          :goal-removable="!shareMode && !forkTransition"
+          :goal-busy="goalBusy"
           :resolve-session-availability="resolveCreatedSessionAvailability"
           :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
           @fork-conversation="forkConversation"
@@ -232,6 +234,7 @@
           @plan-implement-current="implementCurrentPlan"
           @plan-implement-new="implementPlanInNewTask"
           @plan-replan="beginPlanRevision"
+          @goal-clear="clearGoal"
         >
           <template #router-strip="{ message: msg }">
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
@@ -273,6 +276,9 @@
           v-if="goalOutcomeGoal && !goalOutcomeHasMessageAnchor"
           :goal="goalOutcomeGoal"
           :elapsed="goalLastElapsed"
+          :removable="!shareMode && !forkTransition"
+          :busy="goalBusy"
+          @clear="clearGoal"
         />
         <PlanCard
           v-if="currentPlan && !currentPlanInHistory"
@@ -828,6 +834,7 @@ import {
   goalHasRenderedTerminalAnchor,
   goalStatusIsTerminal,
   type GoalSetAcceptedPayload,
+  type GoalSnapshot,
   useChatGoals,
 } from '@/composables/chat/useChatGoals'
 import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
@@ -2536,6 +2543,7 @@ const {
   copyMessage,
   regenerateMessage,
   editMessage,
+  cancelEdit,
 } = chatMessageActions
 
 async function handleRegenerateMessage(
@@ -3169,10 +3177,18 @@ async function editGoalFromRibbon(
   }
 }
 
-async function clearGoal() {
+async function clearGoal(requestedGoal: GoalSnapshot | null = currentGoalRun.value) {
   const requestedSessionKey = sessionKey.value
-  const requestedGoal = currentGoalRun.value
-  if (!requestedGoal || goalBusy.value) return false
+  const currentAtRequest = currentGoalRun.value
+  if (
+    !requestedGoal
+    || !currentAtRequest
+    || goalBusy.value
+    || requestedGoal.sessionKey !== requestedSessionKey
+    || requestedGoal.goalId !== currentAtRequest.goalId
+    || requestedGoal.sessionId !== currentAtRequest.sessionId
+    || requestedGoal.epoch !== currentAtRequest.epoch
+  ) return false
   const requestedGoalIdentity = {
     goalId: requestedGoal.goalId,
     sessionId: requestedGoal.sessionId,
@@ -3306,6 +3322,7 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   popPendingTail,
   enqueuePendingInput,
   sendCurrentInput: () => sendCurrentInput(),
+  cancelMessageEdit: () => cancelEdit(),
 })
 const {
   onTextareaBeforeInput,
@@ -7159,6 +7176,7 @@ watch(optionalSessionRpcAllowed, admitted => {
 
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  chatMessageActions.discardEditRestorePoint()
   // Retire any in-flight page walk and clear the old Session before starting
   // the new one, so a late response cannot leak deliverables across tabs/routes.
   resetSessionArtifacts()

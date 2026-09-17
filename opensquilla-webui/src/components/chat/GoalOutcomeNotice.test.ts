@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h } from 'vue'
 import { createI18n } from 'vue-i18n'
 import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
@@ -88,6 +88,45 @@ describe('GoalOutcomeNotice', () => {
     )
     expect(host.textContent).not.toContain('1m 03s active')
     expect(host.querySelector('.goal-outcome--inline')).not.toBeNull()
+    expect(host.querySelector('button')).toBeNull()
+  })
+
+  it.each([false, true])('emits the settled Goal when removed (inline: %s)', (inline) => {
+    const goal = completedGoal()
+    const onClear = vi.fn()
+    const host = mountNotice({ goal, inline, removable: true, onClear })
+    const button = host.querySelector('button')!
+
+    expect(button.textContent).toContain('Remove goal')
+    expect(button.type).toBe('button')
+    expect(button.disabled).toBe(false)
+    button.click()
+
+    expect(onClear).toHaveBeenCalledExactlyOnceWith(goal)
+    expect(onClear.mock.calls[0]![0]).toBe(goal)
+  })
+
+  it('disables removal while a Goal operation is pending', () => {
+    const onClear = vi.fn()
+    const host = mountNotice({ removable: true, busy: true, onClear })
+    const button = host.querySelector('button')!
+
+    expect(button.disabled).toBe(true)
+    button.click()
+    // Synthetic events can bypass a disabled button; the handler must guard too.
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+
+    expect(onClear).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { activeTaskId: 'task-settling', executionState: 'working' as const },
+    { activeTaskId: 'task-settling', executionState: 'idle' as const },
+    { executionState: 'queued' as const },
+    { status: 'active' as const },
+  ])('hides removal before the terminal outcome has settled (%j)', (overrides) => {
+    const host = mountNotice({ removable: true, goal: completedGoal(overrides) })
+
     expect(host.querySelector('button')).toBeNull()
   })
 

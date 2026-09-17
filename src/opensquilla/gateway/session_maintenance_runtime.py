@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import inspect
-import uuid
 from typing import Any
 
 from opensquilla.memory.checkpoint import checkpoint_coverage_hash, checkpoint_turn_id
-from opensquilla.observability.network_policy import (
-    provider_request_correlation_disabled,
-)
-from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction_lifecycle import (
     durable_receipt_allows_destructive_compaction,
 )
@@ -86,34 +81,35 @@ async def durable_checkpoint_covers_transcript(
     return any(durable_receipt_allows_destructive_compaction(receipt) for receipt in receipts)
 
 
-def build_session_flush_correlation(
-    context: object,
-    session_id: object,
-) -> tuple[str, ProviderRequestCorrelation | None]:
-    """Create one root operation and execution for a session-bound flush."""
-
-    turn_id = uuid.uuid4().hex
-    config = getattr(context, "config", None)
-    if (
-        not isinstance(session_id, str)
-        or not session_id
-        or provider_request_correlation_disabled(config=config)
-    ):
-        return turn_id, None
-    return (
-        turn_id,
-        ProviderRequestCorrelation(
-            session_id=session_id,
-            turn_id=turn_id,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.session_flush",
-        ),
+async def checkpoint_before_session_rewrite(
+    manager: Any,
+    storage: Any,
+    session_key: str,
+    session_id: str | None,
+    entries: list[Any],
+    *,
+    expected_session_epoch: int | None = None,
+    source: str,
+) -> None:
+    """Save the exact removed transcript before a destructive session rewrite."""
+    if not entries:
+        return
+    if await durable_checkpoint_covers_transcript(storage, session_key, session_id, entries):
+        return
+    receipt = await manager.record_memory_checkpoint(
+        session_key,
+        entries,
+        source=source,
+        expected_session_id=session_id,
+        expected_session_epoch=expected_session_epoch,
     )
+    if not durable_receipt_allows_destructive_compaction(receipt):
+        raise RuntimeError("transcript checkpoint failed")
 
 
 __all__ = [
     "TaskScopedCancelUnsupportedError",
-    "build_session_flush_correlation",
+    "checkpoint_before_session_rewrite",
     "cancel_task_runtime",
     "durable_checkpoint_covers_transcript",
 ]

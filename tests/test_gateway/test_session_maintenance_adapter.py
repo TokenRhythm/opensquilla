@@ -12,8 +12,6 @@ import pytest
 from opensquilla.application.session_maintenance import (
     CompactSession,
     SessionCompactionDeadlineError,
-    SessionCompactionFlushSafetyError,
-    SessionCompactionMemoryAssessment,
     SessionCompactionResult,
 )
 from opensquilla.gateway.adapters.session_maintenance import (
@@ -21,8 +19,10 @@ from opensquilla.gateway.adapters.session_maintenance import (
     GatewaySessionMaintenancePorts,
 )
 from opensquilla.gateway.compaction_target import GatewayCompactionTarget, GatewayConsumerBudget
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
 from opensquilla.project_workspaces import project_path_key
+from opensquilla.provider.selector import ProviderConfig
 from opensquilla.session.models import ProjectWorkspace, SessionNode
 from tests.helpers.image_bytes import image_bytes
 
@@ -139,7 +139,6 @@ async def test_adapter_projects_terminal_domain_result() -> None:
         critical_carry_forward_count=1,
         state_kind="structured",
         quality_report={"score": 1},
-        flush_receipt_status="flushed",
     )
 
     response = await adapter.compact({"key": "canonical"})
@@ -149,7 +148,6 @@ async def test_adapter_projects_terminal_domain_result() -> None:
     assert response["summary_len"] == 12
     assert response["coverage_status"] == "complete"
     assert response["quality_report"] == {"score": 1}
-    assert response["flush_receipt_status"] == "flushed"
 
 
 async def test_adapter_maps_deadline_to_wire_error() -> None:
@@ -167,27 +165,25 @@ async def test_adapter_maps_deadline_to_wire_error() -> None:
     assert raised.value.details["phase"] == "summarizing"
 
 
-async def test_adapter_maps_flush_safety_to_wire_error() -> None:
-    adapter, application = _adapter()
-    application.error = SessionCompactionFlushSafetyError(
-        session_key="canonical",
-        session_id="session-1",
-        receipt=None,
-        receipt_status="missing",
-        assessment=SessionCompactionMemoryAssessment(
-            allows_destructive_compaction=False,
-            safety_status="unsafe",
-            semantic_status="missing",
-        ),
+def test_manual_plan_keeps_generation_budget_without_fabricating_active_request() -> None:
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-manual", "api_key": "synthetic-key",
+        "context_window_tokens": 32_000, "max_tokens": 8192,
+    })
+    current = ProviderConfig(
+        provider="openai", model="synthetic-manual", api_key="synthetic-key",
     )
+    ports = GatewaySessionMaintenancePorts(RpcContext(
+        conn_id="manual-generation", config=config, session_manager=SimpleNamespace(storage=None),
+        provider_selector=SimpleNamespace(current_config=current),
+    ))
 
-    with pytest.raises(RpcHandlerError) as raised:
-        await adapter.compact({"key": "canonical"})
+    plan = ports.build_plan(None, 0, "manual-generation", time.monotonic() + 120)
 
-    assert raised.value.code == "CONTEXT_FLUSH_FAILED"
-    assert raised.value.details["reason"] == (
-        "destructive_manual_compact_requires_safe_flush"
-    )
+    compaction = plan.runtime_value.config
+    assert compaction.request_context is None
+    assert compaction.llm_plan.primary.max_generation_tokens == 8192
+    assert compaction.llm_plan.primary.max_output_tokens == 1024
 
 
 @pytest.mark.parametrize("workspace_kind", ["agent", "project", "untrusted", "disabled"])

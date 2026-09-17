@@ -6,9 +6,11 @@ import {
   type UseChatSessionSubscriptionOptions,
 } from './useChatSessionSubscription'
 import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
+import { useChatHistory } from './useChatHistory'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import {
   createSessionReadLifecycle,
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadHistoryPage,
   type SessionReadLease,
@@ -101,6 +103,7 @@ const EMPTY_HISTORY: SessionReadHistoryPage = {
 
 function leaseFixture(options: {
   live?: SessionReadLive | Promise<SessionReadLive>
+  history?: SessionReadLease['history']
   metadata?: SessionReadMetadata | Promise<SessionReadMetadata>
   retryMetadata?: () => Promise<SessionReadMetadata>
   criticalRequestsQueued?: Promise<void>
@@ -114,7 +117,7 @@ function leaseFixture(options: {
     criticalRequestsQueued: options.criticalRequestsQueued ?? Promise.resolve(),
     live: Promise.resolve(options.live ?? live()),
     metadata: metadataPromise,
-    history: {
+    history: options.history ?? {
       latest: async () => EMPTY_HISTORY,
       before: async () => EMPTY_HISTORY,
       after: async () => EMPTY_HISTORY,
@@ -246,6 +249,61 @@ function harness(
 }
 
 describe('useChatSessionSubscription domain lease', () => {
+  it('waits for a rejected history cursor to recover before confirming reconciliation', async () => {
+    const confirmInstalled = vi.fn(async () => {})
+    const page: SessionReadHistoryPage = {
+      ...EMPTY_HISTORY,
+      messages: [{
+        id: 'm4', messageId: 'm4', transcriptId: 'transcript:m4',
+        role: 'assistant', text: 'hello', createdAt: 1,
+        reasoningContent: null, routerDecision: null,
+        artifacts: [], toolCalls: [], timeline: [], attachments: [], promptAnnotations: [],
+        provenance: { kind: null, sourceSessionKey: null, sourceTool: null },
+        turnContext: null, usage: null, model: null, inputTokens: null, outputTokens: null,
+        additional: {},
+      }],
+      hasMore: true,
+      oldestCursor: 'cursor-4',
+      newestCursor: 'cursor-4',
+    }
+    const latest = vi.fn(async () => page)
+    const before = vi.fn(async () => {
+      throw new SessionReadHistoryCursorError('stale', 'cursor rejected')
+    })
+    const fixture = leaseFixture({
+      live: live({ confirmInstalled }),
+      history: { latest, before, after: async () => EMPTY_HISTORY },
+    })
+    const history = useChatHistory({
+      sessionReadLeaseReader: { current: () => fixture.lease },
+      sessionKey: ref(KEY),
+      messages: ref([]),
+      lastHeaderRole: ref(''),
+      lastHeaderDay: ref(''),
+      stripTimePrefix: text => text,
+      scrollToBottom: vi.fn(),
+    })
+    const subject = harness(fixture.lease, { loadHistory: () => history.reconcileHistory() })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await history.loadHistory()
+      await history.loadEarlierHistory()
+
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: false })
+      expect(latest).toHaveBeenCalledTimes(1)
+      expect(confirmInstalled).not.toHaveBeenCalled()
+
+      await history.retryHistory()
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: true })
+      expect(confirmInstalled).toHaveBeenCalledTimes(1)
+      expect(before).toHaveBeenCalledTimes(1)
+      expect(fixture.close).not.toHaveBeenCalled()
+    } finally {
+      history.cleanup()
+      warn.mockRestore()
+    }
+  })
+
   it('does not declare installation when history reconciliation returns an explicit failed result', async () => {
     const confirmInstalled = vi.fn(async () => {})
     const fixture = leaseFixture({ live: live({ confirmInstalled }) })

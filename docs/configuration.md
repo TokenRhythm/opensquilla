@@ -305,7 +305,6 @@ opensquilla memory list
 opensquilla memory search "project preference"
 opensquilla memory show <path>
 opensquilla memory dream
-opensquilla memory flush-session <session-key>
 ```
 
 Configure embedding behavior:
@@ -371,6 +370,44 @@ Only subnets of `198.18.0.0/15` are accepted in this setting. Loopback, RFC
 1918 private ranges, link-local addresses, and other internal ranges remain
 hard-blocked even if configured. If a public hostname resolves to one of those
 hard-blocked ranges, fix the DNS or proxy setup instead of bypassing the guard.
+
+## Environment Proxies
+
+Outbound HTTP clients ignore `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` by
+default so a stray proxy in a parent shell cannot reroute agent traffic. Set
+`OPENSQUILLA_TRUST_ENV=1` (for example in `~/.opensquilla/.env`) to opt in.
+That gate is shared by channel adapters, providers, `http_request`, and
+`web_fetch`.
+
+`web_search` has a separate `search_use_env_proxy` / `OPENSQUILLA_GATEWAY_SEARCH_USE_ENV_PROXY`
+switch; it does not enable `web_fetch`.
+
+`web_fetch` pins direct and environment-proxied requests to the locally
+SSRF-vetted address by default. With trust-env enabled, `SSL_CERT_FILE` and
+`SSL_CERT_DIR` remain available for custom TLS certificate authorities.
+
+If local DNS is poisoned or intercepted and your proxy needs to resolve the
+original hostname, explicitly enable both options:
+
+```dotenv
+OPENSQUILLA_TRUST_ENV=1
+OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS=1
+HTTPS_PROXY=http://127.0.0.1:7890
+```
+
+`OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS` is off by default. It only applies when
+an environment proxy is selected for that URL. It delegates DNS resolution
+and **final destination access control to the proxy**. A local SSRF check
+cannot prevent that proxy from subsequently resolving a hostname to a private,
+loopback, or link-local address. Use this mode only when you trust the proxy's
+destination policy; a proxy being on localhost does not itself provide that
+protection.
+
+Local URL/DNS checks still run before fetching and on every redirect, so URLs
+that locally resolve to blocked addresses remain blocked, and local DNS must
+still succeed. `NO_PROXY` matches continue to use direct, pinned connections.
+This option does not change sandbox-managed proxy routing or permissions.
+Restart the gateway after changing these environment settings.
 
 ## Gateway Binding
 

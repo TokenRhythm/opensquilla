@@ -127,13 +127,17 @@ def _exception_status_code(exc: Exception) -> int | None:
     """Best-effort HTTP status code from a provider list_models exception.
 
     Adapters raise heterogeneous errors: ``httpx.HTTPStatusError`` carries a
-    ``response.status_code``; others are plain messages. When no structured
-    code is present, ``classify_provider_error`` still classifies from the
-    message text (e.g. "invalid api key"), so ``None`` is a safe default.
+    ``response.status_code`` and response-parse errors carry a direct
+    ``status_code``. When no structured code is present,
+    ``classify_provider_error`` still classifies from the message text (e.g.
+    "invalid api key"), so ``None`` is a safe default.
     """
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
+        return status_code
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
         return status_code
     return None
 

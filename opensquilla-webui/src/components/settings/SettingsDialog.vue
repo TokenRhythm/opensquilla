@@ -134,7 +134,9 @@
               @update-llm-timeout="updateLlmTimeout"
               @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
+              @cancel-provider-probe="cancelProviderProbe"
               @refresh-models="refreshProviderModels"
+              @cancel-configured-provider-probe="cancelConfiguredProviderProbe"
               @save-provider="saveProvider"
               @save-provider-and-activate="saveProviderAndActivate"
               @cancel-provider-edit="cancelProviderEdit"
@@ -317,8 +319,10 @@ const {
   updateLlmTimeout,
   updateContextWindow,
   probeProviderConnection,
+  cancelProviderProbe,
   refreshProviderModels,
   probeConfiguredProvider,
+  cancelConfiguredProviderProbe,
   activateProvider,
   removeProviderProfile,
   updateTierField,
@@ -523,7 +527,8 @@ function focusCompositeHash(): boolean {
   const target = document.getElementById(targetId)
   if (!target) return false
   target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' })
-  target.focus({ preventScroll: true })
+  const initialFocus = target.querySelector<HTMLElement>('[data-settings-initial-focus]')
+  ;(initialFocus ?? target).focus({ preventScroll: true })
   return true
 }
 

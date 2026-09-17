@@ -19,6 +19,11 @@ const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
 const addDataSeparator = process.platform === 'win32' ? ';' : ':'
 const gitLfsPointerHeader = 'version https://git-lfs.github.com/spec/v1'
+const gatewayUvArgs = [
+  'run', '--locked', '--group', 'desktop-build',
+  '--extra', 'recommended', '--extra', 'mcp', '--extra', 'msg',
+  '--extra', 'matrix', '--extra', 'document-extras',
+]
 
 function findFilesByName(root, fileName) {
   const matches = []
@@ -118,7 +123,7 @@ function pythonPackageFile(packageName, relativePath) {
   ].join('\n')
   const result = spawnSync(
     'uv',
-    ['run', '--extra', 'recommended', 'python', '-c', code],
+    [...gatewayUvArgs, 'python', '-c', code],
     {
       cwd: repoRoot,
       env: {
@@ -303,19 +308,7 @@ const macOpenMpBinaryArgs = process.platform === 'darwin'
   : []
 
 const args = [
-  'run',
-  '--extra',
-  'recommended',
-  '--extra',
-  'mcp',
-  '--extra',
-  'msg',
-  '--extra',
-  'matrix',
-  '--extra',
-  'document-extras',
-  '--with',
-  'pyinstaller',
+  ...gatewayUvArgs,
   'pyinstaller',
   '--noconfirm',
   '--clean',
@@ -403,4 +396,12 @@ if (result.status !== 0) {
 
 patchMacLightgbmRuntime()
 externalizeControlUiArtifact()
+const dependencyInventory = spawnSync('uv', [
+  ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'release_dependency_inventory.py'),
+  '--repo', repoRoot, '--kind', 'pyinstaller',
+  '--analysis', join(pyinstallerWorkDir, 'opensquilla-gateway', 'Analysis-00.toc'),
+  '--output', join(runtimeGatewayDir, 'dependency-inventory.json'),
+], { cwd: repoRoot, stdio: 'inherit', windowsHide: true })
+if (dependencyInventory.error) throw dependencyInventory.error
+if (dependencyInventory.status !== 0) process.exit(dependencyInventory.status ?? 1)
 writeGatewayBuildRecord(repoRoot, runtimeGatewayDir, buildInputs)

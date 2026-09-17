@@ -68,7 +68,7 @@ def test_docs_only_plan_is_small_and_canonical(
 ) -> None:
     plan = _plan(tmp_path, suite_config, "docs/architecture.md", "docs/ci.md")
 
-    assert plan["required_suites"] == ["readme-locale", "workflow-lint"]
+    assert plan["required_suites"] == ["dependency-audit", "readme-locale", "workflow-lint"]
     assert plan["desktop_matrix"] == []
     assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
     assert _platform_cells(plan, "readme-locale") == {
@@ -98,6 +98,7 @@ def test_root_readmes_select_release_packaging_contract(
     plan = _plan(tmp_path, suite_config, path)
 
     assert plan["required_suites"] == [
+        "dependency-audit",
         "readme-locale",
         "release-packaging",
         "workflow-lint",
@@ -168,6 +169,7 @@ def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
     }
     assert plan["desktop_matrix"] == []
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "macos-recovery",
         "python-targeted",
         "readme-locale",
@@ -450,10 +452,18 @@ def test_deleted_unregistered_test_still_fails_closed(
     assert "unknown_path" in plan["reason_codes"]
 
 
+@pytest.mark.parametrize(
+    ("source", "skill_hub"),
+    [
+        ("src/opensquilla/engine/turn_runner/input_stage.py", False),
+        ("src/opensquilla/engine/runtime.py", True),
+        ("src/opensquilla/engine/agent.py", True),
+    ],
+)
 def test_shared_python_core_requests_complete_offline_python_only(
-    tmp_path: Path, suite_config: dict[str, Any]
+    tmp_path: Path, suite_config: dict[str, Any], source: str, skill_hub: bool,
 ) -> None:
-    plan = _plan(tmp_path, suite_config, "src/opensquilla/engine/runtime.py")
+    plan = _plan(tmp_path, suite_config, source)
 
     assert plan["full_fallback"] is False
     assert "python-full" in plan["required_suites"]
@@ -468,7 +478,15 @@ def test_shared_python_core_requests_complete_offline_python_only(
         ("ubuntu-latest", shard)
         for shard in suite_config["full_python_matrix"]["ubuntu"]
     }
-    assert plan["reason_codes"] == ["python_shared_core"]
+    assert plan["reason_codes"] == (
+        ["python_shared_core", "skill_hub_changed"] if skill_hub else ["python_shared_core"]
+    )
+    assert ("skill-hub" in plan["required_suites"]) is skill_hub
+    if skill_hub:
+        assert _platform_cells(plan, "skill-hub") == {
+            ("ubuntu-latest", "default"), ("macos-latest", "default"),
+            ("windows-latest", "default"),
+        }
 
 
 def test_generic_webui_change_does_not_wake_desktop_matrix(
@@ -1177,6 +1195,7 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
 
     assert plan["full_fallback"] is False
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "desktop-recovery-e2e",
         "frontend-artifact",
         "frontend-validation",
@@ -1231,6 +1250,7 @@ def test_webui_dependency_changes_stay_in_webui_ecosystem(
 
     assert plan["full_fallback"] is False
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "frontend-artifact",
         "frontend-validation",
         "readme-locale",
@@ -1257,6 +1277,7 @@ def test_electron_dependency_changes_select_full_desktop_matrix_only(
 
     assert plan["full_fallback"] is False
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "desktop-recovery-e2e",
         "desktop-static",
         "frontend-artifact",
@@ -1286,6 +1307,7 @@ def test_tui_dependency_changes_add_ubuntu_host_companion_contract(
 
     assert plan["full_fallback"] is False
     assert set(plan["required_suites"]) == {
+        "dependency-audit",
         "python-targeted",
         "readme-locale",
         "tui",

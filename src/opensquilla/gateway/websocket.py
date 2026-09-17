@@ -122,20 +122,38 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "workspaces.list",
     }
 )
-_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list", "skills.install"}).union(
-    _CONCURRENT_OPTIONAL_READ_METHODS
+_CANCELLABLE_REQUEST_METHODS: frozenset[str] = frozenset(
+    {
+        "onboarding.llmProfile.draft.probe",
+        "onboarding.llmProfile.probe",
+        "onboarding.provider.probe",
+    }
+)
+_PROVIDER_PROBE_MODES: tuple[str, ...] = ("model", "reachability")
+_ACTIVE_PROVIDER_PROBE_LEASES: set[object] = set()
+_MAX_ACTIVE_PROVIDER_PROBES = 16
+_BASE_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
+    {"meta.drafts.list", "skills.install"}
+).union(
+    _CONCURRENT_OPTIONAL_READ_METHODS,
+)
+_DETACHED_RPC_METHODS: frozenset[str] = _BASE_DETACHED_RPC_METHODS.union(
+    _CANCELLABLE_REQUEST_METHODS,
 )
 # Reserve one bounded slot for every method that may legitimately run detached.
 # A fresh WebUI can issue every optional metadata read plus draft recovery before
 # the first responses arrive; keeping this derived from the allowlist prevents a
 # newly advertised read from silently outgrowing the bootstrap budget again.
-_MAX_DETACHED_REQUESTS_PER_CONNECTION = len(_DETACHED_RPC_METHODS)
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = len(_BASE_DETACHED_RPC_METHODS)
+_MAX_CANCELLABLE_REQUESTS_PER_CONNECTION = len(_CANCELLABLE_REQUEST_METHODS)
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
 
 def _should_detach_rpc_request(method: str, params: Any) -> bool:
     if method not in _DETACHED_RPC_METHODS:
         return False
+    if method in _CANCELLABLE_REQUEST_METHODS:
+        return _is_cancellable_request(method, params)
     if method != "skills.install":
         return True
     if not isinstance(params, dict):
@@ -144,6 +162,40 @@ def _should_detach_rpc_request(method: str, params: Any) -> bool:
         isinstance(params.get(key), str) and bool(params[key].strip())
         for key in ("operationId", "operation_id")
     )
+
+
+def _is_cancellable_request(method: str, params: Any) -> bool:
+    if method not in _CANCELLABLE_REQUEST_METHODS or not isinstance(params, dict):
+        return False
+    mode = params.get("mode")
+    return isinstance(mode, str) and mode.strip() in {"model", "reachability"}
+
+
+def _active_provider_probe_cleanup_tasks() -> int:
+    # Import lazily so ordinary Gateway startup does not load provider setup
+    # machinery solely to report a transport capability.
+    from opensquilla.onboarding.probe import active_provider_probe_cleanup_tasks
+
+    return active_provider_probe_cleanup_tasks()
+
+
+def _is_provider_probe_request(method: str) -> bool:
+    return method in _CANCELLABLE_REQUEST_METHODS
+
+
+def _try_acquire_provider_probe_lease() -> object | None:
+    if (
+        len(_ACTIVE_PROVIDER_PROBE_LEASES) + _active_provider_probe_cleanup_tasks()
+        >= _MAX_ACTIVE_PROVIDER_PROBES
+    ):
+        return None
+    lease = object()
+    _ACTIVE_PROVIDER_PROBE_LEASES.add(lease)
+    return lease
+
+
+def _release_provider_probe_lease(lease: object) -> None:
+    _ACTIVE_PROVIDER_PROBE_LEASES.discard(lease)
 
 
 @dataclass(slots=True)
@@ -213,10 +265,21 @@ class WsConnection:
         init=False,
         repr=False,
     )
-    _accept_detached_responses: bool = field(default=True, init=False, repr=False)
-    _ordinary_queue: asyncio.Queue[tuple[Coroutine[Any, Any, None], int]] | None = field(
-        default=None, init=False, repr=False
+    _cancellable_request_tasks: dict[str, asyncio.Task[None]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
     )
+    _cancelled_request_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _accept_detached_responses: bool = field(default=True, init=False, repr=False)
+    _ordinary_queue: (
+        asyncio.Queue[tuple[Coroutine[Any, Any, None], int, object | None]]
+        | None
+    ) = field(default=None, init=False, repr=False)
     _ordinary_worker: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _ordinary_stopped: bool = field(default=False, init=False, repr=False)
     _transport_bytes: int = field(default=0, init=False, repr=False)
@@ -540,7 +603,13 @@ class WsConnection:
             except Exception:
                 log.exception("gateway.ws_transport_cleanup_failed", conn_id=self.conn_id)
 
-    def _enqueue_ordinary_request(self, request: Coroutine[Any, Any, None], size: int) -> bool:
+    def _enqueue_ordinary_request(
+        self,
+        request: Coroutine[Any, Any, None],
+        size: int,
+        *,
+        provider_probe_lease: object | None = None,
+    ) -> bool:
         if self._ordinary_stopped or self._closing:
             return False
         start_worker = self._ordinary_worker is None or self._ordinary_worker.done()
@@ -550,7 +619,7 @@ class WsConnection:
             self._ordinary_queue = asyncio.Queue(maxsize=_MAX_ORDINARY_REQUESTS)
         if self._ordinary_queue.full() or not self.reserve_transport_bytes(size):
             return False
-        self._ordinary_queue.put_nowait((request, size))
+        self._ordinary_queue.put_nowait((request, size, provider_probe_lease))
         if start_worker:
             self._ordinary_worker = asyncio.create_task(
                 self._run_ordinary_requests(), name=f"ws-rpc-worker-{self.conn_id}"
@@ -565,19 +634,27 @@ class WsConnection:
         # No await on an empty queue: the reader creates the next worker only
         # after admitting another request, so an idle connection has no worker.
         while not self._ordinary_stopped and not self._ordinary_queue.empty():
-            request, size = self._ordinary_queue.get_nowait()
+            request, size, provider_probe_lease = self._ordinary_queue.get_nowait()
             try:
                 await request
             finally:
-                self.release_transport_bytes(size)
+                try:
+                    self.release_transport_bytes(size)
+                finally:
+                    if provider_probe_lease is not None:
+                        _release_provider_probe_lease(provider_probe_lease)
 
     async def _stop_ordinary_requests(self) -> None:
         self._ordinary_stopped = True
         if self._ordinary_queue is not None:
             while not self._ordinary_queue.empty():
-                request, size = self._ordinary_queue.get_nowait()
-                request.close()
-                self.release_transport_bytes(size)
+                request, size, provider_probe_lease = self._ordinary_queue.get_nowait()
+                try:
+                    request.close()
+                    self.release_transport_bytes(size)
+                finally:
+                    if provider_probe_lease is not None:
+                        _release_provider_probe_lease(provider_probe_lease)
         worker = self._ordinary_worker
         if worker is None:
             return
@@ -840,11 +917,27 @@ class WsConnection:
         except Exception:
             pass
 
-    def _track_detached_request(self, task: asyncio.Task[None]) -> None:
+    def _track_detached_request(
+        self,
+        task: asyncio.Task[None],
+        *,
+        request_id: str | None = None,
+        provider_probe_lease: object | None = None,
+    ) -> None:
         self._detached_request_tasks.add(task)
+        if request_id is not None:
+            self._cancellable_request_tasks[request_id] = task
 
         def finished(completed: asyncio.Task[None]) -> None:
             self._detached_request_tasks.discard(completed)
+            if provider_probe_lease is not None:
+                _release_provider_probe_lease(provider_probe_lease)
+            self._cancelled_request_tasks.discard(completed)
+            if (
+                request_id is not None
+                and self._cancellable_request_tasks.get(request_id) is completed
+            ):
+                self._cancellable_request_tasks.pop(request_id, None)
             if completed.cancelled():
                 return
             try:
@@ -860,10 +953,31 @@ class WsConnection:
 
         task.add_done_callback(finished)
 
+    def _cancel_detached_request(self, request_id: str) -> None:
+        """Cancel a cancellable request owned by this connection, if still active."""
+
+        task = self._cancellable_request_tasks.get(request_id)
+        if task is None or task.done():
+            return
+        self._cancelled_request_tasks.add(task)
+        task.cancel()
+
+    def _detached_response_allowed(
+        self,
+        task: asyncio.Task[None] | None,
+    ) -> bool:
+        return (
+            self._accept_detached_responses
+            and task is not None
+            and task not in self._cancelled_request_tasks
+        )
+
     async def _stop_detached_requests(self) -> None:
         self._accept_detached_responses = False
         tasks = tuple(self._detached_request_tasks)
         self._detached_request_tasks.clear()
+        self._cancellable_request_tasks.clear()
+        self._cancelled_request_tasks.update(tasks)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -1543,7 +1657,6 @@ async def handle_ws_connection(
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
-    flush_service: Any = None,
     heartbeat_service: Any = None,
     heartbeat_loop: Any = None,
     agent_registry: Any = None,
@@ -1738,6 +1851,8 @@ async def handle_ws_connection(
             ),
             concurrent_history_reads=True,
             concurrent_optional_read_methods=sorted(_CONCURRENT_OPTIONAL_READ_METHODS),
+            cancellable_request_methods=sorted(_CANCELLABLE_REQUEST_METHODS),
+            provider_probe_modes=list(_PROVIDER_PROBE_MODES),
             agent_stream_heartbeat_interval_ms=int(
                 max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
                 * 1000
@@ -1798,7 +1913,6 @@ async def handle_ws_connection(
             cron_scheduler,
             turn_runner,
             task_runtime,
-            flush_service,
             heartbeat_service,
             heartbeat_loop,
             agent_registry,
@@ -1918,7 +2032,6 @@ async def _message_loop(
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
-    flush_service: Any = None,
     heartbeat_service: Any = None,
     heartbeat_loop: Any = None,
     agent_registry: Any = None,
@@ -2005,6 +2118,28 @@ async def _message_loop(
 
         frame_type = data.get("type")
 
+        if frame_type == "cancel":
+            request_id = data.get("id")
+            if (
+                set(data) != {"type", "id"}
+                or not isinstance(request_id, str)
+                or not request_id
+                or not _is_wire_text(request_id)
+            ):
+                await conn.send_res(
+                    make_error_res(
+                        _wire_frame_id(request_id),
+                        "INVALID_REQUEST",
+                        "Cancel frame must contain only a non-empty string id",
+                    )
+                )
+                continue
+            # Cancellation is intentionally connection-local and idempotent.
+            # There is no acknowledgement because the client has already
+            # retired the pending request that owned this id.
+            conn._cancel_detached_request(request_id)
+            continue
+
         if frame_type == "ping":
             nonce = data.get("nonce")
             if nonce is not None and (
@@ -2073,7 +2208,6 @@ async def _message_loop(
                 cron_scheduler=cron_scheduler,
                 turn_runner=turn_runner,
                 task_runtime=task_runtime,
-                flush_service=flush_service,
                 heartbeat_service=heartbeat_service,
                 heartbeat_loop=heartbeat_loop,
                 prompt_cache_keepalive_service=prompt_cache_keepalive_service,
@@ -2089,12 +2223,40 @@ async def _message_loop(
                 await _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
                 continue
             if _should_detach_rpc_request(method, params):
-                if len(conn._detached_request_tasks) >= _MAX_DETACHED_REQUESTS_PER_CONNECTION:
+                cancellable = _is_cancellable_request(method, params)
+                if cancellable and req_id in conn._cancellable_request_tasks:
+                    await conn.send_res(
+                        make_error_res(
+                            req_id,
+                            "INVALID_REQUEST",
+                            "A cancellable request with this id is already running",
+                        )
+                    )
+                    continue
+                ordinary_detached_count = (
+                    len(conn._detached_request_tasks)
+                    - len(conn._cancellable_request_tasks)
+                )
+                at_limit = (
+                    len(conn._cancellable_request_tasks)
+                    >= _MAX_CANCELLABLE_REQUESTS_PER_CONNECTION
+                    if cancellable
+                    else ordinary_detached_count >= _MAX_DETACHED_REQUESTS_PER_CONNECTION
+                )
+                provider_probe_lease = None
+                if cancellable and not at_limit:
+                    provider_probe_lease = _try_acquire_provider_probe_lease()
+                    at_limit = provider_probe_lease is None
+                if at_limit:
                     await conn.send_res(
                         make_error_res(
                             req_id,
                             ERROR_UNAVAILABLE,
-                            "Too many detached requests are already running",
+                            (
+                                "Too many provider probe requests are already running"
+                                if cancellable
+                                else "Too many detached requests are already running"
+                            ),
                             retryable=True,
                         )
                     )
@@ -2108,11 +2270,29 @@ async def _message_loop(
                         params,
                         ctx,
                         detached=True,
+                        cancellable=cancellable,
                     ),
                     name=f"ws-detached-request-{conn.conn_id}",
                 )
-                conn._track_detached_request(task)
+                conn._track_detached_request(
+                    task,
+                    request_id=req_id if cancellable else None,
+                    provider_probe_lease=provider_probe_lease,
+                )
                 continue
+            provider_probe_lease = None
+            if _is_provider_probe_request(method):
+                provider_probe_lease = _try_acquire_provider_probe_lease()
+                if provider_probe_lease is None:
+                    await conn.send_res(
+                        make_error_res(
+                            req_id,
+                            ERROR_UNAVAILABLE,
+                            "Too many provider probe requests are already running",
+                            retryable=True,
+                        )
+                    )
+                    continue
             request = _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
             if method in _DETACHED_READ_METHODS:
                 if conn._try_start_detached_read(request, method=method):
@@ -2130,8 +2310,14 @@ async def _message_loop(
                     )
                 )
                 continue
-            if not conn._enqueue_ordinary_request(request, raw_size):
+            if not conn._enqueue_ordinary_request(
+                request,
+                raw_size,
+                provider_probe_lease=provider_probe_lease,
+            ):
                 request.close()
+                if provider_probe_lease is not None:
+                    _release_provider_probe_lease(provider_probe_lease)
                 await conn.send_res(
                     make_error_res(
                         req_id,
@@ -2162,9 +2348,12 @@ async def _dispatch_and_send(
     ctx: RpcContext,
     *,
     detached: bool = False,
+    cancellable: bool = False,
 ) -> None:
     response = await dispatcher.dispatch(req_id, method, params, ctx)
     if detached and not conn._accept_detached_responses:
+        return
+    if cancellable and not conn._detached_response_allowed(asyncio.current_task()):
         return
     await conn.send_res(response)
 

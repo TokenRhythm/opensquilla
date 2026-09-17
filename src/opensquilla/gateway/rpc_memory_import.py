@@ -253,6 +253,9 @@ class _GatewayFusionCompletion:
         self._max_tokens = request_budget.max_output_tokens
         self._provider_request_max_chars = request_budget.provider_request_max_chars
         self._provider_request_max_tokens = request_budget.max_input_tokens
+        self._provider_request_max_chars_explicit_cap = (
+            request_budget.provider_request_max_chars_explicit_cap
+        )
         configured_timeout = request_timeout
         if configured_timeout is None:
             configured_timeout = getattr(
@@ -312,15 +315,26 @@ class _GatewayFusionCompletion:
             )
         llm_config = getattr(getattr(self._ctx, "config", None), "llm", None)
         configured_max_tokens = int(getattr(llm_config, "max_tokens", 0) or 0)
+        request_budget = resolve_auxiliary_request_budget(
+            provider,
+            provider_id=self._provider_id,
+            model=self._model,
+            max_output_tokens=self._max_tokens or configured_max_tokens or 16_384,
+            provider_request_max_chars=self._provider_request_max_chars_explicit_cap,
+        )
         chat_config = ChatConfig(
-            max_tokens=self._max_tokens or configured_max_tokens or 16_384,
+            max_tokens=request_budget.max_output_tokens,
             temperature=0.0,
             timeout=self._request_timeout,
             system=str(getattr(request, "system_prompt", "") or ""),
             output_json_schema=getattr(request, "response_schema", None),
             output_json_schema_strict=True,
             candidate_output_mode="inert_artifact",
-            provider_request_max_chars=self._provider_request_max_chars,
+            provider_request_max_chars=request_budget.provider_request_max_chars,
+            provider_context_window_tokens=request_budget.context_window_tokens,
+            provider_request_max_chars_explicit_cap=(
+                request_budget.provider_request_max_chars_explicit_cap
+            ),
             provider_request_correlation=correlation,
         )
         messages = [
@@ -329,8 +343,8 @@ class _GatewayFusionCompletion:
         ensure_auxiliary_text_fits(
             messages,
             system=chat_config.system or "",
-            max_chars=self._provider_request_max_chars,
-            max_tokens=self._provider_request_max_tokens,
+            max_chars=request_budget.provider_request_max_chars,
+            max_tokens=request_budget.max_input_tokens,
         )
         usage_scope = None
         if getattr(self._ctx, "usage_event_sink", None) is not None:

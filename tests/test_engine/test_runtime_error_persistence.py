@@ -10,8 +10,10 @@ import pytest
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import ErrorEvent
 from opensquilla.provider import DoneEvent as ProviderDone
+from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.session.storage import StaleEpochError
+from opensquilla.session.terminal_reply import CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES
 from opensquilla.tools.types import CallerKind, ToolContext
 
 
@@ -109,6 +111,85 @@ class _ProviderSelector:
 
 
 @pytest.mark.asyncio
+async def test_stream_failure_keeps_durable_ref_and_execution_context() -> None:
+    class FailingProvider(_SingleReplyProvider):
+        provider_name = "openai"
+
+        async def _stream(self) -> AsyncIterator[object]:
+            yield ProviderText(text="Partial answer")
+            yield ProviderError(message="synthetic invalid api key", code="401")
+
+    records: list[dict[str, Any]] = []
+
+    class Writer:
+        def record_error(self, record):
+            records.append(record)
+            return True
+
+    manager = _RecordingSessionManager()
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(FailingProvider()),
+        session_manager=manager,
+        turn_error_writer=Writer(),
+        config=SimpleNamespace(context_window_tokens=100_000),
+    )
+    events = [event async for event in runner.run(
+        "hello", "agent:main:webchat:test",
+        ToolContext(is_owner=True, caller_kind=CallerKind.WEB),
+        no_memory_capture=True,
+        input_mode="text",
+    )]
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == len(records) == 1
+    assert errors[0].failure_kind == "auth_invalid"
+    assert errors[0].error_id == records[0]["error_id"]
+    assert records[0]["turn_id"]
+    assert records[0]["provider"] == "openai"
+    assert records[0]["model"] == "fake-model"
+    assert records[0]["surface"] == "text"
+    assert any(f"(ref: {errors[0].error_id})" in content for _, _, content in manager.messages)
+
+
+@pytest.mark.asyncio
+async def test_stream_error_records_without_session_manager_and_does_not_duplicate() -> None:
+    records: list[dict[str, Any]] = []
+
+    class Writer:
+        def record_error(self, record):
+            records.append(record)
+            return True
+
+    runner = TurnRunner(provider_selector=None, turn_error_writer=Writer())
+    event = ErrorEvent(message="Synthetic failure", code="provider_error")
+    await runner._persist_turn_error(
+        "agent:main:test:writer", event, turn_id="turn-1", surface="text",
+        provider="test", model="fake-model", fallback_hops=2,
+    )
+    await runner._persist_turn_error("agent:main:test:writer", event)
+    assert len(records) == 1
+    assert event.error_id == records[0]["error_id"]
+    assert records[0]["turn_id"] == "turn-1"
+    assert records[0]["fallback_hops"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_stream_error_failed_diagnostics_do_not_create_ref(raises: bool) -> None:
+    class Writer:
+        def record_error(self, record):
+            if raises:
+                raise RuntimeError("synthetic diagnostic failure")
+            return False
+
+    manager = _RecordingSessionManager()
+    runner = TurnRunner(provider_selector=None, session_manager=manager, turn_error_writer=Writer())
+    event = ErrorEvent(message="Synthetic failure", code="provider_error")
+    await runner._persist_turn_error("agent:main:test:writer", event)
+    assert event.error_id == ""
+    assert manager.messages[0][2] == "Error: Synthetic failure"
+
+
+@pytest.mark.asyncio
 async def test_provider_request_too_large_error_persistence_does_not_compact_transcript() -> None:
     manager = _RecordingSessionManager()
     runner = TurnRunner(
@@ -139,6 +220,22 @@ async def test_provider_request_too_large_error_persistence_does_not_compact_tra
             "or a larger-context model.",
         )
     ]
+
+
+@pytest.mark.parametrize("message", CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES.values())
+async def test_specific_request_budget_reason_survives_error_persistence(message: str) -> None:
+    manager = _RecordingSessionManager()
+    runner = TurnRunner(
+        provider_selector=None, session_manager=manager,
+        config=SimpleNamespace(context_window_tokens=100_000),
+    )
+
+    await runner._persist_turn_error(
+        "agent:main:webchat:test", ErrorEvent(message=message, code="provider_request_too_large"),
+    )
+
+    assert manager.compact_calls == []
+    assert manager.messages == [("agent:main:webchat:test", "system", f"Error: {message}")]
 
 
 @pytest.mark.asyncio

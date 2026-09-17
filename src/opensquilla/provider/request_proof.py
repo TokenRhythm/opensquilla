@@ -17,7 +17,9 @@ from typing import Any
 
 from PIL import Image
 
-from .types import ProviderFinalRequestProjection
+from opensquilla.context_budget import ContextBudgetGovernor
+
+from .types import ChatConfig, ProviderFinalRequestProjection
 
 _COMPACTED_STRING_MAX_CHARS = 1200
 _COMPACTED_TAIL_STRING_MAX_CHARS = 640
@@ -205,6 +207,76 @@ def _effective_proof_budget(proof_budget: int) -> tuple[int, int]:
     if proof_budget <= headroom:
         headroom = max(0, proof_budget // 4)
     return max(1, proof_budget - headroom), headroom
+
+
+def effective_proof_token_budget(token_budget: int) -> tuple[int, int]:
+    """Apply token headroom independently of any character constraint."""
+
+    if token_budget <= 0:
+        return 0, 0
+    headroom = min(4_096, max(128, int(token_budget * _PROOF_BUDGET_HEADROOM_RATIO)))
+    return max(0, token_budget - headroom), min(token_budget, headroom)
+
+
+def projected_generation_budget(payload: dict[str, Any], fallback_max_tokens: int) -> int:
+    """Read the final wire cap, or use a backend's configured output reserve.
+
+    Reasoning is already included in the adapter's generation cap. Backends
+    that omit the cap, including ChatGPT Codex, retain their supplied reserve.
+    """
+
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    options = payload.get("options")
+    if isinstance(options, dict):
+        value = options.get("num_predict")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return max(0, int(fallback_max_tokens))
+
+
+def provider_request_token_budget(payload: dict[str, Any], config: ChatConfig) -> int | None:
+    """Return raw physical input capacity; None keeps unknown-window compatibility."""
+
+    window = config.provider_context_window_tokens
+    if window <= 0:
+        return None
+    return ContextBudgetGovernor.from_values(
+        context_window_tokens=window,
+        max_output_tokens=projected_generation_budget(payload, config.max_tokens),
+        thinking_budget_tokens=0,
+        context_overflow_threshold=0.85,
+    ).snapshot().usable_tokens
+
+
+def provider_request_character_budget(payload: dict[str, Any], config: ChatConfig) -> int:
+    """Resolve the same caller/environment character guard for projection and send."""
+
+    configured = max(0, int(config.provider_request_max_chars or 0))
+    explicit = config.provider_request_max_chars_explicit_cap
+    if explicit is None and configured > 0:
+        # Compatibility for callers that predate cap provenance, or copied a
+        # config with its provenance deliberately unset.
+        budget = configured
+    elif explicit is not None and explicit > 0:
+        budget = explicit
+    else:
+        token_budget = provider_request_token_budget(payload, config)
+        # Zero physical capacity is enforced by the independent token proof;
+        # a positive sentinel also keeps character-only consumers guarded.
+        budget = (
+            configured if token_budget is None
+            else max(1, token_budget * _CHARS_PER_TOKEN_EQUIVALENT)
+        )
+    try:
+        environment_cap = int(os.environ.get("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS") or 0)
+    except ValueError:
+        environment_cap = 0
+    if environment_cap > 0:
+        return min(budget, environment_cap) if budget > 0 else environment_cap
+    return budget
 
 
 def _serialized_token_estimate(serialized_payload: str) -> tuple[int, str]:
@@ -1569,6 +1641,7 @@ def project_provider_payload(
     *,
     projection_adapter: str,
     proof_budget: int,
+    token_budget: int | None = None,
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
     envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
@@ -1608,19 +1681,27 @@ def project_provider_payload(
     estimated_chars = projected_text_chars + media.reserve_chars
     estimated_tokens = estimated_text_tokens + media.reserve_tokens
     effective_budget, headroom_chars = _effective_proof_budget(proof_budget)
-    raw_token_budget = (
-        max(1, proof_budget // _CHARS_PER_TOKEN_EQUIVALENT)
-        if proof_budget > 0
-        else proof_budget
-    )
-    effective_token_budget = (
-        max(1, effective_budget // _CHARS_PER_TOKEN_EQUIVALENT)
-        if proof_budget > 0
-        else effective_budget
-    )
+    if token_budget is None:
+        raw_token_budget = (
+            max(1, proof_budget // _CHARS_PER_TOKEN_EQUIVALENT)
+            if proof_budget > 0
+            else proof_budget
+        )
+        effective_token_budget = (
+            max(1, effective_budget // _CHARS_PER_TOKEN_EQUIVALENT)
+            if proof_budget > 0
+            else effective_budget
+        )
+        headroom_tokens = max(0, raw_token_budget - effective_token_budget)
+        token_budget_source = "legacy_character_limit"
+    else:
+        raw_token_budget = max(0, token_budget)
+        effective_token_budget, headroom_tokens = effective_proof_token_budget(raw_token_budget)
+        token_budget_source = "physical_context_window"
     fits_char_budget = proof_budget <= 0 or estimated_chars <= effective_budget
     fits_token_budget = (
-        proof_budget <= 0 or estimated_tokens <= effective_token_budget
+        (token_budget is None and proof_budget <= 0)
+        or estimated_tokens <= effective_token_budget
     )
     fits = fits_char_budget and fits_token_budget
     proof: dict[str, Any] = {
@@ -1636,6 +1717,8 @@ def project_provider_payload(
         "raw_proof_token_budget": raw_token_budget,
         "effective_proof_token_budget": effective_token_budget,
         "proof_headroom_chars": headroom_chars,
+        "proof_headroom_tokens": headroom_tokens,
+        "token_budget_source": token_budget_source,
         "fits_char_budget": fits_char_budget,
         "fits_token_budget": fits_token_budget,
         "fits": fits,
@@ -1738,6 +1821,7 @@ def project_final_request_payload(
     *,
     projection_adapter: str,
     proof_budget: int,
+    token_budget: int | None = None,
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
     envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
@@ -1757,6 +1841,7 @@ def project_final_request_payload(
         payload,
         projection_adapter=projection_adapter,
         proof_budget=proof_budget,
+        token_budget=token_budget,
         status_projection_mode=status_projection_mode,
         fallback_reason=fallback_reason,
         envelope_shape=envelope_shape,
@@ -1802,6 +1887,7 @@ def prove_provider_payload(
     *,
     projection_adapter: str,
     proof_budget: int,
+    token_budget: int | None = None,
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
     envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
@@ -1814,6 +1900,7 @@ def prove_provider_payload(
         payload,
         projection_adapter=projection_adapter,
         proof_budget=proof_budget,
+        token_budget=token_budget,
         status_projection_mode=status_projection_mode,
         fallback_reason=fallback_reason,
         envelope_shape=envelope_shape,
@@ -1830,13 +1917,14 @@ def prove_or_compact_provider_payload(
     *,
     projection_adapter: str,
     proof_budget: int,
+    token_budget: int | None = None,
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
     envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
     active_user_message_index: int | None = None,
     protected_tool_result_indexes: Collection[int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    if proof_budget <= 0:
+    if proof_budget <= 0 and token_budget is None:
         # A disabled size proof is not permission to bypass the physical
         # transport's JSON contract. HTTPX rejects NaN/Infinity and other
         # non-JSON values, so validate with the same strictness here and let
@@ -1853,6 +1941,7 @@ def prove_or_compact_provider_payload(
             payload,
             projection_adapter=projection_adapter,
             proof_budget=proof_budget,
+            token_budget=token_budget,
             status_projection_mode=status_projection_mode,
             fallback_reason=fallback_reason,
             envelope_shape=envelope_shape,
@@ -1866,6 +1955,7 @@ def prove_or_compact_provider_payload(
             payload,
             projection_adapter=projection_adapter,
             proof_budget=proof_budget,
+            token_budget=token_budget,
             status_projection_mode=status_projection_mode,
             fallback_reason=fallback_reason,
             envelope_shape=envelope_shape,
@@ -1890,6 +1980,7 @@ def prove_or_compact_provider_payload(
             tool_compacted,
             projection_adapter=projection_adapter,
             proof_budget=proof_budget,
+            token_budget=token_budget,
             status_projection_mode=status_projection_mode,
             fallback_reason=fallback_reason,
             envelope_shape=envelope_shape,
@@ -1916,6 +2007,7 @@ def prove_or_compact_provider_payload(
             tail_compacted,
             projection_adapter=projection_adapter,
             proof_budget=proof_budget,
+            token_budget=token_budget,
             status_projection_mode=status_projection_mode,
             fallback_reason=fallback_reason,
             envelope_shape=envelope_shape,
@@ -1934,6 +2026,7 @@ def prove_or_compact_provider_payload(
                 emergency_compacted,
                 projection_adapter=projection_adapter,
                 proof_budget=proof_budget,
+                token_budget=token_budget,
                 status_projection_mode=status_projection_mode,
                 fallback_reason=fallback_reason,
                 envelope_shape=envelope_shape,
@@ -1952,6 +2045,7 @@ def prove_or_compact_provider_payload(
                     hard_compacted,
                     projection_adapter=projection_adapter,
                     proof_budget=proof_budget,
+                    token_budget=token_budget,
                     status_projection_mode=status_projection_mode,
                     fallback_reason=fallback_reason,
                     envelope_shape=envelope_shape,
@@ -2030,6 +2124,7 @@ def prove_provider_payload_from_env(
     payload: dict[str, Any],
     *,
     projection_adapter: str,
+    token_budget: int | None = None,
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
     envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
@@ -2037,16 +2132,17 @@ def prove_provider_payload_from_env(
     protected_tool_result_indexes: Collection[int] | None = None,
 ) -> dict[str, Any] | None:
     raw = os.environ.get("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS")
-    if not raw:
-        return None
     try:
-        proof_budget = int(raw)
+        proof_budget = int(raw) if raw else 0
     except ValueError:
+        proof_budget = 0
+    if proof_budget <= 0 and token_budget is None:
         return None
     return prove_provider_payload(
         payload,
         projection_adapter=projection_adapter,
         proof_budget=proof_budget,
+        token_budget=token_budget,
         status_projection_mode=status_projection_mode,
         fallback_reason=fallback_reason,
         envelope_shape=envelope_shape,

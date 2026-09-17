@@ -48,6 +48,13 @@ from opensquilla.skills.hub.lockfile import (
     compute_sha256,
     compute_tree_sha256,
 )
+from opensquilla.skills.hub.operations import (
+    InstallOperations,
+    InstallOperationStore,
+    current_install_operation,
+    operation_database,
+    report_install_progress,
+)
 from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.scanner import ScanResult, scan_skill_tree
 from opensquilla.skills.hub.source import (
@@ -65,6 +72,7 @@ from opensquilla.skills.hub.transaction import (
     fsync_directory,
     fsync_staging_tree,
     guard_retained_recovery_journal,
+    managed_root_identity,
     path_is_occupied,
     recover_pending_skill_transaction,
     remove_transaction_journal,
@@ -459,6 +467,10 @@ class InstallResult:
             "rollbackPerformed": self.rollback_performed,
             "catalogGeneration": self.catalog_generation,
             "effectiveFrom": self.effective_from,
+            **({"recoveryRequired": True} if any(
+                item.blocking and item.code == "RECOVERY_REQUIRED"
+                for item in self.diagnostics
+            ) else {}),
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -1175,11 +1187,22 @@ class SkillManagementService:
         self._journal_path = journal_path or default_journal_path(managed_dir)
         self._mutation_lock = mutation_lock or mutation_lock_for(managed_dir)
         self._offline = offline or loader is None
+        self._install_operations: InstallOperations | None = None
         self._recovery_required_diagnostics: tuple[SkillDiagnostic, ...] = ()
         bind_lockfile = getattr(loader, "bind_managed_lockfile", None)
         if callable(bind_lockfile):
             bind_lockfile(lockfile_path)
         self._observe_recovery(list(startup_recovery_diagnostics))
+
+    @property
+    def install_operations(self) -> InstallOperations:
+        if self._install_operations is None:
+            self._install_operations = InstallOperations(InstallOperationStore(
+                operation_database(self._journal_path),
+                root_id=managed_root_identity(self._managed_dir),
+            ))
+        self._install_operations.store.recover_orphans(self._journal_path)
+        return self._install_operations
 
     @property
     def managed_dir(self) -> Path:
@@ -2031,6 +2054,7 @@ class SkillManagementService:
             )
             return self._recovery_required_result(recovery_name)
 
+        report_install_progress("downloading")
         transaction_id = uuid.uuid4().hex
         transaction_root = staging_root(self._managed_dir) / transaction_id
         raw_candidate = transaction_root / "_candidate"
@@ -2178,6 +2202,7 @@ class SkillManagementService:
                 resolution,
                 identifier,
             )
+            report_install_progress("scanning")
             scan_result = await run_staging_worker(scan_skill_tree, candidate_dir)
             risk_confirmation_details: dict[str, Any] = {}
             risk_acknowledged = False
@@ -2644,6 +2669,7 @@ class SkillManagementService:
                     rollback=rollback,
                     lockfile_path=self._lockfile_path,
                 )
+                report_install_progress("committing")
                 fsync_staging_tree(candidate_dir)
                 fsync_directory(rollback.parent)
                 fsync_directory(rollback.parent.parent)
@@ -2805,11 +2831,18 @@ class SkillManagementService:
                     effective_from="next_turn" if self._loader is not None else "next_start",
                 )
                 if journal is not None:
+                    if journal.install_operation_id:
+                        journal.install_receipt = success_result.to_dict()
                     journal.advance("committed", self._journal_path)
                 durably_committed = True
                 if publication_barrier is not None:
                     publication_barrier.commit()
                 try:
+                    operation = current_install_operation()
+                    if operation is not None:
+                        operation.store.finish(
+                            operation.owner, operation.id, success_result.to_dict(),
+                        )
                     if journal is not None:
                         validate_transaction_journal_paths(
                             journal,
@@ -2944,9 +2977,7 @@ class SkillManagementService:
                     drifted = True
             if journal is None or not path_is_occupied(self._journal_path):
                 cleanup_pre_journal_reservation()
-            if not isinstance(exc, Exception):
-                raise
-            return self._failure(
+            failure_result = self._failure(
                 name=name,
                 message=str(exc) or type(exc).__name__,
                 diagnostics=diagnostics,
@@ -2965,6 +2996,16 @@ class SkillManagementService:
                 install_id=old_entry.install_id if old_entry is not None else "",
                 compatibility=_entry_compatibility(old_entry),
             )
+            if not isinstance(exc, Exception):
+                operation = current_install_operation()
+                if isinstance(exc, asyncio.CancelledError) and operation is not None:
+                    payload = failure_result.to_dict()
+                    payload["cancelled"] = not payload.get("recoveryRequired", False)
+                    if payload["cancelled"]:
+                        payload["message"] = "Skill installation cancelled"
+                    operation.store.finish(operation.owner, operation.id, payload)
+                raise
+            return failure_result
         finally:
             publication_stack.close()
 

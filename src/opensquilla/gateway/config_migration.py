@@ -41,6 +41,19 @@ class ConfigParseError(ValueError):
 
 DEPRECATED_MEMORY_FIELDS: frozenset[str] = frozenset(
     {
+        "memory.flush_enabled",
+        "memory.flush_triggers",
+        "memory.flush_pre_compaction",
+        "memory.flush_timeout_seconds",
+        "memory.flush_background_timeout_seconds",
+        "memory.flush_backoff_initial_seconds",
+        "memory.flush_backoff_max_seconds",
+        "memory.flush_archive_max_bytes",
+        "memory.flush_compaction_requires_safe_receipt",
+        "memory.flush_compaction_safety_mode",
+        "memory.repair_enabled",
+        "memory.repair_interval_seconds",
+        "memory.repair_max_items_per_tick",
         "memory.profile",
         "memory.cost.embedding_cache",
         "memory.cost.rerank_cache",
@@ -188,13 +201,13 @@ def handle_deprecated_memory_fields(
         warnings.warn(
             f"OpenSquilla: {n} legacy memory.* config field(s) ignored "
             f"(e.g. {first_three}); see {log_ref} for details. "
-            f"These fields will be removed in 0.2.0.",
+            "These fields will be cleaned during config rewrite.",
             DeprecationWarning,
             stacklevel=6,
         )
         logging.getLogger(__name__).warning(
             "OpenSquilla: %d legacy memory.* config field(s) ignored (e.g. %s); "
-            "see %s for details. These fields will be removed in 0.2.0.",
+            "see %s for details. These fields will be cleaned during config rewrite.",
             n,
             first_three,
             log_ref,
@@ -842,7 +855,7 @@ def backup_and_write_migrated_config(
     atomic_write_config(target, payload)
     os.chmod(native_io_path(target), 0o600)
     logging.getLogger(__name__).warning(
-        "OpenSquilla config migrated for 0.2.0 schema",
+        "OpenSquilla config migrated",
         extra={
             "path": str(target),
             "backup": str(backup),

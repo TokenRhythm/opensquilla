@@ -93,14 +93,6 @@ opensquilla sessions export <session-key>
 opensquilla diagnostics on
 ```
 
-For memory repair surfaces related to degraded compaction records:
-
-```sh
-opensquilla memory repair list
-opensquilla memory repair show --summary-id <id>
-opensquilla memory raw-fallbacks list
-```
-
 ## Best Practices
 
 - Keep important final artifacts in files or published artifacts.

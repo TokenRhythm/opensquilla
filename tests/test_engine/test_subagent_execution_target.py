@@ -31,7 +31,7 @@ from opensquilla.provider import (
     ToolDefinition,
     ToolInputSchema,
 )
-from opensquilla.provider.model_catalog import shared_catalog
+from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 
 
@@ -78,7 +78,12 @@ class _OpaqueProvider:
         return []
 
 
-def test_subagent_model_override_binds_child_provider_window_and_compaction_plan() -> None:
+def test_subagent_model_override_binds_child_provider_window_and_compaction_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({"fake/child-model": {"context_window": 32_768}})
+    monkeypatch.setattr("opensquilla.provider.model_catalog.shared_catalog", lambda: catalog)
     parent_provider = _ModelProvider("parent-model")
     parent = Agent(
         provider=parent_provider,
@@ -101,7 +106,8 @@ def test_subagent_model_override_binds_child_provider_window_and_compaction_plan
     assert child.config.provider_id == "fake"
     assert child.config.model_id == "child-model"
     assert child.config.context_window_tokens == 32_768
-    assert child.config.max_tokens == shared_catalog().resolve_max_tokens(
+    assert child.config.context_window_known is True
+    assert child.config.max_tokens == catalog.resolve_max_tokens(
         "child-model",
         provider="fake",
     )
@@ -112,6 +118,89 @@ def test_subagent_model_override_binds_child_provider_window_and_compaction_plan
     assert plan.primary.provider_id == "fake"
     assert plan.primary.model == "child-model"
     assert plan.primary.context_window_tokens == child.config.context_window_tokens
+
+
+@pytest.mark.parametrize("known_window", [False, True])
+def test_subagent_preserves_inherited_window_provenance(known_window: bool) -> None:
+    model = "synthetic-undocumented-window"
+    parent = Agent(
+        provider=_ModelProvider(model),
+        config=AgentConfig(
+            provider_id="fake", model_id=model,
+            context_window_tokens=200_000, context_window_known=known_window,
+            max_tokens=4096,
+        ),
+    )
+    child = parent._make_child_agent(SubagentSpec(task="inspect this"), depth=1)
+    assert child.config.context_window_tokens == 200_000
+    assert child.config.context_window_known is known_window
+    chat_config = child._provider_admission_chat_config(
+        "synthetic request", context_window_tokens=200_000,
+    )
+    assert chat_config.provider_context_window_tokens == (200_000 if known_window else 0)
+    plan = child.config.compaction_execution_plan
+    assert plan is not None
+    assert plan.primary.context_window_source == (
+        "caller_resolved" if known_window else "bounded_fallback"
+    )
+
+
+def test_subagent_unknown_model_override_keeps_legacy_window_unproven() -> None:
+    parent = Agent(
+        provider=_ModelProvider("parent-model"),
+        config=AgentConfig(provider_id="fake", model_id="parent-model"),
+    )
+    child = parent._make_child_agent(
+        SubagentSpec(task="inspect this", model_id="synthetic-undocumented-window"), depth=1,
+    )
+    assert child.config.context_window_tokens == 32_768
+    assert child.config.context_window_known is False
+    assert child.config.compaction_execution_plan is not None
+    assert (
+        child.config.compaction_execution_plan.primary.context_window_source == "bounded_fallback"
+    )
+
+
+@pytest.mark.parametrize("model_override_window", [0, 96_000])
+def test_subagent_model_override_uses_exact_credential_limits(
+    monkeypatch: pytest.MonkeyPatch, model_override_window: int,
+) -> None:
+    from opensquilla.provider.openai import OpenAIProvider
+    from opensquilla.provider.tokenrhythm_catalog import (
+        parse_tokenrhythm_declared,
+        tokenrhythm_authority_identity,
+    )
+
+    model = "qwen3.7-max"
+    key = "synthetic-limited-authority"
+    base = "https://tokenrhythm.studio/v1"
+    authority = tokenrhythm_authority_identity(provider="tokenrhythm", base_url=base, api_key=key)
+    assert authority is not None
+    catalog = ModelCatalog()
+    catalog.set_tokenrhythm_snapshot_sidecars(published={}, declared_by_authority={
+        authority: parse_tokenrhythm_declared({"data": [{
+            "id": model, "context_length": 64_000, "max_completion_tokens": 8192,
+        }]}),
+    })
+    if model_override_window:
+        catalog.set_user_overrides({f"tokenrhythm/{model}": {
+            "context_window": model_override_window,
+        }})
+    monkeypatch.setattr("opensquilla.provider.model_catalog.shared_catalog", lambda: catalog)
+    parent = Agent(
+        provider=OpenAIProvider(
+            provider_kind="tokenrhythm", model="parent-model", api_key=key, base_url=base,
+        ),
+        config=AgentConfig(provider_id="tokenrhythm", model_id="parent-model"),
+    )
+    child = parent._make_child_agent(SubagentSpec(task="inspect", model_id=model), depth=1)
+    assert child.config.context_window_tokens == (model_override_window or 64_000)
+    assert child.config.context_window_known is True
+    assert child.config.max_tokens == 8192
+    assert child.config.compaction_execution_plan is not None
+    assert child.config.compaction_execution_plan.primary.context_window_tokens == (
+        model_override_window or 64_000
+    )
 
 
 def test_subagent_inherits_current_physical_model_vision_support() -> None:
@@ -446,7 +535,12 @@ async def test_subagent_inherits_a_working_progressive_tool_index() -> None:
     assert "list_dir" in {tool.name for tool in child.tool_definitions}
 
 
-def test_selector_fallback_subagent_freezes_active_chain_and_model_override() -> None:
+def test_selector_fallback_subagent_freezes_active_chain_and_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({"ollama/child-model": {"max_output_tokens": 2048}})
+    monkeypatch.setattr("opensquilla.provider.model_catalog.shared_catalog", lambda: catalog)
     selector = ModelSelector(
         SelectorConfig(
             primary=ProviderConfig(
@@ -500,7 +594,12 @@ def test_selector_fallback_subagent_freezes_active_chain_and_model_override() ->
     assert child.config.model_id == "child-model"
 
 
-def test_selector_fallback_subagent_without_override_still_owns_selector() -> None:
+def test_selector_fallback_subagent_without_override_still_owns_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({"ollama/active-model": {"max_output_tokens": 2048}})
+    monkeypatch.setattr("opensquilla.provider.model_catalog.shared_catalog", lambda: catalog)
     selector = ModelSelector(
         SelectorConfig(
             primary=ProviderConfig(

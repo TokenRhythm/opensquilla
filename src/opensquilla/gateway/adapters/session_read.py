@@ -141,13 +141,14 @@ def build_v4_session_read_application(
     storage: SessionStorage | None,
     ports: GatewaySessionReadPorts,
     clock: Clock | None = None,
+    channel_types: dict[str, str] | None = None,
 ) -> SessionReadApplication:
     """Compose the complete Session read Module behind one production seam."""
 
     snapshots = build_v4_conversation_snapshot_application(streams)
     history = build_session_history_application(session_manager)
     transcript = (
-        build_session_preview_application(storage, clock=clock)
+        build_session_preview_application(storage, clock=clock, channel_types=channel_types)
         if storage is not None
         else _unavailable_preview_application(clock=clock)
     )

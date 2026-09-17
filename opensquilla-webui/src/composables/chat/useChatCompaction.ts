@@ -1,6 +1,7 @@
 import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import {
+  compactionCompletedLabelCode,
   compactionSkippedLabelCode,
   compactionSkipIsInformational,
 } from '@/utils/chat/compactionStatus'
@@ -181,7 +182,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (!payload) return false
     if (payload.refused === true || payload.safe_to_send === false || payload.safeToSend === false) return true
     const reason = String(payload.reason || payload.error_reason || payload.errorClass || payload.error_class || payload.error?.reason || payload.error?.code || '').toLowerCase()
-    return ['compaction_insufficient', 'compaction_flush_failed', 'context_overflow', 'unsafe_flush_receipt'].includes(reason)
+    return ['compaction_insufficient', 'context_overflow'].includes(reason)
   }
 
   function settleCompactInFlight(payload: ChatCompactPayload = {}, settleOptions: SettleCompactOptions = {}) {
@@ -441,7 +442,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (status === 'emergency_ephemeral') {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
-      showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.compacted'), {
+      showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.temporarilyReduced'), {
         tone: 'warn',
         detail: typeof payload.detail === 'string'
           ? payload.detail
@@ -455,7 +456,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (status === 'completed') {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
-      showCompactStatus('completed', i18n.global.t('chat.compact.compacted'), {
+      showCompactStatus('completed', i18n.global.t(compactionCompletedLabelCode(payload.durability)), {
         tone: 'ok',
         source,
         compactionId,

@@ -113,6 +113,7 @@ class _ResolvedCatalog:
     top_p: float | None = None
     # Explicit provider-request proof budget (chars); 0 keeps the derived path.
     provider_request_proof_max_chars: int = 0
+    context_window_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -120,25 +121,14 @@ class _AgentConfigAuxiliaries:
     """Bag of resolved auxiliaries for AgentConfig construction.
 
     Carries every value the AgentConfig body reads via
-    ``getattr(_mem_cfg, ...)`` / ``getattr(_agent_token_cfg, ...)`` so the
+    ``getattr(_compaction_cfg, ...)`` / ``getattr(_agent_token_cfg, ...)`` so the
     stage body becomes a single ``AgentConfig(...)`` call site.
     """
 
     thinking: bool | ThinkingLevel
-    flush_workspace_dir: str
     tool_result_store_dir: str
     tool_result_store_session_id: str
-    # Memory-cfg-derived (defaults match the inline ``getattr`` defaults)
-    flush_enabled: bool
-    flush_triggers: list[str]
-    flush_pre_compaction: bool
-    flush_timeout_seconds: float
-    flush_background_timeout_seconds: float
-    flush_backoff_initial_seconds: float
-    flush_backoff_max_seconds: float
-    flush_archive_max_bytes: int
-    flush_compaction_requires_safe_receipt: bool
-    flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"]
+    # Compaction-cfg-derived (defaults match the inline ``getattr`` defaults)
     compaction_profile: Literal["conversation", "coding", "research", "support"]
     compaction_protected_recent_messages: int
     compaction_total_timeout_seconds: float
@@ -275,8 +265,8 @@ class AgentFactoryPort(Protocol):
     """Wraps the typed ``Agent(...)`` constructor.
 
     Mirrors the call shape with the typed runtime constructor params
-    (``memory_sync_manager``, ``session_flush_service``). The adapter at
-    the harness side reads ``self._session_flush_service`` from the
+    (``memory_sync_manager``). The adapter at
+    the harness side reads runtime collaborators from the
     runner and forwards everything else from the call site.
     """
 
@@ -626,10 +616,13 @@ class AgentBootstrapStage:
                     if fallback_catalog.auto_max_tokens_known
                     else 0
                 )
+                physical_window = (
+                    fallback_catalog.context_window if fallback_catalog.context_window_known else 0
+                )
                 private_fallback_limits.append(
                     (
                         deployment,
-                        fallback_catalog.context_window,
+                        physical_window,
                         effective_max_tokens,
                         fallback_catalog.capabilities,
                     )
@@ -650,7 +643,7 @@ class AgentBootstrapStage:
                 fallback_capabilities.setdefault(
                     (fallback_provider, fallback_model),
                     (
-                        fallback_catalog.context_window,
+                        physical_window,
                         effective_max_tokens,
                         fallback_catalog.capabilities,
                     ),
@@ -674,7 +667,7 @@ class AgentBootstrapStage:
                     fallback_provider,
                 )
                 fallback_capabilities[(fallback_provider, fallback_model)] = (
-                    fallback_catalog.context_window,
+                    fallback_catalog.context_window if fallback_catalog.context_window_known else 0,
                     (
                         fallback_catalog.auto_max_tokens
                         if fallback_catalog.auto_max_tokens_known
@@ -774,6 +767,7 @@ class AgentBootstrapStage:
             temperature=catalog.temperature,
             top_p=catalog.top_p,
             context_window_tokens=catalog.context_window,
+            context_window_known=catalog.context_window_known,
             context_window_tokens_global_override=(
                 catalog.context_window_tokens_global_override
             ),
@@ -785,21 +779,10 @@ class AgentBootstrapStage:
             materialize_historical_attachments=bool(
                 inp.turn.metadata.get("bootstrap_workspace_dir")
             ),
-            flush_enabled=aux.flush_enabled,
-            flush_triggers=aux.flush_triggers,
-            flush_pre_compaction=aux.flush_pre_compaction,
-            flush_timeout_seconds=aux.flush_timeout_seconds,
-            flush_background_timeout_seconds=aux.flush_background_timeout_seconds,
-            flush_backoff_initial_seconds=aux.flush_backoff_initial_seconds,
-            flush_backoff_max_seconds=aux.flush_backoff_max_seconds,
-            flush_archive_max_bytes=aux.flush_archive_max_bytes,
-            flush_compaction_requires_safe_receipt=(aux.flush_compaction_requires_safe_receipt),
-            flush_compaction_safety_mode=aux.flush_compaction_safety_mode,
             compaction_profile=aux.compaction_profile,
             compaction_protected_recent_messages=(aux.compaction_protected_recent_messages),
             compaction_total_timeout_seconds=aux.compaction_total_timeout_seconds,
             compaction_heartbeat_interval_seconds=aux.compaction_heartbeat_interval_seconds,
-            flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
             model_tools_capability_verified=active_artifact_tools_verified,
             model_vision_support=effective_model_vision_support,

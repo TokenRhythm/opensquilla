@@ -4,8 +4,8 @@ The subagent loads its config through ``OPENSQUILLA_GATEWAY_CONFIG_PATH``,
 which REPLACES the normal config chain — so the bundled template used to pin
 the subagent to the template's own provider no matter what the operator
 configured (issue #541). Assembly keeps the template authoritative for run
-policy (tool deny list, sandbox and access posture, meta-skill gating, memory
-flush) while the operator's provider stack is carried into the per-run config,
+policy (tool deny list, sandbox and access posture, meta-skill gating) while
+the operator's provider stack is carried into the per-run config,
 so the subagent talks to the same provider as every other surface.
 """
 

@@ -543,6 +543,40 @@ def test_profile_import_preserves_unmodified_toml_bytes_and_comments(
     assert (target / "config.toml").read_bytes() == source_config
 
 
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_profile_import_removes_retired_inline_memory_fields_without_reformatting(
+    tmp_path: Path, newline: bytes,
+) -> None:
+    source = _build_source_home(tmp_path)
+    header = (
+        f"config_version = {config_migration_module.LATEST_CONFIG_VERSION}\n"
+        "# keep operator comments\nport = 18791\n"
+    ).encode()
+    source_config = header + (
+        b'memory = { flush_enabled=true, "flush_triggers"=["manual"], '
+        b"embedding={model='synthetic, } # model'}, capture_assistant = true, "
+        b"repair_enabled=false } # keep memory comment\n"
+    )
+    expected = header + (
+        b"memory = { embedding={model='synthetic, } # model'}, "
+        b"capture_assistant = true} # keep memory comment\n"
+    )
+    source_config = source_config.replace(b"\n", newline)
+    expected = expected.replace(b"\n", newline)
+    (source / "config.toml").write_bytes(source_config)
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    assert not _errors(report)
+    assert (source / "config.toml").read_bytes() == source_config
+    assert (target / "config.toml").read_bytes() == expected
+    assert tomllib.loads(expected.decode())["memory"] == {
+        "embedding": {"model": "synthetic, } # model"},
+        "capture_assistant": True,
+    }
+
+
 def test_profile_import_losslessly_patches_legacy_paths_and_secret_comments(
     tmp_path: Path,
 ) -> None:

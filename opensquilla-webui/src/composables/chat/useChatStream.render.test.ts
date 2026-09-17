@@ -7,6 +7,7 @@ import {
 } from './useChatStream'
 import type { ChatMessage, ChatRunStatus } from '@/types/chat'
 import type { InterruptViewState } from '@/types/parts'
+import { reconcileRunningHistoryMessages } from '@/utils/chat/historyMerge'
 
 // Focused coverage for the streaming render coalescer: stream deltas are
 // batched onto the frame clock (requestAnimationFrame) and the live reveal
@@ -828,6 +829,7 @@ describe('useChatStream render coalescing', () => {
 
     for (const [status, id] of [
       ['completed', 'cmp-completed'],
+      ['emergency_ephemeral', 'cmp-temporary'],
       ['skipped', 'cmp-skipped'],
       ['stale', 'cmp-stale'],
       ['cancelled', 'cmp-cancelled'],
@@ -838,11 +840,13 @@ describe('useChatStream render coalescing', () => {
 
     expect(api.foldedTurn.value.statusHistory.map(entry => [entry.id, entry.state])).toEqual([
       ['cmp-completed', 'completed'],
+      ['cmp-temporary', 'completed'],
       ['cmp-skipped', 'skipped'],
       ['cmp-stale', 'stale'],
       ['cmp-cancelled', 'cancelled'],
       ['cmp-failed', 'failed'],
     ])
+    expect(api.foldedTurn.value.statusHistory[1]?.durability).toBe('request_scoped')
     api.cleanup()
   })
 
@@ -870,6 +874,65 @@ describe('useChatStream render coalescing', () => {
       ['assistant', 'after'],
     ])
     expect(messages.value.every(message => message.turnId === 'turn-steered')).toBe(true)
+    api.cleanup()
+  })
+
+  it('preserves distinct steer checkpoints with identical timestamps and text after history refresh', () => {
+    vi.setSystemTime(new Date('2026-07-06T01:00:00Z'))
+    const { api, messages } = makeStream()
+    messages.value.push({
+      role: 'user',
+      text: 'request',
+      ts: 0,
+      messageId: 'user',
+      turnId: 'turn-steered',
+    })
+
+    api.appendDelta('OK', 'answer', { modelCallId: '1.0', iteration: 1 })
+    api.checkpointForUserMessage('turn-steered', 'steer-1')
+    messages.value.push({
+      role: 'user',
+      text: 'first adjustment',
+      ts: 1,
+      messageId: 'steer-1',
+      clientId: 'steer-1',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+    api.acknowledgeSteerBoundary('steer-1', '2.0', 2)
+    api.appendDelta('OK', 'answer', { modelCallId: '2.0', iteration: 2 })
+    api.checkpointForUserMessage('turn-steered', 'steer-2')
+    messages.value.push({
+      role: 'user',
+      text: 'second adjustment',
+      ts: 2,
+      messageId: 'steer-2',
+      clientId: 'steer-2',
+      turnId: 'turn-steered',
+      inputDisposition: 'applied',
+    })
+    api.acknowledgeSteerBoundary('steer-2', '3.0', 3)
+
+    const checkpoints = messages.value.filter(message => message.role === 'assistant')
+    expect(checkpoints.map(message => [message.clientId, message.text])).toEqual([
+      ['live-steer-checkpoint:steer-1', 'OK'],
+      ['live-steer-checkpoint:steer-2', 'OK'],
+    ])
+    expect(checkpoints[0]?.ts).toEqual(checkpoints[1]?.ts)
+
+    const incoming = messages.value
+      .filter(message => message.role === 'user')
+      .map(message => ({ ...message, restoredFromHistory: true }))
+    const merged = reconcileRunningHistoryMessages(messages.value, incoming)
+    expect(merged.map(message => [message.role, message.text])).toEqual([
+      ['user', 'request'],
+      ['assistant', 'OK'],
+      ['user', 'first adjustment'],
+      ['assistant', 'OK'],
+      ['user', 'second adjustment'],
+    ])
+    expect(merged.filter(message => message.role === 'assistant').map(message => message.clientId))
+      .toEqual(['live-steer-checkpoint:steer-1', 'live-steer-checkpoint:steer-2'])
     api.cleanup()
   })
 

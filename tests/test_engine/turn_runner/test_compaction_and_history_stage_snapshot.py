@@ -261,7 +261,6 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
         session_key="cron:tick:s1",
         t3_return="not_applicable",
     ),
-    _case("t3_flush_failed_preflight_fallthrough", t3_return="flush_failed"),
     _case("compaction_circuit_open", t3_return="handled"),
     _case(
         "durable_summaries_exist",
@@ -301,7 +300,7 @@ def _build_runner() -> TurnRunner:
         model_catalog=_StubModelCatalog(),
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,
@@ -438,7 +437,7 @@ async def test_compaction_and_history_stage_snapshot(
         assert isinstance(yielded[0], ErrorEvent)
         assert yielded[0].code == "agent_error"
         assert len(call_log["t3"]) == 1
-        if case["t3_return"] in {"not_applicable", "flush_failed"}:
+        if case["t3_return"] == "not_applicable":
             assert len(call_log["preflight"]) == 1
         # And history must have been attempted once before raising.
         assert len(call_log["history"]) == 1
@@ -461,7 +460,7 @@ async def test_compaction_and_history_stage_snapshot(
     # Routing assertions: t3 always invoked exactly once.
     assert len(call_log["t3"]) == 1, f"{case_id}: t3 calls"
     # Preflight invoked only on fall-through sentinels.
-    fall_through = case["t3_return"] in {"not_applicable", "flush_failed"}
+    fall_through = case["t3_return"] == "not_applicable"
     expected_pre_calls = 1 if fall_through else 0
     assert len(call_log["preflight"]) == expected_pre_calls, (
         f"{case_id}: preflight calls"

@@ -38,7 +38,6 @@ _AUXILIARY_CALL_ROLES = frozenset(
     {
         "meta",
         "vision_gate",
-        "session_flush",
         "media",
         "naming",
         "compaction",

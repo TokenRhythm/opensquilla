@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,7 +17,8 @@ from opensquilla.gateway.adapters.session_preview import (
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
-from opensquilla.session.storage import _BOUNDED_INTERACTIVE_READS
+from opensquilla.session.models import SessionNode, TranscriptEntry
+from opensquilla.session.storage import _BOUNDED_INTERACTIVE_READS, SessionStorage
 
 
 class BoundedStorage:
@@ -48,8 +51,19 @@ class BoundedStorage:
         )
         return {"preview-id": "latest"}
 
+    async def list_canonical_user_transcript_content_batch(
+        self,
+        session_ids: list[str],
+        *,
+        limit_per_session: int,
+    ) -> dict[str, list[str]]:
+        self.calls.append(
+            ("titles", (_BOUNDED_INTERACTIVE_READS.get(), list(session_ids), limit_per_session))
+        )
+        return {"preview-id": ["整理示例图片"]}
 
-def context(storage: BoundedStorage) -> RpcContext:
+
+def context(storage: BoundedStorage | SessionStorage) -> RpcContext:
     ctx = RpcContext(
         conn_id="preview-test",
         principal=Principal(
@@ -58,7 +72,7 @@ def context(storage: BoundedStorage) -> RpcContext:
             is_owner=True,
             authenticated=True,
         ),
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
     )
     ctx.session_manager = SimpleNamespace(storage=storage)
     return ctx
@@ -99,6 +113,36 @@ async def test_preview_adapter_preserves_key_selection_order() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_preview_recovers_custom_named_channel_title_using_configured_type() -> None:
+    storage = BoundedStorage()
+    storage.session.session_key = "agent:main:sample-channel:direct:sample-user"
+    storage.session.last_channel = "sample-channel"
+    storage.session.derived_title = "I cannot assist with that request"
+    ctx = context(storage)
+    ctx.config = GatewayConfig(
+        channels={
+            "channels": [
+                {
+                    "type": "feishu",
+                    "name": "sample-channel",
+                    "app_id": "cli_dummy",
+                    "app_secret": "dummy",
+                }
+            ]
+        },
+    )
+
+    payload = await rpc_sessions._handle_sessions_preview(None, ctx)
+
+    assert payload["previews"][0]["title"] == "整理示例图片"
+    assert storage.calls == [
+        ("list", (True, 50)),
+        ("preview", (True, ["preview-id"], 120)),
+        ("titles", (True, ["preview-id"], 3)),
+    ]
+
+
 @pytest.mark.parametrize("params", ["x", 1, True])
 def test_preview_keeps_legacy_non_mapping_params_error_order(params: Any) -> None:
     """The old handler raised before checking manager/storage availability."""
@@ -129,8 +173,126 @@ async def test_preview_non_mapping_params_fail_before_unavailable_manager(
             is_owner=True,
             authenticated=True,
         ),
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
     )
 
     with pytest.raises(AttributeError):
         await rpc_sessions._handle_sessions_preview(params, ctx)
+
+
+@pytest.mark.asyncio
+async def test_preview_recovers_only_refused_chat_titles_in_one_batch_after_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = str(tmp_path / "preview-titles.db")
+    refusal = "I'm unable to provide assistance with this request"
+    rows = [
+        SessionNode(
+            session_key="agent:main:webchat:refused-full",
+            session_id="refused-full-id",
+            display_name="WebChat",
+            derived_title=refusal,
+        ),
+        SessionNode(
+            session_key="agent:main:webchat:refused-truncated",
+            session_id="refused-truncated-id",
+            derived_title="I'm unable to provide assistance with this reque",
+        ),
+        SessionNode(
+            session_key="agent:main:webchat:no-visible-text",
+            session_id="no-visible-text-id",
+            derived_title=refusal,
+        ),
+        SessionNode(
+            session_key="agent:main:webchat:manual",
+            session_id="manual-id",
+            display_name=refusal,
+            derived_title=refusal,
+        ),
+        SessionNode(
+            session_key="agent:main:webchat:valid-title",
+            session_id="valid-title-id",
+            derived_title="I cannot log in",
+        ),
+        SessionNode(
+            session_key="agent:main:subagent:preview-task",
+            session_id="task-id",
+            derived_title=refusal,
+        ),
+        SessionNode(
+            session_key="cron:preview-job:run:sample",
+            session_id="cron-id",
+            derived_title=refusal,
+        ),
+    ]
+    storage = SessionStorage(db_path)
+    await storage.connect()
+    try:
+        for row in rows:
+            await storage.upsert_session(row)
+        for content in (
+            "[Tool result (sample-call): synthetic tool output]",
+            json.dumps(
+                {
+                    "text": "[2026-01-05T12:00+00:00 Mon UTC]\n"
+                    "Describe sample files and their folder layout"
+                }
+            ),
+        ):
+            await storage.append_transcript_entry(
+                TranscriptEntry(
+                    session_key=rows[0].session_key,
+                    session_id=rows[0].session_id,
+                    role="user",
+                    content=content,
+                )
+            )
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_key=rows[1].session_key,
+                session_id=rows[1].session_id,
+                role="user",
+                content="整理示例图片",
+            )
+        )
+    finally:
+        await storage.close()
+
+    reopened = SessionStorage(db_path)
+    await reopened.connect()
+    try:
+        before = [(await reopened.get_session(row.session_key)).model_dump() for row in rows]
+        batch_calls: list[tuple[bool, list[str], int]] = []
+        original_batch = reopened.list_canonical_user_transcript_content_batch
+
+        async def capture_batch(
+            session_ids: list[str],
+            *,
+            limit_per_session: int,
+        ) -> dict[str, list[str]]:
+            batch_calls.append(
+                (_BOUNDED_INTERACTIVE_READS.get(), list(session_ids), limit_per_session)
+            )
+            return await original_batch(session_ids, limit_per_session=limit_per_session)
+
+        monkeypatch.setattr(reopened, "list_canonical_user_transcript_content_batch", capture_batch)
+        payload = await rpc_sessions._handle_sessions_preview(
+            {"keys": [row.session_key for row in rows]},
+            context(reopened),
+        )
+
+        assert [item["title"] for item in payload["previews"]] == [
+            "Describe sample files and their...",
+            "整理示例图片",
+            "no-visib",
+            refusal,
+            "I cannot log in",
+            refusal,
+            refusal,
+        ]
+        assert batch_calls == [(True, [row.session_id for row in rows[:3]], 3)]
+        after = [(await reopened.get_session(row.session_key)).model_dump() for row in rows]
+        assert after == before
+    finally:
+        await reopened.close()

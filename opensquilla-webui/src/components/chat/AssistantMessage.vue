@@ -270,13 +270,20 @@
         <SourcesRow v-if="message.toolCalls?.length" ref="sourcesRowRef" :calls="message.toolCalls" :sources="message.sources ?? []" />
       </div>
 
-      <div v-if="showFooter" class="msg-ai-footer">
+      <div
+        v-if="showFooter"
+        class="msg-ai-footer"
+        :class="{ 'msg-ai-footer--goal': goalOutcome }"
+      >
         <GoalOutcomeNotice
           v-if="goalOutcome"
           class="msg-goal-outcome"
           :goal="goalOutcome"
           :elapsed="goalElapsed || '0s'"
+          :removable="goalRemovable && !shareMode"
+          :busy="goalBusy"
           inline
+          @clear="$emit('goalClear', $event)"
         />
         <span
           v-if="isCronMessage"
@@ -545,6 +552,8 @@ const props = defineProps<{
   showTurnOutcome?: boolean
   goalOutcome?: GoalSnapshot | null
   goalElapsed?: string
+  goalRemovable?: boolean
+  goalBusy?: boolean
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
   resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
 }>()
@@ -566,6 +575,7 @@ const emit = defineEmits<{
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
   openSession: [sessionKey: string]
+  goalClear: [goal: GoalSnapshot]
 }>()
 
 // Absolute label is static; only the relative label subscribes to the shared
@@ -1122,19 +1132,16 @@ const activityDetailLabel = computed(() => {
   return parts.join(' · ')
 })
 
-const completedMaintenanceCount = computed(() =>
-  activityProjection.value.statusSteps.filter(step =>
-    step.category === 'maintenance' && step.state === 'completed',
-  ).length,
-)
-
 function withMaintenanceSummary(label: string): string {
-  const count = completedMaintenanceCount.value
-  if (!count) return label
-  const maintenance = count > 1
-    ? `${String(t('chat.compact.compacted'))} ×${count}`
-    : String(t('chat.compact.compacted'))
-  return [label, maintenance].filter(Boolean).join(' · ')
+  const counts = new Map<string, number>()
+  for (const step of activityProjection.value.statusSteps) {
+    if (step.category !== 'maintenance' || step.state !== 'completed') continue
+    counts.set(step.label.code, (counts.get(step.label.code) ?? 0) + 1)
+  }
+  const maintenance = [...counts].map(([code, count]) =>
+    count > 1 ? `${String(t(code))} ×${count}` : String(t(code)),
+  )
+  return [label, ...maintenance].filter(Boolean).join(' · ')
 }
 
 const activitySummaryLabel = computed(() => {
@@ -1348,6 +1355,10 @@ function fmtUsd(value: number): string {
   align-items: center;
   gap: 0.625rem;
   margin-top: 0.25rem;
+}
+
+.msg-ai-footer--goal {
+  flex-wrap: wrap;
 }
 
 .msg-provenance-chip {

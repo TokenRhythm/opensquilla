@@ -57,23 +57,23 @@ def _default_catalog(*, capabilities: Any = None) -> _ResolvedCatalog:
 def _default_aux(
     *,
     thinking: bool | ThinkingLevel = False,
-    flush_compaction_requires_safe_receipt: bool = False,
+
 ) -> _AgentConfigAuxiliaries:
     return _AgentConfigAuxiliaries(
         thinking=thinking,
-        flush_workspace_dir="/tmp/flush",
+
         tool_result_store_dir="/tmp/tool-results",
         tool_result_store_session_id="session-test",
-        flush_enabled=True,
-        flush_triggers=["session_reset", "manual", "idle", "pre_compaction"],
-        flush_pre_compaction=True,
-        flush_timeout_seconds=15.0,
-        flush_background_timeout_seconds=120.0,
-        flush_backoff_initial_seconds=30.0,
-        flush_backoff_max_seconds=300.0,
-        flush_archive_max_bytes=800_000,
-        flush_compaction_requires_safe_receipt=flush_compaction_requires_safe_receipt,
-        flush_compaction_safety_mode="protect",
+
+
+
+
+
+
+
+
+
+
         compaction_profile="conversation",
         compaction_protected_recent_messages=0,
         compaction_total_timeout_seconds=120.0,
@@ -586,6 +586,7 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
                 capabilities=None,
                 auto_max_tokens=16_384,
                 auto_max_tokens_known=False,
+                context_window_known=False,
             ),
         }
     )
@@ -614,7 +615,7 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
 
     assert provider.limits == {
         ("provider-b", "fallback/model"): (32_000, 8_192),
-        ("provider-b", "unknown/model"): (200_000, 0),
+        ("provider-b", "unknown/model"): (0, 0),
     }
     assert (
         turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"]["effective_max_tokens"]
@@ -856,6 +857,20 @@ async def test_case05_no_model_catalog_fallback() -> None:
     assert out.output.model_capabilities is None
     assert out.output.agent_config.metadata["resolved_output_cap_tokens"] == 8192
     assert out.output.agent_config.metadata["resolved_context_window_tokens"] == 200_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known", [False, True])
+async def test_context_window_provenance_reaches_agent_without_replacing_history_window(
+    known: bool,
+) -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=replace(_default_catalog(), context_window_known=known),
+    )
+    out = await _make_stage(catalog=catalog).run(_make_input())
+    assert out.output is not None
+    assert out.output.agent_config.context_window_known is known
+    assert out.output.agent_config.context_window_tokens == 200_000
 
 
 @pytest.mark.asyncio
@@ -1226,7 +1241,7 @@ def test_value_objects_frozen() -> None:
 
     aux = _default_aux()
     with pytest.raises(Exception):  # noqa: BLE001
-        aux.flush_enabled = False  # type: ignore[misc]
+        aux.thinking = False  # type: ignore[misc]
 
     result = _MemorySnapshotResult(sync_manager=None, private_memory_allowed=True)
     with pytest.raises(Exception):  # noqa: BLE001

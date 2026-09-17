@@ -24,6 +24,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
+from itertools import chain
 from pathlib import Path
 from typing import Any, Literal
 
@@ -34,6 +35,7 @@ from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     workspace_attachment_budget_from_config,
 )
+from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.context_budget import ContextBudgetClass, ContextBudgetGovernor
 from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_MIMES, normalize_attachment_mime
 from opensquilla.contracts.image_validation import validate_image_bytes
@@ -69,6 +71,11 @@ from opensquilla.engine.repetition_guard import (
     guard_provider_text_stream,
 )
 from opensquilla.engine.replay_compat import rebase_incomplete_reasoning_history
+from opensquilla.engine.request_window import (
+    RequestWindowCandidate,
+    compact_request_window_tools,
+    iter_request_window_candidates,
+)
 from opensquilla.engine.runtime_diagnostics import RuntimeDiagnosticsObserver
 from opensquilla.engine.runtime_events import append_runtime_event
 from opensquilla.engine.runtime_recovery import (
@@ -115,7 +122,6 @@ from opensquilla.engine.web_search_projection import (
 )
 from opensquilla.execution_status import (
     mark_execution_status_truncated,
-    normalize_execution_status,
     runtime_execution_status,
 )
 from opensquilla.git_runtime import GitRunState, run_git
@@ -187,8 +193,12 @@ from opensquilla.provider.protocol import (
 )
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
+    effective_proof_token_budget,
     project_provider_payload,
+    projected_generation_budget,
     prove_provider_payload,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from opensquilla.provider.types import (
     ContentBlockImage,
@@ -224,30 +234,30 @@ from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
     CompactionRequestContext,
+    CompactionResult,
     arm_compaction_deadline,
     build_compaction_config_from_provider,
     compact_context,
     compaction_prompt_layout,
-    compaction_remaining_seconds,
     compaction_replay_summary,
-    require_compaction_time,
 )
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
     CompactionTimeoutError,
+    ConsumerAdmissionStaleError,
     compaction_effect_payload,
     compaction_lifecycle_payload,
     compaction_result_payload,
-    flush_receipt_allows_destructive_compaction,
-    flush_receipt_is_successful_flush,
-    flush_trigger_enabled,
     new_compaction_id,
-    pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.context_view import format_compaction_summary_context
-from opensquilla.session.terminal_reply import build_terminal_reply, safe_provider_failure_code
+from opensquilla.session.terminal_reply import (
+    CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES,
+    build_terminal_reply,
+    safe_provider_failure_code,
+)
 from opensquilla.telemetry.contracts.reliability import (
     ToolCategory,
     ToolErrorCode,
@@ -2348,7 +2358,6 @@ class Agent:
         session_key: str | None = None,
         turn_call_logger: TurnCallLogger | None = None,
         memory_sync_manager: Any | None = None,
-        session_flush_service: Any | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_context: ToolContext | None = None,
         failure_injector: FailureInjector | None = None,
@@ -2462,14 +2471,8 @@ class Agent:
         # internal slot.
         self._memory_sync_manager: Any | None = memory_sync_manager
 
-        # Memory flush state (sub-agent based, re-entrant per compaction cycle)
-        self._flush_done_this_cycle: bool = False
-        self._active_flush_task: asyncio.Task | None = None
-        self._flush_wait_timed_out_task: asyncio.Task | None = None
-        self._flush_backoff_until: float = 0.0
-        self._flush_backoff_seconds: float = 0.0
-        self._session_flush_service = session_flush_service
         self._last_compaction_refusal_reason: str | None = None
+        self._compaction_failed_this_turn = False
         self._pending_durable_compaction_event: CompactionEvent | None = None
         self._compaction_request_context: CompactionRequestContext | None = None
         # Stable session/base consumer identity. Turn routing and ensemble
@@ -2479,6 +2482,7 @@ class Agent:
         self._durable_consumer_provider: Any = self.provider
         self._durable_consumer_model_id = self.config.model_id
         self._durable_consumer_window_tokens = self.config.context_window_tokens
+        self._durable_consumer_window_known = self.config.context_window_known
         self._durable_consumer_max_output_tokens = self.config.max_tokens
         self._durable_consumer_model_capabilities = self.config.model_capabilities
         self._durable_consumer_provider_request_max_chars = (
@@ -2680,22 +2684,6 @@ class Agent:
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
-        if reason == "memory_flush_timeout_before_compaction":
-            return ErrorEvent(
-                message=(
-                    "Context compaction could not run because the pre-compaction "
-                    "memory flush timed out."
-                ),
-                code="compaction_refused_flush_timeout",
-            )
-        if reason == "memory_flush_degraded_before_compaction":
-            return ErrorEvent(
-                message=(
-                    "Context compaction could not run because the pre-compaction "
-                    "memory flush did not produce a verified summary."
-                ),
-                code="compaction_refused_memory_flush",
-            )
         if reason == "empty_summary_rejected":
             return ErrorEvent(
                 message="Context compaction produced no replacement summary.",
@@ -2710,6 +2698,11 @@ class Agent:
             return ErrorEvent(
                 message="Context compaction did not reduce the provider request.",
                 code="compaction_not_smaller",
+            )
+        if reason in CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES:
+            return ErrorEvent(
+                message=CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES[reason],
+                code="provider_request_too_large",
             )
         if reason in {
             "provider_native_overflow_after_admission",
@@ -2805,6 +2798,10 @@ class Agent:
         if proof is None:
             self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
             return
+        component_reason = self._request_budget_component_refusal(proof)
+        if component_reason is not None:
+            self._last_compaction_refusal_reason = component_reason
+            return
         if proof.get("recent_tail_too_large") is True:
             self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
             return
@@ -2814,6 +2811,25 @@ class Agent:
         fallback_reason = proof.get("fallback_reason")
         if fallback_reason == "provider_request_budget_exhausted":
             self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+
+    @classmethod
+    def _request_budget_component_refusal(
+        cls, proof: dict[str, Any], *, input_budget_chars: int | None = None,
+    ) -> str | None:
+        char_budgets = [
+            value for value in (
+                cls._positive_int(proof.get("effective_proof_budget")), input_budget_chars,
+            ) if value is not None and value > 0
+        ]
+        if not char_budgets:
+            return None
+        for component, refusal in (
+            ("system_chars", "provider_system_prompt_too_large"),
+            ("tools_chars", "provider_tool_schema_too_large"),
+        ):
+            if (cls._positive_int(proof.get(component)) or 0) > min(char_budgets):
+                return refusal
+        return None
 
     @staticmethod
     def _provider_request_budget_proof(
@@ -2894,6 +2910,7 @@ class Agent:
         model_id: str | None,
         context_window_tokens: int,
         max_output_tokens: int,
+        context_window_known: bool = True,
         model_capabilities: ModelCapabilities | None = None,
         provider_request_proof_max_chars: int = 0,
     ) -> None:
@@ -2901,6 +2918,7 @@ class Agent:
 
         self._durable_consumer_provider = provider
         self._durable_consumer_model_id = model_id
+        self._durable_consumer_window_known = context_window_known
         self._durable_consumer_window_tokens = max(
             1,
             int(context_window_tokens or 0),
@@ -2927,6 +2945,7 @@ class Agent:
         active_user_message: str,
         *,
         context_window_tokens: int,
+        context_window_known: bool | None = None,
         max_output_tokens: int | None = None,
         model_capabilities: ModelCapabilities | None = None,
         provider_request_proof_max_chars: int | None = None,
@@ -3017,6 +3036,12 @@ class Agent:
                 self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
             ),
             provider_request_max_chars=proof_budget,
+            provider_context_window_tokens=(
+                max(0, int(context_window_tokens))
+                if (self.config.context_window_known
+                    if context_window_known is None else context_window_known)
+                else 0
+            ),
             context_window_tokens_global_override=(
                 self.config.context_window_tokens_global_override
             ),
@@ -3035,10 +3060,8 @@ class Agent:
 
     def build_compaction_request_context(
         self, active_user_message: str = ""
-    ) -> CompactionRequestContext | None:
-        """Freeze current request settings for one suffix compaction operation."""
-        if compaction_prompt_layout() != "suffix":
-            return None
+    ) -> CompactionRequestContext:
+        """Freeze current request settings for one compaction operation."""
         current = self._compaction_request_context
         if current is not None:
             chat_config = current.chat_config
@@ -3108,7 +3131,13 @@ class Agent:
                 "max_tokens": max_output_tokens,
                 "model_capabilities": self._durable_consumer_model_capabilities,
                 "provider_request_max_chars": proof_budget,
-                "provider_request_max_chars_explicit_cap": proof_budget,
+                "provider_request_max_chars_explicit_cap": (
+                    self._durable_consumer_provider_request_max_chars
+                ),
+                "provider_context_window_tokens": (
+                    self._durable_consumer_window_tokens
+                    if self._durable_consumer_window_known else 0
+                ),
             }
         )
         return project_provider_final_request(
@@ -3274,6 +3303,11 @@ class Agent:
         chat_config = self._provider_admission_chat_config(
             active_user_message,
             context_window_tokens=context_window_tokens,
+            context_window_known=(
+                self._durable_consumer_window_known
+                if consumer_provider is self._durable_consumer_provider
+                else self.config.context_window_known
+            ),
             max_output_tokens=max_output_tokens,
             model_capabilities=consumer_model_capabilities,
             provider_request_proof_max_chars=(consumer_provider_request_max_chars),
@@ -3394,6 +3428,30 @@ class Agent:
             replay_summary: str,
             kept_entries: list[dict[str, Any]],
         ) -> bool:
+            current_template = self._project_compaction_consumer_request(
+                consumer_provider=consumer_provider,
+                replay_summary=template_summary,
+                kept_entries=[],
+                active_user_message=active_user_message,
+                active_user_in_history=False,
+                bound_user_message_id=None,
+                attachment_messages=attachment_messages,
+                runtime_context_message=runtime_context_message,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
+            )
+            current_template_hash = (
+                hashlib.sha256(json.dumps(
+                    current_template.payload, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                if current_template is not None else "projection_unavailable"
+            )
+            if current_template_hash != fingerprint_payload["template_payload_sha256"]:
+                raise ConsumerAdmissionStaleError("compaction consumer request changed")
             projection = self._project_compaction_consumer_request(
                 consumer_provider=consumer_provider,
                 replay_summary=replay_summary,
@@ -3520,34 +3578,37 @@ class Agent:
         }
         if self.config.output_json_schema is not None:
             payload["response_format"] = self._live_request_jsonable(self.config.output_json_schema)
-        proof_budget = self._provider_request_proof_max_chars()
-        if context_window_tokens is not None:
-            try:
-                thinking_enabled, thinking_budget = self.config.resolve_thinking(
-                    active_user_message
-                )
-            except Exception:  # noqa: BLE001 - lightweight config compatibility
-                thinking_enabled = False
-                thinking_budget = 0
-            proof_budget = (
-                ContextBudgetGovernor.from_values(
-                    context_window_tokens=context_window_tokens,
-                    max_output_tokens=(consumer_max_output_tokens or self.config.max_tokens),
-                    thinking_budget_tokens=thinking_budget if thinking_enabled else 0,
-                    context_overflow_threshold=self.config.context_overflow_threshold,
-                    provider_request_proof_max_chars=max(
-                        0,
-                        int(consumer_provider_request_max_chars or 0),
-                    ),
-                )
-                .snapshot()
-                .provider_request_max_chars
+        fallback_config = self._provider_admission_chat_config(
+            active_user_message,
+            context_window_tokens=effective_window,
+            context_window_known=(
+                self._durable_consumer_window_known
+                if exact_provider is self._durable_consumer_provider
+                else self.config.context_window_known
+            ),
+            max_output_tokens=consumer_max_output_tokens,
+            model_capabilities=consumer_model_capabilities,
+            provider_request_proof_max_chars=consumer_provider_request_max_chars,
+        )
+        # Raw ingress attachments cannot enter an exact wire projection yet.
+        # The typed envelope can still reveal the adapter's actual generation
+        # cap, including provider-specific reasoning reserves, without I/O.
+        generation_projection = project_provider_final_request(
+            exact_provider, fixed_messages, self.tool_definitions, fallback_config
+        )
+        payload["max_tokens"] = (
+            projected_generation_budget(generation_projection.payload, fallback_config.max_tokens)
+            if generation_projection is not None
+            else fallback_config.max_tokens + (
+                fallback_config.thinking_budget_tokens if fallback_config.thinking else 0
             )
+        )
         try:
             proof = prove_provider_payload(
                 payload,
                 projection_adapter="preflight_history_capacity",
-                proof_budget=proof_budget,
+                proof_budget=provider_request_character_budget(payload, fallback_config),
+                token_budget=provider_request_token_budget(payload, fallback_config),
             )
         except ProviderRequestBudgetExceededError as exc:
             proof = exc.proof
@@ -3769,6 +3830,9 @@ class Agent:
             model_vision_support=self.config.model_vision_support,
             physical_attempt_limit=1,
             provider_request_max_chars=self._provider_request_proof_max_chars(),
+            provider_context_window_tokens=(
+                self.config.context_window_tokens if self.config.context_window_known else 0
+            ),
             context_window_tokens_global_override=(
                 self.config.context_window_tokens_global_override
             ),
@@ -5908,6 +5972,7 @@ class Agent:
             self._flush_pending_tool_reliability(terminal=pending_tool_terminal)
             self._freeze_current_replay_view()
             self._compaction_request_context = None
+            self._compaction_failed_this_turn = False
             self._image_analysis_provider_wrapper = None
             for snapshot_context, previous_writer in snapshot_context_bindings:
                 snapshot_context.tool_result_snapshot_writer = previous_writer
@@ -5976,6 +6041,14 @@ class Agent:
         self.config.metadata.pop("reasoning_replay_context_rebuilt", None)
         self._provider_tool_result_overrides = {}
         self._current_turn_message = message
+        from opensquilla.skills.install_turn import SkillInstallTurn
+
+        install_turn = SkillInstallTurn(semantic_message or message)
+        if self._tool_context is not None:
+            self._tool_context.skill_install_turn = install_turn
+            install_turn.finalization_allowed = not (
+                self._tool_context.goal_context or self._tool_context.plan_run_id
+            )
         _meta_invoke_turn_count.set(0)
         usage_scope = current_usage_accounting_scope()
         reasoning_block_index = 0
@@ -6247,10 +6320,9 @@ class Agent:
             context_window_tokens=self.config.context_window_tokens,
             max_output_tokens=self.config.max_tokens,
         )
-        if compaction_prompt_layout() == "suffix":
-            self._compaction_request_context = self.build_compaction_request_context(
-                thinking_prompt
-            )
+        self._compaction_request_context = self.build_compaction_request_context(
+            thinking_prompt
+        )
         _log = structlog.get_logger("opensquilla.engine.agent")
 
         def _positive_float(value: Any) -> float | None:
@@ -6836,6 +6908,7 @@ class Agent:
             )
             turn_messages.append(staged_pending_input_message)
             pending_input_batch_staged = True
+            install_turn.accept_user_input()
             return True
 
         async def _mark_staged_pending_inputs_applied(
@@ -7200,6 +7273,9 @@ class Agent:
                                     (self.tool_definitions or None) if tools_supported else None
                                 )
                                 self.config.model_vision_support = chat_cfg.model_vision_support
+                                self.config.context_window_known = (
+                                    chat_cfg.provider_context_window_tokens > 0
+                                )
                                 self.config.max_tokens = chat_cfg.max_tokens
                                 self.config.provider_request_proof_max_chars = (
                                     chat_cfg.provider_request_max_chars
@@ -7638,9 +7714,8 @@ class Agent:
                                 config=call_chat_cfg,
                             )
                             budget = self._context_budget_governor().snapshot()
-                            token_limit = max(
-                                1,
-                                int(budget.usable_tokens * budget.threshold),
+                            token_limit, _ = effective_proof_token_budget(
+                                budget.usable_tokens,
                             )
                             char_limit = budget.provider_request_max_chars
                             restored_request_fits = bool(
@@ -7680,16 +7755,15 @@ class Agent:
                                 yield terminal_error
                             break
 
-                    if compaction_prompt_layout() == "suffix":
-                        self._compaction_request_context = CompactionRequestContext(
-                            chat_config=call_chat_cfg.model_copy(deep=True),
-                            tools=(
-                                tuple(
-                                    tool.model_copy(deep=True) for tool in provider_tools_for_call
-                                )
-                                if provider_tools_for_call else None
-                            ),
-                        )
+                    self._compaction_request_context = CompactionRequestContext(
+                        chat_config=call_chat_cfg.model_copy(deep=True),
+                        tools=(
+                            tuple(
+                                tool.model_copy(deep=True) for tool in provider_tools_for_call
+                            )
+                            if provider_tools_for_call else None
+                        ),
+                    )
                     self._write_turn_call_log(
                         "llm_request",
                         call_id=call_id,
@@ -9941,6 +10015,7 @@ class Agent:
                         terminal_error = ErrorEvent(
                             message=terminal_message,
                             code="empty_response",
+                            failure_kind=ProviderFailureKind.EMPTY_RESPONSE.value,
                         )
                         yield terminal_error
                         break
@@ -10021,12 +10096,7 @@ class Agent:
                             provider_error.code,
                             failure_kind.value,
                         )
-                        kind = _fallback.classify_error(
-                            provider_error.message,
-                            provider_name=getattr(self.provider, "provider_name", ""),
-                            status_code=provider_error_status_code,
-                            raw_code=provider_error.code,
-                        )
+                        kind = failure_kind
                         if (
                             image_failure.is_unsupported
                             and (
@@ -10515,6 +10585,7 @@ class Agent:
                                 request_window_chars=provider_request_window_chars,
                                 estimated_context_chars=provider_estimated_chars,
                                 durable_consumer_overflow_proven=(durable_consumer_overflow_proven),
+                                provider_overflow=True,
                             )
                             if overflow_outcome is None:
                                 yield self._transition(AgentState.ERROR)
@@ -11697,6 +11768,16 @@ class Agent:
                                         timed_out=True,
                                     ),
                                 )
+                                if (
+                                    tc.tool_name == "skill_install_community"
+                                    and cancellation_policy == "must_settle"
+                                    and execution_task.done()
+                                    and not execution_task.cancelled()
+                                    and execution_task.exception() is None
+                                ):
+                                    # The installer settles cancellation against its durable
+                                    # commit receipt before returning. Preserve that result.
+                                    res = execution_task.result()
                         except asyncio.CancelledError:
                             if (
                                 execution_task is not None
@@ -11832,6 +11913,22 @@ class Agent:
                         finally:
                             for task in pending:
                                 tc = task_to_tool_call[task]
+                                if tc.tool_name == "skill_install_community":
+                                    from opensquilla.skills.install_source import (
+                                        resolve_install_source,
+                                    )
+
+                                    identifier = str(tc.arguments.get("identifier", ""))
+                                    source = resolve_install_source(
+                                        identifier, tc.arguments.get("source"),
+                                    )
+                                    receipt = install_turn.previous(identifier, source)
+                                    if receipt is not None:
+                                        results_by_id[tc.tool_use_id] = ToolResult(
+                                            tool_use_id=tc.tool_use_id,
+                                            tool_name=tc.tool_name,
+                                            content=json.dumps(receipt),
+                                        )
                                 result = results_by_id.get(tc.tool_use_id)
                                 if (
                                     result is None
@@ -11970,6 +12067,9 @@ class Agent:
                         yield event
 
                 for tc in tool_calls:
+                    peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                    if callable(peek_installs) and peek_installs():
+                        install_turn.finalization_allowed = False
                     if dispatch_boundary is not None:
                         results_by_id[tc.tool_use_id] = _not_executed_after_dispatch_boundary(
                             tc,
@@ -12075,6 +12175,8 @@ class Agent:
                             # this provider batch. Pair every later tool call
                             # with a not-executed result, then perform exactly
                             # one tool-free final-summary model call.
+                            dispatch_boundary = mutex_result
+                        if mutex_result is not None and install_turn.complete:
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
                             plan_run_delivery_only = True
@@ -12466,6 +12568,20 @@ class Agent:
                         failure_anchor_summary=failure_anchor_summary,
                     ):
                         append_runtime_event(self.config.runtime_events_path, runtime_event)
+                if install_turn.complete:
+                    await _claim_pending_inputs_for_next_call()
+                    peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                    if callable(peek_installs) and peek_installs():
+                        install_turn.finalization_allowed = False
+                if install_turn.complete:
+                    final_response_text = install_turn.final_text()
+                    final_text_parts[:] = [final_response_text]
+                    applied_model_call_boundaries.clear()
+                    yield TextDeltaEvent(
+                        text=final_response_text, presentation="answer",
+                        generation_epoch=generation_epoch,
+                    )
+                    break
                 budget_error = (
                     None if accepted_goal_terminal_status is not None else _turn_budget_error()
                 )
@@ -12499,6 +12615,9 @@ class Agent:
                     yield self._transition(AgentState.THINKING)
                     continue
                 await _claim_pending_inputs_for_next_call()
+                peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                if callable(peek_installs) and peek_installs():
+                    install_turn.finalization_allowed = False
                 if terminal_projection_preflight_error:
                     self._write_turn_call_log(
                         "tool_argument_projection_rehydrate_recovery",
@@ -13812,7 +13931,9 @@ class Agent:
                 flat = message.content
                 real_tokens = get_approx_tokens(message.content)
             else:
-                flat = _flatten_content_blocks(message.content)
+                flat = "\n".join(
+                    block.text for block in message.content if isinstance(block, ContentBlockText)
+                )
                 budget = project_provider_payload(
                     {"messages": [Agent._live_request_jsonable(message)]},
                     projection_adapter="live_compaction_entry",
@@ -13826,61 +13947,50 @@ class Agent:
                     "token_count": real_tokens,
                 }
             )
+            if isinstance(message.content, list):
+                segments: list[dict[str, Any]] = []
+                for block in message.content:
+                    if isinstance(block, ContentBlockToolUse):
+                        segments.append({
+                            "type": "tool_use",
+                            "tool_use_id": block.id,
+                            "name": block.name,
+                            "input": copy.deepcopy(block.input),
+                        })
+                    elif isinstance(block, ContentBlockToolResult):
+                        segments.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.tool_use_id,
+                            "result": copy.deepcopy(block.content),
+                            "is_error": block.is_error,
+                            "execution_status": copy.deepcopy(block.execution_status),
+                        })
+                if segments:
+                    entries[-1]["tool_calls"] = segments
             if compaction_prompt_layout() == "suffix":
                 entries[-1]["_provider_message"] = message.model_copy(deep=True)
         return entries
 
     @staticmethod
     def _tool_result_requires_raw_preservation(message: Message) -> bool:
+        """Keep active protocol state; completed errors may leave a request window."""
+        from opensquilla.session.compaction import _execution_status_is_live
+
         if not isinstance(message.content, list):
             return False
-        unresolved_markers = {
-            "pending",
-            "queued",
-            "running",
-            "in_progress",
-            "requires_action",
-            "awaiting_approval",
-        }
         for block in message.content:
             if not isinstance(block, ContentBlockToolResult):
                 continue
-            if bool(getattr(block, "is_error", False)):
+            if _execution_status_is_live(block.execution_status):
                 return True
-            raw_status = getattr(block, "execution_status", None)
-            if isinstance(raw_status, dict):
-                raw_status_name = str(raw_status.get("status") or "").strip().lower()
-                if raw_status_name in unresolved_markers | {
-                    "error",
-                    "failed",
-                    "failure",
-                    "timeout",
-                    "timed_out",
-                    "cancelled",
-                    "unresolved",
-                }:
-                    return True
-                normalized_status = normalize_execution_status(raw_status)
-                normalized_name = normalized_status["status"]
-                if normalized_name in {"error", "timeout", "cancelled"}:
-                    return True
-                if normalized_name == "unknown" and (
-                    normalized_status["source"] != "legacy"
-                    or normalized_status["reason"] not in {None, "legacy_missing_status"}
-                    or normalized_status["preservation_class"] == "ephemeral"
-                ):
-                    return True
-            raw = block.content
-            if not isinstance(raw, str):
+            if not isinstance(block.content, str):
                 continue
             try:
-                parsed = json.loads(raw)
+                parsed = json.loads(block.content)
             except (TypeError, json.JSONDecodeError):
                 continue
-            if (
-                isinstance(parsed, dict)
-                and str(parsed.get("status") or parsed.get("execution_status") or "").lower()
-                in unresolved_markers
+            if isinstance(parsed, dict) and _execution_status_is_live(
+                parsed.get("execution_status") or parsed
             ):
                 return True
         return False
@@ -13959,6 +14069,198 @@ class Agent:
             return 2 + active_prefix_count + (original_index - keep_start)
         return 2 + active_prefix_count
 
+    def _recover_local_request_window(
+        self,
+        messages: list[Message],
+        *,
+        protected_turn_start_index: int,
+        request_context_insert_index: int | None,
+        runtime_context_insert_index: int | None,
+        config: ChatConfig | None = None,
+        request_context_message: Message | None = None,
+        runtime_context_message: Message | None = None,
+        request_suffix_messages: list[Message] | None = None,
+        target_wire_messages: int | None = None,
+        input_budget_tokens: int | None = None,
+        input_budget_chars: int | None = None,
+        allow_unchanged: bool = False,
+        compaction_config: CompactionConfig | None = None,
+        reason: str = "summary_failed",
+    ) -> CompactionOutcome | None:
+        """Admit a temporary raw window without changing canonical history."""
+
+        protected_start = max(0, min(protected_turn_start_index, len(messages)))
+        protected_indexes = {
+            index for index, message in enumerate(messages)
+            if self._tool_result_requires_raw_preservation(message)
+        }
+        assistant_indexes = [
+            index for index, message in enumerate(messages) if message.role == "assistant"
+        ]
+        protected_indexes.update(assistant_indexes[-2:])
+        live_boundary = self._live_turn_compaction_boundary(
+            messages, protected_turn_start_index=protected_start,
+        )
+        chat_config = config or self._provider_admission_chat_config(
+            getattr(self, "_current_turn_message", "") or "",
+            context_window_tokens=self.config.context_window_tokens,
+        )
+        if request_context_message is None:
+            request_context_message = self._request_context_message(
+                self.config.request_context_prompt,
+            )
+        if runtime_context_message is None:
+            runtime_context_message = self._freeze_preflight_runtime_context_message()
+
+        last_proof: dict[str, Any] | None = None
+
+        def _fits(projection: ProviderFinalRequestProjection | None) -> bool:
+            nonlocal last_proof
+            if projection is None:
+                return False
+            proof = projection.proof
+            if "estimated_tokens" not in proof or "estimated_chars" not in proof:
+                proof = project_provider_payload(
+                    projection.payload, projection_adapter="request_window", proof_budget=0,
+                )
+            budget_fits = bool(proof.get("fits", True)) and (
+                input_budget_tokens is None
+                or int(proof["estimated_tokens"]) <= input_budget_tokens
+            ) and (
+                input_budget_chars is None
+                or int(proof["estimated_chars"]) <= input_budget_chars
+            )
+            last_proof = None if budget_fits else proof
+            return projection.fits and budget_fits
+
+        unchanged = self._provider_request_messages_for_count_projection(
+            [*messages, *(request_suffix_messages or [])],
+            request_context_message=request_context_message,
+            request_context_insert_index=(
+                request_context_insert_index
+                if request_context_insert_index is not None else len(messages)
+            ),
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=(
+                runtime_context_insert_index
+                if runtime_context_insert_index is not None else len(messages)
+            ),
+        )
+        unchanged_projection = project_provider_final_request(
+            self.provider, unchanged, self.tool_definitions, chat_config,
+            message_limit=target_wire_messages,
+        )
+        if _fits(unchanged_projection) and allow_unchanged:
+            return CompactionOutcome(
+                messages=messages,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                protected_turn_start_index=protected_start,
+            )
+        pruned_messages = compact_request_window_tools(messages)
+        retained_indexes: set[int] = set()
+        if (
+            len(messages) > 1 and isinstance(messages[0].content, str)
+            and messages[0].content.startswith("[Context summary]\n")
+            and messages[1].role == "assistant"
+            and messages[1].content == "Understood. Continuing from summary."
+        ):
+            summary_body = messages[0].content.removeprefix("[Context summary]\n")
+            replayed = format_compaction_summary_context([summary_body]) or ""
+            if summary_body in replayed:
+                retained_indexes.update((0, 1))
+        candidates = []
+        if pruned_messages is not messages:
+            candidates.append(RequestWindowCandidate(
+                pruned_messages, tuple(range(len(messages))), 0,
+            ))
+        window_candidates = iter_request_window_candidates(
+            pruned_messages,
+            protected_start_index=protected_start,
+            protected_indexes=protected_indexes,
+            retained_indexes=retained_indexes,
+            live_boundary=live_boundary,
+        )
+        without_summary = (
+            iter_request_window_candidates(
+                pruned_messages,
+                protected_start_index=protected_start,
+                protected_indexes=protected_indexes - retained_indexes,
+                live_boundary=live_boundary,
+            ) if retained_indexes else ()
+        )
+        for candidate in chain(candidates, window_candidates, without_summary):
+            request_index = candidate.map_index(request_context_insert_index)
+            runtime_index = candidate.map_index(runtime_context_insert_index)
+            if not candidate.omitted_count:
+                request_index = request_context_insert_index
+                runtime_index = runtime_context_insert_index
+            request_messages = self._provider_request_messages_for_count_projection(
+                [*candidate.messages, *(request_suffix_messages or [])],
+                request_context_message=request_context_message,
+                request_context_insert_index=(
+                    request_index if request_index is not None else len(candidate.messages)
+                ),
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=(
+                    runtime_index if runtime_index is not None else len(candidate.messages)
+                ),
+            )
+            active_index = _active_user_message_index_for_request(
+                request_messages,
+                current_user_text=getattr(self, "_current_turn_message", "") or "",
+            )
+            candidate_config = chat_config.model_copy(
+                update={"active_user_message_index": active_index},
+            )
+            projection = project_provider_final_request(
+                self.provider,
+                request_messages,
+                self.tool_definitions,
+                candidate_config,
+                message_limit=target_wire_messages,
+            )
+            if not _fits(projection):
+                continue
+            compaction_id = (
+                compaction_config.operation_id
+                if compaction_config is not None and compaction_config.operation_id
+                else new_compaction_id()
+            )
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_request_window",
+                    status="emergency_ephemeral",
+                    reason=reason,
+                    removed_count=candidate.omitted_count,
+                    kept_count=len(candidate.kept_indices),
+                    **compaction_effect_payload(status="emergency_ephemeral", reason=reason),
+                    **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+                )
+            return CompactionOutcome(
+                messages=candidate.messages,
+                compacted=True,
+                removed_count=candidate.omitted_count,
+                compaction_id=compaction_id,
+                request_context_insert_index=request_index,
+                runtime_context_insert_index=runtime_index,
+                protected_turn_start_index=(
+                    candidate.map_index(protected_start)
+                    if candidate.omitted_count else protected_start
+                ),
+                ephemeral_only=True,
+                runtime_compaction_config=compaction_config,
+            )
+        if last_proof is not None:
+            self._last_compaction_refusal_reason = (
+                self._request_budget_component_refusal(
+                    last_proof, input_budget_chars=input_budget_chars,
+                ) or "provider_protected_context_too_large"
+            )
+        return None
+
     async def _recover_live_turn_request_overflow(
         self,
         messages: list[Message],
@@ -13973,6 +14275,16 @@ class Agent:
     ) -> CompactionOutcome | None:
         """Summarize completed live rounds into an ephemeral provider view."""
 
+        if self._compaction_failed_this_turn:
+            return self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                input_budget_tokens=context_window_tokens,
+                input_budget_chars=context_window_chars,
+                reason="already_attempted_this_turn",
+            )
         boundary = self._live_turn_compaction_boundary(
             messages,
             protected_turn_start_index=protected_turn_start_index,
@@ -13995,6 +14307,9 @@ class Agent:
             return None
 
         config = shared_compaction_config or self._build_compaction_config()
+        # Keep failures latched until the turn ends; another recovery entry
+        # must not grant the same failed summary a new call budget/deadline.
+        self._compaction_failed_this_turn = True
         # This request contains only the already-completed prefix. The caller
         # retains the active user and the verified recent/error raw tail.
         compaction_id = new_compaction_id()
@@ -14024,10 +14339,24 @@ class Agent:
                     ),
                 )
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - local recovery needs no working summarizer
+            return self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_start,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                input_budget_tokens=context_window_tokens,
+                input_budget_chars=context_window_chars,
+                compaction_config=config,
+            )
         finally:
             if shared_compaction_config is not None:
                 config.protect_semantic_tail = original_protect_semantic_tail
                 config.protected_recent_messages = original_protected_recent_messages
+        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+            self._compaction_failed_this_turn = False
         replacement_applied = bool(
             result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
         )
@@ -14036,7 +14365,16 @@ class Agent:
         # ahead of the unchanged raw history.
         replay_summary = compaction_replay_summary(result) if replacement_applied else ""
         if result.removed_count != len(summary_messages) or not replay_summary:
-            return None
+            return self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_start,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                reason=str(getattr(result, "skip_reason", None) or "summary_failed"),
+                input_budget_tokens=context_window_tokens,
+                input_budget_chars=context_window_chars,
+                compaction_config=config,
+            )
 
         projected = [
             Message(
@@ -14095,6 +14433,7 @@ class Agent:
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
+        self._compaction_failed_this_turn = False
         return CompactionOutcome(
             messages=projected,
             compacted=True,
@@ -14142,8 +14481,20 @@ class Agent:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable reason
-            return None, "live_turn_summary_failed"
-        if outcome is None or not outcome.ephemeral_only:
+            outcome = None
+        if outcome is None or not outcome.ephemeral_only or not outcome.summary:
+            outcome = self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                config=config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target_wire_messages,
+            )
+        if outcome is None:
             return None, "no_safe_cut_or_live_turn_boundary"
 
         mapped_request_index = (
@@ -14167,7 +14518,34 @@ class Agent:
         if verified is None:
             return None, "projection_unavailable_after_live_turn_summary"
         if verified.actual_wire_messages > target_wire_messages:
-            return None, "projection_above_target_after_live_turn_summary"
+            window = self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                config=config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target_wire_messages,
+                compaction_config=outcome.runtime_compaction_config,
+                reason="summary_above_message_target",
+            )
+            if window is None:
+                return None, "projection_above_target_after_live_turn_summary"
+            outcome = window
+            mapped_request_index = int(outcome.request_context_insert_index or 0)
+            mapped_runtime_index = int(outcome.runtime_context_insert_index or 0)
+            verified = self._project_provider_request_message_count(
+                [*outcome.messages, *request_suffix_messages],
+                config=config,
+                request_context_message=request_context_message,
+                request_context_insert_index=mapped_request_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=mapped_runtime_index,
+            )
+            if verified is None or verified.actual_wire_messages > target_wire_messages:
+                return None, "projection_above_target_after_window"
 
         return (
             _MessageCountRecoveryOutcome(
@@ -14222,6 +14600,19 @@ class Agent:
             return None, "projection_unavailable"
         if projected_current.actual_wire_messages <= limit:
             return None, "local_wire_count_not_over_limit"
+
+        if self._compaction_failed_this_turn:
+            return await self._recover_live_turn_message_count_limit(
+                messages,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target,
+                config=config,
+                request_context_message=request_context_message,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=runtime_context_insert_index,
+                protected_turn_start_index=protected_turn_start_index,
+            )
 
         placeholder_summary = Message(
             role="user",
@@ -14280,6 +14671,7 @@ class Agent:
             )
 
         compaction_config = self._build_compaction_config()
+        self._compaction_failed_this_turn = True
         arm_compaction_deadline(
             compaction_config,
             operation_id=new_compaction_id(),
@@ -14305,8 +14697,15 @@ class Agent:
         )
         try:
             result = await compact_context(request)
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable terminal state
-            return None, "summary_failed"
+            result = CompactionResult(
+                summary="", kept_entries=request.entries, removed_count=0,
+                chunks_processed=0, skip_reason="summary_failed",
+            )
+        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+            self._compaction_failed_this_turn = False
         replacement_applied = bool(
             result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
         )
@@ -14322,7 +14721,40 @@ class Agent:
             or kept_start_index != selected_cut
             or not replay_summary
         ):
-            return None, str(result.skip_reason or "summary_failed")
+            window = self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_start,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                config=config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target,
+                reason=str(getattr(result, "skip_reason", None) or "summary_failed"),
+                compaction_config=compaction_config,
+            )
+            if window is not None:
+                request_idx = int(window.request_context_insert_index or 0)
+                runtime_idx = int(window.runtime_context_insert_index or 0)
+                window_projection = self._project_provider_request_message_count(
+                    [*window.messages, *request_suffix_messages],
+                    config=config,
+                    request_context_message=request_context_message,
+                    request_context_insert_index=request_idx,
+                    runtime_context_message=runtime_context_message,
+                    runtime_context_insert_index=runtime_idx,
+                )
+                if window_projection is not None:
+                    return _MessageCountRecoveryOutcome(
+                        messages=window.messages,
+                        request_context_insert_index=request_idx,
+                        runtime_context_insert_index=runtime_idx,
+                        protected_turn_start_index=int(window.protected_turn_start_index or 0),
+                        projected_wire_messages=window_projection.actual_wire_messages,
+                        removed_count=window.removed_count,
+                    ), "recovered_window"
+            return None, str(getattr(result, "skip_reason", None) or "summary_failed")
 
         compacted = [
             Message(role="user", content=f"[Context summary]\n{replay_summary}"),
@@ -14353,6 +14785,7 @@ class Agent:
         if verified.actual_wire_messages > target:
             return None, "projection_above_target_after_summary"
 
+        self._compaction_failed_this_turn = False
         return (
             _MessageCountRecoveryOutcome(
                 messages=compacted,
@@ -14766,11 +15199,11 @@ class Agent:
         request_window_chars: int | None = None,
         estimated_context_chars: int | None = None,
         durable_consumer_overflow_proven: bool | None = None,
+        provider_overflow: bool = False,
     ) -> CompactionOutcome | None:
         """Check if estimated live context tokens exceed the overflow threshold.
 
-        Uses sub-agent flush instead of prompt injection.
-        The flush is re-entrant: it can trigger on every approach to threshold.
+        Preserve canonical history while selecting a provider-compatible request view.
         """
         self._last_compaction_refusal_reason = None
         window_tokens = compaction_window_tokens or self.config.context_window_tokens
@@ -14794,6 +15227,47 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
+        recovery_config: CompactionConfig | None = None
+
+        def _local_after_failure(reason: str) -> CompactionOutcome | None:
+            active_index = _active_user_message_index_for_request(
+                messages,
+                current_user_text=getattr(self, "_current_turn_message", "") or "",
+            )
+            boundary = (
+                protected_turn_start_index
+                if protected_turn_start_index is not None else active_index
+            )
+            if boundary is None:
+                return None
+            outcome = self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=boundary,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                input_budget_tokens=pressure_window_tokens,
+                input_budget_chars=request_window_chars,
+                allow_unchanged=not provider_overflow and not (
+                    request_scoped_only or routed_window_is_narrower
+                ),
+                compaction_config=recovery_config,
+                reason=reason,
+            )
+            if (
+                outcome is not None and not outcome.compacted
+                and recovery_config is not None and self._session_key
+            ):
+                notify_compaction(
+                    self._session_key, source="automatic", phase="agent_inline_overflow",
+                    status="skipped", reason=reason,
+                    **compaction_effect_payload(status="skipped", reason=reason),
+                    **compaction_lifecycle_payload(
+                        recovery_config.operation_id or new_compaction_id(),
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return outcome
+
         durable_window_tokens = max(
             1,
             int(self._durable_consumer_window_tokens or 0),
@@ -14802,6 +15276,8 @@ class Agent:
         routed_window_is_narrower = (
             durable_window_tokens > window_tokens and durable_consumer_overflow_proven is not True
         )
+        if self._compaction_failed_this_turn:
+            return _local_after_failure("already_attempted_this_turn")
         if request_scoped_only or routed_window_is_narrower:
             # A temporary route/member window is request scope. Preflight has
             # already admitted durable history against the stable session
@@ -14843,7 +15319,7 @@ class Agent:
                 durable_consumer_overflow_proven=(durable_consumer_overflow_proven),
                 protected_turn_start_index=protected_turn_start_index,
             )
-            return None
+            return _local_after_failure("provider_request_budget_exhausted")
 
         if protected_turn_start_index is not None:
             protected_tail_start = max(
@@ -14891,11 +15367,39 @@ class Agent:
                     context_window_tokens=pressure_window_tokens,
                     protected_message_count=len(messages) - protected_tail_start,
                 )
-                return None
+                return _local_after_failure("provider_recent_tail_too_large")
+
+        history_window_tokens = window_tokens
+        history_window_chars: int | None = None
+        if durable_consumer_overflow_proven is True and (
+            request_window_tokens is not None or request_window_chars is not None
+        ):
+            # The core compacts history, whereas the overflow proof includes
+            # the complete request. Reserve the stable consumer's fixed
+            # envelope and generation budget before selecting its history.
+            # A routed member's smaller request cap must not rewrite durable
+            # history. The active user/tool tail already belongs to entries.
+            history_window_tokens, history_window_chars = self.preflight_history_capacity(
+                active_user_message="",
+                active_user_in_history=False,
+                context_window_tokens=self._durable_consumer_window_tokens,
+                consumer_provider=self._durable_consumer_provider,
+                consumer_max_output_tokens=self._durable_consumer_max_output_tokens,
+                consumer_model_id=self._durable_consumer_model_id,
+                consumer_model_capabilities=self._durable_consumer_model_capabilities,
+                consumer_provider_request_max_chars=(
+                    self._durable_consumer_provider_request_max_chars
+                ),
+            )
+            if history_window_tokens <= 0 or history_window_chars <= 0:
+                self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+                return _local_after_failure("provider_request_budget_exhausted")
 
         protected_start: int | None = None
         compaction_id = new_compaction_id()
         compaction_config = self._build_compaction_config()
+        recovery_config = compaction_config
+        self._compaction_failed_this_turn = True
         if protected_turn_start_index is not None:
             protected_start = max(
                 0,
@@ -14914,6 +15418,13 @@ class Agent:
                 status="started",
                 tokens_before=estimated_context_tokens,
                 context_window_tokens=window_tokens,
+                request_capacity_tokens=pressure_window_tokens,
+                request_capacity_chars=request_window_chars,
+                request_tokens=estimated_context_tokens,
+                request_chars=estimated_context_chars,
+                threshold=threshold,
+                char_threshold=char_threshold,
+                ratio=self.config.context_overflow_threshold,
                 heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
                 **compaction_effect_payload(status="started"),
                 **compaction_lifecycle_payload(
@@ -14921,188 +15432,6 @@ class Agent:
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
-        # --- Pre-compaction flush; inline compaction can continue on degraded flush. ---
-        flush_task: asyncio.Task | None = None
-        self._consume_completed_flush_task()
-
-        async def _await_flush_task() -> Any | None:
-            # Give flush a grace period to complete instead of cancelling immediately.
-            # Adds up to flush_timeout_seconds (default 15s) of latency, but without
-            # this the flush is effectively dead code (always cancelled before finishing).
-            if flush_task is not None and not flush_task.done():
-                if flush_task is self._flush_wait_timed_out_task:
-                    return None
-                try:
-                    require_compaction_time(compaction_config, phase="flushing")
-                    remaining = compaction_remaining_seconds(compaction_config)
-                    wait_timeout = self.config.flush_timeout_seconds
-                    if remaining is not None:
-                        wait_timeout = min(wait_timeout, remaining)
-                    receipt = await asyncio.wait_for(
-                        asyncio.shield(flush_task),
-                        timeout=wait_timeout,
-                    )
-                    logger.info("memory_flush.completed_after_compaction")
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return receipt
-                except TimeoutError:
-                    require_compaction_time(compaction_config, phase="flushing")
-                    self._flush_wait_timed_out_task = flush_task
-                    next_retry_seconds = self._record_flush_timeout_backoff()
-                    logger.warning(
-                        "memory_flush.timed_out",
-                        timeout_seconds=self.config.flush_timeout_seconds,
-                        next_retry_seconds=next_retry_seconds,
-                    )
-                except CompactionTimeoutError:
-                    raise
-                except Exception as exc:
-                    logger.warning("memory_flush.await_failed", error=str(exc))
-                    self._mark_flush_task_completed(flush_task)
-                    return None
-            if flush_task is not None and flush_task.done():
-                try:
-                    receipt = flush_task.result()
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return receipt
-                except Exception as exc:
-                    logger.warning("memory_flush.await_failed", error=str(exc))
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return None
-            return None
-
-        pre_compaction_flush_enabled = flush_trigger_enabled(
-            self.config,
-            "pre_compaction",
-        )
-
-        if not self._flush_done_this_cycle and pre_compaction_flush_enabled:
-            try:
-                from opensquilla.memory.flush import (
-                    resolve_flush_plan,
-                    should_flush,
-                )
-
-                now = time.monotonic()
-                if self._active_flush_task is not None and not self._active_flush_task.done():
-                    logger.debug("memory_flush.skipped", reason="already_running")
-                    flush_task = self._active_flush_task
-                elif now < self._flush_backoff_until:
-                    logger.warning(
-                        "memory_flush.skipped",
-                        reason="backoff",
-                        retry_after_seconds=round(self._flush_backoff_until - now, 3),
-                    )
-                else:
-                    transcript_bytes = sum(
-                        len(m.content.encode("utf-8")) if isinstance(m.content, str) else 0
-                        for m in messages
-                    )
-
-                    if should_flush(
-                        total_tokens=estimated_context_tokens,
-                        threshold_tokens=int(threshold),
-                        transcript_bytes=transcript_bytes,
-                    ):
-                        plan = resolve_flush_plan(
-                            workspace_dir=self.config.flush_workspace_dir,
-                            archive_max_bytes=self.config.flush_archive_max_bytes,
-                        )
-                        logger.info(
-                            "memory_flush.triggered",
-                            path=plan.relative_path,
-                            total_tokens=estimated_context_tokens,
-                            threshold=int(threshold),
-                        )
-                        flush_task = asyncio.create_task(self._run_flush(plan, list(messages)))
-                        flush_task.add_done_callback(self._on_flush_task_done)
-                        self._active_flush_task = flush_task
-                        self._flush_done_this_cycle = True
-            except Exception:
-                logger.debug("memory_flush.skipped", reason="flush module unavailable")
-
-        if pre_compaction_flush_enabled:
-            if (
-                flush_task is not None
-                and not flush_task.done()
-                and time.monotonic() < self._flush_backoff_until
-            ):
-                logger.warning(
-                    "memory_flush.skipped",
-                    reason="backoff",
-                    retry_after_seconds=round(self._flush_backoff_until - time.monotonic(), 3),
-                )
-                self._flush_done_this_cycle = False
-            try:
-                receipt = await _await_flush_task()
-            except asyncio.CancelledError:
-                if self._session_key:
-                    notify_compaction(
-                        self._session_key,
-                        source="automatic",
-                        phase="flushing",
-                        status="cancelled",
-                        reason="cancelled",
-                        **compaction_effect_payload(status="cancelled"),
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
-                        ),
-                    )
-                raise
-            except CompactionTimeoutError as exc:
-                self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
-                if self._session_key:
-                    notify_compaction(
-                        self._session_key,
-                        source="automatic",
-                        phase=exc.phase,
-                        status="timed_out",
-                        reason=self._last_compaction_refusal_reason,
-                        **compaction_effect_payload(status="timed_out"),
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
-                        ),
-                    )
-                return None
-            if not flush_receipt_allows_destructive_compaction(receipt):
-                reason = "memory_flush_degraded_before_compaction"
-                if flush_task is not None and self._flush_wait_timed_out_task is flush_task:
-                    reason = "memory_flush_timeout_before_compaction"
-                logger.warning(
-                    "memory_flush.degraded_before_compaction",
-                    reason=reason,
-                    mode=getattr(receipt, "mode", None),
-                    integrity_status=getattr(receipt, "integrity_status", None),
-                    indexed_chunk_count=getattr(receipt, "indexed_chunk_count", None),
-                )
-                self._flush_done_this_cycle = False
-                if pre_compaction_flush_requires_safe_receipt(self.config):
-                    self._last_compaction_refusal_reason = reason
-                    if self._session_key:
-                        notify_compaction(
-                            self._session_key,
-                            source="automatic",
-                            phase="agent_inline_overflow",
-                            status="skipped",
-                            reason=reason,
-                            tokens_before=estimated_context_tokens,
-                            context_window_tokens=window_tokens,
-                            **compaction_effect_payload(
-                                status="skipped",
-                                reason=reason,
-                            ),
-                            **compaction_lifecycle_payload(
-                                compaction_id,
-                                COMPACTION_TRIGGERED_EVENT,
-                            ),
-                        )
-                    return None
-
         # --- Compaction ---
         # Summaries consume flattened text; retention and cut decisions use
         # the original structured message's text and native-media estimate.
@@ -15111,7 +15440,8 @@ class Agent:
         request = CompactionRequest(
             session_id="agent-turn",
             entries=entries,
-            context_window_tokens=window_tokens,
+            context_window_tokens=history_window_tokens,
+            context_window_chars=history_window_chars,
             config=compaction_config,
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
@@ -15156,7 +15486,7 @@ class Agent:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-            return None
+            return _local_after_failure("compaction_deadline_exceeded")
         except Exception as exc:  # noqa: BLE001
             self._last_compaction_refusal_reason = "compaction_failed"
             if self._session_key:
@@ -15175,8 +15505,10 @@ class Agent:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-            return None  # signal failure
+            return _local_after_failure("compaction_failed")
 
+        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+            self._compaction_failed_this_turn = False
         replacement_applied = bool(
             result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
         )
@@ -15248,7 +15580,7 @@ class Agent:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-            return None
+            return _local_after_failure("empty_summary_rejected")
 
         # A skip (nothing removed, no summary) is a no-op regardless of whether
         # the in-memory history is structured or string-only. Reporting it as
@@ -15256,41 +15588,34 @@ class Agent:
         # spurious CompactionEvent that rewrites the durable transcript and
         # corrupts row metadata, so short-circuit every no-op skip here.
         if not replacement_applied:
-            has_structured_content = any(not isinstance(m.content, str) for m in messages)
-            try:
-                await _await_flush_task()
-            except asyncio.CancelledError:
+            failure_reason = str(getattr(result, "skip_reason", None) or "summary_failed")
+            local = _local_after_failure(failure_reason)
+            if local is not None:
+                return local
+            if (
+                durable_consumer_overflow_proven is not None
+                or request_window_tokens is not None
+                or self._last_compaction_refusal_reason in {
+                    "provider_system_prompt_too_large",
+                    "provider_tool_schema_too_large",
+                    "provider_protected_context_too_large",
+                }
+            ):
+                if self._last_compaction_refusal_reason is None:
+                    self._last_compaction_refusal_reason = failure_reason
                 if self._session_key:
                     notify_compaction(
-                        self._session_key,
-                        source="automatic",
-                        phase="flushing",
-                        status="cancelled",
-                        reason="cancelled",
-                        **compaction_effect_payload(status="cancelled"),
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
+                        self._session_key, source="automatic", phase="agent_inline_overflow",
+                        status="failed", reason=self._last_compaction_refusal_reason,
+                        **compaction_effect_payload(
+                            status="failed", reason=self._last_compaction_refusal_reason,
                         ),
-                    )
-                raise
-            except CompactionTimeoutError as exc:
-                self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
-                if self._session_key:
-                    notify_compaction(
-                        self._session_key,
-                        source="automatic",
-                        phase=exc.phase,
-                        status="timed_out",
-                        reason=self._last_compaction_refusal_reason,
-                        **compaction_effect_payload(status="timed_out"),
                         **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
+                            compaction_id, COMPACTION_TRIGGERED_EVENT,
                         ),
                     )
                 return None
-            self._flush_done_this_cycle = False
+            has_structured_content = any(not isinstance(m.content, str) for m in messages)
             skip_reason = getattr(result, "skip_reason", None) or (
                 "structured_content_noop" if has_structured_content else "noop"
             )
@@ -15334,42 +15659,6 @@ class Agent:
             )
         compacted.extend(messages[kept_start_index:])
 
-        try:
-            await _await_flush_task()
-        except asyncio.CancelledError:
-            if self._session_key:
-                notify_compaction(
-                    self._session_key,
-                    source="automatic",
-                    phase="flushing",
-                    status="cancelled",
-                    reason="cancelled",
-                    **compaction_effect_payload(status="cancelled"),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-            raise
-        except CompactionTimeoutError as exc:
-            self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
-            if self._session_key:
-                notify_compaction(
-                    self._session_key,
-                    source="automatic",
-                    phase=exc.phase,
-                    status="timed_out",
-                    reason=self._last_compaction_refusal_reason,
-                    **compaction_effect_payload(status="timed_out"),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-            return None
-
-        # Reset flush flag so it can trigger again after next compaction
-        self._flush_done_this_cycle = False
 
         # Trigger 6: post-compaction sync
         if self._memory_sync_manager is not None:
@@ -15396,6 +15685,7 @@ class Agent:
             kept_start_index,
             summary_present=bool(replay_summary),
         )
+        self._compaction_failed_this_turn = False
         return CompactionOutcome(
             messages=compacted,
             compacted=True,
@@ -15420,65 +15710,6 @@ class Agent:
             runtime_compaction_config=compaction_config,
         )
 
-    def _consume_completed_flush_task(self) -> None:
-        task = self._active_flush_task
-        if task is None or not task.done():
-            return
-        self._mark_flush_task_completed(task)
-
-    def _on_flush_task_done(self, task: asyncio.Task) -> None:
-        self._mark_flush_task_completed(task)
-
-    def _mark_flush_task_completed(self, task: asyncio.Task) -> None:
-        if self._flush_wait_timed_out_task is task:
-            self._flush_wait_timed_out_task = None
-        if self._active_flush_task is not task:
-            return
-        try:
-            receipt = task.result()
-        except asyncio.CancelledError:
-            logger.debug("memory_flush.cancelled")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("memory_flush.background_failed", error=str(exc))
-        else:
-            mode = getattr(receipt, "mode", None)
-            if not flush_receipt_is_successful_flush(receipt):
-                next_retry_seconds = self._ensure_flush_degraded_backoff()
-                logger.warning(
-                    "memory_flush.degraded",
-                    mode=mode,
-                    result_status=getattr(receipt, "result_status", None),
-                    integrity_status=getattr(receipt, "integrity_status", None),
-                    output_coverage_status=getattr(receipt, "output_coverage_status", None),
-                    obligation_status=getattr(receipt, "obligation_status", None),
-                    raw_reason=getattr(receipt, "raw_reason", None),
-                    next_retry_seconds=next_retry_seconds,
-                )
-            else:
-                self._flush_backoff_seconds = 0.0
-                self._flush_backoff_until = 0.0
-        self._active_flush_task = None
-
-    def _record_flush_timeout_backoff(self) -> float:
-        initial = max(0.0, float(self.config.flush_backoff_initial_seconds))
-        maximum = max(initial, float(self.config.flush_backoff_max_seconds))
-        if initial == 0:
-            self._flush_backoff_seconds = 0.0
-            self._flush_backoff_until = 0.0
-            return 0.0
-        if self._flush_backoff_seconds <= 0:
-            next_retry_seconds = initial
-        else:
-            next_retry_seconds = min(self._flush_backoff_seconds * 2, maximum)
-        self._flush_backoff_seconds = next_retry_seconds
-        self._flush_backoff_until = time.monotonic() + next_retry_seconds
-        return next_retry_seconds
-
-    def _ensure_flush_degraded_backoff(self) -> float:
-        remaining = self._flush_backoff_until - time.monotonic()
-        if remaining > 0:
-            return remaining
-        return self._record_flush_timeout_backoff()
 
     @staticmethod
     def _adjust_index_after_prefix_compaction(
@@ -15493,64 +15724,6 @@ class Agent:
         summary_prefix = 2 if summary_present and original_index > 0 else 0
         return summary_prefix + max(0, original_index - kept_start_index)
 
-    async def _run_flush(
-        self,
-        plan: Any,
-        messages: list[Message],
-    ) -> Any | None:
-        """Run memory flush before compaction; delegates to SessionFlushService.
-
-        When a ``SessionFlushService`` is injected, this method forwards the
-        call and returns its receipt. When no service is injected (standalone
-        Agent instances in unit tests or legacy paths), it falls back to an
-        inline raw-dump so we don't silently drop data.
-        """
-        service = getattr(self, "_session_flush_service", None)
-        if service is not None:
-            try:
-                from opensquilla.session.keys import parse_agent_id
-
-                sk = getattr(self, "_session_key", None) or "agent:main:legacy"
-                return await service.execute(
-                    messages,
-                    session_key=sk,
-                    agent_id=parse_agent_id(sk),
-                    timeout=self.config.flush_background_timeout_seconds,
-                    message_window=0,
-                    segment_mode="auto",
-                    provider_request_correlation=derive_provider_request_correlation(
-                        self._provider_request_correlation,
-                        execution_id=uuid.uuid4().hex,
-                        call_kind="auxiliary.session_flush",
-                    ),
-                )
-            except asyncio.CancelledError:
-                logger.debug("memory_flush.cancelled")
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("memory_flush.service_failed", error=str(exc))
-            return None
-
-        # Legacy fallback — only hit when no service is injected.
-        from opensquilla.memory.flush import dump_transcript_excerpt
-
-        if self.provider is None and self.tool_handler is not None:
-            excerpt = dump_transcript_excerpt(messages)
-            if excerpt.strip():
-                from opensquilla.tool_boundary import ToolCall as _FlushToolCall
-
-                await self.tool_handler(
-                    _FlushToolCall(
-                        tool_use_id="flush-fallback",
-                        tool_name="memory_save",
-                        arguments={
-                            "content": excerpt,
-                            "path": plan.relative_path,
-                            "mode": "append",
-                        },
-                    )
-                )
-        return None
 
     @staticmethod
     def _has_provider_context_replay_marker(arguments: dict[str, Any]) -> bool:
@@ -17577,19 +17750,8 @@ class Agent:
             max_turn_tool_errors=self.config.max_turn_tool_errors,
             length_capped_continuations=self.config.length_capped_continuations,
             context_window_tokens=child_target.context_window_tokens,
+            context_window_known=child_target.context_window_known,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
-            flush_enabled=self.config.flush_enabled,
-            flush_triggers=list(self.config.flush_triggers),
-            flush_pre_compaction=self.config.flush_pre_compaction,
-            flush_timeout_seconds=self.config.flush_timeout_seconds,
-            flush_background_timeout_seconds=self.config.flush_background_timeout_seconds,
-            flush_backoff_initial_seconds=self.config.flush_backoff_initial_seconds,
-            flush_backoff_max_seconds=self.config.flush_backoff_max_seconds,
-            flush_archive_max_bytes=self.config.flush_archive_max_bytes,
-            flush_compaction_requires_safe_receipt=(
-                self.config.flush_compaction_requires_safe_receipt
-            ),
-            flush_compaction_safety_mode=self.config.flush_compaction_safety_mode,
             compaction_profile=self.config.compaction_profile,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
             compaction_total_timeout_seconds=self.config.compaction_total_timeout_seconds,

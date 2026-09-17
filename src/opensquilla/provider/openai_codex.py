@@ -43,6 +43,8 @@ from .request_proof import (
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import (
     DEFAULT_MAX_TOOL_CALLS,
@@ -249,7 +251,8 @@ class OpenAICodexProvider:
         return project_final_request_payload(
             payload,
             projection_adapter="openai_codex",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=wire_active_user_index,
@@ -305,7 +308,8 @@ class OpenAICodexProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="openai_codex",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=wire_active_user_index,
@@ -331,6 +335,7 @@ class OpenAICodexProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, cfg),
                 projection_adapter="openai_codex",
                 status_projection_mode="content_envelope",
                 envelope_shape=RESPONSES_REQUEST_ENVELOPE,

@@ -202,13 +202,10 @@ from opensquilla.gateway.session_maintenance_runtime import (
     TaskScopedCancelUnsupportedError as _TaskScopedCancelUnsupportedError,
 )
 from opensquilla.gateway.session_maintenance_runtime import (
-    build_session_flush_correlation as _build_session_flush_correlation,
-)
-from opensquilla.gateway.session_maintenance_runtime import (
     cancel_task_runtime as _cancel_task_runtime,
 )
 from opensquilla.gateway.session_maintenance_runtime import (
-    durable_checkpoint_covers_transcript as _durable_receipt_allows_covered_destructive_compaction,
+    checkpoint_before_session_rewrite,
 )
 from opensquilla.gateway.session_services import (
     get_session_epoch,
@@ -217,7 +214,12 @@ from opensquilla.gateway.session_services import (
     set_session_epoch,
 )
 from opensquilla.gateway.session_streams import get_session_streams
-from opensquilla.gateway.session_view import build_session_view_item, derive_transcript_title
+from opensquilla.gateway.session_title_recovery import read_refused_title_fallbacks
+from opensquilla.gateway.session_view import (
+    build_session_view_item,
+    derive_transcript_title,
+    has_refused_chat_title,
+)
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
@@ -256,12 +258,6 @@ from opensquilla.sandbox.run_mode_policy import (
     principal_has_host_execute,
     run_mode_allowed_for_principal,
 )
-from opensquilla.session.compaction_lifecycle import (
-    compaction_memory_status,
-    flush_receipt_status_for_compaction,
-    flush_receipt_to_dict,
-    flush_trigger_enabled,
-)
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from opensquilla.session.models import (
     AgentTaskStatus,
@@ -286,6 +282,7 @@ from opensquilla.session.storage import (
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
+    safe_error_id,
     safe_provider_failure_code,
     safe_provider_failure_message,
     sanitize_agent_error,
@@ -311,10 +308,6 @@ def _pending_input_lock_for(pending_input_id: str) -> asyncio.Lock:
 log = structlog.get_logger(__name__)
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
-
-
-
-
 
 
 def _emit_steer_metric(disposition: str, **labels: Any) -> None:
@@ -576,8 +569,10 @@ async def _fork_title_state(
     if all(getattr(session, "session_key", None) != parent.session_key for session in sessions):
         sessions.append(parent)
 
-    transcript_titles = await _list_transcript_titles(storage, sessions)
     channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    transcript_titles = await _list_transcript_titles(
+        storage, sessions, channel_types=channel_types
+    )
     sessions_by_key = {
         str(getattr(session, "session_key", "") or ""): session for session in sessions
     }
@@ -704,14 +699,6 @@ def _truncate_removed_entries(transcript: list[Any], max_messages: int) -> list[
     if max_messages == 0:
         return list(transcript)
     return list(transcript[:-max_messages])
-
-
-def _truncate_checkpoint_scope_entries(
-    transcript: list[Any],
-    max_messages: int,
-) -> list[Any]:
-    removed_entries = _truncate_removed_entries(transcript, max_messages)
-    return removed_entries or list(transcript)
 
 
 def _trusted_elevated_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> str | None:
@@ -1731,14 +1718,19 @@ def _task_summary(row: Any) -> dict[str, Any]:
     if terminal_reason is not None:
         summary["terminal_reason"] = terminal_reason
     if summary.get("status") in {"failed", "timeout", "abandoned", "cancelled"}:
-        summary["terminal_message"] = build_terminal_reply(
+        outcome = summary.get("turn_outcome", {})
+        summary["terminal_message"] = append_error_ref(build_terminal_reply(
             {
                 "status": summary.get("status"),
                 "terminal_reason": terminal_reason,
                 "error_class": getattr(row, "error_class", None),
                 "error_message": getattr(row, "error_message", None),
+                "failure_kind": outcome.get("failure_kind"),
+                **{key: outcome[key] for key in (
+                    "usage_call_index", "no_prior_provider_dispatch", "replay_safe"
+                ) if key in outcome},
             }
-        )
+        ), safe_error_id(outcome.get("error_id")))
     return summary
 
 
@@ -1747,17 +1739,18 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         return payload
 
     prior_outcome = payload.get("turn_outcome")
+    prior_outcome = prior_outcome if isinstance(prior_outcome, dict) else {}
     prior_failure_kind = (
-        prior_outcome.get("failure_kind")
-        if isinstance(prior_outcome, dict)
-        else payload.get("failure_kind")
+        prior_outcome.get("failure_kind") or payload.get("failure_kind")
     )
     message = payload.get("message")
     error_message = payload.get("error_message")
     raw_message = error_message if isinstance(error_message, str) and error_message else message
     raw_text = raw_message if isinstance(raw_message, str) and raw_message else "Agent error"
     if isinstance(prior_failure_kind, str) and prior_failure_kind:
-        raw_text = safe_provider_failure_message(prior_failure_kind)
+        raw_text = safe_provider_failure_message(
+            prior_failure_kind, code=payload.get("code"), message=raw_text
+        )
     code = payload.get("code")
     if isinstance(prior_failure_kind, str) and prior_failure_kind:
         code = safe_provider_failure_code(
@@ -1767,12 +1760,15 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     code_text = str(code or "").lower()
     is_timeout = "timeout" in code_text or "stream idle" in raw_text.lower()
     terminal_payload = {
-        "status": "timeout" if is_timeout else "failed",
+        **payload,
+        "status": payload.get("status") or ("timeout" if is_timeout else "failed"),
         "terminal_reason": payload.get("terminal_reason") or ("timeout" if is_timeout else "error"),
         "error_class": code,
         "error_message": raw_text,
-        **payload,
+        "failure_kind": prior_failure_kind,
     }
+    if prior_failure_kind:
+        terminal_payload.pop("terminal_message", None)
     _, safe_error_message = sanitize_agent_error(
         terminal_payload,
         fallback_error_class=str(code) if code else None,
@@ -1781,8 +1777,13 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     # Join the user-visible reply to its durable turn_errors row: hex ids keep
     # substring-based timeout classification stable, and append_error_ref is
     # idempotent so the CLI client's re-normalization cannot double-suffix.
-    error_id = payload.get("error_id")
-    error_ref = error_id if isinstance(error_id, str) else None
+    error_ids = [
+        source["error_id"] for source in (payload, prior_outcome)
+        if "error_id" in source and source["error_id"] != ""
+    ]
+    error_ref = safe_error_id(error_ids[0]) if error_ids else None
+    if any(safe_error_id(value) != error_ref for value in error_ids):
+        error_ref = None
     terminal_message = append_error_ref(build_terminal_reply(terminal_payload), error_ref)
     # Serialize the typed turn outcome onto the wire so every surface (Web UI,
     # CLI, channels) can render a specific cause + retryability + recovery
@@ -1796,7 +1797,22 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         message=safe_error_message,
         error_class=str(code) if code else None,
         failure_kind=(str(prior_failure_kind) if isinstance(prior_failure_kind, str) else None),
-    )
+    ).to_dict()
+    # Preserve existing public extensions, not arbitrary provider fields. In
+    # particular, re-normalization must not erase the stricter usage proof.
+    for key in (
+        "retry_after_ms", "usage_call_index", "no_prior_provider_dispatch", "replay_safe",
+        "user_message_id", "cancellation_source", "document_mutation_outcome",
+        "documentMutationOutcome",
+    ):
+        if key in prior_outcome:
+            outcome[key] = prior_outcome[key]
+    if error_ref is not None:
+        outcome["error_id"] = error_ref
+    elif error_ids:
+        # Preserve invalid/conflicting evidence across repeated normalization;
+        # omission would let a later pass trust the surviving top-level id.
+        outcome["error_id"] = None
     sensitive_provider_fields = {
         "provider_error_message",
         "provider_response_body",
@@ -1815,7 +1831,7 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         "terminal_message": terminal_message,
         "terminal_reason": terminal_payload["terminal_reason"],
         "error_message": safe_error_message,
-        "turn_outcome": outcome.to_dict(),
+        "turn_outcome": outcome,
     }
 
 
@@ -2125,11 +2141,37 @@ async def _list_task_rows_by_session(
     return {key: await _list_task_rows(ctx, storage, key) for key in keys}
 
 
-async def _list_transcript_titles(storage: Any, sessions: list[Any]) -> dict[str, str]:
+async def _list_transcript_titles(
+    storage: Any,
+    sessions: Sequence[Any],
+    *,
+    channel_types: dict[str, str] | None = None,
+) -> dict[str, str]:
+    affected = [
+        session
+        for session in sessions
+        if has_refused_chat_title(session, channel_types=channel_types)
+    ]
+    titles = {
+        str(getattr(session, "session_id", "") or ""): ""
+        for session in affected
+        if getattr(session, "session_id", None)
+    }
+    if affected:
+        try:
+            titles.update(
+                await read_refused_title_fallbacks(storage, affected, channel_types=channel_types)
+            )
+        except Exception:
+            # Keep list/search enrichment best-effort. A failed historical read
+            # selects the existing default, never an unrelated active-tail topic.
+            log.warning("sessions.refused_title_recovery_failed", exc_info=True)
     session_ids = [str(getattr(session, "session_id", "") or "") for session in sessions]
-    session_ids = [session_id for session_id in session_ids if session_id]
+    session_ids = [
+        session_id for session_id in session_ids if session_id and session_id not in titles
+    ]
     if not session_ids:
-        return {}
+        return titles
 
     title_inputs: dict[str, list[str]] = {session_id: [] for session_id in session_ids}
     storage_batch = getattr(storage, "list_user_transcript_content_batch", None)
@@ -2163,7 +2205,6 @@ async def _list_transcript_titles(storage: Any, sessions: list[Any]) -> dict[str
                     if str(getattr(entry, "role", "") or "").lower() == "user"
                 ][:3]
 
-    titles: dict[str, str] = {}
     for session_id, values in title_inputs.items():
         for value in values:
             title = derive_transcript_title(value)
@@ -2404,7 +2445,10 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         storage,
         [s.session_key for s in sessions],
     )
-    transcript_titles = await _list_transcript_titles(storage, sessions)
+    channel_types = _channel_types_from_config(ctx.config)
+    transcript_titles = await _list_transcript_titles(
+        storage, sessions, channel_types=channel_types
+    )
 
     # Batch transcript counts in one round-trip to avoid N+1 against
     # count_transcript_entries. Storage layers that don't implement the batch
@@ -2420,7 +2464,6 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
             entry_counts = {}
 
     result = []
-    channel_types = _channel_types_from_config(ctx.config)
     for s in sessions:
         # Fetch entry count for metadata
         entry_count = entry_counts.get(s.session_id, 0)
@@ -2551,12 +2594,16 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
             updated_at=view.get("updatedAt"),
         )
 
+    async def read_titles(sessions: Sequence[Any]) -> dict[str, str]:
+        return await _list_transcript_titles(storage, sessions, channel_types=channel_types)
+
     result = await SessionDirectory(storage).search(
         raw_query,
         raw_limit,
         now_ms=now_ms,
         project=project,
         derive_transcript_title=derive_transcript_title,
+        read_transcript_titles=read_titles,
     )
     return {
         "sessions": [
@@ -2927,8 +2974,6 @@ def _turn_source_scope(source_hint: dict[str, Any], ctx: RpcContext) -> str:
     return f"{caller_kind}:{channel_kind}:{principal_role}"[:256]
 
 
-
-
 async def _accepted_turn_response(
     result: TurnAcceptanceResult,
     *,
@@ -3076,11 +3121,6 @@ async def _accepted_turn_response(
     payload["terminal_reason"] = task_record.terminal_reason
     payload["terminal_message"] = build_terminal_reply(task_record)
     return payload
-
-
-
-
-
 
 
 def _pending_input_storage(ctx: RpcContext) -> SessionStorage:
@@ -3628,16 +3668,7 @@ async def _delete_session_with_lifecycle(
         if lock is not None:
             await fences.enter_async_context(lock)
 
-        # These durable writers may outlive the task coroutine that scheduled
-        # them. Settle both before the row and its generation disappear.
         await drain_pending_flushes_for_sessions(session_keys)
-        drain_turn_writes = getattr(
-            ctx.turn_runner,
-            "drain_session_background_writes",
-            None,
-        )
-        if callable(drain_turn_writes):
-            await drain_turn_writes(session_keys)
 
         get_session = getattr(storage, "get_session", None)
         session = await get_session(canonical_key) if callable(get_session) else None
@@ -3741,8 +3772,6 @@ _handle_sessions_context_compact_contract = register_session_maintenance_contrac
 
 @_d.method("sessions.truncate", scope="operator.write")
 async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dict:
-    from opensquilla.memory.session_flush import FlushReceipt
-
     key = _require_key(params)
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -3754,141 +3783,37 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
     lock = get_session_lock(turn_runner, key)
 
     async def _run_locked() -> dict[str, Any]:
-        receipt: FlushReceipt | None = None
         storage = get_session_storage(ctx.session_manager)
         session = None
         if storage is not None:
             session = await storage.get_session(key)
         previous_session_id = getattr(session, "session_id", None) if session else None
 
-        truncate_flush_enabled = flush_trigger_enabled(ctx.config, "session_reset")
-        if truncate_flush_enabled and ctx.flush_service is None:
-            # Fail-closed: refuse to truncate a non-empty transcript without
-            # an admin force override. Empty transcripts are safe to truncate.
-            transcript = await ctx.session_manager.get_transcript(key)
-            if transcript and not force:
-                checkpoint_safe = (
-                    storage is not None
-                    and await _durable_receipt_allows_covered_destructive_compaction(
-                        storage,
-                        key,
-                        previous_session_id,
-                        _truncate_checkpoint_scope_entries(transcript, max_messages),
-                    )
-                )
-                if not checkpoint_safe:
-                    raise RpcHandlerError(
-                        code="flush_unavailable",
-                        message=(
-                            "Truncate aborted: flush service is unavailable and "
-                            "the transcript is non-empty. Re-run with force=true "
-                            "(admin) to truncate without backup."
-                        ),
-                        details={
-                            "key": key,
-                            "session_id": previous_session_id,
-                            "reason": "flush_service_disabled",
-                            "message_count": len(transcript),
-                        },
-                    )
-            if transcript and force and "operator.admin" not in ctx.principal.scopes:
-                raise RpcHandlerError(
-                    code="permission_denied",
-                    message="force=true on sessions.truncate requires operator.admin scope.",
-                    details={"key": key, "session_id": previous_session_id},
-                )
-        elif truncate_flush_enabled:
-            if storage is None:
-                raise KeyError("No session storage available")
-            if session is None:
-                raise KeyError(f"Session not found: {key}")
-            agent_id = normalize_agent_id(getattr(session, "agent_id", None) or "main")
-            transcript = await ctx.session_manager.get_transcript(key)
-            if transcript:
-                try:
-                    flush_turn_id, flush_correlation = _build_session_flush_correlation(
-                        ctx,
-                        previous_session_id,
-                    )
-                    flush_kwargs: dict[str, Any] = {
-                        "agent_id": agent_id,
-                        "timeout": 30.0,
-                        "message_window": 0,
-                        "segment_mode": "auto",
-                        "raw_capture_policy": "required",
-                    }
-                    if _accepts_keyword_arg(ctx.flush_service.execute, "turn_id"):
-                        flush_kwargs["turn_id"] = flush_turn_id
-                    if flush_correlation is not None and _accepts_keyword_arg(
-                        ctx.flush_service.execute,
-                        "provider_request_correlation",
-                    ):
-                        flush_kwargs["provider_request_correlation"] = flush_correlation
-                    receipt = await ctx.flush_service.execute(
-                        transcript,
-                        key,
-                        **flush_kwargs,
-                    )
-                except Exception as exc:  # noqa: BLE001 — both LLM and raw-dump failed
-                    receipt = FlushReceipt(
-                        mode="error",
-                        flushed_paths=[],
-                        slug=None,
-                        message_count=len(transcript),
-                        duration_ms=0,
-                        raw_reason=None,
-                        error=str(exc),
-                        result_status="archive_failed",
-                    )
-                    raise RpcHandlerError(
-                        code="CONTEXT_FLUSH_FAILED",
-                        message=f"Truncate aborted: flush failed ({receipt.error})",
-                        details={
-                            "flush_receipt": receipt.to_dict(),
-                            "key": key,
-                            "session_id": previous_session_id,
-                        },
-                    ) from exc
-
-                durable_receipt_safe = await _durable_receipt_allows_covered_destructive_compaction(
+        if force and not ctx.has_scope("operator.admin"):
+            raise RpcHandlerError(
+                code="permission_denied",
+                message="force=true on sessions.truncate requires operator.admin scope.",
+                details={"key": key, "session_id": previous_session_id},
+            )
+        transcript = await ctx.session_manager.get_transcript(key)
+        removed_entries = _truncate_removed_entries(transcript, max_messages)
+        if removed_entries and not force:
+            try:
+                await checkpoint_before_session_rewrite(
+                    ctx.session_manager,
                     storage,
                     key,
                     previous_session_id,
-                    _truncate_checkpoint_scope_entries(transcript, max_messages),
+                    removed_entries,
+                    expected_session_epoch=getattr(session, "epoch", None),
+                    source="session_truncate",
                 )
-                memory_status = compaction_memory_status(
-                    receipt,
-                    deterministic_receipt_safe=durable_receipt_safe,
-                    required=True,
-                )
-                if not memory_status.allows_destructive_compaction:
-                    flush_status = flush_receipt_status_for_compaction(receipt, ctx.config)
-                    raise RpcHandlerError(
-                        code="CONTEXT_FLUSH_FAILED",
-                        message=(
-                            f"Truncate aborted: flush status {flush_status!r} is not "
-                            "sufficient for destructive truncate."
-                        ),
-                        details={
-                            "flush_receipt": flush_receipt_to_dict(receipt),
-                            "key": key,
-                            "session_id": previous_session_id,
-                            "reason": "destructive_truncate_requires_safe_flush",
-                            "flush_receipt_status": flush_status,
-                            "memory_safety_status": memory_status.safety_status,
-                            "semantic_memory_status": memory_status.semantic_status,
-                        },
-                    )
-            else:
-                receipt = FlushReceipt(
-                    mode="skipped",
-                    flushed_paths=[],
-                    slug=None,
-                    message_count=0,
-                    duration_ms=0,
-                    raw_reason=None,
-                    error=None,
-                )
+            except Exception as exc:
+                raise RpcHandlerError(
+                    code="CHECKPOINT_FAILED",
+                    message="Truncate aborted: transcript checkpoint could not be saved.",
+                    details={"key": key, "session_id": previous_session_id},
+                ) from exc
 
         result = await ctx.session_manager.truncate(key, max_messages=max_messages)
         payload = {
@@ -3898,27 +3823,12 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
             "before_count": result["before_count"],
             "after_count": result["after_count"],
         }
-        if receipt is not None:
-            payload["flush_receipt"] = flush_receipt_to_dict(receipt)
         return payload
 
-    async def _run_accounted() -> dict[str, Any]:
-        from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
-        from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
-
-        usage_scope = await build_session_usage_scope(
-            getattr(ctx, "usage_event_sink", None),
-            ctx.session_manager,
-            key,
-            run_kind="memory_flush",
-        )
-        with bind_usage_accounting_scope(usage_scope):
-            return await _run_locked()
-
     if lock is None:
-        return await _run_accounted()
+        return await _run_locked()
     async with lock:
-        return await _run_accounted()
+        return await _run_locked()
 
 
 async def _handle_sessions_subscribe(params: dict | None, ctx: RpcContext) -> None:
@@ -4197,6 +4107,7 @@ def _build_session_read_application(
         storage=storage,
         ports=ports,
         clock=clock,
+        channel_types=_channel_types_from_config(ctx.config),
     )
 
 
@@ -5718,11 +5629,9 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
             yield
 
 
-
     def clear_compaction_marker(self, key: str) -> None:
         if callable(self._clear_compaction):
             self._clear_compaction(key)
-
 
 
     async def publish_forked(self, key: str) -> None:

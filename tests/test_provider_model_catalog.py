@@ -7,6 +7,19 @@ import pytest
 from opensquilla.provider.model_catalog import ModelCatalog, _corrections_budget_fallback
 
 
+def test_deployment_context_window_distinguishes_unknown_from_operator_and_runtime() -> None:
+    catalog = ModelCatalog()
+    unknown = catalog.resolve_deployment_limits("synthetic-private-model", provider="private-api")
+    assert unknown.context_window == 200_000
+    assert unknown.context_window_known is False
+    local = catalog.resolve_deployment_limits("synthetic-private-model", provider="ollama")
+    assert local.context_window_known is True
+    catalog.set_user_overrides({"private-api/synthetic-private-model": {"context_window": 48_000}})
+    explicit = catalog.resolve_deployment_limits("synthetic-private-model", provider="private-api")
+    assert explicit.context_window == 48_000
+    assert explicit.context_window_known is True
+
+
 def test_user_override_price_fields_keep_qualified_precedence_and_bare_fallback() -> None:
     catalog = ModelCatalog()
     catalog.set_user_overrides(
@@ -34,18 +47,19 @@ def test_user_override_price_fields_keep_qualified_precedence_and_bare_fallback(
     }
 
 
-def test_deepseek_v4_direct_models_use_models_dev_limits() -> None:
-    # The vendored models.dev snapshot supplies the real per-(provider, model)
-    # budgets offline (PR #406 roadmap item 4); the packaged corrections
-    # budget rows remain only the emergency floor beneath it.
+def test_deepseek_direct_current_flash_alias_and_pro_limits() -> None:
+    # Official direct API metadata: current Flash and its retired V4 alias
+    # share the V4.1 deployment, while Pro remains a text-only deployment.
     catalog = ModelCatalog()
 
-    for model in ("deepseek-v4-flash", "deepseek-v4-pro"):
+    for model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"):
         assert catalog.resolve_context_window(model, "deepseek") == 1_000_000
+        assert catalog.resolve_context_window_with_source(model, "deepseek")[1] == "catalog"
         assert catalog.resolve_max_tokens(model, provider="deepseek") == 384_000
         caps = catalog.get_capabilities(model, provider_name="deepseek")
         assert caps.supports_reasoning is True
         assert caps.supports_tools is True
+        assert caps.supports_vision is (model != "deepseek-v4-pro")
         assert caps.reasoning_format == "deepseek"
 
 
@@ -68,6 +82,41 @@ def test_openrouter_c5_models_have_offline_budgets_and_capabilities() -> None:
         assert capabilities.supports_tools is True
         assert capabilities.supports_vision is True
         assert capabilities.reasoning_format == "openrouter"
+
+
+@pytest.mark.parametrize(
+    ("model", "window", "output"),
+    [
+        ("deepseek/deepseek-v4-flash", 1_024_000, 384_000),
+        ("deepseek/deepseek-v4-pro", 1_048_576, 393_216),
+        ("z-ai/glm-5.2", 1_048_576, 131_072),
+        ("z-ai/glm-5.1", 200_000, 128_000),
+        ("moonshotai/kimi-k2.6", 262_144, 235_929),
+    ],
+)
+def test_openrouter_public_physical_limits_are_available_offline(
+    model: str, window: int, output: int,
+) -> None:
+    catalog = ModelCatalog()
+    entry = catalog.resolve_entry(model, provider="openrouter")
+    assert (entry.context_window, entry.max_output_tokens) == (window, output)
+    assert catalog.resolve_context_window_with_source(model, "openrouter") == (window, "catalog")
+    assert catalog.resolve_max_tokens(model, provider="openrouter") == output
+    assert entry.supports_tools is True
+    assert entry.supports_reasoning is True
+
+
+@pytest.mark.parametrize("top_window", [None, -1, 100_000, 250_000])
+def test_openrouter_live_context_respects_the_smaller_positive_top_provider_limit(
+    top_window: int | None,
+) -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data([{
+        "id": "vendor/synthetic-model", "context_length": 200_000,
+        "top_provider": {"context_length": top_window, "max_completion_tokens": 8_192},
+    }])
+    expected = 100_000 if top_window == 100_000 else 200_000
+    assert catalog.resolve_context_window("vendor/synthetic-model", "openrouter") == expected
 
 
 def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
@@ -127,7 +176,7 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     assert catalog.resolve_context_window("glm-5", provider="tokenrhythm") == 1_000_000
     assert catalog.resolve_context_window("kimi-k2.5", provider="tokenrhythm") == 256_000
     assert catalog.resolve_context_window("kimi-k2.7-code", provider="tokenrhythm") == 256_000
-    assert catalog.resolve_max_tokens("kimi-k2.7-code", provider="tokenrhythm") == 128_000
+    assert catalog.resolve_max_tokens("kimi-k2.7-code", provider="tokenrhythm") == 16_000
     assert catalog.resolve_context_window("qwen3.7-max", provider="tokenrhythm") == 1_000_000
     assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
     # The correction is scoped to TokenRhythm. Direct/provider-less snapshot

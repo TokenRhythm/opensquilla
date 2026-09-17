@@ -142,7 +142,7 @@ async def test_build_services_constructs_unconfigured_selector_without_key(
     )
 
     config = GatewayConfig(
-        memory={"flush_enabled": False},
+        memory={},
     )
     services = await build_services(
         config=config, session_db_path=":memory:", seed_agent_workspaces=False

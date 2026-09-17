@@ -380,6 +380,7 @@ METHOD_SCOPES: dict[str, str] = {
     "agents.files.set": ADMIN_SCOPE,
     "skills.install": ADMIN_SCOPE,
     "skills.install.cancel": ADMIN_SCOPE,
+    "skills.install.status": ADMIN_SCOPE,
     "skills.update": ADMIN_SCOPE,
     "skills.uninstall": ADMIN_SCOPE,
     "skills.reload": ADMIN_SCOPE,
@@ -439,11 +440,6 @@ METHOD_SCOPES: dict[str, str] = {
     "memory.import.apply": ADMIN_SCOPE,
     "memory.import.undo": ADMIN_SCOPE,
     "memory.import.discard": ADMIN_SCOPE,
-    "memory.raw_fallbacks.list": ADMIN_SCOPE,
-    "memory.raw_fallbacks.show": ADMIN_SCOPE,
-    "memory.repair.list": ADMIN_SCOPE,
-    "memory.repair.run": ADMIN_SCOPE,
-    "memory.repair.show": ADMIN_SCOPE,
     # Settings-only profile import discovery. These methods expose no paths
     # and never apply an import, but host-level inventory remains admin-only.
     "migration.sources.list": ADMIN_SCOPE,

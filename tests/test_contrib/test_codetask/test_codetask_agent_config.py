@@ -18,7 +18,7 @@ _TEMPLATE = {
     "sandbox": {"sandbox": False, "security_grading": False},
     "tools": {"deny": ["memory*"]},
     "meta_skill": {"enabled": False},
-    "memory": {"flush_enabled": False},
+    "memory": {},
 }
 
 
@@ -249,7 +249,7 @@ def test_bundled_template_pins_no_provider_sections():
     )
     for section in OPERATOR_SECTIONS:
         assert section not in template, section
-    for section in ("tools", "sandbox", "meta_skill", "memory"):
+    for section in ("tools", "sandbox", "meta_skill"):
         assert section in template, section
 
 

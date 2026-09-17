@@ -22,6 +22,7 @@ from opensquilla.provider.protocol import (
     provider_metadata,
 )
 from opensquilla.provider.selector import ProviderConfig, build_provider_from_config
+from opensquilla.provider.types import ChatConfig
 
 MAX_COMPACTION_LLM_CALLS = 2
 DEFAULT_COMPACTION_OUTPUT_TOKENS = 1024
@@ -101,7 +102,11 @@ class CompactionExecutionTarget:
     context_window_tokens: int = 0
     context_window_source: str = "model_catalog"
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS
+    # The portable body cap is independent of the provider's whole generation
+    # allowance, which may also be consumed by unavoidable reasoning.
+    max_generation_tokens: int | None = None
     provider_request_max_chars: int = 0
+    provider_request_max_chars_explicit_cap: int | None = field(default=None, repr=False)
     deployment_fingerprint: str = ""
     portable: bool = True
     source: str = "active_provider"
@@ -122,6 +127,8 @@ class CompactionExecutionTarget:
             raise ValueError("context_window_tokens must be non-negative")
         if self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
+        if self.max_generation_tokens is not None and self.max_generation_tokens <= 0:
+            raise ValueError("max_generation_tokens must be positive")
         if self.provider_request_max_chars < 0:
             raise ValueError("provider_request_max_chars must be non-negative")
         if not self.deployment_fingerprint:
@@ -211,11 +218,18 @@ def _resolved_target_budgets(
     # override when it may have come from a catalog or per-model profile.
     window_source = "caller_resolved"
     if resolved_window <= 0:
-        catalog_window = int(
-            catalog.resolve_context_window(model, provider=provider_id) or 0
+        resolve_with_source = getattr(catalog, "resolve_context_window_with_source", None)
+        if callable(resolve_with_source):
+            catalog_window, catalog_source = resolve_with_source(model, provider=provider_id)
+        else:
+            catalog_window = catalog.resolve_context_window(model, provider=provider_id)
+            catalog_source = "catalog"
+        resolved_window = int(catalog_window or 0)
+        window_source = (
+            "model_catalog"
+            if resolved_window > 0 and catalog_source != "default"
+            else "bounded_fallback"
         )
-        resolved_window = catalog_window
-        window_source = "model_catalog" if catalog_window > 0 else "bounded_fallback"
     resolved_window = max(1, resolved_window)
 
     catalog_output = int(
@@ -257,6 +271,7 @@ def build_compaction_llm_plan_from_provider_config(
     provider_request_max_chars: int = 0,
     max_calls: int = MAX_COMPACTION_LLM_CALLS,
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS,
+    max_generation_tokens: int | None = None,
     deployment_fingerprint: str = "",
     portable: bool = True,
     source: str = "provider_config",
@@ -301,7 +316,11 @@ def build_compaction_llm_plan_from_provider_config(
                 context_window_tokens=resolved_window,
                 context_window_source=window_source,
                 max_output_tokens=resolved_output,
+                max_generation_tokens=max_generation_tokens,
                 provider_request_max_chars=resolved_chars,
+                provider_request_max_chars_explicit_cap=max(
+                    0, int(provider_request_max_chars or 0),
+                ),
                 deployment_fingerprint=(
                     deployment_fingerprint
                     or _provider_config_fingerprint(isolated)
@@ -322,6 +341,7 @@ def build_compaction_llm_plan_from_provider(
     provider_request_max_chars: int = 0,
     max_calls: int = MAX_COMPACTION_LLM_CALLS,
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS,
+    max_generation_tokens: int | None = None,
     deployment_fingerprint: str = "",
     portable: bool = True,
     source: str = "resolved_provider",
@@ -372,7 +392,11 @@ def build_compaction_llm_plan_from_provider(
                 context_window_tokens=resolved_window,
                 context_window_source=window_source,
                 max_output_tokens=resolved_output,
+                max_generation_tokens=max_generation_tokens,
                 provider_request_max_chars=resolved_chars,
+                provider_request_max_chars_explicit_cap=max(
+                    0, int(provider_request_max_chars or 0),
+                ),
                 deployment_fingerprint=deployment_fingerprint,
                 portable=portable,
                 source=source,
@@ -426,13 +450,18 @@ def resolve_compaction_execution_plan(
         if config is None:
             return
         try:
+            target_window = (
+                context_window_tokens
+                if source in {"routed_deployment", "active_deployment"}
+                else 0
+            )
+            if source == "ensemble_aggregator":
+                resolve_config = getattr(active_provider, "compaction_chat_config", None)
+                if callable(resolve_config):
+                    target_window = resolve_config(ChatConfig()).provider_context_window_tokens
             plan = build_compaction_execution_plan_from_provider_config(
                 config,
-                context_window_tokens=(
-                    context_window_tokens
-                    if source in {"routed_deployment", "active_deployment"}
-                    else 0
-                ),
+                context_window_tokens=target_window,
                 source=source,
                 replay_provider_state=None if active_only else False,
             )

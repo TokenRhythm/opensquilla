@@ -113,7 +113,7 @@ async def open_stack(db_path: Path) -> AsyncIterator[WorkspaceStack]:
         principal=OWNER,
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "default-workspace"),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
         ),
         session_manager=manager,
@@ -1863,7 +1863,7 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
 
     config = GatewayConfig(
         workspace_dir=str(workspace),
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
         agent_stream_heartbeat_interval_seconds=0.0,
         agent_stream_idle_timeout_seconds=1.0,

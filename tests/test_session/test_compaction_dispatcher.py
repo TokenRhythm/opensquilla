@@ -11,12 +11,12 @@ from __future__ import annotations
 import pytest
 
 from opensquilla.session.compaction import (
-    CompactionConfig,
     CompactionRequest,
     CompactionResult,
     compact_context,
     compact_context_new,
 )
+from tests.helpers.compaction import synthetic_compaction_config
 
 
 def _make_request(
@@ -89,50 +89,39 @@ async def test_compact_context_noop_when_within_budget():
 @pytest.mark.asyncio
 async def test_new_avoids_mid_turn_cut():
     """Turn-boundary cut must not split an assistant tool_call from its result."""
-    # Build entries that would be split mid-turn by a pure token-budget cut.
-    # Window = 30 tokens; keep_budget = 15.
-    # Entries: u=5 a_tool=5 tool_result=5 u=5 a=5  (total=25)
-    # A raw token-budget cut from the end would try to keep 15 tokens:
-    #   a_final(5) + u_2(5) = 10 < 15, then tool_result(5) = 15 — keep 3 entries
-    #   last_removed = a_tool → mid_turn!
-    # The new impl should walk back one more step so last_removed = u_1 (turn_boundary).
+    # The raw 250-token keep budget would retain the final answer, question,
+    # and tool result but split it from its 200-token assistant call. The
+    # completed tool round must instead move wholly into the summary.
     entries = [
-        {"role": "user", "content": "q1", "token_count": 5},
+        {"role": "user", "content": "Earlier request.", "token_count": 1_000},
+        {"role": "assistant", "content": "Earlier answer.", "token_count": 1_000},
+        {"role": "user", "content": "q1", "token_count": 200},
         {
             "role": "assistant",
-            "content": "[tool_call:read_file({\"path\": \"x\"})]",
-            "token_count": 5,
+            "content": '[tool_call:read_file({"path": "x"})]',
+            "token_count": 200,
         },
-        {"role": "tool", "content": "[tool_result:read_file] contents", "token_count": 5},
+        {"role": "tool", "content": "[tool_result:read_file] contents", "token_count": 100},
         {"role": "user", "content": "q2", "token_count": 5},
         {"role": "assistant", "content": "answer", "token_count": 5},
     ]
-    # Use a small window to force compaction; no API key so fallback summary is used.
     request = CompactionRequest(
-        session_id="boundary-test",
-        entries=entries,
-        context_window_tokens=22,  # total=25 > 22*safety(1.2)=26.4 — actually under; use tighter
-        config=CompactionConfig(safety_margin=1.0),
+        session_id="boundary-test", entries=entries, context_window_tokens=500,
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
     result = await compact_context_new(request)
 
-    if result.removed_count > 0:
-        # The cut should NOT land with last_removed = assistant tool_call
-        # and first_kept = tool_result.
-        removed = entries[: len(entries) - len(result.kept_entries)]
-        kept = result.kept_entries
-        if removed and kept:
-            last_removed_role = removed[-1].get("role")
-            last_removed_content = str(removed[-1].get("content") or "")
-            first_kept_role = kept[0].get("role")
-            is_mid_turn = (
-                last_removed_role == "assistant"
-                and "[tool_call:" in last_removed_content
-                and first_kept_role == "tool"
-            )
-            assert not is_mid_turn, (
-                f"Cut landed mid-turn: last_removed={removed[-1]}, first_kept={kept[0]}"
-            )
+    assert result.removed_count == 5
+    assert result.summary
+    assert result.kept_entries == entries[5:]
+    removed = entries[:result.removed_count]
+    kept = result.kept_entries
+    is_mid_turn = (
+        removed[-1]["role"] == "assistant"
+        and "[tool_call:" in removed[-1]["content"]
+        and kept[0]["role"] == "tool"
+    )
+    assert not is_mid_turn
 
 
 @pytest.mark.asyncio
@@ -153,8 +142,9 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     request = CompactionRequest(
         session_id="agent-flattened-boundary-test",
         entries=entries,
-        context_window_tokens=500,
-        config=CompactionConfig(safety_margin=1.0),
+        # Keep q1's complete tool round within the 20% raw-tail target.
+        context_window_tokens=750,
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
     result = await compact_context_new(request)
 
@@ -199,15 +189,15 @@ async def test_new_can_cut_after_completed_tool_round(monkeypatch):
         session_id="boundary-start-test",
         entries=entries,
         context_window_tokens=23,
-        config=CompactionConfig(safety_margin=1.0),
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
 
     result = await compact_context_new(request)
 
     assert result.removed_count == 0
-    assert result.summary_source == "fallback"
+    assert result.summary_source == "llm"
     assert result.kept_entries == entries
-    assert result.skip_reason == "quality_gate_failed"
+    assert result.skip_reason == "summary_does_not_fit"
     assert result.quality_report["fits_context_window"] is False
 
 
@@ -217,18 +207,28 @@ async def test_new_prev_summary_marker_remains_backward_compatible():
     entries = [
         {"role": "user", "content": "a " * 500, "token_count": 500},
         {"role": "assistant", "content": "b " * 500, "token_count": 500},
+        {"role": "user", "content": "Continue.", "token_count": 5},
+        {"role": "assistant", "content": "Continuing.", "token_count": 5},
     ]
+    config = synthetic_compaction_config(
+        summary="prior context here; earlier work completed.", safety_margin=1.0,
+    )
     request = CompactionRequest(
-        session_id="prev-summary-test",
-        entries=entries,
-        context_window_tokens=100,
-        config=CompactionConfig(safety_margin=1.0),
+        session_id="prev-summary-test", entries=entries, context_window_tokens=500,
+        config=config,
         custom_instructions="__prev_summary__:prior context here\nnormal instructions",
     )
     result = await compact_context_new(request)
-    if result.removed_count > 0:
-        assert "prior context here" in result.summary
-        assert "__prev_summary__:" not in result.summary
+
+    assert result.removed_count == 2
+    assert result.summary
+    assert "prior context here" in result.summary
+    assert "__prev_summary__:" not in result.summary
+    assert config.llm_plan is not None
+    [(messages, _, chat_config)] = config.llm_plan.primary.provider.calls
+    assert "[Existing portable checkpoint to replace]\nprior context here" in messages[0].content
+    assert "normal instructions" in messages[0].content
+    assert "__prev_summary__:" not in messages[0].content + chat_config.system
 
 
 @pytest.mark.asyncio

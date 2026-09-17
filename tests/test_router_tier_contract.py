@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
+from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.engine.capacity_admission import (
     LargeContextCapacityError,
     model_has_request_capacity,
@@ -28,6 +28,10 @@ from opensquilla.onboarding.mutations import (
 )
 from opensquilla.onboarding.router_policy import router_provider_conflicts
 from opensquilla.provider.model_catalog import DeploymentModelLimits, ModelCatalog
+from opensquilla.provider.request_proof import (
+    effective_proof_token_budget,
+    project_provider_payload,
+)
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.router_tiers import (
     STATIC_B5_PROFILES,
@@ -815,13 +819,13 @@ def test_capacity_admission_reserves_actual_high_thinking_budget(monkeypatch) ->
     assert model_has_request_capacity(
         provider="openai",
         model="reasoning-model",
-        material_tokens=60_000,
+        material_tokens=75_000,
         thinking_budget_tokens=4_096,
     )
     assert not model_has_request_capacity(
         provider="openai",
         model="reasoning-model",
-        material_tokens=60_000,
+        material_tokens=75_000,
         thinking_budget_tokens=20_000,
     )
 
@@ -839,14 +843,13 @@ def test_complete_request_capacity_boundary_and_unknown_model_fail_closed(
         }
     )
     monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
-    safe_input_tokens = (
+    safe_input_tokens, _headroom = effective_proof_token_budget(
         ContextBudgetGovernor.from_values(
             context_window_tokens=32_000,
             max_output_tokens=4_000,
             thinking_budget_tokens=0,
             context_overflow_threshold=0.85,
-        ).snapshot().provider_request_max_chars
-        // CHARS_PER_TOKEN
+        ).snapshot().usable_tokens
     )
 
     assert model_has_request_capacity(
@@ -951,7 +954,7 @@ def test_capacity_admission_honors_global_context_and_output_overrides(
     )
 
 
-def test_capacity_admission_honors_endpoint_and_explicit_proof_caps(
+def test_capacity_admission_honors_endpoint_and_defers_character_cap_to_final_proof(
     monkeypatch,
 ) -> None:
     catalog = ModelCatalog()
@@ -981,13 +984,19 @@ def test_capacity_admission_honors_endpoint_and_explicit_proof_caps(
         thinking_budget_tokens=0,
         base_url="https://deployment.example/v1",
     )
-    assert not model_has_request_capacity(
+    assert model_has_request_capacity(
         provider="openai",
         model="endpoint-model",
         material_tokens=50_000,
         thinking_budget_tokens=0,
         provider_request_proof_max_chars=160_000,
     )
+    proof = project_provider_payload(
+        {"messages": [{"role": "user", "content": "x" * 160_001}]},
+        projection_adapter="openai", proof_budget=160_000, token_budget=170_000,
+    )
+    assert proof["fits_char_budget"] is False
+    assert proof["fits"] is False
 
 
 def test_large_context_fallback_rejects_model_at_high_thinking_budget(
@@ -1018,7 +1027,7 @@ def test_large_context_fallback_rejects_model_at_high_thinking_budget(
             {"tier": "c3", "model": "router-borderline"},
         ],
         "large_context_floor_min_tier": "c3",
-        "large_context_material_tokens": 60_000,
+        "large_context_material_tokens": 75_000,
         "large_context_thinking_budget_tokens": 20_000,
         "routed_model": "routed-at-floor",
     }

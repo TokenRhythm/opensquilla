@@ -181,6 +181,41 @@ class _BlockingProvider:
             yield None
 
 
+class _CloseTrackedIterator:
+    def __init__(
+        self,
+        events: list[Any],
+        *,
+        block_after_events: bool = False,
+        block_close: bool = False,
+    ) -> None:
+        self._events = iter(events)
+        self._block_after_events = block_after_events
+        self._block_close = block_close
+        self.entered = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.close_calls = 0
+
+    def __aiter__(self) -> _CloseTrackedIterator:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._events)
+        except StopIteration:
+            if not self._block_after_events:
+                raise StopAsyncIteration from None
+        self.entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        if self._block_close:
+            await asyncio.Event().wait()
+
+
 class _SequenceProvider:
     provider_name = "fake"
 
@@ -688,6 +723,80 @@ async def test_cancelled_provider_call_is_marked_unknown() -> None:
     assert sink.finalized == []
     assert len(sink.unknown) == 1
     assert sink.unknown[0][1] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_accounted_outer_aclose_closes_physical_stream_once_after_done() -> None:
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(sink=sink, context=_context())
+    physical = _CloseTrackedIterator(
+        [ProviderDone(input_tokens=2, output_tokens=1, model="model-a")],
+        block_after_events=True,
+    )
+
+    with bind_usage_accounting_scope(scope):
+        accounted = account_provider_stream(
+            lambda: physical,
+            provider="fake",
+            model="model-a",
+        )
+        event = await anext(accounted)
+        await accounted.aclose()
+        await accounted.aclose()
+
+    assert isinstance(event, ProviderDone)
+    assert physical.close_calls == 1
+    assert len(sink.finalized) == 1
+    assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+async def test_accounted_outer_aclose_without_scope_is_bounded_and_closes_once() -> None:
+    physical = _CloseTrackedIterator(
+        [ProviderText(text="partial")],
+        block_close=True,
+    )
+    accounted = account_provider_stream(
+        lambda: physical,
+        provider="fake",
+        model="model-a",
+        close_timeout=0.01,
+    )
+
+    assert isinstance(await anext(accounted), ProviderText)
+    await asyncio.wait_for(accounted.aclose(), timeout=0.1)
+    await accounted.aclose()
+
+    assert physical.close_started.is_set()
+    assert physical.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_accounted_outer_cancellation_closes_physical_stream_once() -> None:
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(sink=sink, context=_context())
+    physical = _CloseTrackedIterator([], block_after_events=True)
+
+    async def consume() -> None:
+        with bind_usage_accounting_scope(scope):
+            async for _ in account_provider_stream(
+                lambda: physical,
+                provider="fake",
+                model="model-a",
+            ):
+                pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(physical.entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert physical.close_calls == 1
+    assert sink.finalized == []
+    assert [(call.event_id, reason) for call, reason in sink.unknown] == [
+        (sink.started[0].event_id, "cancelled")
+    ]
 
 
 @pytest.mark.asyncio

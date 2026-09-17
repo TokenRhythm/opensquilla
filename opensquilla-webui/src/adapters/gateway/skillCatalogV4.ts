@@ -46,6 +46,10 @@ import {
   type Result as SkillsInstallCancelResult,
 } from '@/contracts/generated/v4/skillsInstallCancel'
 import { validateResult as validateSkillsInstallCancelResult } from '@/contracts/generated/v4/skillsInstallCancelValidators.mjs'
+import { SKILLS_INSTALL_STATUS_METHOD, type Result as SkillsInstallStatusResult } from '@/contracts/generated/v4/skillsInstallStatus'
+import { validateResult as validateSkillsInstallStatusResult } from '@/contracts/generated/v4/skillsInstallStatusValidators.mjs'
+import type { SkillInstallStatus } from '@/modules/skillCatalog'
+
 import {
   SKILLS_DEPS_INSTALL_METHOD,
   type Params as SkillsDepsInstallParams,
@@ -347,6 +351,16 @@ export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
       )
       if (!validateSkillsInstallResult(result)) throw invalid(SKILLS_INSTALL_METHOD)
       return result as unknown as SkillInstallResult
+    },
+    supportsInstallStatus() {
+      return rpc.supports(SKILLS_INSTALL_STATUS_METHOD)
+    },
+    async installStatus(operationId, options) {
+      const result = await rpc.request<SkillsInstallStatusResult>(
+        SKILLS_INSTALL_STATUS_METHOD, { operationId }, callOptions(options?.signal),
+      )
+      if (!validateSkillsInstallStatusResult(result)) throw invalid(SKILLS_INSTALL_STATUS_METHOD)
+      return result as unknown as SkillInstallStatus
     },
     supportsInstallCancellation() {
       return rpc.supports(SKILLS_INSTALL_CANCEL_METHOD)

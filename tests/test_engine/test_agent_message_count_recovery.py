@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -14,6 +16,7 @@ from opensquilla.engine import (
     WarningEvent,
 )
 from opensquilla.engine.types import CompactionEvent
+from opensquilla.execution_status import normalize_execution_status
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import (
     ChatConfig,
@@ -25,6 +28,7 @@ from opensquilla.provider import (
     OpenAIProvider,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ReasoningDeltaEvent,
     TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -39,7 +43,11 @@ from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
 from opensquilla.provider.selector import ProviderConfig
-from opensquilla.session.compaction import CompactionResult
+from opensquilla.session.compaction import CompactionResult, _format_chunk_for_llm
+from opensquilla.session.compaction_lifecycle import (
+    CompactionTimeoutError,
+    ConsumerAdmissionStaleError,
+)
 
 
 class _ExactMessageLimitProvider:
@@ -536,6 +544,7 @@ class _CountAwareEnsembleMemberProvider:
                 "request_cap": int(
                     getattr(config, "provider_request_max_chars", 0) or 0
                 ),
+                "max_tokens": int(getattr(config, "max_tokens", 0) or 0),
                 "aggregator": is_aggregator,
             }
         )
@@ -659,7 +668,6 @@ async def test_message_count_suffix_uses_current_source_and_request_without_pare
             thinking_budget_tokens=2048,
             max_provider_retries=0,
             system_prompt="Current shared request instructions.",
-            flush_enabled=False,
             model_capabilities=ModelCapabilities(supports_tools=True, supports_reasoning=True),
         ),
         tool_definitions=tools,
@@ -683,18 +691,61 @@ async def test_message_count_suffix_uses_current_source_and_request_without_pare
     assert agent._history[:len(history)] == history
     assert not any(isinstance(event, CompactionEvent) for event in events)
     if summary_failed:
-        assert len(provider.calls) == 1
-        assert any(
-            isinstance(event, ErrorEvent)
-            and event.code == "provider_request_message_limit_exhausted"
-            for event in events
-        )
+        assert len(provider.calls) == 2
+        assert provider.projections[-1].actual_wire_messages <= 90
+        assert "[Temporary history window]" in str(provider.calls[-1])
+        assert not any(isinstance(event, ErrorEvent) for event in events)
     else:
         assert len(provider.calls) == 2
         assert provider.projections[-1].actual_wire_messages <= 90
         assert provider.calls[-1][2:2 + len(history) - cut] == history[cut:]
         assert "delivery color is azure" in str(provider.calls[-1][0].content)
         assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+async def test_message_count_prefix_uses_current_generation_budget_across_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+    provider = _SuffixMessageLimitProvider([100, None, 100, None])
+    history = _plain_history()
+    for message in history[:24]:
+        message.content += " Synthetic background describing completed work." * 10
+
+    async def reasoning_summary():
+        yield ReasoningDeltaEvent(text="synthetic reasoning " * 600)
+        yield TextDeltaEvent(text="The newly selected delivery color is azure.")
+        yield ProviderDoneEvent(stop_reason="stop", output_tokens=3000, reasoning_tokens=2980)
+
+    monkeypatch.setattr(provider, "_summary_stream", reasoning_summary)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="glm-5.2", context_window_tokens=64_000, max_tokens=4096,
+            max_provider_retries=0, system_prompt="Parent-only synthetic system instruction.",
+            model_capabilities=ModelCapabilities(supports_tools=True, supports_reasoning=False),
+        ),
+        tool_definitions=[ToolDefinition(
+            name="check", description="Run a synthetic check.", input_schema=ToolInputSchema(),
+        )],
+    )
+    agent.set_history(history)
+
+    for index, generation_budget in enumerate((4096, 8192)):
+        agent.config.max_tokens = generation_budget
+        events = [event async for event in agent.run_turn(f"current synthetic request {index}")]
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        assert len(provider.summary_calls) == index + 1
+        summary_messages, summary_tools, summary_config = provider.summary_calls[index]
+        assert summary_config.max_tokens == generation_budget
+        assert summary_config.max_tokens == provider.ordinary_configs[index * 2].max_tokens
+        assert summary_config.thinking is False
+        assert summary_config.system.startswith("You are a conversation compactor.")
+        assert "Parent-only synthetic system instruction." not in summary_config.system
+        assert "within 1024 tokens" in summary_config.system
+        assert summary_tools is None
+        assert len(summary_messages) == 1
+        assert agent._compaction_request_context is None
 
 
 async def test_message_count_suffix_refreshes_config_and_tools_between_turns(
@@ -713,7 +764,6 @@ async def test_message_count_suffix_refreshes_config_and_tools_between_turns(
             max_tokens=8192,
             system_prompt="First-turn instructions.",
             max_provider_retries=0,
-            flush_enabled=False,
             model_capabilities=ModelCapabilities(supports_tools=True),
         ),
         tool_definitions=[ToolDefinition(
@@ -767,7 +817,6 @@ async def test_message_count_suffix_uses_latest_call_config_within_tool_turn(
             context_window_tokens=64_000,
             max_tokens=8192,
             max_provider_retries=0,
-            flush_enabled=False,
             metadata={"meta_match_tool_choice": "required"},
             model_capabilities=ModelCapabilities(supports_tools=True),
         ),
@@ -807,8 +856,7 @@ async def test_message_limit_recovery_retries_once_below_headroom_without_rewrit
             execution_identity=(
                 ExecutionIdentity(model="synthetic-model") if identity_enabled else None
             ),
-            flush_enabled=False,
-        ),
+            ),
     )
     agent.set_history(history)
 
@@ -866,7 +914,6 @@ async def test_message_limit_recovery_preserves_referenced_and_uploaded_images(
         provider=provider,
         config=AgentConfig(
             max_provider_retries=0,
-            flush_enabled=False,
             model_vision_support="supported",
             execution_identity=(
                 ExecutionIdentity(model="synthetic-model") if identity_enabled else None
@@ -918,7 +965,7 @@ async def test_message_limit_cut_never_splits_parallel_tool_group(
     provider = _ExactMessageLimitProvider([100, None])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=0, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=0),
     )
     agent.set_history(_history_with_parallel_tool_group())
 
@@ -943,7 +990,7 @@ async def test_second_exact_message_limit_error_is_terminal_without_loop(
     provider = _ExactMessageLimitProvider([100, 80])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=3, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=3),
     )
     agent.set_history(_plain_history())
 
@@ -961,7 +1008,7 @@ async def test_second_exact_message_limit_error_is_terminal_without_loop(
 
 
 @pytest.mark.asyncio
-async def test_message_limit_summary_failure_is_terminal_without_retry(
+async def test_message_limit_summary_failure_continues_with_temporary_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     compact_requests: list[Any] = []
@@ -969,19 +1016,353 @@ async def test_message_limit_summary_failure_is_terminal_without_retry(
     provider = _ExactMessageLimitProvider([100])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=3, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=3),
     )
-    agent.set_history(_plain_history())
+    history = _plain_history()
+    agent.set_history(history)
 
     events = [event async for event in agent.run_turn("current user request")]
 
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 2
     assert len(compact_requests) == 1
-    assert any(
-        isinstance(event, ErrorEvent)
-        and event.code == "provider_request_message_limit_exhausted"
-        for event in events
+    assert provider.projections[-1].actual_wire_messages <= 90
+    assert "[Temporary history window]" in str(provider.calls[-1])
+    assert agent._history[:len(history)] == history
+    assert not any(isinstance(event, (ErrorEvent, CompactionEvent)) for event in events)
+
+
+@pytest.mark.parametrize("failure", ["empty", "timeout"])
+async def test_failed_compaction_window_preserves_checkpoint_and_canonical_history(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    calls = 0
+
+    async def compact(request: Any) -> CompactionResult:
+        nonlocal calls
+        calls += 1
+        if failure == "timeout":
+            raise CompactionTimeoutError("summarizing", 120)
+        return CompactionResult(
+            summary="", kept_entries=request.entries, removed_count=0,
+            chunks_processed=0, skip_reason="summary_failed",
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", compact)
+    provider = _ExactMessageLimitProvider([100])
+    agent = Agent(provider=provider, config=AgentConfig())
+    history = [
+        Message(role="user", content="[Context summary]\nPrevious valid checkpoint."),
+        Message(role="assistant", content="Understood. Continuing from summary."),
+        *_plain_history(),
+    ]
+    agent.set_history(history)
+
+    events = [event async for event in agent.run_turn("current user request")]
+
+    assert calls == 1
+    assert len(provider.calls) == 2
+    assert str(provider.calls[-1]).count("Previous valid checkpoint.") == 1
+    assert agent._history[:len(history)] == history
+    assert not any(isinstance(event, (ErrorEvent, CompactionEvent)) for event in events)
+
+
+async def test_summary_cancellation_does_not_make_a_temporary_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def compact(_request: Any) -> CompactionResult:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", compact)
+    provider = _ExactMessageLimitProvider([100])
+    agent = Agent(provider=provider, config=AgentConfig())
+    history = _plain_history()
+    agent.set_history(history)
+
+    with pytest.raises(asyncio.CancelledError):
+        _ = [event async for event in agent.run_turn("current user request")]
+
+    assert len(provider.calls) == 1
+    assert agent._history[:len(history)] == history
+
+
+def test_compaction_entries_preserve_tool_arguments_and_complete_results() -> None:
+    result_text = "prefix " * 80 + "middle_fact_retained" + " tail" * 80
+    entries = Agent._message_count_compaction_entries([
+        Message(role="assistant", content=[ContentBlockToolUse(
+            id="call", name="check", input={"constraint": "retain_this_argument"},
+        )]),
+        Message(role="user", content=[ContentBlockToolResult(
+            tool_use_id="call", content=result_text, is_error=True,
+            execution_status=normalize_execution_status({
+                "status": "error", "reason": "synthetic_failure",
+            }),
+        )]),
+    ])
+
+    assert entries[0]["tool_calls"][0]["input"]["constraint"] == "retain_this_argument"
+    assert entries[1]["tool_calls"][0]["result"] == result_text
+    assert entries[1]["tool_calls"][0]["execution_status"]["reason"] == "synthetic_failure"
+
+
+def test_typed_tool_image_is_projected_before_prefix_summary_formatting() -> None:
+    image = ContentBlockImage(
+        data="c3ludGhldGljLWltYWdlLWJ5dGVz", media_type="image/png",
+        local_path="/synthetic/private-image.png",
     )
+    message = Message(role="user", content=[ContentBlockToolResult(
+        tool_use_id="synthetic-image-call", content=[image],
+    )])
+
+    entries = Agent._message_count_compaction_entries([message])
+    formatted = _format_chunk_for_llm(entries)
+
+    assert "image omitted from compaction input" in formatted
+    assert image.data not in formatted
+    assert image.local_path not in formatted
+    assert message.content[0].content[0] == image
+    assert entries[0]["tool_calls"][0]["result"][0] == image
+
+
+@pytest.mark.parametrize("large_component", ["current_user", "system", "tools"])
+def test_window_admission_includes_protected_request_components(large_component: str) -> None:
+    provider = _ExactMessageLimitProvider([])
+    tools = [ToolDefinition(
+        name="check", description="tool detail " * 1000,
+        input_schema=ToolInputSchema(),
+    )] if large_component == "tools" else []
+    agent = Agent(
+        provider=provider, config=AgentConfig(), tool_definitions=tools,
+    )
+    current_request = "current request" * (1000 if large_component == "current_user" else 1)
+    messages = [*_plain_history(20), Message(role="user", content=current_request)]
+    config = ChatConfig(
+        max_tokens=100, provider_request_max_chars=2000,
+        system="system detail " * 1000 if large_component == "system" else "",
+    )
+
+    outcome = agent._recover_local_request_window(
+        messages, protected_turn_start_index=20,
+        request_context_insert_index=20, runtime_context_insert_index=20,
+        config=config, request_context_message=Message(role="user", content="checkpoint"),
+        runtime_context_message=Message(role="user", content="runtime"),
+        target_wire_messages=10,
+    )
+
+    assert outcome is None
+    assert messages[-1].content == current_request
+    error = agent._context_overflow_error()
+    assert error.code == "provider_request_too_large"
+    assert {
+        "current_user": "current input and protected recent context",
+        "system": "fixed system instructions",
+        "tools": "tool definitions",
+    }[large_component] in error.message
+    assert "Stored history was not changed" in error.message
+
+
+@pytest.mark.parametrize("component", ["system", "tools"])
+def test_provider_budget_error_names_oversized_fixed_component(component: str) -> None:
+    agent = Agent(provider=_ExactMessageLimitProvider([]), config=AgentConfig())
+
+    agent._record_provider_context_overflow_reason(ProviderErrorEvent(
+        code="provider_request_budget_exhausted",
+        message=json.dumps({
+            "effective_proof_budget": 2_000,
+            f"{component}_chars": 3_000,
+            "fallback_reason": "provider_request_budget_exhausted",
+        }),
+    ))
+
+    error = agent._context_overflow_error()
+    assert error.code == "provider_request_too_large"
+    assert {
+        "system": "fixed system instructions", "tools": "tool definitions",
+    }[component] in error.message
+
+
+async def test_failed_summary_with_unfittable_system_does_not_report_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+    _install_exact_compactor(monkeypatch, calls, fail=True)
+    agent = Agent(
+        provider=_ExactMessageLimitProvider([]),
+        config=AgentConfig(
+            context_window_tokens=1_000,
+            system_prompt="synthetic system " * 2_000,
+        ),
+    )
+    messages = [*_plain_history(20), Message(role="user", content="current request")]
+
+    outcome = await agent._check_context_overflow(
+        messages, 20_000, protected_turn_start_index=20, provider_overflow=True,
+        request_context_insert_index=20, runtime_context_insert_index=20,
+    )
+
+    assert outcome is None
+    assert len(calls) == 1
+    assert agent._context_overflow_error().code == "provider_request_too_large"
+    assert "fixed system instructions" in agent._context_overflow_error().message
+
+
+@pytest.mark.parametrize("first_entry", ["inline", "live", "message_count"])
+async def test_failed_summary_blocks_other_compaction_entries_until_turn_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    first_entry: str,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+    provider = _SuffixMessageLimitProvider([], summary_failed=True)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="glm-5.2", context_window_tokens=64_000, max_tokens=4096,
+            max_provider_retries=0, ),
+    )
+    messages = _plain_history(40)
+    for message in messages:
+        message.content += " Synthetic completed work and its detailed explanation." * 10
+    protected_start = len(messages)
+    messages.append(Message(role="user", content="continue the synthetic task"))
+    for index in range(6):
+        messages.extend([
+            Message(role="assistant", content=[ContentBlockToolUse(
+                id=f"synthetic-step-{index}", name="check", input={"step": index},
+            )]),
+            Message(role="user", content=[ContentBlockToolResult(
+                tool_use_id=f"synthetic-step-{index}", content=f"completed synthetic step {index}",
+            )]),
+        ])
+    before = [message.model_copy(deep=True) for message in messages]
+    agent._current_turn_message = "continue the synthetic task"
+    chat_config = ChatConfig(max_tokens=4096)
+    runtime_context = Message(role="user", content="Synthetic runtime context")
+    projection = agent._project_provider_request_message_count(
+        messages, config=chat_config, request_context_message=None,
+        request_context_insert_index=protected_start,
+        runtime_context_message=runtime_context, runtime_context_insert_index=protected_start,
+    )
+    assert projection is not None
+    proof = ProviderMessageLimitProof(
+        actual_wire_messages=projection.actual_wire_messages, limit=22,
+        logical_messages=projection.logical_messages, system_messages=projection.system_messages,
+        tool_result_messages=projection.tool_result_messages,
+        provider_kind=projection.provider_kind,
+        model=projection.model, base_host=projection.base_host,
+    )
+
+    async def recover(entry: str) -> None:
+        if entry == "inline":
+            await agent._check_context_overflow(
+                messages, 100_000, protected_turn_start_index=protected_start,
+                request_context_insert_index=protected_start,
+                runtime_context_insert_index=protected_start, provider_overflow=True,
+                compaction_window_tokens=6000,
+            )
+        elif entry == "live":
+            await agent._recover_live_turn_request_overflow(
+                messages, protected_turn_start_index=protected_start,
+                context_window_tokens=64_000, request_context_insert_index=protected_start,
+                runtime_context_insert_index=protected_start,
+            )
+        else:
+            await agent._recover_provider_message_count_limit(
+                messages, request_suffix_messages=[], proof=proof, config=chat_config,
+                request_context_message=None, request_context_insert_index=protected_start,
+                runtime_context_message=runtime_context,
+                runtime_context_insert_index=protected_start,
+                protected_turn_start_index=protected_start,
+            )
+
+    await recover(first_entry)
+    assert len(provider.summary_calls) == 1
+    assert agent._compaction_failed_this_turn
+    for entry in ("inline", "live", "message_count"):
+        await recover(entry)
+        assert len(provider.summary_calls) == 1
+        assert agent._compaction_failed_this_turn
+    assert messages == before
+    assert not provider.ordinary_configs
+
+    events = [event async for event in agent.run_turn("a small new synthetic request")]
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert len(provider.ordinary_configs) == 1
+    assert not agent._compaction_failed_this_turn
+
+
+async def test_unfittable_tool_schema_terminalizes_rejected_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notifications: list[dict[str, Any]] = []
+
+    async def rejected_summary(request: Any) -> CompactionResult:
+        return CompactionResult(
+            summary="", kept_entries=request.entries, removed_count=0, chunks_processed=0,
+            skip_reason="summary_failed",
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", rejected_summary)
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.notify_compaction",
+        lambda _key, **payload: notifications.append(payload),
+    )
+    agent = Agent(
+        provider=_ExactMessageLimitProvider([]),
+        config=AgentConfig(context_window_tokens=1_000),
+        session_key="agent:main:synthetic-window",
+        tool_definitions=[ToolDefinition(
+            name="check", description="synthetic tool " * 2_000, input_schema=ToolInputSchema(),
+        )],
+    )
+    messages = [*_plain_history(20), Message(role="user", content="current request")]
+
+    outcome = await agent._check_context_overflow(
+        messages, 20_000, protected_turn_start_index=20, provider_overflow=True,
+        request_context_insert_index=20, runtime_context_insert_index=20,
+    )
+
+    assert outcome is None
+    assert [item["status"] for item in notifications] == ["started", "failed"]
+    assert notifications[-1]["reason"] == "provider_tool_schema_too_large"
+    assert notifications[0]["compaction_id"] == notifications[-1]["compaction_id"]
+
+
+def test_consumer_admission_refuses_changed_request_configuration() -> None:
+    provider = _ExactMessageLimitProvider([])
+    agent = Agent(provider=provider, config=AgentConfig(
+        system_prompt="Original synthetic instructions", ))
+    admission, _ = agent.build_compaction_consumer_admission(
+        consumer_provider=provider,
+        active_user_message="current request", active_user_in_history=False,
+        bound_user_message_id=None, attachment_messages=None,
+        context_window_tokens=64_000,
+    )
+    assert admission("Valid checkpoint", [])
+
+    agent.config.system_prompt = "Different synthetic instructions"
+
+    with pytest.raises(ConsumerAdmissionStaleError):
+        admission("Valid checkpoint", [])
+
+
+async def test_ten_failed_summaries_do_not_nest_windows_or_rewrite_canonical_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Any] = []
+    _install_exact_compactor(monkeypatch, requests, fail=True)
+    provider = _ExactMessageLimitProvider([100, None] * 10)
+    agent = Agent(provider=provider, config=AgentConfig())
+    history = _plain_history()
+    agent.set_history(history)
+
+    for index in range(10):
+        events = [event async for event in agent.run_turn(f"current synthetic request {index}")]
+        assert not any(isinstance(event, (ErrorEvent, CompactionEvent)) for event in events)
+        assert str(provider.calls[-1]).count("[Temporary history window]") == 1
+
+    assert len(requests) == 10
+    assert agent._history[:len(history)] == history
+    assert "[Temporary history window]" not in str(agent._history)
+    assert len(agent._history) == len(history) + 20
 
 
 @pytest.mark.asyncio
@@ -993,7 +1374,7 @@ async def test_protected_current_turn_over_limit_refuses_without_summary(
     provider = _ExactMessageLimitProvider([10])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=3, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=3),
     )
     current_inputs = [Message(role="user", content=f"current-{index}") for index in range(11)]
 
@@ -1014,6 +1395,29 @@ async def test_protected_current_turn_over_limit_refuses_without_summary(
     )
 
 
+@pytest.mark.parametrize(
+    ("content", "execution_status", "is_error", "requires_raw"),
+    [
+        ("completed diagnostic", {"status": "error"}, True, False),
+        ('{"status":"timed_out","reason":"deadline_exceeded"}', None, True, False),
+        ("still running", {"status": "success", "reason": "background_running"}, False, True),
+        ('{"status":"awaiting_approval","approval_id":"approval-synthetic"}', None, False, True),
+        ("retry in progress", {"status": "error", "reason": "running"}, True, True),
+        ('{"status":"success","reason":"background_running"}', None, False, True),
+    ],
+)
+def test_request_window_preserves_live_tool_state_without_pinning_terminal_errors(
+    content, execution_status, is_error, requires_raw,
+) -> None:
+    result = Message(role="user", content=[ContentBlockToolResult(
+        tool_use_id="synthetic-operation", content=content, is_error=is_error,
+        execution_status=(
+            normalize_execution_status(execution_status) if execution_status is not None else None
+        ),
+    )])
+    assert Agent._tool_result_requires_raw_preservation(result) is requires_raw
+
+
 @pytest.mark.asyncio
 async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_cannot_fit(
     monkeypatch: pytest.MonkeyPatch,
@@ -1023,7 +1427,7 @@ async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_
     provider = _ExactMessageLimitProvider([None])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=0, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=0),
     )
     active_text = "finish this active request byte-for-byte: 你好 🦑"
     active_user = Message(role="user", content=active_text)
@@ -1100,29 +1504,32 @@ async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_
     )
     assert outcome.messages[2] is active_user
     assert outcome.messages[2].content == active_text
-    # The error and pending-approval rounds force the raw tail to begin at
-    # round four; the newest two rounds therefore remain raw as well.
-    assert outcome.messages[-12:] == [
-        message for pair in rounds[4:] for message in pair
+    # The approval is still live. The preceding completed error can be
+    # summarized; it must not permanently anchor the raw request window.
+    assert outcome.messages[-10:] == [
+        message for pair in rounds[5:] for message in pair
     ]
     assert outcome.messages[-2] is rounds[-1][0]
     assert outcome.messages[-1] is rounds[-1][1]
     assert "approval-live-5" in str(outcome.messages)
-    assert "result-4" in str(outcome.messages)
+    assert rounds[4][1] not in outcome.messages
+    assert "result-4" in str(compact_requests[0].entries)
     assert messages == canonical_snapshot
     assert all(
         entry["content"] != active_text
         for entry in compact_requests[0].entries
     )
-    assert compact_requests[0].forced_prefix_cut == 8
+    assert compact_requests[0].forced_prefix_cut == 10
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("summary_failed", [False, True])
 async def test_long_tool_loop_continues_after_live_turn_message_count_projection(
     monkeypatch: pytest.MonkeyPatch,
+    summary_failed: bool,
 ) -> None:
     compact_requests: list[Any] = []
-    _install_exact_compactor(monkeypatch, compact_requests)
+    _install_exact_compactor(monkeypatch, compact_requests, fail=summary_failed)
     provider = _LiveTurnMessageLimitProvider()
 
     async def tool_handler(call: Any) -> ToolResult:
@@ -1138,7 +1545,6 @@ async def test_long_tool_loop_continues_after_live_turn_message_count_projection
         config=AgentConfig(
             max_iterations=20,
             max_provider_retries=0,
-            flush_enabled=False,
             model_capabilities=ModelCapabilities(supports_tools=True),
         ),
         tool_definitions=[
@@ -1206,8 +1612,7 @@ async def test_reasoning_scaffold_cleanup_preserves_recovered_tool_pairing(
             ),
             reasoning_prefill_recovery_mode="recover",
             max_provider_retries=0,
-            flush_enabled=False,
-        ),
+            ),
         tool_definitions=[
             ToolDefinition(
                 name="echo",
@@ -1271,8 +1676,7 @@ async def test_retired_loop_perturbation_does_not_create_message_count_overflow(
             reasoning_prefill_recovery_mode="recover",
             identical_request_loop_break_threshold=1,
             max_provider_retries=0,
-            flush_enabled=False,
-        ),
+            ),
     )
     # 98 historical messages + current user + reasoning prefill = 100 in the
     # pure request view. The retired loop setting must not append another
@@ -1324,7 +1728,7 @@ async def test_token_compaction_maps_duplicate_content_boundaries_by_prefix_cut(
     monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
     agent = Agent(
         provider=_ExactMessageLimitProvider([None]),
-        config=AgentConfig(flush_enabled=False),
+        config=AgentConfig(),
     )
 
     outcome = await agent._check_context_overflow(
@@ -1415,8 +1819,7 @@ async def test_member_budget_rebinding_and_exact_count_recovery_compose_once(
             max_tokens=128_000,
             context_window_tokens=256_000,
             max_provider_retries=0,
-            flush_enabled=False,
-        ),
+            ),
     )
     agent.set_history(_plain_history())
 
@@ -1428,11 +1831,14 @@ async def test_member_budget_rebinding_and_exact_count_recovery_compose_once(
     assert sum(call["aggregator"] for call in member_calls) == 1
     # Failed drafts, compacted retries, and aggregation must retain C5 member
     # budgets instead of inheriting the outer Kimi route's 256k context limit.
-    assert {(call["model"], call["request_cap"]) for call in member_calls} == {
-        ("deepseek-flash", 2_026_400),
-        ("glm-5.3-flash", 3_051_513),
-        ("qwen3.8-flash", 2_886_355),
-        ("qwen3.8-max", 2_886_355),
+    assert {
+        (call["model"], call["max_tokens"], call["request_cap"])
+        for call in member_calls
+    } == {
+        ("deepseek-flash", 384_000, 2_384_000),
+        ("glm-5.3-flash", 131_072, 3_590_016),
+        ("qwen3.8-flash", 131_072, 3_395_712),
+        ("qwen3.8-max", 131_072, 3_395_712),
     }
     assert any(getattr(event, "kind", None) == "done" for event in events)
     assert not any(

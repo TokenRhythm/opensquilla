@@ -478,8 +478,8 @@ class TurnErrorPersistPort(Protocol):
 
     The helper owns its own log-and-continue try/except; the
     adapter forwards verbatim. The helper guards
-    ``session_manager is None`` AND ``event is None`` internally -- the
-    stage body has no None checks.
+    ``event is None`` internally; transcript writes additionally require a
+    session manager.
     """
 
     async def persist_error(
@@ -490,6 +490,11 @@ class TurnErrorPersistPort(Protocol):
         append_transcript: bool = True,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        turn_id: str | None = None,
+        surface: str = "unknown",
+        provider: str | None = None,
+        model: str | None = None,
+        fallback_hops: int = 0,
     ) -> None: ...
 
 
@@ -596,6 +601,9 @@ class TurnFinalizerStageInput:
     # assistant snapshot. Keep the structured turn_errors row, but do not add
     # the ordinary second system "Error:" transcript message on reload.
     terminal_generation_reset: bool = False
+    error_provider: str | None = None
+    error_model: str | None = None
+    error_fallback_hops: int = 0
 
 @dataclass(frozen=True)
 class TurnFinalizerStageOutput:
@@ -961,15 +969,21 @@ class TurnFinalizerStage:
             if inp.execution_context is not None:
                 inp.execution_context.release_reserved_unpublished("no_visible_output")
 
-        # 4. Error persist (only when error_message is truthy; the
-        # adapter folds the session-manager-None guard, and the helper
-        # also guards event-is-None internally).
+        # 4. Error diagnostics and, when available, transcript persistence.
         if inp.error_message:
             error_kwargs: dict[str, Any] = {
                 "session_key": inp.session_key,
                 "event": inp.pending_error_event,
                 "append_transcript": not inp.terminal_generation_reset,
+                "surface": inp.input_mode or "unknown",
+                "fallback_hops": inp.error_fallback_hops,
             }
+            if inp.execution_context is not None:
+                error_kwargs["turn_id"] = inp.execution_context.identity.turn_id
+            if inp.error_provider is not None:
+                error_kwargs["provider"] = inp.error_provider
+            if inp.error_model is not None:
+                error_kwargs["model"] = inp.error_model
             if inp.expected_session_id is not None:
                 error_kwargs["expected_session_id"] = inp.expected_session_id
             if inp.expected_session_epoch is not None:

@@ -19,6 +19,270 @@ DRIVER = ROOT / "desktop/electron/scripts/test-packaged-real-update-flow.mjs"
 
 
 @pytest.fixture
+def nsis_regression():
+    spec = importlib.util.spec_from_file_location(
+        "nsis_regression", SCRIPTS / "verify-nsis-upgrade-regression.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def fresh_nsis_arguments(tmp_path):
+    node = tmp_path / "synthetic-node.exe"
+    node.write_bytes(b"never executed")
+    return [
+        "--case", "fresh", "--install-path", "default", "--node", str(node),
+        "--candidate-installer", str(tmp_path / "candidate.exe"),
+        "--candidate-version", "0.5.5.0", "--candidate-source-sha", "a" * 40,
+        "--candidate-installer-sha256", "b" * 64, "--candidate-asar-sha256", "c" * 64,
+        "--candidate-executable-sha256", "d" * 64,
+        "--candidate-dependency-inventory-sha256", "e" * 64,
+        "--evidence-root", str(tmp_path / "evidence"),
+    ]
+
+
+def test_nsis_fresh_arguments_have_no_old_baseline(nsis_regression, fresh_nsis_arguments):
+    args = nsis_regression.parse_args(fresh_nsis_arguments)
+    assert args.baseline_installer is None and args.baseline_version is None
+    assert args.candidate_version == "0.5.5"
+
+
+@pytest.mark.parametrize("extra", [
+    ["--baseline-version", "0.5.4"], ["--baseline-installer", "old.exe"],
+    ["--candidate-asar-sha256", ""], ["--candidate-executable-sha256", ""],
+    ["--candidate-installer-sha256", ""], ["--candidate-dependency-inventory-sha256", ""],
+    ["--case", "baseline"], ["--case", "readlock"], ["--case", "longpath"],
+])
+def test_nsis_rejects_ambiguous_baselines_and_unbound_candidates(
+    nsis_regression, fresh_nsis_arguments, extra,
+):
+    with pytest.raises(SystemExit):
+        nsis_regression.parse_args([*fresh_nsis_arguments, *extra])
+
+
+@pytest.mark.parametrize("case", ["baseline", "readlock", "longpath"])
+def test_nsis_upgrade_still_requires_pinned_baseline(nsis_regression, fresh_nsis_arguments, case):
+    args = nsis_regression.parse_args([
+        *fresh_nsis_arguments, "--case", case,
+        "--baseline-installer", "old.exe", "--baseline-version", "0.5.4",
+    ])
+    assert args.case == case and args.baseline_version == "0.5.4"
+
+
+def _fresh_interaction_success():
+    return {
+        "ok": True, "executable": "OpenSquilla.exe", "iterations": 20,
+        "rpc": {"chatSend": 40, "uniqueSessions": 20}, "provider": {"chatRequestCount": 40},
+        "renderer": {"pageErrors": 0, "consoleErrors": 0}, "externalRendererRequests": 0,
+        "desktopLog": {
+            "forbiddenErrorCount": 0, "unexpectedRendererErrorCount": 0,
+            "eventCounts": {
+                "before_quit": 1, "quit_gateway_shutdown_requested": 1, "quit_gateway_exit": 1,
+            },
+        },
+    }
+
+
+def test_nsis_fresh_probe_requires_final_report_after_phase_logs(nsis_regression):
+    success = _fresh_interaction_success()
+    output = '\ufeff{"phase":"cleanup-complete"}\n' + json.dumps(success, indent=2)
+    assert nsis_regression.fresh_interaction_result(output) == success
+    with pytest.raises(RuntimeError, match="did not pass"):
+        nsis_regression.fresh_interaction_result(output + '\n{"phase":"unfinished"}')
+
+
+@pytest.mark.parametrize("missing", ["ok", "rpc", "provider", "renderer", "desktopLog"])
+def test_nsis_fresh_probe_rejects_incomplete_success(nsis_regression, missing):
+    report = _fresh_interaction_success()
+    del report[missing]
+    with pytest.raises(RuntimeError):
+        nsis_regression.fresh_interaction_result(json.dumps(report))
+
+
+@pytest.mark.parametrize("event", [
+    "before_quit", "quit_gateway_shutdown_requested", "quit_gateway_exit",
+])
+def test_nsis_fresh_probe_requires_normal_quit(nsis_regression, event):
+    report = _fresh_interaction_success()
+    del report["desktopLog"]["eventCounts"][event]
+    with pytest.raises(RuntimeError, match="normal Quit"):
+        nsis_regression.fresh_interaction_result(json.dumps(report))
+
+
+def _fresh_shutdown_log():
+    # Native packaged first-send evidence: Gateway clean exit precedes commit.
+    return [
+        {"event": "quit_gateway_exit", "exited": True, "hardTerminated": False},
+        {"event": "desktop_exit_phase", "from": "draining", "to": "committed",
+         "reason": "all lifecycle-owned Gateways exited"},
+    ]
+
+
+@pytest.mark.parametrize("mutation", [
+    "none", "hard-terminated", "not-exited", "missing-commit", "reversed", "late-dirty-exit",
+])
+def test_nsis_fresh_normal_quit_requires_clean_gateway_then_commit(nsis_regression, mutation):
+    records = _fresh_shutdown_log()
+    if mutation == "hard-terminated":
+        records[0]["hardTerminated"] = True
+    elif mutation == "not-exited":
+        records[0]["exited"] = False
+    elif mutation == "missing-commit":
+        records.pop()
+    elif mutation == "reversed":
+        records.reverse()
+    elif mutation == "late-dirty-exit":
+        records.append({"event": "quit_gateway_exit", "exited": True, "hardTerminated": True})
+    output = "\n".join(json.dumps(item) for item in records)
+    if mutation == "none":
+        assert nsis_regression.fresh_shutdown_evidence(output) == {
+            "gatewayExitCount": 1, "allGatewayExitsClean": True, "committedAfterGatewayExits": True,
+        }
+    else:
+        with pytest.raises(RuntimeError):
+            nsis_regression.fresh_shutdown_evidence(output)
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+def test_nsis_fresh_installs_bound_candidate_then_launches_unseeded_installed_exe(
+    nsis_regression, fresh_nsis_arguments, tmp_path, monkeypatch, install_mode,
+):
+    module = nsis_regression
+    audit = module.Audit.__new__(module.Audit)
+    audit.args = module.parse_args([*fresh_nsis_arguments, "--install-path", install_mode])
+    audit.root = tmp_path / "isolated"
+    audit.install = audit.root / (
+        "default-install" if install_mode == "default" else "Custom Apps/OpenSquilla"
+    )
+    audit.user_data = audit.root / "fresh-user-data"
+    audit.evidence = tmp_path / "evidence"
+    audit.evidence.mkdir()
+    audit.short_temp = audit.root / "t"
+    audit.short_temp.mkdir(parents=True)
+    audit.report = {"proofs": {"fixedUpgrade": None, "restart": None}}
+    candidate = Path(audit.args.candidate_installer)
+    candidate.write_bytes(b"candidate installer")
+    audit.args.candidate_installer_sha256 = module.digest(candidate)
+    bindings = {
+        "OpenSquilla.exe": "candidate_executable_sha256",
+        "resources/app.asar": "candidate_asar_sha256",
+        "resources/runtime/gateway/dependency-inventory.json": (
+            "candidate_dependency_inventory_sha256"
+        ),
+    }
+    for name, attribute in bindings.items():
+        setattr(audit.args, attribute, hashlib.sha256(name.encode()).hexdigest())
+    build = tmp_path / "repo/desktop/electron/dist"
+    build.mkdir(parents=True)
+    for name in ("desktop-gateway-ownership.js", "gateway-lifecycle.js"):
+        (build / name).touch()
+    monkeypatch.setattr(module, "REPOSITORY", tmp_path / "repo")
+    monkeypatch.setattr(module, "installed_registry", lambda: [])
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
+    events = []
+    audit.save = lambda: None
+    audit.require_no_product_processes = lambda stage: events.append(stage)
+    audit.check_environment_registry = lambda stage: None
+    audit.assert_version = lambda state, version: events.append(("version", version))
+    audit.seed_retained_profile = lambda: pytest.fail("Fresh must not seed an old profile")
+    audit.uninstall_candidate = lambda **kwargs: events.append(("uninstall", kwargs))
+
+    def run(label, executable, arguments, temp):
+        assert temp == audit.short_temp
+        assert not audit.user_data.exists()
+        events.append(label)
+        if label == "candidate-fresh":
+            assert executable == candidate
+            assert arguments == (["/S", "/currentuser"] if install_mode == "default" else [
+                "/S", "/currentuser", "/D=" + str(audit.install),
+            ])
+            for name in bindings:
+                destination = audit.install / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(name.encode())
+            return {"exitCode": 0}
+        assert label == "fresh-first-interaction"
+        assert arguments == [
+            str(module.FIRST_SEND_PROBE), "--executable", str(audit.install / "OpenSquilla.exe"),
+            "--user-data-dir", str(audit.user_data), "--iterations", "20",
+        ]
+        audit.user_data.mkdir()
+        (audit.user_data / "logs").mkdir()
+        (audit.user_data / "logs/desktop.log").write_text(
+            "\n".join(json.dumps(item) for item in _fresh_shutdown_log()), encoding="utf-8",
+        )
+        (audit.evidence / "fresh-first-interaction-stdout.log").write_text(
+            '{"phase":"cleanup-complete"}\n' + json.dumps(_fresh_interaction_success()),
+            encoding="utf-8",
+        )
+        return {"exitCode": 0, "tempEnvironmentSamples": [{
+            "image": str(audit.install / "OpenSquilla.exe"), "TEMP": str(temp), "TMP": str(temp),
+        }]}
+
+    audit.run = run
+    audit.state = lambda *args, **kwargs: {
+        "asarSha256": module.digest(audit.install / "resources/app.asar"),
+        "executableSha256": module.digest(audit.install / "OpenSquilla.exe"),
+    }
+    audit.execute()
+    assert events.index("candidate-fresh") < events.index("fresh-first-interaction")
+    assert events[-1] == ("uninstall", {"retained_profile": False})
+    assert audit.report["inputs"]["baselineInstaller"] is None
+    assert audit.report["freshProfileBeforeInstall"]["exists"] is False
+    assert audit.report["freshProfileBeforeLaunch"]["exists"] is False
+    assert audit.report["proofs"] == {
+        "fixedUpgrade": None, "restart": None, "auditedDependenciesInstalled": True,
+        "freshInstall": True, "realClientStarted": True, "firstSend": True, "normalQuit": True,
+    }
+    # Existing data must fail before a second installer or probe can run.
+    with pytest.raises(RuntimeError, match="absent test profile"):
+        audit.execute_fresh(candidate)
+    with pytest.raises(RuntimeError, match="unseeded profile"):
+        audit.run_fresh_interaction(audit.short_temp)
+    standard_profile = tmp_path / "user/.opensquilla"
+    standard_profile.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="Preexisting application profile"):
+        audit.execute()
+    monkeypatch.setattr(module, "installed_registry", lambda: [{"existing": True}])
+    with pytest.raises(RuntimeError, match="Preexisting OpenSquilla registration"):
+        audit.execute()
+    assert events.count("candidate-fresh") == events.count("fresh-first-interaction") == 1
+
+
+def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
+    path = ROOT / ".github/workflows/windows-nsis-upgrade-regression.yml"
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    job = workflow["jobs"]["upgrade-and-start"]
+    matrix = job["strategy"]["matrix"]
+    assert matrix["baseline"] == ["0.5.3", "0.5.4"]
+    assert matrix["install-path"] == ["default", "custom"]
+    assert matrix["scenario"] == ["baseline", "readlock", "longpath"]
+    assert matrix["include"] == [
+        {"baseline": "fresh", "install-path": path, "scenario": "fresh"}
+        for path in ("default", "custom")
+    ]
+    download = next(step for step in job["steps"]
+                    if step.get("name") == "Download pinned official baseline")
+    assert download["if"] == "matrix.scenario != 'fresh'"
+    verify = next(step["run"] for step in job["steps"]
+                  if "--candidate-source-sha" in step.get("run", ""))
+    baseline_branch = "if ('${{ matrix.scenario }}' -ne 'fresh')"
+    assert baseline_branch in verify
+    assert verify.index(baseline_branch) < verify.index("'--baseline-installer'")
+    for binding in (
+        "sourceSha", "installerSha256", "asarSha256", "executableSha256",
+        "dependencyInventorySha256",
+    ):
+        assert f"$manifest.{binding}" in verify
+    assert "Candidate source mismatch" in verify and "Candidate hash mismatch" in verify
+    assert "& python @arguments" in verify and "if ($LASTEXITCODE -ne 0) { throw" in verify
+
+
+@pytest.fixture
 def complete_v054_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.syspath_prepend(str(SCRIPTS))
     import upgrade_baseline
@@ -207,6 +471,7 @@ def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
 @pytest.mark.parametrize(
     ("launch_fails", "cleanup_fails"), [(False, False), (False, True), (True, False)]
 )
+@pytest.mark.ci_serial
 def test_packaged_recovery_preserves_original_failure_after_cleanup(
     tmp_path: Path, launch_fails: bool, cleanup_fails: bool
 ) -> None:
@@ -244,38 +509,47 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
         encoding="utf-8",
     )
     # This is a synthetic error/cleanup contract, not a recovery-latency check.
-    # Allow Windows CI headroom for Node startup and captured-pipe completion.
-    try:
-        result = subprocess.run(
-            [
-                node,
-                str(tmp_path / "test-packaged-session-recovery.mjs"),
-                "--executable",
-                str(tmp_path / "synthetic.exe"),
-                "--user-data-dir",
-                str(tmp_path / "profile"),
-                "--session-key",
-                "synthetic-main",
-                "--switch-session-key",
-                "synthetic-peer",
-                "--label",
-                "synthetic",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30 if os.name == "nt" else 10,
-        )
-    except subprocess.TimeoutExpired as error:
-        error.add_note(f"Captured stdout: {error.stdout!r}\nCaptured stderr: {error.stderr!r}")
-        raise
+    # File-backed output avoids Windows pipe-reader threads and preserves partial
+    # diagnostics even when the child has not exited by the original deadline.
+    stdout_path = tmp_path / "node-stdout.log"
+    stderr_path = tmp_path / "node-stderr.log"
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        try:
+            result = subprocess.run(
+                [
+                    node,
+                    str(tmp_path / "test-packaged-session-recovery.mjs"),
+                    "--executable",
+                    str(tmp_path / "synthetic.exe"),
+                    "--user-data-dir",
+                    str(tmp_path / "profile"),
+                    "--session-key",
+                    "synthetic-main",
+                    "--switch-session-key",
+                    "synthetic-peer",
+                    "--label",
+                    "synthetic",
+                ],
+                stdout=stdout_file,
+                stderr=stderr_file,
+                check=False,
+                timeout=30 if os.name == "nt" else 10,
+            )
+        except subprocess.TimeoutExpired as error:
+            error.add_note(
+                f"Captured stdout: {stdout_path.read_text(encoding='utf-8', errors='replace')!r}\n"
+                f"Captured stderr: {stderr_path.read_text(encoding='utf-8', errors='replace')!r}"
+            )
+            raise
+    stdout = stdout_path.read_text(encoding="utf-8")
+    stderr = stderr_path.read_text(encoding="utf-8")
     assert result.returncode != 0
-    assert "packaged_session_recovery_failed_before_cleanup" in result.stderr
-    assert "synthetic-cleanup-ran" in result.stderr
-    assert "Error: synthetic recovery fault" in result.stderr
-    assert not result.stdout
+    assert "packaged_session_recovery_failed_before_cleanup" in stderr
+    assert "synthetic-cleanup-ran" in stderr
+    assert "Error: synthetic recovery fault" in stderr
+    assert not stdout
     if cleanup_fails:
-        assert result.stderr.rindex("Error: synthetic recovery fault") > result.stderr.rindex(
+        assert stderr.rindex("Error: synthetic recovery fault") > stderr.rindex(
             "Error: synthetic cleanup fault"
         )
 
@@ -604,28 +878,48 @@ def _run_rehearsal_driver(
         cache = driver.parent / "user-data" / "update-downloads"
         cache.mkdir(parents=True, exist_ok=True)
         (cache / f"OpenSquilla-{candidate}-win-x64.exe").write_bytes(cached_bytes)
-    return subprocess.run(
-        arguments,
-        env={
-            **os.environ,
-            "SYNTHETIC_BASELINE_VERSION": installed,
-            "SYNTHETIC_CANDIDATE_VERSION": candidate,
-            "SYNTHETIC_UPDATE_MODE": mode,
-            "SYNTHETIC_COMPLETE_SIGNED": "1" if complete_signed else "0",
-            "SYNTHETIC_CAN_INSTALL": "1" if can_install else "0",
-            "SYNTHETIC_EXPECTED_SOURCE": (
-                "github" if download_source_mode == "github-to-oss" else "oss"
-            ),
-            "SYNTHETIC_FALLBACK_FAULT": fallback_fault,
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=15,
+    environment = {
+        **os.environ,
+        "SYNTHETIC_BASELINE_VERSION": installed,
+        "SYNTHETIC_CANDIDATE_VERSION": candidate,
+        "SYNTHETIC_UPDATE_MODE": mode,
+        "SYNTHETIC_COMPLETE_SIGNED": "1" if complete_signed else "0",
+        "SYNTHETIC_CAN_INSTALL": "1" if can_install else "0",
+        "SYNTHETIC_EXPECTED_SOURCE": (
+            "github" if download_source_mode == "github-to-oss" else "oss"
+        ),
+        "SYNTHETIC_FALLBACK_FAULT": fallback_fault,
+    }
+    # Keep the process deadline independent of Windows pipe-reader threads.
+    # Files also retain partial diagnostics if the driver itself hangs.
+    stdout_path = driver.parent / "rehearsal-stdout.log"
+    stderr_path = driver.parent / "rehearsal-stderr.log"
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        try:
+            result = subprocess.run(
+                arguments,
+                env=environment,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                check=False,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as error:
+            error.add_note(
+                f"Captured stdout: {stdout_path.read_text(encoding='utf-8', errors='replace')!r}\n"
+                f"Captured stderr: {stderr_path.read_text(encoding='utf-8', errors='replace')!r}"
+            )
+            raise
+    return subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        stdout_path.read_text(encoding="utf-8"),
+        stderr_path.read_text(encoding="utf-8"),
     )
 
 
 @pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4"])
+@pytest.mark.ci_serial
 def test_rehearsal_driver_accepts_selected_baseline(
     rehearsal_driver: tuple[str, Path], baseline: str | None
 ) -> None:
@@ -635,6 +929,10 @@ def test_rehearsal_driver_accepts_selected_baseline(
     assert f"DOWNLOAD_REACHED:{selected}" in result.stderr
 
 
+# Keep all consumers of the shared Node driver in the serial phase. Otherwise
+# moving one cold-start probe leaves the next consumer exposed to the same
+# Windows runner contention; these are behavior contracts, not latency checks.
+@pytest.mark.ci_serial
 def test_rehearsal_driver_rejects_mislabeled_official_baseline(
     rehearsal_driver: tuple[str, Path],
 ) -> None:
@@ -653,6 +951,7 @@ def test_rehearsal_driver_rejects_mislabeled_official_baseline(
         ("0.5.4", "0.5.5rc1", "must be a canonical stable version"),
     ],
 )
+@pytest.mark.ci_serial
 def test_rehearsal_driver_rejects_invalid_versions_before_launch(
     rehearsal_driver: tuple[str, Path], baseline: str, candidate: str, message: str
 ) -> None:
@@ -665,6 +964,7 @@ def test_rehearsal_driver_rejects_invalid_versions_before_launch(
 
 
 @pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4", "0.5.5rc1"])
+@pytest.mark.ci_serial
 def test_signed_handoff_rejects_missing_or_legacy_baseline_before_launch(
     rehearsal_driver: tuple[str, Path], baseline: str | None
 ) -> None:
@@ -681,6 +981,7 @@ def test_signed_handoff_rejects_missing_or_legacy_baseline_before_launch(
 
 
 @pytest.mark.parametrize("missing", ["source_sha", "expected_sha"])
+@pytest.mark.ci_serial
 def test_signed_handoff_requires_pinned_artifact_before_launch(
     rehearsal_driver: tuple[str, Path], missing: str
 ) -> None:
@@ -698,6 +999,7 @@ def test_signed_handoff_requires_pinned_artifact_before_launch(
 
 
 @pytest.mark.parametrize("fault", ["capability-denied", "cache-replaced"])
+@pytest.mark.ci_serial
 def test_signed_handoff_rejects_unverified_or_changed_candidate(
     rehearsal_driver: tuple[str, Path], fault: str
 ) -> None:
@@ -718,6 +1020,7 @@ def test_signed_handoff_rejects_unverified_or_changed_candidate(
     assert not (rehearsal_driver[1].parent / "handoff.json").exists()
 
 
+@pytest.mark.ci_serial
 def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
     rehearsal_driver: tuple[str, Path],
 ) -> None:
@@ -750,6 +1053,7 @@ def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
 
 
 @pytest.mark.parametrize("fault", ["", "discovery", "download"])
+@pytest.mark.ci_serial
 def test_signed_download_fallback_requires_both_stage_observations(
     rehearsal_driver: tuple[str, Path], fault: str
 ) -> None:
@@ -776,6 +1080,7 @@ def test_signed_download_fallback_requires_both_stage_observations(
     ("native", "github-to-oss"), ("manual", "oss"),
     ("signed-cached-handoff", "github-to-oss"), ("signed-handoff", "invalid"),
 ])
+@pytest.mark.ci_serial
 def test_download_source_override_rejects_other_modes_before_launch(
     rehearsal_driver: tuple[str, Path], mode: str, source: str
 ) -> None:
@@ -1164,6 +1469,7 @@ def test_windows_default_install_refuses_existing_installation_before_download(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Native Windows KnownFolder read")
+@pytest.mark.ci_serial
 def test_windows_nsis_known_folder_is_independent_of_localappdata_environment(
     windows_upgrade_harness: tuple[str, Path],
 ) -> None:

@@ -711,7 +711,8 @@ def test_fallback_leg_rebinds_request_budget_and_model_capabilities(
 
     assert rebound is not original
     assert rebound.max_tokens == 2_048
-    assert rebound.provider_request_max_chars == 17_408
+    assert rebound.provider_context_window_tokens == 8_192
+    assert rebound.provider_request_max_chars == 20_480
     assert rebound.model_capabilities == ModelCapabilities(
         supports_tools=False,
         supports_vision=False,
@@ -804,11 +805,11 @@ def test_fallback_leg_preserves_global_context_window_override(
         max_output_tokens=2_048,
     )
 
-    assert original.provider_request_max_chars == 17_408
+    assert original.provider_request_max_chars == 20_480
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
     rebound = wrapper._config_for_active_leg(original)
 
-    assert rebound.provider_request_max_chars == 17_408
+    assert rebound.provider_request_max_chars == 20_480
     assert rebound.context_window_tokens_global_override == 8_192
     assert rebound.provider_request_max_chars_explicit_cap == 0
 
@@ -2911,9 +2912,12 @@ async def _run_turn_events(
     *,
     primary_fails: bool,
     pending_input_provider: ListPendingInputProvider | None = None,
+    model_catalog: ModelCatalog | None = None,
 ) -> list[Any]:
     monkeypatch.setattr(TurnRunner, "_run_pipeline", _routed_pipeline_fake(PRIMARY_MODEL))
-    runner = TurnRunner(provider_selector=_ChainSelector(primary_fails=primary_fails))
+    runner = TurnRunner(
+        provider_selector=_ChainSelector(primary_fails=primary_fails), model_catalog=model_catalog,
+    )
     return [
         event
         async for event in runner.run(
@@ -3002,11 +3006,20 @@ async def test_same_turn_pending_input_applies_after_precontent_selector_fallbac
 ) -> None:
     pending = ListPendingInputProvider()
     pending.append("replace the original constraint")
+    catalog = ModelCatalog()
+    catalog._populate_from_data([
+        {
+            "id": model, "context_length": 32_000,
+            "top_provider": {"max_completion_tokens": 8192},
+        }
+        for model in (PRIMARY_MODEL, FALLBACK_MODEL)
+    ])
 
     events = await _run_turn_events(
         monkeypatch,
         primary_fails=True,
         pending_input_provider=pending,
+        model_catalog=catalog,
     )
 
     assert len(pending.applications) == 1
@@ -3020,6 +3033,27 @@ async def test_same_turn_pending_input_applies_after_precontent_selector_fallbac
         for item in done.route_plan["fallback_chain"]
     } >= {("openrouter", FALLBACK_MODEL)}
     assert done.model == FALLBACK_MODEL
+
+
+async def test_same_turn_pending_input_stays_queued_when_fallback_window_is_unknown(
+    monkeypatch: Any,
+) -> None:
+    pending = ListPendingInputProvider()
+    pending.append("replace the original constraint")
+
+    events = await _run_turn_events(
+        monkeypatch, primary_fails=True, pending_input_provider=pending,
+    )
+
+    assert pending.applications == ()
+    assert pending.peek_pending() == ["replace the original constraint"]
+    done = next(event for event in events if isinstance(event, EngineDoneEvent))
+    assert done.model == FALLBACK_MODEL
+    assert done.route_plan is not None
+    fallback = next(
+        leg for leg in done.route_plan["fallback_chain"] if leg["model"] == FALLBACK_MODEL
+    )
+    assert fallback["capabilities"]["context_window"] == 0
 
 
 async def test_turn_without_fallback_hop_emits_exactly_one_router_decision(

@@ -246,14 +246,6 @@ async def _handle_workspaces_history_delete(
                 # tasks above. Let matching work settle naturally: cancelling a
                 # wrapper cannot stop an underlying writer thread.
                 await drain_pending_flushes_for_sessions(candidate_keys)
-                drain_turn_writes = getattr(
-                    ctx.turn_runner,
-                    "drain_session_background_writes",
-                    None,
-                )
-                if callable(drain_turn_writes):
-                    await drain_turn_writes(candidate_keys)
-
                 session_ids: dict[str, str] = {}
                 for session_key in candidate_keys:
                     node = await storage.get_session(session_key)

@@ -588,6 +588,14 @@ class ChatConfig(BaseModel):
     )
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
+    # Resolved window of this physical deployment, rebound for every routed
+    # or ensemble leg. Zero preserves legacy callers without catalog facts.
+    provider_context_window_tokens: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        repr=False,
+    )
     # Runtime-only provenance for an explicit global
     # ``llm.context_window_tokens`` override. Selector fallback must resolve the
     # new physical model with this same operator setting; zero means the active

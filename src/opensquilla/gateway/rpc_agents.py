@@ -21,7 +21,7 @@ from opensquilla.gateway.rpc import (
 )
 from opensquilla.identity.bootstrap import (
     CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
-    ONE_SHOT_BOOTSTRAP_FILENAME,
+    RETIRED_WORKSPACE_FILENAMES,
     ensure_agent_workspace,
 )
 from opensquilla.session.keys import normalize_agent_id
@@ -31,8 +31,6 @@ _d = get_dispatcher()
 _ALLOWED_FILE_EXTENSIONS = frozenset({".md", ".txt", ".yaml", ".yml", ".j2"})
 _WORKSPACE_AGENT_FILE_NAMES = (
     *CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
-    ONE_SHOT_BOOTSTRAP_FILENAME,
-    "MEMORY.md",
     "memory.md",
 )
 _WORKSPACE_AGENT_FILE_NAME_SET = frozenset(_WORKSPACE_AGENT_FILE_NAMES)
@@ -58,7 +56,11 @@ def _validate_workspace_file_name(name: str) -> str:
     if name != Path(name).name or "/" in name or "\\" in name:
         raise ValueError("workspace file name must not contain path separators")
     if name not in _WORKSPACE_AGENT_FILE_NAME_SET:
-        raise ValueError(f"Unsupported workspace agent file: {name}")
+        raise ValueError(
+            f"Retired workspace agent file: {name}; use ordinary file tools to access it"
+            if name in RETIRED_WORKSPACE_FILENAMES
+            else f"Unsupported workspace agent file: {name}"
+        )
     return name
 
 

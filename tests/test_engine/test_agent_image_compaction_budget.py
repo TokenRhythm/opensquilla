@@ -45,14 +45,25 @@ async def test_inline_compaction_reduces_old_text_while_preserving_current_image
         requests.append(request)
         return await compact_context(request)
 
+    async def synthetic_summary(**_kwargs: object) -> str:
+        return "The archived batches are complete. Continue with the current image request."
+
     monkeypatch.setattr(agent_module, "compact_context", record_compaction)
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.call_compaction_llm", synthetic_summary,
+    )
     agent = Agent(
         provider=SimpleNamespace(provider_name="synthetic"),
         config=AgentConfig(
-            context_window_tokens=8192, context_overflow_threshold=0.9, flush_enabled=False,
+            # Leave input space for the current image after reserving the
+            # complete output cap; the default 8k output fills this window.
+            context_window_tokens=8192, max_tokens=1024,
+            context_overflow_threshold=0.9,
         ),
     )
-    monkeypatch.setattr(agent, "_build_compaction_config", lambda: CompactionConfig())
+    monkeypatch.setattr(agent, "_build_compaction_config", lambda: CompactionConfig(
+        model="synthetic-summary", api_key="synthetic-test-key",
+    ))
     messages: list[Message] = []
     for index in range(20):
         messages.extend([

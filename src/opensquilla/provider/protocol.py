@@ -28,6 +28,15 @@ IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
     "model or remove the image and try again."
 )
 
+
+class ProviderModelListingResponseError(RuntimeError):
+    """A model-list response arrived but could not be parsed safely."""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 if TYPE_CHECKING:
     from .selector import ProviderConfig, SelectorConfig
 

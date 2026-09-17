@@ -26,6 +26,7 @@ export interface RpcTransport {
   ): Promise<T>
   ready(options?: TransportReadyOptions): Promise<void>
   supports(method: string): boolean
+  readonly policy?: Readonly<Record<string, unknown>> | null
   markUnsupported(method: string): void
   acknowledgeDelivery?(receipt: TransportDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: TransportInstalledReceipt): Promise<void> | void
@@ -56,6 +57,7 @@ export interface GatewayTransports {
 }
 
 interface RpcStoreTransportSource {
+  readonly policy?: Record<string, unknown> | null
   readonly connectionGeneration: number
   call<T = unknown>(
     method: string,
@@ -145,6 +147,7 @@ export function createPrivateGatewayTransports(
       supports(method) {
         return source.hasRpcMethod(method)
       },
+      get policy() { return source.policy },
       markUnsupported(method) {
         source.rememberUnsupportedMethod(method)
       },

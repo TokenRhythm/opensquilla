@@ -14,9 +14,11 @@ describe('ChatView Goal outcome placement', () => {
     )
   })
 
-  it('keeps settled outcomes read-only while active Goal controls remain available', () => {
+  it('connects settled and active Goal removal to the same guarded confirmation', () => {
     expect(chatViewSource).not.toContain('@goal-edit=')
-    expect(chatViewSource).not.toContain('@goal-clear=')
+    expect(chatViewSource).toContain('@goal-clear="clearGoal"')
+    expect(chatViewSource).toContain(':goal-removable="!shareMode && !forkTransition"')
+    expect(chatViewSource).toContain(':removable="!shareMode && !forkTransition"')
     expect(chatViewSource).toContain('<GoalRibbon')
     expect(chatViewSource).toContain('@edit="editGoalFromRibbon"')
     expect(chatViewSource).toContain('@clear="clearGoal"')

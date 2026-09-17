@@ -42,6 +42,7 @@ from opensquilla.application.config_secrets import (
     redact_public_config as redact_public_config,
 )
 from opensquilla.gateway.config_migration import (
+    DEPRECATED_MEMORY_LEAVES,
     LATEST_CONFIG_VERSION,
     ConfigParseError,
     backup_and_write_migrated_config,
@@ -78,11 +79,6 @@ from opensquilla.router_tiers import (
 )
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS, MAX_SEARCH_RESULTS
-from opensquilla.session.compaction_lifecycle import (
-    DEFAULT_FLUSH_TRIGGERS,
-    FlushTrigger,
-    normalize_flush_triggers_strict,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -1175,28 +1171,6 @@ class MemoryConfig(BaseSettings):
     # when entry_ttl_days = 0.
     ttl_sweep_interval_minutes: float = Field(default=60.0, ge=0.0)
 
-    # Flush (pre-compaction memory save)
-    flush_enabled: bool = False
-    flush_triggers: list[FlushTrigger] = Field(
-        default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS)
-    )
-    flush_pre_compaction: bool = False
-    flush_timeout_seconds: float = 15.0
-    flush_background_timeout_seconds: float = 120.0
-    flush_backoff_initial_seconds: float = 30.0
-    flush_backoff_max_seconds: float = 300.0
-    flush_archive_max_bytes: int = 800_000
-    flush_compaction_requires_safe_receipt: bool = False
-    flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
-    repair_enabled: bool = True
-    repair_interval_seconds: float = Field(default=60.0, ge=0.0)
-    repair_max_items_per_tick: int = Field(default=5, ge=1)
-
-    @field_validator("flush_triggers", mode="before")
-    @classmethod
-    def _normalize_flush_triggers(cls, value: object) -> list[FlushTrigger]:
-        return list(normalize_flush_triggers_strict(value))
-
     # Per-turn auto capture / recall
     auto_capture_enabled: bool = True
     capture_mode: Literal["turn_pair", "off"] = "turn_pair"
@@ -1675,13 +1649,12 @@ class HeartbeatConfig(BaseSettings):
         default=False,
         validation_alias=AliasChoices("light_context", "lightContext"),
     )
-    # Path to HEARTBEAT.md for live-reload of cadence + Loop overrides.
-    # ``None`` resolves to ``<workspace_dir>/HEARTBEAT.md``
-    # at boot. When the file is absent the loop falls back to the bootstrap
-    # values above; a malformed frontmatter is fail-open (defaults).
+    # Retained for configuration round-tripping, never resolved or read.
     config_path: str | None = Field(
         default=None,
         validation_alias=AliasChoices("config_path", "configPath"),
+        description="Deprecated and ignored: HEARTBEAT.md no longer controls heartbeat.",
+        json_schema_extra={"deprecated": True},
     )
 
     @field_validator("target")
@@ -2178,7 +2151,7 @@ class SubagentsGatewayConfig(BaseModel):
     is archived. ``0`` disables auto-archive."""
 
     prompt_compact: bool = False
-    """When enabled, subagent bootstrap prompts keep only AGENTS.md and TOOLS.md."""
+    """When enabled, subagent bootstrap prompts keep only AGENTS.md."""
 
 
 class MetaSkillPersistenceConfig(BaseSettings):
@@ -2449,6 +2422,14 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
         llm = values.get("llm")
         if isinstance(llm, dict):
             llm.pop("extra_body", None)
+        memory = values.get("memory")
+        if isinstance(memory, dict):
+            # Old nested environment/dotenv settings can survive an upgrade
+            # even after the TOML migration. Keep new explicit payloads strict.
+            values["memory"] = {
+                key: value for key, value in memory.items()
+                if key.lower() not in DEPRECATED_MEMORY_LEAVES
+            }
         return values
 
 

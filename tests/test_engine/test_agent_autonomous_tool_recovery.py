@@ -83,7 +83,6 @@ async def test_identical_calls_execute_and_each_real_result_reaches_next_request
         provider=provider,
         config=AgentConfig(
             timeout=5,
-            flush_enabled=False,
             tool_failure_loop_block_threshold=1,
             repeated_tool_call_recovery_threshold=1,
             repeated_tool_call_recovery_extra_tools=("probe",),

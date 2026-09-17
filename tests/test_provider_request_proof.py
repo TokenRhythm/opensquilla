@@ -17,13 +17,111 @@ from opensquilla.provider.protocol import project_provider_final_request
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceeded,
     _final_hard_cap_payload_once,
+    effective_proof_token_budget,
     project_final_request_payload,
     project_provider_payload,
+    projected_generation_budget,
     protected_tool_result_indexes,
     prove_or_compact_provider_payload,
     prove_provider_payload,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from opensquilla.provider.types import ChatConfig, ContentBlockToolResult, Message
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"max_output_tokens": 5_000}, 5_000),
+        ({"max_completion_tokens": 6_000}, 6_000),
+        ({"max_tokens": 14_096}, 14_096),
+        ({"options": {"num_predict": 7_000}}, 7_000),
+        ({}, 4_000),
+        ({"max_tokens": True, "options": {"num_predict": -1}}, 4_000),
+    ],
+)
+def test_generation_budget_uses_adapter_wire_cap_or_backend_reserve(
+    payload: dict[str, Any], expected: int,
+) -> None:
+    assert projected_generation_budget(payload, 4_000) == expected
+
+
+def test_physical_budget_uses_wire_generation_cap_without_double_counting_thinking() -> None:
+    config = ChatConfig(
+        provider_context_window_tokens=128_000,
+        max_tokens=1_024,
+        thinking=True,
+        thinking_budget_tokens=10_000,
+    )
+    assert provider_request_token_budget({"max_tokens": 14_096}, config) == 93_904
+    assert "provider_context_window_tokens" not in config.model_dump()
+    assert "provider_context_window_tokens" not in repr(config)
+    assert provider_request_token_budget({}, ChatConfig()) is None
+
+
+@pytest.mark.parametrize("explicit", [None, 0, 1_234])
+def test_character_budget_preserves_explicit_cap_and_rebinds_only_derived_cap(
+    explicit: int | None,
+) -> None:
+    config = ChatConfig(
+        provider_context_window_tokens=32_000,
+        max_tokens=1_000,
+        provider_request_max_chars=9_999,
+        provider_request_max_chars_explicit_cap=0,
+    ).model_copy(update={"provider_request_max_chars_explicit_cap": explicit})
+    payload = {"max_tokens": 4_000}
+    assert provider_request_token_budget(payload, config) == 24_000
+    expected = 9_999 if explicit is None else explicit or 96_000
+    assert provider_request_character_budget(payload, config) == expected
+
+
+def test_unknown_window_preserves_existing_character_limit() -> None:
+    config = ChatConfig(provider_request_max_chars=7_777, provider_request_max_chars_explicit_cap=0)
+    assert provider_request_character_budget({"max_tokens": 4_000}, config) == 7_777
+
+
+@pytest.mark.parametrize(
+    ("configured", "environment", "expected"),
+    [(20_000, "10000", 10_000), (5_000, "10000", 5_000),
+     (0, "10000", 10_000), (5_000, "invalid", 5_000), (5_000, "0", 5_000)],
+)
+def test_character_budget_includes_environment_limit_in_projection(
+    monkeypatch: pytest.MonkeyPatch, configured: int, environment: str, expected: int,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS", environment)
+    config = ChatConfig(provider_request_max_chars=configured)
+    assert provider_request_character_budget({}, config) == expected
+
+
+def test_environment_character_guard_preserves_independent_physical_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS", "20000")
+    config = ChatConfig(provider_context_window_tokens=32_000, max_tokens=1_000)
+    payload = {"messages": [{"role": "user", "content": "synthetic"}], "max_tokens": 1_000}
+    projection = project_provider_payload(
+        payload, projection_adapter="synthetic",
+        proof_budget=provider_request_character_budget(payload, config),
+        token_budget=provider_request_token_budget(payload, config),
+    )
+    final = request_proof.prove_provider_payload_from_env(
+        payload, projection_adapter="synthetic",
+        token_budget=provider_request_token_budget(payload, config),
+    )
+    assert final is not None
+    assert projection["effective_proof_budget"] == final["effective_proof_budget"] == 18_000
+    assert projection["effective_proof_token_budget"] == final["effective_proof_token_budget"]
+    assert projection["effective_proof_token_budget"] > 18_000 // 4
+
+
+@pytest.mark.parametrize(
+    ("capacity", "expected", "headroom"),
+    [(0, 0, 0), (100, 0, 100), (1_000, 872, 128), (20_000, 18_000, 2_000),
+     (100_000, 95_904, 4_096)],
+)
+def test_independent_token_headroom_bounds(capacity: int, expected: int, headroom: int) -> None:
+    assert effective_proof_token_budget(capacity) == (expected, headroom)
 
 
 @pytest.fixture(autouse=True)
@@ -62,6 +160,89 @@ def test_provider_request_proof_allows_payload_within_budget() -> None:
     assert proof["system_chars"] == 0
     assert proof["top_level_chars"] == 0
     assert proof["tool_schema_too_large"] is False
+
+
+def test_character_cap_does_not_restrict_independent_token_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(request_proof, "_serialized_token_estimate", lambda _: (200, "synthetic"))
+    payload = {"messages": [{"role": "user", "content": "dense synthetic text"}]}
+    proof = prove_provider_payload(
+        payload, projection_adapter="openai", proof_budget=1_000, token_budget=500,
+    )
+    assert proof["fits"] is True
+    assert proof["effective_proof_token_budget"] == 372
+    assert proof["token_budget_source"] == "physical_context_window"
+
+    tighter = project_provider_payload(
+        payload, projection_adapter="openai", proof_budget=1_000_000, token_budget=200,
+    )
+    assert tighter["fits_char_budget"] is True
+    assert tighter["fits_token_budget"] is False
+
+
+def test_character_gate_remains_independent_when_tokens_fit() -> None:
+    proof = project_provider_payload(
+        {"messages": [{"role": "user", "content": "x" * 1_000}]},
+        projection_adapter="openai", proof_budget=300, token_budget=10_000,
+    )
+    assert proof["fits_char_budget"] is False
+    assert proof["fits_token_budget"] is True
+
+
+@pytest.mark.parametrize("token_budget", [0, 150])
+def test_disabled_character_cap_does_not_bypass_token_rejection(token_budget: int) -> None:
+    payload = {"messages": [{"role": "user", "content": "protected user input " * 100}]}
+    with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
+        prove_or_compact_provider_payload(
+            payload, projection_adapter="openai", proof_budget=0, token_budget=token_budget,
+        )
+    assert exc_info.value.proof["fits_char_budget"] is True
+    assert exc_info.value.proof["fits_token_budget"] is False
+    assert exc_info.value.proof["raw_proof_token_budget"] == token_budget
+
+
+def test_token_only_admission_keeps_tool_shaping_and_final_proof() -> None:
+    payload = {
+        "messages": [
+            {"role": "user", "content": "synthetic request"},
+            {"role": "tool", "content": "x" * 5_000},
+        ]
+    }
+    compacted, proof = prove_or_compact_provider_payload(
+        payload, projection_adapter="openai", proof_budget=0, token_budget=600,
+    )
+    assert proof is not None
+    assert proof["fits"] is True
+    assert proof["retry_count"] == 1
+    assert proof["raw_proof_token_budget"] == 600
+    assert compacted["messages"][0] == payload["messages"][0]
+    assert len(compacted["messages"][1]["content"]) < 5_000
+
+
+def test_final_request_projection_preserves_independent_token_rejection() -> None:
+    projection = project_final_request_payload(
+        {"messages": [{"role": "user", "content": "synthetic input"}]},
+        projection_adapter="openai", proof_budget=1_000_000, token_budget=0,
+    )
+    assert projection.fits is False
+    assert projection.proof["fits_char_budget"] is True
+    assert projection.proof["fits_token_budget"] is False
+
+
+@pytest.mark.parametrize("character_limit", [None, "0", "invalid"])
+def test_environment_character_guard_cannot_disable_physical_token_guard(
+    monkeypatch: pytest.MonkeyPatch, character_limit: str | None,
+) -> None:
+    if character_limit is None:
+        monkeypatch.delenv("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS", character_limit)
+    with pytest.raises(ProviderRequestBudgetExceeded):
+        request_proof.prove_provider_payload_from_env(
+            {"messages": [{"role": "user", "content": "synthetic input"}]},
+            projection_adapter="openai", token_budget=0,
+        )
 
 
 def test_provider_request_proof_blocks_oversized_payload() -> None:

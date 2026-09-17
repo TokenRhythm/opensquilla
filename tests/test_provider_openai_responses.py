@@ -1131,3 +1131,26 @@ def test_openai_responses_incomplete_max_output_tokens_reports_length(
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.stop_reason == "length"
+
+
+def test_responses_send_enforces_same_physical_token_budget_as_projection(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+    config = ChatConfig(
+        max_tokens=8_192,
+        provider_context_window_tokens=8_192,
+        provider_request_max_chars=1_000_000,
+    )
+    projection = provider.project_final_request(
+        [Message(role="user", content="hi")], config=config,
+    )
+    assert not projection.fits
+    events = _collect_events(provider, config=config)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "provider_request_budget_exhausted"
+        for event in events
+    )
+    assert captured == {}

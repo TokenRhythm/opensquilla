@@ -40,11 +40,13 @@ function field(value: string, caret: 'start' | 'end' | 'middle' | number, end?: 
 
 function harness(over: {
   inputText?: string
+  messages?: ChatMessage[]
   pendingQueue?: ChatPendingItem[]
   canQueueMore?: boolean
   safari?: boolean
   slashOpen?: boolean
   filteredSlashCmds?: ChatSlashCommand[]
+  cancelMessageEdit?: () => boolean
 } = {}) {
   const inputText = ref(over.inputText ?? '')
   const spies = {
@@ -56,11 +58,12 @@ function harness(over: {
     closeSlashMenu: vi.fn(),
     completeSlashCmd: vi.fn(),
     activateSlashCmd: vi.fn(),
+    cancelMessageEdit: vi.fn(over.cancelMessageEdit ?? (() => false)),
   }
   const api = useChatComposerShortcuts({
     inputText,
     composing: ref(false),
-    messages: ref<ChatMessage[]>([]),
+    messages: ref<ChatMessage[]>(over.messages ?? []),
     pendingQueue: ref<ChatPendingItem[]>(over.pendingQueue ?? []),
     canQueueMore: ref(over.canQueueMore ?? true),
     slashOpen: ref(over.slashOpen ?? false),
@@ -292,5 +295,109 @@ describe('useChatComposerShortcuts', () => {
       expect(ta.value).toBe('')
       expect(inputText.value).toBe('')
     })
+  })
+})
+
+describe('Escape and message edits', () => {
+  it('resets history navigation so ArrowDown cannot overwrite the restored draft', () => {
+    const { api, inputText, spies } = harness({
+      messages: [{ role: 'user', text: 'earlier request', ts: null }],
+    })
+    api.onTextareaKeydown(keydown({ key: 'ArrowUp', target: field('', 'start') }))
+    expect(inputText.value).toBe('earlier request')
+    inputText.value = 'edited message'
+    spies.cancelMessageEdit.mockImplementation(() => {
+      inputText.value = 'restored draft'
+      return true
+    })
+
+    api.onTextareaKeydown(keydown({ key: 'Escape', target: field('edited message', 'end') }))
+    const down = keydown({ key: 'ArrowDown', target: field('restored draft', 'end') })
+    api.onTextareaKeydown(down)
+
+    expect(inputText.value).toBe('restored draft')
+    expect(down.preventDefault).not.toHaveBeenCalled()
+  })
+
+  it('cancels an uncommitted edit instead of clearing the composer', () => {
+    // #1372: edit mode empties the transcript on the first click, and Escape
+    // used to clear the draft and leave that empty state on screen. Cancelling
+    // the edit is the whole action — the composer is restored by the cancel
+    // itself, so Escape must not go on to blank it.
+    const { api, inputText, spies } = harness({
+      inputText: 'B',
+      cancelMessageEdit: () => true,
+    })
+
+    const e = keydown({ key: 'Escape', target: field('B', 'end') })
+    api.onTextareaKeydown(e)
+
+    expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
+    expect(e.preventDefault).toHaveBeenCalledOnce()
+    expect(inputText.value).toBe('B')
+  })
+
+  it('offers the cancel even when the composer has been emptied by hand', () => {
+    // The old guard required a non-empty draft, so clearing the box first left
+    // no way out of the truncated transcript at all.
+    const { api, spies } = harness({ inputText: '', cancelMessageEdit: () => true })
+
+    api.onTextareaKeydown(keydown({ key: 'Escape', target: field('', 'end') }))
+
+    expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
+  })
+
+  it('reaches the cancel even with something queued', () => {
+    // The draft-clearing branch is inert when the queue is non-empty, and the
+    // cancel used to sit inside that guard: one queued message and edit mode
+    // had no exit at all, which is the defect being fixed one step along.
+    const { api, spies } = harness({
+      inputText: 'B',
+      pendingQueue: QUEUE,
+      cancelMessageEdit: () => true,
+    })
+
+    api.onTextareaKeydown(keydown({ key: 'Escape', target: field('B', 'end') }))
+
+    expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
+  })
+
+  it('leaves a queued Escape alone when no edit is live', () => {
+    const { api, inputText, spies } = harness({ inputText: 'draft', pendingQueue: QUEUE })
+
+    api.onTextareaKeydown(keydown({ key: 'Escape', target: field('draft', 'end') }))
+
+    expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
+    // Unchanged: with something queued this handler never cleared the draft.
+    expect(inputText.value).toBe('draft')
+  })
+
+  it('still clears the draft when there is no edit to cancel', () => {
+    const { api, inputText, spies } = harness({ inputText: 'just a draft' })
+
+    const e = keydown({ key: 'Escape', target: field('just a draft', 'end') })
+    api.onTextareaKeydown(e)
+
+    expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
+    expect(inputText.value).toBe('')
+    expect(e.preventDefault).toHaveBeenCalledOnce()
+  })
+
+  it('leaves the slash menu Escape alone', () => {
+    // Escape closes the menu first; an edit underneath it is not touched until
+    // the menu is out of the way.
+    const { api, spies } = harness({
+      inputText: '/co',
+      slashOpen: true,
+      filteredSlashCmds: [
+        { name: '/coding', cmd: '/coding', label: '/coding', desc: '' },
+      ] as unknown as ChatSlashCommand[],
+      cancelMessageEdit: () => true,
+    })
+
+    api.onTextareaKeydown(keydown({ key: 'Escape', target: field('/co', 'end') }))
+
+    expect(spies.closeSlashMenu).toHaveBeenCalledOnce()
+    expect(spies.cancelMessageEdit).not.toHaveBeenCalled()
   })
 })

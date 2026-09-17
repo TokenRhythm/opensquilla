@@ -75,11 +75,17 @@ def _canon(value: Any) -> str:
 def _legacy_proof_view(proof: dict[str, Any]) -> dict[str, Any]:
     """Remove token-aware additions before comparing rollback goldens."""
 
+    assert proof["token_budget_source"] == "legacy_character_limit"
+    assert proof["proof_headroom_tokens"] == (
+        proof["raw_proof_token_budget"] - proof["effective_proof_token_budget"]
+    )
     projected = dict(proof)
     for key in (
         "estimated_text_tokens",
         "raw_proof_token_budget",
         "effective_proof_token_budget",
+        "proof_headroom_tokens",
+        "token_budget_source",
         "fits_char_budget",
         "fits_token_budget",
         "usage_source",

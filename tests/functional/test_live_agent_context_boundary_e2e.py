@@ -45,7 +45,7 @@ async def test_live_openrouter_agent_boundary_smoke() -> None:
             context_window_tokens=200_000,
             max_tokens=64,
             provider_request_proof_max_chars=8_000,
-            flush_enabled=False,
+
             max_iterations=1,
             request_timeout=45.0,
         ),

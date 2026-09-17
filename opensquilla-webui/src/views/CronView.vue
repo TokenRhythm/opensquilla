@@ -344,7 +344,7 @@ const automationTemplates: AutomationTemplate[] = [
     payloadKind: 'agent_turn',
     sessionTarget: 'isolated',
     requiresWorkspace: true,
-    message: '仅检查当前绑定的项目空间，读取其中的项目文件、错误日志和待办记录。只报告有直接证据的项目风险，并按高、中、低风险分级，说明证据、影响范围和建议动作。缺少 Git 仓库、AGENTS.md、TOOLS.md、HEARTBEAT.md 等可选文件，以及本次巡检任务自身正在运行，均不得列为风险。不要检查 OpenSquilla 安装目录、Gateway、模型路由或系统依赖状态。没有证据的风险等级写“暂无”。不要执行删除、发布或修改生产配置等不可逆操作。',
+    message: '仅检查当前绑定的项目空间，读取其中的项目文件、错误日志和待办记录。只报告有直接证据的项目风险，并按高、中、低风险分级，说明证据、影响范围和建议动作。缺少 Git 仓库、AGENTS.md 等可选文件，以及本次巡检任务自身正在运行，均不得列为风险。不要检查 OpenSquilla 安装目录、Gateway、模型路由或系统依赖状态。没有证据的风险等级写“暂无”。不要执行删除、发布或修改生产配置等不可逆操作。',
   },
   {
     id: 'knowledge-review',

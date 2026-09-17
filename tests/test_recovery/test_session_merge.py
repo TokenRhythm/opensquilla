@@ -823,6 +823,97 @@ def test_merge_session_database_snapshots_wal_when_target_is_missing(
     source.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["recover_new", "recover_existing", "backup"])
+async def test_usage_identity_follows_retained_daily_buckets(
+    tmp_path: Path, operation: str
+) -> None:
+    source_path = tmp_path / "source.db"
+    target_path = tmp_path / "target.db"
+    identity_key = "telemetry.daily_usage_store_id"
+    source = await SessionStorage.open(str(source_path))
+    try:
+        source_store_id = await source.ensure_daily_usage_store_id()
+        await source.set_runtime_preference("retained.setting", "source-setting")
+        await source.record_daily_usage(
+            day="2026-07-25",
+            input_tokens=3,
+            output_tokens=0,
+            cached_tokens=0,
+            cache_write_tokens=0,
+            updated_at=1,
+        )
+    finally:
+        await source.close()
+
+    target_store_id = None
+    if operation == "recover_existing":
+        target = await SessionStorage.open(str(target_path))
+        try:
+            target_store_id = await target.ensure_daily_usage_store_id()
+            await target.set_runtime_preference("retained.setting", "target-setting")
+            await target.record_daily_usage(
+                day="2026-07-25",
+                input_tokens=7,
+                output_tokens=0,
+                cached_tokens=0,
+                cache_write_tokens=0,
+                updated_at=1,
+            )
+        finally:
+            await target.close()
+
+    if operation == "backup":
+        snapshot_session_database(source_path, target_path)
+    else:
+        merge_session_database(
+            target_path,
+            source_path,
+            source_id="33333333-3333-4333-8333-333333333333",
+        )
+
+    with sqlite3.connect(target_path) as target:
+        preferences = dict(
+            target.execute(
+                "SELECT preference_key, preference_value FROM runtime_preferences"
+            ).fetchall()
+        )
+        usage = target.execute(
+            "SELECT conversation_turns, input_tokens FROM telemetry_daily_usage"
+        ).fetchall()
+    if operation == "recover_new":
+        assert identity_key not in preferences
+        assert preferences["retained.setting"] == "source-setting"
+        assert usage == []
+    elif operation == "recover_existing":
+        assert preferences[identity_key] == target_store_id
+        assert preferences["retained.setting"] == "target-setting"
+        assert usage == [(1, 7)]
+    else:
+        assert preferences[identity_key] == source_store_id
+        assert preferences["retained.setting"] == "source-setting"
+        assert usage == [(1, 3)]
+
+    with sqlite3.connect(source_path) as source:
+        assert source.execute(
+            "SELECT preference_value FROM runtime_preferences WHERE preference_key = ?",
+            (identity_key,),
+        ).fetchone() == (source_store_id,)
+        assert source.execute(
+            "SELECT conversation_turns, input_tokens FROM telemetry_daily_usage"
+        ).fetchall() == [(1, 3)]
+
+    reopened = await SessionStorage.open(str(target_path))
+    try:
+        confirmed_id = await reopened.ensure_daily_usage_store_id()
+        if operation == "recover_new":
+            assert confirmed_id != source_store_id
+        else:
+            assert confirmed_id == (target_store_id or source_store_id)
+    finally:
+        await reopened.close()
+
+
 def test_merge_existing_imports_bound_workspace_without_replaying_trust(
     tmp_path: Path,
 ) -> None:

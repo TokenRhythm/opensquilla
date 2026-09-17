@@ -12,7 +12,7 @@ import pytest
 from opensquilla.skills import file_hash
 from opensquilla.skills import loader as skill_loader_module
 from opensquilla.skills.file_hash import _TreeChangedDuringHashError
-from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, SkillLoader
+from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, PinnedSkillLoader, SkillLoader
 
 
 def _write_skill(root: Path, name: str, description: str = "description") -> Path:
@@ -858,6 +858,48 @@ def test_snapshot_v12_is_invalid_and_v16_round_trips_atomically(tmp_path: Path) 
     restored_skills = restored.load_snapshot() or []
     assert [skill.name for skill in restored_skills] == ["alpha"]
     assert restored_skills[0].tree_digest == data["skills"][0]["tree_digest"]
+
+
+def test_legacy_snapshot_normalizes_triggers_without_recompiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "alpha")
+    skill_file.write_text(
+        "---\nname: alpha\ndescription: Synthetic trigger fixture\n"
+        "triggers: [123, [nested, list], dubbing]\n---\nbody",
+        encoding="utf-8",
+    )
+    snapshot_path = tmp_path / "snapshot.json"
+    loader = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+    loader.load_all()
+    loader.save_snapshot()
+
+    data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    for key in ("skills", "candidates"):
+        assert data[key]
+        for skill in data[key]:
+            skill["triggers"] = [123, ["nested", "list"], "dubbing"]
+    snapshot_path.write_text(json.dumps(data), encoding="utf-8")
+
+    restored = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+
+    def unexpected_rebuild(*args: object, **kwargs: object) -> None:
+        pytest.fail("unchanged Skill sources should reuse the existing snapshot")
+
+    monkeypatch.setattr(restored, "_build_catalog", unexpected_rebuild)
+    expected = ["123", "['nested', 'list']", "dubbing"]
+    snapshot_skills = restored.load_snapshot()
+    assert snapshot_skills is not None
+    assert [skill.triggers for skill in snapshot_skills] == [expected]
+    assert [skill.triggers for skill in restored.load_all()] == [expected]
+    catalog = restored.snapshot()
+    assert [skill.triggers for skill in catalog.skills] == [expected]
+    assert [skill.triggers for skill in catalog.candidates] == [expected]
+    pinned = PinnedSkillLoader(catalog, restored)
+    for matcher in (restored, pinned):
+        for query in ("DUBBING", "123", "['nested', 'list']"):
+            assert [skill.name for skill in matcher.find_by_trigger(query)] == ["alpha"]
 
 
 def test_description_zh_is_parsed_and_survives_snapshot_round_trip(tmp_path: Path) -> None:

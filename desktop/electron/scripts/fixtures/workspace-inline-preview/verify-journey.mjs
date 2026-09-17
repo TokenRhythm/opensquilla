@@ -505,8 +505,6 @@ network_default = "proxy_allowlist"
 default_mode = "off"
 
 [memory]
-flush_enabled = false
-repair_enabled = false
 auto_capture_enabled = false
 retrieval_mode = "fts_only"
 ttl_sweep_interval_minutes = 0

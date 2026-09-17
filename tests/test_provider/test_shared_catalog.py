@@ -44,6 +44,13 @@ class _SentinelCatalog(ModelCatalog):
         self.max_tokens_calls.append((model_id, provider))
         return self.MAX_TOKENS
 
+    def resolve_max_tokens_with_source(
+        self, model_id: str, user_override: int = 0, provider: str = ""
+    ) -> tuple[int, str]:
+        # Deployment limits resolve through the same injected instance while
+        # carrying source reliability alongside the sentinel capacity.
+        return self.resolve_max_tokens(model_id, user_override, provider), "catalog"
+
     def get_capabilities(
         self,
         model_id: str,

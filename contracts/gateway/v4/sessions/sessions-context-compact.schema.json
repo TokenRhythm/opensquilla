@@ -24,7 +24,6 @@
     "response": "#/$defs/SessionsContextCompactResponseFrame", "result": "#/$defs/SessionsContextCompactResult",
     "errors": [
       { "code": "INVALID_PARAMS" }, { "code": "NOT_FOUND" }, { "code": "UNAUTHORIZED" },
-      { "code": "CONTEXT_FLUSH_FAILED", "retryable": true, "details": true },
       { "code": "COMPACTION_TIMEOUT", "retryable": true, "details": true }, { "code": "INTERNAL_ERROR" }
     ]
   },
@@ -56,8 +55,7 @@
         "coverage_status": { "type": "string" }, "missing_obligation_count": { "type": "integer" },
         "critical_carry_forward_count": { "type": "integer" }, "state_kind": { "type": "string" },
         "quality_report": { "type": "object", "additionalProperties": true }, "skip_reason": { "type": "string" },
-        "reason": { "type": "string" }, "flush_receipt": { "type": ["object", "null"], "additionalProperties": true },
-        "flush_receipt_status": { "type": ["string", "null"] }
+        "reason": { "type": "string" }
       }
     },
     "RpcError": { "type": "object", "additionalProperties": true, "required": ["code", "message"], "properties": { "code": { "type": "string" }, "message": { "type": "string" } } },

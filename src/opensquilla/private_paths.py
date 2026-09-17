@@ -344,7 +344,10 @@ class _CtypesWindowsPrivateAcl:
         invalid_handle = ctypes.c_void_p(-1).value
         if handle in {None, invalid_handle}:
             error_number = _windows_last_error()
-            raise OSError(error_number, "cannot bind private Windows path")
+            # Keep the Win32 code so existing bounded sharing retries can
+            # distinguish access/sharing failures from permanent errors.
+            win_error = getattr(ctypes, "WinError")
+            raise win_error(error_number, "cannot bind private Windows path")
         try:
             attributes = _WindowsFileAttributeTagInfo()
             if not get_information(

@@ -229,7 +229,7 @@ describe('ChatMessageList usage barrier retry anchor', () => {
       usageBarrierError('error-safe', 'turn-safe', 'user-safe'),
     ])
 
-    expect(host.querySelector('.msg-error-card__resume')?.textContent).toContain('Retry')
+    expect(host.querySelector('.msg-error__resume')?.textContent).toContain('Retry')
   })
 
   it('hides Retry when pagination only retained a previous-turn user', () => {
@@ -238,7 +238,7 @@ describe('ChatMessageList usage barrier retry anchor', () => {
       usageBarrierError('error-new', 'turn-new', 'user-new'),
     ])
 
-    expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(host.querySelector('.msg-error__resume')).toBeNull()
   })
 
   it.each([
@@ -250,7 +250,7 @@ describe('ChatMessageList usage barrier retry anchor', () => {
       usageBarrierError('error-safe', 'turn-safe', userMessageId),
     ])
 
-    expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(host.querySelector('.msg-error__resume')).toBeNull()
   })
 
   it.each(['inline', 'staged', 'file'] as const)(
@@ -263,7 +263,7 @@ describe('ChatMessageList usage barrier retry anchor', () => {
         usageBarrierError('error-safe', 'turn-safe', 'user-primary'),
       ])
 
-      expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+      expect(host.querySelector('.msg-error__resume')).toBeNull()
     },
   )
 })
