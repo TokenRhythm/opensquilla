@@ -367,6 +367,7 @@ async def test_synchronous_compaction_respects_gateway_budget(
 @pytest.mark.parametrize(("method", "params", "deadline"), [
     ("sessions.list", {}, 30.0),
     ("custom.read", {}, 30.0),
+    ("memory.repair.run", {}, 30.0),
     ("sessions.contextCompact", {"key": "agent:main:test", "wait": False}, 30.0),
     ("sessions.contextCompact", {"key": "agent:main:test"}, 150.0),
     ("cron.run", {"id": "synthetic-job"}, 630.0),
@@ -415,7 +416,7 @@ async def test_rpc_silence_remains_bounded_with_operation_deadlines(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", [
     "sessions.reset", "skills.install", "skills.update", "skills.deps.install",
-    "memory.index", "memory.repair.run",
+    "memory.index",
 ])
 async def test_synchronous_maintenance_preserves_slow_completion(
     monkeypatch: pytest.MonkeyPatch, method: str,

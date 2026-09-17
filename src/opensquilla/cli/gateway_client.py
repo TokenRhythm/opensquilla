@@ -219,7 +219,6 @@ _SYNCHRONOUS_MAINTENANCE_METHODS = frozenset({
     "skills.update",
     "skills.deps.install",
     "memory.index",
-    "memory.repair.run",
 })
 
 
