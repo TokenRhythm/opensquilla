@@ -311,7 +311,15 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
       result.modelCapacity = { provider: capacity.provider, model: capacity.model,
         contextWindow: Number(capacity.contextWindow), source: capacity.source as import('@/modules/providerConfiguration').ModelCapacitySource }
     }
-    result.terminalOutcome = normalizeTurnOutcome({ ...source, turn_id: taskId, status: 'failed' })
+    result.terminalOutcome = normalizeTurnOutcome({
+      ...source,
+      turn_id: source.turn_id ?? source.turnId ?? taskId,
+      status: kind === 'task-timed-out' ? 'timeout' : kind === 'task-abandoned' ? 'abandoned' : 'failed',
+      ...(kind !== 'turn-failed' ? {
+        statusSource: 'task',
+        reason: source.terminal_reason ?? source.terminalReason ?? source.reason,
+      } : {}),
+    })
     const errorCode = usageAccountingErrorCode(source)
     if (errorCode) result.error_class = errorCode
   }

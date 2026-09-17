@@ -6,6 +6,9 @@ import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import SystemMessage from './SystemMessage.vue'
+import { copyTextWithFallback } from '@/utils/browser'
+
+vi.mock('@/utils/browser', () => ({ copyTextWithFallback: vi.fn().mockResolvedValue(undefined) }))
 
 function errorMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
   return {
@@ -59,7 +62,7 @@ describe('SystemMessage sandbox resume', () => {
     const onRetry = vi.fn()
     const target = { provider: 'custom_anthropic', model: 'example.vendor/model.v1:latest', contextWindow: 8192, source: 'default' as const }
     const { app, el } = await mountMsg(errorMessage({ errorCode: 'provider_request_too_large', modelCapacity: target }), undefined, onRetry, true)
-    const href = el.querySelector<HTMLAnchorElement>('.msg-error-card__resume')?.getAttribute('href')
+    const href = el.querySelector<HTMLAnchorElement>('.msg-error__capacity')?.getAttribute('href')
     const url = new URL(href!, 'https://capacity.invalid')
     expect(url.pathname).toBe('/settings/modelStrategy')
     expect(url.searchParams.get('capacityProvider')).toBe(target.provider)
@@ -68,13 +71,64 @@ describe('SystemMessage sandbox resume', () => {
     expect(onRetry).not.toHaveBeenCalled()
     app.unmount()
   })
+
+  it('preserves capacity guidance alongside a diagnostic action without provider replay', async () => {
+    const onRetry = vi.fn()
+    const text = 'The request exceeds the system default of 8,192 tokens.'
+    const { app, el } = await mountMsg(errorMessage({
+      text, errorCode: 'provider_request_budget_exhausted', turnId: 'capacity-turn',
+      modelCapacity: { provider: 'custom', model: 'example/model.v1:latest', contextWindow: 8192, source: 'default' },
+      turnOutcome: { turnId: 'capacity-turn', status: 'failed', failureKind: 'context_overflow', errorId: 'abcdef01', retryable: true },
+    }), undefined, onRetry, true)
+    expect(el.querySelector('.msg-error__text')?.textContent).toBe(text)
+    expect(el.querySelector('.msg-error__capacity')).not.toBeNull()
+    expect(el.querySelector('.msg-error__copy')).not.toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
+    expect(onRetry).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('keeps lifecycle timeout text ahead of a preserved provider classification', async () => {
+    const { app, el } = await mountMsg(errorMessage({
+      text: 'The task timed out before it could finish.', errorCode: '429', turnId: 't',
+      turnOutcome: { turnId: 't', status: 'timeout', statusSource: 'task', failureKind: 'rate_limited' },
+    }))
+    expect(el.querySelector('.msg-error__text')?.textContent).toBe('The task timed out before it could finish.')
+    expect(el.querySelectorAll('button')).toHaveLength(0)
+    app.unmount()
+  })
+
+  it('copies only a validated diagnostic id and never offers provider replay', async () => {
+    const { app, el } = await mountMsg(errorMessage({
+      text: 'safe fallback', errorCode: '429', turnId: 't',
+      turnOutcome: { turnId: 't', status: 'failed', failureKind: 'rate_limited', errorId: 'abcdef01', retryable: true },
+    }), undefined, undefined, true)
+    expect(el.textContent).toContain('rate-limiting requests')
+    const button = el.querySelector<HTMLButtonElement>('.msg-error__copy')
+    expect(button?.textContent).toContain('Copy diagnostic ID')
+    button?.click()
+    await nextTick()
+    expect(copyTextWithFallback).toHaveBeenCalledWith('abcdef01')
+    expect(el.querySelectorAll('button')).toHaveLength(1)
+    app.unmount()
+  })
+
+  it.each([undefined, null, 'INVALID1'])('hides copy for absent or invalid reference %s', async errorId => {
+    const { app, el } = await mountMsg(errorMessage({
+      text: 'safe fallback (ref: abcdef01)', turnId: 't',
+      turnOutcome: { turnId: 't', status: 'failed', errorId },
+    }))
+    expect(el.querySelector('.msg-error__copy')).toBeNull()
+    app.unmount()
+  })
+
   it('renders a Resume button for a sandbox-pause error and emits resume once on click', async () => {
     const onResume = vi.fn()
     const { app, el } = await mountMsg(
       errorMessage({ errorCode: 'sandbox_threshold_exceeded' }),
       onResume,
     )
-    const btn = el.querySelector<HTMLButtonElement>('.msg-error-card__resume')
+    const btn = el.querySelector<HTMLButtonElement>('.msg-error__resume')
     expect(btn).not.toBeNull()
     expect(btn?.textContent).toContain('Resume execution')
 
@@ -91,13 +145,13 @@ describe('SystemMessage sandbox resume', () => {
 
   it('does not render a Resume button for other terminal error codes', async () => {
     const { app, el } = await mountMsg(errorMessage({ errorCode: 'iteration_timeout' }))
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
   it('does not render a Resume button when the error carries no code', async () => {
     const { app, el } = await mountMsg(errorMessage())
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
@@ -105,7 +159,7 @@ describe('SystemMessage sandbox resume', () => {
     const { app, el } = await mountMsg(
       errorMessage({ role: 'system', displayRole: 'system', errorCode: 'sandbox_threshold_exceeded' }),
     )
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
@@ -128,10 +182,10 @@ describe('SystemMessage sandbox resume', () => {
     })
     const { app, el } = await mountMsg(message, undefined, onRetry, true)
 
-    expect(el.querySelector('.msg-error-card__heading')?.textContent).toContain(
-      'Usage accounting temporarily unavailable',
+    expect(el.querySelector('.msg-error__text')?.textContent).toContain(
+      'The provider request was not sent',
     )
-    const btn = el.querySelector<HTMLButtonElement>('.msg-error-card__resume')
+    const btn = el.querySelector<HTMLButtonElement>('.msg-error__resume')
     expect(btn?.textContent).toContain('Retry')
     btn?.click()
     await nextTick()
@@ -163,10 +217,10 @@ describe('SystemMessage sandbox resume', () => {
       },
     }), undefined, undefined, true)
 
-    expect(el.querySelector('.msg-error-card__heading')?.textContent).toContain(
-      'Usage accounting temporarily unavailable',
+    expect(el.querySelector('.msg-error__text')?.textContent).toContain(
+      'Earlier work in this turn',
     )
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
@@ -335,7 +389,7 @@ describe('SystemMessage sandbox resume', () => {
       errorCode: 'usage_accounting_busy',
       turnOutcome,
     }), undefined, undefined, true)
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 
@@ -391,7 +445,7 @@ describe('SystemMessage sandbox resume', () => {
       },
     }))
 
-    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
     app.unmount()
   })
 })

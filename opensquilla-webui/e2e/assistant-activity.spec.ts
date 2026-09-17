@@ -854,7 +854,7 @@ test.describe('Live assistant activity lifecycle', () => {
     })
     await expect(liveActivity.getByText('Retrying · attempt 7', { exact: true })).toBeVisible()
     await expect(liveActivity).not.toContainText('7/0')
-    await expect(page.locator('.msg-error-card')).toHaveCount(0)
+    await expect(page.locator('.msg-error')).toHaveCount(0)
 
     lifecycle.finish()
     await expect(liveActivity).toHaveCount(0)
@@ -948,7 +948,7 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(settled.locator('.tool-row--error')).toHaveCount(1)
     await expect(settled.locator('.tool-row[data-op="command.run"]')).toHaveCount(2)
     await expect(page.getByText('Recovered final answer.', { exact: true })).toHaveCount(1)
-    await expect(page.locator('.msg-error-card')).toHaveCount(0)
+    await expect(page.locator('.msg-error')).toHaveCount(0)
   })
 
   test('moves draft text back into activity when a later tool starts, then settles', async ({ page }) => {

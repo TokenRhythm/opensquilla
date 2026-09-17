@@ -100,6 +100,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `ValueError: ... was created in a different Context` chain, and the
   subscriber-visible turn-terminal event could be lost.
 
+- Skill catalog filtering and trigger matching tolerate numeric or nested YAML
+  trigger values, including restored caches and older Gateway responses (#1018).
+
 ## [0.5.4] - 2026-08-25
 
 ### Added

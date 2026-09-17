@@ -120,6 +120,7 @@
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
           :retry-available="usageBarrierRetryAvailable(entry.index)"
+          :has-partial-answer="Boolean(messages[entry.index].turnId && visibleAnswerTurns.has(messages[entry.index].turnId!))"
           @resume="$emit('resumeSandbox')"
           @retry="forwardSystemRetry"
         />
@@ -261,6 +262,10 @@ function forwardSystemRetry(
 ) {
   emit('regenerateMessage', message, settle)
 }
+
+const visibleAnswerTurns = computed(() => new Set(props.messages
+  .filter(message => message.displayRole === 'assistant' && message.text.trim() && message.turnId)
+  .map(message => message.turnId!)))
 
 function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]

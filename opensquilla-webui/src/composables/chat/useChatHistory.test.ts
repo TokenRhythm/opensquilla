@@ -3498,6 +3498,154 @@ describe('useChatHistory optimistic local rows', () => {
     expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
   })
 
+  it('recovers a provider card from outcome, then merges its durable row across pages', async () => {
+    const { api, historyFixture, messages } = makeHistory(true)
+    const outcome = {
+      turnId: 'provider-turn', taskId: 'provider-turn', status: 'failed',
+      outcome: { kind: 'failed', failure_kind: 'rate_limited', error_id: 'abcdef01', error_class: '429' },
+    }
+    historyFixture.mockResolvedValueOnce({
+      messages: [{
+        id: 'answer', messageId: 'answer', role: 'assistant', text: 'Partial answer',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId: 'provider-turn' },
+      }],
+      turnOutcomes: [outcome], hasMore: true, oldestCursor: 'answer', newestCursor: 'answer', scope: 'session',
+    }).mockResolvedValueOnce({
+      messages: [{
+        id: 'error', messageId: 'error', role: 'system', text: 'Error: safe fallback (ref: abcdef01)',
+        createdAt: '2026-07-07T10:00:00Z', turnContext: { turnId: 'provider-turn' },
+      }],
+      turnOutcomes: [outcome], hasMore: false, oldestCursor: 'error', newestCursor: 'error', scope: 'session',
+    })
+    await api.loadHistory()
+    const initial = messages.value.find(message => message.role === 'error')
+    expect(initial?.messageId).toBe('terminal-error:provider-turn')
+    expect(initial?.turnOutcome).toMatchObject({ failureKind: 'rate_limited', errorId: 'abcdef01' })
+    await api.loadEarlierHistory()
+    const errors = messages.value.filter(message => message.role === 'error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]?.messageId).toBe('error')
+    expect(errors[0]?.text).toBe(initial?.text)
+    expect(errors[0]?.turnOutcome?.errorId).toBe('abcdef01')
+    expect(messages.value.find(message => message.role === 'assistant')?.text).toBe('Partial answer')
+  })
+
+  it.each([false, true])('retains reference conflicts across history loading with prepend=%s', async prepend => {
+    const { api, historyFixture, messages } = makeHistory(true)
+    const page = (errorId: string): SessionReadHistoryPageFixture => ({
+      messages: [{
+        id: 'provider-error', messageId: 'provider-error', role: 'system', text: 'Error: safe message',
+        createdAt: '2026-01-01T09:00:00Z', turnContext: { turnId: 'provider-turn' },
+      }],
+      turnOutcomes: [{
+        turnId: 'provider-turn', taskId: 'provider-turn', status: 'failed',
+        outcome: { kind: 'failed', error_class: '429', failure_kind: 'rate_limited', error_id: errorId },
+      }],
+      hasMore: true, oldestCursor: 'provider-error', newestCursor: 'provider-error', scope: 'session',
+    })
+    historyFixture.mockResolvedValueOnce(page('abcdef01')).mockResolvedValue(page('abcdef02'))
+    await api.loadHistory()
+    expect(messages.value.find(message => message.role === 'error')?.turnOutcome?.errorId).toBe('abcdef01')
+    if (prepend) await api.loadEarlierHistory()
+    else await api.loadHistory()
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+    expect(messages.value.find(message => message.role === 'error')?.turnOutcome?.errorId).toBeNull()
+    await api.loadHistory()
+    expect(messages.value.find(message => message.role === 'error')?.turnOutcome?.errorId).toBeNull()
+  })
+
+  it.each([
+    { historyErrorId: 'abcdef01', expectedErrorId: 'abcdef01' },
+    { historyErrorId: 'abcdef02', expectedErrorId: null },
+  ])('keeps steered partial answers and one provider failure through history catch-up with $historyErrorId', async ({ historyErrorId, expectedErrorId }) => {
+    const turnId = 'turn-steered-failure'
+    const safeMessage = 'The model provider is rate-limiting requests. Try again later.'
+    const user: SessionReadMessageFixture = {
+      id: 'user-original', messageId: 'user-original', role: 'user', text: 'Draft a summary',
+      createdAt: 1_000, turnContext: { turnId },
+    }
+    const steer: SessionReadMessageFixture = {
+      id: 'user-steer', messageId: 'user-steer', role: 'user', text: 'Include the risks',
+      createdAt: 3_000, turnContext: { turnId, inputDisposition: 'applied' },
+    }
+    const outcome: SessionReadTurnOutcomeFixture = {
+      turnId, taskId: turnId, status: 'failed', errorClass: '429', terminalMessage: safeMessage,
+      outcome: { kind: 'failed', failure_kind: 'rate_limited', error_id: historyErrorId },
+    }
+    const { api, historyFixture, messages } = makeHistory(false, {
+      preserveLiveTail: true,
+      messages: [
+        { role: 'user', text: user.text!, messageId: 'user-original', ts: 1_000 },
+        {
+          role: 'router', text: '', messageId: 'router-first', turnId, ts: 1_100,
+          routerModelCallId: '1.0', routerIteration: 1,
+        },
+        { role: 'assistant', text: 'Initial summary.', turnId, ts: 2_000 },
+        {
+          role: 'user', text: steer.text!, messageId: 'user-steer', turnId, ts: 3_000,
+          inputDisposition: 'applied',
+        },
+        { role: 'assistant', text: 'Risk analysis in progress.', turnId, ts: 4_000 },
+        {
+          role: 'error', text: safeMessage, turnId, ts: 5_000, terminalNotice: true,
+          errorCode: '429',
+          turnOutcome: { turnId, status: 'failed', failureKind: 'rate_limited', errorId: 'abcdef01' },
+        },
+      ],
+      // The terminal task receipt arrives before its transcript rows. A history
+      // refresh already in flight must retain the output on both sides of steer.
+      response: { messages: [user, steer], turnOutcomes: [outcome] },
+    })
+
+    const expectPreservedTurn = () => {
+      expect(messages.value.map(message => [message.role, message.text])).toEqual([
+        ['user', 'Draft a summary'],
+        ['router', ''],
+        ['assistant', 'Initial summary.'],
+        ['user', 'Include the risks'],
+        ['assistant', 'Risk analysis in progress.'],
+        ['error', safeMessage],
+      ])
+      const notice = messages.value.filter(message => message.role === 'error')
+      expect(notice).toHaveLength(1)
+      expect(notice[0]?.turnOutcome).toMatchObject({
+        turnId, status: 'failed', statusSource: 'task', failureKind: 'rate_limited',
+        errorId: expectedErrorId,
+      })
+      expect(messages.value.find(message => message.role === 'router')).toMatchObject({
+        messageId: 'router-first', turnId, routerModelCallId: '1.0', routerIteration: 1,
+      })
+    }
+
+    await api.loadHistory()
+    expectPreservedTurn()
+
+    historyFixture.mockResolvedValue({
+      messages: [
+        user,
+        {
+          id: 'answer-first', messageId: 'answer-first', role: 'assistant',
+          text: 'Initial summary.', createdAt: 2_000, turnContext: { turnId },
+        },
+        steer,
+        {
+          id: 'answer-second', messageId: 'answer-second', role: 'assistant',
+          text: 'Risk analysis in progress.', createdAt: 4_000, turnContext: { turnId },
+        },
+        {
+          id: 'error-steered', messageId: 'error-steered', role: 'system',
+          text: `Error: ${safeMessage}`, createdAt: 5_000, turnContext: { turnId },
+        },
+      ],
+      turnOutcomes: [outcome],
+    })
+    await api.loadHistory()
+    expectPreservedTurn()
+    expect(messages.value.find(message => message.role === 'error')?.messageId).toBe('error-steered')
+    await api.loadHistory()
+    expectPreservedTurn()
+  })
+
   it('keeps exact-turn optimistic usage activity through repeated history catch-up', async () => {
     const pendingResponse: SessionReadHistoryPageFixture = {
       messages: [{

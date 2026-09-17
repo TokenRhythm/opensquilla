@@ -789,6 +789,8 @@ jobs:
           assistant-activity.spec.ts
           composer-paste.spec.ts
           history-hydration.spec.ts
+          provider-error-experience.spec.ts
+          user-message-newlines.spec.ts
           session-created-card.spec.ts
           session-switch-transport.spec.ts
           new-task-ensemble-race.spec.ts

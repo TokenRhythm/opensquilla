@@ -24,7 +24,7 @@ from opensquilla.bootstrap_types import BootstrapFileReport
 from opensquilla.observability.log_privacy import log_metadata
 from opensquilla.paths import default_opensquilla_home
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _INTENT_SUMMARY_MAX_CHARS = 500
 _VISION_GATE_DECISIONS = {"needs_image", "text_only", "unknown"}
 _VISION_GATE_STATIC_DECISIONS = {"disabled", "current_image", "not_applicable"}
@@ -100,6 +100,17 @@ class PipelineStepRecord:
     routing_source: RoutingSource = "none"
     confidence: float | None = None
     fallback_reason: str | None = None
+    # Capture the outcome before log privacy removes exception text.
+    status: Literal["ok", "skipped", "failed", "unknown"] | None = None
+
+    def __post_init__(self) -> None:
+        if self.status is None:
+            if self.applied:
+                self.status = "ok"
+            elif self.fallback_reason is not None:
+                self.status = "failed"
+            else:
+                self.status = "skipped"
 
 
 @dataclass
@@ -301,11 +312,20 @@ def load_entries(path: Path) -> list[DecisionEntry]:
         payload = json.loads(line)
         payload = _coerce_decision_payload(payload)
         steps_payload = payload.pop("pipeline_steps", [])
-        steps = [
-            PipelineStepRecord(**_filter_payload(PipelineStepRecord, s))
-            for s in steps_payload
-            if isinstance(s, dict)
-        ]
+        steps = []
+        for step_payload in steps_payload:
+            if not isinstance(step_payload, dict):
+                continue
+            step_fields = _filter_payload(PipelineStepRecord, step_payload)
+            if (
+                step_fields.get("status") is None
+                and not step_fields.get("applied")
+                and "fallback_reason" not in step_fields
+            ):
+                # Older private logs lost the reason for non-applied steps;
+                # they cannot distinguish an exception from a gated skip.
+                step_fields["status"] = "unknown"
+            steps.append(PipelineStepRecord(**step_fields))
         bootstrap_payload = payload.pop("bootstrap_files", [])
         bootstrap_files = [
             BootstrapFileReport(**_filter_payload(BootstrapFileReport, item))
