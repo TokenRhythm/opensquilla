@@ -22,6 +22,7 @@ PLATFORM_CONFIGURATION_CONTRACT_METHODS: Final = (
     "config.patch",
     "config.patch.safe",
     "models.list",
+    "models.capacity.resolve",
     "providers.status",
     "models.routing.get",
     "models.routing.set",

@@ -23,11 +23,14 @@ describe('SettingsAdvancedPanel data maintenance entry', () => {
     const Component = (await import('./SettingsAdvancedPanel.vue')).default
     const openDataMaintenance = vi.fn()
     const updateAutoCapture = vi.fn()
+    const copyConfigPath = vi.fn()
     const el = document.createElement('div')
     document.body.appendChild(el)
     const app = createApp(Component, {
       autoCapture: true,
       loaded: true,
+      configPath: '/example/config.toml',
+      onCopyConfigPath: copyConfigPath,
       onOpenDataMaintenance: openDataMaintenance,
       onUpdateAutoCapture: updateAutoCapture,
     })
@@ -35,6 +38,11 @@ describe('SettingsAdvancedPanel data maintenance entry', () => {
     app.mount(el)
     mounted.push(app)
     await nextTick()
+
+    const configFile = el.querySelector('[data-testid="advanced-config-file"]')!
+    expect(configFile.querySelector('code')?.textContent).toBe('/example/config.toml')
+    configFile.querySelector<HTMLButtonElement>('button')!.click()
+    expect(copyConfigPath).toHaveBeenCalledOnce()
 
     const memoryGroup = el.querySelector<HTMLElement>('[data-testid="advanced-memory-group"]')!
     const capture = memoryGroup.querySelector<HTMLInputElement>('input[name="memory_auto_capture"]')!

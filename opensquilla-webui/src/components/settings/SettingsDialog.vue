@@ -111,6 +111,8 @@
             v-else-if="section === 'advanced'"
             :auto-capture="memoryPanel.autoCapture"
             :loaded="loaded"
+            :config-path="displayConfigPath"
+            @copy-config-path="copyDisplayPath"
             @update-auto-capture="setMemoryAutoCapture"
             @open-agent-configuration="openAgentConfiguration"
             @open-data-maintenance="openDataMaintenance"
@@ -123,6 +125,9 @@
             <span>{{ t('shared.loading') }}</span>
           </div>
           <template v-else>
+            <SetupModelCapacity v-if="section === 'modelStrategy' && capacityTarget" :key="JSON.stringify(capacityTarget)"
+              v-bind="capacityTarget" initial-open hide-trigger
+              :disabled="saveAllPending || primaryMutationPending || modelStrategyRoutingBusy" />
             <SetupProviderPanel
               v-if="section === 'provider'"
               :panel="providerPanel"
@@ -210,21 +215,6 @@
         >{{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
       </div>
 
-      <footer class="settings-foot">
-        <span class="settings-foot__text">{{ t('settings.dialog.moreOptionsIn') }}</span>
-        <code class="settings-foot__path">{{ displayConfigPath }}</code>
-        <button
-          type="button"
-          class="settings-foot__copy"
-          :aria-label="t('settings.dialog.copyConfigPath')"
-          :title="t('settings.dialog.copyConfigPath')"
-          @click="copyDisplayPath"
-        >
-          <Icon name="copy" :size="13" />
-        </button>
-        <span class="settings-foot__sep" aria-hidden="true">&middot;</span>
-        <span class="settings-foot__text">{{ t('settings.dialog.applyLiveNote') }}</span>
-      </footer>
       </section>
       </Transition>
     </div>
@@ -235,9 +225,11 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
+import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
@@ -260,6 +252,12 @@ import '@/styles/settings-forms.css'
 
 const route = useRoute()
 const router = useRouter()
+const capacityTarget = computed(() => {
+  const provider = route.query.capacityProvider
+  const model = route.query.capacityModel
+  return typeof provider === 'string' && provider.trim() && provider.length <= 1024
+    && typeof model === 'string' && model.trim() && model.length <= 1024 ? { provider, model } : null
+})
 const { t } = useI18n()
 const { confirmChoice, confirmState } = useConfirm()
 
@@ -730,7 +728,7 @@ function onDocumentKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return
   // The confirm modal owns the keyboard while it is open; let it handle Escape
   // so a single keypress cannot both dismiss the prompt and re-open it.
-  if (confirmState.value) return
+  if (confirmState.value || hasOpenDialogLayer()) return
   if (event.key === 'Escape') {
     event.preventDefault()
     void requestClose()
@@ -1067,50 +1065,6 @@ onUnmounted(() => {
   flex: 1;
 }
 
-/* Footer */
-.settings-foot {
-  align-items: center;
-  border-top: 1px solid var(--border);
-  color: var(--text-dim);
-  display: flex;
-  flex-shrink: 0;
-  flex-wrap: wrap;
-  font-size: var(--fs-xs);
-  gap: var(--sp-2);
-  min-width: 0;
-  padding: var(--sp-2) var(--sp-4);
-}
-
-.settings-foot__path {
-  color: var(--text-muted);
-  flex: 1 1 240px;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.settings-foot__copy {
-  align-items: center;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  cursor: pointer;
-  display: inline-flex;
-  height: 24px;
-  justify-content: center;
-  width: 24px;
-}
-
-.settings-foot__copy:hover {
-  background: var(--bg-hover);
-  border-color: var(--border);
-  color: var(--text);
-}
-
 /* Mobile: full screen, horizontal section chips */
 @media (max-width: 768px) {
   .settings-overlay {
@@ -1160,24 +1114,6 @@ onUnmounted(() => {
 
   .settings-panel {
     padding: var(--sp-3);
-  }
-
-  .settings-foot {
-    align-items: flex-start;
-    gap: var(--sp-1) var(--sp-2);
-    padding-bottom: max(var(--sp-2), env(safe-area-inset-bottom));
-  }
-
-  .settings-foot__text:first-child {
-    display: none;
-  }
-
-  .settings-foot__path {
-    flex-basis: calc(100% - 32px);
-  }
-
-  .settings-foot__sep {
-    display: none;
   }
 }
 </style>

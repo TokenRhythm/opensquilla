@@ -2682,6 +2682,27 @@ class Agent:
                 error_type=type(exc).__name__,
             )
 
+    def _context_capacity_details(self) -> dict[str, Any] | None:
+        from opensquilla.provider.model_catalog import (
+            resolve_effective_context_window,
+            shared_catalog,
+        )
+
+        provider = str(self.config.provider_id or "").strip()
+        model = str(self.config.model_id or "").strip()
+        if not provider or not model:
+            return None
+        window, source = resolve_effective_context_window(
+            shared_catalog(), model, provider,
+            self.config.context_window_tokens_global_override,
+        )
+        # Only attach a model setting when its resolved window is the actual
+        # window that rejected this request. A wrapper's different physical
+        # member must not be misidentified as the outer model.
+        if window != self.config.context_window_tokens:
+            return None
+        return {"provider": provider, "model": model, "contextWindow": window, "source": source}
+
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
         if reason == "empty_summary_rejected":
@@ -2703,6 +2724,7 @@ class Agent:
             return ErrorEvent(
                 message=CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES[reason],
                 code="provider_request_too_large",
+                model_capacity=self._context_capacity_details(),
             )
         if reason in {
             "provider_native_overflow_after_admission",
@@ -2715,6 +2737,7 @@ class Agent:
                     "a narrower current request or a larger-context model."
                 ),
                 code="provider_request_too_large",
+                model_capacity=self._context_capacity_details(),
             )
         if reason == "provider_request_budget_exhausted":
             return ErrorEvent(
@@ -2724,6 +2747,7 @@ class Agent:
                     "tools, or choose a larger-context model."
                 ),
                 code="provider_request_too_large",
+                model_capacity=self._context_capacity_details(),
             )
         return ErrorEvent(
             message="Context overflow persists after compaction",

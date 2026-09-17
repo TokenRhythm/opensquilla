@@ -61,6 +61,19 @@ def test_normalized_error_payload_keys_are_frozen() -> None:
     assert set(normalized) == NORMALIZED_ERROR_KEYS
 
 
+def test_normalized_error_payload_preserves_explicit_model_capacity() -> None:
+    capacity = {
+        "provider": "custom",
+        "model": "synthetic-model",
+        "contextWindow": 8192,
+        "source": "default",
+    }
+    payload = {**_synthetic_error_payload(), "model_capacity": capacity}
+    normalized = _normalize_terminal_event_payload("session.event.error", payload)
+    assert set(normalized) == NORMALIZED_ERROR_KEYS | {"model_capacity"}
+    assert normalized["model_capacity"] == capacity
+
+
 def test_normalized_error_payload_message_carries_ref() -> None:
     normalized = _normalize_terminal_event_payload(
         "session.event.error", _synthetic_error_payload()

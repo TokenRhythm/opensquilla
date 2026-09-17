@@ -440,6 +440,7 @@ class ModelCatalog:
         # User-override layer for resolve_entry; keys are lowercased
         # "provider/model" or bare model ids (see set_user_overrides).
         self._user_overrides: dict[str, dict[str, Any]] = {}
+        self._capacity_endpoint_identities: dict[str, str] = {}
         # Provider-scoped live layer: boot-time ingest of a provider's own
         # public model listing (see provider/live_catalog.py). Keyed
         # provider -> lowercased model id -> validated entry fields.
@@ -1463,7 +1464,8 @@ class ModelCatalog:
         return self.resolve_max_tokens_with_source(model_id, user_override, provider)[0]
 
     def resolve_max_tokens_with_source(
-        self, model_id: str, user_override: int = 0, provider: str = ""
+        self, model_id: str, user_override: int = 0, provider: str = "",
+        *, capacity_only: bool = False,
     ) -> tuple[int, MaxTokensSource]:
         """Resolve max_tokens and name the layer that decided the value.
 
@@ -1495,6 +1497,10 @@ class ModelCatalog:
         source: MaxTokensSource
         if using_user_override:
             effective = user_override
+            if isinstance(override_max, int) and override_max > 0:
+                # A request/member output budget cannot enlarge an explicitly
+                # configured model capability. Smaller request limits survive.
+                effective = min(effective, override_max)
             source = "override"
         elif isinstance(override_max, int) and override_max > 0:
             # A [models.*] operator override is authoritative for budgeting;
@@ -1552,6 +1558,11 @@ class ModelCatalog:
                             declared_max_tokens=declared_max,
                             published_max_tokens=published_max,
                         )
+
+        if capacity_only:
+            # Model configuration displays a capability, not the request's
+            # output reservation. Keep the same selection and source chain.
+            return effective, source
 
         # Clamp to context window. Some provider catalogs report a model's
         # max_completion_tokens as almost the entire context window; using that

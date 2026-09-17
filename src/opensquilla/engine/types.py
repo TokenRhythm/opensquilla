@@ -277,6 +277,7 @@ class ErrorEvent:
     usage_call_index: int | None = None
     no_prior_provider_dispatch: bool | None = None
     replay_safe: bool | None = None
+    model_capacity: dict[str, Any] | None = None
 
 
 @dataclass

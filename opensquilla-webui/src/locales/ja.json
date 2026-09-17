@@ -729,6 +729,47 @@
     }
   },
   "setup": {
+    "capacity": {
+      "customOpenAI": "カスタム · OpenAI 互換",
+      "customAnthropic": "カスタム · Anthropic 互換",
+      "partialSaved": "保存済み：{saved}。未保存：{pending}。未保存の入力は保持されています。",
+      "providerPartialSaved": "プロバイダーは保存されました。モデル上限は保存されていません。入力は保持されています。",
+      "backToRouting": "スマートルーティングに戻る",
+      "editSharedEnsemble": "共有アンサンブルを編集",
+      "sharedEnsemble": "C3 とモデル融合はこの構成を共有します。",
+      "title": "モデル設定",
+      "forModel": "モデル設定 — {model}",
+      "unknown": "上限未確認",
+      "contextWindow": "コンテキストウィンドウ",
+      "maxOutputTokens": "最大出力長",
+      "scope": "このプロバイダーで同じモデルを使用するすべての場所に適用されます。",
+      "current": "現在 {value} トークン · {source}",
+      "source": {
+        "catalog": "モデルカタログ",
+        "default": "システムの既定値",
+        "config": "全体設定",
+        "override": "手動設定"
+      },
+      "autoValue": "自動（{value}）",
+      "autoHint": "空欄で自動値を使用します。変更するには正の整数を入力してください。",
+      "requestHint": "モデルの出力上限です。実際の応答は短くなる場合があります。",
+      "localHint": "ローカルモデルサーバーのコンテキスト設定と一致させてください。",
+      "serverControlled": "出力の長さはサーバーが制御します。",
+      "restore": "自動設定に戻す",
+      "positiveInteger": "正の整数を入力するか、空欄にして自動値を使用してください。",
+      "upgrade": "モデル上限を表示・編集するには Gateway を更新してください。既存のモデル設定は引き続き利用できます。",
+      "loadFailed": "モデル上限を読み込めませんでした。変更内容は保持されています。",
+      "retry": "再試行",
+      "draftHint": "完了後、設定ページの「変更を保存」で反映されます。",
+      "done": "完了",
+      "invalid": "保存する前にモデル上限の値を確認してください。",
+      "saved": "モデル上限を保存しました。",
+      "saveFailed": "モデル上限を保存できませんでした。未保存の入力は保持されています。",
+      "unknownHint": "モデル上限の一方または両方が未確認です。既定値が使用されています。ここで上限を設定できます。",
+      "automaticSource": "自動 · {source}",
+      "unsaved": "未保存",
+      "effective": "実際の上限：{value} トークン"
+    },
     "cli": {
       "advancedTitle": "詳細 · 内蔵 CLI",
       "hintBundled": "これらのコマンドはアプリ内蔵の CLI を使用します。ターミナルに貼り付けて実行できます。",
@@ -1179,7 +1220,7 @@
       "openrouterFixedDesc": "モデルサービスで {provider} を使用する場合、集約ルーティングは 4 つの提案モデルと 1 つの集約モデルを使います。",
       "openrouterFixedProposer": "提案モデル",
       "openrouterFixedAggregator": "集約モデル",
-      "credentialReady": "接続済み",
+      "credentialReady": "認証情報あり",
       "credentialNeeded": "{provider} の認証情報が必要",
       "credentialMissingEnv": "{envKey} が必要",
       "credentialUnknown": "認証情報は未確認",
@@ -1210,7 +1251,7 @@
       "aggregatorNote": "全ドラフトを集約して最終回答を生成。ツールを呼び出せる唯一のメンバー",
       "aggregatorSectionLabel": "集約モデル",
       "aggregatorSectionDesc": "最終回答を生成する集約モデルは 1 つだけです。編成内で最も強力なモデルを選んでください。",
-      "aggregatorInheritedNote": "集約モデル未指定 — 現在のチャットモデルがドラフトを集約します",
+      "aggregatorInheritedNote": "現在のモデルを使用",
       "proposerSectionLabel": "提案モデル",
       "proposerRoleLabel": "提案",
       "aggregatorRoleLabel": "集約",
@@ -1228,7 +1269,7 @@
       "replaceCandidateConfirm": "置き換え",
       "candidateDuplicate": "このモデルは提案モデルの一覧に既にあります。",
       "addProposer": "提案モデルを追加",
-      "chooseAggregator": "集約モデルを選択",
+      "chooseAggregator": "モデルを変更",
       "aggregatorPickerTitle": "集約モデルを選択",
       "aggregatorFromProposers": "既存の提案モデルから選択",
       "aggregatorOtherModel": "または別のモデルを選択",
@@ -1247,7 +1288,8 @@
       "proposerRetriesDesc": "再試行可能な失敗のみ。最初のリクエストは再試行に含みません。",
       "proposerRetriesOption": "最初のリクエスト後に最大 {count} 回再試行",
       "runtimeLimitsLabel": "制限時間",
-      "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理"
+      "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理",
+      "fallbackModelLabel": "フォールバックモデル"
     },
     "behavior": {
       "title": "セッションの動作",
@@ -1745,7 +1787,9 @@
       "dataMaintenanceAria": "データメンテナンスを開く",
       "runTraceLabel": "ログの実行トレースドロワー",
       "runTraceDesc": "ログ行を操作可能にし、ログビューで行ごとのノードステップ詳細ドロワーを開きます。",
-      "runTraceAria": "ログの実行トレースドロワー（再読み込み後に有効）"
+      "runTraceAria": "ログの実行トレースドロワー（再読み込み後に有効）",
+      "configFileLabel": "設定ファイル",
+      "configFileDesc": "その他のオプションは設定ファイルで変更できます。"
     },
     "privacy": {
       "statusDisabledByEnv": "環境設定により無効になっています。",

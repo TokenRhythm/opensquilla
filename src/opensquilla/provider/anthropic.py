@@ -1282,7 +1282,7 @@ class AnthropicProvider:
                 code="provider_internal",
             )
 
-    async def list_models(self) -> list[ModelInfo]:
+    async def list_models(self, *, raise_on_error: bool = False) -> list[ModelInfo]:
         """Build listing rows for this provider identity from the shared catalog.
 
         The catalog's canonical costs are USD per million tokens; the
@@ -1290,14 +1290,64 @@ class AnthropicProvider:
         renders per-1k), so entry costs are converted back (÷1000).
         Capability flags stay at ``ModelInfo`` defaults — the listing has
         only ever advertised identity, windows, and pricing. Native Anthropic
-        uses its built-in SKU list; compatibility endpoints receive an exact
-        registry list or the configured model from the selector.
+        uses its built-in SKU list. Explicit custom Anthropic endpoints read
+        their own model list, including declared capacity fields.
         """
+        if self.provider_id == "custom_anthropic":
+            # Only an explicit model-list call reads this endpoint. Capacity
+            # resolution itself is offline and never performs discovery.
+            from .model_capacity import custom_listing_capacity
+            from .protocol import ProviderModelListingResponseError
+
+            headers = {"anthropic-version": _ANTHROPIC_VERSION}
+            if self._api_key:
+                if self._auth_header_style == "bearer":
+                    headers["Authorization"] = f"Bearer {self._api_key}"
+                else:
+                    headers["x-api-key"] = self._api_key
+            try:
+                async with httpx.AsyncClient(
+                    timeout=15.0,
+                    trust_env=_trust_env(),
+                    proxy=self._proxy,
+                ) as client:
+                    response = await client.get(self._api_url("/v1/models"), headers=headers)
+                    response.raise_for_status()
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        raise ProviderModelListingResponseError(
+                            "Provider model catalog returned invalid JSON",
+                            status_code=response.status_code,
+                        ) from None
+                models = data.get("data") if isinstance(data, dict) else None
+                if not isinstance(models, list):
+                    raise ProviderModelListingResponseError(
+                        "Provider model catalog response must contain a model list",
+                        status_code=response.status_code,
+                    )
+                return [
+                    ModelInfo(
+                        provider=self.provider_id,
+                        model_id=row["id"],
+                        display_name=str(row.get("display_name") or row["id"]),
+                        context_window=custom_listing_capacity(row).get("context_window", 0),
+                        max_output_tokens=custom_listing_capacity(row).get("max_output_tokens", 0),
+                        metadata={"capacity": custom_listing_capacity(row)},
+                    )
+                    for row in models
+                    if isinstance(row, dict) and isinstance(row.get("id"), str)
+                ]
+            except (httpx.HTTPError, ValueError, TypeError, ProviderModelListingResponseError):
+                if raise_on_error:
+                    raise
+                # Some compatible servers implement messages but no model list.
+                # Preserve their configured model without inventing capacity
+                # metadata or treating it as a successful discovery result.
+                return [ModelInfo(provider=self.provider_id, model_id=self._model)]
         rows: list[ModelInfo] = []
         model_ids = (
-            _LISTING_MODEL_IDS
-            if self._listing_model_ids is None
-            else self._listing_model_ids
+            _LISTING_MODEL_IDS if self._listing_model_ids is None else self._listing_model_ids
         )
         for model_id in model_ids:
             entry = shared_catalog().resolve_entry(model_id, provider=self.provider_id)

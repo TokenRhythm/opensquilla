@@ -1958,6 +1958,7 @@ async def _emit_task_runtime_stream_events(
             raw_usage_call_index = event_dict.pop("usage_call_index", None)
             raw_no_prior_provider_dispatch = event_dict.pop("no_prior_provider_dispatch", None)
             raw_replay_safe = event_dict.pop("replay_safe", None)
+            model_capacity = event_dict.pop("model_capacity", None)
             # Keep the normalized provider classification internal to the
             # durable task outcome; it is not part of the public stream event.
             raw_failure_kind = event_dict.pop("failure_kind", None)
@@ -2004,6 +2005,9 @@ async def _emit_task_runtime_stream_events(
                     replay_safe=raw_replay_safe,
                 )
                 terminal_payload.update(replay_proof)
+            if model_capacity is not None:
+                event_dict["model_capacity"] = model_capacity
+                terminal_payload["model_capacity"] = model_capacity
             terminal_message = build_terminal_reply(terminal_payload)
             # Additive ref suffix joining the reply to its durable turn_errors
             # row; absent when no record was written (error_id empty).
@@ -2660,6 +2664,9 @@ def apply_model_catalog_overrides(catalog: ModelCatalog, config: GatewayConfig) 
     value rather than dropping it silently.
     """
     try:
+        from opensquilla.provider.model_capacity import sync_custom_capacity_endpoints
+
+        sync_custom_capacity_endpoints(catalog, config)
         catalog.set_user_overrides(model_override_entries(config))
     except ValueError as exc:
         log.warning("model_catalog.user_override_rejected", error=str(exc))

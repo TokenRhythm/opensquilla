@@ -11,6 +11,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type {
   RouterProviderRoles,
@@ -62,6 +63,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
   migrateLegacyEnsemble: []
+  editEnsemble: []
 }>()
 
 const THINKING_LEVELS = ['', 'off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh']
@@ -760,6 +762,10 @@ const allowsFloatingContent = computed(() => (
               } : undefined"
               @update="(val) => updateModelChoice(tier, val)"
             />
+            <SetupModelCapacity v-if="!tierEnsembleActive(tier)" :provider="tier.provider" :model="tier.model" :disabled="rowFieldsDisabled(tier)" />
+            <button v-else type="button" class="btn btn--icon btn--ghost" data-testid="tier-edit-shared-ensemble"
+              :title="t('setup.capacity.editSharedEnsemble')" :aria-label="t('setup.capacity.editSharedEnsemble')"
+              :disabled="disabled" @click="emit('editEnsemble')"><Icon name="gear" :size="14" /></button>
             <span
               v-if="compactSharedTierEnsembleActive(tier)"
               class="setup-tier-table__ensemble-details"
@@ -1023,6 +1029,9 @@ const allowsFloatingContent = computed(() => (
 }
 
 @media (max-width: 760px) {
+  .setup-tier-table--open {
+    overflow-x: auto;
+  }
   .setup-tier-table--without-provider .setup-tier-table__row {
     min-width: 460px;
   }

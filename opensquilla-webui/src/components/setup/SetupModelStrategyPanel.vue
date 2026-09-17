@@ -2,6 +2,8 @@
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
+import SetupModelIdentity from '@/components/setup/SetupModelIdentity.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import SetupTierTable from '@/components/setup/SetupTierTable.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -147,9 +149,32 @@ function requestRecommendedReset() {
   emit('resetRecommendedRouter')
 }
 
-const showRouterDetails = computed(() => props.panel.activeStrategy === 'router')
+const editingSharedEnsemble = ref(false)
+const sharedEnsembleBack = ref<HTMLButtonElement | null>(null)
+let sharedEnsembleInvoker: HTMLElement | null = null
+async function openSharedEnsemble() {
+  sharedEnsembleInvoker = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  editingSharedEnsemble.value = true
+  await nextTick()
+  sharedEnsembleBack.value?.focus()
+}
+async function closeSharedEnsemble() {
+  editingSharedEnsemble.value = false
+  await nextTick()
+  // The table is recreated on return, so use its stable action when needed.
+  const entry = sharedEnsembleInvoker?.isConnected ? sharedEnsembleInvoker : document.querySelector<HTMLElement>('[data-testid="tier-edit-shared-ensemble"]')
+  entry?.focus()
+}
+watch(() => props.panel.activeStrategy, () => { editingSharedEnsemble.value = false })
+const showRouterDetails = computed(() => props.panel.activeStrategy === 'router' && !editingSharedEnsemble.value)
 
 const fixedModelIsPrimaryStrategy = computed(() => props.panel.activeStrategy === 'single')
+const fallbackExpanded = ref(false)
+function onFallbackToggle(event: Event) {
+  fallbackExpanded.value = (event.target as HTMLDetailsElement).open
+  if (!fallbackExpanded.value) closeFixedProviderMenu()
+}
+watch(() => props.panel.activeStrategy, () => { fallbackExpanded.value = false })
 const routerEditingDisabled = computed(() => !props.panel.hasSavedProvider)
 const newCandidateProvider = ref('')
 const newCandidateModel = ref('')
@@ -764,7 +789,37 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
     </div>
 
     <template v-else>
-      <section v-if="panel.routingSummary" class="setup-model-strategy__saved-summary" data-testid="routing-saved-summary">
+      <section class="setup-model-strategy__mode" :aria-label="t('setup.modelStrategy.modeTitle')">
+        <div class="setup-model-strategy__cards" role="radiogroup" :aria-label="t('setup.modelStrategy.modeTitle')">
+          <label
+            v-for="card in panel.cards"
+            :key="card.id"
+            class="setup-model-strategy__card"
+            :class="{ 'is-active': card.enabled }"
+            :data-strategy-id="card.id"
+          >
+            <input
+              class="setup-model-strategy__card-input"
+              type="radio"
+              name="setup_model_strategy"
+              :value="card.id"
+              :checked="card.enabled"
+              :disabled="routingModeBusy === true"
+              @change="emit('updateStrategy', card.id)"
+            >
+            <span class="setup-model-strategy__card-heading">
+              <span class="setup-model-strategy__card-title">{{ t(card.titleKey) }}</span>
+              <span
+                v-if="card.badgeKey"
+                class="setup-model-strategy__card-badge"
+              >{{ t(card.badgeKey) }}</span>
+            </span>
+            <span class="setup-model-strategy__card-desc">{{ t(card.descKey) }}</span>
+          </label>
+        </div>
+      </section>
+
+      <section v-if="showRouterDetails && panel.routingSummary" class="setup-model-strategy__saved-summary" data-testid="routing-saved-summary">
         <div class="setup-model-strategy__saved-facts">
           <dl>
             <div>
@@ -797,40 +852,10 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           <p :id="resetHelpId">{{ panel.routingSummary.resetDisabledReason || t(panel.routingSummary.enabled ? 'setup.modelStrategy.resetKeepsMode' : 'setup.modelStrategy.resetKeepsOff') }}</p>
         </div>
       </section>
-      <section class="setup-model-strategy__mode" :aria-label="t('setup.modelStrategy.modeTitle')">
-        <div class="setup-model-strategy__cards" role="radiogroup" :aria-label="t('setup.modelStrategy.modeTitle')">
-          <label
-            v-for="card in panel.cards"
-            :key="card.id"
-            class="setup-model-strategy__card"
-            :class="{ 'is-active': card.enabled }"
-            :data-strategy-id="card.id"
-          >
-            <input
-              class="setup-model-strategy__card-input"
-              type="radio"
-              name="setup_model_strategy"
-              :value="card.id"
-              :checked="card.enabled"
-              :disabled="routingModeBusy === true"
-              @change="emit('updateStrategy', card.id)"
-            >
-            <span class="setup-model-strategy__card-heading">
-              <span class="setup-model-strategy__card-title">{{ t(card.titleKey) }}</span>
-              <span
-                v-if="card.badgeKey"
-                class="control-pill control-pill--info"
-              >{{ t(card.badgeKey) }}</span>
-            </span>
-            <span class="setup-model-strategy__card-desc">{{ t(card.descKey) }}</span>
-          </label>
-        </div>
-      </section>
-
-      <p v-if="panel.routingSummary?.crossProviderEnabled" class="setup-model-strategy__notice" data-testid="routing-cross-provider-enabled">
+      <p v-if="showRouterDetails && panel.routingSummary?.crossProviderEnabled" class="setup-model-strategy__hint" data-testid="routing-cross-provider-enabled">
         {{ t('setup.modelStrategy.crossProviderNotice') }}
       </p>
-      <p v-else-if="panel.routingSummary?.hasForeignTierProviders" class="setup-model-strategy__notice" data-testid="routing-provider-mismatch">
+      <p v-else-if="showRouterDetails && panel.routingSummary?.hasForeignTierProviders" class="setup-model-strategy__notice" data-testid="routing-provider-mismatch">
         {{ t('setup.modelStrategy.crossProviderDisabledMismatch') }}
       </p>
 
@@ -885,6 +910,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           :effective-ensemble-selection-mode="panel.ensemble.selectionMode"
           @update-tier-field="(name, key, value) => emit('updateTierField', name, key, value)"
           @migrate-legacy-ensemble="emit('migrateEnsembleLegacy')"
+          @edit-ensemble="openSharedEnsemble"
         />
         <p class="control-section__desc" data-testid="router-image-capability-hint">
           {{ t('setup.router.imageCapabilityAutomatic') }}
@@ -924,11 +950,15 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
       </section>
 
       <section
-        v-else-if="panel.activeStrategy === 'ensemble'"
+        v-else-if="panel.activeStrategy === 'ensemble' || editingSharedEnsemble"
         class="control-section setup-model-strategy__detail setup-model-strategy__ensemble"
         data-testid="ensemble-panel"
       >
-        <p class="setup-model-strategy__notice" data-testid="ensemble-candidate-image-hint">
+        <div v-if="editingSharedEnsemble" class="control-row">
+          <button ref="sharedEnsembleBack" type="button" class="btn btn--ghost" @click="closeSharedEnsemble">{{ t('setup.capacity.backToRouting') }}</button>
+          <span class="control-row__desc">{{ t('setup.capacity.sharedEnsemble') }}</span>
+        </div>
+        <p class="setup-model-strategy__hint" data-testid="ensemble-candidate-image-hint">
           {{ t('setup.modelStrategy.candidateModelHint') }}
         </p>
         <div
@@ -1010,11 +1040,14 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 class="setup-model-strategy__candidate"
                 role="listitem"
               >
-                <span class="setup-model-strategy__candidate-label">{{ candidateLabel(candidate) }}</span>
+                <SetupModelIdentity :provider="candidate.provider" :provider-label="displayProvider(candidate.provider)" :model="candidate.model" />
+                <SetupModelCapacity :provider="candidate.provider" :model="candidate.model" :disabled="routingModeBusy" />
                 <span
                   class="setup-model-strategy__credential"
-                  :class="{ 'is-missing': candidate.credential && !candidate.credential.available }"
+                  :class="{ 'is-missing': candidate.credential && !candidate.credential.available, 'is-ready': candidate.credential?.available }"
+                  :title="credentialLabel(candidate)"
                 >
+                  <span v-if="candidate.credential?.available" class="setup-model-strategy__credential-dot" aria-hidden="true"></span>
                   {{ credentialLabel(candidate) }}
                 </span>
               </div>
@@ -1034,11 +1067,14 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 class="setup-model-strategy__candidate"
                 role="listitem"
               >
-                <span class="setup-model-strategy__candidate-label">{{ candidateLabel(candidate) }}</span>
+                <SetupModelIdentity :provider="candidate.provider" :provider-label="displayProvider(candidate.provider)" :model="candidate.model" />
+                <SetupModelCapacity :provider="candidate.provider" :model="candidate.model" :disabled="routingModeBusy" />
                 <span
                   class="setup-model-strategy__credential"
-                  :class="{ 'is-missing': candidate.credential && !candidate.credential.available }"
+                  :class="{ 'is-missing': candidate.credential && !candidate.credential.available, 'is-ready': candidate.credential?.available }"
+                  :title="credentialLabel(candidate)"
                 >
+                  <span v-if="candidate.credential?.available" class="setup-model-strategy__credential-dot" aria-hidden="true"></span>
                   {{ credentialLabel(candidate) }}
                 </span>
               </div>
@@ -1047,12 +1083,8 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 class="setup-model-strategy__candidate setup-model-strategy__candidate--inherited"
                 role="listitem"
               >
-                <span class="setup-model-strategy__candidate-main">
-                  <span class="setup-model-strategy__candidate-label">
-                    {{ displayProvider(customLineup.inheritedAggregatorProvider) }} · {{ customLineup.inheritedAggregatorModel || currentModel }}
-                  </span>
-                  <span class="setup-model-strategy__candidate-source">{{ t('setup.modelStrategy.aggregatorInheritedNote') }}</span>
-                </span>
+                <SetupModelIdentity :provider="customLineup.inheritedAggregatorProvider" :provider-label="displayProvider(customLineup.inheritedAggregatorProvider)" :model="customLineup.inheritedAggregatorModel || currentModel" :note="t('setup.modelStrategy.aggregatorInheritedNote')" />
+                <SetupModelCapacity :provider="customLineup.inheritedAggregatorProvider" :model="customLineup.inheritedAggregatorModel || currentModel" :disabled="routingModeBusy" />
               </div>
             </div>
           </section>
@@ -1092,10 +1124,12 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 class="setup-model-strategy__candidate"
                 role="listitem"
               >
-                <span class="setup-model-strategy__candidate-label">{{ candidateLabel(candidate) }}</span>
+                <SetupModelIdentity :provider="candidate.provider" :provider-label="displayProvider(candidate.provider)" :model="candidate.model" />
+                <SetupModelCapacity :provider="candidate.provider" :model="candidate.model" :disabled="routingModeBusy" />
                 <span
                   class="setup-model-strategy__credential"
-                  :class="{ 'is-missing': candidate.credential && !candidate.credential.available }"
+                  :class="{ 'is-missing': candidate.credential && !candidate.credential.available, 'is-ready': candidate.credential?.available }"
+                  :title="credentialLabel(candidate)"
                 >
                   <span
                     v-if="candidate.credential?.available"
@@ -1115,12 +1149,12 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             </header>
             <div class="setup-model-strategy__candidate-list setup-model-strategy__candidate-list--aggregator" role="list">
               <div class="setup-model-strategy__candidate" role="listitem">
-                <span class="setup-model-strategy__candidate-label">
-                  {{ candidateLabel(panel.ensemble.fixedProfile.aggregator) }}
-                </span>
+                <SetupModelIdentity :provider="panel.ensemble.fixedProfile.aggregator.provider" :provider-label="displayProvider(panel.ensemble.fixedProfile.aggregator.provider)" :model="panel.ensemble.fixedProfile.aggregator.model" />
+                <SetupModelCapacity :provider="panel.ensemble.fixedProfile.aggregator.provider" :model="panel.ensemble.fixedProfile.aggregator.model" :disabled="routingModeBusy" />
                 <span
                   class="setup-model-strategy__credential"
-                  :class="{ 'is-missing': panel.ensemble.fixedProfile.aggregator.credential && !panel.ensemble.fixedProfile.aggregator.credential.available }"
+                  :class="{ 'is-missing': panel.ensemble.fixedProfile.aggregator.credential && !panel.ensemble.fixedProfile.aggregator.credential.available, 'is-ready': panel.ensemble.fixedProfile.aggregator.credential?.available }"
+                  :title="credentialLabel(panel.ensemble.fixedProfile.aggregator)"
                 >
                   <span
                     v-if="panel.ensemble.fixedProfile.aggregator.credential?.available"
@@ -1172,10 +1206,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 class="setup-model-strategy__candidate"
                 role="listitem"
               >
-                <span class="setup-model-strategy__candidate-label">{{ candidateLabel(candidate) }}</span>
+                <SetupModelIdentity :provider="candidate.provider" :provider-label="displayProvider(candidate.provider)" :model="candidate.model" />
                 <span
                   class="setup-model-strategy__credential"
-                  :class="{ 'is-missing': candidate.credential && !candidate.credential.available }"
+                  :class="{ 'is-missing': candidate.credential && !candidate.credential.available, 'is-ready': candidate.credential?.available }"
+                  :title="credentialLabel(candidate)"
                 >
                   <span
                     v-if="candidate.credential?.available"
@@ -1189,6 +1224,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                     <Icon name="moreHorizontal" :size="17" aria-hidden="true" />
                   </summary>
                   <div class="setup-model-strategy__candidate-menu">
+                    <SetupModelCapacity menu :provider="candidate.provider" :model="candidate.model" :disabled="routingModeBusy" />
                     <button
                       type="button"
                       data-testid="ensemble-replace-proposer"
@@ -1375,7 +1411,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
               </p>
               <p
                 v-if="customLineup.diversityWarning"
-                class="setup-model-strategy__notice"
+                class="setup-model-strategy__hint"
                 data-testid="ensemble-diversity-warn"
               >
                 {{ t('setup.modelStrategy.diversityHint') }}
@@ -1396,10 +1432,12 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 role="listitem"
                 data-testid="ensemble-custom-aggregator"
               >
-                <span class="setup-model-strategy__candidate-label">{{ candidateLabel(customLineup.aggregator) }}</span>
+                <SetupModelIdentity :provider="customLineup.aggregator.provider" :provider-label="displayProvider(customLineup.aggregator.provider)" :model="customLineup.aggregator.model" />
+                <SetupModelCapacity :provider="customLineup.aggregator.provider" :model="customLineup.aggregator.model" :disabled="routingModeBusy" />
                 <span
                   class="setup-model-strategy__credential"
-                  :class="{ 'is-missing': customLineup.aggregator.credential && !customLineup.aggregator.credential.available }"
+                  :class="{ 'is-missing': customLineup.aggregator.credential && !customLineup.aggregator.credential.available, 'is-ready': customLineup.aggregator.credential?.available }"
+                  :title="credentialLabel(customLineup.aggregator)"
                 >
                   <span
                     v-if="customLineup.aggregator.credential?.available"
@@ -1423,12 +1461,8 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 role="listitem"
                 data-testid="ensemble-custom-aggregator-inherited"
               >
-                <span class="setup-model-strategy__candidate-main">
-                  <span class="setup-model-strategy__candidate-label">
-                    {{ displayProvider(customLineup.inheritedAggregatorProvider) }} · {{ customLineup.inheritedAggregatorModel || currentModel }}
-                  </span>
-                  <span class="setup-model-strategy__candidate-source">{{ t('setup.modelStrategy.aggregatorInheritedNote') }}</span>
-                </span>
+                <SetupModelIdentity :provider="customLineup.inheritedAggregatorProvider" :provider-label="displayProvider(customLineup.inheritedAggregatorProvider)" :model="customLineup.inheritedAggregatorModel || currentModel" :note="t('setup.modelStrategy.aggregatorInheritedNote')" />
+                <SetupModelCapacity :provider="customLineup.inheritedAggregatorProvider" :model="customLineup.inheritedAggregatorModel || currentModel" :disabled="routingModeBusy" />
                 <button
                   type="button"
                   class="setup-model-strategy__replace-aggregator"
@@ -1621,120 +1655,132 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
         </details>
       </section>
 
-      <section
+      <component
+        :is="fixedModelIsPrimaryStrategy ? 'section' : 'details'"
         class="control-section setup-model-strategy__detail"
         :class="{ 'setup-model-strategy__detail--secondary': !fixedModelIsPrimaryStrategy }"
         data-testid="setup-model-strategy-fixed-section"
+        :open="!fixedModelIsPrimaryStrategy && fallbackExpanded"
+        @toggle="onFallbackToggle"
       >
-        <div v-if="fixedModelIsPrimaryStrategy" class="control-section__head">
-          <h4 class="control-section__title">
-            {{ t('setup.modelStrategy.singleTitle') }}
-          </h4>
-          <p class="control-section__desc">
-            {{ t('setup.modelStrategy.singleDependency') }}
+        <summary v-if="!fixedModelIsPrimaryStrategy" class="setup-model-strategy__fallback-summary">
+          <span class="setup-model-strategy__fallback-label">{{ t('setup.modelStrategy.fallbackModelLabel') }}</span>
+          <span class="setup-model-strategy__fallback-target" :title="`${panel.single.providerLabel} · ${panel.single.model}`">{{ displayProvider(panel.single.providerId) }} · {{ panel.single.model }}</span>
+          <Icon name="chevronDown" :size="14" class="setup-model-strategy__fallback-chevron" aria-hidden="true" />
+        </summary>
+        <div class="control-section setup-model-strategy__fixed-fields">
+          <div v-if="fixedModelIsPrimaryStrategy" class="control-section__head">
+            <h4 class="control-section__title">
+              {{ t('setup.modelStrategy.singleTitle') }}
+            </h4>
+            <p class="control-section__desc">
+              {{ t('setup.modelStrategy.singleDependency') }}
+            </p>
+          </div>
+          <div class="setup-model-strategy__single-provider">
+            <span
+              id="setup-model-strategy-fixed-provider-label"
+              class="setup-model-strategy__single-provider-label"
+            >
+              {{ t('setup.modelStrategy.singleProviderLabel') }}
+            </span>
+            <span
+              v-if="fixedProviderOptions.length > 1"
+              ref="fixedProviderControlRef"
+              class="setup-model-strategy__single-provider-control"
+              :class="{ 'is-open': fixedProviderMenuOpen }"
+              @focusout="onFixedProviderControlFocusout"
+            >
+              <button
+                ref="fixedProviderTriggerRef"
+                type="button"
+                class="control-input setup-model-strategy__single-provider-select"
+                role="combobox"
+                aria-haspopup="listbox"
+                aria-controls="setup-model-strategy-fixed-provider-listbox"
+                aria-labelledby="setup-model-strategy-fixed-provider-label"
+                :aria-expanded="fixedProviderMenuOpen ? 'true' : 'false'"
+                :aria-activedescendant="fixedProviderActiveOptionId"
+                data-testid="setup-model-strategy-fixed-provider-trigger"
+                @click="toggleFixedProviderMenu"
+                @keydown="onFixedProviderTriggerKeydown"
+              >
+                <span class="setup-model-strategy__single-provider-value">
+                  {{ selectedFixedProviderOption?.label || panel.single.providerLabel }}
+                </span>
+              </button>
+              <Icon
+                class="setup-model-strategy__single-provider-chevron"
+                name="chevronDown"
+                :size="14"
+                aria-hidden="true"
+              />
+              <Teleport to="body">
+                <Transition name="fixed-provider-menu">
+                  <div
+                    v-if="fixedProviderMenuOpen"
+                    id="setup-model-strategy-fixed-provider-listbox"
+                    class="setup-model-strategy__single-provider-menu"
+                    role="listbox"
+                    :aria-labelledby="'setup-model-strategy-fixed-provider-label'"
+                    :style="fixedProviderMenuStyle"
+                  >
+                    <button
+                      v-for="(option, index) in fixedProviderOptions"
+                      :id="`setup-model-strategy-fixed-provider-option-${index}`"
+                      :key="option.providerId"
+                      type="button"
+                      tabindex="-1"
+                      class="setup-model-strategy__single-provider-option"
+                      :class="{
+                        'is-active': index === fixedProviderActiveIndex,
+                        'is-selected': option.providerId === panel.single.providerId,
+                      }"
+                      role="option"
+                      :aria-selected="option.providerId === panel.single.providerId ? 'true' : 'false'"
+                      :disabled="option.disabled"
+                      @mousedown.prevent
+                      @mouseenter="fixedProviderActiveIndex = index"
+                      @click="chooseFixedProviderOption(option)"
+                    >
+                      <span>{{ option.label }}</span>
+                      <Icon
+                        v-if="option.providerId === panel.single.providerId"
+                        class="setup-model-strategy__single-provider-check"
+                        name="check"
+                        :size="14"
+                        aria-hidden="true"
+                      />
+                    </button>
+                  </div>
+                </Transition>
+              </Teleport>
+            </span>
+            <strong v-else>{{ panel.single.providerLabel }}</strong>
+          </div>
+          <SetupModelCombobox
+            class="setup-model-strategy__fixed-model-row"
+            data-testid="setup-model-strategy-fixed-model"
+            :field="{
+              name: 'model_strategy_fixed_model',
+              label: t('setup.modelStrategy.singleModelLabel'),
+              description: t('setup.modelStrategy.singleModelDesc'),
+              descriptionPresentation: 'info',
+              placeholder: t('setup.modelStrategy.singleModelPlaceholder'),
+              required: true,
+            }"
+            :value="panel.single.model"
+            :models="panel.single.models"
+            :model-source="panel.single.modelSource"
+            @update="emit('updateFixedModel', $event)"
+          >
+            <template #actions><SetupModelCapacity :provider="panel.single.providerId" :model="panel.single.model" :disabled="routingModeBusy" /></template>
+          </SetupModelCombobox>
+          <p v-if="fixedModelIsPrimaryStrategy" class="setup-model-strategy__muted">
+            {{ t('setup.modelStrategy.singleDesc') }}
           </p>
         </div>
-        <div class="setup-model-strategy__single-provider">
-          <span
-            id="setup-model-strategy-fixed-provider-label"
-            class="setup-model-strategy__single-provider-label"
-          >
-            {{ t('setup.modelStrategy.singleProviderLabel') }}
-          </span>
-          <span
-            v-if="fixedProviderOptions.length > 1"
-            ref="fixedProviderControlRef"
-            class="setup-model-strategy__single-provider-control"
-            :class="{ 'is-open': fixedProviderMenuOpen }"
-            @focusout="onFixedProviderControlFocusout"
-          >
-            <button
-              ref="fixedProviderTriggerRef"
-              type="button"
-              class="control-input setup-model-strategy__single-provider-select"
-              role="combobox"
-              aria-haspopup="listbox"
-              aria-controls="setup-model-strategy-fixed-provider-listbox"
-              aria-labelledby="setup-model-strategy-fixed-provider-label"
-              :aria-expanded="fixedProviderMenuOpen ? 'true' : 'false'"
-              :aria-activedescendant="fixedProviderActiveOptionId"
-              data-testid="setup-model-strategy-fixed-provider-trigger"
-              @click="toggleFixedProviderMenu"
-              @keydown="onFixedProviderTriggerKeydown"
-            >
-              <span class="setup-model-strategy__single-provider-value">
-                {{ selectedFixedProviderOption?.label || panel.single.providerLabel }}
-              </span>
-            </button>
-            <Icon
-              class="setup-model-strategy__single-provider-chevron"
-              name="chevronDown"
-              :size="14"
-              aria-hidden="true"
-            />
-            <Teleport to="body">
-              <Transition name="fixed-provider-menu">
-                <div
-                  v-if="fixedProviderMenuOpen"
-                  id="setup-model-strategy-fixed-provider-listbox"
-                  class="setup-model-strategy__single-provider-menu"
-                  role="listbox"
-                  :aria-labelledby="'setup-model-strategy-fixed-provider-label'"
-                  :style="fixedProviderMenuStyle"
-                >
-                  <button
-                    v-for="(option, index) in fixedProviderOptions"
-                    :id="`setup-model-strategy-fixed-provider-option-${index}`"
-                    :key="option.providerId"
-                    type="button"
-                    tabindex="-1"
-                    class="setup-model-strategy__single-provider-option"
-                    :class="{
-                      'is-active': index === fixedProviderActiveIndex,
-                      'is-selected': option.providerId === panel.single.providerId,
-                    }"
-                    role="option"
-                    :aria-selected="option.providerId === panel.single.providerId ? 'true' : 'false'"
-                    :disabled="option.disabled"
-                    @mousedown.prevent
-                    @mouseenter="fixedProviderActiveIndex = index"
-                    @click="chooseFixedProviderOption(option)"
-                  >
-                    <span>{{ option.label }}</span>
-                    <Icon
-                      v-if="option.providerId === panel.single.providerId"
-                      class="setup-model-strategy__single-provider-check"
-                      name="check"
-                      :size="14"
-                      aria-hidden="true"
-                    />
-                  </button>
-                </div>
-              </Transition>
-            </Teleport>
-          </span>
-          <strong v-else>{{ panel.single.providerLabel }}</strong>
-        </div>
-        <SetupModelCombobox
-          class="setup-model-strategy__fixed-model-row"
-          data-testid="setup-model-strategy-fixed-model"
-          :field="{
-            name: 'model_strategy_fixed_model',
-            label: t('setup.modelStrategy.singleModelLabel'),
-            description: t('setup.modelStrategy.singleModelDesc'),
-            descriptionPresentation: 'info',
-            placeholder: t('setup.modelStrategy.singleModelPlaceholder'),
-            required: true,
-          }"
-          :value="panel.single.model"
-          :models="panel.single.models"
-          :model-source="panel.single.modelSource"
-          @update="emit('updateFixedModel', $event)"
-        />
-        <p v-if="fixedModelIsPrimaryStrategy" class="setup-model-strategy__muted">
-          {{ t('setup.modelStrategy.singleDesc') }}
-        </p>
-      </section>
+      </component>
     </template>
   </section>
 </template>
@@ -1796,6 +1842,8 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
 .setup-model-strategy__page-head .control-section__desc {
   flex: none;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .setup-model-strategy__page-meta {
@@ -1947,6 +1995,20 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
 .setup-model-strategy__detail.setup-model-strategy__detail--secondary {
   margin-top: var(--sp-2);
+}
+
+.setup-model-strategy__detail--secondary { border-top: 1px solid var(--border); }
+.setup-model-strategy__fallback-summary { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) 0; list-style: none; cursor: pointer; min-width: 0; }
+.setup-model-strategy__fallback-summary::-webkit-details-marker { display: none; }
+.setup-model-strategy__fallback-label { color: var(--text); font-size: var(--fs-sm); flex-shrink: 0; }
+.setup-model-strategy__fallback-target { color: var(--text-muted); font-size: var(--fs-xs); min-width: 0; flex: 1; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+.setup-model-strategy__fallback-chevron { color: var(--text-muted); flex-shrink: 0; }
+.setup-model-strategy__detail--secondary[open] > summary .setup-model-strategy__fallback-chevron { transform: rotate(180deg); }
+.setup-model-strategy__fallback-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.setup-model-strategy__fixed-fields { min-width: 0; }
+@container model-strategy-panel (max-width: 520px) {
+  .setup-model-strategy__fallback-summary { flex-wrap: wrap; }
+  .setup-model-strategy__fallback-target { flex-basis: calc(100% - 120px); }
 }
 
 .setup-model-strategy__single-provider {
@@ -2231,20 +2293,8 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
 }
 
-.setup-model-strategy__candidate-main {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
 
-.setup-model-strategy__candidate-label {
-  overflow-wrap: anywhere;
-}
 
-.setup-model-strategy__candidate-source {
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-}
 
 .setup-model-strategy__credential {
   color: var(--text-muted);
@@ -2533,9 +2583,9 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
 .setup-model-strategy__step-number {
   align-items: center;
-  background: var(--accent);
+  background: var(--bg-hover);
   border-radius: var(--radius-full);
-  color: var(--accent-foreground);
+  color: var(--text-muted);
   display: inline-flex;
   flex: 0 0 auto;
   font-size: var(--fs-xs);
@@ -2609,19 +2659,13 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   display: block;
 }
 
-.setup-model-strategy__candidate-list--aggregator {
-  background: color-mix(in srgb, var(--accent) 6%, var(--bg-surface-2));
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
-  box-shadow: inset 3px 0 0 var(--accent);
-}
-
 .setup-model-strategy__candidate {
   background: transparent;
   border: 0;
   border-bottom: 1px solid var(--border);
   border-radius: 0;
   display: flex;
-  gap: var(--sp-3);
+  gap: var(--sp-2);
   min-height: 2.85rem;
   padding: 8px var(--sp-3);
   position: relative;
@@ -2635,16 +2679,6 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   border-style: none;
 }
 
-.setup-model-strategy__candidate-label,
-.setup-model-strategy__candidate-main {
-  min-width: 0;
-}
-
-.setup-model-strategy__candidate-label {
-  flex: 1 1 auto;
-  font-size: var(--fs-sm);
-  line-height: 1.35;
-}
 
 .setup-model-strategy__credential {
   align-items: center;
@@ -2728,7 +2762,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__add-trigger {
   align-items: center;
   background: transparent;
-  border: 1px dashed var(--border-strong);
+  border: 1px solid transparent;
   border-radius: var(--radius-md);
   color: var(--text-muted);
   cursor: pointer;
@@ -2738,7 +2772,8 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   gap: var(--sp-2);
   justify-content: center;
   min-height: 2.3rem;
-  width: 100%;
+  justify-self: start;
+  padding: 0 var(--sp-2);
 }
 
 .setup-model-strategy__add-trigger:not(:disabled):hover {
@@ -2809,7 +2844,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__replace-aggregator {
   background: transparent;
   border: 0;
-  color: var(--accent-hover);
+  color: var(--text-muted);
   cursor: pointer;
   flex: 0 0 auto;
   font: inherit;
@@ -2861,12 +2896,34 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
 .setup-model-strategy__facts {
   align-items: center;
-  background: var(--bg-surface-2);
-  border: 1px solid transparent;
+  background: transparent;
+  border: 0;
   display: flex;
   gap: var(--sp-2);
-  min-height: 2.5rem;
-  padding: 8px var(--sp-3);
+  margin: 0;
+  padding: var(--sp-1) 0;
+}
+
+.setup-model-strategy__hint {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.setup-model-strategy__card-badge {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.setup-model-strategy__credential.is-ready { font-size: 0; margin-left: 0; }
+
+
+@container model-strategy-panel (max-width: 520px) {
+  .setup-model-strategy__candidate { flex-wrap: wrap; justify-content: flex-end; }
+  .setup-model-strategy__candidate > :deep(.setup-model-identity) { flex-basis: 100%; }
 }
 
 .setup-model-strategy__runtime {

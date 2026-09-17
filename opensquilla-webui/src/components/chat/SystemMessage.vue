@@ -3,7 +3,11 @@
   <div v-if="message.displayRole === 'error'" class="msg-error" role="alert">
     <p v-if="errorText" class="msg-error__text">{{ errorText }}</p>
     <p v-if="hasPartialAnswer" class="msg-error__note">{{ t('chat.partialFailureNote') }}</p>
-    <div v-if="diagnosticId || showResume || showRetry || timeIso" class="msg-error__actions">
+    <div v-if="diagnosticId || showModelCapacity || showResume || showRetry || timeIso" class="msg-error__actions">
+      <RouterLink v-if="showModelCapacity" class="msg-error__action msg-error__capacity"
+        :to="{ path: '/settings/modelStrategy', query: message.modelCapacity ? {
+          capacityProvider: message.modelCapacity.provider, capacityModel: message.modelCapacity.model,
+        } : {} }">{{ t('setup.capacity.title') }}</RouterLink>
       <button
         v-if="diagnosticId"
         type="button"
@@ -49,6 +53,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { absoluteTime, fullTime, isoTime } from '@/utils/messageTime'
@@ -80,6 +85,7 @@ const emit = defineEmits<{
 }>()
 const resolving = ref(false)
 const retryResolving = ref(false)
+const showModelCapacity = computed(() => ['provider_request_too_large', 'provider_request_budget_exhausted'].includes(props.message.errorCode || ''))
 const copied = ref(false)
 const copyFailed = ref(false)
 const diagnosticId = computed(() => props.message.turnId && props.message.turnId === props.message.turnOutcome?.turnId

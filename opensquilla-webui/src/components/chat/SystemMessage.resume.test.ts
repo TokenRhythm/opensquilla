@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
@@ -42,6 +43,10 @@ async function mountMsg(
     retryAvailable,
   })
   app.use(i18n)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:pathMatch(.*)*', component: { render: () => null } }] })
+  app.use(router)
+  await router.push('/')
+  await router.isReady()
   app.mount(el)
   await nextTick()
   return { app, el }
@@ -53,6 +58,36 @@ beforeEach(() => {
 })
 
 describe('SystemMessage sandbox resume', () => {
+  it('links a capacity failure to the exact provider and punctuation-containing model without retrying', async () => {
+    const onRetry = vi.fn()
+    const target = { provider: 'custom_anthropic', model: 'example.vendor/model.v1:latest', contextWindow: 8192, source: 'default' as const }
+    const { app, el } = await mountMsg(errorMessage({ errorCode: 'provider_request_too_large', modelCapacity: target }), undefined, onRetry, true)
+    const href = el.querySelector<HTMLAnchorElement>('.msg-error__capacity')?.getAttribute('href')
+    const url = new URL(href!, 'https://capacity.invalid')
+    expect(url.pathname).toBe('/settings/modelStrategy')
+    expect(url.searchParams.get('capacityProvider')).toBe(target.provider)
+    expect(url.searchParams.get('capacityModel')).toBe(target.model)
+    expect(el.querySelector('button')).toBeNull()
+    expect(onRetry).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('preserves capacity guidance alongside a diagnostic action without provider replay', async () => {
+    const onRetry = vi.fn()
+    const text = 'The request exceeds the system default of 8,192 tokens.'
+    const { app, el } = await mountMsg(errorMessage({
+      text, errorCode: 'provider_request_budget_exhausted', turnId: 'capacity-turn',
+      modelCapacity: { provider: 'custom', model: 'example/model.v1:latest', contextWindow: 8192, source: 'default' },
+      turnOutcome: { turnId: 'capacity-turn', status: 'failed', failureKind: 'context_overflow', errorId: 'abcdef01', retryable: true },
+    }), undefined, onRetry, true)
+    expect(el.querySelector('.msg-error__text')?.textContent).toBe(text)
+    expect(el.querySelector('.msg-error__capacity')).not.toBeNull()
+    expect(el.querySelector('.msg-error__copy')).not.toBeNull()
+    expect(el.querySelector('.msg-error__resume')).toBeNull()
+    expect(onRetry).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
   it('keeps lifecycle timeout text ahead of a preserved provider classification', async () => {
     const { app, el } = await mountMsg(errorMessage({
       text: 'The task timed out before it could finish.', errorCode: '429', turnId: 't',
