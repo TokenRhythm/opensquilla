@@ -1641,9 +1641,11 @@ async def test_durable_meta_control_does_not_claim_active_goal(
             },
             stack.context,
         )
-        await stack.wait_until_running()
-
         assert response.ok is True
+        # Real activation persists running/transcript state before entering
+        # the handler. Allow shared-runner SQLite setup time before checking
+        # goal ownership.
+        await asyncio.wait_for(stack.handler_started.wait(), timeout=10.0)
         accepted_control = await stack.storage.get_meta_control_intent(
             session_key=SESSION_KEY,
             control_kind=control_kind,

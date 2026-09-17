@@ -1508,6 +1508,7 @@
     "tests/test_tools/test_shell_background_seatbelt.py": 0.01,
     "tests/test_tools/test_shell_managed_toolchains.py": 0.11,
     "tests/test_tools/test_shell_masked_pipeline.py": 0.01,
+    "tests/test_tools/test_shell_native_argv.py": 0.01,
     "tests/test_tools/test_shell_policy_windows.py": 0.024,
     "tests/test_tools/test_shell_process_isolation.py": 2.888,
     "tests/test_tools/test_shell_self_kill_policy.py": 0.065,

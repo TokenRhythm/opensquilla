@@ -1,5 +1,5 @@
 import type { Ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { isNavigationFailure, NavigationFailureType, useRoute, useRouter } from 'vue-router'
 import {
   recentDraftSessionKey,
   recoverableDraftSessionKey,
@@ -170,6 +170,36 @@ export function useChatSessionRoute(
     navigation.catch(() => {})
   }
 
+  /** Change only this draft's project, including its reload recovery scope. */
+  async function replaceDraftProject(projectId: string | null): Promise<boolean> {
+    if (!isDraftRoute() || !sessionKey.value) return false
+    const key = sessionKey.value
+    const agentId = draftAgentId()
+    const project = projectId || ''
+    const state = { draftSessionKey: key, draftAgentId: agentId, draftProjectId: project }
+    try {
+      const failure = await router.replace({
+        path: DRAFT_CHAT_PATH,
+        query: { agent: agentId, ...(project ? { project } : {}) },
+        state,
+      })
+      const duplicate = isNavigationFailure(failure, NavigationFailureType.duplicated)
+      if (
+        (failure && !duplicate)
+        || sessionKey.value !== key
+        || !isDraftRoute()
+        || draftAgentId() !== agentId
+        || readProjectFromUrl() !== project
+      ) return false
+      // Vue Router skips history state on a duplicate navigation. The route
+      // already matches, but an untouched draft may not have a recovery scope.
+      if (duplicate) window.history.replaceState({ ...window.history.state, ...state }, '')
+      return true
+    } catch {
+      return false
+    }
+  }
+
   function createSessionKey(agentId?: string): string {
     const agent = agentId || agentIdFromSessionKey(sessionKey.value)
     freshDraftSessionKey = inGuestNamespace(
@@ -232,6 +262,7 @@ export function useChatSessionRoute(
     rebindFreshDraftSession,
     draftAgentId,
     goToDraft,
+    replaceDraftProject,
     hasLegacyNewChatQuery,
     isDraftRoute,
     persistSession,

@@ -1,5 +1,11 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-race-a'
@@ -23,10 +29,12 @@ async function readSessionDiag(page: Page): Promise<Array<{ source?: string; to?
 test('late chat.send response cannot navigate away from the current session', async ({ page }) => {
   let delayedSend: { id: string; sendResponse: (payload: unknown) => void } | null = null
 
+  await page.route('**/api/**', route => route.fulfill({ json: {} }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ pending: [], mode: 'prompt', allowPatterns: [], denyPatterns: [] }),
   }))
 
   await page.routeWebSocket(/\/ws$/, ws => {
@@ -48,9 +56,10 @@ test('late chat.send response cannot navigate away from the current session', as
           return
         }
 
+        const sessionKey = String(frame.params?.key || frame.params?.sessionKey || '')
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: [], has_more: false },
+          'chat.history': chatHistoryPayload(),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
@@ -88,12 +97,10 @@ test('late chat.send response cannot navigate away from the current session', as
             ts: 1_800_000_000,
             has_more: false,
           },
-          'sessions.messages.subscribe': {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
+          'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
           'usage.status': { sessions: [] },
         }
 

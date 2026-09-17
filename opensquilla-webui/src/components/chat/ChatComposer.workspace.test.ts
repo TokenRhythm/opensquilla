@@ -119,6 +119,32 @@ describe('ChatComposer project draft', () => {
     app.unmount()
   })
 
+  it.each([false, true])('disables project changes during a pending binding (selected=%s)', async selected => {
+    const chooseProject = vi.fn()
+    const closeProject = vi.fn()
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(ChatComposer, composerProps({
+      ...(!selected ? { projectWorkspace: null } : {}),
+      canCloseProject: selected,
+      projectBindingBusy: true,
+      onChooseProject: chooseProject,
+      onCloseProject: closeProject,
+    }))
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    const action = host.querySelector<HTMLButtonElement>(selected
+      ? '.chat-project-chip button'
+      : '.chat-project-choose')!
+    expect(action.disabled).toBe(true)
+    action.click()
+    expect(chooseProject).not.toHaveBeenCalled()
+    expect(closeProject).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
   it('announces an unavailable active project and disables sending', async () => {
     const host = document.createElement('div')
     document.body.appendChild(host)

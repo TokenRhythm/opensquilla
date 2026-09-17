@@ -651,6 +651,7 @@
       :voice-ready="voiceReady"
       :project-workspace="activeWorkspace"
       :project-workspace-status="activeWorkspaceStatus"
+      :project-binding-busy="projectBindingBusy || sessionHasActiveWork || goalBusy || planModeBusy || modelRoutingSettingsBusy"
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
@@ -710,7 +711,7 @@
       :enabled="gatewayAccess.canChooseProject"
       :session-key="sessionKey"
       :initial-path="activeWorkspace?.path"
-      @close="projectPickerOpen = false"
+      @close="cancelDraftProjectChoice"
       @choose="chooseProjectPath"
     />
     </div>
@@ -1276,6 +1277,15 @@ const {
   sendBlockedReason: activeWorkspaceSendBlockedReason,
 } = activeProjectWorkspace
 const projectPickerOpen = ref(false)
+const projectBindingBusy = ref(false)
+interface DraftProjectChoice {
+  sessionKey: string
+  agentId: string
+  projectId: string
+  connectionEpoch: number
+  target?: ActiveProjectWorkspaceSnapshot | null
+}
+let draftProjectChoice: DraftProjectChoice | null = null
 let activeProjectValidationController: AbortController | null = null
 
 function cancelActiveProjectValidation() {
@@ -2101,6 +2111,7 @@ const {
   rebindFreshDraftSession,
   draftAgentId,
   goToDraft,
+  replaceDraftProject,
   hasLegacyNewChatQuery,
   isDraftRoute,
   persistSession,
@@ -2866,7 +2877,8 @@ const deliveryBlockedReason = computed<string | null>(() => (
   sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
 ))
 const effectiveSendBlockedReason = computed<string | null>(() => (
-  deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
+  (projectBindingBusy.value ? t('workspaces.activeProjectResolving') : null)
+  || deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
 ))
 const provenSessionDelivery = ref<{
   key: string; identity: string; withoutProject: boolean
@@ -6546,44 +6558,114 @@ function persistDraftHistoryState() {
   } catch { /* ignore */ }
 }
 
+function canChangeDraftProject(): boolean {
+  return isDraftRoute()
+    && pendingSessionIntent.value === 'new_chat'
+    && gatewayAccess.canChooseProject
+    && !sessionHasActiveWork.value
+    && !goalBusy.value
+    && !planModeBusy.value
+    && !modelRoutingSettingsBusy.value
+    && pendingQueue.value.length === 0
+}
+
+function cancelDraftProjectChoice() {
+  draftProjectChoice = null
+  projectPickerOpen.value = false
+  projectBindingBusy.value = false
+}
+
+function draftProjectChoiceIsCurrent(choice: DraftProjectChoice): boolean {
+  return draftProjectChoice === choice
+    && !chatViewDisposed
+    && canChangeDraftProject()
+    && sessionKey.value === choice.sessionKey
+    && draftAgentId() === choice.agentId
+    && gatewayAccess.subscriptionEpoch === choice.connectionEpoch
+    && (readProjectFromUrl() === choice.projectId
+      || (choice.target !== undefined && readProjectFromUrl() === (choice.target?.id || '')))
+}
+
+function beginDraftProjectChoice(): DraftProjectChoice | null {
+  if (projectBindingBusy.value || !canChangeDraftProject()) return null
+  const choice: DraftProjectChoice = {
+    sessionKey: sessionKey.value,
+    agentId: draftAgentId(),
+    projectId: readProjectFromUrl(),
+    connectionEpoch: gatewayAccess.subscriptionEpoch,
+  }
+  draftProjectChoice = choice
+  projectBindingBusy.value = true
+  // Choosing a directory is an explicit draft edit, not a fresh task or an
+  // invitation to recover another provisional Meta draft.
+  markProvisionalDraftUsed()
+  cancelActiveProjectValidation()
+  return choice
+}
+
+function applyDraftProjectChoice(choice: DraftProjectChoice) {
+  if (choice.target) activeProjectWorkspace.beginProjectDraft(choice.target)
+  else activeProjectWorkspace.clearDraft()
+  persistDraftHistoryState()
+}
+
+async function commitDraftProjectChoice(
+  choice: DraftProjectChoice,
+  workspace: ActiveProjectWorkspaceSnapshot | null,
+) {
+  if (!draftProjectChoiceIsCurrent(choice)) return
+  choice.target = workspace
+  const committed = await replaceDraftProject(workspace?.id || null)
+  if (!draftProjectChoiceIsCurrent(choice)) return
+  if (!committed) throw new Error('Project navigation did not complete.')
+  // Until navigation succeeds, the original route still owns its hydration.
+  // Cancelling the picker or a failed choice must let that draft finish loading.
+  draftProjectHydration.invalidate()
+  applyDraftProjectChoice(choice)
+  await nextTick()
+}
+
 async function chooseProjectPath(path: string) {
   projectPickerOpen.value = false
-  if (!gatewayAccess.canChooseProject) return
-  const trusted = await confirm({
-    title: t('workspaces.trustTitle'),
-    body: t('workspaces.trustBody', { path }),
-    primaryLabel: t('workspaces.trustConfirm'),
-    primaryClass: 'btn--primary',
-  })
-  if (!trusted) return
+  const choice = draftProjectChoice
+  if (!choice || !draftProjectChoiceIsCurrent(choice)) return
   try {
-    const workspace = await projectWorkspaces.openWorkspace(path)
-    if (!workspace) return
-    freshTaskDraft.requestFreshTask(draftAgentId(), workspace.id)
-    goToDraft({
-      agentId: draftAgentId(),
-      projectId: workspace.id,
-      replace: true,
+    const trusted = await confirm({
+      title: t('workspaces.trustTitle'),
+      body: t('workspaces.trustBody', { path }),
+      primaryLabel: t('workspaces.trustConfirm'),
+      primaryClass: 'btn--primary',
     })
+    if (!trusted || !draftProjectChoiceIsCurrent(choice)) return
+    const workspace = await projectWorkspaces.openWorkspace(path)
+    if (!workspace || !draftProjectChoiceIsCurrent(choice)) return
+    await commitDraftProjectChoice(choice, activeSnapshot(workspace))
   } catch (cause) {
+    if (!draftProjectChoiceIsCurrent(choice)) return
     const detail = cause instanceof Error ? cause.message : String(cause)
     pushToast(t('workspaces.openFailed', { error: detail }), { tone: 'warn' })
+  } finally {
+    if (draftProjectChoice === choice) cancelDraftProjectChoice()
   }
 }
 
 function openProjectPicker() {
-  if (!gatewayAccess.canChooseProject) return
+  if (!beginDraftProjectChoice()) return
   projectPickerOpen.value = true
 }
 
-function closeProjectDraft() {
-  activeProjectWorkspace.clearDraft()
-  freshTaskDraft.requestFreshTask(draftAgentId())
-  goToDraft({
-    agentId: draftAgentId(),
-    projectId: null,
-    replace: true,
-  })
+async function closeProjectDraft() {
+  const choice = beginDraftProjectChoice()
+  if (!choice) return
+  try {
+    await commitDraftProjectChoice(choice, null)
+  } catch (cause) {
+    if (!draftProjectChoiceIsCurrent(choice)) return
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    pushToast(t('workspaces.openFailed', { error: detail }), { tone: 'warn' })
+  } finally {
+    if (draftProjectChoice === choice) cancelDraftProjectChoice()
+  }
 }
 
 async function validateActiveProjectBeforeSend(): Promise<string | null> {
@@ -6979,6 +7061,7 @@ watch(
 )
 
 onUnmounted(() => {
+  cancelDraftProjectChoice()
   window.removeEventListener('pointerup', onThreadPointerEnd)
   window.removeEventListener('pointercancel', onThreadPointerEnd)
   chatRouteHeaderRegistration.release()
@@ -7115,6 +7198,12 @@ watch(
 
 // Entering the draft route resets to a clean draft for the requested agent.
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
+  if (
+    draftProjectChoice
+    && draftProjectChoice.target !== undefined
+    && draftProjectChoiceIsCurrent(draftProjectChoice)
+    && readProjectFromUrl() === (draftProjectChoice.target?.id || '')
+  ) return
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
@@ -7149,6 +7238,7 @@ watch(() => pendingQueue.value.length, (count) => {
 // draft URL already on screen (for example, clicking the same project pencil).
 watch(freshTaskDraft.request, request => {
   if (!request) return
+  cancelDraftProjectChoice()
   draftProjectHydration.invalidate()
   landingPrefilled.value = false
   // Clear before changing sessionKey. The draft watcher then observes an empty
@@ -7168,6 +7258,27 @@ watch(freshTaskDraft.request, request => {
   startDraftSession(request.agentId)
   if (isDesktopViewport.value) composerRef.value?.focusTextarea()
 })
+
+watch(
+  () => [
+    sessionKey.value,
+    route.fullPath,
+    gatewayAccess.subscriptionEpoch,
+    gatewayAccess.canChooseProject,
+    pendingSessionIntent.value,
+    sessionHasActiveWork.value,
+    goalBusy.value,
+    planModeBusy.value,
+    modelRoutingSettingsBusy.value,
+    pendingQueue.value.length,
+  ],
+  () => {
+    if (draftProjectChoice && !draftProjectChoiceIsCurrent(draftProjectChoice)) {
+      cancelDraftProjectChoice()
+    }
+  },
+  { flush: 'sync' },
+)
 
 watch(projectWorkspaces.workspaces, workspaces => {
   if (!gatewayAccess.canManageProjectWorkspaces) return

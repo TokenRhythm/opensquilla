@@ -2068,10 +2068,98 @@
           "label": "Debounce window (s)"
         },
         "transport_name": {
+          "label": "Connection method",
           "choices": {
             "polling": "Polling",
             "webhook": "Webhook"
           }
+        },
+        "access_token": {
+          "label": "Access token"
+        },
+        "agent_id_int": {
+          "label": "Agent id (int)"
+        },
+        "app_password": {
+          "label": "App password"
+        },
+        "app_token": {
+          "label": "App-level token (xapp-...)"
+        },
+        "application_id": {
+          "label": "Application id"
+        },
+        "cool_app_code": {
+          "label": "Cool App Code"
+        },
+        "corp_id": {
+          "label": "Corp id"
+        },
+        "default_channel_id": {
+          "label": "Default channel id"
+        },
+        "device_id": {
+          "label": "Device id"
+        },
+        "domain": {
+          "label": "Domain"
+        },
+        "drop_pending_updates": {
+          "label": "Drop pending updates"
+        },
+        "encoding_aes_key": {
+          "label": "Encoding AES key"
+        },
+        "encrypt_key": {
+          "label": "Encrypt key"
+        },
+        "encryption": {
+          "label": "Encryption"
+        },
+        "gateway_url": {
+          "label": "Gateway URL"
+        },
+        "intents": {
+          "label": "Intents bitmask"
+        },
+        "password": {
+          "label": "Password"
+        },
+        "poll_idle_sleep_s": {
+          "label": "Poll idle sleep (s)"
+        },
+        "poll_limit": {
+          "label": "Poll limit"
+        },
+        "poll_timeout_s": {
+          "label": "Polling timeout (s)"
+        },
+        "reply_in_thread": {
+          "label": "Reply in thread"
+        },
+        "robot_code": {
+          "label": "Robot Code"
+        },
+        "slack_channel_id": {
+          "label": "Default channel id"
+        },
+        "token": {
+          "label": "Bot token (xoxb-...)"
+        },
+        "verification_token": {
+          "label": "Verification token"
+        },
+        "webhook_path": {
+          "label": "Webhook path"
+        },
+        "webhook_secret_token": {
+          "label": "Webhook secret token"
+        },
+        "webhook_url": {
+          "label": "Webhook URL (webhook only)"
+        },
+        "websocket_url": {
+          "label": "WebSocket URL"
         }
       },
       "groups": {
@@ -2507,6 +2595,13 @@
       "enable": "Enable",
       "disable": "Disable",
       "notReported": "Not reported",
+      "transport": {
+        "polling": "Polling",
+        "webhook": "Webhook",
+        "websocket": "WebSocket",
+        "http_sync": "HTTP sync",
+        "mixed": "Multiple connection methods"
+      },
       "tabs": {
         "overview": "Overview",
         "pairings": "Members",

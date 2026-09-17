@@ -8,6 +8,7 @@
     "tests/test_engine/test_request_execution_identity.py",
     "tests/test_gateway/test_session_model_routing_rpc.py",
     "tests/test_tools/test_execution_status.py",
+    "tests/test_tools/test_shell_native_argv.py",
     "tests/test_provider_ensemble.py"
   ],
   "baseline_suites": [
@@ -310,6 +311,7 @@
         "src/opensquilla/engine/**",
         "src/opensquilla/provider/**",
         "src/opensquilla/tools/**",
+        "src/opensquilla/process_tree.py",
         "src/opensquilla/gateway/**",
         "src/opensquilla/router_control.py",
         "src/opensquilla/persistence/**",
@@ -321,6 +323,7 @@
         "tests/test_engine/test_request_execution_identity.py",
         "tests/test_gateway/test_session_model_routing_rpc.py",
         "tests/test_tools/test_execution_status.py",
+        "tests/test_tools/test_shell_native_argv.py",
         "tests/test_provider_ensemble.py"
       ]
     },

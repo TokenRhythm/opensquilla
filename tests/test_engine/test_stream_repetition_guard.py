@@ -577,15 +577,20 @@ async def test_outer_wrapper_task_deadline_propagates_once_to_provider() -> None
     upstream = _LifecycleIterator(emit_first=False)
     guarded = guard_provider_text_stream(upstream)
     agent = _deadline_agent(iteration_timeout=0.01)
+    # Keep the initial budget positive even if a loaded runner deschedules this
+    # test before the first pull. asyncio.wait still exercises the real timeout
+    # and cancellation; expiring before the lazy guard starts tests another path.
+    deadline_clock: Any = SimpleNamespace(time=lambda: 0.0)
 
     with pytest.raises(TimeoutError, match="total timeout"):
         async for _ in agent._stream_provider_events_with_deadline(
             guarded,
-            loop=asyncio.get_running_loop(),
-            total_deadline=asyncio.get_running_loop().time() + 0.01,
+            loop=deadline_clock,
+            total_deadline=0.01,
         ):
             pass
 
+    assert upstream.blocked.is_set()
     assert upstream.close_calls == 1
 
 

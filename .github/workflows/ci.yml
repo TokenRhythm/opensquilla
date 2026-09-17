@@ -1283,6 +1283,15 @@ jobs:
           }
           throw "No verified native Git Bash found. Candidates: $($candidates -join '; ')"
 
+      - name: Verify PowerShell 7 for native shell contracts
+        if: ${{ matrix.shard == 'core' }}
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion.Major -lt 7) {
+            throw "Native shell contracts require PowerShell 7"
+          }
+          Get-Command pwsh -CommandType Application -ErrorAction Stop | Out-Null
+
       - name: Set up Bun
         if: ${{ matrix.shard == 'core' }}
         uses: oven-sh/setup-bun@v2
@@ -1491,6 +1500,7 @@ jobs:
             tests/test_engine/test_request_execution_identity.py
             tests/test_gateway/test_session_model_routing_rpc.py
             tests/test_tools/test_execution_status.py
+            tests/test_tools/test_shell_native_argv.py
             tests/test_provider_ensemble.py
             -q
             --durations=50

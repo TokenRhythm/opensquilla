@@ -108,7 +108,9 @@ def test_windows_noop_uses_direct_powershell(monkeypatch) -> None:
         "Bypass",
         "-Command",
     )
-    assert command in argv[-1]
+    # Python candidates carry the original source as a PowerShell literal for
+    # native AST parsing; doubled apostrophes preserve its exact contents.
+    assert command.replace("'", "''") in argv[-1]
     assert "exit $global:LASTEXITCODE" in argv[-1]
     assert "if (-not $?) { exit 1 }" in argv[-1]
     assert "Invoke-OpenSquillaPythonProcess" not in argv[-1]

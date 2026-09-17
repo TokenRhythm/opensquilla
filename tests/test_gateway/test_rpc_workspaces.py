@@ -199,6 +199,78 @@ async def test_validated_workspace_returns_canonical_guard(
     )
 
 
+async def test_open_workspace_preserves_decomposed_unicode_path(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    project = tmp_path / "Cafe\u0301"
+    project.mkdir()
+
+    opened = await _handle_workspaces_open(
+        {"path": str(project), "trusted": True}, ctx,
+    )
+
+    assert opened["workspace"]["available"] is True
+    assert opened["workspace"]["path"] == str(project.resolve())
+    resolved = await resolve_validated_project_workspace(storage, opened["workspace"]["id"])
+    assert Path(resolved.canonical_path).samefile(project)
+
+
+async def test_unicode_workspace_reopen_preserves_existing_binding_after_restart(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    composed = tmp_path / "Caf\u00e9"
+    decomposed = tmp_path / "Cafe\u0301"
+    composed.mkdir()
+    decomposed.mkdir(exist_ok=True)
+    if composed.samefile(decomposed):
+        pytest.skip("filesystem treats Unicode normalization variants as the same directory")
+
+    # Seed the path/key spelling written by older versions. Its original
+    # selection cannot be reconstructed, so opening NFD must not rebind it.
+    old_path = str(composed.resolve())
+    old = await storage.create_or_restore_project_workspace(
+        path=old_path,
+        path_key=os.path.normcase(old_path).replace("\\", "/"),
+        display_name=decomposed.name,
+        trusted_at=1,
+    )
+    old_session = SessionNode(
+        session_key="agent:main:webchat:old-unicode-project",
+        workspace_id=old.workspace_id,
+    )
+    await storage.upsert_session(old_session)
+
+    opened = await _handle_workspaces_open(
+        {"path": str(decomposed), "trusted": True}, ctx,
+    )
+    new_id = opened["workspace"]["id"]
+    assert new_id != old.workspace_id
+    assert opened["workspace"]["path"] == str(decomposed.resolve())
+    await storage.close()
+    await storage.connect()
+
+    reopened = await _handle_workspaces_open(
+        {"path": str(decomposed), "trusted": True}, ctx,
+    )
+    assert reopened["workspace"]["id"] == new_id
+    old_reopened = await _handle_workspaces_open(
+        {"path": str(composed), "trusted": True}, ctx,
+    )
+    assert old_reopened["workspace"]["id"] == old.workspace_id
+    assert await storage.get_project_workspace(old.workspace_id) == old
+    retained = await storage.get_session(old_session.session_key)
+    assert retained is not None
+    assert retained.session_id == old_session.session_id
+    assert retained.workspace_id == old.workspace_id
+    assert (await resolve_validated_project_workspace(storage, new_id)).canonical_path == str(
+        decomposed.resolve()
+    )
+
+
 @pytest.mark.asyncio
 async def test_validated_workspace_rejects_not_found(
     workspace_ctx: tuple[RpcContext, SessionStorage],

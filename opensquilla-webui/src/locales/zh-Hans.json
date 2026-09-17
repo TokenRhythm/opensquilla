@@ -2067,10 +2067,98 @@
           "label": "去抖窗口（秒）"
         },
         "transport_name": {
+          "label": "连接方式",
           "choices": {
             "polling": "轮询",
             "webhook": "Webhook（回调）"
           }
+        },
+        "access_token": {
+          "label": "访问令牌"
+        },
+        "agent_id_int": {
+          "label": "Agent id（整数）"
+        },
+        "app_password": {
+          "label": "应用密码"
+        },
+        "app_token": {
+          "label": "应用级令牌（xapp-...）"
+        },
+        "application_id": {
+          "label": "应用 ID"
+        },
+        "cool_app_code": {
+          "label": "酷应用 Code"
+        },
+        "corp_id": {
+          "label": "企业 ID"
+        },
+        "default_channel_id": {
+          "label": "默认频道 ID"
+        },
+        "device_id": {
+          "label": "设备 ID"
+        },
+        "domain": {
+          "label": "域名"
+        },
+        "drop_pending_updates": {
+          "label": "丢弃待处理更新"
+        },
+        "encoding_aes_key": {
+          "label": "Encoding AES 密钥"
+        },
+        "encrypt_key": {
+          "label": "加密密钥"
+        },
+        "encryption": {
+          "label": "加密方式"
+        },
+        "gateway_url": {
+          "label": "网关地址"
+        },
+        "intents": {
+          "label": "Intents 位掩码"
+        },
+        "password": {
+          "label": "密码"
+        },
+        "poll_idle_sleep_s": {
+          "label": "轮询空闲等待（秒）"
+        },
+        "poll_limit": {
+          "label": "单次轮询条数"
+        },
+        "poll_timeout_s": {
+          "label": "轮询超时（秒）"
+        },
+        "reply_in_thread": {
+          "label": "以话题回复"
+        },
+        "robot_code": {
+          "label": "机器人 Code"
+        },
+        "slack_channel_id": {
+          "label": "默认频道 ID"
+        },
+        "token": {
+          "label": "机器人令牌（xoxb-...）"
+        },
+        "verification_token": {
+          "label": "验证令牌"
+        },
+        "webhook_path": {
+          "label": "Webhook 路径"
+        },
+        "webhook_secret_token": {
+          "label": "Webhook 密钥令牌"
+        },
+        "webhook_url": {
+          "label": "Webhook URL（仅回调模式）"
+        },
+        "websocket_url": {
+          "label": "WebSocket 地址"
         }
       },
       "groups": {
@@ -2506,6 +2594,13 @@
       "enable": "启用",
       "disable": "禁用",
       "notReported": "未报告",
+      "transport": {
+        "polling": "轮询",
+        "webhook": "Webhook（回调）",
+        "websocket": "WebSocket 连接",
+        "http_sync": "HTTP 同步",
+        "mixed": "支持多种连接方式"
+      },
       "tabs": {
         "overview": "概览",
         "pairings": "成员",

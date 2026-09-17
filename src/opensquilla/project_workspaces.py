@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -54,7 +53,8 @@ class ValidatedProjectWorkspace:
 
 
 def _normalized_path(candidate: Path) -> str:
-    return unicodedata.normalize("NFC", str(candidate))
+    # Unicode normalization can name a different directory on the host filesystem.
+    return str(candidate)
 
 
 def project_path_key(value: str | Path, *, strict: bool = False) -> str:

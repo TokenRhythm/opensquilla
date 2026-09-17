@@ -1985,10 +1985,98 @@
           "label": "デバウンス期間（秒）"
         },
         "transport_name": {
+          "label": "接続方式",
           "choices": {
             "polling": "ポーリング",
             "webhook": "Webhook"
           }
+        },
+        "access_token": {
+          "label": "アクセストークン"
+        },
+        "agent_id_int": {
+          "label": "エージェント ID（整数）"
+        },
+        "app_password": {
+          "label": "アプリパスワード"
+        },
+        "app_token": {
+          "label": "アプリレベルトークン（xapp-...）"
+        },
+        "application_id": {
+          "label": "アプリケーション ID"
+        },
+        "cool_app_code": {
+          "label": "Cool App Code"
+        },
+        "corp_id": {
+          "label": "企業 ID"
+        },
+        "default_channel_id": {
+          "label": "デフォルトチャンネル ID"
+        },
+        "device_id": {
+          "label": "デバイス ID"
+        },
+        "domain": {
+          "label": "ドメイン"
+        },
+        "drop_pending_updates": {
+          "label": "未処理のアップデートを破棄"
+        },
+        "encoding_aes_key": {
+          "label": "Encoding AES キー"
+        },
+        "encrypt_key": {
+          "label": "暗号化キー"
+        },
+        "encryption": {
+          "label": "暗号化方式"
+        },
+        "gateway_url": {
+          "label": "ゲートウェイ URL"
+        },
+        "intents": {
+          "label": "Intents ビットマスク"
+        },
+        "password": {
+          "label": "パスワード"
+        },
+        "poll_idle_sleep_s": {
+          "label": "ポーリングアイドル待機（秒）"
+        },
+        "poll_limit": {
+          "label": "1回のポーリング取得上限"
+        },
+        "poll_timeout_s": {
+          "label": "ポーリングタイムアウト（秒）"
+        },
+        "reply_in_thread": {
+          "label": "スレッドで返信"
+        },
+        "robot_code": {
+          "label": "ロボットコード"
+        },
+        "slack_channel_id": {
+          "label": "デフォルトチャンネル ID"
+        },
+        "token": {
+          "label": "ボットトークン（xoxb-...）"
+        },
+        "verification_token": {
+          "label": "検証トークン"
+        },
+        "webhook_path": {
+          "label": "Webhook パス"
+        },
+        "webhook_secret_token": {
+          "label": "Webhook シークレットトークン"
+        },
+        "webhook_url": {
+          "label": "Webhook URL（Webhook のみ）"
+        },
+        "websocket_url": {
+          "label": "WebSocket URL"
         }
       },
       "groups": {
@@ -2424,6 +2512,13 @@
       "enable": "有効化",
       "disable": "無効化",
       "notReported": "報告なし",
+      "transport": {
+        "polling": "ポーリング",
+        "webhook": "Webhook",
+        "websocket": "WebSocket",
+        "http_sync": "HTTP同期",
+        "mixed": "複数の接続方式"
+      },
       "tabs": {
         "overview": "概要",
         "pairings": "メンバー",

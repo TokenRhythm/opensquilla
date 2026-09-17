@@ -1985,10 +1985,98 @@
           "label": "Fenêtre de regroupement (s)"
         },
         "transport_name": {
+          "label": "Mode de connexion",
           "choices": {
             "polling": "Interrogation (polling)",
             "webhook": "Webhook"
           }
+        },
+        "access_token": {
+          "label": "Jeton d'accès"
+        },
+        "agent_id_int": {
+          "label": "ID d'agent (entier)"
+        },
+        "app_password": {
+          "label": "Mot de passe d'application"
+        },
+        "app_token": {
+          "label": "Jeton au niveau de l'app (xapp-...)"
+        },
+        "application_id": {
+          "label": "ID d'application"
+        },
+        "cool_app_code": {
+          "label": "Cool App Code"
+        },
+        "corp_id": {
+          "label": "ID d'entreprise"
+        },
+        "default_channel_id": {
+          "label": "ID de canal par défaut"
+        },
+        "device_id": {
+          "label": "ID d'appareil"
+        },
+        "domain": {
+          "label": "Domaine"
+        },
+        "drop_pending_updates": {
+          "label": "Ignorer les mises à jour en attente"
+        },
+        "encoding_aes_key": {
+          "label": "Clé AES d'encodage"
+        },
+        "encrypt_key": {
+          "label": "Clé de chiffrement"
+        },
+        "encryption": {
+          "label": "Chiffrement"
+        },
+        "gateway_url": {
+          "label": "URL de la passerelle"
+        },
+        "intents": {
+          "label": "Masque de bits d'intents"
+        },
+        "password": {
+          "label": "Mot de passe"
+        },
+        "poll_idle_sleep_s": {
+          "label": "Veille d'inactivité du polling (s)"
+        },
+        "poll_limit": {
+          "label": "Limite de polling"
+        },
+        "poll_timeout_s": {
+          "label": "Délai d'expiration du polling (s)"
+        },
+        "reply_in_thread": {
+          "label": "Répondre en fil"
+        },
+        "robot_code": {
+          "label": "Code du robot"
+        },
+        "slack_channel_id": {
+          "label": "ID de canal par défaut"
+        },
+        "token": {
+          "label": "Jeton de bot (xoxb-...)"
+        },
+        "verification_token": {
+          "label": "Jeton de vérification"
+        },
+        "webhook_path": {
+          "label": "Chemin du webhook"
+        },
+        "webhook_secret_token": {
+          "label": "Jeton secret du webhook"
+        },
+        "webhook_url": {
+          "label": "URL de webhook (webhook uniquement)"
+        },
+        "websocket_url": {
+          "label": "URL WebSocket"
         }
       },
       "groups": {
@@ -2424,6 +2512,13 @@
       "enable": "Activer",
       "disable": "Désactiver",
       "notReported": "Non communiqué",
+      "transport": {
+        "polling": "Interrogation (polling)",
+        "webhook": "Webhook",
+        "websocket": "WebSocket",
+        "http_sync": "Synchro HTTP",
+        "mixed": "Plusieurs modes de connexion"
+      },
       "tabs": {
         "overview": "Vue d'ensemble",
         "pairings": "Membres",

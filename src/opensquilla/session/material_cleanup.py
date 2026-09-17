@@ -29,6 +29,7 @@ from pathlib import Path
 
 import structlog
 
+from opensquilla.paths import native_io_path
 from opensquilla.session.models import ProjectWorkspace, SessionNode
 
 log = structlog.get_logger(__name__)
@@ -140,5 +141,23 @@ def rmtree_scoped(target: Path, *, expected_name: str) -> None:
     if not is_safe_segment(expected_name) or target.name != expected_name:
         log.warning("session_material_cleanup.unsafe_target", target=str(target))
         return
-    if target.is_dir() and not target.is_symlink():
-        shutil.rmtree(target, ignore_errors=True)
+
+    def _ignore_disappeared(_function: object, _path: str, error: BaseException) -> None:
+        # Python 3.12 aborts rmtree when an enumerated child disappears unless
+        # its per-item handler ignores that race and lets traversal continue.
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    try:
+        io_target = native_io_path(target)
+        if io_target.is_dir() and not io_target.is_symlink():
+            shutil.rmtree(io_target, onexc=_ignore_disappeared)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        # Keep later material stores eligible for cleanup after a local failure.
+        log.warning(
+            "session_material_cleanup.remove_failed",
+            target=str(target),
+            error_type=type(exc).__name__,
+        )

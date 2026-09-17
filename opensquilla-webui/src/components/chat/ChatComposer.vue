@@ -214,6 +214,7 @@
               <button
                 v-if="canCloseProject"
                 type="button"
+                :disabled="projectBindingBusy"
                 :aria-label="t('workspaces.closeProjectDraft')"
                 :title="t('workspaces.closeProjectDraft')"
                 @click="emit('closeProject')"
@@ -230,6 +231,7 @@
               "
               type="button"
               class="chat-project-choose"
+              :disabled="projectBindingBusy"
               @click="emit('chooseProject')"
             >
               <Icon name="folder" :size="15" />
@@ -525,6 +527,7 @@ const props = withDefaults(defineProps<{
   voiceReady: boolean
   projectWorkspace?: { id: string; name: string; path: string } | null
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
+  projectBindingBusy?: boolean
   projectStatusMessage?: string
   promptAnnotations?: readonly PromptAnnotation[]
   canCloseProject?: boolean

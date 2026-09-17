@@ -363,13 +363,15 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
         after_frames=finish_after_save,
     )
 
+    # Allow handshake/setup scheduling overhead in this integration watchdog;
+    # probe cancellation, stream cleanup, and save progress keep their 1s waits.
     await asyncio.wait_for(
         handle_ws_connection(
             ws,
             GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
             dispatcher=dispatcher,
         ),
-        timeout=2,
+        timeout=10,
     )
 
     responses = {frame["id"]: frame for frame in ws.responses()}

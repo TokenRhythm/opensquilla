@@ -199,12 +199,15 @@ async function installGateway(page: Page, holdFirstSend = false, serverQueue = f
   }
 }
 
-async function openChat(page: Page) {
+async function openChat(page: Page, expectedState: 'idle' | 'running' = 'idle') {
   const root = process.env.OPENSQUILLA_E2E_NATIVE_DESKTOP === '1'
     ? 'opensquilla-app://desktop/' : '/control/'
   await page.goto(`${root}chat?session=${encodeURIComponent(SESSION)}`)
   await expect(page.locator('.conn-pill.connected')).toBeVisible()
-  await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+  const readyAction = expectedState === 'running'
+    ? page.getByRole('button', { name: 'Stop current response' })
+    : page.locator('.chat-send-btn[aria-label="Send"]')
+  await expect(readyAction).toBeEnabled()
 }
 
 for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
@@ -322,7 +325,9 @@ test('a new browser tab recovers the original identity and durable offline draft
   const replacement = await context.newPage()
   try {
     const recovered = await installGateway(replacement, false, true)
-    await openChat(replacement)
+    // Recovery dispatches the durable draft automatically; the idle Send
+    // button can disappear before navigation readiness is observed.
+    await openChat(replacement, 'running')
     await expect.poll(async () => ({
       sends: recovered.sends.length,
       enqueues: recovered.enqueues.length,

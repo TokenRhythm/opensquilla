@@ -1985,10 +1985,98 @@
           "label": "Entprellfenster (s)"
         },
         "transport_name": {
+          "label": "Verbindungsart",
           "choices": {
             "polling": "Polling",
             "webhook": "Webhook"
           }
+        },
+        "access_token": {
+          "label": "Zugriffs-Token"
+        },
+        "agent_id_int": {
+          "label": "Agent-ID (int)"
+        },
+        "app_password": {
+          "label": "App-Passwort"
+        },
+        "app_token": {
+          "label": "Token auf App-Ebene (xapp-...)"
+        },
+        "application_id": {
+          "label": "Anwendungs-ID"
+        },
+        "cool_app_code": {
+          "label": "Cool App Code"
+        },
+        "corp_id": {
+          "label": "Unternehmens-ID"
+        },
+        "default_channel_id": {
+          "label": "Standardkanal-ID"
+        },
+        "device_id": {
+          "label": "Geräte-ID"
+        },
+        "domain": {
+          "label": "Domain"
+        },
+        "drop_pending_updates": {
+          "label": "Ausstehende Updates verwerfen"
+        },
+        "encoding_aes_key": {
+          "label": "Encoding-AES-Schlüssel"
+        },
+        "encrypt_key": {
+          "label": "Verschlüsselungsschlüssel"
+        },
+        "encryption": {
+          "label": "Verschlüsselung"
+        },
+        "gateway_url": {
+          "label": "Gateway-URL"
+        },
+        "intents": {
+          "label": "Intents-Bitmaske"
+        },
+        "password": {
+          "label": "Passwort"
+        },
+        "poll_idle_sleep_s": {
+          "label": "Polling-Leerlaufwartezeit (s)"
+        },
+        "poll_limit": {
+          "label": "Polling-Limit"
+        },
+        "poll_timeout_s": {
+          "label": "Polling-Timeout (s)"
+        },
+        "reply_in_thread": {
+          "label": "Im Thread antworten"
+        },
+        "robot_code": {
+          "label": "Roboter-Code"
+        },
+        "slack_channel_id": {
+          "label": "Standardkanal-ID"
+        },
+        "token": {
+          "label": "Bot-Token (xoxb-...)"
+        },
+        "verification_token": {
+          "label": "Verifizierungs-Token"
+        },
+        "webhook_path": {
+          "label": "Webhook-Pfad"
+        },
+        "webhook_secret_token": {
+          "label": "Webhook-Geheimtoken"
+        },
+        "webhook_url": {
+          "label": "Webhook-URL (nur Webhook)"
+        },
+        "websocket_url": {
+          "label": "WebSocket-URL"
         }
       },
       "groups": {
@@ -2424,6 +2512,13 @@
       "enable": "Aktivieren",
       "disable": "Deaktivieren",
       "notReported": "Nicht gemeldet",
+      "transport": {
+        "polling": "Polling",
+        "webhook": "Webhook",
+        "websocket": "WebSocket",
+        "http_sync": "HTTP-Sync",
+        "mixed": "Mehrere Verbindungsarten"
+      },
       "tabs": {
         "overview": "Übersicht",
         "pairings": "Mitglieder",

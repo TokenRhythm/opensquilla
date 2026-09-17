@@ -469,6 +469,10 @@ def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
 
 def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_live_provider_profile_gateway_e2e.py"),
+        "test_attachment_capacity_runner_bounds_provider_http_failures_to_one_call",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_ci/test_windows_signed_update_audit.py"),
         "test_real_node_and_frozen_python_complete_only_in_new_temporary_parent",
     )

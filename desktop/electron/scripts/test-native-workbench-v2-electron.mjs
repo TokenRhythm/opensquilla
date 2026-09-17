@@ -1189,6 +1189,21 @@ try {
       if (!annotationOverlay) throw new Error('Trusted annotation overlay was not created.')
       await annotationOverlay.ready
       await waitFor(() => annotationOverlay.view.getVisible(), 'trusted annotation overlay')
+      // Native visibility changes before Chromium necessarily receives setBounds.
+      // Check the renderer viewport before sampling CSS; do not wait for the
+      // expected textarea height, which would hide an actual layout regression.
+      let annotationOverlayLayout = null
+      await waitFor(async () => {
+        const bounds = annotationOverlay.view.getBounds()
+        const zoom = annotationOverlay.view.webContents.getZoomFactor()
+        const viewport = await annotationOverlay.view.webContents.executeJavaScript(
+          '({ width: innerWidth, height: innerHeight, dpr: devicePixelRatio })',
+        )
+        annotationOverlayLayout = { bounds, zoom, viewport }
+        // innerWidth/innerHeight are integers; fractional DPI can round by a pixel.
+        return Math.abs(viewport.width - bounds.width / zoom) < 1
+          && Math.abs(viewport.height - bounds.height / zoom) < 1
+      }, 'trusted annotation renderer viewport', 10_000, () => annotationOverlayLayout)
       const overlayPreferences = annotationOverlay.view.webContents.getLastWebPreferences()
       const annotationOverlaySecurity = {
         contextIsolation: overlayPreferences.contextIsolation,
@@ -2635,6 +2650,7 @@ try {
         annotationOverlayResult,
         annotationOverlaySecurity,
         annotationOverlayVisualStructure,
+        annotationOverlayLayout,
         annotationOverlayDevToolsBlocked,
         annotationOverlayBounds,
         annotationOverlayMovedBounds,
@@ -2975,7 +2991,8 @@ try {
   assert.ok(
     Number.parseFloat(annotationTextareaHeight) >= 73
       && Number.parseFloat(annotationTextareaHeight) < 74,
-    'annotation textarea height must remain within one fractional Windows DPI pixel',
+    `annotation textarea height must remain within one fractional Windows DPI pixel; `
+      + `actual=${annotationTextareaHeight}; layout=${JSON.stringify(result.annotationOverlayLayout)}`,
   )
   assert.equal(result.annotationOverlayDevToolsBlocked, true)
   assert.ok(result.annotationOverlayBounds.width <= 304)

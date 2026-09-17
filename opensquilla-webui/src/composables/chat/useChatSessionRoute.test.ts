@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { effectScope, nextTick, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import {
   shouldCanonicalizeInitialDraftRoute,
   useChatSessionRoute,
@@ -14,11 +15,12 @@ const { routeMock, routerMock } = vi.hoisted(() => ({
   },
   routerMock: {
     push: vi.fn(() => Promise.resolve()),
-    replace: vi.fn(() => Promise.resolve()),
+    replace: vi.fn((_target: unknown): Promise<unknown> => Promise.resolve()),
   },
 }))
 
-vi.mock('vue-router', () => ({
+vi.mock('vue-router', async importOriginal => ({
+  ...await importOriginal<typeof import('vue-router')>(),
   useRoute: () => routeMock,
   useRouter: () => routerMock,
 }))
@@ -28,7 +30,7 @@ describe('useChatSessionRoute', () => {
     routeMock.path = '/chat/new'
     routeMock.query = {}
     routerMock.push.mockClear()
-    routerMock.replace.mockClear()
+    routerMock.replace.mockReset().mockResolvedValue(undefined)
     localStorage.clear()
   })
 
@@ -293,5 +295,98 @@ describe('useChatSessionRoute', () => {
       currentPathIsDraft: false,
       hasLegacyNewChatQuery: false,
     })).toBe(true)
+  })
+
+  it('rebinds the current draft route with its recovery identity in the same navigation', async () => {
+    const key = 'agent:main:webchat:keep-draft'
+    const sessionKey = ref(key)
+    routeMock.query = { agent: 'main' }
+    localStorage.setItem(`opensquilla.chat.draft:${key}`, 'keep this prompt')
+    routerMock.replace.mockImplementationOnce(async (target: any) => {
+      routeMock.path = target.path
+      routeMock.query = target.query
+    })
+    const route = useChatSessionRoute(sessionKey)
+
+    await expect(route.replaceDraftProject('project-a')).resolves.toBe(true)
+
+    expect(sessionKey.value).toBe(key)
+    expect(routerMock.replace).toHaveBeenCalledWith({
+      path: '/chat/new',
+      query: { agent: 'main', project: 'project-a' },
+      state: { draftSessionKey: key, draftAgentId: 'main', draftProjectId: 'project-a' },
+    })
+    expect(route.resolveInitialSession({ scopedDraft: {
+      sessionKey: key, agentId: 'main', projectId: 'project-a',
+    } })).toMatchObject({ sessionKey: key, recoveredDraft: true, draft: true })
+  })
+
+  it('keeps the original draft route when project navigation fails', async () => {
+    routeMock.query = { agent: 'main', project: 'project-a' }
+    const sessionKey = ref('agent:main:webchat:keep-draft')
+    routerMock.replace.mockRejectedValueOnce(new Error('navigation aborted'))
+    const route = useChatSessionRoute(sessionKey)
+
+    await expect(route.replaceDraftProject(null)).resolves.toBe(false)
+
+    expect(routeMock.query).toEqual({ agent: 'main', project: 'project-a' })
+    expect(sessionKey.value).toBe('agent:main:webchat:keep-draft')
+  })
+
+  it('does not commit an aborted navigation reported as a resolved failure', async () => {
+    routeMock.query = { agent: 'main', project: 'project-a' }
+    routerMock.replace.mockResolvedValueOnce({ type: 4 })
+    const route = useChatSessionRoute(ref('agent:main:webchat:keep-draft'))
+
+    await expect(route.replaceDraftProject(null)).resolves.toBe(false)
+    expect(route.readProjectFromUrl()).toBe('project-a')
+  })
+
+  it('accepts selecting the same project and refreshes its recovery scope', async () => {
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [{ path: '/chat/new', component: { template: '<div />' } }],
+    })
+    const target = '/chat/new?agent=main&project=project-a'
+    await router.push(target)
+    const duplicate = await router.replace(target)
+    routerMock.replace.mockResolvedValueOnce(duplicate)
+    routeMock.query = { agent: 'main', project: 'project-a' }
+    const key = 'agent:main:webchat:keep-draft'
+    const route = useChatSessionRoute(ref(key))
+
+    await expect(route.replaceDraftProject('project-a')).resolves.toBe(true)
+    expect(window.history.state).toMatchObject({
+      draftSessionKey: key, draftAgentId: 'main', draftProjectId: 'project-a',
+    })
+  })
+
+  it('clears the draft project and its recovery scope without changing its key', async () => {
+    const key = 'agent:main:webchat:keep-draft'
+    routeMock.query = { agent: 'main', project: 'project-a' }
+    routerMock.replace.mockImplementationOnce(async (target: any) => {
+      routeMock.path = target.path
+      routeMock.query = target.query
+    })
+    const route = useChatSessionRoute(ref(key))
+
+    await expect(route.replaceDraftProject(null)).resolves.toBe(true)
+    expect(routerMock.replace).toHaveBeenCalledWith({
+      path: '/chat/new', query: { agent: 'main' },
+      state: { draftSessionKey: key, draftAgentId: 'main', draftProjectId: '' },
+    })
+  })
+
+  it('does not commit a project route after another draft replaces the source', async () => {
+    const sessionKey = ref('agent:main:webchat:source')
+    let finish!: () => void
+    routerMock.replace.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))
+    const route = useChatSessionRoute(sessionKey)
+    const navigation = route.replaceDraftProject('project-a')
+    sessionKey.value = 'agent:main:webchat:replacement'
+    finish()
+
+    await expect(navigation).resolves.toBe(false)
+    expect(sessionKey.value).toBe('agent:main:webchat:replacement')
   })
 })

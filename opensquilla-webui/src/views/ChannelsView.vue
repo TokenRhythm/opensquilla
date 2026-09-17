@@ -78,7 +78,7 @@
               :startup-failed="startupFailure(selectedChannel.diagnostics)"
               show-cause
             />
-            <span class="chd__fact">{{ transportLabel(selectedChannel, t('console.channels.notReported')) }}</span>
+            <span class="chd__fact">{{ transportLabel(selectedChannel, t('console.channels.notReported'), localizedTransport) }}</span>
             <button
               v-if="selectedChannel.bot_user_id"
               type="button"
@@ -504,6 +504,7 @@ import {
   providerLabel,
   record,
   transportLabel,
+  humanize as transportHumanize,
   type CapabilityEvidence,
   type Channel,
   type ProbeResult,
@@ -535,7 +536,15 @@ const SECTIONS: SectionId[] = ['pairings', 'configuration', 'diagnostics']
 // The home has EXACTLY ONE "add" affordance on screen at any time: 0 channels →
 // the inline platform gallery IS the page; ≥1 channel → the enroll strip closes
 // the fleet front page. No per-count add-card or header button.
-const { t, locale } = useI18n()
+const { t, te, locale } = useI18n()
+
+// Transport tokens ('polling', 'http_sync', …) render through
+// console.channels.transport.*; an unknown future token degrades to the
+// humanized token rather than a raw key.
+function localizedTransport(token: string): string {
+  const key = `console.channels.transport.${token}`
+  return te(key) ? t(key) : transportHumanize(token)
+}
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
 const appSettings = injectedAppSettings
@@ -942,7 +951,7 @@ function connectedDuration(ch: Channel): string {
 }
 
 function cardSubline(ch: Channel): string {
-  const parts = [transportLabel(ch, t('console.channels.notReported'))]
+  const parts = [transportLabel(ch, t('console.channels.notReported'), localizedTransport)]
   const botId = String(ch.bot_user_id || '')
   if (botId) parts.push(t('console.channels.detail.bot', { id: truncateId(botId) }))
   return parts.join(' · ')

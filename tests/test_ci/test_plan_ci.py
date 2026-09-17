@@ -777,6 +777,53 @@ def test_macos_recovery_test_routing_is_covered_by_suite_digest(
     )
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/opensquilla/tools/builtin/shell.py",
+        "tests/test_tools/test_shell_native_argv.py",
+    ],
+)
+def test_native_shell_changes_require_all_three_platforms(
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert {"python-targeted", "windows-high-risk", "macos-recovery"} <= set(
+        plan["required_suites"]
+    )
+    assert "core" in plan["python_matrix"]["windows"]
+    assert _platform_cells(plan, "macos-recovery") == {
+        ("macos-latest", "recovery")
+    }
+    assert any(
+        "tests/test_tools/test_shell_native_argv.py" == target
+        or "tests/test_tools" == target
+        for target in plan["python_targets"]
+    )
+
+
+def test_native_shell_contracts_execute_in_required_macos_job() -> None:
+    import yaml
+
+    jobs = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))[
+        "jobs"
+    ]
+    macos = jobs["macos-recovery"]
+    assert macos["runs-on"] == "macos-latest"
+    assert "'macos-recovery'" in macos["if"]
+    assert "macos-recovery" in jobs["ci-result"]["needs"]
+    native_step = next(
+        step for step in macos["steps"]
+        if "tests/test_tools/test_shell_native_argv.py" in step.get("run", "")
+    )
+    assert "uv run pytest" in native_step["run"]
+    assert "exit \"${status}\"" in native_step["run"]
+    assert not native_step.get("continue-on-error", False)
+    assert not native_step.get("if")
+
+
 def test_macos_recovery_test_routing_without_digest_coverage_is_rejected(
     tmp_path: Path,
 ) -> None:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from structlog.testing import capture_logs
 
 from opensquilla.artifacts import ArtifactNotFoundError, ArtifactStore
 from opensquilla.attachment_refs import (
@@ -18,10 +21,13 @@ from opensquilla.execution_workspaces import configured_execution_workspace
 from opensquilla.gateway.boot import (
     build_session_material_cleanup,
 )
+from opensquilla.paths import native_io_path
 from opensquilla.project_workspaces import project_path_key
+from opensquilla.session import material_cleanup
 from opensquilla.session.material_cleanup import (
     reset_session_artifact_cleanup,
     reset_session_material_cleanup,
+    rmtree_scoped,
     set_session_material_cleanup,
 )
 from opensquilla.session.models import SessionNode
@@ -52,8 +58,8 @@ async def _seed_material(media_root: Path, workspace: Path, session_id: str) -> 
         payload=b"queued bytes",
     )
     att_dir = _workspace_attachment_dir(workspace, session_id)
-    att_dir.mkdir(parents=True, exist_ok=True)
-    (att_dir / "doc.pdf").write_bytes(b"%PDF-1.4\n")
+    native_io_path(att_dir).mkdir(parents=True, exist_ok=True)
+    native_io_path(att_dir / "doc.pdf").write_bytes(b"%PDF-1.4\n")
     listed = ArtifactStore(media_root).publish_bytes(
         b"<!doctype html><title>preview</title>",
         session_id=session_id,
@@ -161,6 +167,178 @@ async def test_delete_session_without_hook_is_still_db_safe(tmp_path: Path) -> N
     await storage.delete_session("agent:main:webchat:a")
     assert await storage.get_session("agent:main:webchat:a") is None
     await storage.close()
+
+
+@pytest.mark.parametrize("operation", ["delete", "prune"])
+@pytest.mark.parametrize("long_path", [False, True], ids=["short", "long"])
+async def test_material_cleanup_handles_short_and_long_paths(
+    tmp_path: Path, operation: str, long_path: bool,
+) -> None:
+    if long_path and os.name != "nt":
+        pytest.skip("Windows extended-length path regression")
+    material_root = tmp_path / "material"
+    if long_path:
+        while len(str(material_root)) <= 280:
+            material_root /= "segment-" + "x" * 40
+    workspace = tmp_path / "workspace"
+    media_root = material_root / "media"
+    native_io_path(workspace).mkdir(parents=True)
+    set_session_material_cleanup(build_session_material_cleanup(_config(media_root, workspace)))
+    try:
+        async with SessionStorage(tmp_path / "sessions.db") as storage:
+            node = SessionNode(session_key="agent:main:webchat:cleanup-path", session_id="target")
+            await storage.upsert_session(node)
+            listed, internal = await _seed_material(media_root, workspace, node.session_id)
+            await _seed_material(media_root, workspace, "sibling")
+            if long_path:
+                nested = _workspace_attachment_dir(workspace, node.session_id)
+                while len(str(nested)) <= 280:
+                    nested /= "nested-" + "x" * 40
+                native_io_path(nested).mkdir(parents=True)
+                native_io_path(nested / "payload.txt").write_text("nested attachment")
+            source = workspace / "authored.txt"
+            native_io_path(source).write_text("keep source")
+
+            if operation == "delete":
+                await storage.delete_session(node.session_key)
+            else:
+                await storage.prune_stale_sessions(10**16)
+
+            assert await storage.get_session(node.session_key) is None
+            assert not native_io_path(transcript_material_dir(media_root, "target")).exists()
+            assert not native_io_path(_workspace_attachment_dir(workspace, "target")).exists()
+            assert native_io_path(transcript_material_dir(media_root, "sibling")).is_dir()
+            assert native_io_path(_workspace_attachment_dir(workspace, "sibling")).is_dir()
+            assert native_io_path(source).read_text() == "keep source"
+            for artifact_id in (listed, internal):
+                with pytest.raises(ArtifactNotFoundError):
+                    ArtifactStore(media_root).get_ref(
+                        session_id=node.session_id, artifact_id=artifact_id,
+                    )
+    finally:
+        shutil.rmtree(native_io_path(tmp_path / "material"), ignore_errors=True)
+
+
+async def test_material_cleanup_logs_failure_and_continues_other_stores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    media_root = tmp_path / "media"
+    set_session_material_cleanup(build_session_material_cleanup(_config(media_root, workspace)))
+    async with SessionStorage(tmp_path / "sessions.db") as storage:
+        node = SessionNode(session_key="agent:main:webchat:cleanup-failure", session_id="target")
+        await storage.upsert_session(node)
+        listed, internal = await _seed_material(media_root, workspace, node.session_id)
+        transcript_root = transcript_material_dir(media_root, node.session_id)
+        original_rmtree = shutil.rmtree
+
+        def deny_transcript(path, *args, **kwargs):
+            if native_io_path(path) == native_io_path(transcript_root):
+                if kwargs.get("ignore_errors"):
+                    return None
+                raise PermissionError("injected transcript deletion failure")
+            return original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(material_cleanup.shutil, "rmtree", deny_transcript)
+        with capture_logs() as logs:
+            await storage.delete_session(node.session_key)
+
+        assert await storage.get_session(node.session_key) is None
+        assert transcript_root.is_dir()
+        assert not _workspace_attachment_dir(workspace, node.session_id).exists()
+        for artifact_id in (listed, internal):
+            with pytest.raises(ArtifactNotFoundError):
+                ArtifactStore(media_root).get_ref(
+                    session_id=node.session_id, artifact_id=artifact_id,
+                )
+        assert any(
+            entry["event"] == "session_material_cleanup.remove_failed"
+            and entry["target"] == str(transcript_root)
+            and entry["error_type"] == "PermissionError"
+            for entry in logs
+        )
+
+
+def test_material_cleanup_missing_directory_race_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+
+    def disappeared(path, *args, **kwargs):
+        Path(path).rmdir()
+        if kwargs.get("ignore_errors"):
+            return None
+        raise FileNotFoundError(str(path))
+
+    monkeypatch.setattr(material_cleanup.shutil, "rmtree", disappeared)
+    with capture_logs() as logs:
+        rmtree_scoped(target, expected_name="target")
+
+    assert not target.exists()
+    assert logs == []
+
+
+@pytest.mark.parametrize("child_kind", ["file", "directory"])
+def test_material_cleanup_continues_when_child_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, child_kind: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    disappearing = target / "disappearing"
+    if child_kind == "file":
+        disappearing.write_text("attachment removed concurrently")
+    else:
+        disappearing.mkdir()
+    (target / "remaining.txt").write_text("attachment still to clean")
+    operation = "unlink" if child_kind == "file" else "rmdir"
+    original_remove = getattr(os, operation)
+    race_injected = False
+
+    def remove_with_disappearing_child(path, *args, **kwargs):
+        nonlocal race_injected
+        original_remove(path, *args, **kwargs)
+        if Path(path).name == disappearing.name:
+            # The child was enumerated, but another actor removed it before
+            # rmtree could do so. Exercise rmtree's real per-item error path.
+            race_injected = True
+            raise FileNotFoundError(str(path))
+
+    monkeypatch.setattr(os, operation, remove_with_disappearing_child)
+    with capture_logs() as logs:
+        rmtree_scoped(target, expected_name="target")
+
+    assert race_injected
+    assert not target.exists()
+    assert logs == []
+
+
+def test_material_cleanup_child_permission_failure_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    blocked = target / "blocked.txt"
+    blocked.write_text("locked attachment")
+    original_unlink = os.unlink
+
+    def deny_child(path, *args, **kwargs):
+        if Path(path).name == blocked.name:
+            raise PermissionError("injected child deletion failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", deny_child)
+    with capture_logs() as logs:
+        rmtree_scoped(target, expected_name="target")
+
+    assert blocked.read_text() == "locked attachment"
+    assert any(
+        entry["event"] == "session_material_cleanup.remove_failed"
+        and entry["target"] == str(target)
+        and entry["error_type"] == "PermissionError"
+        for entry in logs
+    )
 
 
 @pytest.mark.parametrize("root_kind", ["managed", "configured", "legacy", "project"])

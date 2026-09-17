@@ -354,6 +354,7 @@
       "tests/test_tools/test_presentation_rules.py",
       "tests/test_tools/test_restored_tool_contracts.py",
       "tests/test_tools/test_shell_managed_toolchains.py",
+      "tests/test_tools/test_shell_native_argv.py",
       "tests/test_tools/test_shell_policy_windows.py",
       "tests/test_tools/test_shell_process_isolation.py",
       "tests/test_tools/test_shell_self_kill_policy.py",
