@@ -57,16 +57,12 @@
 - **old：48.506 分**。漏掉 Muthoot Mercantile 和 KLM Axiva，并使用了不符合日期条件的发行人；对 EFSL 杠杆的判断也不准确。
 - **C5：76.782 分，提升 28.276 个百分点**。识别出有效发行人，给出评级、11.73% 收益率、发行前后债务权益比，并明确提示高杠杆风险。
 
-[old 答案](data/DRACO-Monthly-Fusion-2026-09-11/raw-run/groups/old/tasks/1ed18b1d-8436-44e5-9924-a503514c387d/agent/response.md) · [C5 答案](data/DRACO-Fusion-C1-C7-2026-09-11/raw-run/groups/C5/tasks/1ed18b1d-8436-44e5-9924-a503514c387d/agent/response.md)
-
 ### 案例二：巴黎萨克雷经济学硕士与 Charpak 奖学金
 
 任务要求整理项目录取条件、奖学金资格、申请时间和材料。
 
 - **old：39.894 分**。遗漏全日制限制、往届获奖者和博士生不可申请等关键条件，也没有覆盖 M2 申请及推荐信要求。
 - **C5：66.489 分，提升 26.596 个百分点**。补齐交换、实习、研究项目、博士生和往届获奖者等限制，并说明 M2、推荐信及英语证明要求。
-
-[old 答案](data/DRACO-Monthly-Fusion-2026-09-11/raw-run/groups/old/tasks/1070e6eb-7a8f-4ce9-8818-1931bcfdb2dd/agent/response.md) · [C5 答案](data/DRACO-Fusion-C1-C7-2026-09-11/raw-run/groups/C5/tasks/1070e6eb-7a8f-4ce9-8818-1931bcfdb2dd/agent/response.md)
 
 ### 案例三：澳大利亚半退休城市选择
 
@@ -75,6 +71,4 @@
 - **old：49.863 分**。错误判断 Cairns 缺少本地电生理和消融能力，对 Toowoomba 的心脏服务及城市间价格口径说明也不完整。
 - **C5：68.493 分，提升 18.630 个百分点**。确认 Cairns 本地电生理和消融服务，补齐 Toowoomba 的介入、起搏器、ICD 和消融能力，并解释不同房价数据的时间与统计口径差异。
 
-[old 答案](data/DRACO-Monthly-Fusion-2026-09-11/raw-run/groups/old/tasks/f1b0f094-fa7a-4f18-adbd-f4cd86633f77/agent/response.md) · [C5 答案](data/DRACO-Fusion-C1-C7-2026-09-11/raw-run/groups/C5/tasks/f1b0f094-fa7a-4f18-adbd-f4cd86633f77/agent/response.md)
-
-完整实验数据见 [DRACO 多模型融合实验综合报告](DRACO-Fusion-Combined-Report-2026-09-14.md)。
+本次配置更新及实验摘要见 [PR #1709](https://github.com/TokenRhythm/opensquilla/pull/1709)。完整实验报告及原始答案未包含在本仓库中。
