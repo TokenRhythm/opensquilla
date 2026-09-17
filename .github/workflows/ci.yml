@@ -713,7 +713,9 @@ jobs:
     name: WebUI chat recovery
     needs: [plan-ci, frontend-artifact]
     if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-chat-recovery') }}
-    runs-on: ubuntu-latest
+    # Use a runner that permits the real unprivileged Bubblewrap sandbox without
+    # changing host security policy. Migrate before Ubuntu 22.04 retires in April 2027.
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
       OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791

@@ -502,6 +502,9 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
     } <= set(plan["required_suites"])
     assert "desktop-recovery-e2e" not in plan["required_suites"]
     assert plan["desktop_matrix"] == []
+    assert _platform_cells(plan, "webui-chat-recovery") == {
+        ("ubuntu-22.04", "chromium")
+    }
     assert plan["reason_codes"] == ["webui_changed"]
 
 

@@ -412,7 +412,7 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
         ("windows-latest", "contract-determinism"),
     ),
     "wheel-webui-roundtrip": (("ubuntu-latest", "package"),),
-    "webui-chat-recovery": (("ubuntu-latest", "chromium"),),
+    "webui-chat-recovery": (("ubuntu-22.04", "chromium"),),
     "tui": (("ubuntu-latest", "default"),),
     "desktop-static": (("ubuntu-latest", "default"),),
     "python-targeted": (("ubuntu-latest", "targeted"),),

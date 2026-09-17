@@ -2177,6 +2177,7 @@ def test_ci_evidence_artifacts_are_replaceable_across_rerun_attempts() -> None:
 
 def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     job = _workflow("ci.yml")["jobs"]["webui-chat-recovery"]
+    assert job["runs-on"] == "ubuntu-22.04"
     steps = job["steps"]
     download = next(
         step for step in steps if step.get("name") == "Download verified frontend artifact"
