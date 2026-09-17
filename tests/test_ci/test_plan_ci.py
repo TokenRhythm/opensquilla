@@ -24,6 +24,68 @@ MERGE_CRITICAL_INPUTS = json.loads(TRUST_POLICY_PATH.read_text(encoding="utf-8")
 ]
 
 
+def test_native_acceptance_tracks_dependency_and_probe_changes_without_running_for_docs(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    paths = (
+        "pyproject.toml", "uv.lock", "desktop/electron/package.json",
+        "desktop/electron/package-lock.json", "opensquilla-webui/package.json",
+        "opensquilla-webui/package-lock.json",
+        "desktop/electron/scripts/nsis/include.nsh",
+        "desktop/electron/scripts/test-nsis-upgrade.mjs",
+        "desktop/electron/scripts/test-packaged-first-send-renderer.mjs",
+        "desktop/electron/scripts/packaged-first-send-cleanup.mjs",
+        "desktop/electron/scripts/packaged-smoke-helpers.mjs",
+        "desktop/electron/scripts/test-packaged-retained-interaction.mjs",
+        "desktop/electron/scripts/fixtures/packaged-retained-interaction/provider.mjs",
+        "desktop/electron/scripts/e2e-shutdown-helpers.mjs",
+        "desktop/electron/scripts/build-gateway.mjs",
+        "desktop/electron/scripts/gateway-integrity.mjs",
+        "scripts/release_dependency_inventory.py", "scripts/build_wheelhouse_zip.py",
+        ".github/scripts/verify-nsis-upgrade-regression.py",
+        ".github/scripts/verify-release-profile-preservation.py",
+        ".github/scripts/upgrade_baseline.py",
+        "tests/fixtures/upgrade-v054/manifest.json",
+        "tests/fixtures/upgrade-v054/sessions.sql",
+        ".github/workflows/windows-nsis-upgrade-regression.yml",
+    )
+    for path in paths:
+        plan = _plan(tmp_path, suite_config, path)
+        assert "windows-nsis-regression" in plan["required_suites"], path
+    docs = _plan(tmp_path, suite_config, "docs/providers.md")
+    assert "windows-nsis-regression" not in docs["required_suites"]
+
+
+def test_native_acceptance_evidence_covers_the_actual_complete_reusable_matrix(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    import itertools
+
+    import yaml
+
+    jobs = yaml.safe_load(Path(".github/workflows/windows-nsis-upgrade-regression.yml").read_text(
+        encoding="utf-8",
+    ))["jobs"]
+    matrix = jobs["upgrade-and-start"]["strategy"]["matrix"]
+    cases = {
+        f"{baseline}-{install_path}-{scenario}"
+        for baseline, install_path, scenario in itertools.product(
+            matrix["baseline"], matrix["install-path"], matrix["scenario"],
+        )
+    } | {f"{item['baseline']}-{item['install-path']}-{item['scenario']}"
+         for item in matrix["include"]}
+    assert len(cases) == 14
+    assert {"fresh-default-fresh", "fresh-custom-fresh"} <= cases
+    expected = {(jobs["build"]["runs-on"], "build")}
+    expected.update((jobs["wheelhouse-security"]["runs-on"], f"wheelhouse-{profile}")
+                    for profile in jobs["wheelhouse-security"]["strategy"]["matrix"]["profile"])
+    expected.update((jobs["upgrade-and-start"]["runs-on"], case) for case in cases)
+    assert len(expected) == 17
+    for path in ("uv.lock", ".ci/run-all"):
+        plan = _plan(tmp_path, suite_config, path)
+        assert _platform_cells(plan, "windows-nsis-regression") == expected
+
+
 @pytest.fixture
 def suite_config() -> dict[str, Any]:
     return load_config(CONFIG_PATH, repo=Path.cwd())
@@ -1211,6 +1273,7 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
         "webui-chat-recovery",
         "wheel-webui-roundtrip",
         "windows-high-risk",
+        "windows-nsis-regression",
         "workflow-lint",
     }
     assert plan["desktop_matrix"] == sorted(
@@ -1259,6 +1322,7 @@ def test_webui_dependency_changes_stay_in_webui_ecosystem(
         "readme-locale",
         "webui-chat-recovery",
         "wheel-webui-roundtrip",
+        "windows-nsis-regression",
         "workflow-lint",
     }
     assert plan["desktop_matrix"] == []
@@ -1286,6 +1350,7 @@ def test_electron_dependency_changes_select_full_desktop_matrix_only(
         "frontend-artifact",
         "readme-locale",
         "release-packaging",
+        "windows-nsis-regression",
         "workflow-lint",
     }
     assert plan["desktop_matrix"] == sorted(

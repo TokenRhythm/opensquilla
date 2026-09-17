@@ -257,6 +257,7 @@ export interface ConnectionState {
   models: DiscoveredModel[]
   modelSource: 'live' | 'none'
   discoverError: string
+  discovering?: boolean
   catalog?: CatalogSyncStatus | null
 }
 
@@ -331,6 +332,7 @@ function freshConnection(providerId: string): ConnectionState {
     models: [],
     modelSource: 'none',
     discoverError: '',
+    discovering: false,
     catalog: null,
   }
 }
@@ -782,7 +784,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     discoverPromise = null
     discoverPromiseForceRefresh = false
     const controller = new AbortController()
-    connectionBeforeProbe = connection.value
+    connectionBeforeProbe = { ...connection.value, discovering: false }
     activeProbeController = controller
     connection.value = {
       ...freshConnection(providerSelected.value),
@@ -906,6 +908,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
       })
     }
     const epoch = connectionEpoch
+    connection.value = { ...connection.value, discovering: true, discoverError: '' }
     const request = (async () => {
       try {
         const payload = {
@@ -956,6 +959,9 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
       if (discoverPromise === tracked) {
         discoverPromise = null
         discoverPromiseForceRefresh = false
+      }
+      if (epoch === connectionEpoch) {
+        connection.value = { ...connection.value, discovering: false }
       }
     })
     discoverPromise = tracked

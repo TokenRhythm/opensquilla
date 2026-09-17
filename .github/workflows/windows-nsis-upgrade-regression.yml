@@ -3,33 +3,13 @@ name: Windows NSIS Upgrade Regression
 # Unsigned full packages on disposable runners; never installs on a developer's
 # machine. Signing, interactive UAC and Windows 10/11 remain release gates.
 on:
-  pull_request:
-    paths:
-      - desktop/electron/scripts/nsis/**
-      - desktop/electron/scripts/test-nsis-*.cjs
-      - desktop/electron/scripts/test-nsis-*.mjs
-      - desktop/electron/package.json
-      - desktop/electron/package-lock.json
-      - pyproject.toml
-      - uv.lock
-      - opensquilla-webui/package.json
-      - opensquilla-webui/package-lock.json
-      - desktop/electron/scripts/build-gateway.mjs
-      - desktop/electron/scripts/gateway-integrity.mjs
-      - scripts/release_dependency_inventory.py
-      - scripts/build_wheelhouse_zip.py
-      - .github/scripts/audit_dependencies.py
-      - .github/ci/dependency-audit.v1.json
-      - .github/scripts/verify-nsis-upgrade-regression.py
-      - .github/workflows/windows-nsis-upgrade-regression.yml
+  # CI owns change selection, cancellation, and the required aggregate result.
+  # Reusing this workflow keeps manual diagnostics on the same acceptance path.
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  group: windows-nsis-upgrade-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   PYTHONUTF8: '1'
@@ -47,6 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           lfs: true
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -92,6 +73,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed' }
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Electron build failed' }
+          node scripts/test-packaged-first-send-cleanup.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged cleanup contract failed' }
+          node --test scripts/test-packaged-first-send-evidence.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged renderer evidence contract failed' }
           npm run verify:prepared
           if ($LASTEXITCODE -ne 0) { throw 'Prepared package verification failed' }
           node -e "const b=require('electron-builder'); b.build({targets:b.Platform.WINDOWS.createTarget('nsis'),publish:'never',config:{win:{signExecutable:false},forceCodeSigning:false}}).catch(e=>{console.error(e);process.exitCode=1})"
@@ -109,8 +94,9 @@ jobs:
           try {
             npm run verify:gateway-smoke
             if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
-            node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send"
-            if ($LASTEXITCODE -ne 0) { throw 'Packaged first interaction failed' }
+            node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/security-first-send-report.log"
+            $probeExitCode = $LASTEXITCODE
+            if ($probeExitCode -ne 0) { throw "Packaged first interaction failed with exit code $probeExitCode" }
           } finally { Pop-Location }
       - name: Record exact candidate identities
         run: |
@@ -156,6 +142,16 @@ jobs:
           path: ${{ runner.temp }}/nsis-upgrade-native-*/
           if-no-files-found: warn
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: packaged-first-send-evidence
+          path: |
+            ${{ runner.temp }}/security-first-send-report.log
+            ${{ runner.temp }}/security-first-send/logs/desktop.log*
+            ${{ runner.temp }}/security-first-send/first-send-main-console.jsonl
+          if-no-files-found: warn
+          retention-days: 14
 
   wheelhouse-security:
     name: Windows locked wheelhouse (${{ matrix.profile }})
@@ -171,6 +167,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           lfs: true
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -225,6 +222,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -259,6 +257,7 @@ jobs:
           $candidate = @(Get-ChildItem candidate -Filter '*.exe' -File)
           if ($candidate.Count -ne 1) { throw 'Unexpected candidate installer count' }
           $manifest = Get-Content candidate/audit-candidate.json -Raw | ConvertFrom-Json
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'Acceptance checkout mismatch' }
           if ($manifest.sourceSha -ne (git rev-parse HEAD).Trim()) { throw 'Candidate source mismatch' }
           if ((Get-FileHash -LiteralPath $candidate[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.installerSha256) { throw 'Candidate hash mismatch' }
           $arguments = @('.github/scripts/verify-nsis-upgrade-regression.py',
@@ -286,3 +285,29 @@ jobs:
             candidate/audit-candidate.json
           if-no-files-found: warn
           retention-days: 14
+  acceptance-result:
+    name: Windows NSIS acceptance result
+    needs: [build, wheelhouse-security, upgrade-and-start]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject cancelled acceptance
+        if: ${{ cancelled() }}
+        run: |
+          echo 'ERROR: cancelled Windows acceptance cannot pass.' >&2
+          exit 1
+      - name: Require every packaged acceptance job
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          WHEELHOUSE_RESULT: ${{ needs.wheelhouse-security.result }}
+          UPGRADE_RESULT: ${{ needs.upgrade-and-start.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for result in "${BUILD_RESULT}" "${WHEELHOUSE_RESULT}" "${UPGRADE_RESULT}"; do
+            if [[ "${result}" != "success" ]]; then
+              echo "ERROR: every Windows acceptance job must succeed; got ${result:-missing}." >&2
+              exit 1
+            fi
+          done

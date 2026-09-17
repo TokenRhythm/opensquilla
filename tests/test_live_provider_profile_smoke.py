@@ -62,6 +62,8 @@ def test_live_smoke_env_maps_cover_openai_zhipu_kimi_and_minimax() -> None:
     assert smoke._BASE_ENV["openrouter"] == "OPENROUTER_BASE_URL"
     assert smoke._DEFAULT_MODELS["openrouter"] == "deepseek/deepseek-v4-flash"
 
+    assert smoke._DEFAULT_MODELS["deepseek"] == "deepseek-flash"
+
     assert smoke._MODEL_ENV["dashscope"] == "DASHSCOPE_MODEL"
     assert smoke._BASE_ENV["dashscope"] == "DASHSCOPE_BASE_URL"
     assert smoke._DEFAULT_MODELS["dashscope"] == "qwen3.7-plus"

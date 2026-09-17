@@ -1,9 +1,9 @@
 """Preset registry: packaged data parity, synthesized coverage, and API shape.
 
-The golden fixture (``golden/router_tier_profiles.json``) was captured from
+The golden fixture (``golden/router_tier_profiles.json``) originated from
 ``git show staging/provider-overhaul:src/opensquilla/gateway/config.py``
-(``_router_tier_profile_defaults`` at f884d4c9) and pins the packaged preset
-data byte-identically to the historical hardcoded dict literals.
+(``_router_tier_profile_defaults`` at f884d4c9) and tracks the current packaged
+preset data, including intentional updates to provider defaults.
 """
 
 from __future__ import annotations

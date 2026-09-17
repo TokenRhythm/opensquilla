@@ -4,11 +4,14 @@ import os
 import runpy
 import subprocess
 import sys
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[2]
 HOOK_PATH = (
@@ -258,12 +261,24 @@ def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
     smoke_source = (ROOT / "desktop/electron/scripts/smoke-gateway.mjs").read_text(
         encoding="utf-8"
     )
-    project_source = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    runtime_requirements = [Requirement(value) for value in project["project"]["dependencies"]]
+    certifi_requirements = [value for value in runtime_requirements if value.name == "certifi"]
 
     assert "'--runtime-hook',\n  caRuntimeHookPath," in build_source
     assert "'--collect-data',\n  'certifi'," in build_source
     assert "'--hidden-import',\n  'certifi'," in build_source
-    assert '"certifi>=2024.7.4"' in project_source
+    assert len(certifi_requirements) == 1
+    certifi_requirement = certifi_requirements[0]
+    assert certifi_requirement.marker is None
+    assert certifi_requirement.url is None
+    # Keep certifi mandatory with an explicit trust-bundle floor; raising that
+    # floor must not break the packaging contract.
+    assert any(
+        specifier.operator in {">=", ">"}
+        and Version(specifier.version) >= Version("2024.7.4")
+        for specifier in certifi_requirement.specifier
+    )
     assert "--_desktop-ca-probe" in entry_source
     assert "--internal-child" in entry_source
     assert "--_sandbox-filesystem-worker" in entry_source

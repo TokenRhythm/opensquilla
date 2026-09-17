@@ -1,12 +1,11 @@
 """Router tier presets: config adapter parity, upgrade fixtures, downgrade guard.
 
 The golden fixture (``tests/test_provider/golden/router_tier_profiles.json``)
-was captured from
+originated from
 ``git show staging/provider-overhaul:src/opensquilla/gateway/config.py``
-(the ``_router_tier_profile_defaults`` dict literals at f884d4c9). Every test
-here pins that moving the preset data into packaged TOML changed nothing about
-how existing configs load: the fixture battery shapes come from the upgrade
-audit and must keep loading byte-identically.
+(the ``_router_tier_profile_defaults`` dict literals at f884d4c9) and tracks
+intentional updates to packaged defaults. The fixture battery shapes come
+from the upgrade audit and protect how existing explicit configs load.
 """
 
 from __future__ import annotations
@@ -63,7 +62,7 @@ def test_router_tier_profile_ids_are_exactly_the_legacy_nine() -> None:
 
 
 @pytest.mark.parametrize("profile_id", sorted(LEGACY_NINE))
-def test_profile_defaults_match_pre_registry_dict_literals(profile_id: str) -> None:
+def test_profile_defaults_match_packaged_golden(profile_id: str) -> None:
     assert _router_tier_profile_defaults(profile_id) == _golden()[profile_id]
 
 

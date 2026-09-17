@@ -1241,11 +1241,11 @@ async def test_profile_activate_rpc_omits_model_and_uses_provider_default(
     )
 
     assert response.error is None, response.error
-    assert response.payload["entry"]["model"] == "deepseek-v4-flash"
+    assert response.payload["entry"]["model"] == "deepseek-flash"
     assert cfg.llm.provider == "deepseek"
-    assert cfg.llm.model == "deepseek-v4-flash"
+    assert cfg.llm.model == "deepseek-flash"
     persisted = tomllib.loads(config_path.read_text())
-    assert persisted["llm"]["model"] == "deepseek-v4-flash"
+    assert persisted["llm"]["model"] == "deepseek-flash"
     assert persisted["llm_profiles"]["openai"]["model"] == "gpt-old"
     assert target_secret not in repr(response.payload)
     assert old_secret not in repr(response.payload)

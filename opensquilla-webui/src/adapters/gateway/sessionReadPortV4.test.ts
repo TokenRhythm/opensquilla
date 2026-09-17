@@ -304,6 +304,7 @@ describe('v4 SessionReadPort Adapter', () => {
     const events = createConversationEventsTestHarness()
     const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
     const approvals = scope.run(() => useChatApprovals({
+      gatewayAvailability: ref('available'),
       approvalCenter: {
         snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),
         subscribe: vi.fn(() => ({ close: vi.fn() })),

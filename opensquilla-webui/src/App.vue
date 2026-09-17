@@ -1854,6 +1854,7 @@ function errorMessage(err: unknown): string {
 // ---------------------------------------------------------------------------
 
 const approvalSubscriptions: ApprovalSubscription[] = []
+let approvalSeedGeneration = 0
 
 function approvalItemToPending(item: ApprovalItem): PendingApproval | null {
   const approvalId = item.id.trim()
@@ -1870,8 +1871,12 @@ function approvalItemToPending(item: ApprovalItem): PendingApproval | null {
 // while a request is already pending. The
 // snapshot is ordered oldest-first, which the deep-link relies on.
 async function seedPendingApprovals() {
+  if (!appAutomaticRpcMounted || gatewayAccess.availability !== 'available') return
+  const generation = ++approvalSeedGeneration
   try {
     const snapshot = await approvalCenter.snapshot()
+    if (!appAutomaticRpcMounted || generation !== approvalSeedGeneration
+      || gatewayAccess.availability !== 'available') return
     const items = snapshot.pending
       .map(approvalItemToPending)
       .filter((item): item is PendingApproval => item !== null)
@@ -1896,6 +1901,7 @@ function onApprovalEvent(event: ApprovalEvent) {
 // was down); the push events keep it live thereafter.
 function onApprovalAvailability(state: 'available' | 'recovering' | 'unavailable') {
   if (state !== 'available') {
+    approvalSeedGeneration++
     appStore.setPendingApprovals([])
     return
   }
@@ -1910,6 +1916,7 @@ function subscribeApprovals() {
 }
 
 function unsubscribeApprovals() {
+  approvalSeedGeneration++
   approvalSubscriptions.splice(0).forEach(subscription => subscription.close())
   approvalCenter.dispose()
 }

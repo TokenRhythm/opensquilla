@@ -566,7 +566,8 @@ class SessionStreamRegistry:
                 self._clear_live_state(session_key)
             return
 
-        if task_id and current_task_id and task_id != current_task_id:
+        # A new task also replaces taskless standalone maintenance in the live view.
+        if task_id and task_id != current_task_id:
             self._clear_live_state(session_key)
         if task_id:
             self._live_task_by_session[session_key] = task_id

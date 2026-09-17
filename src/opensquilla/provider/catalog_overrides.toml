@@ -535,6 +535,9 @@ reasoning_format = "none"
 # Official https://api-docs.deepseek.com/quick_start/pricing, verified 2026-09-17.
 # The retired V4 Flash id is served by V4.1 Flash; this does not change the
 # distinct dated TokenRhythm deployment or OpenRouter's catalog identities.
+# Prices are peak-hour USD/Mtok estimates (input is cache miss). Off-peak
+# rates are half these amounts; the static catalog does not select a tariff
+# by request time. These conservative estimates are not provider-billed costs.
 [deepseek."deepseek-flash"]
 context_window = 1000000
 max_output_tokens = 384000
@@ -542,6 +545,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = true
 reasoning_format = "deepseek"
+input_cost_per_mtok = 0.3
+output_cost_per_mtok = 1.2
+cache_read_cost_per_mtok = 0.006
 
 [deepseek."deepseek-v4-flash"]
 context_window = 1000000
@@ -550,6 +556,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = true
 reasoning_format = "deepseek"
+input_cost_per_mtok = 0.3
+output_cost_per_mtok = 1.2
+cache_read_cost_per_mtok = 0.006
 
 # Other DeepSeek models retain their provider dialect and conservative vision default.
 [deepseek."*"]

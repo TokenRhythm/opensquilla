@@ -168,6 +168,19 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
     if not isinstance(content, str):
         return None
 
+    if tool_name in {"exec_command", "background_process"}:
+        try:
+            shell_payload = json.loads(content)
+        except (TypeError, ValueError):
+            shell_payload = None
+        if (
+            isinstance(shell_payload, dict)
+            and shell_payload.get("code") == "RUNTIME_UNAVAILABLE"
+            and shell_payload.get("status") == "failed"
+            and shell_payload.get("retryable") is False
+        ):
+            return runtime_execution_status("error", reason="runtime_unavailable")
+
     if tool_name == "exec_command":
         if content.startswith("[timeout after "):
             return {
@@ -301,13 +314,21 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
         if returncode is None:
             return None
         failed = returncode != 0
+        runtime_failure = session.get("runtime_failure")
+        runtime_unavailable = (
+            failed
+            and isinstance(runtime_failure, dict)
+            and runtime_failure.get("code") == "RUNTIME_UNAVAILABLE"
+        )
         return {
             "version": 1,
             "status": "error" if failed else "success",
             "exit_code": returncode,
             "timed_out": False,
             "truncated": False,
-            "reason": "nonzero_exit" if failed else None,
+            "reason": (
+                "runtime_unavailable" if runtime_unavailable else "nonzero_exit" if failed else None
+            ),
             "source": "adapter",
             "preservation_class": "diagnostic" if failed else "normal",
         }

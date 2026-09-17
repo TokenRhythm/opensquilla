@@ -138,7 +138,7 @@ _DEFAULT_MODELS = {
     "openai_responses": "gpt-5.4-mini",
     "openrouter": "deepseek/deepseek-v4-flash",
     "dashscope": "qwen3.7-plus",
-    "deepseek": "deepseek-v4-flash",
+    "deepseek": "deepseek-flash",
     "gemini": "gemini-3.5-flash",
     "volcengine": "doubao-seed-2-0-lite-260215",
     "volcengine_coding_plan": "doubao-seed-2.0-pro",

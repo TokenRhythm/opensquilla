@@ -2587,7 +2587,7 @@ def test_html_evidence_classifies_persisted_production_tool_failures(
     from opensquilla.engine.runtime import _persisted_tool_result_segment
     from opensquilla.engine.types import ToolResultEvent
     from opensquilla.tools.builtin.filesystem import _apply_edit_replacements, _EditReplacement
-    from opensquilla.tools.builtin.patch import Hunk, _apply_hunk, _parse_patch
+    from opensquilla.tools.builtin.patch import Hunk, _apply_update_content, _parse_patch
     from opensquilla.tools.envelope import build_tool_failure_envelope
     from opensquilla.tools.types import InvalidToolArgumentsError
 
@@ -2602,7 +2602,7 @@ def test_html_evidence_classifies_persisted_production_tool_failures(
             )
         elif failure == "patch-context":
             name = "apply_patch"
-            _apply_hunk(["actual\n"], Hunk(1, 1, 1, 1, ["-expected", "+replacement"]))
+            _apply_update_content("actual\n", [Hunk(1, 1, 1, 1, ["-expected", "+replacement"])])
         elif failure == "patch-format":
             name = "apply_patch"
             _parse_patch("PRIVATE_PATCH_SENTINEL")

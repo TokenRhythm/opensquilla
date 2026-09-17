@@ -173,6 +173,7 @@
     "tests/test_channels/test_feishu_approval_card.py": 0.01,
     "tests/test_channels/test_feishu_auth_validation.py": 11.843,
     "tests/test_channels/test_feishu_reactions.py": 0.01,
+    "tests/test_channels/test_feishu_sdk_websocket.py": 0.01,
     "tests/test_channels/test_feishu_send_file.py": 0.026,
     "tests/test_channels/test_feishu_websocket_transport.py": 0.372,
     "tests/test_channels/test_length_declaration_conformance.py": 0.045,

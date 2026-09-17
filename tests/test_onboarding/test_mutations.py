@@ -1472,8 +1472,8 @@ def test_upsert_llm_provider_preset_id_applies_default_model_when_model_omitted(
         api_key_env="DEEPSEEK_API_KEY",
     )
 
-    # deepseek preset default_model is deepseek-v4-flash.
-    assert res.config.llm.model == "deepseek-v4-flash"
+    # DeepSeek official preset uses the current Flash model ID.
+    assert res.config.llm.model == "deepseek-flash"
 
 
 def test_upsert_llm_provider_preset_id_synthesized_writes_custom_shape():
@@ -1765,7 +1765,7 @@ def test_upsert_router_custom_is_accepted_for_any_provider():
     assert res.config.squilla_router.enabled is True
     assert res.config.squilla_router.tier_profile is None
     assert res.config.squilla_router.tiers["c0"]["provider"] == "deepseek"
-    assert res.config.squilla_router.tiers["c0"]["model"] == "deepseek-v4-flash"
+    assert res.config.squilla_router.tiers["c0"]["model"] == "deepseek-flash"
     assert res.public_payload["mode"] == "custom"
     assert res.public_payload["tier_profile"] is None
     # With no persisted profile the effective tiers persist expanded inline.

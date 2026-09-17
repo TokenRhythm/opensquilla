@@ -255,7 +255,7 @@ def test_onboard_noninteractive_provider_can_omit_model_for_router_profile(
     assert result.exit_code == 0, result.stdout
     data = tomllib.loads(target.read_text())
     assert data["llm"]["provider"] == "deepseek"
-    assert data["llm"]["model"] == "deepseek-v4-flash"
+    assert data["llm"]["model"] == "deepseek-flash"
     assert data["squilla_router"]["tier_profile"] == "deepseek"
 
 
@@ -1745,7 +1745,7 @@ def test_configure_provider_can_omit_model_for_router_profile(tmp_path, monkeypa
     assert result.exit_code == 0, result.stdout
     data = tomllib.loads(target.read_text())
     assert data["llm"]["provider"] == "deepseek"
-    assert data["llm"]["model"] == "deepseek-v4-flash"
+    assert data["llm"]["model"] == "deepseek-flash"
 
 
 def test_configure_provider_fails_closed_for_unclassified_foreign_router(tmp_path, monkeypatch):

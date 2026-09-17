@@ -73,15 +73,43 @@ def test_nsis_upgrade_still_requires_pinned_baseline(nsis_regression, fresh_nsis
 
 
 def _fresh_interaction_success():
+    desktop_records = _fresh_shutdown_log()
+    main_records = [
+        {"event": "observation-start", "index": 0, "at": "2026-09-17T01:00:00.000Z"},
+        {"event": "cleanup-start", "index": 1, "at": "2026-09-17T01:00:01.000Z"},
+        {"event": "observation-exit", "index": 2, "at": "2026-09-17T01:00:02.000Z",
+         "code": 0, "writeErrors": 0},
+    ]
+
+    def summary(records):
+        raw = ("\n".join(json.dumps(item) for item in records) + "\n").encode()
+        return {
+            "complete": True, "malformedRecords": 0, "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(), "records": records,
+        }
+
     return {
+        "reportType": "packaged-first-send", "schemaVersion": 2,
         "ok": True, "executable": "OpenSquilla.exe", "iterations": 20,
         "rpc": {"chatSend": 40, "uniqueSessions": 20}, "provider": {"chatRequestCount": 40},
-        "renderer": {"pageErrors": 0, "consoleErrors": 0}, "externalRendererRequests": 0,
+        "renderer": {
+            "pageErrors": 0, "consoleErrors": 0, "pageErrorDetails": [], "consoleErrorDetails": [],
+        },
+        "externalRendererRequests": 0,
+        "observation": {
+            "completed": True, "errors": [], "targetPageId": 1, "targetWebContentsId": 7,
+            "subframePageIds": [],
+            "mainConsoleRecords": [], "journal": summary(main_records),
+        },
+        "acceptance": {
+            "version": 1, "cleanupSucceeded": True, "consoleMatches": [],
+            "unexpectedConsoleIndices": [], "unexpectedMainRecordIndices": [],
+            "unexpectedDesktopRecordIndices": [], "failures": [],
+        },
         "desktopLog": {
+            **summary(desktop_records),
             "forbiddenErrorCount": 0, "unexpectedRendererErrorCount": 0,
-            "eventCounts": {
-                "before_quit": 1, "quit_gateway_shutdown_requested": 1, "quit_gateway_exit": 1,
-            },
+            "eventCounts": {record["event"]: 1 for record in desktop_records},
         },
     }
 
@@ -114,11 +142,13 @@ def test_nsis_fresh_probe_requires_normal_quit(nsis_regression, event):
 
 def _fresh_shutdown_log():
     # Native packaged first-send evidence: Gateway clean exit precedes commit.
-    return [
+    return [dict(at="2026-09-17T01:00:01.000Z", **record) for record in [
+        {"event": "before_quit", "gatewayDrainInFlight": False},
+        {"event": "quit_gateway_shutdown_requested", "accepted": True, "alreadyStopping": False},
         {"event": "quit_gateway_exit", "exited": True, "hardTerminated": False},
         {"event": "desktop_exit_phase", "from": "draining", "to": "committed",
          "reason": "all lifecycle-owned Gateways exited"},
-    ]
+    ]]
 
 
 @pytest.mark.parametrize("mutation", [
@@ -127,9 +157,9 @@ def _fresh_shutdown_log():
 def test_nsis_fresh_normal_quit_requires_clean_gateway_then_commit(nsis_regression, mutation):
     records = _fresh_shutdown_log()
     if mutation == "hard-terminated":
-        records[0]["hardTerminated"] = True
+        records[2]["hardTerminated"] = True
     elif mutation == "not-exited":
-        records[0]["exited"] = False
+        records[2]["exited"] = False
     elif mutation == "missing-commit":
         records.pop()
     elif mutation == "reversed":
@@ -213,11 +243,18 @@ def test_nsis_fresh_installs_bound_candidate_then_launches_unseeded_installed_ex
         audit.user_data.mkdir()
         (audit.user_data / "logs").mkdir()
         (audit.user_data / "logs/desktop.log").write_text(
-            "\n".join(json.dumps(item) for item in _fresh_shutdown_log()), encoding="utf-8",
+            "\n".join(json.dumps(item) for item in _fresh_shutdown_log()) + "\n",
+            encoding="utf-8", newline="\n",
         )
         (audit.evidence / "fresh-first-interaction-stdout.log").write_text(
             '{"phase":"cleanup-complete"}\n' + json.dumps(_fresh_interaction_success()),
             encoding="utf-8",
+        )
+        (audit.evidence / "fresh-first-interaction-stderr.log").write_text("", encoding="utf-8")
+        (audit.user_data / "first-send-main-console.jsonl").write_text(
+            "\n".join(json.dumps(item) for item
+                      in _fresh_interaction_success()["observation"]["journal"]["records"]) + "\n",
+            encoding="utf-8", newline="\n",
         )
         return {"exitCode": 0, "tempEnvironmentSamples": [{
             "image": str(audit.install / "OpenSquilla.exe"), "TEMP": str(temp), "TMP": str(temp),

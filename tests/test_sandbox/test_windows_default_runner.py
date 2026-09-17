@@ -70,6 +70,41 @@ def test_helper_error_marker_and_offline_payload_keep_authentication_nonce(
     assert json.loads(mod._payload_to_json(payload))["helperNonce"] == "nonce-123"
 
 
+def test_timeout_marker_survives_offline_payload_and_preserves_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as backend
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    payload = mod.HelperPayload(
+        argv=("cmd", "/c", "exit 124"),
+        cwd=tmp_path,
+        env={},
+        policy={"network": "none", "mounts": []},
+        run_mode="safe",
+        timeout=5,
+        helper_nonce="timeout-test",
+    )
+    offline = mod._parse_payload([mod._payload_to_json(replace(payload, offline_child=True))])
+    assert offline.helper_nonce == payload.helper_nonce
+    assert "helperNonce" not in mod._effective_child_env(offline)
+    stderr = io.BytesIO()
+    monkeypatch.setattr(mod.sys, "stderr", SimpleNamespace(buffer=stderr))
+    user_output = b"unterminated stderr\xff"
+    stderr.write(user_output)
+
+    mod._emit_helper_timeout(offline)
+    mod._emit_helper_timeout(payload)
+
+    assert backend._extract_authenticated_helper_timeout(
+        stderr.getvalue(), expected_nonce=payload.helper_nonce
+    ) == (user_output, True)
+    stderr.seek(0)
+    stderr.truncate()
+    mod._emit_helper_timeout(replace(payload, helper_nonce=""))
+    assert stderr.getvalue() == b""
+
+
 def test_parse_payload_decodes_stdin_base64(tmp_path) -> None:
     from opensquilla.sandbox.backend.windows_default_runner import _parse_payload
 
@@ -692,9 +727,7 @@ def test_live_deny_acl_requires_exact_nonduplicated_managed_aces() -> None:
 
     stored_write_mask = mod.FILE_WRITE_DENY_MASK & ~mod.GENERIC_WRITE
     inherited_children = (
-        mod.OBJECT_INHERIT_ACE_FLAG
-        | mod.CONTAINER_INHERIT_ACE_FLAG
-        | mod.INHERIT_ONLY_ACE_FLAG
+        mod.OBJECT_INHERIT_ACE_FLAG | mod.CONTAINER_INHERIT_ACE_FLAG | mod.INHERIT_ONLY_ACE_FLAG
     )
 
     assert mod._deny_ace_entries_match_expected(
@@ -2600,9 +2633,17 @@ def test_offline_identity_launch_grants_payload_acl_roots_to_offline_user(
     assert grants == [(tmp_path, "RWX", "S-1-5-21-100-200-300-400")]
 
 
+@pytest.mark.parametrize(
+    ("wait_result", "child_exit", "expected_timeout"),
+    [(0, 0, False), (0, 124, False), (0x00000102, 0, True)],
+)
 def test_offline_identity_native_launch_sets_all_stdio_handles(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    capsys,
+    wait_result: int,
+    child_exit: int,
+    expected_timeout: bool,
 ) -> None:
     import ctypes
     import os
@@ -2633,6 +2674,7 @@ def test_offline_identity_native_launch_sets_all_stdio_handles(
         },
         run_mode="trusted",
         timeout=5,
+        helper_nonce="native-timeout-test",
     )
     captured: dict[str, object] = {}
     events: list[str] = []
@@ -2686,7 +2728,7 @@ def test_offline_identity_native_launch_sets_all_stdio_handles(
         return 1
 
     def _get_exit_code_process(_process, code):
-        code._obj.value = 0
+        code._obj.value = child_exit
         return 1
 
     def _write_file(_handle, data, size, written, _overlapped):
@@ -2704,7 +2746,9 @@ def test_offline_identity_native_launch_sets_all_stdio_handles(
             self.CreatePipe = FakeFunction(_create_pipe)
             self.SetHandleInformation = FakeFunction(lambda *_args: 1)
             self.CloseHandle = FakeFunction(lambda *_args: 1)
-            self.WaitForSingleObject = FakeFunction(lambda *_args: events.append("wait") or 0)
+            self.WaitForSingleObject = FakeFunction(
+                lambda *_args: events.append("wait") or wait_result
+            )
             self.TerminateProcess = FakeFunction(lambda *_args: 1)
             self.CreateJobObjectW = FakeFunction(lambda *_args: _new_handle())
             self.SetInformationJobObject = FakeFunction(lambda *_args: 1)
@@ -2734,14 +2778,17 @@ def test_offline_identity_native_launch_sets_all_stdio_handles(
         lambda _handle, _flags: os.open(os.devnull, os.O_RDONLY),
     )
 
-    assert (
-        mod._run_payload_as_offline_identity_native(
-            payload,
-            username="OpenSquillaSandbox",
-            password="secret",
-        )
-        == 0
-    )
+    assert mod._run_payload_as_offline_identity_native(
+        payload,
+        username="OpenSquillaSandbox",
+        password="secret",
+    ) == (124 if expected_timeout else child_exit)
+    from opensquilla.sandbox.backend import windows_default as backend
+
+    raw_stderr = capsys.readouterr().err.encode()
+    assert backend._extract_authenticated_helper_timeout(
+        raw_stderr, expected_nonce="native-timeout-test"
+    ) == (b"", expected_timeout)
     assert captured["stdin"]
     assert captured["stdout"]
     assert captured["stderr"]

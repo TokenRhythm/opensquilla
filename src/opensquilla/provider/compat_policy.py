@@ -499,6 +499,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "azure": OpenAICompatPolicy(display_name="Azure OpenAI"),
     "deepseek": OpenAICompatPolicy(
         display_name="DeepSeek",
+        official_host="api.deepseek.com",
         default_reasoning_format="deepseek",
         supports_native_json_schema_output=False,
         supports_json_object_output=True,

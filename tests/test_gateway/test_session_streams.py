@@ -452,6 +452,75 @@ def test_live_turn_snapshot_is_replaced_by_the_next_task_and_cleared_on_terminal
     assert terminal_snapshot.current_stream_seq == registry.current_seq(session_key)
 
 
+def test_standalone_compaction_does_not_enter_next_turn_activity(monkeypatch) -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:standalone-compaction"
+    clock = iter((1_000, 1_100, 240_000, 260_157))
+    monkeypatch.setattr(session_streams, "_epoch_time_ms", lambda: next(clock))
+
+    for status in ("started", "completed"):
+        registry.record(
+            session_key,
+            "session.event.compaction",
+            {"compaction_id": "manual-1", "status": status, "source": "manual"},
+        )
+    assert [event.event_name for event in registry.live_snapshot(session_key).events] == [
+        "session.event.compaction",
+        "session.event.compaction",
+    ]
+
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {"task_id": "task-next", "turn_id": "task-next", "phase": "requesting"},
+    )
+    live = registry.live_snapshot(session_key)
+    assert live.task_id == "task-next"
+    assert [event.event_name for event in live.events] == ["session.event.provider_activity"]
+
+    registry.record(
+        session_key,
+        "session.event.done",
+        {"task_id": "task-next", "turn_id": "task-next"},
+    )
+    snapshot = registry.take_terminal_activity_snapshot(
+        session_key, "task-next", turn_id="task-next"
+    )
+    assert snapshot is not None
+    assert [entry["type"] for entry in snapshot["entries"]] == ["phase"]
+    assert snapshot["entries"][0]["at"] == 240_000
+    assert snapshot["entries"][0]["ended_at"] == 260_157
+    assert len(registry.replay(session_key, 0).events) == 4
+
+
+def test_compaction_during_a_turn_remains_in_its_activity() -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:in-turn-compaction"
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {"task_id": "task-active", "turn_id": "task-active", "phase": "requesting"},
+    )
+    registry.record(
+        session_key,
+        "session.event.compaction",
+        {"compaction_id": "automatic-1", "status": "completed", "source": "automatic"},
+    )
+    registry.record(
+        session_key,
+        "session.event.done",
+        {"task_id": "task-active", "turn_id": "task-active"},
+    )
+
+    snapshot = registry.take_terminal_activity_snapshot(
+        session_key, "task-active", turn_id="task-active"
+    )
+    assert snapshot is not None
+    assert [entry["type"] for entry in snapshot["entries"]] == [
+        "phase", "maintenance",
+    ]
+
+
 def test_turn_committed_replays_without_reopening_or_clearing_successors() -> None:
     session_key = "agent:main:durable-terminal"
     registry = SessionStreamRegistry(max_events_per_session=10)

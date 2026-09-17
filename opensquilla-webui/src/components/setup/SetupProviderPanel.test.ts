@@ -353,6 +353,66 @@ describe('SetupProviderPanel — verify configuration', () => {
 })
 
 describe('SetupProviderPanel — visible verification dialog', () => {
+  it('keeps refresh and discovery feedback visible in the provider editor', async () => {
+    const onRefreshModels = vi.fn()
+    const { app, el, panelState } = await mountPanel({
+      connection: connection({ discovering: true }),
+    }, { onRefreshModels })
+    try {
+      const dialog = await openConfiguredEditor(el)
+      const refresh = dialog.querySelector<HTMLButtonElement>('[data-testid="setup-refresh-models"]')!
+      const status = () => dialog.querySelector('[data-testid="setup-model-catalog-sync"]')
+      expect(status()?.textContent).toBe('Discovering models…')
+      expect(status()?.getAttribute('role')).toBe('status')
+      expect(refresh.disabled).toBe(true)
+      expect(dialog.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')?.disabled)
+        .toBe(false)
+
+      panelState.connection = connection({ discoverError: 'HTTP 401' })
+      await nextTick()
+      expect(status()?.textContent).toContain('Couldn\'t list models — type a model id.')
+      expect(status()?.textContent).toContain('HTTP 401')
+      expect(refresh.disabled).toBe(false)
+      refresh.click()
+      expect(onRefreshModels).toHaveBeenCalledOnce()
+
+      panelState.connection = connection({ modelSource: 'live' })
+      await nextTick()
+      expect(status()?.textContent).toBe('Available · 0')
+    } finally { app.unmount() }
+  })
+
+  it('lets a DeepSeek editor choose and save a discovered model without replacing its ID', async () => {
+    const onUpdateProviderField = vi.fn((_name: string, value: unknown) => {
+      panelState.providerFieldValue = () => String(value)
+    })
+    const onSaveProvider = vi.fn()
+    const { app, el, panelState } = await mountPanel({
+      providerSelected: 'deepseek',
+      runtimeProviders: [{ providerId: 'deepseek', label: 'DeepSeek' }],
+      providerFieldValue: () => 'deepseek-v4-flash',
+      connection: connection({
+        modelSource: 'live',
+        models: [{ ...DISCOVERED[0], id: 'deepseek-flash', name: 'DeepSeek Flash' }],
+      }),
+    }, { dirty: true, onUpdateProviderField, onSaveProvider })
+    try {
+      const dialog = await openConfiguredEditor(el, 'deepseek')
+      dialog.querySelector<HTMLButtonElement>('[data-testid="setup-model-options-toggle"]')!.click()
+      await nextTick()
+      const option = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+        .find(row => row.textContent?.includes('deepseek-flash'))!
+      expect(option).toBeTruthy()
+      option.click()
+      await nextTick()
+      expect(onUpdateProviderField).toHaveBeenCalledWith('model', 'deepseek-flash')
+      expect(dialog.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')?.value)
+        .toBe('deepseek-flash')
+      dialog.querySelector<HTMLButtonElement>('.setup-provider-modal__footer .btn--primary')!.click()
+      expect(onSaveProvider).toHaveBeenCalledOnce()
+    } finally { app.unmount() }
+  })
+
   it('uses separate probe modes and shows successful model timings in the teleported editor', async () => {
     const onProbeConnection = vi.fn()
     const { app, el } = await mountPanel({

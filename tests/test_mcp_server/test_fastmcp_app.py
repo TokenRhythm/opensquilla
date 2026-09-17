@@ -107,3 +107,4 @@ def test_optional_mcp_dependency_excludes_vulnerable_fastmcp_releases() -> None:
     requirement = next(Requirement(spec) for spec in mcp_specs if spec.startswith("mcp"))
     assert "1.28.1" in requirement.specifier
     assert "1.28.0" not in requirement.specifier
+    assert "2.0.0" not in requirement.specifier

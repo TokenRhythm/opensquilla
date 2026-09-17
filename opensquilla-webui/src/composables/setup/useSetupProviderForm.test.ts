@@ -774,23 +774,30 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('restores the previous state when an in-flight model test is cancelled', async () => {
     let resolveProbe!: (value: unknown) => void
+    let resolveDiscover!: (value: unknown) => void
     callMock.mockImplementation((method: string) => {
       if (method === 'onboarding.provider.probe') {
         return new Promise(resolve => { resolveProbe = resolve })
       }
-      if (method === 'onboarding.models.discover') return Promise.resolve(DISCOVER_OK)
+      if (method === 'onboarding.models.discover') {
+        return new Promise(resolve => { resolveDiscover = resolve })
+      }
       throw new Error(`unexpected rpc method: ${method}`)
     })
     const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
 
+    const discovery = f.discoverModels()
+    expect(f.connection.value.discovering).toBe(true)
     const pending = f.probeConnection({ defaultModel: 'slow-model', mode: 'model' })
     expect(f.connection.value).toMatchObject({ phase: 'probing', probeMode: 'model' })
     f.cancelProbe()
     expect(f.connection.value.phase).toBe('unverified')
+    expect(f.connection.value.discovering).toBe(false)
 
     resolveProbe(PROBE_OK)
-    await pending
+    resolveDiscover(DISCOVER_OK)
+    await Promise.all([pending, discovery])
     expect(f.connection.value.phase).toBe('unverified')
     expect(f.connection.value.failureKind).toBe('')
   })
@@ -1206,11 +1213,31 @@ describe('useSetupProviderForm — connection state machine', () => {
 
     const first = f.discoverModels()
     const second = f.discoverModels()
+    expect(f.connection.value.discovering).toBe(true)
     resolvers.forEach(resolve => resolve(DISCOVER_OK))
     await Promise.all([first, second])
 
     expect(callMock).toHaveBeenCalledTimes(1)
     expect(f.connection.value.models).toHaveLength(1)
+    expect(f.connection.value.discovering).toBe(false)
+  })
+
+  it('does not clear the current loading status when a stale discovery completes', async () => {
+    const resolvers: Array<(value: unknown) => void> = []
+    callMock.mockImplementation(() => new Promise(resolve => { resolvers.push(resolve) }))
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('openai')
+    const stale = f.discoverModels()
+    f.selectProvider('deepseek')
+    expect(f.connection.value.discovering).toBe(false)
+    const current = f.discoverModels()
+
+    resolvers[0](DISCOVER_OK)
+    await stale
+    expect(f.connection.value.discovering).toBe(true)
+    resolvers[1](DISCOVER_OK)
+    await current
+    expect(f.connection.value.discovering).toBe(false)
   })
 
   it('keeps an in-flight catalog request alive while the user types a model id', async () => {

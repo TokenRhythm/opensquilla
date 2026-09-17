@@ -723,6 +723,13 @@ const effectiveMaxTokensReadout = computed(() => {
 })
 
 const catalogSyncReadout = computed(() => {
+  if (props.panel.connection.discovering) return t('setup.provider.discoveringModels')
+  if (props.panel.connection.discoverError) {
+    return `${t('setup.provider.discoverFailed')} ${props.panel.connection.discoverError}`
+  }
+  if (props.panel.connection.modelSource === 'live' && !props.panel.connection.models.length) {
+    return t('setup.provider.modelListReadout', { count: 0 })
+  }
   const catalog = props.panel.connection.catalog
   if (!catalog) return ''
   const ago = localizedRelativeTime(catalog.lastSyncedAt, locale.value)
@@ -1050,6 +1057,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           type="button"
           class="btn btn--ghost setup-model-catalog-sync__refresh"
           data-testid="setup-refresh-models"
+          :disabled="providerBusy || saving || panel.connection.discovering"
           @click="emit('refreshModels')"
         >
           <Icon name="refresh" :size="14" aria-hidden="true" />
@@ -1336,6 +1344,25 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                       @update="(name, val) => emit('updateProviderField', name, val)"
                     />
                   </template>
+                  <div class="setup-model-catalog-sync">
+                    <span
+                      v-if="catalogSyncReadout"
+                      class="setup-model-catalog-sync__status"
+                      :class="{ 'is-stale': panel.connection.catalog?.stale }"
+                      data-testid="setup-model-catalog-sync"
+                      role="status"
+                    >{{ catalogSyncReadout }}</span>
+                    <button
+                      type="button"
+                      class="btn btn--ghost setup-model-catalog-sync__refresh"
+                      data-testid="setup-refresh-models"
+                      :disabled="providerBusy || saving || panel.connection.discovering"
+                      @click="emit('refreshModels')"
+                    >
+                      <Icon name="refresh" :size="14" aria-hidden="true" />
+                      {{ t('setup.provider.refreshModels') }}
+                    </button>
+                  </div>
                   <SetupModelCapacity
                     inline :provider="panel.providerSelected"
                     :model="String(panel.providerFieldValue({ name: 'model', label: '' }) || '')"
@@ -1961,6 +1988,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 .setup-model-catalog-sync__status {
   color: var(--text-muted);
   font-size: var(--fs-xs);
+  overflow-wrap: anywhere;
 }
 
 .setup-model-catalog-sync__status.is-stale {

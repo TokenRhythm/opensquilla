@@ -27,6 +27,7 @@ class ChildRole(StrEnum):
     LINUX_HELPER = "linux-helper"
     WINDOWS_DEFAULT_RUNNER = "windows-default-runner"
     DIRECTORY_PICKER = "directory-picker"
+    PYTHON_CODE = "python-code"
 
 
 class InternalChildDispatchError(ValueError):
@@ -39,6 +40,7 @@ _ROLE_MODULES: dict[ChildRole, str] = {
     ChildRole.LINUX_HELPER: "opensquilla.sandbox.backend.linux_helper",
     ChildRole.WINDOWS_DEFAULT_RUNNER: "opensquilla.sandbox.backend.windows_default_runner",
     ChildRole.DIRECTORY_PICKER: "opensquilla.gateway.windows_directory_picker",
+    ChildRole.PYTHON_CODE: "opensquilla.sandbox.python_code_runner",
 }
 
 _RUNTIME_ROOT_ENV = "OPENSQUILLA_BUNDLED_RUNTIME_ROOT"
@@ -199,12 +201,19 @@ def _run_directory_picker(args: Sequence[str]) -> int:
     return int(main(args))
 
 
+def _run_python_code(args: Sequence[str]) -> int:
+    from opensquilla.sandbox.python_code_runner import main
+
+    return main(args)
+
+
 _ROLE_HANDLERS: dict[ChildRole, Callable[[Sequence[str]], int]] = {
     ChildRole.PROCESS_TREE: _run_process_tree,
     ChildRole.FILESYSTEM_WORKER: _run_filesystem_worker,
     ChildRole.LINUX_HELPER: _run_linux_helper,
     ChildRole.WINDOWS_DEFAULT_RUNNER: _run_windows_default_runner,
     ChildRole.DIRECTORY_PICKER: _run_directory_picker,
+    ChildRole.PYTHON_CODE: _run_python_code,
 }
 
 

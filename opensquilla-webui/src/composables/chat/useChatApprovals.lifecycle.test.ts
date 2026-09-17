@@ -34,6 +34,7 @@ function harness() {
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
   const submit = vi.fn(async (_command: unknown): Promise<unknown> => ({ resolved: true }))
   const approvals = scope.run(() => useChatApprovals({
+    gatewayAvailability: ref('available'),
     approvalCenter: {
       snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),
       subscribe: vi.fn(() => ({ close: vi.fn() })),

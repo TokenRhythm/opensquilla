@@ -187,9 +187,9 @@ async def test_provider_configure_can_omit_model_for_router_profile(tmp_path, mo
         _admin_ctx(),
     )
     assert res.error is None, res.error
-    assert res.payload["entry"]["model"] == "deepseek-v4-flash"
+    assert res.payload["entry"]["model"] == "deepseek-flash"
     data = tomllib.loads((tmp_path / "c.toml").read_text())
-    assert data["llm"]["model"] == "deepseek-v4-flash"
+    assert data["llm"]["model"] == "deepseek-flash"
     assert data["squilla_router"]["tier_profile"] == "deepseek"
 
 

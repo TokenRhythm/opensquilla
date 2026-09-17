@@ -15,41 +15,46 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "starlette>=1.3.1",
-    "python-multipart>=0.0.31",
+    "starlette>=1.6.0",
+    "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.30",
-    "watchfiles>=1.1.1",
-    "pydantic>=2.0",
-    "pydantic-settings>=2.14.2",
-    "sqlmodel>=0.0.20",
-    "sqlalchemy>=2.0",
-    "anyio>=4.0",
+    "watchfiles>=1.2.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "sqlmodel>=0.0.42",
+    "sqlalchemy>=2.0.52",
+    "anyio>=4.15.1",
     "httpx>=0.27",
     # Security floors for HTTP and parsing dependencies used by base features.
     "aiohttp>=3.14.3",
-    "idna>=3.15",
+    "idna>=3.19",
     "urllib3>=2.7.0",
     "brotli>=1.1",
     "jinja2>=3.1",
-    "structlog>=24.0",
-    "typer>=0.12",
-    "click>=8.3.3",
+    "structlog>=26.1.0",
+    # The compact help renderer adapts Typer's private Rich panel hook.
+    # Review that contract before moving to another Typer minor series.
+    "typer>=0.27.2,<0.28",
+    "click>=8.5.0,<9",
     "rich>=13.0",
-    "websockets>=13.0",
+    # Keep fresh installs on the current transport family while Lark declares
+    # websockets<16 in newer SDKs. Revisit both bounds together after real SDK
+    # reconnect/close acceptance; this is not a long-term support guarantee.
+    "websockets>=16.0,<17",
     "aiosqlite>=0.20",
-    "apscheduler>=3.10",
+    "apscheduler>=3.11.3",
     "pyyaml>=6.0",
     "sqlite-vec>=0.1",
     "html2text>=2024.2",
-    "readability-lxml>=0.8",
+    "readability-lxml>=0.9",
     "lxml-html-clean>=0.4.5",
-    "beautifulsoup4>=4.12",
-    "soupsieve>=2.8.4",
+    "beautifulsoup4>=4.15.0",
+    "soupsieve>=2.9.2",
     "cachetools>=5.3",
-    "certifi>=2024.7.4",
-    "pdfplumber>=0.11",
+    "certifi>=2026.7.22",
+    "pdfplumber>=0.11.10",
     "pillow>=12.3.0",
-    "croniter>=2.0",
+    "croniter>=6.2.4",
     "tomli-w>=1.0",
     "yoyo-migrations>=8.2,<10",
     "sqlparse>=0.6.0",
@@ -59,13 +64,13 @@ dependencies = [
     "python-docx>=1.1.0",
     "python-pptx>=1.0.0",
     "openpyxl>=3.1.0",
-    "pypdf>=6.16.1",
+    "pypdf>=6.18.1",
     "reportlab>=4.0.0",
-    "lark-oapi>=1.5.3,<2",
-    "python-telegram-bot>=20.0",
+    "lark-oapi>=1.5.5,<1.6",
+    "python-telegram-bot>=22.8",
     "dingtalk-stream>=0.24.3,<0.25",
     "qq-botpy>=1.2.1,<1.3",
-    "cryptography>=50.0.0",
+    "cryptography>=50.0.1",
     "duckduckgo-search>=8.1.1",
     "anyascii>=0.3.3",
     "snowballstemmer>=2.2",
@@ -73,33 +78,34 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "pytest-xdist>=3.6",
-    "mypy>=1.10",
-    "ruff>=0.5",
+    "mypy>=2.3.1",
+    "ruff>=0.16.7",
 ]
-mcp = ["mcp>=1.28.1"]
+# The MCP server uses the v1 FastMCP API; v2 requires a separate migration.
+mcp = ["mcp>=1.28.1,<2"]
 # Optional Outlook .msg attachment extraction. Heavy transitive deps
 # (oletools, msoffcrypto-tool, …), so it is opt-in; .msg uploads degrade
 # gracefully with a clear message when this extra is not installed.
-msg = ["extract-msg>=0.48"]
+msg = ["extract-msg>=0.56.1"]
 memory = [
-    "tiktoken>=0.5",
+    "tiktoken>=0.14.0",
     "jieba>=0.42",
 ]
 recommended = [
-    "tiktoken>=0.5",
+    "tiktoken>=0.14.0",
     "jieba>=0.42",
-    "numpy>=1.26",
-    "lightgbm>=4.0",
-    "joblib>=1.3",
-    "scikit-learn>=1.3",
-    "onnxruntime>=1.17",
-    "tokenizers>=0.15",
+    "numpy>=2.5.3",
+    "lightgbm>=4.7.0",
+    "joblib>=1.6.0",
+    "scikit-learn>=1.9.1",
+    "onnxruntime>=1.30.0",
+    "tokenizers>=0.23.2",
 ]
-matrix = ["matrix-nio>=0.25,<0.26", "markdown>=3.0", "h2>=4.4.1"]
-matrix-e2e = ["matrix-nio[e2e]>=0.25,<0.26", "markdown>=3.0", "h2>=4.4.1"]
+matrix = ["matrix-nio>=0.25,<0.26", "markdown>=3.10.3", "h2>=4.4.1"]
+matrix-e2e = ["matrix-nio[e2e]>=0.25,<0.26", "markdown>=3.10.3", "h2>=4.4.1"]
 document-extras = [
     "weasyprint>=70.0",
 ]
@@ -264,5 +270,5 @@ wheelhouse-build = ["pip==26.2.1"]
 dev = [
     "datamodel-code-generator==0.75.1",
     "laboratory>=1.0.2",
-    "syrupy>=5.1.0",
+    "syrupy>=6.1.1",
 ]

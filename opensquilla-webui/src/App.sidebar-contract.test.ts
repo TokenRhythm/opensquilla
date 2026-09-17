@@ -80,4 +80,15 @@ describe('App sidebar chrome contract', () => {
     expect(appSource).not.toContain("rpcStore.on('plugin.approval")
     expect(appSource).not.toContain("rpcStore.on('_state', onApproval")
   })
+
+  it('admits approval hydration only after mount and Gateway readiness, rejecting stale results', () => {
+    const seed = appSource.slice(appSource.indexOf('async function seedPendingApprovals()'), appSource.indexOf('function onApprovalEvent('))
+    const request = seed.indexOf('await approvalCenter.snapshot()')
+    expect(seed.slice(0, request)).toContain("if (!appAutomaticRpcMounted || gatewayAccess.availability !== 'available') return")
+    expect(seed.slice(request)).toContain('generation !== approvalSeedGeneration')
+    expect(seed.slice(request)).toContain("gatewayAccess.availability !== 'available'")
+    const availability = appSource.slice(appSource.indexOf('function onApprovalAvailability('), appSource.indexOf('function subscribeApprovals()'))
+    expect(availability).toContain('approvalSeedGeneration++')
+    expect(availability).toContain('void seedPendingApprovals()')
+  })
 })

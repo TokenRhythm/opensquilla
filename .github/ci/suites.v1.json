@@ -31,6 +31,7 @@
     "webui-chat-recovery",
     "wheel-webui-roundtrip",
     "windows-high-risk",
+    "windows-nsis-regression",
     "workflow-lint"
   ],
   "full_desktop_matrix": [
@@ -145,6 +146,27 @@
     }
   },
   "suites": {
+    "windows-nsis-regression": {
+      "execution_inputs": [
+        ".github/actions/download-required-artifact/action.yml",
+        ".github/scripts/audit_dependencies.py",
+        ".github/scripts/verify-nsis-upgrade-regression.py",
+        ".github/scripts/verify-release-profile-preservation.py",
+        ".github/scripts/upgrade_baseline.py",
+        ".github/scripts/verify-release-windows-upgrade.ps1",
+        ".github/scripts/verify-sandbox-package.mjs",
+        ".github/workflows/windows-nsis-upgrade-regression.yml",
+        "desktop/electron/**",
+        "migrations/**",
+        "opensquilla-webui/**",
+        "pyproject.toml",
+        "scripts/build_wheelhouse_zip.py",
+        "scripts/release_dependency_inventory.py",
+        "src/opensquilla/**",
+        "tests/fixtures/upgrade-v054/**",
+        "uv.lock"
+      ]
+    },
     "workflow-lint": {
       "execution_inputs": [
         ".github/workflows/**",
@@ -341,6 +363,7 @@
         "scripts/install_source.*",
         "start.*",
         "tests/test_ci/test_upgrade_baselines.py",
+        "tests/test_ci/test_nsis_fresh_interaction.py",
         "tests/fixtures/upgrade-v054/**",
         "scripts/build_v054_upgrade_fixture.py",
         "tests/test_ci/test_windows_signed_update_audit.py",

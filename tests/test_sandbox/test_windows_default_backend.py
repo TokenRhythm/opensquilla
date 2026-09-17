@@ -1126,9 +1126,9 @@ def test_payload_prepends_real_windows_tool_paths_and_grants_user_tool_acl(
         grant["path"]: grant["access"]
         for grant in payload["policy"]["windowsAclPlan"]["autoGrants"]
     }
-    assert grants[str(userprofile / "AppData")] == "RX"
-    assert grants[str(local_appdata)] == "RX"
-    assert grants[str(local_appdata / "OpenAI")] == "RX"
+    assert str(userprofile / "AppData") not in grants
+    assert str(local_appdata) not in grants
+    assert str(local_appdata / "OpenAI") not in grants
     assert grants[str(node_bin)] == "RX"
     assert str(git_cmd) not in grants
 
@@ -1191,10 +1191,65 @@ def test_payload_discovers_codex_bundled_git_and_node_tools(
         grant["path"]: grant["access"]
         for grant in payload["policy"]["windowsAclPlan"]["autoGrants"]
     }
-    assert grants[str(userprofile / ".cache")] == "RX"
-    assert grants[str(userprofile / ".cache" / "codex-runtimes")] == "RX"
+    assert str(userprofile / ".cache") not in grants
+    assert str(userprofile / ".cache" / "codex-runtimes") not in grants
     assert grants[str(git_cmd)] == "RX"
     assert grants[str(node_bin)] == "RX"
+
+
+@pytest.mark.parametrize("parent_parts", [("AppData", "Local"), (".cache",)])
+@pytest.mark.parametrize("explicit_parent_read", [False, True])
+def test_tool_discovery_keeps_ancestor_reads_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_parts: tuple[str, ...],
+    explicit_parent_read: bool,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    userprofile = tmp_path / "user"
+    ancestor = userprofile.joinpath(*parent_parts)
+    tool_root = ancestor / "tools" / "node" / "bin"
+    tool_root.mkdir(parents=True)
+    (tool_root / "node.exe").write_bytes(b"synthetic tool discovery fixture")
+    unrelated = ancestor / "unrelated"
+    unrelated.mkdir()
+    entries = [FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE)]
+    if explicit_parent_read:
+        entries.append(FileSystemPermissionEntry(ancestor, FileSystemAccess.READ))
+    request = replace(
+        _request(workspace),
+        env={
+            "PATH": str(tool_root),
+            "USERPROFILE": str(userprofile),
+            "LOCALAPPDATA": str(userprofile / "AppData" / "Local"),
+            "APPDATA": str(userprofile / "AppData" / "Roaming"),
+        },
+        policy=replace(_policy(), file_system=FileSystemPermissionProfile(entries=tuple(entries))),
+    )
+    monkeypatch.setattr(mod, "_common_windows_tool_dirs", lambda _env: ())
+    monkeypatch.setattr(mod, "_host_tool_env", lambda _request: request.env)
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda _executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda _argv, _env: ())
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(mod, "_deny_acl_state_path", lambda: tmp_path / "deny_acl.json")
+
+    plan = mod._acl_plan_payload(request)
+    grants = {grant["path"]: grant for grant in plan["autoGrants"]}
+
+    assert grants[str(tool_root)]["access"] == "RX"
+    assert grants[str(workspace)]["access"] == "RWX"
+    assert str(tool_root.parent) not in grants
+    assert str(userprofile / "AppData") not in grants
+    assert str(unrelated) not in grants
+    if explicit_parent_read:
+        assert grants[str(ancestor)]["access"] == "RX"
+        assert grants[str(ancestor)]["kind"] == "policy"
+    else:
+        assert str(ancestor) not in grants
 
 
 def test_payload_encodes_stdin_as_base64(
@@ -1300,15 +1355,18 @@ async def test_backend_readonly_cwd_does_not_prepare_or_rehome_cache(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [7, 124])
 async def test_backend_returns_helper_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
 ) -> None:
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
     class _Proc:
-        returncode = 7
+        def __init__(self):
+            self.returncode = returncode
 
         async def communicate(self):
             return b"out", b"err"
@@ -1326,7 +1384,8 @@ async def test_backend_returns_helper_result(
 
     result = await WindowsDefaultBackend().run(_request(tmp_path))
 
-    assert result.returncode == 7
+    assert result.returncode == returncode
+    assert result.timed_out is False
     assert result.stdout == "out"
     assert result.stderr == "err"
     assert result.backend_used == "windows_default"
@@ -1334,6 +1393,83 @@ async def test_backend_returns_helper_result(
     assert "--payload-env" in captured["argv"]
     payload_env = captured["env"]["OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"]
     assert '"argv":["python","-c","print(\'ok\')"]' in payload_env
+
+
+@pytest.mark.parametrize("user_stderr", [b"", b"no newline", "中文错误\r\n".encode(), b"\xff\xfe"])
+def test_authenticated_timeout_frames_preserve_user_stderr_bytes(user_stderr: bytes) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    marker = (
+        b'\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT {"nonce":"timeout-test","timed_out":true}\n'
+    )
+    # Both the restricted runner and its offline parent can observe a timeout.
+    stderr, timed_out = mod._extract_authenticated_helper_timeout(
+        user_stderr + marker + marker, expected_nonce="timeout-test"
+    )
+
+    assert stderr == user_stderr
+    assert timed_out is True
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        b'{"nonce":"wrong","timed_out":true}',
+        b'{"nonce":"timeout-test","timed_out":false}',
+        b'{"nonce":"timeout-test","timed_out":1}',
+        b'{"nonce":null,"timed_out":true}',
+        '{"nonce":"伪造","timed_out":true}'.encode(),
+        b"[]",
+        b"{broken",
+        b"\xff",
+        b'{"nonce":' + b"9" * 5000 + b',"timed_out":true}',
+        b"[" * 2000 + b"]" * 2000,
+    ],
+)
+def test_untrusted_timeout_frames_remain_user_output(status: bytes) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    raw = b"user stderr\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT " + status + b"\n"
+    assert mod._extract_authenticated_helper_timeout(raw, expected_nonce="timeout-test") == (
+        raw,
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_backend_authenticates_timeout_before_stderr_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    user_stderr = "中文错误 without newline".encode()
+    marker = (
+        b'\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT {"nonce":"timeout-test","timed_out":true}\n'
+    )
+
+    class Proc:
+        returncode = 124
+
+        async def communicate(self):
+            return "已就绪".encode(), user_stderr + marker
+
+    async def fake_exec(*args, **kwargs):
+        return Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "timeout-test")
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "_OUTPUT_BYTE_CAP", 12)
+
+    result = await mod.WindowsDefaultBackend().run(_request(tmp_path))
+
+    assert result.returncode == 124
+    assert result.timed_out is True
+    assert result.stdout == "已就绪"
+    assert result.stderr == "中文错误"
+    assert result.truncated_stderr is True
 
 
 @pytest.mark.asyncio

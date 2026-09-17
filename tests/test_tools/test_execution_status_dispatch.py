@@ -68,6 +68,24 @@ async def test_exec_command_nonzero_exit_gets_trusted_execution_status() -> None
     }
 
 
+@pytest.mark.parametrize("tool_name", ["exec_command", "background_process"])
+async def test_runtime_unavailable_is_a_trusted_tool_error(tool_name: str) -> None:
+    payload = {
+        "status": "failed",
+        "code": "RUNTIME_UNAVAILABLE",
+        "componentId": "node",
+        "retryable": False,
+    }
+    handler = build_tool_handler(_registry(tool_name, json.dumps(payload)))
+
+    result = await handler(ToolCall("call_runtime_missing", tool_name, {}))
+
+    assert result.is_error is True
+    assert result.execution_status is not None
+    assert result.execution_status["reason"] == "runtime_unavailable"
+    assert result.execution_status["status"] == "error"
+
+
 @pytest.mark.asyncio
 async def test_execute_code_timeout_gets_trusted_execution_status() -> None:
     handler = build_tool_handler(

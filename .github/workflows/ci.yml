@@ -949,6 +949,8 @@ jobs:
           node scripts/test-windows-update-refresh.mjs
           node scripts/test-windows-update-network.mjs
           node scripts/test-packaged-retained-interaction-contract.mjs
+          node scripts/test-packaged-first-send-cleanup.mjs
+          node --test scripts/test-packaged-first-send-evidence.mjs
           node scripts/test-packaged-cached-handoff-contract.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
@@ -2275,6 +2277,7 @@ jobs:
           command -v pwsh
           uv run pytest \
             tests/test_ci/test_upgrade_baselines.py \
+            tests/test_ci/test_nsis_fresh_interaction.py \
             tests/test_ci/test_windows_signed_update_audit.py \
             tests/test_ci/test_release_signing_preflight.py \
             tests/test_ci/test_windows_signatures.py \
@@ -2394,6 +2397,12 @@ jobs:
           tests/functional/test_gateway_silent_reply_process_e2e.py
           -q --durations=10
 
+  windows-nsis-regression:
+    name: Windows NSIS acceptance
+    needs: plan-ci
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-nsis-regression') }}
+    uses: ./.github/workflows/windows-nsis-upgrade-regression.yml
+
   ci-result:
     name: CI result
     needs:
@@ -2418,6 +2427,7 @@ jobs:
       - release-packaging
       - managed-toolchain-artifacts
       - main-canary
+      - windows-nsis-regression
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -2521,6 +2531,7 @@ jobs:
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
           RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
           RESULT_SKILL_HUB: ${{ needs.skill-hub.result }}
+          RESULT_WINDOWS_NSIS: ${{ needs.windows-nsis-regression.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}
           RESULT_MANAGED_TOOLCHAIN_ARTIFACTS: ${{ needs.managed-toolchain-artifacts.result }}
           REQUIRED_SUITES: ${{ needs.plan-ci.outputs.required_suites }}

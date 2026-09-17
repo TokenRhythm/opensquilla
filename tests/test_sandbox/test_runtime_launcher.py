@@ -19,6 +19,7 @@ from opensquilla.sandbox.runtime_launcher import (
         (ChildRole.PROCESS_TREE, "opensquilla.process_tree"),
         (ChildRole.FILESYSTEM_WORKER, "opensquilla.sandbox.filesystem_worker"),
         (ChildRole.LINUX_HELPER, "opensquilla.sandbox.backend.linux_helper"),
+        (ChildRole.PYTHON_CODE, "opensquilla.sandbox.python_code_runner"),
         (
             ChildRole.WINDOWS_DEFAULT_RUNNER,
             "opensquilla.sandbox.backend.windows_default_runner",
@@ -53,6 +54,7 @@ def test_source_child_uses_python_module(
         ChildRole.LINUX_HELPER,
         ChildRole.WINDOWS_DEFAULT_RUNNER,
         ChildRole.DIRECTORY_PICKER,
+        ChildRole.PYTHON_CODE,
     ],
 )
 def test_frozen_child_uses_internal_role(
@@ -88,6 +90,21 @@ def test_dispatch_process_tree_child(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(process_tree, "main", lambda args: 7 if tuple(args) == ("--probe",) else 2)
 
     assert dispatch_internal_child(["process-tree", "--probe"]) == 7
+
+
+def test_dispatch_python_code_child_preserves_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    from opensquilla.sandbox import python_code_runner
+
+    def fail_with_requested_exit(args: list[str] | tuple[str, ...]) -> int:
+        assert tuple(args) == ("raise SystemExit(7)",)
+        raise SystemExit(7)
+
+    monkeypatch.setattr(python_code_runner, "main", fail_with_requested_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        dispatch_internal_child(["python-code", "raise SystemExit(7)"])
+
+    assert exc.value.code == 7
 
 
 def test_strict_runtime_path_does_not_inherit_host_when_no_pack_exists(

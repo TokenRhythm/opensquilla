@@ -997,6 +997,10 @@ async def test_standalone_streams_fence_reset_owner_before_runner_write(
     replacement = None
 
     class FakeTurnRunner:
+        # Match the real TurnRunner's timeout ownership so the legacy idle
+        # wrapper cannot cancel this owner-fencing check during SQLite reset.
+        context_bound = True
+
         async def run(
             self,
             message: str,

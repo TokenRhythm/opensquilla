@@ -63,6 +63,35 @@ def test_deepseek_direct_current_flash_alias_and_pro_limits() -> None:
         assert caps.reasoning_format == "deepseek"
 
 
+@pytest.mark.parametrize("model", ["deepseek-flash", "deepseek-v4-flash"])
+def test_deepseek_flash_prices_use_official_peak_estimates(model: str) -> None:
+    entry = ModelCatalog().resolve_entry(model, provider="deepseek")
+
+    assert entry.input_cost_per_mtok == pytest.approx(0.3)
+    assert entry.output_cost_per_mtok == pytest.approx(1.2)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(0.006)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "input_cost", "output_cost", "cache_read_cost"),
+    [
+        ("tokenrhythm", "deepseek-flash", 0.2867383512544803, 1.1469534050179212,
+         0.005734767025089606),
+        ("tokenrhythm", "deepseek-v4-flash", 0.14336917562724014, 0.2867383512544803,
+         0.02867383512544803),
+        ("openrouter", "deepseek/deepseek-v4-flash", 0.09, 0.18, 0.018),
+    ],
+)
+def test_deepseek_official_price_corrections_do_not_replace_other_provider_rates(
+    provider: str, model: str, input_cost: float, output_cost: float, cache_read_cost: float,
+) -> None:
+    entry = ModelCatalog().resolve_entry(model, provider=provider)
+
+    assert entry.input_cost_per_mtok == pytest.approx(input_cost)
+    assert entry.output_cost_per_mtok == pytest.approx(output_cost)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(cache_read_cost)
+
+
 def test_openrouter_c5_models_have_offline_budgets_and_capabilities() -> None:
     catalog = ModelCatalog()
     expected = {

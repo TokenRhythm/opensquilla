@@ -28,6 +28,7 @@ import {
 import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
 import type { ConversationEventHub } from '@/modules/conversationEventHub'
 import type { ConversationEvent } from '@/modules/conversationEvents'
+import type { GatewayAvailability } from '@/modules/gatewayAccess'
 
 const MAX_RESOLVED_OUTCOMES = 4
 const CLARIFY_TERMINAL_EVENTS = new Set([
@@ -137,6 +138,7 @@ export interface UseChatApprovalsOptions {
   conversationEvents: Pick<ConversationEventHub<ConversationEvent>, 'open'>
   clarificationSubmission: ClarificationSubmission
   approvalCenter: ApprovalCenter
+  gatewayAvailability: Readonly<Ref<GatewayAvailability>>
   sessionKey: Ref<string>
   runStatus: Ref<ChatRunStatus>
   /** The live-turn stream surface that hosts interrupt frames. */
@@ -375,6 +377,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   async function fetchSnapshot() {
+    if (options.gatewayAvailability.value !== 'available') return
     if (fetchInFlight) {
       // A push event landed mid-fetch; the in-flight response may predate
       // it, so run one more fetch when the current one settles.
@@ -387,7 +390,8 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const key = sessionKey.value
     try {
       const data = await approvalCenter.snapshot()
-      if (snapshotAttempt !== snapshotGeneration || generation !== statusGeneration || key !== sessionKey.value) return
+      if (snapshotAttempt !== snapshotGeneration || generation !== statusGeneration || key !== sessionKey.value
+        || options.gatewayAvailability.value !== 'available') return
       const pending = data.pending || []
       options.onSnapshotCount?.(pending.length)
       syncSnapshot(pending)
@@ -403,11 +407,15 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   async function reconcile() {
+    if (options.gatewayAvailability.value !== 'available') {
+      throw new ApprovalCenterError('unavailable', 'Gateway is unavailable for approval reconciliation.')
+    }
     const key = sessionKey.value
     const generation = ++statusGeneration
     const snapshotAttempt = ++snapshotGeneration
     const assertCurrent = () => {
-      if (sessionKey.value !== key || statusGeneration !== generation || snapshotAttempt !== snapshotGeneration) {
+      if (sessionKey.value !== key || statusGeneration !== generation || snapshotAttempt !== snapshotGeneration
+        || options.gatewayAvailability.value !== 'available') {
         throw new Error('Approval reconciliation was superseded.')
       }
     }
@@ -443,6 +451,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // `opensquilla.chat.approvalPoll` flag is set. Default behaviour is hydrate-
   // only — the stream carries new approvals, so no interval runs.
   function hydrateApprovals() {
+    if (options.gatewayAvailability.value !== 'available') return Promise.resolve()
     const hydration = fetchSnapshot()
     if (approvalPollEnabled() && !pollTimer) {
       pollTimer = setInterval(() => { void fetchSnapshot() }, APPROVAL_POLL_INTERVAL_MS)
@@ -772,7 +781,12 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // Reconnect recovers approvals that arrived while the socket was down: a fresh
   // hydration re-surfaces still-pending items as frames (deduped by the fold).
   function handleAvailability(state: ApprovalAvailability) {
-    if (state !== 'available') return
+    if (state !== 'available') {
+      statusGeneration++
+      snapshotGeneration++
+      stopFallbackPoll()
+      return
+    }
     const generation = ++statusGeneration
     void (async () => {
       await hydrateApprovals()

@@ -1563,6 +1563,7 @@ const copySupported = shareCopyImageSupported()
 
 const chatElevatedMode = useChatElevatedMode({
   sessionKey,
+  connectionState: gatewayConnectionState,
   approvalCenter,
 })
 // Persist the composer draft per session so a refresh / session switch / crash
@@ -3822,6 +3823,7 @@ const chatApprovals = useChatApprovals({
   conversationEvents: conversationSessionRuntime.events,
   clarificationSubmission,
   approvalCenter,
+  gatewayAvailability: computed(() => gatewayAccess.availability),
   sessionKey,
   runStatus,
   stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },

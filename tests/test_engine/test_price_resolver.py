@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from opensquilla.engine.pricing import PriceEntry, _endpoint_price, resolve_model_price
+from opensquilla.engine.pricing import (
+    PriceEntry,
+    _endpoint_price,
+    estimate_cost,
+    resolve_model_price,
+)
 from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
 
 
@@ -167,6 +172,56 @@ def test_catalog_snapshot_wins_over_static_table_with_source(
     assert r.source == "catalog"
     assert r.entry.input_per_m == pytest.approx(0.435)
     assert r.entry.cache_read_per_m == pytest.approx(0.003625)
+
+
+@pytest.mark.parametrize("model", ["deepseek-flash", "deepseek-v4-flash"])
+def test_deepseek_flash_budget_uses_peak_catalog_price_and_cache_rate(
+    monkeypatch: pytest.MonkeyPatch, model: str,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    set_shared_catalog(ModelCatalog())
+    try:
+        resolved = resolve_model_price(model, provider="deepseek")
+    finally:
+        set_shared_catalog(None)
+
+    assert resolved.source == "catalog"
+    assert resolved.entry == PriceEntry(0.3, 1.2, cache_read_per_m=0.006)
+    # The static estimate uses peak rates. Off-peak billed cost may be lower.
+    estimate = estimate_cost(
+        input_tokens=1_000_000,
+        output_tokens=100_000,
+        cache_read_tokens=750_000,
+        price=resolved.entry,
+    )
+    assert estimate.basis == "cache_aware"
+    assert estimate.cost_usd == pytest.approx(0.1995)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "input_cost", "output_cost"),
+    [
+        ("tokenrhythm", "deepseek-flash", 0.2867383512544803, 1.1469534050179212),
+        ("openrouter", "deepseek/deepseek-v4-flash", 0.09, 0.18),
+    ],
+)
+def test_other_providers_keep_their_deepseek_flash_budget_rates(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    model: str,
+    input_cost: float,
+    output_cost: float,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    set_shared_catalog(ModelCatalog())
+    try:
+        resolved = resolve_model_price(model, provider=provider)
+    finally:
+        set_shared_catalog(None)
+
+    assert resolved.source == "catalog"
+    assert resolved.entry.input_per_m == pytest.approx(input_cost)
+    assert resolved.entry.output_per_m == pytest.approx(output_cost)
 
 
 def test_static_table_fallback_with_source(monkeypatch: pytest.MonkeyPatch) -> None:

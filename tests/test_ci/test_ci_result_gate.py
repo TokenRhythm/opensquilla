@@ -264,6 +264,9 @@ def test_partial_gate_keeps_shared_frontend_job_and_requires_full_coverage() -> 
     ("QUEUE_REUSED_SUITES", '["frontend-validation","frontend-validation"]'),
     ("QUEUE_REUSED_SUITES", "null"), ("QUEUE_REUSED_SUITES", '[{}]'),
     ("RESULT_WINDOWS_FULL", "skipped"), ("RESULT_WINDOWS_FULL", "failure"),
+    ("RESULT_WINDOWS_NSIS", "skipped"), ("RESULT_WINDOWS_NSIS", "failure"),
+    ("RESULT_WINDOWS_NSIS", "cancelled"), ("RESULT_WINDOWS_NSIS", ""),
+    ("QUEUE_REUSED_SUITES", '["frontend-validation","windows-nsis-regression"]'),
     ("RESULT_FRONTEND", "failure"), ("RESULT_CONTRACT_WINDOWS", "failure"),
     ("RESULT_PLANNER", "cancelled"),
     ("QUEUE_PARTIAL", ""), ("QUEUE_PARTIAL", "false"), ("QUEUE_PARTIAL", "invalid"),
@@ -278,6 +281,21 @@ def test_partial_gate_rejects_an_unaccounted_suite_even_with_green_remaining_job
     env = _partial_env()
     required = set(json.loads(env["REQUIRED_SUITES"])) - {"windows-high-risk"}
     env.update(_env_for(required))
+    assert any("partition" in error for error in check_ci_results(env))
+
+
+@pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", "", "neutral"])
+def test_required_windows_acceptance_cannot_be_hidden_by_green_other_jobs(result: str) -> None:
+    env = _env_for(BASELINE_SUITES | {"windows-nsis-regression"})
+    assert check_ci_results(env) == []
+    env["RESULT_WINDOWS_NSIS"] = result
+    assert any("Windows packaged install" in error for error in check_ci_results(env))
+
+
+def test_partial_gate_rejects_omitted_windows_acceptance() -> None:
+    env = _partial_env()
+    suites = set(json.loads(env["REQUIRED_SUITES"])) - {"windows-nsis-regression"}
+    env.update(_env_for(suites))
     assert any("partition" in error for error in check_ci_results(env))
 
 

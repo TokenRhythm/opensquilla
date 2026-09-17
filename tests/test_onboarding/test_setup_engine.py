@@ -124,7 +124,7 @@ def test_setup_engine_can_derive_provider_model_from_router_default_tier(tmp_pat
     data = tomllib.loads(target.read_text())
     assert result.path == target
     assert data["llm"]["provider"] == "deepseek"
-    assert data["llm"]["model"] == "deepseek-v4-flash"
+    assert data["llm"]["model"] == "deepseek-flash"
     assert data["squilla_router"]["tier_profile"] == "deepseek"
     assert load_config(target).squilla_router.default_tier == "c1"
 

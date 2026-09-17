@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import signal
 
 from opensquilla.sandbox.types import SandboxResult
@@ -17,6 +18,9 @@ _DENIED_KEYWORDS = (
 )
 _QUICK_REJECT_EXIT_CODES = frozenset({2, 126, 127})
 _UNSANDBOXED_BACKENDS = frozenset({"", "noop", "none", "host"})
+_PYTHON_TRACEBACK_LOCATION = re.compile(
+    r'  File "[^"\r\n]+", line [1-9][0-9]*(?:, in (?:\w+|<\w+>))?'
+)
 
 
 def is_likely_sandbox_denied(result: SandboxResult) -> bool:
@@ -29,7 +33,15 @@ def is_likely_sandbox_denied(result: SandboxResult) -> bool:
         return True
     if result.returncode == 0:
         return False
-    combined = "\n".join((result.stderr, result.stdout)).lower()
+    # Frozen Python tracebacks include internal paths such as sandbox/*.py.
+    # A frame location is not denial evidence; keep source and error text, and
+    # leave the public stderr and all stdout unchanged.
+    stderr = "\n".join(
+        line
+        for line in result.stderr.splitlines()
+        if not _PYTHON_TRACEBACK_LOCATION.fullmatch(line)
+    )
+    combined = "\n".join((stderr, result.stdout)).lower()
     if any(keyword in combined for keyword in _DENIED_KEYWORDS):
         return True
     if result.returncode in _QUICK_REJECT_EXIT_CODES:

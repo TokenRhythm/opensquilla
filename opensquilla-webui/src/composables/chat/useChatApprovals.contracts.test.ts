@@ -85,6 +85,7 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
     }) as any)
   }
   const approvals = scope.run(() => useChatApprovals({
+    gatewayAvailability: ref('available'),
     approvalCenter,
     conversationEvents: conversationEvents.events,
     clarificationSubmission: clarificationSubmissionFromTestRpc({

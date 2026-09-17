@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { readFile, readdir, writeFile } from 'node:fs/promises'
-import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
-import { tmpdir } from 'node:os'
+import { readdir } from 'node:fs/promises'
+import { basename, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
 import {
@@ -20,8 +19,17 @@ import {
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   electronProcessSnapshot,
-  expectedShutdownCancellationIndices,
 } from './packaged-first-send-cleanup.mjs'
+import {
+  FIRST_SEND_REPORT_VERSION,
+  MAIN_CONSOLE_JOURNAL,
+  evaluateFirstSendEvidence,
+  installMainConsoleObservation,
+  markMainConsoleCleanup,
+  observeRendererPages,
+  readDesktopLogEvidence,
+  readEvidenceLog,
+} from './packaged-first-send-evidence.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 
 const DEFAULT_ITERATIONS = 20
@@ -29,11 +37,6 @@ const SEND_TIMEOUT_MS = 45_000
 const INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + SEND_TIMEOUT_MS
 const HEADER_IDENTITY_ATTRIBUTE = 'data-opensquilla-first-send-identity'
 const HEADER_IDENTITY_SETTLE_MS = 250
-const FORBIDDEN_RENDERER_ERROR = /(?:emitsOptions|\bexposed\b|nextSibling|getNextHostNode|Teleport\.process|\[ErrorBoundary\])/i
-const PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS = new Set([
-  'Electron sandboxed_renderer.bundle.js script failed to run',
-  "TypeError: Cannot destructure property 'preloadScripts' of 'binding.startupData' as it is null.",
-])
 const WIDE_VIEWPORT = { width: 1440, height: 900 }
 const TIGHT_VIEWPORT = { width: 900, height: 780 }
 let headerIdentityNonce = 0
@@ -174,68 +177,6 @@ async function assertIsolatedUserData(userDataDir) {
   }
 }
 
-async function readDesktopLogSummary(userDataDir) {
-  const path = resolve(userDataDir, 'logs', 'desktop.log')
-  let source = ''
-  try {
-    source = await readFile(path, 'utf8')
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
-  }
-  const eventCounts = {}
-  const records = []
-  const rendererErrors = []
-  const quitSteps = []
-  let malformedRecords = 0
-  let forbiddenErrorCount = 0
-  let playwrightSandboxErrorCount = 0
-  let unexpectedRendererErrorCount = 0
-  for (const line of source.split(/\r?\n/)) {
-    if (!line.trim()) continue
-    if (FORBIDDEN_RENDERER_ERROR.test(line)) forbiddenErrorCount += 1
-    try {
-      const record = JSON.parse(line)
-      records.push(record)
-      const event = typeof record?.event === 'string' ? record.event : 'unknown'
-      eventCounts[event] = (eventCounts[event] || 0) + 1
-      if (event === 'quit_commit_step' && quitSteps.length < 10) {
-        quitSteps.push({ event, at: record.at, step: record.step, pid: record.pid })
-      }
-      if (event === 'renderer_console' && rendererErrors.length < 10) {
-        rendererErrors.push({
-          level: record?.level,
-          message: record?.message,
-          source: record?.source,
-          line: record?.line,
-        })
-      }
-      if (event === 'renderer_console') {
-        if (PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS.has(String(record?.message || ''))) {
-          playwrightSandboxErrorCount += 1
-        } else {
-          unexpectedRendererErrorCount += 1
-        }
-      }
-    } catch {
-      malformedRecords += 1
-      records.push(null)
-    }
-  }
-  const expectedShutdownCancellationCount = expectedShutdownCancellationIndices(records).size
-  unexpectedRendererErrorCount -= expectedShutdownCancellationCount
-  return {
-    bytes: Buffer.byteLength(source, 'utf8'),
-    eventCounts,
-    rendererErrors,
-    quitSteps,
-    forbiddenErrorCount,
-    playwrightSandboxErrorCount,
-    unexpectedRendererErrorCount,
-    expectedShutdownCancellationCount,
-    malformedRecords,
-  }
-}
-
 assertSecretScrubbingBoundary()
 
 const executablePath = resolve(requiredOption('--executable'))
@@ -247,8 +188,12 @@ let runError
 let rendererPage
 let electronProcessIdentity
 let failureRendererSnapshot
-const pageErrors = []
-const consoleErrors = []
+let rendererObservation = { pages: new Map(), subframePageIds: new Set(), pageErrorDetails: [], consoleErrorDetails: [] }
+let targetPageId = null
+let targetWebContentsId = null
+let mainObservationInstalled = false
+let cleanupSucceeded = false
+const observationErrors = []
 const outboundNetwork = []
 const rpcSendCounts = new Map()
 const rpcSessions = new Map()
@@ -435,6 +380,12 @@ try {
       no_proxy: '127.0.0.1,localhost,::1',
     },
   })
+  // Observe every available page before waiting for a URL, Gateway readiness,
+  // or process diagnostics. The desktop log covers earlier trusted-frame
+  // console events; none of those pre-observation errors can be waived.
+  rendererObservation = observeRendererPages(app.context(), () => currentPhase)
+  await installMainConsoleObservation(app, userDataDir)
+  mainObservationInstalled = true
   electronProcessIdentity = await captureElectronProcessIdentity(app)
   reportPhase('electron-launch-complete', { processes: electronProcessIdentity })
 
@@ -446,6 +397,10 @@ try {
   })
   const page = await app.firstWindow({ timeout: 60_000 })
   rendererPage = page
+  rendererObservation.attach(page)
+  targetPageId = rendererObservation.pages.get(page)
+  const browserWindow = await app.browserWindow(page)
+  targetWebContentsId = await browserWindow.evaluate(window => window.webContents.id)
   reportPhase('renderer-window-ready')
   await waitFor(
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
@@ -462,10 +417,6 @@ try {
     timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS,
   })
   reportPhase('gateway-connected')
-  page.on('pageerror', (error) => pageErrors.push(String(error?.message || error)))
-  page.on('console', (message) => {
-    if (message.type() === 'error') consoleErrors.push(message.text())
-  })
   // Observe the renderer's own WebSocket without proxying it. Playwright's
   // routeWebSocket transparent proxy changes the ASGI accept sequence in a
   // packaged Electron app. Register the probe for later full-document route
@@ -578,8 +529,8 @@ try {
     reportPhase('iteration-complete', { iteration, completedChatSends: rpcSendCounts.size })
   }
 
-  assert.equal(pageErrors.length, 0, `renderer page errors: ${pageErrors.length}`)
-  assert.equal(consoleErrors.length, 0, `renderer console errors: ${consoleErrors.length}`)
+  assert.equal(rendererObservation.pageErrorDetails.length, 0, 'renderer page errors before cleanup')
+  assert.equal(rendererObservation.consoleErrorDetails.length, 0, 'renderer console errors before cleanup')
   assert.equal(outboundNetwork.length, 0, `unexpected external renderer requests: ${outboundNetwork.length}`)
   await syncObservedChatSends(page)
   for (const [message, count] of rpcSendCounts) {
@@ -609,6 +560,13 @@ try {
   }))
 } finally {
   reportPhase('cleanup-start', { failed: Boolean(runError) })
+  if (app && mainObservationInstalled) {
+    const marked = await captureFirstSendDiagnostic(() => markMainConsoleCleanup(app))
+    if (marked?.diagnosticError) {
+      observationErrors.push(marked.diagnosticError)
+      runError ??= new Error(marked.diagnosticError)
+    }
+  }
   try {
     await cleanupPackagedFirstSend({
       app,
@@ -616,58 +574,60 @@ try {
       processIdentity: electronProcessIdentity,
       diagnostics: async () => ({
         processes: electronProcessSnapshot(electronProcessIdentity),
-        desktopLog: await readDesktopLogSummary(userDataDir),
+        desktopLog: await readDesktopLogEvidence(userDataDir),
         rendererBeforeCleanup: failureRendererSnapshot,
       }),
       onPhase: reportPhase,
     })
+    cleanupSucceeded = Boolean(app && provider)
   } catch (error) {
     console.error(error)
     runError ??= error
   }
-  desktopLogSummary = await readDesktopLogSummary(userDataDir)
+  desktopLogSummary = await readDesktopLogEvidence(userDataDir)
   reportPhase('cleanup-complete', { failed: Boolean(runError) })
 }
 
-if (runError) {
-  console.error(JSON.stringify({
-    ok: false,
-    iterations,
-    completedChatSends: rpcSendCounts.size,
-    provider: provider?.counts(),
-    renderer: {
-      pageErrors: pageErrors.length,
-      consoleErrors: consoleErrors.length,
-      consoleErrorMessages: consoleErrors.slice(0, 10),
-      failureSnapshot: failureRendererSnapshot,
-    },
-    externalRendererRequests: outboundNetwork.length,
-    desktopLog: desktopLogSummary,
-  }, null, 2))
-  throw runError
+const renderer = {
+  pageErrors: rendererObservation.pageErrorDetails.length,
+  consoleErrors: rendererObservation.consoleErrorDetails.length,
+  pageErrorDetails: rendererObservation.pageErrorDetails,
+  consoleErrorDetails: rendererObservation.consoleErrorDetails,
 }
-
-assert.equal(desktopLogSummary.forbiddenErrorCount, 0, 'desktop.log contains a forbidden renderer failure')
-assert.equal(
-  desktopLogSummary.unexpectedRendererErrorCount,
-  0,
-  'desktop.log contains unexpected renderer console errors',
-)
-assert.equal(desktopLogSummary.eventCounts.renderer_unresponsive || 0, 0, 'renderer became unresponsive')
-assert.equal(
-  provider?.counts().chatRequestCount,
-  iterations * 2,
-  'each accepted chat.send must complete exactly one synthetic provider request',
-)
-
+const journal = await readEvidenceLog(resolve(userDataDir, MAIN_CONSOLE_JOURNAL))
+const observation = {
+  targetPageId, targetWebContentsId,
+  subframePageIds: [...rendererObservation.subframePageIds],
+  completed: mainObservationInstalled && cleanupSucceeded,
+  errors: observationErrors,
+  journal,
+  mainConsoleRecords: journal.records.filter(record => record?.event === 'console'),
+}
+const acceptance = evaluateFirstSendEvidence({ renderer, desktopLog: desktopLogSummary,
+  observation, cleanupSucceeded, externalRendererRequests: outboundNetwork.length })
+try {
+  assert.deepEqual(acceptance.failures, [], 'final renderer and shutdown evidence failed')
+  assert.equal(provider?.counts().chatRequestCount, iterations * 2,
+    'each accepted chat.send must complete exactly one synthetic provider request')
+} catch (error) {
+  runError ??= error
+}
+// Always emit the versioned final report, including late assertions and
+// cleanup failures. A zero exit and this report are both required by consumers.
 console.log(JSON.stringify({
-  ok: true,
+  reportType: 'packaged-first-send',
+  schemaVersion: FIRST_SEND_REPORT_VERSION,
+  ok: !runError,
   executable: basename(executablePath),
   iterations,
   viewports: { wide: Math.ceil(iterations / 2), tight: Math.floor(iterations / 2) },
   rpc: { chatSend: rpcSendCounts.size, uniqueSessions: new Set(rpcSessions.values()).size },
   provider: provider?.counts(),
-  renderer: { pageErrors: pageErrors.length, consoleErrors: consoleErrors.length },
+  renderer,
   externalRendererRequests: outboundNetwork.length,
   desktopLog: desktopLogSummary,
+  observation,
+  acceptance,
+  ...(runError ? { error: runError?.stack || String(runError), failureSnapshot: failureRendererSnapshot } : {}),
 }, null, 2))
+if (runError) process.exitCode = 1

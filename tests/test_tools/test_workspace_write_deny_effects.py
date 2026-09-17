@@ -286,7 +286,7 @@ async def test_shell_preexecution_denial_does_not_claim_postexecution_warning(
     )
     monkeypatch.setattr(
         shell,
-        "_strict_runtime_unavailable_envelope",
+        "_runtime_unavailable_envelope",
         lambda *_args, **_kwargs: {
             "status": "error",
             "reason": "runtime_unavailable",

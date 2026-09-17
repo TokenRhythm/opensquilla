@@ -1,5 +1,4 @@
 import { setTimeout as delay } from 'node:timers/promises'
-import { closeElectronWithDeadline } from './e2e-shutdown-helpers.mjs'
 
 // Preserve the production Gateway's shutdown request, 80s exit observation,
 // and 6s + 5s hard-kill backstops without changing any interaction budget.
@@ -126,6 +125,9 @@ export async function cleanupPackagedFirstSend({
   diagnosticTimeoutMs = 3_000,
   providerTimeoutMs = PROVIDER_CLEANUP_TIMEOUT_MS,
 }) {
+  // The log classifier is also consumed before a desktop build exists.
+  // Load process shutdown helpers only when an actual cleanup is requested.
+  const { closeElectronWithDeadline } = await import('./e2e-shutdown-helpers.mjs')
   const errors = []
   if (app) {
     onPhase('electron-cleanup-start')

@@ -1,9 +1,10 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, type App as VueApp } from 'vue'
+import { createApp, nextTick, reactive, type App as VueApp } from 'vue'
 import i18n from '@/i18n'
 import UpdateBanner from './UpdateBanner.vue'
 import { OBSERVABILITY_KEY, type UpdateNotice } from '@/modules/observability'
+import { GATEWAY_ACCESS_KEY, type GatewayAvailability } from '@/modules/gatewayAccess'
 
 const platformMocks = vi.hoisted(() => ({
   desktopUpdateManaged: vi.fn(),
@@ -20,6 +21,7 @@ const POLL_INTERVAL_MS = 15 * 60 * 1000
 const REQUEST_TIMEOUT_MS = 5 * 1000
 const apps = new Set<VueApp>()
 let fetchMock: ReturnType<typeof vi.fn>
+let access: { availability: GatewayAvailability }
 
 interface UpdatePayload {
   current: string
@@ -76,6 +78,7 @@ async function mountBanner(): Promise<{ app: VueApp; el: HTMLDivElement }> {
   document.body.appendChild(el)
   const app = createApp(UpdateBanner)
   app.use(i18n)
+  app.provide(GATEWAY_ACCESS_KEY, access as never)
   app.provide(OBSERVABILITY_KEY, {
     async updateNotice(options?: { signal?: AbortSignal }): Promise<UpdateNotice | null | undefined> {
       const headers: Record<string, string> = {}
@@ -126,6 +129,7 @@ beforeEach(() => {
   localStorage.clear()
   sessionStorage.clear()
   setVisibility('visible')
+  access = reactive({ availability: 'available' })
   i18n.global.locale.value = 'en'
   platformMocks.desktopUpdateManaged.mockReset().mockResolvedValue(false)
   fetchMock = vi.fn()
@@ -141,6 +145,59 @@ afterEach(() => {
 })
 
 describe('UpdateBanner live update polling', () => {
+  it('waits for the Gateway and resumes once per connection without polling offline', async () => {
+    access.availability = 'preparing'
+    injectBootstrap()
+    fetchMock.mockResolvedValue(jsonResponse(payload()))
+    const { app, el } = await mountBanner()
+    expect(el.querySelector('[data-testid="update-banner"]')?.textContent).toContain('0.5.0rc5')
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 2)
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    access.availability = 'available'
+    await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    access.availability = 'unavailable'
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 2)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    access.availability = 'available'
+    await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    unmount(app)
+    access.availability = 'unavailable'
+    access.availability = 'available'
+    await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts offline work and ignores its late result after reconnect', async () => {
+    let resolveOld!: (response: Response) => void
+    fetchMock.mockImplementationOnce(() => new Promise<Response>(resolve => { resolveOld = resolve }))
+      .mockResolvedValue(jsonResponse(payload()))
+    const { el } = await mountBanner()
+    const oldSignal = fetchMock.mock.calls[0]?.[1]?.signal as AbortSignal
+    access.availability = 'preparing'
+    expect(oldSignal.aborted).toBe(true)
+    access.availability = 'available'
+    await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    resolveOld(jsonResponse(payload({ available: true, latest: 'obsolete' })))
+    await flushAsync()
+    expect(el.querySelector('[data-testid="update-banner"]')).toBeNull()
+  })
+
+  it('keeps desktop-managed updates suppressed when the Gateway becomes ready', async () => {
+    access.availability = 'preparing'
+    platformMocks.desktopUpdateManaged.mockResolvedValue(true)
+    await mountBanner()
+    access.availability = 'available'
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 2)
+    await flushAsync()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it.each(['TokenRhythm', 'opensquilla'])(
     'shows a newly published %s release on the next poll without remounting',
     async (owner) => {

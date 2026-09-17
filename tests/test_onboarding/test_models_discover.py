@@ -99,6 +99,7 @@ def test_selectable_discovery_fails_closed_before_credentials_or_provider_build(
 @pytest.mark.parametrize(
     "provider_id",
     [
+        "deepseek",
         "openrouter",
         "qwen_token_plan",
     ],
@@ -248,6 +249,8 @@ def test_token_plan_anthropic_discovery_never_reuses_its_messages_path(
 @pytest.mark.parametrize(
     ("provider_id", "base_url"),
     [
+        ("deepseek", "https://api.deepseek.com.attacker.example/v1"),
+        ("deepseek", "https://custom.example/v1"),
         ("openrouter", "https://openrouter.ai.attacker.example/v1"),
         ("tokenrhythm", "https://tokenrhythm.studio.attacker.example/v1"),
         (
@@ -280,6 +283,7 @@ def test_selectable_discovery_rejects_non_official_base_url_before_raw_discovery
 @pytest.mark.parametrize(
     ("provider_id", "base_url"),
     [
+        ("deepseek", "http://api.deepseek.com/v1"),
         ("openrouter", "http://openrouter.ai/api/v1"),
         ("tokenrhythm", "http://tokenrhythm.studio/v1"),
         (
@@ -437,6 +441,43 @@ def test_tokenrhythm_uat_listing_does_not_inherit_production_metadata(
     assert isinstance(metadata, dict)
     assert metadata["published"] is None
     assert metadata["declared"] is not None
+
+
+@pytest.mark.parametrize("base_url", ["", "https://api.deepseek.com/v1"])
+def test_deepseek_picker_lists_only_endpoint_models(monkeypatch: Any, base_url: str) -> None:
+    seen = _patch_response(
+        monkeypatch,
+        lambda: httpx.Response(
+            200,
+            json={"data": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]},
+        ),
+    )
+
+    result = _discover_selectable(
+        provider_id="deepseek", api_key="synthetic-key", base_url=base_url,
+    )
+
+    assert result.ok is True
+    assert result.source == "live"
+    assert [model["id"] for model in result.models] == ["deepseek-flash", "deepseek-v4-pro"]
+    assert str(seen[0].url) == "https://api.deepseek.com/v1/models"
+    assert seen[0].headers["authorization"] == "Bearer synthetic-key"
+    flash = result.models[0]
+    assert flash["contextWindow"] == 1_000_000
+    assert flash["maxOutputTokens"] == 384_000
+    assert set(flash["capabilities"]) == {"chat", "tools", "reasoning", "vision"}
+    assert flash["pricing"] == {"inputPer1k": 0.0003, "outputPer1k": 0.0012}
+
+
+def test_deepseek_picker_surfaces_auth_failure(monkeypatch: Any) -> None:
+    _patch_response(
+        monkeypatch,
+        lambda: httpx.Response(401, json={"error": {"message": "Invalid API key"}}),
+    )
+    result = _discover_selectable(provider_id="deepseek", api_key="synthetic-invalid-key")
+    assert result.ok is False
+    assert result.failure_kind == ProviderFailureKind.AUTH_INVALID.value
+    assert result.models == []
 
 
 def test_discover_reports_missing_key_without_network(monkeypatch: Any) -> None:

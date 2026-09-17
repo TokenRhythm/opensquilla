@@ -33,6 +33,12 @@ packaging. Both directories are generated and ignored by Git. Local Desktop
 packaging consumes the source-owned artifact and verifies it before PyInstaller
 runs.
 
+Desktop TypeScript uses Node 24 definitions to match Electron's embedded Node
+runtime. The Node.js version used to run build scripts is a separate requirement.
+Playwright stays on the 1.60 line while Electron 42 is supported: the hidden
+browser reload viewport check fails with Playwright 1.63 on Electron 42. Upgrade
+that pair only after the existing native viewport and rendering checks pass.
+
 On first run, the shell opens a setup window for provider, model, base URL, and
 API key. The key is encrypted with Electron `safeStorage` when available, and a
 desktop-specific gateway config is written under Electron `userData`.

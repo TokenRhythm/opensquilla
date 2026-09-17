@@ -765,7 +765,13 @@ def test_token_budgets_are_enforced_before_any_child(
 def test_deep_models_use_file_then_repo_c0_c2_dedup_and_skip_premium() -> None:
     assert matrix._deep_models("deepseek", {"DEEPSEEK_MODEL": "custom-low-model"}) == (
         "custom-low-model",
+        "deepseek-flash",
+        "deepseek-v4-pro",
+    )
+    assert matrix._deep_models("deepseek", {}) == ("deepseek-flash", "deepseek-v4-pro")
+    assert matrix._deep_models("deepseek", {"DEEPSEEK_MODEL": "deepseek-v4-flash"}) == (
         "deepseek-v4-flash",
+        "deepseek-flash",
         "deepseek-v4-pro",
     )
     assert matrix._deep_models("openai", {"OPENAI_MODEL": "gpt-5.5"}) == (

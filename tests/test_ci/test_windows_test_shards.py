@@ -170,6 +170,9 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_channels/test_channel_mock_certification.py",
     "tests/test_channels/test_channel_pairing.py",
     "tests/test_channels/test_discord_gateway_lifecycle.py",
+    # Real Feishu SDK coverage uses the provisional floor until a comparable
+    # three-run Windows refresh supplies measured timings.
+    "tests/test_channels/test_feishu_sdk_websocket.py",
     "tests/test_channels/test_length_declaration_conformance.py",
     "tests/test_channels/test_manager_status_telemetry.py",
     "tests/test_channels/test_matrix_contract_repairs.py",
@@ -644,6 +647,7 @@ def test_prebuilt_core_wheel_environment_is_content_verified(
 def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
     expected = {
         "tests/test_ci/test_router_artifact_manifest.py": "core",
+        "tests/test_channels/test_feishu_sdk_websocket.py": "gateway-sqlite",
         "tests/test_gateway/test_task_runtime_terminal_cleanup.py": "gateway-sqlite",
         "tests/test_persistence/test_migrator.py": "gateway-sqlite",
         "tests/test_session/test_manager.py": "gateway-sqlite",

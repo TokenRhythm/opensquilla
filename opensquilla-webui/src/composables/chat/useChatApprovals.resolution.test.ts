@@ -55,6 +55,7 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
   const rpcCall = vi.fn(async () => statusResponse)
   const conversationEvents = createConversationEventsTestHarness()
   const approvals = useChatApprovals({
+    gatewayAvailability: ref('available'),
     approvalCenter: {
       setElevatedMode: vi.fn(async () => undefined),
       snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),

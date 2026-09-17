@@ -594,7 +594,10 @@ def test_profile_activation_atomically_swaps_primary_without_touching_routes() -
     assert "old-primary-secret" not in repr(result.public_payload)
 
 
-def test_profile_activation_model_precedence_is_request_then_profile_then_default() -> None:
+@pytest.mark.parametrize("saved_model", ["deepseek-profile-model", "deepseek-v4-flash"])
+def test_profile_activation_model_precedence_is_request_then_profile_then_default(
+    saved_model: str,
+) -> None:
     base = {
         "llm": {
             "provider": "openai",
@@ -609,7 +612,7 @@ def test_profile_activation_model_precedence_is_request_then_profile_then_defaul
             **base,
             llm_profiles={
                 "deepseek": {
-                    "model": "deepseek-profile-model",
+                    "model": saved_model,
                     "api_key": "synthetic-deepseek-secret",
                 }
             },
@@ -624,14 +627,15 @@ def test_profile_activation_model_precedence_is_request_then_profile_then_defaul
             **base,
             llm_profiles={
                 "deepseek": {
-                    "model": "deepseek-profile-model",
+                    "model": saved_model,
                     "api_key": "synthetic-deepseek-secret",
                 }
             },
         ),
         provider_id="deepseek",
     ).config
-    assert saved.llm.model == "deepseek-profile-model"
+    assert saved.llm.model == saved_model
+    assert saved.to_toml_dict()["llm"]["model"] == saved_model
 
     legacy_without_model = activate_llm_profile(
         GatewayConfig(
@@ -640,7 +644,7 @@ def test_profile_activation_model_precedence_is_request_then_profile_then_defaul
         ),
         provider_id="deepseek",
     ).config
-    assert legacy_without_model.llm.model == "deepseek-v4-flash"
+    assert legacy_without_model.llm.model == "deepseek-flash"
 
 
 def test_profile_activation_without_saved_or_provider_default_model_fails_closed() -> None:

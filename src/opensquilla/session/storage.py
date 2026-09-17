@@ -382,6 +382,7 @@ class RecoverableMetaControlTask:
 
 
 _SQLITE_BUSY_TIMEOUT_MS = 100
+_SQLITE_STARTUP_BUSY_TIMEOUT_SECONDS = 5.0
 _INTERACTIVE_BUSY_BUDGET_SECONDS = 2.0
 _BUSY_RETRY_INITIAL_SECONDS = 0.025
 _BUSY_RETRY_MAX_SECONDS = 0.250
@@ -1891,40 +1892,51 @@ class SessionStorage:
         ):
             await self.close()
         self._poisoned = False
-        self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
+        self._conn = await aiosqlite.connect(
+            self._db_path,
+            isolation_level=None,
+            timeout=_SQLITE_STARTUP_BUSY_TIMEOUT_SECONDS,
+        )
         self._connection_generation += 1
-        self._conn.row_factory = aiosqlite.Row
-        # Unicode-aware case folding for non-ASCII LIKE search (see _py_lower).
-        # aiosqlite proxies create_function to sqlite3 at runtime; its stub omits it.
-        await self._conn.create_function(  # type: ignore[attr-defined]
-            "py_lower", 1, _py_lower, deterministic=True
-        )
-        for name, arity, function in (
-            ("usage_nonnegative_int", 1, _sqlite_usage_nonnegative_int),
-            ("usage_invalid_int", 1, _sqlite_usage_invalid_int),
-            ("usage_cost_total", 3, _sqlite_usage_cost_total),
-            ("usage_cost_billed", 3, _sqlite_usage_cost_billed),
-            ("usage_cost_estimated", 3, _sqlite_usage_cost_estimated),
-            ("usage_cost_anomaly", 3, _sqlite_usage_cost_anomaly),
-        ):
+        try:
+            self._conn.row_factory = aiosqlite.Row
+            # Unicode-aware case folding for non-ASCII LIKE search (see _py_lower).
+            # aiosqlite proxies create_function to sqlite3 at runtime; its stub omits it.
             await self._conn.create_function(  # type: ignore[attr-defined]
-                name, arity, function, deterministic=True
+                "py_lower", 1, _py_lower, deterministic=True
             )
-        async with self._conn.execute("PRAGMA journal_mode=WAL") as cur:
-            journal_mode_row = await cur.fetchone()
-        journal_mode = (
-            str(journal_mode_row[0]).strip().lower()
-            if journal_mode_row is not None
-            else ""
-        )
-        await self._conn.execute("PRAGMA foreign_keys=ON")
-        await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
-        await self._initialize_schema(goal_pause_reason=goal_pause_reason)
-        await self._open_transcript_reader(journal_mode)
-        self._meta_launch_draft_gc_task = asyncio.create_task(
-            self._run_meta_launch_draft_gc(),
-            name="session-storage-meta-launch-draft-gc",
-        )
+            for name, arity, function in (
+                ("usage_nonnegative_int", 1, _sqlite_usage_nonnegative_int),
+                ("usage_invalid_int", 1, _sqlite_usage_invalid_int),
+                ("usage_cost_total", 3, _sqlite_usage_cost_total),
+                ("usage_cost_billed", 3, _sqlite_usage_cost_billed),
+                ("usage_cost_estimated", 3, _sqlite_usage_cost_estimated),
+                ("usage_cost_anomaly", 3, _sqlite_usage_cost_anomaly),
+            ):
+                await self._conn.create_function(  # type: ignore[attr-defined]
+                    name, arity, function, deterministic=True
+                )
+            async with self._conn.execute("PRAGMA journal_mode=WAL") as cur:
+                journal_mode_row = await cur.fetchone()
+            journal_mode = (
+                str(journal_mode_row[0]).strip().lower()
+                if journal_mode_row is not None
+                else ""
+            )
+            await self._conn.execute("PRAGMA foreign_keys=ON")
+            # Schema setup includes direct writes outside the interactive retry
+            # loop. Keep SQLite's startup busy budget while another opener may
+            # be upgrading, then restore short waits before serving requests.
+            await self._initialize_schema(goal_pause_reason=goal_pause_reason)
+            await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+            await self._open_transcript_reader(journal_mode)
+            self._meta_launch_draft_gc_task = asyncio.create_task(
+                self._run_meta_launch_draft_gc(),
+                name="session-storage-meta-launch-draft-gc",
+            )
+        except BaseException:
+            await self.close()
+            raise
 
     @classmethod
     async def open(cls, db_path: str) -> SessionStorage:

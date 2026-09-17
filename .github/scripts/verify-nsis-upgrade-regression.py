@@ -15,12 +15,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from ctypes import wintypes
 import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import struct
@@ -30,6 +28,10 @@ import threading
 import time
 import traceback
 import uuid
+from ctypes import wintypes
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlsplit
 
 OFFICIAL_BASELINE_SHA256 = {
     '0.5.3': '0a5869c7cee68317b98ee05cc3b0decbddb321c0d6ef57418ccb0b15a164e562',
@@ -41,6 +43,12 @@ PROFILE_HELPER = REPOSITORY / '.github/scripts/verify-release-profile-preservati
 INTERACTION_PROBE = REPOSITORY / 'desktop/electron/scripts/test-packaged-retained-interaction.mjs'
 FIRST_SEND_PROBE = REPOSITORY / 'desktop/electron/scripts/test-packaged-first-send-renderer.mjs'
 FRESH_ITERATIONS = 20
+EXPECTED_SHUTDOWN_CANCELLATION = '[useSessions] session directory error: Connection closed'
+PLAYWRIGHT_SANDBOX_ERRORS = {
+    'Electron sandboxed_renderer.bundle.js script failed to run',
+    "TypeError: Cannot destructure property 'preloadScripts' of 'binding.startupData' "
+    "as it is null.",
+}
 
 
 def environment_registry() -> dict:
@@ -512,7 +520,162 @@ def manifest_changes(before: dict, after: dict) -> dict:
     }
 
 
-def fresh_interaction_result(output: str) -> dict:
+def _log_records(source: str) -> list[dict]:
+    records = [json.loads(line) for line in source.lstrip('\ufeff').splitlines() if line.strip()]
+    require(all(isinstance(record, dict) for record in records), 'Fresh log has invalid records')
+    return records
+
+
+def _fresh_log_summary(summary: object, name: str, source: bytes | None = None) -> list[dict]:
+    require(isinstance(summary, dict), f'Fresh {name} log summary is missing')
+    require(summary.get('complete') is True and type(summary.get('malformedRecords')) is int
+            and summary['malformedRecords'] == 0 and not summary.get('diagnosticError')
+            and summary.get('rotated') is not True,
+            f'Fresh {name} log is incomplete or malformed')
+    require(type(summary.get('bytes')) is int and summary['bytes'] > 0
+            and isinstance(summary.get('sha256'), str)
+            and re.fullmatch('[a-f0-9]{64}', summary['sha256']),
+            f'Fresh {name} log lacks integrity evidence')
+    records = summary.get('records')
+    require(isinstance(records, list) and records
+            and all(isinstance(record, dict) for record in records),
+            f'Fresh {name} log records are missing')
+    for record in records:
+        require(isinstance(record.get('event'), str) and record['event']
+                and record.get('detail_omitted') is not True,
+                f'Fresh {name} log has invalid or truncated records')
+        _fresh_time(record.get('at'))
+    if source is not None:
+        require(source.endswith(b'\n') and summary['bytes'] == len(source)
+                and summary['sha256'] == hashlib.sha256(source).hexdigest()
+                and records == _log_records(source.decode('utf-8-sig')),
+                f'Fresh {name} log does not match its preserved evidence')
+    return records
+
+
+def _fresh_time(value: object) -> float:
+    require(isinstance(value, str), 'Fresh console observation has no timestamp')
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        require(parsed.tzinfo is not None, 'Fresh console timestamp has no timezone')
+        return parsed.timestamp()
+    except ValueError as error:
+        raise RuntimeError('Fresh console observation has an invalid timestamp') from error
+
+
+def _fresh_console_matches(result: dict, desktop: list[dict], journal: list[dict]) -> None:
+    """Recheck each allowed error against both original observation streams."""
+    renderer, observation, acceptance = (
+        result.get('renderer'), result.get('observation'), result.get('acceptance'),
+    )
+    require(isinstance(renderer, dict) and isinstance(observation, dict)
+            and isinstance(acceptance, dict), 'Fresh renderer observation is missing')
+    require(type(acceptance.get('version')) is int and acceptance['version'] == 1
+            and acceptance.get('cleanupSucceeded') is True,
+            'Fresh renderer acceptance contract is unsupported or cleanup failed')
+    for field in ('failures', 'unexpectedConsoleIndices', 'unexpectedMainRecordIndices',
+                  'unexpectedDesktopRecordIndices'):
+        require(acceptance.get(field) == [], f'Fresh renderer acceptance failed: {field}')
+    require(observation.get('completed') is True and observation.get('errors') == [],
+            'Fresh renderer observation did not complete')
+    target_page = observation.get('targetPageId')
+    target_contents = observation.get('targetWebContentsId')
+    require(type(target_page) is int and target_page > 0
+            and type(target_contents) is int and target_contents > 0,
+            'Fresh renderer target identity is missing')
+    subframes = observation.get('subframePageIds')
+    require(isinstance(subframes, list)
+            and all(type(page_id) is int and page_id > 0 for page_id in subframes)
+            and len(set(subframes)) == len(subframes),
+            'Fresh renderer subframe observation is missing or invalid')
+    require(type(renderer.get('pageErrors')) is int and renderer['pageErrors'] == 0
+            and renderer.get('pageErrorDetails') == [], 'Fresh renderer page errors were observed')
+    consoles = renderer.get('consoleErrorDetails')
+    require(isinstance(consoles, list) and type(renderer.get('consoleErrors')) is int
+            and renderer['consoleErrors'] == len(consoles),
+            'Fresh renderer console evidence is incomplete')
+    starts = [i for i, record in enumerate(journal) if record.get('event') == 'observation-start']
+    cleanups = [i for i, record in enumerate(journal) if record.get('event') == 'cleanup-start']
+    observation_exits = [i for i, record in enumerate(journal)
+                         if record.get('event') == 'observation-exit']
+    require(len(starts) == len(cleanups) == len(observation_exits) == 1
+            and starts[0] == 0 < cleanups[0] < observation_exits[0] == len(journal) - 1,
+            'Fresh main console observation has incomplete boundaries')
+    observation_exit = journal[observation_exits[0]]
+    require(type(observation_exit.get('code')) is int and observation_exit['code'] == 0
+            and type(observation_exit.get('writeErrors')) is int
+            and observation_exit['writeErrors'] == 0,
+            'Fresh main console observation did not finish without errors')
+    require(all(type(record.get('index')) is int and record['index'] == index
+                and record.get('event') in {
+                    'observation-start', 'cleanup-start', 'observation-exit', 'console',
+                }
+                for index, record in enumerate(journal)),
+            'Fresh main console observation contains invalid records')
+    main = [(i, record) for i, record in enumerate(journal) if record.get('event') == 'console']
+    require(observation.get('mainConsoleRecords') == [record for _, record in main],
+            'Fresh main console records differ from the preserved journal')
+    requested = next(i for i, record in enumerate(desktop)
+                     if record.get('event') == 'quit_gateway_shutdown_requested')
+    exited = next(i for i, record in enumerate(desktop)
+                  if record.get('event') == 'quit_gateway_exit')
+    desktop_errors = [(i, record) for i, record in enumerate(desktop)
+                      if record.get('event') == 'renderer_console'
+                      and record.get('message') not in PLAYWRIGHT_SANDBOX_ERRORS]
+    require(len(consoles) == len(main) == len(desktop_errors),
+            'Fresh console observations do not match one-to-one')
+    expected_matches = []
+    for index, (console, (main_index, main_record), (desktop_index, desktop_record)) in enumerate(
+            zip(consoles, main, desktop_errors, strict=True)):
+        require(isinstance(console, dict) and type(console.get('index')) is int
+                and console['index'] == index and type(console.get('pageId')) is int
+                and console['pageId'] == target_page
+                and console.get('frameIsolationProven') is True and not subframes
+                and console.get('phase') == 'electron-cleanup-start',
+                'Fresh console error was not observed on the isolated target page during cleanup')
+        require(type(main_record.get('index')) is int and main_record['index'] == main_index
+                and type(main_record.get('webContentsId')) is int
+                and main_record['webContentsId'] == target_contents
+                and main_record.get('mainFrame') is True
+                and cleanups[0] < main_index < observation_exits[0]
+                and main_record.get('phase') == 'electron-cleanup'
+                and requested < desktop_index < exited,
+                'Fresh console error is outside the verified target shutdown interval')
+        require(console.get('message') == main_record.get('message')
+                == desktop_record.get('message') == EXPECTED_SHUTDOWN_CANCELLATION
+                and main_record.get('level') == desktop_record.get('level') == 'error',
+                'Fresh console error is not the exact expected cancellation')
+        require(isinstance(console.get('source'), str)
+                and console['source'].startswith('opensquilla-app://desktop/')
+                and console['source'] == main_record.get('source') == desktop_record.get('source')
+                and type(console.get('line')) is int and console['line'] >= 1
+                and type(main_record.get('line')) is int and type(desktop_record.get('line')) is int
+                and console['line'] == main_record.get('line') == desktop_record.get('line'),
+                'Fresh console error source does not match its main-frame observation')
+        location = urlsplit(console['source'])
+        require(location.scheme == 'opensquilla-app' and location.netloc == 'desktop'
+                and not location.query and not location.fragment,
+                'Fresh console error source was not normalized')
+        # Playwright receipt can be delayed by IPC or runner scheduling. Native
+        # logs share a process clock; match their accepted-shutdown interval,
+        # with exact identity and ordered one-to-one coverage in all streams.
+        _fresh_time(console.get('observedAt'))
+        require(_fresh_time(desktop[requested].get('at'))
+                <= _fresh_time(main_record.get('at')) <= _fresh_time(desktop[exited].get('at')),
+                'Fresh native console error is outside the accepted shutdown interval')
+        expected_matches.append({'consoleIndex': index, 'mainRecordIndex': main_index,
+                                 'desktopRecordIndex': desktop_index})
+    matches = acceptance.get('consoleMatches')
+    require(isinstance(matches, list)
+            and all(isinstance(match, dict) and all(type(value) is int for value in match.values())
+                    for match in matches)
+            and matches == expected_matches,
+            'Fresh renderer acceptance contains invalid console associations')
+
+
+def fresh_interaction_result(
+    output: str, *, desktop_source: bytes | None = None, console_source: bytes | None = None,
+) -> dict:
     """Read the probe's JSON phase stream and require its final success report."""
     decoder = json.JSONDecoder()
     remaining = output.lstrip('\ufeff').strip()
@@ -522,37 +685,80 @@ def fresh_interaction_result(output: str) -> dict:
         remaining = remaining[end:].strip()
     require(isinstance(result, dict) and result.get('ok') is True,
             'Fresh interaction report did not pass')
+    require(result.get('reportType') == 'packaged-first-send'
+            and type(result.get('schemaVersion')) is int and result['schemaVersion'] == 2,
+            'Fresh interaction report schema is unsupported')
     require(result.get('iterations') == FRESH_ITERATIONS,
             'Fresh interaction iteration count changed')
     expected_rpc = {'chatSend': FRESH_ITERATIONS * 2, 'uniqueSessions': FRESH_ITERATIONS}
     require(result.get('rpc') == expected_rpc,
             'Fresh interaction did not complete every send and session')
-    require(result.get('provider', {}).get('chatRequestCount') == FRESH_ITERATIONS * 2,
+    provider = result.get('provider')
+    require(isinstance(provider, dict)
+            and provider.get('chatRequestCount') == FRESH_ITERATIONS * 2,
             'Fresh interaction provider completions do not match sends')
-    require(result.get('renderer') == {'pageErrors': 0, 'consoleErrors': 0}
-            and result.get('externalRendererRequests') == 0,
+    require(type(result.get('externalRendererRequests')) is int
+            and result['externalRendererRequests'] == 0,
             'Fresh interaction renderer/network checks failed')
     desktop = result.get('desktopLog', {})
-    require(desktop.get('forbiddenErrorCount') == 0
-            and desktop.get('unexpectedRendererErrorCount') == 0,
+    require(isinstance(desktop, dict)
+            and type(desktop.get('forbiddenErrorCount')) is int
+            and desktop['forbiddenErrorCount'] == 0
+            and type(desktop.get('unexpectedRendererErrorCount')) is int
+            and desktop['unexpectedRendererErrorCount'] == 0,
             'Fresh interaction desktop log contains errors')
     events = desktop.get('eventCounts', {})
+    require(isinstance(events, dict), 'Fresh interaction lacks normal Quit event counts')
     for event in ('before_quit', 'quit_gateway_shutdown_requested', 'quit_gateway_exit'):
-        require(events.get(event, 0) >= 1, f'Fresh interaction lacks normal Quit evidence: {event}')
+        require(type(events.get(event)) is int and events[event] >= 1,
+                f'Fresh interaction lacks normal Quit evidence: {event}')
+    records = _fresh_log_summary(desktop, 'desktop', desktop_source)
+    observed_events: dict[str, int] = {}
+    for record in records:
+        event = record.get('event') if isinstance(record.get('event'), str) else 'unknown'
+        observed_events[event] = observed_events.get(event, 0) + 1
+    require(events == observed_events, 'Fresh desktop event counts disagree with its records')
+    forbidden = (
+        r'(?:emitsOptions|\bexposed\b|nextSibling|getNextHostNode|Teleport\.process|\[ErrorBoundary\])'
+    )
+    require(not re.search(forbidden,
+                          json.dumps(records), re.IGNORECASE),
+            'Fresh desktop log contains a forbidden renderer failure')
+    fresh_shutdown_evidence('\n'.join(json.dumps(record) for record in records))
+    observation = result.get('observation')
+    require(isinstance(observation, dict), 'Fresh renderer observation is missing')
+    journal = _fresh_log_summary(observation.get('journal'), 'main console', console_source)
+    _fresh_console_matches(result, records, journal)
     return result
 
 
 def fresh_shutdown_evidence(output: str) -> dict:
     """Require clean Gateway exits followed by the desktop's committed exit."""
-    records = [json.loads(line) for line in output.splitlines() if line.strip()]
+    records = _log_records(output)
+    quit_events = ('before_quit', 'quit_gateway_shutdown_requested', 'quit_gateway_exit')
+    positions = [[index for index, item in enumerate(records) if item.get('event') == event]
+                 for event in quit_events]
+    require(all(len(indices) == 1 for indices in positions),
+            'Fresh normal Quit requires one complete shutdown attempt')
+    before, requested, exited = [indices[0] for indices in positions]
+    require(before < requested < exited and records[requested].get('accepted') is True
+            and records[requested].get('alreadyStopping') is False,
+            'Fresh normal Quit lacks an ordered accepted shutdown request')
+    require(not any(item.get('event') in {
+        'quit_gateway_drain_failed', 'quit_gateway_still_running', 'renderer_unresponsive',
+        'renderer_process_gone', 'renderer_console_suppressed',
+    } or (item.get('event') == 'desktop_exit_phase' and item.get('to') == 'running')
+        for item in records), 'Fresh normal Quit contains failed or incomplete observations')
     exits = [(index, item) for index, item in enumerate(records)
              if item.get('event') == 'quit_gateway_exit']
     require(exits and all(item.get('exited') is True and item.get('hardTerminated') is False
                          for _, item in exits),
             'Fresh Gateway did not exit without hard termination')
-    committed = next((index for index, item in enumerate(records)
+    committed_indices = [index for index, item in enumerate(records)
                       if item.get('event') == 'desktop_exit_phase' and item.get('to') == 'committed'
-                      and item.get('reason') == 'all lifecycle-owned Gateways exited'), -1)
+                      and item.get('reason') == 'all lifecycle-owned Gateways exited']
+    require(len(committed_indices) == 1, 'Fresh desktop lacks one committed exit')
+    committed = committed_indices[0]
     require(committed > exits[-1][0], 'Fresh desktop did not commit exit after all Gateway exits')
     return {'gatewayExitCount': len(exits), 'allGatewayExitsClean': True,
             'committedAfterGatewayExits': True}
@@ -1049,26 +1255,79 @@ class Audit:
                     'Installed client/Gateway inherited an unexpected temporary directory')
         return client_samples
 
+    def preserve_fresh_interaction_diagnostics(self) -> dict:
+        """Keep probe evidence even when execution or validation raises.
+
+        The runner already writes stdout/stderr directly to the evidence root.
+        Copy profile logs before checking exit status so a failed assertion or
+        timeout cannot prevent their upload. Diagnostic failures never replace
+        the original probe failure; successful probes must still have evidence.
+        """
+        diagnostics: dict = {'files': {}, 'errors': []}
+        sources = {
+            'stdout': self.evidence / 'fresh-first-interaction-stdout.log',
+            'stderr': self.evidence / 'fresh-first-interaction-stderr.log',
+            'desktopLog': self.user_data / 'logs/desktop.log',
+            'mainConsoleLog': self.user_data / 'first-send-main-console.jsonl',
+        }
+        try:
+            for path in sorted((self.user_data / 'logs').glob('desktop.log.*')):
+                if re.fullmatch(r'desktop\.log\.\d+', path.name):
+                    sources['rotated-' + path.name] = path
+        except Exception as error:
+            diagnostics['errors'].append({'file': 'rotatedDesktopLogs', 'error': str(error)})
+        for name, source in sources.items():
+            fallback_name = (
+                'fresh-interaction-' + source.name if name.startswith('rotated-') else source.name
+            )
+            destination = self.evidence / {
+                'desktopLog': 'fresh-interaction-desktop.log',
+                'mainConsoleLog': 'fresh-interaction-main-console.jsonl',
+            }.get(name, fallback_name)
+            try:
+                if source != destination:
+                    shutil.copyfile(source, destination)
+                diagnostics['files'][name] = {
+                    'path': str(destination), 'bytes': destination.stat().st_size,
+                    'sha256': digest(destination),
+                }
+            except Exception as error:
+                diagnostics['errors'].append({'file': name, 'error': str(error)})
+        self.report['freshInteractionDiagnostics'] = diagnostics
+        try:
+            self.save()
+        except Exception as error:
+            diagnostics['errors'].append({'file': 'result.json', 'error': str(error)})
+        return diagnostics
+
     def run_fresh_interaction(self, temp: Path) -> None:
         require(not self.user_data.exists(),
                 'Fresh first interaction requires a new, unseeded profile directory')
         self.report['freshProfileBeforeLaunch'] = {'path': str(self.user_data), 'exists': False}
         self.runtime_started = True
-        operation = self.run('fresh-first-interaction', Path(self.args.node).resolve(), [
-            str(FIRST_SEND_PROBE), '--executable', str(self.install / 'OpenSquilla.exe'),
-            '--user-data-dir', str(self.user_data), '--iterations', str(FRESH_ITERATIONS),
-        ], temp)
+        try:
+            operation = self.run('fresh-first-interaction', Path(self.args.node).resolve(), [
+                str(FIRST_SEND_PROBE), '--executable', str(self.install / 'OpenSquilla.exe'),
+                '--user-data-dir', str(self.user_data), '--iterations', str(FRESH_ITERATIONS),
+            ], temp)
+        finally:
+            diagnostics = self.preserve_fresh_interaction_diagnostics()
         require(operation['exitCode'] == 0,
                 f'Installed B fresh interaction probe failed: {operation["exitCode"]}')
+        require(not diagnostics['errors'],
+                f'Fresh interaction diagnostic evidence is incomplete: {diagnostics["errors"]}')
         stdout = self.evidence / 'fresh-first-interaction-stdout.log'
-        result = fresh_interaction_result(stdout.read_text(encoding='utf-8-sig'))
+        result = fresh_interaction_result(
+            stdout.read_text(encoding='utf-8-sig'),
+            desktop_source=(self.evidence / 'fresh-interaction-desktop.log').read_bytes(),
+            console_source=(self.evidence / 'fresh-interaction-main-console.jsonl').read_bytes(),
+        )
         require(result.get('executable') == 'OpenSquilla.exe',
                 'Fresh interaction ran an unexpected executable')
         require(self.user_data.is_dir(), 'Fresh interaction did not create its isolated profile')
-        desktop_log = (self.user_data / 'logs/desktop.log').read_text(encoding='utf-8-sig')
-        shutdown = fresh_shutdown_evidence(desktop_log)
         desktop_log_path = self.evidence / 'fresh-interaction-desktop.log'
-        desktop_log_path.write_text(desktop_log, encoding='utf-8')
+        desktop_log = desktop_log_path.read_text(encoding='utf-8-sig')
+        shutdown = fresh_shutdown_evidence(desktop_log)
         result_path = self.evidence / 'fresh-interaction-report.json'
         write_json(result_path, result)
         client_samples = self.verify_client_temp(operation, temp)

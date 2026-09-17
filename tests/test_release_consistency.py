@@ -115,8 +115,12 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "await header.getAttribute(HEADER_IDENTITY_ATTRIBUTE)" in first_send_gate
     assert "landingHeaderNode.evaluate" not in first_send_gate
     assert "await page.mouse.move(1, 1)" in first_send_gate
-    assert "rendererErrors" in first_send_gate
-    assert "consoleErrorMessages" in first_send_gate
+    first_send_evidence = Path(
+        "desktop/electron/scripts/packaged-first-send-evidence.mjs"
+    ).read_text(encoding="utf-8")
+    assert "rendererErrors" in first_send_evidence
+    assert "consoleErrorDetails" in first_send_gate
+    assert "evaluateFirstSendEvidence" in first_send_gate
     assert "DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS" in first_send_gate
     assert (
         "INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS = "
@@ -135,8 +139,8 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert initial_connection < probe_install < current_probe_install
     assert "await page.reload" not in first_send_gate
     assert "timeout: SEND_TIMEOUT_MS" in first_send_gate[current_probe_install:]
-    assert "PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS" in first_send_gate
-    assert "unexpectedRendererErrorCount" in first_send_gate
+    assert "PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS" in first_send_evidence
+    assert "unexpectedRendererErrorCount" in first_send_evidence
 
 
 def test_release_workflow_runs_v053_windows_upgrade_checks_on_server_2022() -> None:

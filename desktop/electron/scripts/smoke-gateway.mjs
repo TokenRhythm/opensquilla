@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:net'
-import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
@@ -272,6 +272,30 @@ function verifyGatewayDocument(gatewayBinary, env, path) {
   })
 }
 
+async function verifyGatewayCodeExecution(gatewayBinary, env, tempHome) {
+  const code = await readFile(join(scriptDir, 'probe-code-execution.py'), 'utf8')
+  const inheritedKeys = new Set([
+    'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+    'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'HOME', 'USERPROFILE',
+    'PYTHONUNBUFFERED', 'PYTHONUTF8', 'PYTHONIOENCODING',
+  ])
+  const probeEnv = Object.fromEntries(Object.entries(env).filter(([key]) => (
+    inheritedKeys.has(key.toUpperCase()) || key.startsWith('OPENSQUILLA_')
+  )))
+  probeEnv.APPDATA = join(tempHome, 'AppData', 'Roaming')
+  probeEnv.LOCALAPPDATA = join(tempHome, 'AppData', 'Local')
+  probeEnv.TMP = probeEnv.TEMP = probeEnv.TMPDIR = join(tempHome, 'code-execution-temp')
+  await mkdir(probeEnv.APPDATA, { recursive: true })
+  await mkdir(probeEnv.LOCALAPPDATA, { recursive: true })
+  await mkdir(probeEnv.TMP, { recursive: true })
+  assert.deepEqual(functionalProbe(gatewayBinary, probeEnv, [
+    '--internal-child', 'python-code', code,
+  ]), {
+    probe: 'opensquilla-desktop-code-execution', frozen: true,
+    pythonExit: 0, errorExit: 7, pages: 1, title: 'Packaged Python tool smoke',
+  })
+}
+
 function verifyGatewayMcp(gatewayBinary, env, port) {
   assert.deepEqual(functionalProbe(gatewayBinary, env, [
     '--_desktop-mcp-probe', `ws://127.0.0.1:${port}/ws`,
@@ -513,6 +537,7 @@ async function main() {
     verifyGatewayToolSearch(gatewayBinary, env)
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
     verifyGatewayDocument(gatewayBinary, env, documentPath)
+    await verifyGatewayCodeExecution(gatewayBinary, env, tempHome)
 
     const port = await findFreePort()
     child = spawn(gatewayBinary, ['gateway', 'run', '--port', String(port), '--bind', '127.0.0.1', '--config', config], {

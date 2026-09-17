@@ -34,6 +34,7 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 |---|---|---|
 | Vue.js (`vue`, `@vue/reactivity`, `@vue/runtime-core`, `@vue/runtime-dom`, `@vue/shared`) | Vue runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2018-present, Yuxi (Evan) You. |
 | Pinia (`pinia`) | State-management runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
+| Vue Devtools API (`@vue/devtools-api`; [vuejs/devtools](https://github.com/vuejs/devtools)) | Explicit Pinia devtools peer; integration code where retained in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2023 webfansplz. |
 | Vue Router (`vue-router`) | Client-side routing runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
 | Vue I18n (`vue-i18n`, `@intlify/core-base`, `@intlify/message-compiler`, `@intlify/shared`) | Localization runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2020 kazuya kawaguchi. |
 | html-to-image (`html-to-image`) | Image-export runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2017-2025 W.Y. |

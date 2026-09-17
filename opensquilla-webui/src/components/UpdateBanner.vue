@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, inject, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from './Icon.vue'
 import { getPlatform } from '@/platform'
 import { OBSERVABILITY_KEY, type UpdateNotice } from '@/modules/observability'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 
 // Passive "a newer version is available" notice. The gateway injects the update
 // info into #opensquilla-data (data-update) only when a newer published release
@@ -44,6 +45,9 @@ const info = ref<UpdateInfo | null>(readUpdate())
 const injectedObservability = inject(OBSERVABILITY_KEY)
 if (!injectedObservability) throw new Error('Observability was not provided')
 const observability = injectedObservability
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
 
 // Assume managed on desktop until the shell confirms otherwise, preventing a
 // native/manual desktop notice from flashing beside the passive banner.
@@ -56,6 +60,7 @@ let activeRequestTimeout: number | null = null
 let inFlight: Promise<void> | null = null
 
 async function refreshUpdateInfo(): Promise<void> {
+  if (!mounted || !pollingEnabled || gatewayAccess.availability !== 'available') return
   if (inFlight) return inFlight
 
   const controller = new AbortController()
@@ -67,7 +72,7 @@ async function refreshUpdateInfo(): Promise<void> {
     try {
       const next = await observability.updateNotice({ signal: controller.signal })
       // undefined means an invalid response: preserve the last known status.
-      if (mounted && next !== undefined) info.value = next
+      if (mounted && !controller.signal.aborted && next !== undefined) info.value = next
     } catch {
       // A transient gateway/network/parse failure must not erase a known update.
     } finally {
@@ -94,7 +99,8 @@ function stopPolling(): void {
 
 function startVisiblePolling(): void {
   stopPolling()
-  if (!pollingEnabled || document.visibilityState !== 'visible') return
+  if (!mounted || !pollingEnabled || gatewayAccess.availability !== 'available'
+    || document.visibilityState !== 'visible') return
   void refreshUpdateInfo()
   pollTimer = window.setInterval(() => {
     void refreshUpdateInfo()
@@ -105,6 +111,25 @@ function onVisibilityChange(): void {
   if (document.visibilityState === 'visible') startVisiblePolling()
   else stopPolling()
 }
+
+function abortActiveRequest(): void {
+  if (activeRequestTimeout !== null) {
+    window.clearTimeout(activeRequestTimeout)
+    activeRequestTimeout = null
+  }
+  activeController?.abort()
+  activeController = null
+  // A disconnected request must not hold up the next connection's refresh.
+  inFlight = null
+}
+
+watch(() => gatewayAccess.availability, state => {
+  if (state === 'available') startVisiblePolling()
+  else {
+    stopPolling()
+    abortActiveRequest()
+  }
+}, { flush: 'sync' })
 
 onMounted(async () => {
   mounted = true
@@ -131,12 +156,7 @@ onBeforeUnmount(() => {
   pollingEnabled = false
   document.removeEventListener('visibilitychange', onVisibilityChange)
   stopPolling()
-  if (activeRequestTimeout !== null) {
-    window.clearTimeout(activeRequestTimeout)
-    activeRequestTimeout = null
-  }
-  activeController?.abort()
-  activeController = null
+  abortActiveRequest()
 })
 
 function readDismissed(): string | null {

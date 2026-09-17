@@ -5280,9 +5280,13 @@ class TestSessionsSteer:
                 "revision": 1,
             }
         finally:
-            await runtime.cancel(task_id=handle.task_id, source="test_cleanup")
-            await runtime.wait(handle.task_id, timeout=2.0)
-            await store.close()
+            try:
+                await runtime.cancel(task_id=handle.task_id, source="test_cleanup")
+                # This drains durable terminal writes after the steering assertions;
+                # it is a cleanup watchdog, not a cancellation latency requirement.
+                await runtime.wait(handle.task_id, timeout=15.0 if os.name == "nt" else 2.0)
+            finally:
+                await store.close()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("message", ["/compact", "!model openai/test"])

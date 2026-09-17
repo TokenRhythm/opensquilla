@@ -416,6 +416,7 @@
       "tests/test_channels/test_dingtalk_reply_routing.py",
       "tests/test_channels/test_discord_gateway_lifecycle.py",
       "tests/test_channels/test_feishu_reactions.py",
+      "tests/test_channels/test_feishu_sdk_websocket.py",
       "tests/test_channels/test_feishu_websocket_transport.py",
       "tests/test_channels/test_pairing_store_bounds.py",
       "tests/test_channels/test_session_key_contract.py",

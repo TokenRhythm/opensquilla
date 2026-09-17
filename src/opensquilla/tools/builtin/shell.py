@@ -11,7 +11,6 @@ import ntpath
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -1091,10 +1090,12 @@ def _direct_runtime_command(
     *,
     windows: bool | None = None,
 ) -> tuple[str, str] | None:
-    """Return ``(component, executable)`` for one unwrapped direct runtime call."""
+    """Recognize a declared runtime without evaluating shell setup or expansion."""
 
     native_windows = os.name == "nt" if windows is None else windows
     platform_name = "windows" if native_windows else "linux"
+    if any(marker in command for marker in ("$(", "${", "`")):
+        return None
     try:
         segments = parse_shell_segments(command, platform=platform_name)
         if len(segments) != 1 or segments[0].source.strip() != command.strip():
@@ -1104,6 +1105,11 @@ def _direct_runtime_command(
         return None
     if not tokens:
         return None
+    if not native_windows:
+        if tokens[0] in {"command", "exec", "env"}:
+            tokens = tokens[1:]
+        if not tokens:
+            return None
     executable = tokens[0].strip().strip("'\"")
     if not executable or any(marker in executable for marker in ("/", "\\", ":", "$", "`")):
         return None
@@ -1117,55 +1123,199 @@ def _direct_runtime_command(
     return None
 
 
-def _strict_runtime_unavailable_envelope(
+def _runtime_unavailable_envelope(
     command: str,
     environment: dict[str, str],
+    *,
+    cwd: str | None = None,
+    windows: bool | None = None,
 ) -> dict[str, object] | None:
-    """Classify a missing direct runtime without guessing about compound shell code."""
+    """Check the child environment, not installed inventory, before starting a runtime."""
 
-    if not _guest_requires_managed_runtime():
-        return None
-    runtime_command = _direct_runtime_command(command)
+    native_windows = os.name == "nt" if windows is None else windows
+    runtime_command = _direct_runtime_command(command, windows=native_windows)
     if runtime_command is None:
         return None
     component_id, executable = runtime_command
-    path_key = next((key for key in environment if key.casefold() == "path"), "PATH")
-    if shutil.which(executable, path=environment.get(path_key, "")) is not None:
+    if not native_windows and (
+        f"BASH_FUNC_{executable}%%" in environment
+        or f"BASH_FUNC_{executable}()" in environment
+    ):
+        # A child shell may import this function without any executable on PATH.
+        # Let that shell determine whether the definition is usable; importing
+        # it in a separate preflight shell could repeat initialization effects.
         return None
-    try:
-        from opensquilla.runtime_packs import status_snapshot
+    if _runtime_executable_available(executable, environment, cwd=cwd, windows=native_windows):
+        return None
+    return _missing_runtime_payload(component_id, executable)
 
-        status = status_snapshot()
-        component = next(
-            (
-                item
-                for item in status.components
-                if item.component_id == component_id
-            ),
-            None,
-        )
-        runtime_policy = active_sandbox_policy().runtimes
-        enabled = bool(
-            runtime_policy.enabled
-            and {
-                "python": runtime_policy.python,
-                "node": runtime_policy.node,
-                "gitBash": runtime_policy.git_bash,
-            }[component_id]
-        )
-        if enabled and component is not None and component.availability.value == "ready":
-            return None
-    except (OSError, RuntimeError, ValueError):
-        pass
+
+def _missing_runtime_payload(component_id: str, executable: str) -> dict[str, object]:
+    location = "managed execution environment" if _guest_requires_managed_runtime() else "PATH"
     return {
         "status": "failed",
         "code": "RUNTIME_UNAVAILABLE",
         "componentId": component_id,
+        "executable": executable,
         "retryable": False,
         "message": (
-            f"The managed {component_id} runtime is unavailable for strict execution."
+            f"The {component_id} runtime executable {executable!r} is unavailable in {location}."
+        ),
+        "recovery": (
+            "Do not repeat runtime probes or change model/provider or permissions "
+            "for this failure. "
+            "If execution is optional, complete the task in text and state that it was not run. "
+            "If execution is required, explain the missing runtime. Retry execution only after "
+            "a relevant runtime installation or environment change."
         ),
     }
+
+
+_RUNTIME_UNAVAILABLE_MARKER = "[opensquilla:runtime-unavailable]"
+
+
+def _runtime_checked_shell_command(command: str) -> str:
+    runtime_command = _direct_runtime_command(command, windows=False)
+    if runtime_command is None:
+        return command
+    _, executable = runtime_command
+    return (
+        f"if ! command -v {shlex.quote(executable)} >/dev/null 2>&1; then "
+        f"printf '%s\\n' {shlex.quote(_RUNTIME_UNAVAILABLE_MARKER)}; exit 127; fi\n"
+        f"{command}"
+    )
+
+
+def _runtime_failure_from_shell_output(
+    command: str, output: str, returncode: int | None
+) -> dict[str, object] | None:
+    if returncode != 127 or _RUNTIME_UNAVAILABLE_MARKER not in output.splitlines():
+        return None
+    runtime_command = _direct_runtime_command(command, windows=False)
+    return _missing_runtime_payload(*runtime_command) if runtime_command is not None else None
+
+
+def _uses_posix_login_shell(runtime: object | None, *, host_execution: bool) -> bool:
+    return (
+        os.name != "nt"
+        and not host_execution
+        and runtime is not None
+        and bool(getattr(getattr(runtime, "effective", None), "sandbox_enabled", False))
+        and not _windows_sandbox_backend_active(runtime)
+    )
+
+
+_WINDOWS_DIRECT_TOOL_CANDIDATES = {
+    "npm": ("npm.cmd", "npm.exe"),
+    "npx": ("npx.cmd", "npx.exe"),
+    "pnpm": ("pnpm.cmd", "pnpm.exe"),
+    "yarn": ("yarn.cmd", "yarn.exe"),
+    "git": ("git.exe", "git.cmd"),
+    "node": ("node.exe",),
+}
+
+
+def _windows_controlled_runtime_unavailable(
+    command: str, environment: dict[str, str], *, cwd: str | None,
+) -> dict[str, object] | None:
+    runtime_command = _direct_runtime_command(command, windows=True)
+    if runtime_command is None:
+        return None
+    component_id, executable = runtime_command
+    if executable.lower() in {"python", "python3"}:
+        # The shell host supplies these functions using its own interpreter.
+        return None
+    candidates = _WINDOWS_DIRECT_TOOL_CANDIDATES.get(_shell_command_basename(executable), ())
+    if any(
+        _runtime_executable_available(candidate, environment, cwd=cwd, windows=True)
+        for candidate in candidates
+    ):
+        return None
+    if executable.lower() in {"npm", "npx"}:
+        # Bare package-manager commands are translated into explicit cmd shims.
+        return _missing_runtime_payload(component_id, executable)
+    # Other commands may still resolve through PowerShell, including ps1 files.
+    return _runtime_unavailable_envelope(command, environment, cwd=cwd, windows=True)
+
+
+def _windows_backend_runtime_preflight(
+    command: str, request: SandboxRequest, runtime: object | None,
+) -> dict[str, object] | None:
+    if not _windows_sandbox_backend_active(runtime):
+        return None
+    from opensquilla.sandbox.backend.windows_default import _process_base_env
+
+    return _windows_controlled_runtime_unavailable(
+        command, _process_base_env(request), cwd=str(request.cwd),
+    )
+
+
+def _shell_runtime_preflight(
+    command: str,
+    environment: dict[str, str],
+    *,
+    cwd: str | None,
+    runtime: object | None,
+    host_execution: bool,
+) -> dict[str, object] | None:
+    if _uses_posix_login_shell(runtime, host_execution=host_execution):
+        return None
+    if _windows_sandbox_backend_active(runtime) and not host_execution:
+        from opensquilla.sandbox.backend.windows_default import _prepend_windows_tool_paths
+
+        # Keep absence checks ahead of approval without overlooking the backend's
+        # discovered tool directories. Final policy filtering is checked again
+        # against the completed request before a process can be launched.
+        environment = dict(environment)
+        if environment.get("OPENSQUILLA_GUEST_SAFE") != "1":
+            host_env = dict(os.environ)
+            host_env.update(environment)
+            _prepend_windows_tool_paths(environment, host_env=host_env)
+        return _windows_controlled_runtime_unavailable(command, environment, cwd=cwd)
+    return _runtime_unavailable_envelope(command, environment, cwd=cwd)
+
+
+def _runtime_executable_available(
+    executable: str,
+    environment: dict[str, str],
+    *,
+    cwd: str | None,
+    windows: bool,
+) -> bool:
+    base = Path(cwd) if cwd else Path.cwd()
+    if windows:
+        folded = {key.upper(): value for key, value in environment.items()}
+        entries = folded.get("PATH", "").split(";")
+        extensions = folded.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+        names = [executable]
+        if not ntpath.splitext(executable)[1]:
+            names = [executable + ext for ext in extensions if ext]
+            names.append(executable + ".ps1")
+        # PowerShell resolves external commands on PATH; it does not implicitly
+        # execute a same-named file from the working directory.
+        for entry in entries:
+            if not entry:
+                continue
+            directory = Path(entry.strip('"'))
+            if not directory.is_absolute():
+                directory = base / directory
+            if any((directory / name).is_file() for name in names):
+                return True
+        return False
+    if "PATH" not in environment:
+        # An unset PATH lets the shell choose its own compiled default; Python's
+        # default executable search path need not match that shell's value.
+        return True
+    # Use POSIX search rules even when inspecting this execution mode on a
+    # Windows host; shutil.which always applies its native PATHEXT behavior.
+    for entry in environment["PATH"].split(":"):
+        directory = Path(entry)
+        if not directory.is_absolute():
+            directory = base / directory
+        candidate = directory / executable
+        if candidate.is_file() and os.access(candidate, os.F_OK | os.X_OK):
+            return True
+    return False
 
 
 def _runtime_shell_environment(
@@ -2373,6 +2523,8 @@ import sys
 import urllib.error
 import urllib.request
 
+_DIRECT_TOOL_CANDIDATES = __OPENSQUILLA_DIRECT_TOOL_CANDIDATES__
+
 _REMOVE_ITEM_RE = re.compile(
     r"^(?:Remove-Item|rm|del|erase)\b(?P<rest>.*)$",
     re.IGNORECASE,
@@ -2883,13 +3035,7 @@ def _windowsapps_alias_path(path):
 
 
 def _direct_tool_candidates(command):
-    if command in {"npm", "npx", "pnpm", "yarn"}:
-        return (f"{command}.cmd", f"{command}.exe")
-    if command == "git":
-        return ("git.exe", "git.cmd")
-    if command == "node":
-        return ("node.exe",)
-    return ()
+    return _DIRECT_TOOL_CANDIDATES.get(command, ())
 
 
 def _which_exact(candidate):
@@ -3202,7 +3348,7 @@ def main():
 
 
 raise SystemExit(main())
-""".strip()
+""".strip().replace("__OPENSQUILLA_DIRECT_TOOL_CANDIDATES__", repr(_WINDOWS_DIRECT_TOOL_CANDIDATES))
 
 
 def _sandbox_shell_backend_argv(
@@ -3219,7 +3365,9 @@ def _sandbox_shell_backend_argv(
         return _windows_direct_powershell_argv(
             _windows_powershell_with_final_exit_code(command)
         )
-    return ("sh", "-lc", command)
+    # Resolve a declared executable after login profiles have established PATH,
+    # inside the same sandbox process that will execute the original command.
+    return ("sh", "-lc", _runtime_checked_shell_command(command))
 
 
 def _sandbox_shell_backend_cwd(cwd: str | None, request: SandboxRequest) -> Path:
@@ -5823,6 +5971,11 @@ def _bg_session_payload(session: _BgSession) -> dict[str, object]:
         payload["output_capture"] = output_details
     if session.local_urls:
         payload["local_urls"] = list(session.local_urls)
+    runtime_failure = _runtime_failure_from_shell_output(
+        session.command, _bg_rendered_output(session), session.returncode
+    )
+    if runtime_failure is not None:
+        payload["runtime_failure"] = runtime_failure
     code_task = _code_task_status_payload(session)
     if code_task:
         payload["code_task"] = code_task
@@ -6434,6 +6587,11 @@ async def _run_full_host_shell_command(
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(_host_shell_env(merged_env))
+    runtime_unavailable = _runtime_unavailable_envelope(
+        command, merged_env, cwd=_effective_workdir(workdir)
+    )
+    if runtime_unavailable is not None:
+        return json.dumps(runtime_unavailable, ensure_ascii=False)
     return await _run_host_shell_command(
         command,
         cwd=_effective_workdir(workdir),
@@ -6610,6 +6768,24 @@ async def exec_command(
         sensitive_block = _sensitive_shell_block("exec_command", command, workdir=cwd, stdin=stdin)
     if sensitive_block is not None:
         return sensitive_block
+    merged_env = _base_shell_environment()
+    if env:
+        merged_env.update(env)
+    merged_env = _managed_skill_environment(
+        _runtime_shell_environment(
+            merged_env,
+            require_bundled=_guest_requires_managed_runtime(),
+        )
+    )
+    apply_utf8_child_env(merged_env)
+    _append_windows_app_alias_path(merged_env, runtime=runtime)
+    merged_env = _dedupe_windows_env_keys(merged_env)
+    runtime_unavailable = _shell_runtime_preflight(
+        command, merged_env, cwd=cwd, runtime=runtime, host_execution=host_execution
+    )
+    if runtime_unavailable is not None:
+        return json.dumps(runtime_unavailable, ensure_ascii=False)
+
     approval_denial = _approval_policy_denial(
         "exec_command",
         command,
@@ -6717,18 +6893,6 @@ async def exec_command(
         if deny_block is not None:
             return json.dumps(deny_block, ensure_ascii=False)
 
-    merged_env = _base_shell_environment()
-    if env:
-        merged_env.update(env)
-    merged_env = _managed_skill_environment(
-        _runtime_shell_environment(
-            merged_env,
-            require_bundled=_guest_requires_managed_runtime(),
-        )
-    )
-    apply_utf8_child_env(merged_env)
-    _append_windows_app_alias_path(merged_env, runtime=runtime)
-    merged_env = _dedupe_windows_env_keys(merged_env)
     effective_timeout = _resolve_exec_timeout(timeout)
     stdin_bytes = stdin.encode("utf-8") if stdin is not None else None
     mutation_before = snapshot_current_workspace_mutations()
@@ -6767,10 +6931,6 @@ async def exec_command(
             before=mutation_before,
             output=output,
         )
-
-    runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
-    if runtime_unavailable is not None:
-        return finish(json.dumps(runtime_unavailable, ensure_ascii=False), executed=False)
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         if windows_process_sandbox:
@@ -6824,6 +6984,13 @@ async def exec_command(
                     session_id=getattr(request, "session_id", ""),
                     run_mode=getattr(request, "run_mode", ""),
                 )
+                runtime_unavailable = _windows_backend_runtime_preflight(
+                    command, backend_request, runtime,
+                )
+                if runtime_unavailable is not None:
+                    return finish(
+                        json.dumps(runtime_unavailable, ensure_ascii=False), executed=False,
+                    )
                 preflight = await preflight_subprocess_managed_network(backend_request, runtime)
                 if isinstance(preflight, DenialResult):
                     return finish(json.dumps(preflight.to_dict()), executed=False)
@@ -6868,6 +7035,11 @@ async def exec_command(
                     raise
                 except Exception as exc:
                     raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
+                runtime_failure = _runtime_failure_from_shell_output(
+                    command, sandbox_result.stdout, sandbox_result.returncode
+                )
+                if runtime_failure is not None:
+                    return finish(json.dumps(runtime_failure, ensure_ascii=False))
                 if is_likely_sandbox_denied(sandbox_result):
                     review_action = _shell_elevation_action(
                         tool_name="exec_command",
@@ -6911,6 +7083,10 @@ async def exec_command(
             host_effect=profile.host_effect,
         )
         merged_env = _host_shell_env(merged_env)
+
+    runtime_unavailable = _runtime_unavailable_envelope(command, merged_env, cwd=cwd)
+    if runtime_unavailable is not None:
+        return finish(json.dumps(runtime_unavailable, ensure_ascii=False), executed=False)
 
     host_process_started = False
 
@@ -6962,6 +7138,9 @@ async def _start_host_background_process(
     host_env = _host_shell_env(host_env)
     _append_windows_app_alias_path(host_env, runtime=runtime)
     host_env = _dedupe_windows_env_keys(host_env)
+    runtime_unavailable = _runtime_unavailable_envelope(command, host_env, cwd=cwd)
+    if runtime_unavailable is not None:
+        return json.dumps(runtime_unavailable, ensure_ascii=False)
 
     process_kwargs: dict[str, Any] = {
         "stdin": asyncio.subprocess.PIPE,
@@ -7128,6 +7307,15 @@ async def background_process(
         sensitive_block = _sensitive_shell_block("background_process", command, workdir=cwd)
     if sensitive_block is not None:
         return sensitive_block
+    merged_env = _managed_skill_environment(_base_shell_environment())
+    _append_windows_app_alias_path(merged_env, runtime=runtime)
+    merged_env = _dedupe_windows_env_keys(merged_env)
+    runtime_unavailable = _shell_runtime_preflight(
+        command, merged_env, cwd=cwd, runtime=runtime, host_execution=host_execution
+    )
+    if runtime_unavailable is not None:
+        return json.dumps(runtime_unavailable, ensure_ascii=False)
+
     approval_denial = _approval_policy_denial(
         "background_process",
         command,
@@ -7229,11 +7417,6 @@ async def background_process(
         if deny_block is not None:
             return json.dumps(deny_block, ensure_ascii=False)
     effective_timeout = _resolve_background_timeout(timeout)
-    merged_env = _managed_skill_environment(_base_shell_environment())
-    runtime_unavailable = _strict_runtime_unavailable_envelope(command, merged_env)
-    if runtime_unavailable is not None:
-        return json.dumps(runtime_unavailable, ensure_ascii=False)
-
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         apply_utf8_child_env(merged_env)
         _append_windows_app_alias_path(merged_env, runtime=runtime)
@@ -7295,6 +7478,11 @@ async def background_process(
                 session_id=getattr(request, "session_id", ""),
                 run_mode=getattr(request, "run_mode", ""),
             )
+            runtime_unavailable = _windows_backend_runtime_preflight(
+                command, backend_request, runtime,
+            )
+            if runtime_unavailable is not None:
+                return json.dumps(runtime_unavailable, ensure_ascii=False)
             preflight = await preflight_subprocess_managed_network(backend_request, runtime)
             if isinstance(preflight, DenialResult):
                 return json.dumps(preflight.to_dict())
