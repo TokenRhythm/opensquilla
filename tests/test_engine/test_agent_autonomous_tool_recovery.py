@@ -1,4 +1,4 @@
-"""Tool execution facts survive retries without heuristic intervention."""
+"""Tool execution facts survive bounded recovery without legacy heuristics."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ class RepeatedCallProvider:
     async def chat(self, messages: list[Message], **kwargs: Any) -> AsyncIterator[Any]:
         index = len(self.requests)
         self.requests.append([message.model_copy(deep=True) for message in messages])
-        if index < self.rounds:
+        if index < self.rounds and kwargs.get("tools"):
             yield ProviderToolStart(tool_use_id=f"probe-{index}", tool_name="probe")
             yield ProviderToolEnd(
                 tool_use_id=f"probe-{index}", tool_name="probe", arguments={"target": "service"}
@@ -62,7 +62,7 @@ def _result(request: list[Message], call_id: str) -> ContentBlockToolResult:
 
 
 @pytest.mark.parametrize("succeeds_on_third", [False, True])
-async def test_identical_calls_execute_and_each_real_result_reaches_next_request(
+async def test_legacy_settings_do_not_override_shared_failure_recovery(
     succeeds_on_third: bool,
 ) -> None:
     rounds = 3 if succeeds_on_third else 5
@@ -97,9 +97,9 @@ async def test_identical_calls_execute_and_each_real_result_reaches_next_request
     )
     events = [event async for event in agent.run_turn("Check the service until it is ready.")]
 
-    assert calls == [{"target": "service"}] * rounds
-    assert len(provider.requests) == rounds + 1
-    for index in range(rounds):
+    assert calls == [{"target": "service"}] * 3
+    assert len(provider.requests) == 4
+    for index in range(3):
         result = _result(provider.requests[index + 1], f"probe-{index}")
         success = succeeds_on_third and index == 2
         assert result.is_error is not success

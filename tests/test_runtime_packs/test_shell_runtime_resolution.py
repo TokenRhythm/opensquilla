@@ -66,24 +66,24 @@ def test_strict_guest_gets_structured_runtime_unavailable_without_path_leak(
     secret_path = tmp_path / "private-runtime-bin"
     token = current_tool_context.set(ToolContext(guest_safe=True, run_mode="safe"))
     try:
-        result = shell._strict_runtime_unavailable_envelope(
+        result = shell._runtime_unavailable_envelope(
             "python --version",
             {"PATH": str(secret_path)},
         )
     finally:
         current_tool_context.reset(token)
 
-    assert result == {
-        "status": "failed",
-        "code": "RUNTIME_UNAVAILABLE",
-        "componentId": "python",
-        "retryable": False,
-        "message": "The managed python runtime is unavailable for strict execution.",
-    }
+    assert result is not None
+    assert result["status"] == "failed"
+    assert result["code"] == "RUNTIME_UNAVAILABLE"
+    assert result["componentId"] == "python"
+    assert result["retryable"] is False
+    assert "managed execution environment" in str(result["message"])
+    assert "text" in str(result["recovery"])
     assert str(secret_path) not in str(result)
 
 
-def test_strict_runtime_preflight_skips_ready_or_compound_commands(
+def test_strict_runtime_preflight_uses_effective_path_even_when_inventory_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     status = SimpleNamespace(
@@ -93,9 +93,10 @@ def test_strict_runtime_preflight_skips_ready_or_compound_commands(
     monkeypatch.setattr(shell, "active_sandbox_policy", SandboxPolicy)
     token = current_tool_context.set(ToolContext(guest_safe=True, run_mode="safe"))
     try:
-        assert shell._strict_runtime_unavailable_envelope("node -v", {"PATH": ""}) is None
+        result = shell._runtime_unavailable_envelope("node -v", {"PATH": ""})
+        assert result is not None and result["code"] == "RUNTIME_UNAVAILABLE"
         assert (
-            shell._strict_runtime_unavailable_envelope(
+            shell._runtime_unavailable_envelope(
                 "python -V | head -1",
                 {"PATH": ""},
             )
@@ -119,7 +120,7 @@ def test_disabled_runtime_is_effectively_unavailable_to_strict_guest(
     )
     token = current_tool_context.set(ToolContext(guest_safe=True, run_mode="safe"))
     try:
-        result = shell._strict_runtime_unavailable_envelope("npm test", {"PATH": ""})
+        result = shell._runtime_unavailable_envelope("npm test", {"PATH": ""})
     finally:
         current_tool_context.reset(token)
 
@@ -316,8 +317,8 @@ async def test_guest_exec_env_override_cannot_restore_host_path(
     monkeypatch.setattr(shell, "_run_host_shell_command", must_not_execute)
     monkeypatch.setattr(
         shell,
-        "_strict_runtime_unavailable_envelope",
-        lambda _command, environment: (
+        "_runtime_unavailable_envelope",
+        lambda _command, environment, **_kw: (
             {
                 "status": "failed",
                 "code": "RUNTIME_UNAVAILABLE",

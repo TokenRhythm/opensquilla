@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,8 @@ def _write_utf8_repro_command() -> str:
 
 
 @pytest.fixture
-def mutation_context(tmp_path: Path):
+def mutation_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PATH", str(Path(sys.executable).parent), prepend=os.pathsep)
     reset_runtime()
     workspace = tmp_path / "workspace"
     workspace.mkdir()

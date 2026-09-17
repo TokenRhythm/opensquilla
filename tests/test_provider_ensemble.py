@@ -313,6 +313,104 @@ def _openrouter_member(model: str, *, thinking: str | None = "high") -> Ensemble
     )
 
 
+@pytest.mark.parametrize("active_role", ["initial", "primary", "fixed"])
+@pytest.mark.parametrize("succeeds", [True, False])
+async def test_single_physical_attempt_uses_current_final_provider_only(
+    monkeypatch, active_role: str, succeeds: bool,
+) -> None:
+    response: list[StreamEvent] = (
+        [TextDeltaEvent(text="Available text answer"), DoneEvent()]
+        if succeeds
+        else [ErrorEvent(message="Temporary upstream failure", code="503")]
+    )
+    registry = _FakeRegistry(plans={
+        "draft": _FakePlan(events=[TextDeltaEvent(text="draft"), DoneEvent()]),
+        "aggregate": _FakePlan(events=response),
+        "fixed": _FakePlan(events=response),
+    })
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="synthetic",
+        proposers=[_member("draft")],
+        aggregator=_member("aggregate"),
+        fallback_provider=registry.provider_for(ProviderConfig("fake", "fixed")),
+        fallback_provider_name="fake",
+        fallback_model="fixed",
+    )
+    if active_role == "primary":
+        provider._primary_takeover_active = True
+        provider._primary_provider = registry.provider_for(ProviderConfig("fake", "aggregate"))
+    elif active_role == "fixed":
+        provider._fixed_takeover_active = True
+        provider._fixed_takeover_role = "fixed_direct"
+    context = TurnExecutionContext.create(
+        TurnIdentity("single-turn", "single-answer", "agent:main:single")
+    )
+    if active_role == "fixed":
+        await context.activate_fixed(StickyExecutionRole.FIXED_DIRECT, "synthetic prior failure")
+
+    events = [event async for event in provider.chat(
+        [Message(role="user", content="Provide the answer from the available evidence.")],
+        config=ChatConfig(physical_attempt_limit=1, timeout=0.1),
+        execution_context=context,
+    )]
+
+    assert [call["model"] for call in registry.calls] == [
+        "fixed" if active_role == "fixed" else "aggregate"
+    ]
+    assert registry.calls[0]["config"].physical_attempt_limit == 1
+    assert registry.calls[0]["config"].timeout <= 0.1
+    assert not any(isinstance(event, ProviderGenerationResetEvent) for event in events)
+    assert any(isinstance(event, DoneEvent if succeeds else ErrorEvent) for event in events)
+    assert context.proposer_request_starts == 0
+    assert len(context.attempt_ledgers) == 1
+    ledger = next(iter(context.attempt_ledgers.values()))
+    assert ledger.attempt_indices == [0]
+    assert ledger.request_starts == 1
+    assert len(ledger.outcomes) == 1
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_single_physical_attempt_releases_provider_on_timeout_or_cancellation(
+    monkeypatch, cancel: bool,
+) -> None:
+    started, closed = asyncio.Event(), asyncio.Event()
+    registry = _FakeRegistry(plans={"aggregate": _FakePlan(
+        events=[], started=started, closed=closed, gate=asyncio.Event(),
+    )})
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="synthetic",
+        proposers=[_member("draft")],
+        aggregator=_member("aggregate"),
+    )
+    context = TurnExecutionContext.create(
+        TurnIdentity("single-stop", "single-answer", "agent:main:single")
+    )
+
+    async def collect() -> list[StreamEvent]:
+        return [event async for event in provider.chat(
+            [Message(role="user", content="Provide the available answer.")],
+            config=ChatConfig(physical_attempt_limit=1, timeout=10 if cancel else 0.01),
+            execution_context=context,
+        )]
+
+    task = asyncio.create_task(collect())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        events = await asyncio.wait_for(task, timeout=1)
+        assert any(isinstance(event, ErrorEvent) and event.code == "timeout" for event in events)
+    await asyncio.wait_for(closed.wait(), timeout=1)
+    assert [call["model"] for call in registry.calls] == ["aggregate"]
+    ledger = next(iter(context.attempt_ledgers.values()))
+    assert ledger.attempt_indices == [0]
+    assert len(ledger.outcomes) == 1
+
+
 @pytest.mark.parametrize(
     "scenario", ["normal", "partial", "fixed_aggregator", "fixed_direct", "terminal"],
 )

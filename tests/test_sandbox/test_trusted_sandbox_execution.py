@@ -147,7 +147,9 @@ async def test_ordinary_approval_result_does_not_carry_elevated_mode(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_warnlist_shell_uses_sandbox_gate_without_exec_approval(monkeypatch) -> None:
+async def test_warnlist_shell_uses_sandbox_gate_without_exec_approval(
+    monkeypatch, tmp_path
+) -> None:
     from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
     from opensquilla.tools.builtin import shell
 
@@ -160,7 +162,7 @@ async def test_warnlist_shell_uses_sandbox_gate_without_exec_approval(monkeypatc
     async def _fake_gate_action(**kwargs):
         calls.append(("gate", kwargs))
         policy = SimpleNamespace()
-        request = SimpleNamespace(cwd="/tmp", action_kind="shell.exec", policy=policy)
+        request = SimpleNamespace(cwd=tmp_path, action_kind="shell.exec", policy=policy)
         return object(), policy, request
 
     async def _fake_run_under_backend(request, *, runtime=None):
@@ -186,10 +188,13 @@ async def test_warnlist_shell_uses_sandbox_gate_without_exec_approval(monkeypatc
     )
 
     token = current_tool_context.set(
-        ToolContext(is_owner=True, caller_kind=CallerKind.CLI, session_key="s1")
+        ToolContext(
+            is_owner=True, caller_kind=CallerKind.CLI, session_key="s1",
+            workspace_dir=str(tmp_path),
+        )
     )
     try:
-        result = await shell.exec_command("rm x")
+        result = await shell.exec_command("rm x", workdir=str(tmp_path))
     finally:
         current_tool_context.reset(token)
         reset_approval_queue()

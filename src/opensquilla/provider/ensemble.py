@@ -445,7 +445,7 @@ async def _provider_stream_with_lifecycle(
     timeout_seconds: float | None,
     reset_deadline_on_event: bool,
     on_request_start: Callable[[], Awaitable[None]] | None = None,
-) -> AsyncIterator[StreamEvent]:
+) -> AsyncGenerator[StreamEvent, None]:
     """Run one provider stream under the turn-local admission lease.
 
     Admission happens before creating the stream, while request-start is
@@ -2537,6 +2537,102 @@ class EnsembleProvider:
             with contextlib.suppress(Exception):
                 await stream.aclose()
 
+    async def _stream_single_attempt(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig,
+        execution_context: TurnExecutionContext | None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Use the current answer model once when the caller owns recovery.
+
+        An operation-level single-attempt bound cannot fan out to proposers,
+        retry aggregation, or activate a new fixed provider. The canonical
+        conversation already contains completed tool outcomes needed for a
+        final answer; no candidate-generation step is necessary here.
+        """
+
+        member: EnsembleMemberConfig | None
+        if self._fixed_takeover_active:
+            fixed_role: Literal["fixed_aggregator", "fixed_direct"] = (
+                "fixed_aggregator"
+                if self._fixed_takeover_role == "fixed_aggregator" else "fixed_direct"
+            )
+            provider = self.fallback_provider
+            member = self._fallback_request_budget_member
+            request_config = self._fixed_chat_config(config, role=fixed_role) or config
+            provider_name, model = self.fallback_provider_name, self.fallback_model
+            role = (
+                StickyExecutionRole.FIXED_AGGREGATOR
+                if fixed_role == "fixed_aggregator"
+                else StickyExecutionRole.FIXED_DIRECT
+            )
+            logical_index = (
+                execution_context.fixed_logical_call_index + 1
+                if execution_context is not None else 0
+            )
+        else:
+            member = self.aggregator
+            provider = self._primary_provider if self._primary_takeover_active else None
+            if provider is None and member.ready:
+                try:
+                    provider = _build_provider(member.provider_config)
+                except Exception:
+                    provider = None
+            request_config = self._aggregator_chat_config(config, messages)
+            provider_name, model = member.provider_config.provider, member.provider_config.model
+            role = StickyExecutionRole.PRIMARY_AGGREGATOR
+            logical_index = (
+                execution_context.primary_logical_call_index + 1
+                if execution_context is not None else 0
+            )
+        if provider is None:
+            yield ErrorEvent(
+                message="The current ensemble answer provider is unavailable.",
+                code="ensemble_single_attempt_unavailable",
+            )
+            return
+        request_config = request_config.model_copy(update={
+            "timeout": min(config.timeout, request_config.timeout),
+            "physical_attempt_limit": 1,
+        })
+        capacity_error = self._attachment_request_unavailability(
+            member=member, chat_config=request_config, role="Ensemble answer provider",
+        )
+        if capacity_error is not None:
+            yield ErrorEvent(message=capacity_error[0], code=capacity_error[1])
+            return
+        stream = _provider_stream_with_lifecycle(
+            lambda: self._account_physical_stream(
+                lambda: provider.chat(
+                    _ensemble_request_messages(messages, request_config),
+                    tools=tools,
+                    config=request_config,
+                ),
+                provider=provider_name,
+                model=model,
+            ),
+            execution_context=execution_context,
+            role=role,
+            logical_call_index=logical_index,
+            attempt_index=0,
+            owner=f"ensemble-single-attempt-{logical_index}",
+            phase="ensemble_answer",
+            message="Waiting for the final answer",
+            timeout_seconds=request_config.timeout,
+            reset_deadline_on_event=False,
+        )
+        try:
+            async for event in stream:
+                yield event
+        except TimeoutError:
+            yield ErrorEvent(
+                message="The ensemble answer provider timed out.", code="timeout",
+            )
+        finally:
+            await stream.aclose()
+
     async def _chat_unbounded(
         self,
         messages: list[Message],
@@ -2572,6 +2668,16 @@ class EnsembleProvider:
             and not self._primary_takeover_active
         ):
             self._restore_sticky_state_from_context(execution_context, messages)
+        if config is not None and config.physical_attempt_limit == 1:
+            stream = self._stream_single_attempt(
+                messages, tools=tools, config=config, execution_context=execution_context,
+            )
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await stream.aclose()
+            return
         if self._fixed_takeover_active:
             async for event in self._stream_fixed_takeover(
                 messages,
