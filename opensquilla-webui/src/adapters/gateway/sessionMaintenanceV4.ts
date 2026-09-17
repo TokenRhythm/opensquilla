@@ -64,7 +64,6 @@ function resetResult(raw: SessionsResetResult): ResetSessionResult {
     previousSessionId: raw.previous_session_id,
     sessionId: raw.session_id,
     epoch: raw.epoch,
-    ...(raw.flush_receipt !== undefined ? { flushReceipt: raw.flush_receipt } : {}),
   }
 }
 
@@ -102,10 +101,6 @@ function compactionResult(raw: SessionsContextCompactResult): SessionCompactionR
     ...(raw.quality_report !== undefined ? { qualityReport: raw.quality_report } : {}),
     ...(raw.skip_reason !== undefined ? { skipReason: raw.skip_reason } : {}),
     ...(raw.reason !== undefined ? { reason: raw.reason } : {}),
-    ...(raw.flush_receipt !== undefined ? { flushReceipt: raw.flush_receipt } : {}),
-    ...(raw.flush_receipt_status !== undefined
-      ? { flushReceiptStatus: raw.flush_receipt_status }
-      : {}),
   }
 }
 

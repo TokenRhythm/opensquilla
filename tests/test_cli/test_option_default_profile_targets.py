@@ -61,7 +61,7 @@ def connected_urls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
             urls.append(url)
 
         async def reset_session(self, key: str) -> dict[str, Any]:
-            return {"session_id": "new", "previous_session_id": key, "flush_receipt": {}}
+            return {"session_id": "new", "previous_session_id": key}
 
         async def close(self) -> None:
             return None

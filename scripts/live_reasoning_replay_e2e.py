@@ -47,6 +47,7 @@ from opensquilla.provider.selector import (  # noqa: E402
 from opensquilla.session.manager import SessionManager  # noqa: E402
 from opensquilla.session.storage import SessionStorage  # noqa: E402
 from opensquilla.session.terminal_reply import safe_provider_failure_code  # noqa: E402
+from opensquilla.token_estimation import estimate_tokens_with_source  # noqa: E402
 from opensquilla.tools.registry import ToolRegistry  # noqa: E402
 from opensquilla.tools.types import ToolContext, ToolSpec  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
@@ -442,7 +443,6 @@ def _config(
     config.memory.retrieval_mode = "fts_only"
     config.memory.auto_capture_enabled = False
     config.memory.capture_mode = "off"
-    config.memory.repair_enabled = False
     config.memory.dream.enabled = False
     config.meta_skill.enabled = False
     config.heartbeat.enabled = False
@@ -977,7 +977,13 @@ async def _run_compaction_case(
     prefix_counts: list[int] = []
     message_json_prefix_chars: list[int] = []
     source_entry_marker_counts: list[int] = []
+    _, token_estimate_source = estimate_tokens_with_source(COMPACTION_PADDING)
+    conservative_estimate = token_estimate_source == "utf8_unicode_conservative"
     seed_repetitions = 15 if variant in {"long_reasoning", "tools", "replay_off"} else 25
+    if conservative_estimate:
+        # Keep the synthetic source within one summary call even when the
+        # optional tokenizer is unavailable. Physical model budgets stay fixed.
+        seed_repetitions = 4 if variant == "replay_off" else 5
     first_prompt = COMPACTION_FIRST_PROMPT
     if tools_enabled:
         first_prompt = (
@@ -1004,6 +1010,10 @@ async def _run_compaction_case(
         )
     first_prompt = "SYNTHETIC_COMPACTION_ENTRY_5_USER\n" + first_prompt
     tail_repetitions = 30 if variant == "replay_off" else 55
+    if conservative_estimate:
+        # The protected current request must fit while remaining large enough
+        # that compaction summarizes every older row, including the final label.
+        tail_repetitions = 11 if variant == "replay_off" else 20
     tail_prompt = (
         "SYNTHETIC_COMPACTION_ENTRY_6_USER\n"
         f"{COMPACTION_TAIL_MARKER}\n{COMPACTION_PADDING * tail_repetitions}\n"
@@ -1018,7 +1028,7 @@ async def _run_compaction_case(
             "COMPACTION_LABEL_2=<new eight lowercase letters>. Retain both labels."
         )
         prompts.append(
-            f"{COMPACTION_TAIL_MARKER}_SECOND\n{COMPACTION_PADDING * 55}\n"
+            f"{COMPACTION_TAIL_MARKER}_SECOND\n{COMPACTION_PADDING * tail_repetitions}\n"
             "Return both labels you invented, in order, followed by COMPACTION_RECALL_OK. "
             "Do not invent new labels and do not use tools."
         )
@@ -1077,6 +1087,8 @@ async def _run_compaction_case(
                     _require(restored == previous_canonical, "database_reopen_state_mismatch")
                     config.compaction.enabled = True
                     config.llm.context_window_tokens = 20_000
+                    if conservative_estimate:
+                        config.preflight_compact_ratio = 0.2
                     if variant == "model_switch":
                         config.llm.model = next_model
                     if variant == "truncated":

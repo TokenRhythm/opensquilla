@@ -55,8 +55,7 @@ async def test_inline_compaction_reduces_old_text_while_preserving_current_image
     agent = Agent(
         provider=SimpleNamespace(provider_name="synthetic"),
         config=AgentConfig(
-            context_window_tokens=8192, context_overflow_threshold=0.9, flush_enabled=False,
-        ),
+            context_window_tokens=8192, context_overflow_threshold=0.9, ),
     )
     monkeypatch.setattr(agent, "_build_compaction_config", lambda: CompactionConfig(
         model="synthetic-summary", api_key="synthetic-test-key",

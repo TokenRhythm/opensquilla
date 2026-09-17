@@ -12,10 +12,6 @@ from opensquilla.contracts.turn_execution import (
 )
 from opensquilla.execution_status import ExecutionStatus
 from opensquilla.provider.types import ExecutionIdentity
-from opensquilla.session.compaction_lifecycle import (
-    DEFAULT_FLUSH_TRIGGERS,
-    normalize_flush_triggers_strict,
-)
 from opensquilla.tool_boundary import ToolCall as ToolCall
 from opensquilla.tool_boundary import ToolEffectOutcome as ToolEffectOutcome
 from opensquilla.tool_boundary import ToolResult as ToolResult
@@ -741,17 +737,6 @@ class AgentConfig:
     # and before the current user turn. The agent persists each turn's
     # skill context in history so provider KV-cache prefixes stay stable.
     skills_context_prompt: str | None = None
-    # Pre-compaction memory flush
-    flush_enabled: bool = False
-    flush_triggers: list[str] = field(default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS))
-    flush_pre_compaction: bool = False
-    flush_timeout_seconds: float = 15.0
-    flush_background_timeout_seconds: float = 120.0
-    flush_backoff_initial_seconds: float = 30.0
-    flush_backoff_max_seconds: float = 300.0
-    flush_archive_max_bytes: int = 800_000
-    flush_compaction_requires_safe_receipt: bool = False
-    flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     compaction_protected_recent_messages: int = 0
     compaction_total_timeout_seconds: float = 120.0
@@ -770,10 +755,6 @@ class AgentConfig:
         repr=False,
         compare=False,
     )
-    repair_enabled: bool = True
-    repair_interval_seconds: float = 60.0
-    repair_max_items_per_tick: int = 5
-    flush_workspace_dir: str | None = None
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
     # Active-deployment tool capability provenance for diagnostics and routing.
     # Tool authorization remains owned by the projected registry surface and
@@ -915,7 +896,6 @@ class AgentConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))
         if self.provider_request_proof_max_chars_explicit is None:
             self.provider_request_proof_max_chars_explicit = (
                 int(self.provider_request_proof_max_chars or 0) > 0

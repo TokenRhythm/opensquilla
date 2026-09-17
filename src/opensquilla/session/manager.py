@@ -464,14 +464,6 @@ def _session_mutation_context(
     return mutation_context() if mutation_context is not None else _null_async_context()
 
 
-def _compaction_flush_status_for_persistence(status: str | None) -> str:
-    if not status:
-        return "unknown"
-    if status == "unsafe":
-        return "degraded_forensic"
-    return status
-
-
 def _archive_dir() -> Path:
     return Path(
         os.environ.get(
@@ -640,7 +632,6 @@ def _frozen_compaction_prefix_hash(
     context_window_tokens: int,
     context_window_chars: int | None,
     custom_instructions: str | None,
-    flush_receipt_status: str | None,
     config: CompactionConfig,
     consumer_admission_fingerprint: str = "",
 ) -> str:
@@ -657,7 +648,6 @@ def _frozen_compaction_prefix_hash(
         "custom_instructions_sha256": hashlib.sha256(
             (custom_instructions or "").encode("utf-8")
         ).hexdigest(),
-        "flush_receipt_status": flush_receipt_status,
         "context_window_tokens": context_window_tokens,
         "context_window_chars": context_window_chars,
         "base_chunk_ratio": config.base_chunk_ratio,
@@ -2106,7 +2096,6 @@ class SessionManager:
                             removed_count=summary.removed_count,
                             kept_count=summary.kept_count,
                             chunk_count=summary.chunk_count,
-                            flush_receipt_status=summary.flush_receipt_status,
                             covered_through_id=summary.covered_through_id,
                             created_at=summary.created_at,
                         )
@@ -2867,7 +2856,6 @@ class SessionManager:
                 idempotency_key=failure_key,
                 status="checkpoint_failed",
                 reason=str(exc),
-                attempt_count=1,
             )
             try:
                 persist_failure = self._storage.upsert_memory_durable_receipt(
@@ -2913,7 +2901,6 @@ class SessionManager:
                 f"checkpoint:{session_key}:{resolved_turn_id}:{result.content_hash}"
             ),
             status="checkpoint_saved",
-            attempt_count=1,
         )
         persisted_call = self._storage.upsert_memory_durable_receipt(
             receipt,
@@ -3026,47 +3013,6 @@ class SessionManager:
                 operation="summary read",
             )
         return summaries
-
-    async def list_degraded_compactions(
-        self,
-        *,
-        agent_id: str | None = None,
-        limit: int = 50,
-    ) -> list[SessionSummary]:
-        prefix = f"agent:{normalize_agent_id(agent_id)}:" if agent_id else None
-        return await self._storage.list_degraded_summaries(
-            session_key_prefix=prefix,
-            limit=limit,
-        )
-
-    async def get_compaction_preimage(self, summary: SessionSummary) -> list[TranscriptEntry]:
-        if not summary.compaction_id:
-            return []
-        return await self._storage.get_compacted_transcript_entries(
-            session_id=summary.session_id,
-            compaction_id=summary.compaction_id,
-        )
-
-    async def mark_compaction_repair_status(
-        self,
-        summary: SessionSummary,
-        status: str,
-    ) -> None:
-        if summary.id is None:
-            return
-        await self._storage.update_summary_flush_receipt_status(summary.id, status)
-
-    async def mark_compaction_flush_receipt_status(
-        self,
-        session_key: str,
-        compaction_id: str,
-        status: str,
-    ) -> int:
-        return await self._storage.update_summary_flush_receipt_status_by_compaction(
-            session_key=canonicalize_session_key(session_key),
-            compaction_id=compaction_id,
-            status=status,
-        )
 
     async def save_context_state(
         self,
@@ -3216,7 +3162,6 @@ class SessionManager:
         *,
         compaction_id: str | None = None,
         trigger_reason: str | None = None,
-        flush_receipt_status: str | None = None,
         context_window_chars: int | None = None,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
@@ -3330,7 +3275,6 @@ class SessionManager:
                 context_window_tokens=context_window_tokens,
                 context_window_chars=context_window_chars,
                 custom_instructions=custom_instructions,
-                flush_receipt_status=flush_receipt_status,
                 config=effective_config,
                 consumer_admission_fingerprint=consumer_admission_fingerprint,
             ),
@@ -3355,7 +3299,6 @@ class SessionManager:
                 custom_instructions=custom_instructions,
                 persisted_compaction_id=persisted_compaction_id,
                 trigger_reason=trigger_reason,
-                flush_receipt_status=flush_receipt_status,
                 mutation_context=mutation_context,
                 provider_request_correlation=provider_request_correlation,
                 consumer_admission=consumer_admission,
@@ -3399,7 +3342,6 @@ class SessionManager:
         custom_instructions: str | None,
         persisted_compaction_id: str,
         trigger_reason: str | None,
-        flush_receipt_status: str | None,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None,
         provider_request_correlation: ProviderRequestCorrelation | None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None,
@@ -3594,9 +3536,7 @@ class SessionManager:
                 removed_count=result.removed_count,
                 kept_count=len(kept_entries),
                 chunk_count=result.chunks_processed,
-                flush_receipt_status=_compaction_flush_status_for_persistence(
-                    flush_receipt_status
-                ),
+
                 covered_through_id=max(
                     previous_covered_through_id,
                     max((entry.id or 0) for entry in removed_entries)
@@ -3699,7 +3639,6 @@ class SessionManager:
         critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
         trigger_reason: str | None = None,
-        flush_receipt_status: str | None = None,
         compaction_deadline_at_monotonic: float | None = None,
         compaction_timeout_seconds: float | None = None,
         removed_count: int | None = None,
@@ -3924,9 +3863,7 @@ class SessionManager:
                 critical_carry_forward=list(structured_summary.critical_carry_forward),
                 removed_count=len(removed_entries),
                 kept_count=persisted_kept_count,
-                flush_receipt_status=_compaction_flush_status_for_persistence(
-                    flush_receipt_status
-                ),
+
                 covered_through_id=max(
                     previous_covered_through_id,
                     max((entry.id or 0) for entry in removed_entries)

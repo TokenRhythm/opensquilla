@@ -704,7 +704,6 @@ async def test_preflight_invalidates_snapshot_only_when_transcript_rows_change(
 
     monkeypatch.setattr(runner, "_maybe_preflight_compact", _force_small_preflight_window)
     monkeypatch.setattr(runner, "_record_checkpoint_before_compaction", _checkpoint_succeeds)
-    monkeypatch.setattr(runner, "_pre_compaction_flush_enabled", lambda: False)
 
     try:
         events = await _run(runner, session_key)

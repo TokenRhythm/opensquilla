@@ -441,11 +441,6 @@ METHOD_SCOPES: dict[str, str] = {
     "memory.import.apply": ADMIN_SCOPE,
     "memory.import.undo": ADMIN_SCOPE,
     "memory.import.discard": ADMIN_SCOPE,
-    "memory.raw_fallbacks.list": ADMIN_SCOPE,
-    "memory.raw_fallbacks.show": ADMIN_SCOPE,
-    "memory.repair.list": ADMIN_SCOPE,
-    "memory.repair.run": ADMIN_SCOPE,
-    "memory.repair.show": ADMIN_SCOPE,
     # Settings-only profile import discovery. These methods expose no paths
     # and never apply an import, but host-level inventory remains admin-only.
     "migration.sources.list": ADMIN_SCOPE,

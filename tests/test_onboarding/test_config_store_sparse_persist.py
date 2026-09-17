@@ -91,21 +91,21 @@ def test_persist_fresh_model_does_not_bake_env_secret(tmp_path, monkeypatch):
 
 
 def test_persist_does_not_freeze_env_override(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENSQUILLA_MEMORY_FLUSH_ENABLED", "true")
+    monkeypatch.setenv("OPENSQUILLA_MEMORY_CAPTURE_ASSISTANT", "true")
     target = tmp_path / "config.toml"
     target.write_text("port = 18791\n")
 
     cfg = load_config(target)
-    assert cfg.memory.flush_enabled is True
+    assert cfg.memory.capture_assistant is True
     cfg.port = 18795
     persist_config(cfg, path=target)
 
-    assert "flush_enabled" not in target.read_text()
+    assert "capture_assistant" not in target.read_text()
 
     # Removing the env override must restore the built-in default: the save
     # above must not have frozen the env value into the file.
-    monkeypatch.delenv("OPENSQUILLA_MEMORY_FLUSH_ENABLED")
-    assert load_config(target).memory.flush_enabled is False
+    monkeypatch.delenv("OPENSQUILLA_MEMORY_CAPTURE_ASSISTANT")
+    assert load_config(target).memory.capture_assistant is False
 
 
 def test_persist_writes_explicit_mutation(tmp_path):
@@ -113,12 +113,12 @@ def test_persist_writes_explicit_mutation(tmp_path):
     target.write_text("port = 18791\n")
 
     cfg = load_config(target)
-    cfg.memory.flush_enabled = True
+    cfg.memory.capture_assistant = True
     persist_config(cfg, path=target)
 
     data = tomllib.loads(target.read_text())
-    assert data["memory"]["flush_enabled"] is True
-    assert load_config(target).memory.flush_enabled is True
+    assert data["memory"]["capture_assistant"] is True
+    assert load_config(target).memory.capture_assistant is True
 
 
 def test_repersist_same_object_writes_revert(tmp_path):
@@ -127,14 +127,14 @@ def test_repersist_same_object_writes_revert(tmp_path):
     target.write_text("port = 18791\n")
 
     cfg = load_config(target)
-    cfg.memory.flush_enabled = True
+    cfg.memory.capture_assistant = True
     persist_config(cfg, path=target)
-    assert tomllib.loads(target.read_text())["memory"]["flush_enabled"] is True
+    assert tomllib.loads(target.read_text())["memory"]["capture_assistant"] is True
 
-    cfg.memory.flush_enabled = False
+    cfg.memory.capture_assistant = False
     persist_config(cfg, path=target)
     data = tomllib.loads(target.read_text())
-    assert data.get("memory", {}).get("flush_enabled") is False
+    assert data.get("memory", {}).get("capture_assistant") is False
 
 
 def test_persist_preserves_existing_toml_values(tmp_path):
@@ -147,7 +147,7 @@ def test_persist_preserves_existing_toml_values(tmp_path):
                 'model = "deepseek/deepseek-v4-flash"',
                 "",
                 "[memory]",
-                "flush_enabled = true",
+                "capture_assistant = true",
                 "",
             ]
         )
@@ -159,7 +159,7 @@ def test_persist_preserves_existing_toml_values(tmp_path):
 
     data = tomllib.loads(target.read_text())
     assert data["llm"]["provider"] == "openrouter"
-    assert data["memory"]["flush_enabled"] is True
+    assert data["memory"]["capture_assistant"] is True
     assert data["port"] == 18795
 
 
@@ -298,7 +298,7 @@ def test_persist_merges_concurrent_disk_edits(tmp_path):
                 'model = "deepseek/deepseek-v4-flash"',
                 "",
                 "[memory]",
-                "flush_enabled = true",
+                "capture_assistant = true",
                 "",
             ]
         )
@@ -308,7 +308,7 @@ def test_persist_merges_concurrent_disk_edits(tmp_path):
 
     data = tomllib.loads(target.read_text())
     assert data["port"] == 18793  # X survives
-    assert data["memory"]["flush_enabled"] is True  # Y survives
+    assert data["memory"]["capture_assistant"] is True  # Y survives
     assert data["llm"]["provider"] == "openrouter"
 
 
@@ -320,7 +320,7 @@ def test_persist_serializes_overlapping_nonconflicting_writers(tmp_path, monkeyp
     first_cfg = load_config(target)
     second_cfg = load_config(target)
     first_cfg.port = 18795
-    second_cfg.memory.flush_enabled = True
+    second_cfg.memory.capture_assistant = True
 
     first_planned = threading.Event()
     release_first = threading.Event()
@@ -361,7 +361,7 @@ def test_persist_serializes_overlapping_nonconflicting_writers(tmp_path, monkeyp
     assert overlapped_plan is False
     data = tomllib.loads(target.read_text())
     assert data["port"] == 18795
-    assert data["memory"]["flush_enabled"] is True
+    assert data["memory"]["capture_assistant"] is True
 
 
 def test_force_persist_paths_are_consumed_after_successful_commit(tmp_path):
@@ -418,11 +418,11 @@ def test_second_object_for_same_path_does_not_revert_first_writers_save(tmp_path
     persist_config(a, path=target)
     assert tomllib.loads(target.read_text())["port"] == 1111
 
-    b.memory.flush_enabled = True
+    b.memory.capture_assistant = True
     persist_config(b, path=target)
 
     data = tomllib.loads(target.read_text())
-    assert data["memory"]["flush_enabled"] is True
+    assert data["memory"]["capture_assistant"] is True
     # B never touched port, so A's persisted 1111 must survive B's save.
     assert data["port"] == 1111
 
@@ -438,11 +438,11 @@ def test_disk_fallback_model_save_does_not_revert_other_writers_change(tmp_path)
     # Another PROCESS (no shared state at all) changes port on disk.
     target.write_text("port = 2222\n")
 
-    b.memory.flush_enabled = True
+    b.memory.capture_assistant = True
     persist_config(b, path=target)
 
     data = tomllib.loads(target.read_text())
-    assert data["memory"]["flush_enabled"] is True
+    assert data["memory"]["capture_assistant"] is True
     assert data["port"] == 2222
 
 
@@ -471,10 +471,10 @@ def test_save_as_to_different_path_carries_loaded_values(tmp_path):
     # The save-as must not disturb the instance's association with its own
     # file: a later save back to the source still diffs against the load
     # snapshot (only the mutated field lands, nothing is erased).
-    cfg.memory.flush_enabled = True
+    cfg.memory.capture_assistant = True
     persist_config(cfg, path=source, backup=False)
     source_data = tomllib.loads(source.read_text())
-    assert source_data["memory"]["flush_enabled"] is True
+    assert source_data["memory"]["capture_assistant"] is True
     assert source_data["port"] == 18795
     assert source_data["llm"]["model"] == "custom/model-x"
 
@@ -725,12 +725,12 @@ def test_persist_after_vanish_uses_last_written_contents(tmp_path):
     persist_config(cfg, path=target)
 
     target.unlink()
-    cfg.memory.flush_enabled = True
+    cfg.memory.capture_assistant = True
     persist_config(cfg, path=target)
 
     data = tomllib.loads(target.read_text())
     assert data["port"] == 18795  # first save survives the vanish
-    assert data["memory"]["flush_enabled"] is True
+    assert data["memory"]["capture_assistant"] is True
     assert data["llm"]["api_key"] == "sk-or-synthetic"
 
 
@@ -858,3 +858,20 @@ def test_persist_plan_invalid_existing_warning_uses_structlog(tmp_path):
     assert entry["log_level"] == "warning"
     assert entry["path"] == str(target)
     assert entry["error"] == "ValidationError"
+
+
+def test_sparse_save_does_not_resurrect_retired_flush_settings(tmp_path):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "config_version = 1\n[memory]\nflush_enabled = true\nrepair_enabled = true\n"
+        "capture_assistant = true\nentry_ttl_days = 14\n"
+    )
+    cfg = GatewayConfig.load(target, read_only=True)
+    cfg.port = 18795
+    persist_config(cfg, path=target)
+    saved = tomllib.loads(target.read_text())
+    assert saved["memory"] == {"capture_assistant": True, "entry_ttl_days": 14}
+    assert saved["port"] == 18795
+    reloaded = load_config(target)
+    assert reloaded.memory.capture_assistant is True
+    assert reloaded.memory.entry_ttl_days == 14

@@ -115,7 +115,7 @@ def _config(workspace: Path) -> GatewayConfig:
     return GatewayConfig(
         workspace_dir=str(workspace),
         sandbox={"run_mode": "standard"},
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
     )
 

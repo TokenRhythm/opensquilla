@@ -424,13 +424,11 @@ def test_memory_evaluator_flags_degraded_backend() -> None:
             "status": "degraded",
             "vecAvailable": False,
             "ftsAvailable": True,
-            "pendingRepairCount": 2,
         }
     )
 
     ids = [finding.id for finding in findings]
     assert "memory.status.degraded" in ids
-    assert "memory.repair.pending" in ids
 
 
 def test_memory_evaluator_does_not_report_unknown_status_as_ready() -> None:
@@ -452,33 +450,6 @@ def test_memory_evaluator_treats_missing_status_as_incomplete() -> None:
         "opensquilla memory status --deep --json",
         "opensquilla gateway restart",
     ]
-
-
-def test_memory_repair_guidance_uses_existing_cli_options() -> None:
-    findings = evaluate_memory(
-        {
-            "backend": "sqlite",
-            "status": "ok",
-            "pendingRepairCount": 2,
-        }
-    )
-
-    repair = next(finding for finding in findings if finding.id == "memory.repair.pending")
-    commands = [step.command for step in repair.fix_steps]
-    assert "opensquilla memory repair run --json" in commands
-    assert "opensquilla memory repair run --yes" not in commands
-
-
-def test_memory_repair_guidance_accepts_pending_repairs_alias() -> None:
-    findings = evaluate_memory(
-        {
-            "backend": "sqlite",
-            "status": "ok",
-            "pendingRepairs": 2,
-        }
-    )
-
-    assert any(finding.id == "memory.repair.pending" for finding in findings)
 
 
 def test_logs_evaluator_flags_missing_debug_log_path() -> None:

@@ -33,6 +33,7 @@ import {
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
 import {
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadCompactionSummary,
   type SessionReadHistoryPage,
@@ -683,6 +684,7 @@ interface HistoryLoadParams {
   bridgeRetry?: boolean
   retry?: boolean
   nonReconnecting?: boolean
+  replaceCanonicalWindow?: boolean
 }
 
 type FailedHistoryRequest =
@@ -695,6 +697,11 @@ type FailedHistoryRequest =
   | {
       kind: 'bridge'
       key: string
+    }
+  | {
+      kind: 'latest'
+      key: string
+      error: unknown
     }
 
 const MAX_FORWARD_BRIDGE_PAGES = 2
@@ -765,7 +772,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       historySyncTimer = null
       const timerNonReconnecting = historySyncTimerNonReconnecting
       historySyncTimerNonReconnecting = false
-      if (historyState.value.loading) {
+      if (historyState.value.loading || failedHistoryRequest?.kind === 'latest') {
         historySyncPending = true
         historySyncPendingNonReconnecting ||= timerNonReconnecting
         return
@@ -1103,8 +1110,17 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         data,
       )
       const previousMessages = crossedSession ? [] : options.messages.value
-      const previousMaintenance = previousMessages.filter(isHistoryMaintenance)
-      const previousTranscript = previousMessages.filter(message => !isHistoryMaintenance(message))
+      const previousMaintenance = previousMessages.filter(message => (
+        isHistoryMaintenance(message)
+        && (!params.replaceCanonicalWindow || message.restoredFromHistory !== true)
+      ))
+      const previousTranscript = previousMessages.filter(message => (
+        !isHistoryMaintenance(message)
+        && (
+          !params.replaceCanonicalWindow
+          || (message.restoredFromHistory !== true && !message.terminalNotice)
+        )
+      ))
       const maintenanceMessages = compactionSummaryMessages(data)
       let historyData = data
       let bridgeContinuationNeeded = false
@@ -1308,7 +1324,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       } else {
         const refreshedWindow = reconcileHistoryWindow(previousTranscript, mapped)
         let nextMessages: ChatMessage[]
-        if (preserveLiveTail) {
+        if (params.replaceCanonicalWindow || preserveLiveTail) {
           nextMessages = reconcileRunningHistoryMessages(previousTranscript, refreshedWindow)
         } else {
           nextMessages = refreshedWindow
@@ -1409,7 +1425,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     } catch (error: unknown) {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
-        if (nonReconnecting) {
+        const cursorRequiresLatestReload = error instanceof SessionReadHistoryCursorError
+        if (nonReconnecting && !cursorRequiresLatestReload) {
           restoreSilentBackgroundState()
           return {
             ok: false,
@@ -1418,14 +1435,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
         }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
-        failedHistoryRequest = bridgeAttempted
-          ? { kind: 'bridge', key }
-          : {
-              kind: 'page',
-              key,
-              before: params.before ?? null,
-              prepend: Boolean(params.prepend),
-            }
+        failedHistoryRequest = cursorRequiresLatestReload || params.replaceCanonicalWindow
+          ? { kind: 'latest', key, error }
+          : bridgeAttempted
+            ? { kind: 'bridge', key }
+            : {
+                kind: 'page',
+                key,
+                before: params.before ?? null,
+                prepend: Boolean(params.prepend),
+              }
         historyState.value = {
           ...historyState.value,
           loading: false,
@@ -1455,6 +1474,17 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): Promise<SessionPhaseResult | void> | undefined {
     const key = options.sessionKey.value
     if (!key) return
+    if (
+      failedHistoryRequest?.key === key
+      && failedHistoryRequest.kind === 'latest'
+      && !params.replaceCanonicalWindow
+    ) {
+      historySyncPending = true
+      historySyncPendingNonReconnecting ||= Boolean(params.nonReconnecting)
+      // Bootstrap and live reconciliation treat an absent result as success.
+      // Keep their recovery fence closed until the replacement page succeeds.
+      return Promise.resolve({ ok: false, error: failedHistoryRequest.error })
+    }
     if (activeHistory) {
       if (
         activeHistory.key === key
@@ -1525,6 +1555,19 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   function retryHistory(bootstrap?: SessionBootstrapPhaseContext) {
     const failed = failedHistoryRequest
     if (failed?.key === options.sessionKey.value) {
+      if (failed.kind === 'latest') {
+        hasLoadedEarlier = false
+        loadEarlierPending = false
+        loadedEarlierCursors.clear()
+        failedHistoryRequest = null
+        historyState.value = {
+          ...historyState.value,
+          hasMore: false,
+          oldestCursor: null,
+          newestCursor: null,
+        }
+        return loadHistory({ replaceCanonicalWindow: true, retry: true }, bootstrap)
+      }
       if (failed.kind === 'bridge') {
         return loadHistory({ bridgeRetry: true, retry: true }, bootstrap)
       }

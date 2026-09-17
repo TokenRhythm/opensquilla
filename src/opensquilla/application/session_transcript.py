@@ -57,6 +57,15 @@ class PreviewContentReader(Protocol):
     ) -> Mapping[str, str]: ...
 
 
+class PreviewTitleReader(Protocol):
+    """Port for display-only corrections to selected preview titles."""
+
+    async def list_title_overrides(
+        self,
+        sessions: Sequence[SessionRecord],
+    ) -> Mapping[str, str]: ...
+
+
 class Clock(Protocol):
     """Clock Port kept separate so application tests are deterministic."""
 
@@ -100,10 +109,12 @@ class SessionTranscriptApplication:
         sessions: SessionRecordReader,
         preview_content: PreviewContentReader,
         clock: Clock,
+        preview_titles: PreviewTitleReader | None = None,
     ) -> None:
         self._sessions = sessions
         self._preview_content = preview_content
         self._clock = clock
+        self._preview_titles = preview_titles
 
     async def preview(self, query: SessionPreviewQuery) -> SessionPreviewResult:
         """Read previews without materializing complete transcripts.
@@ -129,11 +140,16 @@ class SessionTranscriptApplication:
             session_ids,
             max_chars=self.PREVIEW_MAX_CHARS,
         )
+        title_overrides = (
+            await self._preview_titles.list_title_overrides(selected)
+            if self._preview_titles is not None
+            else {}
+        )
 
         previews = tuple(
             SessionPreviewItem(
                 key=session.session_key,
-                title=self._title(session),
+                title=title_overrides.get(session.session_key, self._title(session)),
                 last_message=self._message(last_messages, session),
                 updated_at=session.updated_at,
             )
@@ -158,6 +174,7 @@ class SessionTranscriptApplication:
 __all__ = [
     "Clock",
     "PreviewContentReader",
+    "PreviewTitleReader",
     "SessionPreviewItem",
     "SessionPreviewQuery",
     "SessionPreviewResult",

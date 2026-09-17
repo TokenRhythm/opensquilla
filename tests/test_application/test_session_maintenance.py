@@ -12,9 +12,6 @@ from opensquilla.application.session_maintenance import (
     SessionCompactionDeadlineError,
     SessionCompactionEvent,
     SessionCompactionExecutionResult,
-    SessionCompactionFlushSafetyError,
-    SessionCompactionMemoryAssessment,
-    SessionCompactionMemoryResult,
     SessionCompactionMilestone,
     SessionCompactionPhaseTimeoutError,
     SessionCompactionPlan,
@@ -58,8 +55,6 @@ class _Ports:
             kept_count=1,
         )
         self.execution_error: BaseException | None = None
-        self.allow_memory = True
-        self.memory_available = True
         self.cancel_observed_broadcast = False
         self.executor_gate: asyncio.Event | None = None
         self.background_task: asyncio.Task[object] | None = None
@@ -101,68 +96,10 @@ class _Ports:
     def for_session(self, session_key: str) -> _Lock:
         return _Lock(self.calls)
 
-    @property
-    def flush_enabled(self) -> bool:
-        return True
-
-    @property
-    def flush_available(self) -> bool:
-        return self.memory_available
-
-    async def transcript(self, session_key: str) -> tuple[object, ...]:
-        self.calls.append("memory.transcript")
-        return ("entry",)
-
-    async def flush(
-        self,
-        session: SessionCompactionSession,
-        transcript: tuple[object, ...],
-        plan: SessionCompactionPlan,
-        compaction_id: str,
-    ) -> object:
-        self.calls.append("memory.flush")
-        return {"status": "flushed"}
-
-    def receipt_status(self, receipt: object | None) -> str:
-        return "flushed" if receipt is not None else "missing"
-
-    def receipt_is_successful(self, receipt: object) -> bool:
-        return True
-
-    @property
-    def requires_safe_receipt(self) -> bool:
-        return True
-
-    async def checkpoint_covers(
-        self,
-        session: SessionCompactionSession,
-        transcript: tuple[object, ...],
-    ) -> bool:
-        self.calls.append("memory.checkpoint")
-        return self.allow_memory
-
-    def assess(
-        self,
-        receipt: object | None,
-        *,
-        checkpoint_safe: bool,
-        required: bool,
-    ) -> SessionCompactionMemoryAssessment:
-        self.calls.append("memory.assess")
-        return SessionCompactionMemoryAssessment(
-            allows_destructive_compaction=self.allow_memory,
-            safety_status="safe" if self.allow_memory else "unsafe",
-            semantic_status="durable" if self.allow_memory else "missing",
-        )
-
-    def record(self, outcome: str, **details: object) -> None:
-        self.calls.append(f"memory.record:{outcome}")
-
     async def compact(
         self,
         command: CompactSession,
         plan: SessionCompactionPlan,
-        memory: SessionCompactionMemoryResult,
     ) -> SessionCompactionExecutionResult:
         self.calls.append("executor.compact")
         if self.executor_gate is not None:
@@ -227,7 +164,6 @@ def _application(ports: _Ports) -> SessionMaintenance:
     return SessionMaintenance(
         planning=ports,
         locking=ports,
-        memory=ports,
         executor=ports,
         lifecycle=ports,
         ownership=ports,
@@ -249,37 +185,11 @@ async def test_compaction_orders_safety_before_destructive_execution() -> None:
 
     assert result.status == "completed"
     assert result.context_window_tokens == 8_192
-    assert result.flush_receipt_status == "flushed"
-    assert ports.calls.index("lock.acquire") < ports.calls.index("memory.flush")
-    assert ports.calls.index("memory.assess") < ports.calls.index("executor.compact")
+    assert ports.calls.index("lock.acquire") < ports.calls.index("executor.compact")
     assert ports.calls.index("executor.compact") < ports.calls.index("lock.release")
     assert ports.calls.index("usage.exit") < ports.calls.index("lock.release")
     assert [event.status for event in ports.events].count("completed") == 1
     assert ports.events[-1].terminal is True
-
-
-async def test_unsafe_memory_flush_blocks_compactor() -> None:
-    ports = _Ports()
-    ports.allow_memory = False
-
-    with pytest.raises(SessionCompactionFlushSafetyError):
-        await _application(ports).compact(CompactSession("agent:main:webchat:one"))
-
-    assert "executor.compact" not in ports.calls
-    assert [event.status for event in ports.events if event.terminal] == ["failed"]
-
-
-async def test_missing_flush_service_still_enforces_checkpoint_safety() -> None:
-    ports = _Ports()
-    ports.memory_available = False
-    ports.allow_memory = False
-
-    with pytest.raises(SessionCompactionFlushSafetyError):
-        await _application(ports).compact(CompactSession("agent:main:webchat:one"))
-
-    assert "memory.flush" not in ports.calls
-    assert ports.calls.index("memory.checkpoint") < ports.calls.index("memory.assess")
-    assert "executor.compact" not in ports.calls
 
 
 async def test_timeout_claims_one_terminal_result() -> None:

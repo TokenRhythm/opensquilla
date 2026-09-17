@@ -198,7 +198,7 @@ async def test_build_services_wires_model_overrides_into_shared_catalog(
     )
 
     config = GatewayConfig(
-        memory={"flush_enabled": False},
+        memory={},
     )
     config.models = {
         "deepseek": {

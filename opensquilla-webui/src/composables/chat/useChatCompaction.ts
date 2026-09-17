@@ -182,7 +182,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (!payload) return false
     if (payload.refused === true || payload.safe_to_send === false || payload.safeToSend === false) return true
     const reason = String(payload.reason || payload.error_reason || payload.errorClass || payload.error_class || payload.error?.reason || payload.error?.code || '').toLowerCase()
-    return ['compaction_insufficient', 'compaction_flush_failed', 'context_overflow', 'unsafe_flush_receipt'].includes(reason)
+    return ['compaction_insufficient', 'context_overflow'].includes(reason)
   }
 
   function settleCompactInFlight(payload: ChatCompactPayload = {}, settleOptions: SettleCompactOptions = {}) {

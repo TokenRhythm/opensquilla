@@ -58,7 +58,7 @@ def resolve_compaction_provider(
     )
 
 
-async def flush_before_standalone_rewrite(
+async def checkpoint_before_standalone_rewrite(
     slash_services: _standalone_slash_adapter.StandaloneSlashServices,
     session_key: str,
     *,
@@ -70,7 +70,7 @@ async def flush_before_standalone_rewrite(
         output_console=output_console,
         error_panel_factory=error_panel_factory,
     )
-    return await _standalone_slash_adapter._flush_before_standalone_rewrite(
+    return await _standalone_slash_adapter._checkpoint_before_standalone_rewrite(
         slash_services,
         session_key,
         operation=operation,

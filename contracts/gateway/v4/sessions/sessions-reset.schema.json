@@ -36,8 +36,6 @@
       { "code": "NOT_FOUND" },
       { "code": "UNAUTHORIZED" },
       { "code": "PERMISSION_DENIED" },
-      { "code": "FLUSH_UNAVAILABLE", "retryable": true, "details": true },
-      { "code": "FLUSH_DISK_ERROR", "retryable": true, "details": true },
       { "code": "STORAGE_BUSY", "retryable": true, "retryAfterMs": true, "details": true },
       { "code": "INTERNAL_ERROR" }
     ]
@@ -73,8 +71,7 @@
         "rotated": { "type": "boolean" },
         "previous_session_id": { "type": "string" },
         "session_id": { "type": "string" },
-        "epoch": { "type": "integer" },
-        "flush_receipt": { "type": ["object", "null"], "additionalProperties": true }
+        "epoch": { "type": "integer" }
       }
     },
     "RpcError": {

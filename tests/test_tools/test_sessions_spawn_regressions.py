@@ -535,7 +535,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
     config = GatewayConfig(
         workspace_dir=str(workspace),
         sandbox={"run_mode": "full"},
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
         agent_stream_heartbeat_interval_seconds=0.0,
         agent_stream_idle_timeout_seconds=1.0,
@@ -773,7 +773,7 @@ async def test_task_workspace_spawn_survives_restart_and_revalidates(
     binding["kind"] = kind
     config = GatewayConfig(
         workspace_dir=str(fallback), sandbox={"run_mode": "full"},
-        memory={"flush_enabled": False}, naming={"enabled": False},
+        memory={}, naming={"enabled": False},
     )
     database = tmp_path / "task-sessions.db"
     storage = await SessionStorage.open(str(database))
@@ -946,7 +946,7 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
     config = GatewayConfig(
         workspace_dir=str(global_workspace),
         sandbox={"run_mode": "full"},
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
         agent_stream_heartbeat_interval_seconds=0.0,
         agent_stream_idle_timeout_seconds=1.0,

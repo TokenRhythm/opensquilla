@@ -1178,11 +1178,6 @@ async def test_history_delete_orders_all_fences_drains_and_identity_eviction(
         for session in sessions
     }
 
-    async def drain_turn_runner(keys: list[str]) -> None:
-        assert keys == sorted(session.session_key for session in sessions)
-        assert {"background", "runtime", "direct"} <= active_fences
-        assert all(lock.locked() for lock in locks.values())
-        order.append("turn-drain")
 
     async def drain_router(keys: list[str]) -> None:
         assert keys == sorted(session.session_key for session in sessions)
@@ -1193,7 +1188,6 @@ async def test_history_delete_orders_all_fences_drains_and_identity_eviction(
     ctx.task_runtime = SimpleNamespace(quiesce_sessions=runtime_fence)
     ctx.turn_runner = SimpleNamespace(
         get_session_lock=locks.__getitem__,
-        drain_session_background_writes=drain_turn_runner,
     )
     evicted: list[tuple[str, str | None]] = []
 
@@ -1262,7 +1256,6 @@ async def test_history_delete_orders_all_fences_drains_and_identity_eviction(
     assert order.index("background:enter") < order.index("runtime:enter")
     assert order.index("runtime:enter") < order.index("direct:enter")
     assert order.index("router-drain") < order.index("delete")
-    assert order.index("turn-drain") < order.index("delete")
     assert max(order.index(f"evict:{key}") for key in sorted_keys) < order.index(
         "direct:exit"
     )
@@ -1334,7 +1327,6 @@ async def test_history_delete_repeated_cancellation_waits_for_whole_fenced_opera
     ctx.task_runtime = SimpleNamespace(quiesce_sessions=runtime_fence)
     ctx.turn_runner = SimpleNamespace(
         get_session_lock=lambda _key: lock,
-        drain_session_background_writes=AsyncMock(return_value=None),
     )
     ctx.session_manager.evict_session_runtime_state = lambda *_args, **_kwargs: None
     registry = SimpleNamespace(quiesce_sessions=direct_fence)
@@ -1491,13 +1483,10 @@ async def test_history_delete_real_quiescers_leave_no_late_rows_after_cancellati
     )
     manager.attach_task_runtime(runtime)
 
-    async def no_turn_background_writes(_keys: list[str]) -> None:
-        return
 
     ctx.task_runtime = runtime
     ctx.turn_runner = SimpleNamespace(
         get_session_lock=runtime._get_session_lock_for_turn,
-        drain_session_background_writes=no_turn_background_writes,
     )
     runtime_handle = await runtime.enqueue(
         RouteEnvelope(

@@ -35,16 +35,6 @@ STOP_SURFACE_INVENTORY = {
         "recovery_first": True,
         "interactive_terminal_by_default": False,
     },
-    "compaction_refused_flush_timeout": {
-        "desired_kind": "blocked",
-        "recovery_first": True,
-        "interactive_terminal_by_default": False,
-    },
-    "compaction_refused_memory_flush": {
-        "desired_kind": "blocked",
-        "recovery_first": True,
-        "interactive_terminal_by_default": False,
-    },
     "compaction_refused_empty_summary": {
         "desired_kind": "blocked",
         "recovery_first": True,

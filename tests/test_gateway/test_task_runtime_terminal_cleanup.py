@@ -685,7 +685,7 @@ async def test_cancel_plan_run_stops_the_implementation_task(
             is_owner=True,
             authenticated=True,
         ),
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
         task_runtime=rt,
     )
     ctx.session_manager = manager

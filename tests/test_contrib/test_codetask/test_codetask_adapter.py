@@ -617,8 +617,13 @@ def test_per_run_config_inherits_operator_provider(monkeypatch, tmp_path):
     # re-pin the subagent to a provider the operator moved away from)...
     assert "llm_ensemble" not in parsed
     # ...and the template's run policy stays authoritative.
-    for section in ("tools", "sandbox", "meta_skill", "memory"):
+    for section in ("tools", "sandbox", "meta_skill"):
         assert section in parsed, section
+    assert parsed["workspace_strict"] is False
+    assert parsed["sandbox"]["sandbox"] is False
+    assert parsed["sandbox"]["security_grading"] is False
+    assert "memory*" in parsed["tools"]["deny"]
+    assert parsed["tools"]["trusted_fake_ip_cidrs"] == ["198.18.0.0/15"]
     assert parsed["meta_skill"]["enabled"] is False
 
 

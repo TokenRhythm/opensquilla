@@ -13,6 +13,7 @@ from copy import deepcopy
 import httpx
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import public_agent_event_payload
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
@@ -91,6 +92,7 @@ def _compaction_openrouter_catalog(monkeypatch, *models):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tokenizer_mode", ["default", "unavailable"])
 @pytest.mark.parametrize("provider", ["tokenrhythm", "openrouter"])
 @pytest.mark.parametrize("variant,reasoning_evidence,wire_mutation", [
     ("basic", 1600, None), ("tools", 1600, None), ("replay_off", 1600, None),
@@ -100,8 +102,12 @@ def _compaction_openrouter_catalog(monkeypatch, *models):
     ("model_switch", 1600, "wrong_summary_and_resumed_models"),
 ])
 async def test_compaction_acceptance_matrix_uses_real_runner_and_durable_content(
-    tmp_path, monkeypatch, provider, variant, reasoning_evidence, wire_mutation
+    tmp_path, monkeypatch, provider, variant, reasoning_evidence, wire_mutation, tokenizer_mode
 ):
+    if tokenizer_mode == "unavailable":
+        # Exercise the real conservative estimator used when optional tokenizer
+        # loading fails or times out, without changing request admission.
+        monkeypatch.setattr(token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE)
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
     monkeypatch.setenv("OPENSQUILLA_LIVE_DISABLE_DOTENV", "1")
     model = harness.DEFAULT_MODELS[provider]
@@ -146,7 +152,7 @@ async def test_compaction_acceptance_matrix_uses_real_runner_and_durable_content
                 if index == 3:
                     content += f" Also preserve COMPACTION_LABEL_2={second_label}."
                 if variant == "truncated":
-                    content = "The"
+                    content = "A"
             elif index == (1 if has_tools else 0):
                 content = f"COMPACTION_LABEL={label}"
             elif variant == "repeated" and index == 2:
@@ -161,7 +167,7 @@ async def test_compaction_acceptance_matrix_uses_real_runner_and_durable_content
         if variant == "truncated" and index >= 1:
             native = ""
         if variant == "long_reasoning" and index == 1 and reasoning_evidence == 1600:
-            native = "synthetic reasoning tokens " * 800
+            native = "synthetic reasoning tokens " * 400
         if provider == "openrouter":
             delta["reasoning_details"] = [{
                 "type": "reasoning.text", "text": native, "index": 0,

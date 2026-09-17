@@ -132,10 +132,7 @@ _BOOTSTRAP_SOURCE_FILENAMES_FALLBACK = frozenset(
         "AGENTS.md",
         "SOUL.md",
         "IDENTITY.md",
-        "TOOLS.md",
         "USER.md",
-        "BOOTSTRAP.md",
-        "HEARTBEAT.md",
     }
 )
 _GREP_DEFAULT_MAX_RESULTS = 100

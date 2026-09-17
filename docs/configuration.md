@@ -305,7 +305,6 @@ opensquilla memory list
 opensquilla memory search "project preference"
 opensquilla memory show <path>
 opensquilla memory dream
-opensquilla memory flush-session <session-key>
 ```
 
 Configure embedding behavior:

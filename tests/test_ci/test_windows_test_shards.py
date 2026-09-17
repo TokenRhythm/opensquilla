@@ -112,6 +112,13 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_router_configured_image_policy.py",
     "tests/test_provider/test_image_projection.py",
     "tests/test_session/test_attachment_manifest.py",
+    # Title refusal and archived first-message regressions use the declared
+    # provisional floor until a comparable three-run Windows duration refresh.
+    "tests/test_gateway/test_compacted_title_recovery.py",
+    "tests/test_gateway/test_session_title_recovery.py",
+    "tests/test_session/test_canonical_title_inputs.py",
+    "tests/test_session/test_naming_refusal.py",
+    "tests/test_session/test_title_quality.py",
     "tests/contracts/test_approval_center_contract.py",
     "tests/test_gateway/test_chat_history_characterization.py",
     "tests/contracts/test_conversation_events_contract.py",
@@ -209,7 +216,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_config_persist_corruption.py",
     "tests/test_gateway/test_config_profile_paths.py",
     "tests/test_gateway/test_cron_result_payload.py",
-    "tests/test_gateway/test_memory_repair_storage_gate.py",
     "tests/test_gateway/test_p1a_exact_abort_contract.py",
     "tests/test_gateway/test_rpc_ingress_validation.py",
     "tests/test_gateway/test_sessions_list_contract_adapter.py",
@@ -329,6 +335,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_telemetry_server/test_product_active_pipeline.py",
     "tests/test_telemetry_server/test_product_activity_pipeline.py",
     "tests/test_telemetry_server/test_protocol_upgrade_pipeline.py",
+    # Workspace MD retirement suites use the declared provisional floor until
+    # a comparable three-run Windows refresh supplies measured timings.
+    "tests/test_gateway/test_workspace_md_retirement_rpc.py",
+    "tests/test_identity/test_workspace_md_retirement.py",
+    "tests/test_scheduler/test_heartbeat_retirement.py",
 }
 
 
@@ -670,7 +681,6 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
 
     expected_moved_paths = {
         "tests/test_gateway/test_goal_rpc.py",
-        "tests/test_gateway/test_project_workspace_execution.py",
         "tests/test_gateway/test_rpc_meta_runs.py",
         "tests/test_gateway/test_rpc_router_decisions.py",
         "tests/test_live_long_task_case_driver.py",
@@ -687,7 +697,7 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     assert moved_paths == expected_moved_paths
     assert set(assignments) == set(historical_test_weights())
     assert {str(override["path"]) for override in overrides} == expected_moved_paths
-    assert sum(override.get("affinity_exception") is True for override in overrides) == 6
+    assert sum(override.get("affinity_exception") is True for override in overrides) == 5
     assert guardrails == {
         "max_moved_files": 10,
         "max_moved_fraction": 0.02,
@@ -870,9 +880,6 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
         "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
-        "tests/test_gateway/test_project_workspace_execution.py": (
-            "desktop-installer-contracts"
-        ),
         "tests/test_gateway/test_rpc_meta_runs.py": "desktop-installer-contracts",
         "tests/test_gateway/test_rpc_router_decisions.py": (
             "desktop-installer-contracts"

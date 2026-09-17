@@ -49,7 +49,7 @@ opensquilla <command> --help
 | `opensquilla agents` | Manage durable agents. |
 | `opensquilla mcp-server` | Run the OpenSquilla MCP server bridge. |
 | `opensquilla dist` | Emit a reproducible workspace-state inventory. |
-| `opensquilla reset` | Reset a session and flush memory synchronously. |
+| `opensquilla reset` | Archive the transcript and summaries, then reset the session. |
 
 ## Run Surfaces
 
@@ -322,9 +322,6 @@ opensquilla memory list
 opensquilla memory search "preference"
 opensquilla memory show <path>
 opensquilla memory dream
-opensquilla memory flush-session <session-key>
-opensquilla memory repair list
-opensquilla memory raw-fallbacks list
 ```
 
 Read: [`features/memory.md`](features/memory.md)

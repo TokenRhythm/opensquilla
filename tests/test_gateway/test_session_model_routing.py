@@ -168,7 +168,7 @@ async def test_legacy_default_resolution_is_audited_with_its_revision() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "run_kind",
-    ["default", "runtime_send", "cron_turn", "heartbeat", "memory_repair", "goal"],
+    ["default", "runtime_send", "cron_turn", "heartbeat", "goal"],
 )
 async def test_noninteractive_runs_keep_global_mode_without_reading_session(
     run_kind: str,

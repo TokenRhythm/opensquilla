@@ -109,7 +109,6 @@ async def test_live_agent_uses_web_search_without_web_fetch_loop() -> None:
             request_timeout=45.0,
             timeout=90.0,
             tool_timeout=30.0,
-            flush_enabled=False,
             temperature=0.0,
         ),
         tool_definitions=[

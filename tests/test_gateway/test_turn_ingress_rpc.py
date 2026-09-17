@@ -120,7 +120,7 @@ async def _open_real_stack(
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "workspace"),
             attachments={"media_root": str(db_path.parent / "media")},
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
         ),
         session_manager=manager,
@@ -2081,7 +2081,7 @@ async def test_queued_meta_control_reopens_and_reactivates_exactly_once(
     hold_blocker = asyncio.Event()
     gateway_config = GatewayConfig(
         workspace_dir=str(tmp_path / "workspace"),
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
     )
     routing_state: dict[str, Any] = {"mode": "router", "revision": 7}
@@ -2779,6 +2779,9 @@ async def test_sessions_send_fast_replay_consumes_legacy_meta_launch_draft(
         assert await stack.storage.list_meta_launch_drafts(session_key=SESSION_KEY) == []
 
 
+# Keep the SQLite-backed startup prerequisite within its scheduling budget;
+# the contract below checks replay state, not replay latency under runner load.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_sessions_send_replay_exposes_terminal_task_status(tmp_path: Path) -> None:
     async with _open_real_stack(tmp_path / "sessions.db") as stack:

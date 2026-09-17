@@ -155,7 +155,11 @@ async def _open_goal_rpc_stack(
     ),
 ) -> AsyncIterator[_GoalRpcStack]:
     storage = await SessionStorage.open(str(db_path))
-    manager = SessionManager(storage, inject_time_prefix=False)
+    manager = SessionManager(
+        storage,
+        inject_time_prefix=False,
+        checkpoint_workspace_dir=db_path.parent / "workspace",
+    )
 
     async def no_op_handler(_run: TaskRun) -> None:
         return None
@@ -177,7 +181,7 @@ async def _open_goal_rpc_stack(
 
     gateway_config = GatewayConfig(
         workspace_dir=str(db_path.parent / "workspace"),
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
         goal=GoalConfig(
             execution_enabled=execution_enabled,
@@ -3034,8 +3038,6 @@ async def test_non_user_run_kinds_cannot_claim_a_goal_candidate(
             "cron_turn",
             "memory",
             "memory_dream",
-            "memory_flush",
-            "memory_repair",
             "compaction",
             "session_compaction",
         ):
@@ -3930,6 +3932,8 @@ async def test_goal_settlement_storage_failure_compensates_fail_closed(
 async def test_goal_event_observer_failure_never_changes_durable_tool_result(
     tmp_path: Path,
 ) -> None:
+    from structlog.testing import capture_logs
+
     service: GoalService | None = None
 
     async def handler(run: TaskRun) -> None:
@@ -3960,19 +3964,24 @@ async def test_goal_event_observer_failure_never_changes_durable_tool_result(
             raise OSError("synthetic event observer failure")
 
         stack.service._event_emitter = fail_emit
-        created = await _handle_goals_set(_set_params(), stack.context)
-        # The synthetic observer raises on every lifecycle projection. Under a
-        # loaded suite, rendering those expected warning tracebacks can take
-        # longer than the normal in-memory task path without changing the
-        # durability contract under test.
-        task = await stack.runtime.wait(created["taskId"], timeout=5.0)
-        complete = await _wait_for_goal(
-            stack.storage,
-            lambda goal: goal.status == "complete" and goal.active_task_id is None,
-        )
+        # Capture expected observer failures without rendering their tracebacks
+        # on the event loop while the bounded durability check is running.
+        with capture_logs() as logs:
+            created = await _handle_goals_set(_set_params(), stack.context)
+            task = await stack.runtime.wait(created["taskId"], timeout=5.0)
+            complete = await _wait_for_goal(
+                stack.storage,
+                lambda goal: goal.status == "complete" and goal.active_task_id is None,
+            )
         assert task.status == AgentTaskStatus.SUCCEEDED
         assert complete.progress_revision == 1
         assert complete.terminal_reason == "model_complete"
+        failures = [
+            event for event in logs if event["event"] == "goal.event_emit_failed"
+        ]
+        assert {event["event_type"] for event in failures} == {"created", "updated"}
+        assert all(event["log_level"] == "warning" for event in failures)
+        assert all(event["exc_info"] is True for event in failures)
 
 
 @pytest.mark.asyncio
@@ -4251,7 +4260,7 @@ async def test_goal_artifact_loop_commits_and_settles_durable_terminal_state(
         config = GatewayConfig(
             workspace_dir=str(tmp_path / "workspace"),
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
             goal=GoalConfig(execution_enabled=True),
             squilla_router=SquillaRouterConfig(enabled=False),
@@ -4501,7 +4510,7 @@ async def test_real_turn_runner_continuation_reuses_durable_goal_context_and_com
         config = GatewayConfig(
             workspace_dir=str(tmp_path / "workspace"),
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
             goal=GoalConfig(execution_enabled=True),
             squilla_router=SquillaRouterConfig(enabled=False),
@@ -4828,7 +4837,7 @@ async def test_running_goal_edit_adopts_revision_in_same_task_without_transcript
         config = GatewayConfig(
             workspace_dir=str(tmp_path / "workspace"),
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
             goal=GoalConfig(execution_enabled=True),
             squilla_router=SquillaRouterConfig(enabled=False),
