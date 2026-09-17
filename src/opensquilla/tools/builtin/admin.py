@@ -757,7 +757,7 @@ async def gateway(
     params={
         "provider": {
             "type": "string",
-            "description": "Audio provider id (currently supported: elevenlabs)",
+            "description": "Audio provider id (supported: elevenlabs, atlascloud)",
         },
         "api_key": {
             "type": "string",
