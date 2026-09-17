@@ -17,8 +17,8 @@
       class="chat-share-picker"
       :class="{ 'is-selected': shareSelected }"
       :aria-pressed="shareSelected"
-      :title="shareSelected ? 'Remove from share image' : 'Add to share image'"
-      :aria-label="shareSelected ? 'Remove from share image' : 'Add to share image'"
+      :title="shareSelected ? t('chat.removeFromShare') : t('chat.addToShare')"
+      :aria-label="shareSelected ? t('chat.removeFromShare') : t('chat.addToShare')"
       @click.stop="emit('toggleShare', shareMessageId)"
     >
       <Icon v-if="shareSelected" name="check" :size="13" />
