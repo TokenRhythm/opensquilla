@@ -525,7 +525,8 @@ function focusCompositeHash(): boolean {
   const target = document.getElementById(targetId)
   if (!target) return false
   target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' })
-  target.focus({ preventScroll: true })
+  const initialFocus = target.querySelector<HTMLElement>('[data-settings-initial-focus]')
+  ;(initialFocus ?? target).focus({ preventScroll: true })
   return true
 }
 

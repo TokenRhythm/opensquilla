@@ -49,6 +49,7 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
   return {
     get availability() { return rpc.isConnected ? 'available' : 'unavailable' },
     get connectionError() { return rpc.error },
+    requiresCredential: false,
     get isAvailable() { return rpc.isConnected },
     get isLocalOwner() { return rpc.isLocalOwner },
     get isAuthenticated() { return rpc.isConnected },

@@ -23,6 +23,7 @@ export interface GatewayConnectionSettings {
 export interface GatewayAccess {
   readonly availability: GatewayAvailability
   readonly connectionError: string | null
+  readonly requiresCredential: boolean
   readonly isAvailable: boolean
   readonly isLocalOwner: boolean
   readonly isAuthenticated: boolean

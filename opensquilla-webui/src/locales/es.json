@@ -1566,6 +1566,8 @@
       "tokenLabel": "Token",
       "optional": "opcional",
       "tokenDesc": "Token de portador para puertas de enlace que requieren autenticación. Se almacena solo en esta pestaña.",
+      "tokenRequired": "Se requiere un token",
+      "reasonTokenRequired": "La autenticación falló. Los reintentos automáticos están en pausa. Introduce un token de pasarela válido y selecciona Conectar.",
       "reconnect": "Reconectar",
       "connect": "Conectar",
       "disconnect": "Desconectar"

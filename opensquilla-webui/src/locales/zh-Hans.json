@@ -1648,6 +1648,8 @@
       "tokenLabel": "令牌",
       "optional": "可选",
       "tokenDesc": "用于需要鉴权的网关的 Bearer 令牌。仅存储在此标签页中。",
+      "tokenRequired": "需要令牌",
+      "reasonTokenRequired": "身份验证失败，已暂停自动重试。请输入有效的网关令牌，然后点击连接。",
       "reconnect": "重新连接",
       "connect": "连接",
       "disconnect": "断开"

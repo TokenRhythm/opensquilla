@@ -87,6 +87,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     get connectionError() {
       return source.error
     },
+    get requiresCredential() {
+      return source.error === 'authentication_failed' || source.error === 'authentication_mismatch'
+    },
     get isAvailable() {
       return source.state === 'connected'
     },

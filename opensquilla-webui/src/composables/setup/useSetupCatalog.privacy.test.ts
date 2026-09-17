@@ -85,6 +85,7 @@ async function mountCatalog() {
   app.provide(GATEWAY_ACCESS_KEY, {
     availability: 'available',
     connectionError: null,
+    requiresCredential: false,
     isAvailable: true,
     isLocalOwner: true,
     isAuthenticated: true,

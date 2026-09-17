@@ -1566,6 +1566,8 @@
       "tokenLabel": "トークン",
       "optional": "任意",
       "tokenDesc": "認証が必要なゲートウェイ向けのベアラートークンです。このタブにのみ保存されます。",
+      "tokenRequired": "トークンが必要です",
+      "reasonTokenRequired": "認証に失敗しました。自動再試行を一時停止しました。有効なゲートウェイトークンを入力し、接続を選択してください。",
       "reconnect": "再接続",
       "connect": "接続",
       "disconnect": "切断"

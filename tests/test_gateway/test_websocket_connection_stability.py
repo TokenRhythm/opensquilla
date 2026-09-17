@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from typing import Any
 
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
-from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config import AuthConfig, GatewayConfig
+from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
 from opensquilla.gateway.protocol import make_ok_res
-from opensquilla.gateway.websocket import WsConnection, handle_ws_connection
+from opensquilla.gateway.rpc import RpcDispatcher, get_dispatcher
+from opensquilla.gateway.websocket import (
+    SubscriptionManager,
+    WsConnection,
+    get_registry,
+    handle_ws_connection,
+)
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.storage import SessionStorage
 
 
 class _Socket:
@@ -52,8 +62,10 @@ class _Socket:
                             return frame
                     await self.changed.wait()
 
-    def request(self, request_id: str, method: str) -> None:
-        self.incoming.put_nowait({"type": "req", "id": request_id, "method": method, "params": {}})
+    def request(self, request_id: str, method: str, params: dict | None = None) -> None:
+        self.incoming.put_nowait(
+            {"type": "req", "id": request_id, "method": method, "params": params or {}}
+        )
 
 
 class _Dispatcher:
@@ -77,16 +89,30 @@ class _Dispatcher:
         return make_ok_res(req_id, {"method": method})
 
 
-async def _start(ws: _Socket, dispatcher: _Dispatcher) -> asyncio.Task[None]:
+async def _start(
+    ws: _Socket,
+    dispatcher: _Dispatcher | RpcDispatcher,
+    *,
+    config: GatewayConfig | None = None,
+    auth: dict | None = None,
+    **services: Any,
+) -> asyncio.Task[None]:
     ws.incoming.put_nowait(
         {
             "type": "req",
             "id": "connect",
             "method": "connect",
-            "params": {"minProtocol": 3, "maxProtocol": 3, "caps": ["transport.probe.v1"]},
+            "params": {
+                "minProtocol": 3,
+                "maxProtocol": 3,
+                "caps": ["transport.probe.v1"],
+                "auth": auth or {},
+            },
         }
     )
-    task = asyncio.create_task(handle_ws_connection(ws, GatewayConfig(), dispatcher=dispatcher))  # type: ignore[arg-type]
+    task = asyncio.create_task(
+        handle_ws_connection(ws, config or GatewayConfig(), dispatcher=dispatcher, **services)  # type: ignore[arg-type]
+    )
     hello = await ws.wait_frame(type="hello-ok")
     assert hello["policy"]["transport_probe_nonce"] is True
     assert hello["policy"]["client_ws_keepalive_timeout_ms"] == 0
@@ -177,3 +203,93 @@ def test_connection_transport_reservations_are_shared_and_cleanup_is_idempotent(
     conn._cleanup_transport()
     conn._cleanup_transport()
     assert budget.used == before
+
+
+async def test_enabling_token_auth_preserves_legal_guest_handshake_and_accepts_new_token() -> None:
+    browser_key = "osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    config = GatewayConfig(host="0.0.0.0", auth=AuthConfig(mode="none"))
+    guest_owner_id = None
+    for supplied_token in [None, "", "synthetic-invalid-token", "synthetic-correct-token"]:
+        if supplied_token is not None:
+            config.auth = AuthConfig(mode="token", token="synthetic-correct-token")
+        ws = _Socket()
+        task = await _start(
+            ws,
+            get_dispatcher(),
+            config=config,
+            auth={"guestSessionKey": browser_key, "token": supplied_token or ""},
+        )
+        try:
+            hello = await ws.wait_frame(type="hello-ok")
+            principal = hello["auth"]["principal"]
+            if supplied_token == "synthetic-correct-token":
+                assert principal["authenticated"] is True
+                assert principal["authState"] == "authenticated"
+            else:
+                assert principal["authenticated"] is False
+                assert principal["authState"] == "guest"
+                assert hello["auth"]["guestSessionKey"] == browser_key
+                guest_owner_id = guest_owner_id or principal["guestOwnerId"]
+                assert principal["guestOwnerId"] == guest_owner_id
+            assert ws.close_codes == []
+        finally:
+            ws.incoming.put_nowait(None)
+            await asyncio.wait_for(task, 2)
+
+
+async def test_idle_guest_keeps_owned_subscription_after_unrelated_permission_denials(
+    tmp_path, monkeypatch,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    manager = SessionManager(storage)
+    subscriptions = SubscriptionManager()
+    ws = _Socket()
+    config = GatewayConfig(host="0.0.0.0", auth=AuthConfig(mode="token", token="synthetic-token"))
+    task = await _start(
+        ws,
+        get_dispatcher(),
+        config=config,
+        auth={"guestSessionKey": "osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+        session_manager=manager,
+        subscription_manager=subscriptions,
+    )
+    try:
+        hello = await ws.wait_frame(type="hello-ok")
+        conn_id = hello["server"]["conn_id"]
+        owner_id = hello["auth"]["principal"]["guestOwnerId"]
+        key = guest_owned_session_key(owner_id, "idle-conversation")
+        await manager.create(key)
+        ws.request("subscribe-before", "sessions.messages.subscribe", {"key": key})
+        before = await ws.wait_frame(type="res", id="subscribe-before")
+        assert before["ok"] is True
+        assert before["payload"]["subscribed"] is True
+
+        # Current guest authority is keyed to browser ownership, not idle time.
+        # Advance wall time without waiting a week or fabricating an expiry signal.
+        later = time.time() + 7 * 24 * 60 * 60
+        monkeypatch.setattr(time, "time", lambda: later)
+        ws.incoming.put_nowait({"type": "ping", "nonce": "after-idle"})
+        await ws.wait_frame(type="pong", nonce="after-idle")
+        for request_id, method, params in [
+            ("owner-only", "config.get", {}),
+            ("foreign-session", "sessions.messages.subscribe", {"key": "agent:main:webchat:other"}),
+        ]:
+            ws.request(request_id, method, params)
+            denied = await ws.wait_frame(type="res", id=request_id)
+            assert denied["ok"] is False
+            assert denied["error"]["code"] == "UNAUTHORIZED"
+
+        ws.request("subscribe-after", "sessions.messages.subscribe", {"key": key})
+        after = await ws.wait_frame(type="res", id="subscribe-after")
+        assert after["ok"] is True
+        assert after["payload"]["subscribed"] is True
+        assert subscriptions.get_message_subscribers(key) == {conn_id}
+        connection = get_registry().get(conn_id)
+        assert connection is not None
+        await connection.send_event("session.event", {"session_key": key, "kind": "synthetic"})
+        await ws.wait_frame(type="event", event="session.event")
+        assert ws.close_codes == []
+    finally:
+        ws.incoming.put_nowait(None)
+        await asyncio.wait_for(task, 2)
+        await storage.close()
