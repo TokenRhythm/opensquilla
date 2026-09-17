@@ -11,7 +11,6 @@ import ntpath
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -1095,7 +1094,7 @@ def _direct_runtime_command(
 
     native_windows = os.name == "nt" if windows is None else windows
     platform_name = "windows" if native_windows else "linux"
-    if any(marker in command for marker in ("$(", "`")):
+    if any(marker in command for marker in ("$(", "${", "`")):
         return None
     try:
         segments = parse_shell_segments(command, platform=platform_name)
@@ -1138,6 +1137,14 @@ def _runtime_unavailable_envelope(
     if runtime_command is None:
         return None
     component_id, executable = runtime_command
+    if not native_windows and (
+        f"BASH_FUNC_{executable}%%" in environment
+        or f"BASH_FUNC_{executable}()" in environment
+    ):
+        # A child shell may import this function without any executable on PATH.
+        # Let that shell determine whether the definition is usable; importing
+        # it in a separate preflight shell could repeat initialization effects.
+        return None
     if _runtime_executable_available(executable, environment, cwd=cwd, windows=native_windows):
         return None
     return _missing_runtime_payload(component_id, executable)
@@ -1198,6 +1205,51 @@ def _uses_posix_login_shell(runtime: object | None, *, host_execution: bool) -> 
     )
 
 
+_WINDOWS_DIRECT_TOOL_CANDIDATES = {
+    "npm": ("npm.cmd", "npm.exe"),
+    "npx": ("npx.cmd", "npx.exe"),
+    "pnpm": ("pnpm.cmd", "pnpm.exe"),
+    "yarn": ("yarn.cmd", "yarn.exe"),
+    "git": ("git.exe", "git.cmd"),
+    "node": ("node.exe",),
+}
+
+
+def _windows_controlled_runtime_unavailable(
+    command: str, environment: dict[str, str], *, cwd: str | None,
+) -> dict[str, object] | None:
+    runtime_command = _direct_runtime_command(command, windows=True)
+    if runtime_command is None:
+        return None
+    component_id, executable = runtime_command
+    if executable.lower() in {"python", "python3"}:
+        # The shell host supplies these functions using its own interpreter.
+        return None
+    candidates = _WINDOWS_DIRECT_TOOL_CANDIDATES.get(_shell_command_basename(executable), ())
+    if any(
+        _runtime_executable_available(candidate, environment, cwd=cwd, windows=True)
+        for candidate in candidates
+    ):
+        return None
+    if executable.lower() in {"npm", "npx"}:
+        # Bare package-manager commands are translated into explicit cmd shims.
+        return _missing_runtime_payload(component_id, executable)
+    # Other commands may still resolve through PowerShell, including ps1 files.
+    return _runtime_unavailable_envelope(command, environment, cwd=cwd, windows=True)
+
+
+def _windows_backend_runtime_preflight(
+    command: str, request: SandboxRequest, runtime: object | None,
+) -> dict[str, object] | None:
+    if not _windows_sandbox_backend_active(runtime):
+        return None
+    from opensquilla.sandbox.backend.windows_default import _process_base_env
+
+    return _windows_controlled_runtime_unavailable(
+        command, _process_base_env(request), cwd=str(request.cwd),
+    )
+
+
 def _shell_runtime_preflight(
     command: str,
     environment: dict[str, str],
@@ -1209,20 +1261,17 @@ def _shell_runtime_preflight(
     if _uses_posix_login_shell(runtime, host_execution=host_execution):
         return None
     if _windows_sandbox_backend_active(runtime) and not host_execution:
-        runtime_command = _direct_runtime_command(command, windows=True)
-        if runtime_command is not None:
-            component_id, executable = runtime_command
-            if executable.lower() in {"python", "python3"}:
-                # The Windows sandbox shell supplies these functions using the
-                # interpreter that starts its controlled shell host.
-                return None
-            if executable.lower() in {"npm", "npx"}:
-                executable += ".cmd"
-                if not _runtime_executable_available(
-                    executable, environment, cwd=cwd, windows=True
-                ):
-                    return _missing_runtime_payload(component_id, executable)
-                return None
+        from opensquilla.sandbox.backend.windows_default import _prepend_windows_tool_paths
+
+        # Keep absence checks ahead of approval without overlooking the backend's
+        # discovered tool directories. Final policy filtering is checked again
+        # against the completed request before a process can be launched.
+        environment = dict(environment)
+        if environment.get("OPENSQUILLA_GUEST_SAFE") != "1":
+            host_env = dict(os.environ)
+            host_env.update(environment)
+            _prepend_windows_tool_paths(environment, host_env=host_env)
+        return _windows_controlled_runtime_unavailable(command, environment, cwd=cwd)
     return _runtime_unavailable_envelope(command, environment, cwd=cwd)
 
 
@@ -1239,7 +1288,7 @@ def _runtime_executable_available(
         entries = folded.get("PATH", "").split(";")
         extensions = folded.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
         names = [executable]
-        if not any(executable.lower().endswith(ext.lower()) for ext in extensions if ext):
+        if not ntpath.splitext(executable)[1]:
             names = [executable + ext for ext in extensions if ext]
             names.append(executable + ".ps1")
         # PowerShell resolves external commands on PATH; it does not implicitly
@@ -1257,12 +1306,16 @@ def _runtime_executable_available(
         # An unset PATH lets the shell choose its own compiled default; Python's
         # default executable search path need not match that shell's value.
         return True
-    entries = environment["PATH"].split(os.pathsep)
-    search_path = os.pathsep.join(
-        str(Path(entry) if Path(entry).is_absolute() else base / entry)
-        for entry in entries
-    )
-    return shutil.which(executable, path=search_path) is not None
+    # Use POSIX search rules even when inspecting this execution mode on a
+    # Windows host; shutil.which always applies its native PATHEXT behavior.
+    for entry in environment["PATH"].split(":"):
+        directory = Path(entry)
+        if not directory.is_absolute():
+            directory = base / directory
+        candidate = directory / executable
+        if candidate.is_file() and os.access(candidate, os.F_OK | os.X_OK):
+            return True
+    return False
 
 
 def _runtime_shell_environment(
@@ -2470,6 +2523,8 @@ import sys
 import urllib.error
 import urllib.request
 
+_DIRECT_TOOL_CANDIDATES = __OPENSQUILLA_DIRECT_TOOL_CANDIDATES__
+
 _REMOVE_ITEM_RE = re.compile(
     r"^(?:Remove-Item|rm|del|erase)\b(?P<rest>.*)$",
     re.IGNORECASE,
@@ -2980,13 +3035,7 @@ def _windowsapps_alias_path(path):
 
 
 def _direct_tool_candidates(command):
-    if command in {"npm", "npx", "pnpm", "yarn"}:
-        return (f"{command}.cmd", f"{command}.exe")
-    if command == "git":
-        return ("git.exe", "git.cmd")
-    if command == "node":
-        return ("node.exe",)
-    return ()
+    return _DIRECT_TOOL_CANDIDATES.get(command, ())
 
 
 def _which_exact(candidate):
@@ -3299,7 +3348,7 @@ def main():
 
 
 raise SystemExit(main())
-""".strip()
+""".strip().replace("__OPENSQUILLA_DIRECT_TOOL_CANDIDATES__", repr(_WINDOWS_DIRECT_TOOL_CANDIDATES))
 
 
 def _sandbox_shell_backend_argv(
@@ -6935,6 +6984,13 @@ async def exec_command(
                     session_id=getattr(request, "session_id", ""),
                     run_mode=getattr(request, "run_mode", ""),
                 )
+                runtime_unavailable = _windows_backend_runtime_preflight(
+                    command, backend_request, runtime,
+                )
+                if runtime_unavailable is not None:
+                    return finish(
+                        json.dumps(runtime_unavailable, ensure_ascii=False), executed=False,
+                    )
                 preflight = await preflight_subprocess_managed_network(backend_request, runtime)
                 if isinstance(preflight, DenialResult):
                     return finish(json.dumps(preflight.to_dict()), executed=False)
@@ -7422,6 +7478,11 @@ async def background_process(
                 session_id=getattr(request, "session_id", ""),
                 run_mode=getattr(request, "run_mode", ""),
             )
+            runtime_unavailable = _windows_backend_runtime_preflight(
+                command, backend_request, runtime,
+            )
+            if runtime_unavailable is not None:
+                return json.dumps(runtime_unavailable, ensure_ascii=False)
             preflight = await preflight_subprocess_managed_network(backend_request, runtime)
             if isinstance(preflight, DenialResult):
                 return json.dumps(preflight.to_dict())

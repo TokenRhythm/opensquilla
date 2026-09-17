@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -21,6 +22,63 @@ FAILURE_RECOVERY_INSTRUCTION = (
     "is essential, explain the missing prerequisite and what the user must change."
 )
 
+_DIAGNOSTIC_METADATA_KEYS = frozenset({
+    "attempt", "attempt_count", "retry", "retry_count", "timestamp", "started_at",
+    "completed_at", "duration", "duration_ms", "elapsed", "elapsed_ms", "wall_time_seconds",
+    "call_id", "request_id", "tool_use_id", "pid", "process_id",
+})
+_DIAGNOSTIC_COUNTER = re.compile(
+    r"\b(?:attempt(?:s|_count)?|retr(?:y|ies|y_count)|pid|process_id)"
+    r"\s*(?:[:=#]\s*)?\d+\b", re.IGNORECASE,
+)
+_DIAGNOSTIC_ID = re.compile(
+    r"\b(?:call_id|request_id|tool_use_id)\s*[:=]\s*[^\s,;]+", re.IGNORECASE,
+)
+_DIAGNOSTIC_TIME = re.compile(
+    r"\b(?:\d{4}-\d{2}-\d{2}[T ])?\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?\b"
+)
+_DIAGNOSTIC_DURATION = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:ms|milliseconds?|s|secs?|seconds?)\b", re.IGNORECASE,
+)
+
+
+def _diagnostic_text(value: str) -> str:
+    value = _DIAGNOSTIC_COUNTER.sub("<counter>", value)
+    value = _DIAGNOSTIC_ID.sub("<call>", value)
+    value = _DIAGNOSTIC_TIME.sub("<time>", value)
+    return _DIAGNOSTIC_DURATION.sub("<duration>", value)
+
+
+def _diagnostic_payload(value: Any, depth: int = 0) -> Any:
+    if depth >= 32:
+        return "<nested diagnostic>"
+    if isinstance(value, dict):
+        return {
+            key: _diagnostic_payload(item, depth + 1)
+            for key, item in value.items()
+            if key.lower() not in _DIAGNOSTIC_METADATA_KEYS
+        }
+    if isinstance(value, list):
+        return [_diagnostic_payload(item, depth + 1) for item in value]
+    return _diagnostic_text(value) if isinstance(value, str) else value
+
+
+def _failure_evidence(result: ToolResult) -> str:
+    try:
+        evidence = json.dumps(
+            _diagnostic_payload(json.loads(result.content)), sort_keys=True, ensure_ascii=False,
+        )
+    except (ValueError, TypeError, RecursionError):
+        evidence = _diagnostic_text(result.content)
+    status = result.execution_status
+    evidence = json.dumps([
+        evidence,
+        status.get("exit_code") if status is not None else None,
+        status.get("reason") if status is not None else None,
+    ])
+    return hashlib.sha256(evidence.encode()).hexdigest()
+
 
 @dataclass
 class ToolFailureRecovery:
@@ -28,7 +86,9 @@ class ToolFailureRecovery:
 
     Ordinary failures get two retries. A declared permanent failure cannot be
     repeated unchanged; a different attempt at the same missing capability gets
-    one opportunity. Diagnostic prose and provider call IDs are not progress.
+    one opportunity. An observed repair and new failure evidence renew the
+    ordinary streak together, at most three times before a successful verifier.
+    Diagnostic metadata alone cannot renew it.
     """
 
     failures: dict[str, int] = field(default_factory=dict)
@@ -38,6 +98,10 @@ class ToolFailureRecovery:
     last_code: str = ""
     _inflight: dict[str, int] = field(default_factory=dict)
     _admission: asyncio.Condition = field(default_factory=asyncio.Condition)
+    _repair_generation: int = 0
+    _failure_generation: dict[str, int] = field(default_factory=dict)
+    _seen_evidence: dict[str, set[str]] = field(default_factory=dict)
+    _progress_renewals: dict[str, int] = field(default_factory=dict)
 
     @staticmethod
     def call_key(call: ToolCall) -> str:
@@ -99,20 +163,24 @@ class ToolFailureRecovery:
         if not failed:
             self.failures.pop(key, None)
             self.nonretryable.discard(key)
+            self._failure_generation.pop(key, None)
+            self._seen_evidence.pop(key, None)
+            self._progress_renewals.pop(key, None)
             if repair_observed or (
                 result.effect_outcome is not None
                 and result.effect_outcome.effect_state == "committed"
             ):
-                # A real change reopens admission, without refunding failed
-                # capability attempts. Repeated unrelated writes cannot spin.
+                # Reopen admission for a repair, but renew the failure streak
+                # only after a subsequent verifier demonstrates a new outcome.
                 self.nonretryable.clear()
+                self._repair_generation += 1
             return
         payload: dict[str, Any] = {}
         try:
             decoded = json.loads(result.content)
             if isinstance(decoded, dict):
                 payload = decoded
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             pass
         session = payload.get("session")
         if isinstance(session, dict) and isinstance(session.get("runtime_failure"), dict):
@@ -120,9 +188,23 @@ class ToolFailureRecovery:
         code = payload.get("code")
         if code == FAILURE_RECOVERY_CODE:
             return
-        if isinstance(code, str):
-            self.last_code = code
+        self.last_code = code if isinstance(code, str) else ""
         count = self.failures.get(key, 0) + 1
+        evidence = _failure_evidence(result)
+        seen = self._seen_evidence.setdefault(key, set())
+        if (
+            seen and evidence not in seen
+            and self._repair_generation > self._failure_generation.get(key, 0)
+            and self._progress_renewals.get(key, 0) < 3
+            and payload.get("retryable") is not False
+            and code != "RUNTIME_UNAVAILABLE"
+        ):
+            count = 1
+            # Novel diagnostics are evidence of progress, not proof: external
+            # paths or payloads can vary even when the underlying fault does not.
+            self._progress_renewals[key] = self._progress_renewals.get(key, 0) + 1
+        seen.add(evidence)
+        self._failure_generation[key] = self._repair_generation
         self.failures[key] = count
         if payload.get("retryable") is False:
             self.nonretryable.add(key)

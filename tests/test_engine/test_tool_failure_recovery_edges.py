@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -487,3 +488,44 @@ async def test_runtime_failures_in_different_execution_contexts_are_not_merged(
     assert len(provider.requests) == 5
     assert all(request["tools"] for request in provider.requests)
     assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+@pytest.mark.parametrize(
+    "driver,status,step_status,expected_error",
+    [
+        ("manual", "running", "in_progress", True),
+        ("manual", "running", "completed", False),
+        ("manual", "blocked", "blocked", False),
+        ("goal", "running", "in_progress", False),
+    ],
+)
+async def test_failure_finalization_preserves_plan_completion_guard(
+    driver: str, status: str, step_status: str, expected_error: bool,
+) -> None:
+    plan = SimpleNamespace(
+        run_id="synthetic-plan", driver_kind=driver, status=status, state_revision=1,
+        current_step_id=None if step_status == "completed" else "check",
+        step_states=[{"step_id": "check", "status": step_status}],
+    )
+
+    class Storage:
+        async def get_plan_run(self, run_id: str) -> Any:
+            assert run_id == plan.run_id
+            return plan
+
+    context = ToolContext(plan_run_id=plan.run_id, plan_run=plan, plan_storage=Storage())
+    provider = _EdgeProvider([[('probe', {"target": "sample"})]] * 8)
+
+    async def handler(call: ToolCall) -> ToolResult:
+        return _failed(call)
+
+    agent = _agent(provider, handler, context=context)
+    events = [event async for event in agent.run_turn("Complete the attached work.")]
+    assert len(provider.requests) == (1 if step_status == "completed" else 4)
+    assert provider.requests[-1]["tools"] is None
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    if expected_error:
+        assert [event.code for event in errors] == ["plan_run_checkpoint_required"]
+    else:
+        assert errors == []
+    assert plan.status == status

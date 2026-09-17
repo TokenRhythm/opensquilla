@@ -212,6 +212,8 @@ class ErrorEvent:
     model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
     usage_missing_count: int = 0
     generation_epoch: int | None = None
+    # Preserve request accounting when an ensemble's terminal call fails.
+    ensemble_trace: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -497,16 +497,18 @@ async def _provider_stream_with_lifecycle(
         if on_request_start is not None:
             await on_request_start()
 
+    heartbeat_stream: AsyncIterator[StreamEvent] | None = None
     try:
         stream = stream_factory()
-        async for event in _stream_with_heartbeats(
+        heartbeat_stream = _stream_with_heartbeats(
             stream,
             phase=phase,
             message=message,
             timeout_seconds=timeout_seconds,
             reset_deadline_on_event=reset_deadline_on_event,
             on_request_start=record_request_start,
-        ):
+        )
+        async for event in heartbeat_stream:
             if execution_context is not None and not isinstance(
                 event,
                 ProviderGenerationResetEvent,
@@ -576,8 +578,12 @@ async def _provider_stream_with_lifecycle(
         )
         raise
     finally:
-        if execution_context is not None and lease is not None:
-            await execution_context.finish_provider_call(lease, outcome)
+        try:
+            if heartbeat_stream is not None:
+                await _close_async_iterator(heartbeat_stream, phase=phase)
+        finally:
+            if execution_context is not None and lease is not None:
+                await execution_context.finish_provider_call(lease, outcome)
 
 
 def _generation_reset(
@@ -2553,16 +2559,21 @@ class EnsembleProvider:
         final answer; no candidate-generation step is necessary here.
         """
 
+        from opensquilla.engine.usage_accounting import UsageAccountingUnavailableError
+
         member: EnsembleMemberConfig | None
+        public_role: str
         if self._fixed_takeover_active:
             fixed_role: Literal["fixed_aggregator", "fixed_direct"] = (
                 "fixed_aggregator"
                 if self._fixed_takeover_role == "fixed_aggregator" else "fixed_direct"
             )
-            provider = self.fallback_provider
+            provider = self._fixed_provider
             member = self._fallback_request_budget_member
             request_config = self._fixed_chat_config(config, role=fixed_role) or config
             provider_name, model = self.fallback_provider_name, self.fallback_model
+            public_role, label = fixed_role, "fixed"
+            prior_trace = self._fixed_trace
             role = (
                 StickyExecutionRole.FIXED_AGGREGATOR
                 if fixed_role == "fixed_aggregator"
@@ -2582,31 +2593,78 @@ class EnsembleProvider:
                     provider = None
             request_config = self._aggregator_chat_config(config, messages)
             provider_name, model = member.provider_config.provider, member.provider_config.model
+            public_role = label = "aggregator"
+            prior_trace = self._primary_trace
             role = StickyExecutionRole.PRIMARY_AGGREGATOR
             logical_index = (
                 execution_context.primary_logical_call_index + 1
                 if execution_context is not None else 0
             )
-        if provider is None:
-            yield ErrorEvent(
-                message="The current ensemble answer provider is unavailable.",
-                code="ensemble_single_attempt_unavailable",
-            )
-            return
         request_config = request_config.model_copy(update={
             "timeout": min(config.timeout, request_config.timeout),
             "physical_attempt_limit": 1,
         })
+        request_messages = _ensemble_request_messages(messages, request_config)
+        current_trace = self._trace_payload(
+            (),
+            successful_count=0,
+            fallback_used=self._fixed_takeover_active,
+            fallback_reason="",
+            final_request_role=public_role,
+            final_request_member=member,
+            final_request_config=request_config,
+            final_request_tools=tools,
+            final_request_messages=request_messages,
+            final_request_timeout_seconds=request_config.timeout,
+        )
+        trace = copy.deepcopy(prior_trace) if prior_trace is not None else current_trace
+        trace["final_request_role"] = public_role
+        trace["final_request"] = current_trace["final_request"]
+        provider_name = str(getattr(provider, "active_provider_id", "") or provider_name)
+        text_parts: list[str] = []
+
+        def error_with_trace(event: ErrorEvent) -> ErrorEvent:
+            api_key = (
+                self._fallback_api_key if self._fixed_takeover_active
+                else self.aggregator.provider_config.api_key
+            )
+            event = replace(
+                event,
+                message=redact_upstream_error_text(event.message, api_key=api_key, max_len=2000),
+                code=redact_upstream_error_code(event.code, api_key=api_key),
+            )
+            trace["final_request"].update({
+                "status": "error",
+                "output": _trace_content("".join(text_parts), max_chars=TRACE_CONTENT_MAX_CHARS),
+                "error": {"code": event.code, "message": event.message},
+            })
+            trace["final_request"]["execution"].update({
+                "provider": str(getattr(provider, "active_provider_id", "") or provider_name),
+                "model": model,
+            })
+            return replace(event, ensemble_trace=trace)
+
+        if provider is None:
+            yield error_with_trace(ErrorEvent(
+                message="The current ensemble answer provider is unavailable.",
+                code="ensemble_single_attempt_unavailable",
+            ))
+            return
         capacity_error = self._attachment_request_unavailability(
             member=member, chat_config=request_config, role="Ensemble answer provider",
         )
         if capacity_error is not None:
-            yield ErrorEvent(message=capacity_error[0], code=capacity_error[1])
+            yield error_with_trace(ErrorEvent(message=capacity_error[0], code=capacity_error[1]))
             return
+
+        async def mark_request_started() -> None:
+            _mark_final_request_started(trace)
+
+        started = time.monotonic()
         stream = _provider_stream_with_lifecycle(
             lambda: self._account_physical_stream(
                 lambda: provider.chat(
-                    _ensemble_request_messages(messages, request_config),
+                    request_messages,
                     tools=tools,
                     config=request_config,
                 ),
@@ -2622,14 +2680,55 @@ class EnsembleProvider:
             message="Waiting for the final answer",
             timeout_seconds=request_config.timeout,
             reset_deadline_on_event=False,
+            on_request_start=mark_request_started,
         )
         try:
             async for event in stream:
+                if isinstance(event, TextDeltaEvent):
+                    text_parts.append(event.text)
+                elif isinstance(event, DoneEvent):
+                    actual_provider = str(
+                        getattr(provider, "active_provider_id", "") or provider_name
+                    )
+                    actual_model = event.model or model
+                    row = _done_usage_row(
+                        event, role=public_role, profile=self.profile_name, label=label,
+                        provider=actual_provider, model=actual_model,
+                    )
+                    row["elapsed_ms"] = max(0, int((time.monotonic() - started) * 1000))
+                    _attach_final_request_output(
+                        trace, event=event, output_text="".join(text_parts),
+                    )
+                    trace["final_request"]["execution"].update({
+                        "provider": actual_provider, "model": actual_model,
+                    })
+                    # The outer turn already consumed prior request receipts.
+                    # Only the trace is cumulative at this terminal boundary.
+                    yield replace(
+                        event, provider=actual_provider, model=actual_model,
+                        model_usage_breakdown=[row], ensemble_trace=trace,
+                        billing_receipt=None,
+                    )
+                    return
+                elif isinstance(event, ErrorEvent):
+                    # The caller may stop consuming at this error. Settle the
+                    # physical usage record before handing over that boundary.
+                    await stream.aclose()
+                    yield error_with_trace(event)
+                    return
                 yield event
+            yield error_with_trace(ErrorEvent(
+                message="The ensemble answer provider ended without a terminal response.",
+                code="provider_stream_incomplete",
+            ))
+        except (ProviderAdmissionError, UsageAccountingUnavailableError):
+            raise
         except TimeoutError:
-            yield ErrorEvent(
+            yield error_with_trace(ErrorEvent(
                 message="The ensemble answer provider timed out.", code="timeout",
-            )
+            ))
+        except Exception as exc:  # noqa: BLE001 - terminal provider boundary
+            yield error_with_trace(ErrorEvent(message=str(exc), code="provider_error"))
         finally:
             await stream.aclose()
 

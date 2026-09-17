@@ -8863,6 +8863,12 @@ class Agent:
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
+                                ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
+                                if isinstance(ensemble_trace, dict):
+                                    ensemble_request_count_baseline = _merge_ensemble_request_count(
+                                        ensemble_trace,
+                                        ensemble_request_count_baseline,
+                                    )
                                 pending_tool_events.clear()
                                 usage_unknown_reason = provider_error_usage_reason(raw_ev.code)
                                 known_usage_receipt = has_known_provider_usage_receipt(raw_ev)
@@ -11530,6 +11536,16 @@ class Agent:
                 # No tool calls → we're done
                 if not tool_calls:
                     if tool_failure_finalization_pending:
+                        if await self._unfinished_plan_run_reconciliation_message() is not None:
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "Tool recovery ended before the attached PlanRun reached "
+                                    "a terminal checkpoint. The plan is still incomplete."
+                                ),
+                                code="plan_run_checkpoint_required",
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
                         break
                     if goal_terminal_final_response_pending:
                         goal_terminal_final_response_pending = False
