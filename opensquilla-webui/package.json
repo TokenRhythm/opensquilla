@@ -33,7 +33,7 @@
     "pinia": "^2.1.7",
     "vue": "^3.5.0",
     "vue-i18n": "^11.4.6",
-    "vue-router": "^4.3.0"
+    "vue-router": "^5.3.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
