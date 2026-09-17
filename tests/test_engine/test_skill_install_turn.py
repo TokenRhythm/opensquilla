@@ -289,13 +289,18 @@ def test_final_receipt_never_claims_unusable_skill_is_ready(axis, state, hint) -
 async def test_explicit_turn_deadline_cancels_install_and_preserves_receipt(setup, monkeypatch):
     import asyncio
 
+    import opensquilla.engine.agent as agent_module
+
     source, loader, ctx, calls, make_agent = setup
+    fetch_started = asyncio.Event()
     cancelled = asyncio.Event()
+    release_fetch = asyncio.Event()
 
     async def slow_fetch(resolution):
         source.calls += 1
         try:
-            await asyncio.Event().wait()
+            fetch_started.set()
+            await release_fetch.wait()
         except asyncio.CancelledError:
             cancelled.set()
             raise
@@ -303,7 +308,66 @@ async def test_explicit_turn_deadline_cancels_install_and_preserves_receipt(setu
     monkeypatch.setattr(source, "fetch_resolved", slow_fetch)
     agent = make_agent(ScriptedProvider([[('skill_install_community', {'identifier': 'demo'})]]))
     agent.config.timeout = 0.08
-    _ = [event async for event in agent.run_turn("install demo")]
+    real_loop = asyncio.get_running_loop()
+    execute_tool = agent._execute_tool
+    install_coroutine = None
+    install_tasks = set()
+    deadline_budgets = []
+
+    def track_install(call):
+        nonlocal install_coroutine
+        install_coroutine = execute_tool(call)
+        return install_coroutine
+
+    class ControlledLoop:
+        now = real_loop.time()
+
+        def time(self):
+            return self.now
+
+        def __getattr__(self, name):
+            return getattr(real_loop, name)
+
+    clock = ControlledLoop()
+
+    class ControlledAsyncio:
+        def get_running_loop(self):
+            return clock
+
+        async def wait(self, futures, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+            if any(task.get_coro() is install_coroutine for task in futures):
+                install_tasks.update(futures)
+                deadline_budgets.append(timeout)
+                assert timeout == pytest.approx(agent.config.timeout)
+                await fetch_started.wait()
+                clock.now += timeout
+                return await asyncio.wait(futures, timeout=0, return_when=return_when)
+            # Other waits do not advance this test's controlled deadline.
+            return await asyncio.wait(futures, return_when=return_when)
+
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+    # Expire the configured deadline only after fetch starts. Startup scheduling
+    # must not choose which cancellation path this test exercises.
+    monkeypatch.setattr(agent, "_execute_tool", track_install)
+    monkeypatch.setattr(agent_module, "asyncio", ControlledAsyncio())
+
+    async def collect_turn():
+        return [event async for event in agent.run_turn("install demo")]
+
+    # The watchdog uses the real loop; production cancellation and receipts do too.
+    turn = asyncio.create_task(collect_turn())
+    try:
+        await asyncio.wait_for(asyncio.shield(turn), timeout=5.0)
+    finally:
+        release_fetch.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(turn, *install_tasks, return_exceptions=True), timeout=5.0,
+        )
+    assert deadline_budgets == pytest.approx([0.08])
     assert cancelled.is_set()
     receipt = ctx.skill_install_turn.previous("demo", "clawhub")
     assert receipt["cancelled"] is True
