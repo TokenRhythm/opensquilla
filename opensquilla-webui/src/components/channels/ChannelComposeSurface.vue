@@ -10,6 +10,7 @@ import { useI18n } from 'vue-i18n'
 import ChannelConfigEditor from '@/components/channels/ChannelConfigEditor.vue'
 import ChannelTypeGallery from '@/components/channels/ChannelTypeGallery.vue'
 import { useChannelCatalogI18n } from '@/composables/setup/useChannelCatalogI18n'
+import { humanize, normalizeTransportToken } from '@/composables/channels/channelFacts'
 import type { ChannelEditorApi } from '@/composables/channels/useChannelEditor'
 
 const props = defineProps<{
@@ -31,7 +32,7 @@ const emit = defineEmits<{
   loadCatalog: []
 }>()
 
-const { t } = useI18n()
+const { t, te } = useI18n()
 const { localizeLabel } = useChannelCatalogI18n()
 
 const picked = computed(() => Boolean(props.pickedType))
@@ -41,7 +42,8 @@ const specLabel = computed(() =>
 const transportLabel = computed(() => {
   const transport = spec.value?.transport || ''
   if (!transport || transport === 'unknown') return ''
-  return transport.replace(/[_-]+/g, ' ').replace(/\b\w/g, char => char.toUpperCase())
+  const key = `console.channels.transport.${normalizeTransportToken(transport)}`
+  return te(key) ? t(key) : humanize(transport)
 })
 const testing = computed(() => props.editor.probe.value.phase === 'running')
 
