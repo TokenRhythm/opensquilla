@@ -262,7 +262,7 @@ ignore_missing_imports = true
 desktop-build = ["pyinstaller==6.22.3"]
 wheelhouse-build = ["pip==26.2.1"]
 dev = [
-    "datamodel-code-generator==0.75.1",
+    "datamodel-code-generator==0.81.0",
     "laboratory>=1.0.2",
     "syrupy>=5.1.0",
 ]
