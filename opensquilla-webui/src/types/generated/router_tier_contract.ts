@@ -26,6 +26,7 @@ export interface StaticB5Profile {
   proposers: readonly string[]
   aggregator: string
   apiKeyEnv: string
+  thinkingLevel: string | null
   ownershipRole: string
 }
 
@@ -33,17 +34,19 @@ export const STATIC_B5_PROFILES: Record<string, StaticB5Profile> = {
   "static_openrouter_b5": {
     provider: "openrouter",
     label: "OpenRouter",
-    proposers: ["deepseek/deepseek-v4-pro", "z-ai/glm-5.2", "moonshotai/kimi-k2.7-code", "qwen/qwen3.7-max"] as const,
-    aggregator: "z-ai/glm-5.2",
+    proposers: ["deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash", "qwen/qwen3.8-flash", "qwen/qwen3.8-max-0902"] as const,
+    aggregator: "deepseek/deepseek-v4.1-flash",
     apiKeyEnv: "OPENROUTER_API_KEY",
+    thinkingLevel: "high",
     ownershipRole: "static_profile",
   },
   "static_tokenrhythm_b5": {
     provider: "tokenrhythm",
     label: "TokenRhythm",
-    proposers: ["deepseek-v4-pro", "glm-5.2", "kimi-k2.7-code", "qwen3.7-max"] as const,
-    aggregator: "glm-5.2",
+    proposers: ["deepseek-flash", "glm-5.3-flash", "qwen3.8-flash", "qwen3.8-max"] as const,
+    aggregator: "deepseek-flash",
     apiKeyEnv: "TOKENRHYTHM_API_KEY",
+    thinkingLevel: "high",
     ownershipRole: "static_profile",
   },
 }
@@ -51,7 +54,7 @@ export const STATIC_B5_PROFILES: Record<string, StaticB5Profile> = {
 export const STATIC_B5_SELECTION_MODE_PROVIDERS:
   Readonly<Record<string, string>> = {"static_openrouter_b5": "openrouter", "static_tokenrhythm_b5": "tokenrhythm"}
 export const PROVIDER_RECOMMENDED_ENSEMBLE_SELECTION_MODES:
-  Readonly<Record<string, string>> = {"tokenrhythm": "static_tokenrhythm_b5"}
+  Readonly<Record<string, string>> = {"openrouter": "static_openrouter_b5", "tokenrhythm": "static_tokenrhythm_b5"}
 export const SELECTION_MODE_OWNERSHIP_ROLES:
   Readonly<Record<string, string>> = {"static_openrouter_b5": "static_profile", "static_tokenrhythm_b5": "static_profile", "custom_b5": "custom_profile", "router_dynamic": "router_dynamic"}
 

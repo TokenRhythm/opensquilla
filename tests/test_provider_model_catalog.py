@@ -49,6 +49,27 @@ def test_deepseek_v4_direct_models_use_models_dev_limits() -> None:
         assert caps.reasoning_format == "deepseek"
 
 
+def test_openrouter_c5_models_have_offline_budgets_and_capabilities() -> None:
+    catalog = ModelCatalog()
+    expected = {
+        "deepseek/deepseek-v4.1-flash": (1_048_576, 384_000),
+        "z-ai/glm-5.3-flash": (1_310_720, 131_072),
+        "qwen/qwen3.8-flash": (1_000_000, 131_072),
+        "qwen/qwen3.8-max-0902": (1_000_000, 131_072),
+    }
+
+    for model, (context_window, max_tokens) in expected.items():
+        assert catalog.resolve_context_window_with_source(
+            model, provider="openrouter"
+        ) == (context_window, "catalog")
+        assert catalog.resolve_max_tokens(model, provider="openrouter") == max_tokens
+        capabilities = catalog.get_capabilities(model, provider_name="openrouter")
+        assert capabilities.supports_reasoning is True
+        assert capabilities.supports_tools is True
+        assert capabilities.supports_vision is True
+        assert capabilities.reasoning_format == "openrouter"
+
+
 def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     """tokenrhythm has no models.dev table: without the provider-scoped
     corrections layer, the snapshot's cross-provider bare-id merge would
@@ -58,6 +79,21 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     when the listing is reachable the boot-time live ingest supersedes
     them (see test_provider/test_live_catalog.py)."""
     catalog = ModelCatalog()
+
+    expected_c5_budgets = {
+        "deepseek-flash": (1_000_000, 384_000),
+        "glm-5.3-flash": (1_048_576, 131_072),
+        "qwen3.8-flash": (1_000_000, 131_072),
+        "qwen3.8-max": (1_000_000, 131_072),
+    }
+    for model, (context_window, max_tokens) in expected_c5_budgets.items():
+        assert catalog.resolve_context_window_with_source(
+            model, provider="tokenrhythm"
+        ) == (context_window, "catalog")
+        assert (
+            catalog.resolve_max_tokens(model, provider="tokenrhythm")
+            == max_tokens
+        )
 
     assert catalog.resolve_context_window_with_source(
         "deepseek-v4-flash", provider="tokenrhythm"

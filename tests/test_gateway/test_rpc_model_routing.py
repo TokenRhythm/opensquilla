@@ -63,7 +63,7 @@ def test_fresh_tokenrhythm_ensemble_activation_materializes_recommended_plan() -
     assert "llm_ensemble.candidates" not in changed.force_persist_paths()
 
 
-def test_fresh_openrouter_ensemble_activation_materializes_custom_lineup() -> None:
+def test_fresh_openrouter_ensemble_activation_uses_recommended_static_plan() -> None:
     cfg = GatewayConfig(
         llm={
             "provider": "openrouter",
@@ -73,13 +73,10 @@ def test_fresh_openrouter_ensemble_activation_materializes_custom_lineup() -> No
 
     changed = upsert_llm_ensemble(cfg, enabled=True).config
 
-    assert changed.llm_ensemble.selection_mode == "custom_b5"
-    assert len(changed.llm_ensemble.candidates) == 5
-    assert {
-        candidate.provider for candidate in changed.llm_ensemble.candidates
-    } == {"openrouter"}
-    assert changed.llm_ensemble.candidates[-1].model == "z-ai/glm-5.2"
-    assert changed.llm_ensemble.candidates[-1].role == "aggregator"
+    assert changed.llm_ensemble.selection_mode == "static_openrouter_b5"
+    assert changed.llm_ensemble.candidates == []
+    assert "llm_ensemble.selection_mode" in changed.force_persist_paths()
+    assert "llm_ensemble.candidates" not in changed.force_persist_paths()
 
 
 def test_explicit_cross_provider_ensemble_selection_is_preserved() -> None:

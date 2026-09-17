@@ -321,6 +321,10 @@ def test_packaged_corrections_file_parses_with_expected_tables() -> None:
     assert set(payload["openrouter"]) == {
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-4.6",
+        "deepseek/deepseek-v4.1-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
+        "z-ai/glm-5.3-flash",
         "x-ai/grok-4.3",
         "stepfun/step-3.5-flash",
     }

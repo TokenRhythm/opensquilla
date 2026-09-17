@@ -1561,9 +1561,9 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "routerDefaultTier: 'c1'," in router_config
     assert "routerPresetBinding: 'follow_primary'," in router_config
     assert "[data-model-routing-mode]" not in onboarding_html
-    assert "'selection_mode = \"custom_b5\"'" in main_ts
-    assert "'[[llm_ensemble.candidates]]'" in main_ts
-    assert "DESKTOP_ENSEMBLE_PROFILES[selectionMode]" in main_ts
+    assert "`selection_mode = ${tomlString(selectionMode)}`" in main_ts
+    assert "'[[llm_ensemble.candidates]]'" not in main_ts
+    assert "DESKTOP_ENSEMBLE_PROFILES" not in main_ts
 
     expected_models = (
         "deepseek-v4-flash-0731",

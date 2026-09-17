@@ -83,6 +83,7 @@ export interface EnsembleCandidateConfig {
   source?: 'custom' | 'legacy_model_options'
   enabled?: boolean
   role?: string
+  thinking_level?: string
 }
 
 export interface EnsembleRoutingModeState {
@@ -267,6 +268,8 @@ function normalizeCandidates(value: unknown): EnsembleCandidateConfig[] {
       enabled: raw.enabled === false ? false : true,
       role,
     }
+    const thinkingLevel = String(raw.thinking_level ?? raw.thinkingLevel ?? '').trim()
+    if (thinkingLevel) normalized.thinking_level = thinkingLevel
     const existingIndex = seen.get(key)
     if (existingIndex === undefined) {
       seen.set(key, out.length)
@@ -306,6 +309,7 @@ function customSeedFromProfile(profile: StaticB5Profile): EnsembleCandidateConfi
     source: 'custom',
     enabled: true,
     role: 'proposer',
+    ...(profile.thinkingLevel ? { thinking_level: profile.thinkingLevel } : {}),
   }))
   rows.push({
     provider: profile.provider,
@@ -313,6 +317,7 @@ function customSeedFromProfile(profile: StaticB5Profile): EnsembleCandidateConfi
     source: 'custom',
     enabled: true,
     role: 'aggregator',
+    ...(profile.thinkingLevel ? { thinking_level: profile.thinkingLevel } : {}),
   })
   return normalizeCandidates(rows)
 }
@@ -818,13 +823,14 @@ export function useSetupEnsembleForm() {
       && candidates.value.some(candidate => candidate.enabled !== false)
     ) return
     const presetMode = staticB5ModeForProvider(provider)
-    selectionMode.value = CUSTOM_B5_SELECTION_MODE
-    if (candidates.value.some(candidate => candidate.enabled !== false)) return
-    const profile = presetMode ? STATIC_B5_PROFILES[presetMode] : null
-    if (profile) {
-      candidates.value = customSeedFromProfile(profile)
+    if (presetMode) {
+      selectionMode.value = presetMode
+      modelOptions.value = []
+      candidates.value = []
       return
     }
+    selectionMode.value = CUSTOM_B5_SELECTION_MODE
+    if (candidates.value.some(candidate => candidate.enabled !== false)) return
     importTierCandidates(tierCandidates)
   }
 
@@ -909,6 +915,7 @@ export function useSetupEnsembleForm() {
       source: candidate.source || 'custom',
       enabled: candidate.enabled !== false,
       role: normalizeCandidateRole(candidate.role),
+      ...(candidate.thinking_level ? { thinking_level: candidate.thinking_level } : {}),
     }))
     if (minSuccessfulDirty.value) params.minSuccessfulProposers = minSuccessfulProposers.value
     if (allFailedPolicyDirty.value) params.allFailedPolicy = allFailedPolicy.value

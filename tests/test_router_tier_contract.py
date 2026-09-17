@@ -54,6 +54,15 @@ def test_selection_mode_metadata_has_one_canonical_profile_owner() -> None:
     assert tokenrhythm is STATIC_B5_PROFILES["static_tokenrhythm_b5"]
     assert openrouter is not None and openrouter.provider_id == "openrouter"
     assert tokenrhythm is not None and tokenrhythm.provider_id == "tokenrhythm"
+    assert tokenrhythm.proposer_models == (
+        "deepseek-flash",
+        "glm-5.3-flash",
+        "qwen3.8-flash",
+        "qwen3.8-max",
+    )
+    assert tokenrhythm.aggregator_model == "deepseek-flash"
+    assert openrouter.thinking_level == "high"
+    assert tokenrhythm.thinking_level == "high"
     assert openrouter.ownership_role == "static_profile"
     assert tokenrhythm.api_key_env == "TOKENRHYTHM_API_KEY"
 
