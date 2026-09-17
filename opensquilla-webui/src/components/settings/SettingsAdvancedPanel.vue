@@ -2,12 +2,22 @@
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
+import LoadingSpinner from '@/components/LoadingSpinner.vue'
+import Icon from '@/components/Icon.vue'
 import MemoryLearningGroup from '@/components/settings/MemoryLearningGroup.vue'
+
+defineProps<{
+  autoCapture: boolean
+  loaded: boolean
+  configPath?: string
+}>()
 
 const { t } = useI18n()
 const emit = defineEmits<{
+  'update-auto-capture': [enabled: boolean]
   'open-agent-configuration': []
   'open-data-maintenance': []
+  'copy-config-path': []
 }>()
 
 // Client-only "Labs" preferences. Each row reads/writes ONE localStorage key
@@ -31,14 +41,6 @@ const approvalPoll = ref(readBool(APPROVAL_KEY))
 const runTrace = ref(readBool(RUNTRACE_KEY))
 function setApprovalPoll(on: boolean) { approvalPoll.value = on; writeBool(APPROVAL_KEY, on) }
 function setRunTrace(on: boolean) { runTrace.value = on; writeBool(RUNTRACE_KEY, on) }
-
-// --- foldLiveTurn: default ON; '0' is the only OFF value ---
-const FOLD_KEY = 'opensquilla.chat.foldLiveTurn'
-const foldOn = ref(localStorageGet(FOLD_KEY) !== '0')
-function setFold(on: boolean) {
-  foldOn.value = on
-  try { localStorage.setItem(FOLD_KEY, on ? '1' : '0') } catch { /* private mode */ }
-}
 
 // --- answerReveal: "min,max" milliseconds, min >= 0 and max >= min ---
 const REVEAL_KEY = 'opensquilla.chat.answerReveal'
@@ -83,16 +85,32 @@ const agentConfigAriaLabel = computed(() =>
       <p class="control-section__desc">{{ t('setup.advanced.desc') }} <em>{{ t('setup.advanced.reload') }}</em> {{ t('setup.advanced.descReloadSuffix') }}</p>
     </div>
 
-    <label class="control-row">
-      <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('setup.advanced.foldLabel') }}</span>
-        <span class="control-row__desc">{{ t('setup.advanced.foldDesc') }}</span>
+    <div class="advanced-memory" data-testid="advanced-memory-group">
+      <h4 class="advanced-group">{{ t('settings.memoryOverview.title') }}</h4>
+
+      <label v-if="loaded" class="control-row">
+        <div class="control-row__label-block">
+          <span class="control-row__label">{{ t('settings.memoryOverview.autoCaptureLabel') }}</span>
+          <span class="control-row__desc">{{ t('settings.memoryOverview.autoCaptureDesc') }}</span>
+        </div>
+        <div class="control-row__control">
+          <ControlSwitch
+            :checked="autoCapture"
+            name="memory_auto_capture"
+            :aria-label="t('settings.memoryOverview.autoCaptureLabel')"
+            @change="emit('update-auto-capture', $event)"
+          />
+        </div>
+      </label>
+      <div v-else class="advanced-memory__loading" role="status">
+        <LoadingSpinner />
+        <span>{{ t('shared.loading') }}</span>
       </div>
-      <div class="control-row__control">
-        <span class="labs-hint">{{ t('setup.advanced.reload') }}</span>
-        <ControlSwitch name="labs_fold_live_turn" :checked="foldOn" :aria-label="t('setup.advanced.foldAria')" @change="setFold" />
-      </div>
-    </label>
+
+      <MemoryLearningGroup />
+    </div>
+
+    <h4 class="advanced-group advanced-group--section">{{ t('setup.advanced.experimentsGroup') }}</h4>
 
     <div class="control-row control-row--stack">
       <div class="control-row__label-block">
@@ -135,8 +153,6 @@ const agentConfigAriaLabel = computed(() =>
       </div>
     </label>
 
-    <MemoryLearningGroup />
-
     <label class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.advanced.runTraceLabel') }}</span>
@@ -147,6 +163,22 @@ const agentConfigAriaLabel = computed(() =>
         <ControlSwitch name="labs_run_trace" :checked="runTrace" :aria-label="t('setup.advanced.runTraceAria')" @change="setRunTrace" />
       </div>
     </label>
+
+    <h4 class="advanced-group advanced-group--management">{{ t('setup.advanced.managementGroup') }}</h4>
+
+    <div v-if="configPath" class="control-row control-row--stack" data-testid="advanced-config-file">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('setup.advanced.configFileLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.advanced.configFileDesc') }}</span>
+      </div>
+      <div class="advanced-config-file__path">
+        <code>{{ configPath }}</code>
+        <button type="button" class="btn btn--icon btn--ghost"
+          :aria-label="t('settings.dialog.copyConfigPath')" :title="t('settings.dialog.copyConfigPath')"
+          @click="emit('copy-config-path')"
+        ><Icon name="copy" :size="14" /></button>
+      </div>
+    </div>
 
     <div class="control-row">
       <div class="control-row__label-block">
@@ -185,6 +217,29 @@ const agentConfigAriaLabel = computed(() =>
 </template>
 
 <style scoped>
+.advanced-config-file__path { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; width: 100%; }
+.advanced-config-file__path code { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text-muted); font-family: var(--font-mono); font-size: var(--fs-xs); user-select: text; }
+.advanced-config-file__path .btn { flex-shrink: 0; }
+.advanced-group {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.08em;
+  margin: var(--sp-4) 0 var(--sp-1);
+  text-transform: uppercase;
+}
+
+.advanced-group--management { margin-top: var(--sp-6); }
+.advanced-group--section { margin-top: var(--sp-6); }
+
+.advanced-memory__loading {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  font-size: var(--fs-sm);
+  gap: var(--sp-2);
+  padding: var(--sp-4) 0;
+}
+
 .labs-hint {
   border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
   border-radius: var(--radius-full);

@@ -23,7 +23,6 @@ class ContextFiles:
     soul: str | None = None
     agents: str | None = None
     identity: str | None = None
-    tools: str | None = None
     user: str | None = None
     memory: str | None = None
 
@@ -32,7 +31,6 @@ class ContextFiles:
             "SOUL.md": self.soul,
             "AGENTS.md": self.agents,
             "IDENTITY.md": self.identity,
-            "TOOLS.md": self.tools,
             "USER.md": self.user,
             "MEMORY.md": self.memory,
         }
@@ -57,7 +55,6 @@ def load_context_files(workspace_dir: str) -> ContextFiles:
         "SOUL.md": "soul",
         "AGENTS.md": "agents",
         "IDENTITY.md": "identity",
-        "TOOLS.md": "tools",
         "USER.md": "user",
         "MEMORY.md": "memory",
     }

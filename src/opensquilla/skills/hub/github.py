@@ -2,16 +2,176 @@
 
 from __future__ import annotations
 
+import asyncio
+import codecs
+import hashlib
+import os
 import re
-from dataclasses import dataclass
+import stat
+import tempfile
+import weakref
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
+from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 import structlog
 
 from opensquilla.env import trust_env as _trust_env
-from opensquilla.skills.hub.source import SkillBundle, SkillMeta, SkillSource
+from opensquilla.skills.hub.archive import (
+    DEFAULT_ARCHIVE_LIMITS,
+    ArchiveNormalizationError,
+    normalize_relative_path,
+)
+from opensquilla.skills.hub.contracts import (
+    DiagnosticPhase,
+    DiagnosticSeverity,
+    SkillDiagnostic,
+)
+from opensquilla.skills.hub.operations import report_install_progress
+from opensquilla.skills.hub.source import (
+    SkillBundle,
+    SkillMeta,
+    SkillSource,
+    SkillSourceFetchError,
+    SourceResolution,
+    raise_for_source_http_status,
+    source_invalid_response_error,
+    source_transport_error,
+)
+from opensquilla.skills.hub.tree_io import (
+    CHUNK_SIZE,
+    artifact_tree_digest,
+    exceeds_limit,
+    validate_portable_tree,
+    validate_tree_entry_count,
+)
+from opensquilla.skills.io_worker import check_staging_cancelled, run_staging_worker
+from opensquilla.skills.manifest import MAX_SKILL_FILE_BYTES
 
 log = structlog.get_logger(__name__)
+
+_DOWNLOAD_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _download_slots() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    if loop not in _DOWNLOAD_SLOTS:
+        _DOWNLOAD_SLOTS[loop] = asyncio.Semaphore(8)
+    return _DOWNLOAD_SLOTS[loop]
+
+
+@dataclass
+class _DownloadBudget:
+    limit: int | None
+    used: int = 0
+
+    def reserve(self, size: int) -> None:
+        # All workers run on the same event loop; reservation and write contain
+        # no await, so concurrent files cannot each spend the remaining budget.
+        if exceeds_limit(self.used + size, self.limit):
+            raise SkillSourceFetchError.diagnostic(
+                "FETCH_SIZE_LIMIT",
+                "GitHub Skill exceeds the configured expanded-size limit.",
+                phase=DiagnosticPhase.FETCH,
+            )
+        self.used += size
+
+
+async def _download_file(
+    client: Any, url: str, target: Path, headers: dict[str, str],
+    *, budget: _DownloadBudget | None = None,
+) -> None:
+    import httpx
+
+    reserved = 0
+    async with _download_slots():
+        for attempt in range(3):
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as output:
+                    if budget is not None:
+                        # Only release a retry's partial bytes once truncation
+                        # has removed them from disk.
+                        budget.used -= reserved
+                        reserved = 0
+                    stream = getattr(client, "stream", None)
+                    if callable(stream):
+                        async with stream("GET", url, headers=headers) as response:
+                            raise_for_source_http_status(
+                                response,
+                                phase=DiagnosticPhase.FETCH,
+                                source_name="GitHub",
+                            )
+                            size = 0
+                            async for chunk in response.aiter_bytes(CHUNK_SIZE):
+                                size += len(chunk)
+                                if exceeds_limit(size, DEFAULT_ARCHIVE_LIMITS.max_entry_bytes):
+                                    raise SkillSourceFetchError.diagnostic(
+                                        "FETCH_SIZE_LIMIT",
+                                        "Skill file exceeds configured limit.",
+                                        phase=DiagnosticPhase.FETCH,
+                                    )
+                                if budget is not None:
+                                    budget.reserve(len(chunk))
+                                    reserved += len(chunk)
+                                output.write(chunk)
+                    else:
+                        response = await client.get(url, headers=headers)
+                        raise_for_source_http_status(
+                            response,
+                            phase=DiagnosticPhase.FETCH,
+                            source_name="GitHub",
+                        )
+                        if exceeds_limit(
+                            len(response.content), DEFAULT_ARCHIVE_LIMITS.max_entry_bytes
+                        ):
+                            raise ValueError("GitHub Skill file exceeds configured limit")
+                        if budget is not None:
+                            budget.reserve(len(response.content))
+                            reserved += len(response.content)
+                        output.write(response.content)
+                return
+            except SkillSourceFetchError as exc:
+                retryable = any(d.code == "FETCH_SERVER_FAILED" for d in exc.diagnostics)
+                if not retryable or attempt == 2:
+                    raise
+            except httpx.TransportError:
+                if attempt == 2:
+                    raise
+            await asyncio.sleep(0.25 * (2**attempt))
+
+
+def _manifest_prefix(path: Path) -> str:
+    def too_large() -> SkillSourceFetchError:
+        return SkillSourceFetchError.diagnostic(
+            "MANIFEST_TOO_LARGE", f"SKILL.md exceeds {MAX_SKILL_FILE_BYTES} bytes",
+            phase=DiagnosticPhase.MANIFEST, path=path.name,
+        )
+
+    check_staging_cancelled()
+    if path.stat().st_size > MAX_SKILL_FILE_BYTES:
+        raise too_large()
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    prefix = ""
+    size = 0
+    with path.open("rb") as stream:
+        while True:
+            check_staging_cancelled()
+            chunk = stream.read(min(CHUNK_SIZE, MAX_SKILL_FILE_BYTES + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_SKILL_FILE_BYTES:
+                raise too_large()
+            decoded = decoder.decode(chunk)
+            if len(prefix) < CHUNK_SIZE:
+                prefix += decoded[: CHUNK_SIZE - len(prefix)]
+        decoder.decode(b"", final=True)
+    return prefix
+
 
 _GITHUB_HOSTS = {"github.com", "www.github.com"}
 _RAW_GITHUB_HOST = "raw.githubusercontent.com"
@@ -19,6 +179,30 @@ _REPO_RE = re.compile(
     r"^(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)"
     r"(?:@(?P<ref>[^:]+))?(?::(?P<path>.+))?$"
 )
+_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_MANIFEST_NAME = "SKILL.md"
+_RESERVED_COMPONENTS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".opensquilla",
+        ".opensquilla-rollback",
+        ".opensquilla-staging",
+        ".quarantine",
+        ".staging",
+        "__macosx",
+    }
+)
+
+
+def _valid_repository(owner: str, repo: str) -> bool:
+    return bool(
+        owner not in {".", ".."}
+        and repo not in {".", ".."}
+        and _REPOSITORY_RE.fullmatch(f"{owner}/{repo}")
+    )
 
 
 @dataclass(frozen=True)
@@ -35,9 +219,9 @@ class _GitHubSkillRef:
     @property
     def skill_dir(self) -> str:
         path = self.path.strip("/")
-        if path.endswith("/SKILL.md"):
+        if path.rsplit("/", 1)[-1] == _MANIFEST_NAME and "/" in path:
             return path.rsplit("/", 1)[0]
-        if path == "SKILL.md":
+        if path == _MANIFEST_NAME:
             return ""
         return path
 
@@ -57,6 +241,91 @@ class _GitHubSkillRef:
         return f"https://github.com/{self.repo_full}/tree/{self.ref}"
 
 
+def _select_skill_tree(
+    entries: list[Any],
+    ref: _GitHubSkillRef,
+    resolution: SourceResolution,
+    *,
+    tree_path_prefix: str = "",
+) -> tuple[_GitHubSkillRef, SourceResolution]:
+    """Discover complete, immutable candidate paths before downloading any files."""
+    names = (
+        {_MANIFEST_NAME, "skill.md", "skills.md"}
+        if resolution.allow_legacy_manifest_names
+        else {_MANIFEST_NAME}
+    )
+    manifests: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.FETCH,
+                source_name="GitHub",
+            )
+        raw_path = str(entry.get("path") or "")
+        path = f"{tree_path_prefix}/{raw_path}" if tree_path_prefix else raw_path
+        relative = _relative_to_skill_dir(path, ref.skill_dir)
+        if relative is None or PurePosixPath(path).name not in names:
+            continue
+        try:
+            normalized = normalize_relative_path(path).as_posix()
+        except ArchiveNormalizationError as exc:
+            raise SkillSourceFetchError.diagnostic(
+                "ARTIFACT_PATH_UNSAFE",
+                "GitHub returned an unsafe manifest path.",
+                phase=DiagnosticPhase.SECURITY,
+                path=path,
+            ) from exc
+        if entry.get("type") == "blob":
+            manifests.append(normalized)
+    manifests.sort()
+    if not manifests:
+        raise SkillSourceFetchError.diagnostic(
+            "MANIFEST_MISSING",
+            "The selected GitHub directory contains no Skill manifest.",
+            phase=DiagnosticPhase.MANIFEST,
+            hint="Choose a directory containing SKILL.md.",
+        )
+    if len(manifests) != 1:
+        candidates = []
+        for path in manifests[:100]:
+            directory = str(PurePosixPath(path).parent)
+            directory = "" if directory == "." else directory
+            candidate = replace(ref, path=directory)
+            candidates.append(
+                {
+                    "name": PurePosixPath(directory).name or ref.repo,
+                    "path": directory,
+                    "identifier": candidate.canonical_identifier,
+                }
+            )
+        raise SkillSourceFetchError.diagnostic(
+            "SOURCE_TREE_AMBIGUOUS",
+            "Select one Skill directory from this GitHub repository.",
+            phase=DiagnosticPhase.ARCHIVE,
+            details={
+                "manifests": manifests[:100],
+                "selectionRequired": True,
+                "repository": ref.repo_full,
+                "immutableRevision": ref.ref,
+                "candidateCount": len(manifests),
+                "candidates": candidates,
+            },
+            hint="Install an exact candidate directory or specify a Skill subpath.",
+        )
+    directory = str(PurePosixPath(manifests[0]).parent)
+    directory = "" if directory == "." else directory
+    if directory == ref.skill_dir:
+        return ref, resolution
+    selected = replace(ref, path=directory)
+    return selected, replace(
+        resolution,
+        canonical_identifier=selected.canonical_identifier,
+        skill_path=directory,
+        upstream_url=selected.homepage,
+        package_identifier=f"{selected.repo_full.casefold()}:{directory}",
+    )
+
+
 def _clean_repo_name(repo: str) -> str:
     return repo[:-4] if repo.endswith(".git") else repo
 
@@ -65,8 +334,14 @@ def _split_path(path: str) -> list[str]:
     return [unquote(part) for part in path.split("/") if part]
 
 
-def _normalize_skill_path(path: str) -> str:
-    return "/".join(part for part in path.replace("\\", "/").split("/") if part)
+def _normalize_skill_path(path: str) -> str | None:
+    raw = path.strip().replace("\\", "/").strip("/")
+    if not raw:
+        return ""
+    try:
+        return normalize_relative_path(raw).as_posix()
+    except ArchiveNormalizationError:
+        return None
 
 
 def _parse_identifier(identifier: str) -> _GitHubSkillRef | None:
@@ -82,32 +357,59 @@ def _parse_identifier(identifier: str) -> _GitHubSkillRef | None:
             if len(parts) < 2:
                 return None
             owner, repo = parts[0], _clean_repo_name(parts[1])
+            if not _valid_repository(owner, repo):
+                return None
             ref = "HEAD"
             skill_path = ""
             if len(parts) >= 4 and parts[2] in {"tree", "blob"}:
                 ref = parts[3]
                 skill_path = "/".join(parts[4:])
-            return _GitHubSkillRef(owner, repo, ref, _normalize_skill_path(skill_path))
+            normalized_path = _normalize_skill_path(skill_path)
+            if normalized_path is None:
+                return None
+            return _GitHubSkillRef(owner, repo, ref, normalized_path)
 
         if host == _RAW_GITHUB_HOST:
             if len(parts) < 4:
                 return None
             owner, repo = parts[0], _clean_repo_name(parts[1])
+            if not _valid_repository(owner, repo):
+                return None
             ref = parts[2]
             skill_path = "/".join(parts[3:])
-            return _GitHubSkillRef(owner, repo, ref, _normalize_skill_path(skill_path))
+            normalized_path = _normalize_skill_path(skill_path)
+            if normalized_path is None:
+                return None
+            return _GitHubSkillRef(owner, repo, ref, normalized_path)
 
         return None
 
     match = _REPO_RE.match(raw)
     if match is None:
         return None
+    normalized_path = _normalize_skill_path(match.group("path") or "")
+    if normalized_path is None:
+        return None
+    owner = match.group("owner")
+    repo = _clean_repo_name(match.group("repo"))
+    if not _valid_repository(owner, repo):
+        return None
     return _GitHubSkillRef(
-        match.group("owner"),
-        _clean_repo_name(match.group("repo")),
+        owner,
+        repo,
         match.group("ref") or "HEAD",
-        _normalize_skill_path(match.group("path") or ""),
+        normalized_path,
     )
+
+
+def package_identifier_for(identifier: str) -> str:
+    """Normalize a GitHub install reference to repository plus Skill subpath."""
+
+    ref = _parse_identifier(identifier)
+    if ref is None:
+        return ""
+    repository = ref.repo_full.casefold()
+    return f"{repository}:{ref.skill_dir}" if ref.skill_dir else repository
 
 
 def _relative_to_skill_dir(path: str, skill_dir: str) -> str | None:
@@ -124,6 +426,110 @@ def _decode_file(path: str, content: bytes) -> str | bytes:
         return content.decode("utf-8")
     except UnicodeDecodeError:
         return content
+
+
+async def _fetch_tree_payload(
+    client: Any,
+    url: str,
+    *,
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    response = await client.get(url, headers=headers)
+    raise_for_source_http_status(
+        response,
+        phase=DiagnosticPhase.FETCH,
+        source_name="GitHub",
+    )
+    try:
+        payload = response.json()
+    except (TypeError, ValueError) as exc:
+        raise source_invalid_response_error(
+            phase=DiagnosticPhase.FETCH,
+            source_name="GitHub",
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        raise source_invalid_response_error(
+            phase=DiagnosticPhase.FETCH,
+            source_name="GitHub",
+        )
+    return payload
+
+
+def _github_tree_url(ref: _GitHubSkillRef, treeish: str, *, recursive: bool) -> str:
+    suffix = "?recursive=1" if recursive else ""
+    return (
+        f"https://api.github.com/repos/{ref.repo_full}/git/trees/{quote(treeish, safe='')}{suffix}"
+    )
+
+
+async def _fetch_explicit_subtree(
+    client: Any,
+    ref: _GitHubSkillRef,
+    *,
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    """Resolve an explicit Skill directory without trusting a truncated root tree."""
+
+    treeish = ref.ref
+    for component in PurePosixPath(ref.skill_dir).parts:
+        payload = await _fetch_tree_payload(
+            client,
+            _github_tree_url(ref, treeish, recursive=False),
+            headers=headers,
+        )
+        if payload.get("truncated"):
+            raise SkillSourceFetchError.diagnostic(
+                "SOURCE_TREE_TRUNCATED",
+                "GitHub truncated a directory while resolving the Skill subpath.",
+                phase=DiagnosticPhase.FETCH,
+                hint="Reduce the number of entries in the selected repository directory.",
+            )
+        matches = [
+            item
+            for item in payload["tree"]
+            if isinstance(item, dict) and item.get("path") == component
+        ]
+        if len(matches) != 1:
+            raise SkillSourceFetchError.diagnostic(
+                "FETCH_NOT_FOUND",
+                f"GitHub could not resolve the Skill subpath component: {component}",
+                phase=DiagnosticPhase.FETCH,
+                hint="Verify the exact commit and Skill subpath.",
+                path=ref.skill_dir,
+            )
+        selected = matches[0]
+        if selected.get("type") != "tree":
+            raise SkillSourceFetchError.diagnostic(
+                "ARTIFACT_FILE_TYPE_UNSUPPORTED",
+                f"GitHub Skill subpath is not a regular directory: {ref.skill_dir}",
+                phase=DiagnosticPhase.SECURITY,
+                path=ref.skill_dir,
+            )
+        next_treeish = str(selected.get("sha") or "")
+        if not _COMMIT_RE.fullmatch(next_treeish):
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.FETCH,
+                source_name="GitHub",
+            )
+        treeish = next_treeish
+
+    return await _fetch_tree_payload(
+        client,
+        _github_tree_url(ref, treeish, recursive=True),
+        headers=headers,
+    )
+
+
+def _bundle_digest(files: dict[str, str | bytes]) -> str:
+    hasher = hashlib.sha256()
+    for path in sorted(files):
+        content = files[path]
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        hasher.update(path.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(len(raw).to_bytes(8, "big"))
+        hasher.update(raw)
+    return hasher.hexdigest()
 
 
 def _frontmatter_field(skill_md: str, field: str) -> str:
@@ -165,6 +571,17 @@ class GitHubSource(SkillSource):
     async def search(self, query: str, limit: int = 20) -> list[SkillMeta]:
         import httpx
 
+        # GitHub rejects unauthenticated code search outright, so without a token
+        # this request cannot succeed — every Community search would spend a round
+        # trip earning a 401 and then warn about it, while the results the user sees
+        # come from the other sources regardless. Skip the call instead of crying
+        # wolf. Only search needs the token: fetch and inspect read the tree and raw
+        # endpoints, which do serve anonymous callers, so installing a GitHub skill
+        # by identifier keeps working.
+        if not self._token:
+            log.debug("github.search_skipped_unauthenticated", query=query)
+            return []
+
         search_query = f"{query} filename:SKILL.md"
         url = "https://api.github.com/search/code"
         try:
@@ -174,86 +591,567 @@ class GitHubSource(SkillSource):
                     params={"q": search_query, "per_page": min(limit, 30)},
                     headers=self._headers(),
                 )
-                resp.raise_for_status()
-                data = resp.json()
         except Exception as exc:
             log.warning("github.search_failed", error=str(exc))
-            return []
+            raise source_transport_error(
+                exc,
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
+            ) from exc
 
-        results = []
-        for item in data.get("items", []):
+        raise_for_source_http_status(
+            resp,
+            phase=DiagnosticPhase.SOURCE,
+            source_name="GitHub",
+        )
+        try:
+            data = resp.json()
+        except (TypeError, ValueError) as exc:
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
+            ) from exc
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
+            )
+
+        items = data["items"]
+        results: list[SkillMeta] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             repo = item.get("repository", {})
-            full_name = repo.get("full_name", "")
-            path = item.get("path", "")
+            if not isinstance(repo, dict):
+                continue
+            full_name = str(repo.get("full_name") or "")
+            repository_parts = full_name.split("/", 1)
+            if len(repository_parts) != 2 or not _valid_repository(*repository_parts):
+                continue
+            path = str(item.get("path") or "").strip("/")
+            path_parts = path.split("/")
+            if (
+                not path
+                or path_parts[-1] != _MANIFEST_NAME
+                or any(part in {"", ".", ".."} for part in path_parts)
+            ):
+                continue
             # Extract the skill name from the parent directory of a SKILL.md path.
             parts = path.rsplit("/", 2)
-            skill_name = parts[-2] if len(parts) >= 2 else full_name
+            skill_name = parts[-2] if len(parts) >= 2 else repository_parts[1]
 
             results.append(
                 SkillMeta(
                     name=skill_name,
-                    description=repo.get("description", ""),
+                    description=str(repo.get("description") or ""),
                     source_id=self.source_id,
                     trust_level=self.trust_level,
                     identifier=f"{full_name}:{path}",
-                    homepage=repo.get("html_url", ""),
+                    homepage=str(repo.get("html_url") or ""),
+                    canonical_identifier=f"{full_name}:{path}",
                 )
+            )
+        if items and not results:
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
             )
         return results[:limit]
 
-    async def fetch(self, identifier: str) -> SkillBundle | None:
+    async def resolve(self, identifier: str) -> SourceResolution | None:
+        """Resolve a branch, tag, or HEAD to one immutable commit SHA."""
+
         import httpx
 
         ref = _parse_identifier(identifier)
         if ref is None:
             return None
 
+        commit = ref.ref.lower() if _COMMIT_RE.fullmatch(ref.ref) else ""
+        if not commit:
+            commit_url = (
+                f"https://api.github.com/repos/{ref.repo_full}/commits/{quote(ref.ref, safe='')}"
+            )
+            try:
+                async with httpx.AsyncClient(timeout=15, trust_env=_trust_env()) as client:
+                    response = await client.get(commit_url, headers=self._headers())
+            except Exception as exc:
+                log.warning("github.resolve_failed", identifier=identifier, error=str(exc))
+                raise source_transport_error(
+                    exc,
+                    phase=DiagnosticPhase.SOURCE,
+                    source_name="GitHub",
+                ) from exc
+            raise_for_source_http_status(
+                response,
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
+            )
+            try:
+                response_data = response.json()
+            except (TypeError, ValueError) as exc:
+                log.warning("github.resolve_invalid_json", identifier=identifier)
+                raise source_invalid_response_error(
+                    phase=DiagnosticPhase.SOURCE,
+                    source_name="GitHub",
+                ) from exc
+            if not isinstance(response_data, dict) or not isinstance(response_data.get("sha"), str):
+                raise source_invalid_response_error(
+                    phase=DiagnosticPhase.SOURCE,
+                    source_name="GitHub",
+                )
+            commit = str(response_data["sha"]).lower()
+        if not _COMMIT_RE.fullmatch(commit):
+            log.warning("github.resolve_mutable_ref", identifier=identifier, resolved=commit)
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
+            )
+
+        resolved_ref = _GitHubSkillRef(ref.owner, ref.repo, commit, ref.path)
+        canonical_identifier = resolved_ref.canonical_identifier
+        meta = SkillMeta(
+            name=_fallback_name(resolved_ref),
+            version=commit,
+            source_id=self.source_id,
+            trust_level=self.trust_level,
+            identifier=canonical_identifier,
+            homepage=resolved_ref.homepage,
+            canonical_identifier=canonical_identifier,
+        )
+        return SourceResolution(
+            source_id=self.source_id,
+            requested_identifier=identifier,
+            canonical_identifier=canonical_identifier,
+            immutable=True,
+            revision=commit,
+            artifact_kind="github-tree",
+            repository=resolved_ref.repo_full,
+            skill_path=resolved_ref.skill_dir,
+            trust_state=self.trust_level,
+            publisher=resolved_ref.owner,
+            version=commit,
+            upstream_url=resolved_ref.homepage,
+            package_identifier=(
+                f"{resolved_ref.repo_full.casefold()}:{resolved_ref.skill_dir}"
+                if resolved_ref.skill_dir
+                else resolved_ref.repo_full.casefold()
+            ),
+            meta=meta,
+        )
+
+    async def fetch(self, identifier: str) -> SkillBundle | None:
+        """Resolve and fetch one immutable snapshot for direct source callers."""
+
+        resolution = await self.resolve(identifier)
+        if resolution is None:
+            return None
+        try:
+            return await self.fetch_resolved(resolution)
+        except SkillSourceFetchError as exc:
+            log.warning(
+                "github.fetch_rejected",
+                identifier=resolution.canonical_identifier,
+                diagnostics=[item.code for item in exc.diagnostics],
+            )
+            return None
+
+    async def fetch_resolved(self, resolution: SourceResolution) -> SkillBundle | None:
+        """Preserve the in-memory source API for existing direct callers."""
+        with tempfile.TemporaryDirectory(prefix="skill-fetch-") as temporary:
+            bundle = await self.fetch_resolved_into(resolution, Path(temporary) / "tree")
+            if bundle is not None:
+                assert bundle.directory is not None
+                bundle.files = {
+                    path.relative_to(bundle.directory).as_posix(): _decode_file(
+                        "", path.read_bytes()
+                    )
+                    for path in bundle.directory.rglob("*")
+                    if path.is_file()
+                }
+                bundle.directory = None
+            return bundle
+
+    async def fetch_resolved_into(
+        self,
+        resolution: SourceResolution,
+        destination: Path,
+    ) -> SkillBundle | None:
+        """Validate the selected tree before concurrent, file-backed downloads."""
+
+        if type(self).fetch_resolved is not GitHubSource.fetch_resolved:
+            return await SkillSource.fetch_resolved_into(self, resolution, destination)
+
+        import httpx
+
+        repository = resolution.repository.strip()
+        safe_skill_path = _normalize_skill_path(resolution.skill_path)
+        if (
+            "/" not in repository
+            or not _COMMIT_RE.fullmatch(resolution.revision)
+            or safe_skill_path is None
+        ):
+            raise SkillSourceFetchError.diagnostic(
+                "SOURCE_FETCH_RESOLUTION_INVALID",
+                "GitHub fetch resolution is not a valid commit-pinned Skill path.",
+                phase=DiagnosticPhase.FETCH,
+            )
+        owner, repo = repository.split("/", 1)
+        if not _valid_repository(owner, repo):
+            raise SkillSourceFetchError.diagnostic(
+                "SOURCE_FETCH_RESOLUTION_INVALID",
+                "GitHub fetch resolution contains an invalid repository identity.",
+                phase=DiagnosticPhase.FETCH,
+            )
+        ref = _GitHubSkillRef(owner, repo, resolution.revision.lower(), safe_skill_path)
+
         try:
             async with httpx.AsyncClient(timeout=15, trust_env=_trust_env()) as client:
-                tree_url = (
-                    f"https://api.github.com/repos/{ref.repo_full}/git/trees/"
-                    f"{quote(ref.ref, safe='')}?recursive=1"
+                tree_data = await _fetch_tree_payload(
+                    client,
+                    _github_tree_url(ref, ref.ref, recursive=True),
+                    headers=self._headers(),
                 )
-                tree_resp = await client.get(tree_url, headers=self._headers())
-                tree_resp.raise_for_status()
-                tree_data = tree_resp.json()
+                tree_path_prefix = ""
                 if tree_data.get("truncated"):
-                    log.warning("github.fetch_tree_truncated", identifier=identifier)
-                    return None
+                    log.warning(
+                        "github.fetch_tree_truncated",
+                        identifier=resolution.canonical_identifier,
+                    )
+                    if not ref.skill_dir:
+                        raise SkillSourceFetchError.diagnostic(
+                            "SOURCE_TREE_TRUNCATED",
+                            (
+                                "GitHub truncated the repository tree; "
+                                "the Skill cannot be fetched safely."
+                            ),
+                            phase=DiagnosticPhase.FETCH,
+                            hint="Install from an explicit Skill subpath.",
+                        )
+                    tree_data = await _fetch_explicit_subtree(
+                        client,
+                        ref,
+                        headers=self._headers(),
+                    )
+                    tree_path_prefix = ref.skill_dir
+                    if tree_data.get("truncated"):
+                        raise SkillSourceFetchError.diagnostic(
+                            "SOURCE_TREE_TRUNCATED",
+                            "GitHub truncated the selected Skill directory.",
+                            phase=DiagnosticPhase.FETCH,
+                            hint="Reduce the number of files in the selected Skill directory.",
+                        )
 
-                files: dict[str, str | bytes] = {}
-                for item in tree_data.get("tree", []):
+                ref, resolution = _select_skill_tree(
+                    tree_data["tree"],
+                    ref,
+                    resolution,
+                    tree_path_prefix=tree_path_prefix,
+                )
+                selected: list[tuple[str, str, int, int]] = []
+                declared_total = 0
+                missing_modes = False
+                directories: list[str] = []
+                for item in tree_data["tree"]:
+                    if not isinstance(item, dict):
+                        raise source_invalid_response_error(
+                            phase=DiagnosticPhase.FETCH,
+                            source_name="GitHub",
+                        )
                     path = str(item.get("path") or "")
-                    if item.get("type") != "blob":
+                    if not tree_path_prefix and ref.skill_dir:
+                        selected_parts = PurePosixPath(ref.skill_dir).parts
+                        candidate_parts = tuple(path.split("/"))
+                        if candidate_parts[: len(selected_parts)] != selected_parts:
+                            continue
+                    try:
+                        relative_tree_path = normalize_relative_path(path).as_posix()
+                        safe_path = (
+                            normalize_relative_path(
+                                f"{tree_path_prefix}/{relative_tree_path}"
+                            ).as_posix()
+                            if tree_path_prefix
+                            else relative_tree_path
+                        )
+                    except ArchiveNormalizationError:
+                        log.warning("github.fetch_unsafe_tree_path", path=path)
+                        raise SkillSourceFetchError.diagnostic(
+                            "ARTIFACT_PATH_UNSAFE",
+                            f"GitHub returned an unsafe tree path: {path}",
+                            phase=DiagnosticPhase.SECURITY,
+                            path=path,
+                        ) from None
+                    rel_path = _relative_to_skill_dir(safe_path, ref.skill_dir)
+                    selected_root_entry = bool(ref.skill_dir and safe_path == ref.skill_dir)
+                    if rel_path is None and not selected_root_entry:
                         continue
-                    rel_path = _relative_to_skill_dir(path, ref.skill_dir)
+                    entry_type = str(item.get("type") or "")
+                    if entry_type == "tree":
+                        if item.get("mode") not in {None, "", "040000", "40000"}:
+                            raise SkillSourceFetchError.diagnostic(
+                                "ARTIFACT_FILE_TYPE_UNSUPPORTED",
+                                "GitHub directory has unsupported file mode metadata.",
+                                phase=DiagnosticPhase.SECURITY, path=safe_path,
+                            )
+                        if rel_path:
+                            directories.append(rel_path)
+                        continue
+                    if entry_type != "blob":
+                        log.warning(
+                            "github.fetch_unsupported_tree_entry",
+                            path=safe_path,
+                            entry_type=entry_type,
+                        )
+                        raise SkillSourceFetchError.diagnostic(
+                            "ARTIFACT_FILE_TYPE_UNSUPPORTED",
+                            f"GitHub Skill contains a submodule or unsupported entry: {safe_path}",
+                            phase=DiagnosticPhase.SECURITY,
+                            path=safe_path,
+                        )
                     if not rel_path:
                         continue
-                    raw_url = (
-                        f"https://raw.githubusercontent.com/{ref.repo_full}/"
-                        f"{quote(ref.ref, safe='')}/{quote(path, safe='/')}"
-                    )
-                    raw_resp = await client.get(raw_url, headers=self._headers())
-                    raw_resp.raise_for_status()
-                    files[rel_path] = _decode_file(rel_path, raw_resp.content)
-        except Exception as exc:
-            log.warning("github.fetch_failed", identifier=identifier, error=str(exc))
-            return None
+                    relative = PurePosixPath(rel_path)
+                    if len(relative.parts) > DEFAULT_ARCHIVE_LIMITS.max_depth or any(
+                        part.casefold() in _RESERVED_COMPONENTS for part in relative.parts
+                    ):
+                        log.warning("github.fetch_unsafe_skill_path", path=safe_path)
+                        raise SkillSourceFetchError.diagnostic(
+                            "ARTIFACT_PATH_UNSAFE",
+                            f"GitHub Skill path is unsafe or exceeds the depth limit: {safe_path}",
+                            phase=DiagnosticPhase.SECURITY,
+                            path=safe_path,
+                        )
+                    try:
+                        declared_size = max(0, int(item.get("size") or 0))
+                    except (TypeError, ValueError):
+                        declared_size = 0
+                    if exceeds_limit(declared_size, DEFAULT_ARCHIVE_LIMITS.max_entry_bytes):
+                        log.warning("github.fetch_entry_too_large", path=safe_path)
+                        raise SkillSourceFetchError.diagnostic(
+                            "FETCH_SIZE_LIMIT",
+                            f"GitHub Skill file exceeds the configured entry limit: {safe_path}",
+                            phase=DiagnosticPhase.FETCH,
+                            path=safe_path,
+                        )
+                    raw_mode = str(item.get("mode") or "")
+                    file_mode = 0
+                    if raw_mode:
+                        try:
+                            parsed_mode = int(raw_mode, 8)
+                        except ValueError:
+                            log.warning("github.fetch_invalid_file_mode", path=safe_path)
+                            raise SkillSourceFetchError.diagnostic(
+                                "ARTIFACT_FILE_TYPE_UNSUPPORTED",
+                                f"GitHub returned invalid file mode metadata: {safe_path}",
+                                phase=DiagnosticPhase.SECURITY,
+                                path=safe_path,
+                            ) from None
+                        if stat.S_IFMT(parsed_mode) != stat.S_IFREG:
+                            log.warning("github.fetch_unsupported_file_type", path=safe_path)
+                            raise SkillSourceFetchError.diagnostic(
+                                "ARTIFACT_FILE_TYPE_UNSUPPORTED",
+                                f"GitHub Skill contains a link or special file: {safe_path}",
+                                phase=DiagnosticPhase.SECURITY,
+                                path=safe_path,
+                            )
+                        file_mode = stat.S_IMODE(parsed_mode)
+                    else:
+                        missing_modes = True
+                    declared_total += declared_size
+                    if exceeds_limit(declared_total, DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes):
+                        log.warning(
+                            "github.fetch_tree_too_large",
+                            identifier=resolution.canonical_identifier,
+                        )
+                        raise SkillSourceFetchError.diagnostic(
+                            "FETCH_SIZE_LIMIT",
+                            "GitHub Skill exceeds the configured expanded-size limit.",
+                            phase=DiagnosticPhase.FETCH,
+                        )
+                    selected.append((safe_path, rel_path, declared_size, file_mode))
 
-        skill_md = files.get("SKILL.md")
-        if not isinstance(skill_md, str):
-            return None
+                try:
+                    validate_portable_tree((item[1] for item in selected), directories)
+                except ArchiveNormalizationError as exc:
+                    log.warning("github.fetch_colliding_tree_path", error=str(exc))
+                    raise SkillSourceFetchError.diagnostic(
+                        "ARTIFACT_PATH_COLLISION",
+                        f"GitHub Skill contains colliding portable paths: {exc}",
+                        phase=DiagnosticPhase.SECURITY,
+                    ) from None
+
+                try:
+                    validate_tree_entry_count(
+                        [item[1] for item in selected] + directories,
+                        limit=DEFAULT_ARCHIVE_LIMITS.max_entries,
+                    )
+                    for directory in directories:
+                        if len(PurePosixPath(directory).parts) > DEFAULT_ARCHIVE_LIMITS.max_depth:
+                            raise ValueError("Skill directory exceeds depth limit")
+                        if any(
+                            part.casefold() in _RESERVED_COMPONENTS
+                            for part in PurePosixPath(directory).parts
+                        ):
+                            raise ValueError("Skill directory uses reserved path")
+                except ValueError as exc:
+                    raise SkillSourceFetchError.diagnostic(
+                        "FETCH_ENTRY_LIMIT",
+                        str(exc),
+                        phase=DiagnosticPhase.FETCH,
+                    ) from exc
+                destination.mkdir(parents=True, exist_ok=False)
+                for directory in directories:
+                    destination.joinpath(*PurePosixPath(directory).parts).mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+                file_modes: dict[str, int] = {}
+                pending = iter(selected)
+                actual_total = 0
+                budget = _DownloadBudget(DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes)
+                completed_files = 0
+                report_install_progress("downloading", totalFiles=len(selected), completedFiles=0)
+
+                async def worker() -> None:
+                    nonlocal actual_total, completed_files
+                    for path, rel_path, _declared_size, file_mode in pending:
+                        raw_url = (
+                            f"https://raw.githubusercontent.com/{ref.repo_full}/"
+                            f"{quote(ref.ref, safe='')}/{quote(path, safe='/')}"
+                        )
+                        target = destination.joinpath(*PurePosixPath(rel_path).parts)
+                        await _download_file(
+                            client, raw_url, target, self._headers(), budget=budget,
+                        )
+                        actual_total += target.stat().st_size
+                        completed_files += 1
+                        report_install_progress(
+                            "downloading", completedFiles=completed_files,
+                            totalFiles=len(selected), downloadedBytes=actual_total,
+                        )
+                        if exceeds_limit(actual_total, DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes):
+                            raise ValueError("Skill exceeds configured expanded-size limit")
+                        if file_mode:
+                            file_modes[rel_path] = file_mode
+                            if os.name != "nt":
+                                target.chmod(file_mode & 0o777)
+
+                workers = [asyncio.create_task(worker()) for _ in range(min(8, len(selected)))]
+                try:
+                    await asyncio.gather(*workers)
+                finally:
+                    for task in workers:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
+        except SkillSourceFetchError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "github.fetch_failed",
+                identifier=resolution.canonical_identifier,
+                error=str(exc),
+            )
+            if isinstance(exc, ValueError) and "exceeds" in str(exc).lower():
+                raise SkillSourceFetchError.diagnostic(
+                    "FETCH_SIZE_LIMIT",
+                    str(exc),
+                    phase=DiagnosticPhase.FETCH,
+                ) from exc
+            raise source_transport_error(
+                exc,
+                phase=DiagnosticPhase.FETCH,
+                source_name="GitHub",
+            ) from exc
+
+        accepted_manifest_names = (
+            {_MANIFEST_NAME, "skill.md", "skills.md"}
+            if resolution.allow_legacy_manifest_names
+            else {_MANIFEST_NAME}
+        )
+        manifest_paths = [
+            path
+            for _source_path, path, _size, _mode in selected
+            if PurePosixPath(path).name in accepted_manifest_names
+        ]
+        if len(manifest_paths) != 1 or PurePosixPath(manifest_paths[0]).parent != PurePosixPath(
+            "."
+        ):
+            log.warning(
+                "github.fetch_ambiguous_manifest",
+                identifier=resolution.canonical_identifier,
+                manifests=manifest_paths,
+            )
+            raise SkillSourceFetchError.diagnostic(
+                "SOURCE_TREE_AMBIGUOUS",
+                "GitHub selection must contain exactly one root Skill manifest.",
+                phase=DiagnosticPhase.ARCHIVE,
+                details={"manifests": manifest_paths},
+                hint="Use an explicit repository subpath containing one Skill.",
+            )
+        try:
+            skill_md = await run_staging_worker(
+                _manifest_prefix, destination / manifest_paths[0],
+            )
+        except UnicodeDecodeError:
+            raise SkillSourceFetchError.diagnostic(
+                "MANIFEST_ENCODING_INVALID",
+                "The GitHub Skill manifest is not valid UTF-8 text.",
+                phase=DiagnosticPhase.MANIFEST,
+                path=manifest_paths[0],
+            )
 
         name = _frontmatter_field(skill_md, "name") or _fallback_name(ref)
         meta = SkillMeta(
             name=name,
             description=_frontmatter_field(skill_md, "description"),
+            version=resolution.revision,
             source_id=self.source_id,
             trust_level=self.trust_level,
-            identifier=ref.canonical_identifier,
+            identifier=resolution.canonical_identifier,
             homepage=ref.homepage,
+            canonical_identifier=resolution.canonical_identifier,
         )
-        return SkillBundle(name=name, files=files, meta=meta)
+        actual_digest = await run_staging_worker(
+            artifact_tree_digest, destination, include_lengths=True,
+        )
+        if resolution.expected_digest and resolution.expected_digest.lower() not in {
+            actual_digest,
+            f"sha256:{actual_digest}",
+        }:
+            log.warning(
+                "github.fetch_digest_mismatch",
+                identifier=resolution.canonical_identifier,
+            )
+            raise SkillSourceFetchError.diagnostic(
+                "ARTIFACT_DIGEST_MISMATCH",
+                "The GitHub Skill content digest does not match the immutable resolution.",
+                phase=DiagnosticPhase.SECURITY,
+            )
+        resolved = replace(resolution, expected_digest=actual_digest)
+        if missing_modes and not any(
+            diagnostic.code == "FILE_MODE_UNAVAILABLE" for diagnostic in resolved.diagnostics
+        ):
+            resolved = replace(
+                resolved,
+                diagnostics=(
+                    *resolved.diagnostics,
+                    SkillDiagnostic(
+                        code="FILE_MODE_UNAVAILABLE",
+                        severity=DiagnosticSeverity.WARNING,
+                        phase=DiagnosticPhase.FETCH,
+                        message="GitHub did not return POSIX mode metadata for every file.",
+                    ),
+                ),
+            )
+        return SkillBundle(
+            name=name,
+            directory=destination,
+            meta=meta,
+            resolution=resolved,
+            file_modes=file_modes,
+        )
 
     async def inspect(self, identifier: str) -> SkillMeta | None:
         ref = _parse_identifier(identifier)
@@ -265,4 +1163,5 @@ class GitHubSource(SkillSource):
             trust_level=self.trust_level,
             identifier=ref.canonical_identifier,
             homepage=ref.homepage,
+            canonical_identifier=ref.canonical_identifier,
         )

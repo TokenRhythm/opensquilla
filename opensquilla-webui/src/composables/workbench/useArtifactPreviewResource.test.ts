@@ -1,14 +1,22 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
+import type { NativeHtmlArtifactResource } from '@/modules/artifactWorkbench'
+import {
+  HttpTransportError,
+} from '@/adapters/gateway/privateHttpTransport'
+import {
+  httpTransportTestDouble,
+  type TestHttpBinaryResponse,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
 import {
   ARTIFACT_TEXT_PREVIEW_LIMIT,
 } from '@/utils/workbench/artifactPreview'
 import {
   createArtifactPreviewResource,
-  type NativeHtmlArtifactResource,
-} from './useArtifactPreviewResource'
+} from '@/adapters/gateway/artifactPreviewResourceV4'
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -20,11 +28,19 @@ function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   }
 }
 
-function response(body: BodyInit, mime: string): Response {
-  return new Response(body, {
-    status: 200,
-    headers: { 'Content-Type': mime },
-  })
+function response(body: BlobPart, mime: string): TestHttpBinaryResponse {
+  const blob = new Blob([body], { type: mime })
+  return {
+    metadata: { status: 200, contentLength: blob.size, contentType: mime },
+    blob: async () => blob,
+    stream: () => blob.stream(),
+  }
+}
+
+function httpTransport(
+  requestBinary = vi.fn<TestHttpTransport['requestBinary']>(),
+): TestHttpTransport {
+  return httpTransportTestDouble({ requestBinary })
 }
 
 function deferred<T>() {
@@ -40,13 +56,12 @@ afterEach(() => {
 describe('createArtifactPreviewResource', () => {
   it('aborts the active request synchronously when disposed', () => {
     const observed: { signal?: AbortSignal } = {}
-    const fetchImpl = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
-      observed.signal = init?.signal as AbortSignal
-      return new Promise<Response>(() => undefined)
+    const requestBinary = vi.fn((_url: string, options?: Parameters<TestHttpTransport['requestBinary']>[1]) => {
+      observed.signal = options?.signal
+      return new Promise<TestHttpBinaryResponse>(() => undefined)
     })
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), {
       artifact: () => artifact(),
-      fetchImpl: fetchImpl as typeof fetch,
     })
 
     void controller.load()
@@ -58,14 +73,13 @@ describe('createArtifactPreviewResource', () => {
   })
 
   it('ignores a stale response that resolves after a newer artifact load', async () => {
-    const first = deferred<Response>()
-    const second = deferred<Response>()
-    const fetchImpl = vi.fn()
+    const first = deferred<TestHttpBinaryResponse>()
+    const second = deferred<TestHttpBinaryResponse>()
+    const requestBinary = vi.fn()
       .mockImplementationOnce(() => first.promise)
       .mockImplementationOnce(() => second.promise)
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), {
       artifact: () => artifact(),
-      fetchImpl,
     })
 
     const firstLoad = controller.load()
@@ -84,13 +98,12 @@ describe('createArtifactPreviewResource', () => {
       .mockReturnValueOnce('blob:first')
       .mockReturnValueOnce('blob:second')
     const revokeObjectUrl = vi.fn()
-    const fetchImpl = vi.fn()
+    const requestBinary = vi.fn()
       .mockResolvedValueOnce(response(new Uint8Array([1]), 'image/png'))
       .mockResolvedValueOnce(response(new Uint8Array([2]), 'image/png'))
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), {
       artifact: () => artifact({ name: 'image.png', mime: 'image/png' }),
       createObjectUrl,
-      fetchImpl,
       revokeObjectUrl,
     })
 
@@ -106,42 +119,154 @@ describe('createArtifactPreviewResource', () => {
   })
 
   it('rejects oversized text before downloading it', async () => {
-    const fetchImpl = vi.fn()
-    const controller = createArtifactPreviewResource({
+    const http = httpTransport()
+    const controller = createArtifactPreviewResource(http, {
       artifact: () => artifact({ size: ARTIFACT_TEXT_PREVIEW_LIMIT + 1 }),
-      fetchImpl,
     })
 
     await controller.load()
 
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
     expect(controller.state.value).toBe('unsupported')
     expect(controller.errorCode.value).toBe('too-large')
   })
 
   it('does not fetch preview bytes from an untrusted origin', async () => {
-    const fetchImpl = vi.fn()
-    const controller = createArtifactPreviewResource({
+    const http = httpTransport()
+    const controller = createArtifactPreviewResource(http, {
       artifact: () => artifact({ download_url: 'https://files.invalid/artifact-1' }),
       baseOrigin: () => 'https://control.example',
-      fetchImpl,
     })
 
     await controller.load()
 
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
     expect(controller.state.value).toBe('error')
     expect(controller.errorCode.value).toBe('missing-url')
   })
 
+  it('decodes a server-validated inline UTF-8 HTML attachment without fetch', async () => {
+    const observed: { blob?: Blob } = {}
+    const inlineUrl = 'data:text/html;charset=utf-8;base64,PCFkb2N0eXBlIGh0bWw+PGgxPuS9oOWlve+8jElubGluZSDimJU8L2gxPg=='
+    const http = httpTransport()
+    const controller = createArtifactPreviewResource(http, {
+      artifact: () => artifact({
+        id: undefined,
+        name: 'inline.html',
+        mime: 'text/html',
+        sha256: 'f65982a5bbec7babf0dfda6e60b973dd750a40545a8f52f62a924a5d7c8184e2',
+        size: 43,
+        download_url: inlineUrl,
+        workbenchResourceType: 'attachment',
+      }),
+      createObjectUrl: blob => {
+        observed.blob = blob
+        return 'blob:inline-preview'
+      },
+      revokeObjectUrl: vi.fn(),
+    })
+
+    await controller.load()
+
+    expect(http.requestBinary).not.toHaveBeenCalled()
+    expect(controller.state.value).toBe('ready')
+    expect(controller.objectUrl.value).toBe('blob:inline-preview')
+    expect(await observed.blob?.text()).toContain('你好，Inline ☕')
+    expect(await observed.blob?.text()).toContain("connect-src 'none'")
+  })
+
+  it('fails closed when an inline attachment contains malformed base64', async () => {
+    const http = httpTransport()
+    const controller = createArtifactPreviewResource(http, {
+      artifact: () => artifact({
+        id: undefined,
+        name: 'inline.html',
+        mime: 'text/html',
+        download_url: 'data:text/html;base64,abcde',
+        workbenchResourceType: 'attachment',
+      }),
+    })
+
+    await controller.load()
+
+    expect(http.requestBinary).not.toHaveBeenCalled()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('invalid-content')
+  })
+
+  it('rejects an oversized inline attachment before decoding or fetching it', async () => {
+    const http = httpTransport()
+    const encoded = 'AAAA'.repeat(Math.ceil(ARTIFACT_TEXT_PREVIEW_LIMIT / 3) + 1)
+    const controller = createArtifactPreviewResource(http, {
+      artifact: () => artifact({
+        id: undefined,
+        name: 'inline.html',
+        mime: 'text/html',
+        download_url: `data:text/html;base64,${encoded}`,
+        workbenchResourceType: 'attachment',
+      }),
+    })
+
+    await controller.load()
+
+    expect(http.requestBinary).not.toHaveBeenCalled()
+    expect(controller.state.value).toBe('unsupported')
+    expect(controller.errorCode.value).toBe('too-large')
+  })
+
+  it('reports inline attachment integrity mismatches explicitly', async () => {
+    const http = httpTransport()
+    const controller = createArtifactPreviewResource(http, {
+      artifact: () => artifact({
+        id: undefined,
+        name: 'inline.html',
+        mime: 'text/html',
+        sha256: '0'.repeat(64),
+        size: 15,
+        download_url: 'data:text/html;base64,PGgxPklubGluZTwvaDE+',
+        workbenchResourceType: 'attachment',
+      }),
+    })
+
+    await controller.load()
+
+    expect(http.requestBinary).not.toHaveBeenCalled()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('integrity-error')
+  })
+
+  it.each([
+    { name: 'notes.txt', mime: 'text/plain', body: 'Desktop text' },
+    { name: 'notes.md', mime: 'text/markdown', body: '# Desktop markdown' },
+    { name: 'report.pdf', mime: 'application/pdf', body: new Uint8Array([0x25, 0x50, 0x44, 0x46]) },
+  ])('loads $name through the exact Desktop API proxy', async ({ name, mime, body }) => {
+    const createObjectUrl = vi.fn(() => 'blob:desktop-preview')
+    const requestBinary = vi.fn().mockResolvedValue(response(body, mime))
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), {
+      artifact: () => artifact({ name, mime }),
+      baseOrigin: () => 'opensquilla-app://desktop',
+      createObjectUrl,
+    })
+
+    await controller.load()
+
+    expect(requestBinary).toHaveBeenCalledWith(
+      '/api/v1/artifacts/artifact-1',
+      expect.objectContaining({ timeoutMs: 0 }),
+    )
+    expect(controller.state.value).toBe('ready')
+    if (mime === 'application/pdf') {
+      expect(controller.objectUrl.value).toBe('blob:desktop-preview')
+    }
+  })
+
   it('emits native HTML bytes and reports unresolved relative resources', async () => {
     const nativeReady = vi.fn<(resource: NativeHtmlArtifactResource) => void>()
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
+      '<html><head><link href="./style.css"></head><body>Preview</body></html>',
+      'text/html',
+    ))), {
       artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),
-      fetchImpl: vi.fn().mockResolvedValue(response(
-        '<html><head><link href="./style.css"></head><body>Preview</body></html>',
-        'text/html',
-      )),
       nativeHtml: () => true,
       onNativeHtmlReady: nativeReady,
       sessionKey: () => 'session:test',
@@ -159,45 +284,42 @@ describe('createArtifactPreviewResource', () => {
   })
 
   it('uses the explicit ready-with-warnings state for partial bundle leases', async () => {
-    const fetchImpl = vi.fn()
-    const controller = createArtifactPreviewResource({
+    const http = httpTransport()
+    const controller = createArtifactPreviewResource(http, {
       artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),
-      fetchImpl,
       htmlCollectionStatus: () => 'partial',
       htmlLaunchUrl: () => 'https://preview.example.test/index.html',
     })
 
     await controller.load()
 
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
     expect(controller.objectUrl.value).toBe('https://preview.example.test/index.html')
     expect(controller.state.value).toBe('ready-with-warnings')
   })
 
   it('never downloads the entry HTML while a preview lease is pending or blocked', async () => {
-    const fetchImpl = vi.fn()
+    const http = httpTransport()
     let leaseState: 'pending' | 'blocked' = 'pending'
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(http, {
       artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),
-      fetchImpl,
       htmlLeaseState: () => leaseState,
     })
 
     await controller.load()
     expect(controller.state.value).toBe('loading')
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
 
     leaseState = 'blocked'
     await controller.reload()
     expect(controller.state.value).toBe('error')
     expect(controller.errorCode.value).toBe('preview-blocked')
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
   })
 
   it('keeps recoverable native load errors distinct from renderer crashes', () => {
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(), {
       artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),
-      fetchImpl: vi.fn(),
       nativeHtml: () => true,
     })
 
@@ -212,16 +334,15 @@ describe('createArtifactPreviewResource', () => {
 
   it('builds an offline HTML blob for the web renderer', async () => {
     const observed: { blob?: Blob } = {}
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
+      '<script>document.body.textContent = "ran"</script>',
+      'text/html',
+    ))), {
       artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),
       createObjectUrl: blob => {
         observed.blob = blob
         return 'blob:offline-preview'
       },
-      fetchImpl: vi.fn().mockResolvedValue(response(
-        '<script>document.body.textContent = "ran"</script>',
-        'text/html',
-      )),
       revokeObjectUrl: vi.fn(),
     })
 
@@ -234,9 +355,10 @@ describe('createArtifactPreviewResource', () => {
   })
 
   it('marks a mismatched response as invalid instead of rendering it', async () => {
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(
+      vi.fn().mockResolvedValue(response('<script>bad()</script>', 'text/html')),
+    ), {
       artifact: () => artifact({ name: 'image.png', mime: 'image/png' }),
-      fetchImpl: vi.fn().mockResolvedValue(response('<script>bad()</script>', 'text/html')),
     })
 
     await controller.load()
@@ -255,12 +377,15 @@ describe('createArtifactPreviewResource', () => {
         return allowCancel.promise
       },
     })
-    const controller = createArtifactPreviewResource({
+    const binary: TestHttpBinaryResponse = {
+      metadata: { status: 200, contentType: 'text/html' },
+      blob: async () => new Blob([], { type: 'text/html' }),
+      stream: () => body,
+    }
+    const controller = createArtifactPreviewResource(httpTransport(
+      vi.fn().mockResolvedValue(binary),
+    ), {
       artifact: () => artifact({ name: 'image.png', mime: 'image/png' }),
-      fetchImpl: vi.fn().mockResolvedValue(new Response(body, {
-        status: 200,
-        headers: { 'Content-Type': 'text/html' },
-      })),
     })
 
     const load = controller.load()
@@ -274,15 +399,15 @@ describe('createArtifactPreviewResource', () => {
   })
 
   it('reports Gateway artifact integrity failures explicitly', async () => {
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(
+      vi.fn(async () => {
+        throw new HttpTransportError('http-status', 'Integrity failure', 409, {
+          code: 'INTEGRITY_ERROR',
+          error: 'checksum mismatch',
+        })
+      }),
+    ), {
       artifact: () => artifact(),
-      fetchImpl: vi.fn().mockResolvedValue(new Response(JSON.stringify({
-        code: 'INTEGRITY_ERROR',
-        error: 'checksum mismatch',
-      }), {
-        status: 409,
-        headers: { 'Content-Type': 'application/json' },
-      })),
     })
 
     await controller.load()
@@ -293,7 +418,10 @@ describe('createArtifactPreviewResource', () => {
 
   it('uses an application/pdf Blob for generic PDF responses', async () => {
     const observed: { blob?: Blob } = {}
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
+      new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      'application/octet-stream',
+    ))), {
       artifact: () => artifact({
         name: 'report.pdf',
         mime: 'application/octet-stream',
@@ -302,10 +430,6 @@ describe('createArtifactPreviewResource', () => {
         observed.blob = blob
         return 'blob:pdf-preview'
       },
-      fetchImpl: vi.fn().mockResolvedValue(response(
-        new Uint8Array([0x25, 0x50, 0x44, 0x46]),
-        'application/octet-stream',
-      )),
       revokeObjectUrl: vi.fn(),
     })
 
@@ -318,7 +442,10 @@ describe('createArtifactPreviewResource', () => {
 
   it('uses the file extension to type a generic image response', async () => {
     const observed: { blob?: Blob } = {}
-    const controller = createArtifactPreviewResource({
+    const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+      'application/octet-stream',
+    ))), {
       artifact: () => artifact({
         name: 'preview.png',
         mime: 'application/octet-stream',
@@ -327,10 +454,6 @@ describe('createArtifactPreviewResource', () => {
         observed.blob = blob
         return 'blob:image-preview'
       },
-      fetchImpl: vi.fn().mockResolvedValue(response(
-        new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
-        'application/octet-stream',
-      )),
       revokeObjectUrl: vi.fn(),
     })
 

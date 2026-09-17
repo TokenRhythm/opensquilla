@@ -1,5 +1,10 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
+import type {
+  ConfigureImageGeneration,
+  ConfigureMemoryEmbedding,
+  ConfigureSearch,
+} from '@/modules/setupWorkflow'
 
 interface ProviderSpec {
   providerId: string
@@ -44,6 +49,27 @@ interface StatusData {
   imageGenerationProvider?: string
   imageGenerationPrimary?: string
   imageGenerationSource?: string
+  imageGenerationState?: {
+    mode?: 'unconfigured' | 'disabled' | 'custom' | 'follow_llm' | string
+    effective?: {
+      providerId?: string
+      primary?: string
+      credentialSource?: string
+      credentialOwner?: string
+    }
+    recommendation?: { providerId?: string } | null
+    credentialOptions?: ImageCredentialOption[]
+  }
+}
+
+export interface ImageCredentialOption {
+  providerId: string
+  available: boolean
+  source: string
+  owner: string
+  kind?: string
+  envKey?: string
+  reason?: string
 }
 
 type CapabilityId = 'search' | 'memory_embedding' | 'image_generation' | 'audio'
@@ -57,6 +83,14 @@ interface CapabilitiesPanelContext {
   memoryProviders: ComputedRef<Array<{ providerId: string; label: string }>>
   imageProviders: ComputedRef<Array<{ providerId: string; label: string }>>
   imageSpec: ComputedRef<ProviderSpec | null>
+  imageRecommendation: ComputedRef<{
+      providerId: string
+      label: string
+      canReuseCredential: boolean
+      actionRequired: boolean
+      registrationUrl: string
+    } | null>
+  imageCredentialOptions: ComputedRef<ImageCredentialOption[]>
   imageModels: ComputedRef<Array<{
     id: string
     name: string
@@ -134,6 +168,7 @@ export interface MemoryFormValues {
 }
 
 export interface ImageFormValues {
+  enabled: boolean
   providerId: string
   primary: string
   apiKey: string
@@ -219,8 +254,8 @@ export function imageModelRefForPayload(providerId: string, raw: string): string
   return provider && model ? `${provider}/${model}` : ''
 }
 
-export function buildSearchPayload(values: SearchFormValues): Record<string, unknown> {
-  const params: Record<string, unknown> = { providerId: values.providerId }
+export function buildSearchPayload(values: SearchFormValues): ConfigureSearch {
+  const params: ConfigureSearch = { providerId: values.providerId }
   if (values.apiKey) params.apiKey = values.apiKey
   else if (values.apiKeyEnv) params.apiKeyEnv = values.apiKeyEnv
   params.maxResults = values.maxResults
@@ -231,8 +266,8 @@ export function buildSearchPayload(values: SearchFormValues): Record<string, unk
   return params
 }
 
-export function buildMemoryPayload(values: MemoryFormValues): Record<string, unknown> {
-  const params: Record<string, unknown> = { providerId: values.providerId }
+export function buildMemoryPayload(values: MemoryFormValues): ConfigureMemoryEmbedding {
+  const params: ConfigureMemoryEmbedding = { providerId: values.providerId }
   if (values.model) params.model = values.model
   if (values.apiKey) params.apiKey = values.apiKey
   if (values.apiKeyEnv) params.apiKeyEnv = values.apiKeyEnv
@@ -245,10 +280,11 @@ export function buildImagePayload(
   values: ImageFormValues,
   touched: ReadonlySet<ImageTouchedField> = new Set(),
   options: ImagePayloadOptions = {},
-): Record<string, unknown> {
+): ConfigureImageGeneration {
   const apiKey = values.apiKey.trim()
   const apiKeyEnv = values.apiKeyEnv.trim()
-  const params: Record<string, unknown> = {
+  const params: ConfigureImageGeneration = {
+    enabled: values.enabled,
     providerId: values.providerId.trim(),
   }
   const primary = imageModelRefForPayload(values.providerId, values.primary)
@@ -290,7 +326,11 @@ export function useSetupCapabilitiesForm() {
   const memoryBaseUrl = ref('')
   const memoryOnnxDir = ref('')
 
-  const imageProvider = ref('openrouter')
+  // An unconfigured capability has no selected provider. Catalog order is a
+  // presentation detail, not persisted state; choosing providers[0] here made
+  // a pristine install look configured and hid whether a recommendation had
+  // actually been accepted.
+  const imageProvider = ref('')
   const imagePrimary = ref('')
   const imageApiKey = ref('')
   const imageApiKeyEnv = ref('')
@@ -305,6 +345,9 @@ export function useSetupCapabilitiesForm() {
   const imageGlobalTouchedFields = ref<Set<ImageTouchedField>>(new Set())
   const imageClearFallbacks = ref(false)
   const imageProviderDrafts = new Map<string, ImageProviderDraft>()
+  const imageCredentialOptions = new Map<string, ImageCredentialOption>()
+  let imageProviderSpecs: ProviderSpec[] = []
+  let imageRecommendedProviderId = ''
 
   const searchSerialized = computed(() => JSON.stringify([
     searchProvider.value, searchMaxResults.value, searchApiKey.value, searchApiKeyEnv.value,
@@ -315,6 +358,7 @@ export function useSetupCapabilitiesForm() {
     memoryBaseUrl.value, memoryOnnxDir.value,
   ]))
   const imageSerialized = computed(() => JSON.stringify([
+    imageEnabled.value,
     imageProvider.value, imagePrimary.value, imageApiKey.value, imageApiKeyEnv.value,
     imageBaseUrl.value,
     imageSize.value, imageOutputFormat.value, imageFallbacks.value,
@@ -378,12 +422,37 @@ export function useSetupCapabilitiesForm() {
 
   function initImageFromConfig(config: ConfigData, status: StatusData, providers: ProviderSpec[]) {
     const imageConfig = config.image_generation || {}
-    const primaryRef = (status.imageGenerationPrimary || '').trim()
+    const imageState = status.imageGenerationState
+    const stateMode = String(imageState?.mode || '').trim().toLowerCase()
+    const stateIsAuthoritative = Boolean(imageState && stateMode)
+    const hasPersistedSelection = !stateIsAuthoritative || stateMode !== 'unconfigured'
+    const primaryRef = hasPersistedSelection
+      ? String(
+          imageState?.effective?.primary
+          || status.imageGenerationPrimary
+          || '',
+        ).trim()
+      : ''
     const primaryProvider = primaryRef.split('/', 1)[0]
+    const persistedProvider = hasPersistedSelection
+      ? String(
+          imageState?.effective?.providerId
+          || status.imageGenerationProvider
+          || '',
+        ).trim()
+      : ''
+    imageProviderSpecs = providers
+    imageRecommendedProviderId = String(imageState?.recommendation?.providerId || '').trim()
+    imageCredentialOptions.clear()
+    for (const option of imageState?.credentialOptions || []) {
+      imageCredentialOptions.set(String(option.providerId || '').trim(), option)
+    }
+    // A persisted primary is the route source of truth. Credential status can
+    // lag behind it (for example after a provider change), so consult the
+    // status provider only when the primary does not identify a catalog row.
     const selected = providers.find(p => p.providerId === primaryProvider)?.providerId
-      || providers.find(p => p.providerId === status.imageGenerationProvider)?.providerId
-      || providers[0]?.providerId
-      || 'openrouter'
+      || providers.find(p => p.providerId === persistedProvider)?.providerId
+      || ''
     imageProviderDrafts.clear()
     imageGlobalTouchedFields.value = new Set()
     imageClearFallbacks.value = false
@@ -391,15 +460,35 @@ export function useSetupCapabilitiesForm() {
       const providerConfig = (imageConfig.providers || {})[spec.providerId] || {}
       const configuredPrimary = spec.providerId === primaryProvider ? primaryRef : ''
       const keyConfigured = Boolean(providerConfig.api_key)
-      const isStatusProvider = spec.providerId === status.imageGenerationProvider
+      const isStatusProvider = spec.providerId === persistedProvider
+      const configuredEnv = String(providerConfig.api_key_env || '').trim()
+      // config.get materializes each provider's schema-default env key. For a
+      // provider that is not the persisted route, that default is not proof
+      // that the variable exists and must not suppress the key editor after a
+      // recommendation is accepted. A custom env reference remains authored.
+      const authoredEnv = Boolean(
+        configuredEnv
+        && (isStatusProvider || configuredEnv !== String(spec.envKey || '').trim()),
+      )
       const statusSource = isStatusProvider
-        ? normalizeImageCredentialSource(status.imageGenerationSource)
+        ? normalizeImageCredentialSource(
+            imageState?.effective?.credentialSource
+            || status.imageGenerationSource,
+          )
         : 'none'
+      const reusableOption = imageCredentialOptions.get(spec.providerId)
+      const optionSource: ImageCredentialSource = reusableOption?.available === true
+        ? normalizeImageCredentialSource(reusableOption.source)
+        : reusableOption?.source === 'missing_env'
+          ? 'missing_env'
+          : 'none'
       const credentialSource: ImageCredentialSource = keyConfigured
         ? 'explicit'
         : statusSource !== 'none'
           ? statusSource
-          : Boolean(providerConfig.api_key_env)
+          : optionSource !== 'none'
+            ? optionSource
+          : authoredEnv
             ? 'env'
             : status.imageGenerationConfigured === true && isStatusProvider
               ? 'configured'
@@ -413,7 +502,11 @@ export function useSetupCapabilitiesForm() {
         ),
         apiKeyEnv: keyConfigured
           ? ''
-          : (providerConfig.api_key_env || (spec.requiresApiKey ? spec.envKey || '' : '')),
+          : (
+              configuredEnv
+              || reusableOption?.envKey
+              || (spec.requiresApiKey ? spec.envKey || '' : '')
+            ),
         baseUrl: providerConfig.base_url || spec.defaultBaseUrl || '',
         credentialConfigured,
         credentialSource,
@@ -421,12 +514,16 @@ export function useSetupCapabilitiesForm() {
       })
     }
     imageProvider.value = selected
-    applyImageProviderDraft(
-      imageProviderDrafts.get(selected) || createDefaultImageProviderDraft(
-        providers.find(p => p.providerId === selected),
-      ),
-    )
-    imageEnabled.value = status.imageGenerationEnabled !== false
+    if (selected) {
+      applyImageProviderDraft(
+        imageProviderDrafts.get(selected) || createDefaultImageProviderDraft(
+          providers.find(p => p.providerId === selected),
+        ),
+      )
+    } else {
+      clearImageProviderDraft()
+    }
+    imageEnabled.value = status.imageGenerationEnabled === true
     imageSize.value = imageConfig.size || '1024x1024'
     imageOutputFormat.value = imageConfig.output_format || 'png'
     imageFallbacks.value = (imageConfig.fallbacks || []).join(', ')
@@ -436,12 +533,18 @@ export function useSetupCapabilitiesForm() {
   function createDefaultImageProviderDraft(
     spec: ProviderSpec | null | undefined,
   ): ImageProviderDraft {
+    const option = imageCredentialOptions.get(spec?.providerId || '')
+    const credentialSource: ImageCredentialSource = option?.available === true
+      ? normalizeImageCredentialSource(option.source)
+      : option?.source === 'missing_env'
+        ? 'missing_env'
+        : 'none'
     return {
       primary: imageModelForDisplay(spec?.providerId || '', spec?.defaultModel || ''),
-      apiKeyEnv: spec?.requiresApiKey ? spec.envKey || '' : '',
+      apiKeyEnv: option?.envKey || (spec?.requiresApiKey ? spec.envKey || '' : ''),
       baseUrl: spec?.defaultBaseUrl || '',
-      credentialConfigured: false,
-      credentialSource: 'none',
+      credentialConfigured: option?.available === true,
+      credentialSource,
       touched: new Set(),
     }
   }
@@ -454,6 +557,16 @@ export function useSetupCapabilitiesForm() {
     imageKeyConfigured.value = draft.credentialConfigured
     imageCredentialSource.value = draft.credentialSource
     imageTouchedFields.value = new Set(draft.touched)
+  }
+
+  function clearImageProviderDraft() {
+    imagePrimary.value = ''
+    imageApiKey.value = ''
+    imageApiKeyEnv.value = ''
+    imageBaseUrl.value = ''
+    imageKeyConfigured.value = false
+    imageCredentialSource.value = 'none'
+    imageTouchedFields.value = new Set()
   }
 
   function saveCurrentImageProviderDraft() {
@@ -489,6 +602,7 @@ export function useSetupCapabilitiesForm() {
         imageProviderDrafts.set(nextProviderId, draft)
         applyImageProviderDraft(draft)
       }
+      imageEnabled.value = true
       return
     }
 
@@ -497,6 +611,10 @@ export function useSetupCapabilitiesForm() {
       || createDefaultImageProviderDraft(spec)
     imageProviderDrafts.set(nextProviderId, draft)
     imageProvider.value = nextProviderId
+    // Selecting a provider is the explicit enable/configure action. The wire
+    // configure RPC owns persistence; this local flag keeps draft guidance
+    // (credential requirements, hints) aligned before Save.
+    imageEnabled.value = true
     applyImageProviderDraft(draft)
   }
 
@@ -584,7 +702,15 @@ export function useSetupCapabilitiesForm() {
       imageBaseUrl.value = String(value)
       touchImageField('baseUrl')
     }
-    else if (key === 'enabled') imageEnabled.value = Boolean(value)
+    else if (key === 'enabled') {
+      imageEnabled.value = Boolean(value)
+      if (imageEnabled.value && !imageProvider.value) {
+        const spec = imageProviderSpecs.find(
+          provider => provider.providerId === imageRecommendedProviderId,
+        )
+        if (spec) switchImageProvider(spec.providerId, spec)
+      }
+    }
     else if (key === 'size') imageSize.value = String(value)
     else if (key === 'outputFormat') imageOutputFormat.value = String(value)
     else if (key === 'fallbacks') {
@@ -598,7 +724,7 @@ export function useSetupCapabilitiesForm() {
     }
   }
 
-  function searchPayload(): Record<string, unknown> {
+  function searchPayload(): ConfigureSearch {
     return buildSearchPayload({
       providerId: searchProvider.value,
       apiKey: searchApiKey.value,
@@ -611,7 +737,7 @@ export function useSetupCapabilitiesForm() {
     })
   }
 
-  function memoryPayload(): Record<string, unknown> {
+  function memoryPayload(): ConfigureMemoryEmbedding {
     return buildMemoryPayload({
       providerId: memoryProvider.value,
       model: memoryModel.value,
@@ -622,12 +748,13 @@ export function useSetupCapabilitiesForm() {
     })
   }
 
-  function imagePayload(): Record<string, unknown> {
+  function imagePayload(): ConfigureImageGeneration {
     const touchedFields = new Set([
       ...imageTouchedFields.value,
       ...imageGlobalTouchedFields.value,
     ])
     return buildImagePayload({
+      enabled: imageEnabled.value,
       providerId: imageProvider.value,
       primary: imagePrimary.value,
       apiKey: imageApiKey.value,
@@ -685,6 +812,8 @@ export function useSetupCapabilitiesForm() {
         memoryProviders: context.memoryProviders.value,
         imageProviders: context.imageProviders.value,
         imageSpec: context.imageSpec.value,
+        imageRecommendation: context.imageRecommendation.value,
+        imageCredentialOptions: context.imageCredentialOptions.value,
         imageModels: context.imageModels.value,
       },
       state: {

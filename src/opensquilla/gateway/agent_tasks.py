@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 
 import structlog
 
@@ -19,6 +19,7 @@ class AgentTaskRegistry:
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task] = {}
         self._unsettled_tasks: dict[str, set[asyncio.Task]] = {}
+        self._cleanup_tasks: dict[str, set[asyncio.Task[None]]] = {}
         self._admission_locks: dict[str, asyncio.Lock] = {}
 
     @contextlib.asynccontextmanager
@@ -67,6 +68,14 @@ class AgentTaskRegistry:
                         unsettled.difference_update(completed)
                         if not unsettled:
                             self._unsettled_tasks.pop(session_key, None)
+            cleanup_tasks = {
+                task
+                for session_key in keys
+                for task in self._cleanup_tasks.get(session_key, ())
+                if not task.done()
+            }
+            if cleanup_tasks:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
             async with contextlib.AsyncExitStack() as fences:
                 for session_key in keys:
@@ -77,6 +86,12 @@ class AgentTaskRegistry:
                     not task.done()
                     for session_key in keys
                     for task in self._unsettled_tasks.get(session_key, ())
+                ):
+                    continue
+                if any(
+                    not task.done()
+                    for session_key in keys
+                    for task in self._cleanup_tasks.get(session_key, ())
                 ):
                     continue
                 for session_key in keys:
@@ -92,6 +107,7 @@ class AgentTaskRegistry:
         task: asyncio.Task,
         *,
         cancel_existing: bool = True,
+        terminal_cleanup: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Register a running agent task for a session.
 
@@ -119,6 +135,30 @@ class AgentTaskRegistry:
         self._unsettled_tasks.setdefault(key, set()).add(task)
 
         def _on_done(t: asyncio.Task) -> None:
+            if terminal_cleanup is not None:
+                async def _cleanup() -> None:
+                    try:
+                        await terminal_cleanup()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - task outcome remains authoritative
+                        log.warning(
+                            "agent_task.terminal_cleanup_failed",
+                            session_key=key,
+                            exc_info=True,
+                        )
+
+                cleanup_task = asyncio.create_task(_cleanup())
+                self._cleanup_tasks.setdefault(key, set()).add(cleanup_task)
+
+                def _cleanup_done(completed: asyncio.Task[None]) -> None:
+                    cleanups = self._cleanup_tasks.get(key)
+                    if cleanups is not None:
+                        cleanups.discard(completed)
+                        if not cleanups:
+                            self._cleanup_tasks.pop(key, None)
+
+                cleanup_task.add_done_callback(_cleanup_done)
             if self._tasks.get(key) is t:
                 self._tasks.pop(key, None)
             unsettled = self._unsettled_tasks.get(key)

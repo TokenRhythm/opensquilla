@@ -5,8 +5,20 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.cli.tui.opentui import bridge as opentui_bridge
+from opensquilla.cli.tui.renderers.selection import (
+    RendererBackendAvailability,
+    RendererBackendUnavailableReason,
+)
+from tui_real_terminal import targets as targets_module
 from tui_real_terminal.driver import TerminalSize
-from tui_real_terminal.targets import PACKAGED_GATE_ENV, TargetContext, build_tui_target
+from tui_real_terminal.targets import (
+    PACKAGED_GATE_ENV,
+    TargetContext,
+    build_tui_target,
+    opentui_host_capability_gate,
+    opentui_host_skip_reason,
+)
 
 REMOVED_TEXT_BACKEND = "text" + "ual"
 REMOVED_BACKEND_IDS = ("terminal", REMOVED_TEXT_BACKEND, f"live-{REMOVED_TEXT_BACKEND}")
@@ -121,3 +133,144 @@ def test_packaged_gate_removes_source_resolution_overrides(
     assert "PYTHONPATH" not in target.env
     assert "OPENSQUILLA_TUI_DEV_SOURCE_HOST" not in target.env
     assert "BUN_INSTALL" not in target.env
+
+
+def test_opentui_host_probe_uses_source_switch_and_path_from_target_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_which(command: str, *, path: str | None = None) -> str:
+        calls["which"] = (command, path)
+        return "/target/bin/bun"
+
+    def fake_check(
+        *,
+        runtime_bin: str | None = None,
+        use_source_host: bool | None = None,
+    ) -> RendererBackendAvailability:
+        calls["check"] = (runtime_bin, use_source_host)
+        return RendererBackendAvailability(available=True)
+
+    monkeypatch.setattr(targets_module.shutil, "which", fake_which)
+    monkeypatch.setattr(opentui_bridge, "check_opentui_host_available", fake_check)
+
+    reason = opentui_host_skip_reason(
+        {
+            "OPENSQUILLA_TUI_DEV_SOURCE_HOST": "1",
+            "PATH": "/target/bin",
+        }
+    )
+
+    assert reason is None
+    assert calls == {
+        "which": ("bun", "/target/bin"),
+        "check": ("/target/bin/bun", True),
+    }
+
+
+def test_opentui_host_probe_returns_expected_missing_host_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_check(**_kwargs: object) -> RendererBackendAvailability:
+        calls.append(_kwargs)
+        return RendererBackendAvailability(
+            available=False,
+            reason="OpenTUI companion is not installed",
+            reason_code=RendererBackendUnavailableReason.MISSING,
+        )
+
+    monkeypatch.setattr(opentui_bridge, "check_opentui_host_available", fake_check)
+
+    assert opentui_host_skip_reason({}) == "OpenTUI companion is not installed"
+    assert calls == [{"runtime_bin": None, "use_source_host": False}]
+
+
+def test_opentui_host_probe_uses_target_path_for_missing_bun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_which(command: str, *, path: str | None = None) -> None:
+        calls.append((command, path))
+
+    monkeypatch.setattr(targets_module.shutil, "which", fake_which)
+
+    reason = opentui_host_skip_reason(
+        {
+            "OPENSQUILLA_TUI_DEV_SOURCE_HOST": "1",
+            "PATH": "/target/without-bun",
+        }
+    )
+
+    assert reason == "Bun is not installed or is not on PATH"
+    assert calls == [("bun", "/target/without-bun")]
+
+
+def test_opentui_host_probe_does_not_hide_version_regressions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_check(**_kwargs: object) -> RendererBackendAvailability:
+        return RendererBackendAvailability(
+            available=False,
+            reason="host version mismatch",
+            reason_code=RendererBackendUnavailableReason.VERSION_MISMATCH,
+        )
+
+    monkeypatch.setattr(opentui_bridge, "check_opentui_host_available", fake_check)
+
+    with pytest.raises(AssertionError, match="version_mismatch.*host version mismatch"):
+        opentui_host_skip_reason({})
+
+
+def test_opentui_host_probe_does_not_hide_unexpected_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_check(**_kwargs: object) -> RendererBackendAvailability:
+        raise RuntimeError("probe implementation broke")
+
+    monkeypatch.setattr(opentui_bridge, "check_opentui_host_available", broken_check)
+
+    with pytest.raises(RuntimeError, match="probe implementation broke"):
+        opentui_host_skip_reason({})
+
+
+def test_opentui_host_probe_does_not_hide_missing_source_entrypoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(opentui_bridge, "DEFAULT_HOST_PACKAGE_DIR", tmp_path)
+
+    with pytest.raises(AssertionError, match="source host entrypoint is missing"):
+        opentui_host_skip_reason({"OPENSQUILLA_TUI_DEV_SOURCE_HOST": "1"})
+
+
+def test_opentui_host_capability_gate_skips_optional_missing_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        targets_module,
+        "opentui_host_skip_reason",
+        lambda _env: "OpenTUI host is missing",
+    )
+
+    with pytest.raises(pytest.skip.Exception, match="OpenTUI host is missing"):
+        opentui_host_capability_gate({}, require_capabilities=False)
+
+
+def test_opentui_host_capability_gate_fails_required_missing_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        targets_module,
+        "opentui_host_skip_reason",
+        lambda _env: "OpenTUI host is missing",
+    )
+
+    with pytest.raises(
+        pytest.fail.Exception,
+        match="required real-terminal capability is unavailable: OpenTUI host is missing",
+    ):
+        opentui_host_capability_gate({}, require_capabilities=True)

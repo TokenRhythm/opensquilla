@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from opensquilla.skills.eligibility import EligibilityContext, diagnose_eligibility
 from opensquilla.skills.types import (
     SkillInstallSpec,
@@ -23,6 +25,18 @@ def _env_any_skill() -> SkillSpec:
         metadata=SkillPlatformMeta(
             requires=SkillRequires(env_any=["OPENROUTER_API_KEY", "ARK_API_KEY"])
         ),
+    )
+
+
+def _git_skill() -> SkillSpec:
+    return SkillSpec(
+        name="git-skill",
+        description="Synthetic skill that requires Git.",
+        layer=SkillLayer.BUNDLED,
+        always=False,
+        triggers=[],
+        content="# body",
+        metadata=SkillPlatformMeta(requires=SkillRequires(bins=["git"])),
     )
 
 
@@ -77,3 +91,21 @@ def test_install_metadata_counts_as_declared_dependencies() -> None:
 
     assert report.eligible is True
     assert report.declared is True
+
+
+def test_git_requirement_uses_unified_capability_instead_of_path_lookup(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.git_runtime.resolve_git_capability",
+        lambda: SimpleNamespace(available=False),
+    )
+    monkeypatch.setattr(
+        "opensquilla.skills.eligibility.shutil.which",
+        lambda _name: "/usr/bin/git",
+    )
+
+    report = diagnose_eligibility(_git_skill(), EligibilityContext(os_name="darwin"))
+
+    assert report.eligible is False
+    assert report.missing_bins == ["git"]

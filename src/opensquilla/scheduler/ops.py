@@ -6,6 +6,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from opensquilla.run_mode import RunMode
+from opensquilla.sandbox.legacy_codec import (
+    LegacyModeContext,
+    LegacyModeDecodeError,
+    decode_legacy_run_mode,
+)
 from opensquilla.session.keys import normalize_agent_id
 
 from .delivery import validate_webhook_url
@@ -25,12 +31,20 @@ from .types import (
     SessionTarget,
 )
 
-_RUN_MODE_ALIASES = {
-    "bypass": "full",
-    "standard-sandbox": "standard",
-    "standard_sandbox": "standard",
-}
-_PERSISTED_RUN_MODES = frozenset({"standard", "trusted", "full"})
+
+def _reject_past_at(cron_expr: str, now: datetime) -> None:
+    """Reject a one-time ``at`` timestamp that is already in the past.
+
+    A past ``at`` fires on the next scheduler tick and the one-shot job is then
+    deleted, so the payload runs immediately with no future occurrence. That is
+    almost never what a caller scheduling a one-time reminder intends, so refuse
+    it at creation time instead of silently running it.
+    """
+    at_dt = parse_iso_at(cron_expr)
+    if at_dt < now:
+        raise ValueError(
+            f"schedule.at is in the past: {cron_expr}; one-time schedules must be in the future"
+        )
 
 
 def _validate_structured_schedule(
@@ -72,18 +86,28 @@ def _coerce_wake_mode(value: CronWakeMode | str) -> CronWakeMode:
     return CronWakeMode(str(value or CronWakeMode.NOW.value).strip().lower())
 
 
-def _persisted_run_mode(value: str, *, creator_is_owner: bool) -> str:
+def _persisted_run_mode(
+    value: str,
+    *,
+    creator_is_owner: bool,
+    creator_host_execute: bool,
+) -> str:
     """Resolve the already-authorized execution mode at the scheduler boundary."""
 
+    host_execution_allowed = creator_is_owner or creator_host_execute
     normalized = str(value or "").strip().lower()
-    normalized = _RUN_MODE_ALIASES.get(normalized, normalized)
     if not normalized:
-        normalized = "full" if creator_is_owner else "trusted"
-    if normalized not in _PERSISTED_RUN_MODES:
-        raise ValueError(f"unsupported cron run_mode: {value!r}")
-    if normalized == "full" and not creator_is_owner:
-        return "trusted"
-    return normalized
+        return RunMode.FULL.value if host_execution_allowed else RunMode.SAFE.value
+    try:
+        mode = decode_legacy_run_mode(
+            normalized,
+            context=LegacyModeContext.EXPLICIT,
+        )
+    except LegacyModeDecodeError as exc:
+        raise ValueError(f"unsupported cron run_mode: {value!r}") from exc
+    if mode is RunMode.FULL and not host_execution_allowed:
+        return RunMode.SAFE.value
+    return mode.value
 
 
 def _delivery_requested(delivery: DeliveryConfig | None) -> bool:
@@ -151,6 +175,7 @@ class SchedulerOps:
         schedule_kind: ScheduleKind | str,
         schedule_value: str,
         schedule_tz: str = "",
+        enabled: bool = True,
         handler_key: str = "",
         payload: dict | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
@@ -166,6 +191,7 @@ class SchedulerOps:
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        creator_host_execute: bool = False,
         run_mode: str = "",
         idempotency_key: str = "",
     ) -> CronJob:
@@ -200,11 +226,7 @@ class SchedulerOps:
         # fall back to ISOLATED instead of failing creation. Headless cron
         # callers (no session context) get an isolated run rather than a hard
         # error.
-        if (
-            session_target == SessionTarget.CURRENT
-            and not session_key
-            and not origin_session_key
-        ):
+        if session_target == SessionTarget.CURRENT and not session_key and not origin_session_key:
             session_target = SessionTarget.ISOLATED
 
         origin_session_key = normalize_origin_session_key(session_target, origin_session_key)
@@ -222,13 +244,17 @@ class SchedulerOps:
             delivery=delivery or DeliveryConfig(),
             explicit_delivery=delivery is not None,
         )
+        creator_host_execute = bool(creator_host_execute or creator_is_owner)
         effective_run_mode = _persisted_run_mode(
             run_mode,
             creator_is_owner=creator_is_owner,
+            creator_host_execute=creator_host_execute,
         )
 
         job = CronJob(
             name=name,
+            status=JobStatus.PENDING if enabled else JobStatus.PAUSED,
+            enabled=enabled,
             schedule_raw=schedule_raw,
             schedule_kind=kind,
             cron_expr=cron_expr,
@@ -247,6 +273,7 @@ class SchedulerOps:
             creator_session_key=creator_session_key or "",
             creator_sender_id=creator_sender_id or "",
             creator_is_owner=bool(creator_is_owner),
+            creator_host_execute=creator_host_execute,
             run_mode=effective_run_mode,
             elevated="full" if effective_run_mode == "full" else "",
             execution_target="host" if effective_run_mode == "full" else "sandbox",
@@ -265,7 +292,13 @@ class SchedulerOps:
             # CRON or EVERY with cron expression: scan forward
             job.next_run_at = _next_run(job, now)
 
-        return await self._store.create_or_get(job)
+        # A retry may arrive after the original execution time. Only validate a
+        # new row, after deduplication and with a fresh clock inside the lock.
+        validate_new = (
+            (lambda: _reject_past_at(cron_expr, self._now()))
+            if kind == ScheduleKind.AT else None
+        )
+        return await self._store.create_or_get(job, validate_new=validate_new)
 
     async def update(self, job_id: str, **patch) -> CronJob | None:
         """Apply a partial update to an existing job. Returns None if not found."""
@@ -286,7 +319,8 @@ class SchedulerOps:
         structured_kind = patch.pop("schedule_kind", None)
         structured_value = patch.pop("schedule_value", None)
         structured_tz = patch.pop("schedule_tz", None)
-        if structured_kind is not None and structured_value is not None:
+        schedule_updated = structured_kind is not None and structured_value is not None
+        if schedule_updated:
             kind, cron_expr = _validate_structured_schedule(structured_kind, structured_value)
             if structured_tz is not None:
                 raw_tz = (structured_tz or "").strip()
@@ -296,6 +330,7 @@ class SchedulerOps:
             job.schedule_kind = kind
             job.cron_expr = cron_expr
             if kind == ScheduleKind.AT:
+                _reject_past_at(cron_expr, now)
                 job.anchor_at = None
                 job.next_run_at = datetime.fromisoformat(cron_expr)
             elif kind == ScheduleKind.EVERY:
@@ -310,7 +345,7 @@ class SchedulerOps:
                 "pass schedule_kind + schedule_value instead"
             )
 
-        for field in ("name", "timeout_seconds", "enabled", "origin_session_key"):
+        for field in ("name", "timeout_seconds", "origin_session_key"):
             if field in patch:
                 setattr(job, field, patch.pop(field))
         if "tool_policy" in patch:
@@ -355,6 +390,19 @@ class SchedulerOps:
             job.session_target,
             job.origin_session_key,
         )
+
+        # Persist the enabled toggle with the validated schedule and payload.
+        # A rejected patch must never resume or pause the existing job.
+        if "enabled" in patch:
+            job.enabled = bool(patch.pop("enabled"))
+            if not job.enabled:
+                job.status = JobStatus.PAUSED
+            elif job.status in (JobStatus.PAUSED, JobStatus.DISABLED, JobStatus.FAILED):
+                job.status = JobStatus.PENDING
+                job.backoff_until = None
+                job.consecutive_errors = 0
+                if not schedule_updated and job.schedule_kind != ScheduleKind.AT:
+                    job.next_run_at = _next_run(job, now)
 
         job.updated_at = now
         await self._store.save(job)

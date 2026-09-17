@@ -565,11 +565,11 @@ def ensemble_payload(
         "enabled": True,
         "selectionMode": "custom_b5",
         "candidates": [
-            {**first.public(), "role": "primary", "enabled": True},
+            {**first.public(), "role": "proposer", "enabled": True},
             {
                 "provider": second.provider,
                 "model": BAD_MODEL_ID if bad_proposer else second.model,
-                "role": "contrast",
+                "role": "proposer",
                 "enabled": True,
             },
             {

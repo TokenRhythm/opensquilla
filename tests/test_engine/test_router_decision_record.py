@@ -458,6 +458,75 @@ def test_rehydrate_seeds_history_store_from_synthetic_table(tmp_path: Path) -> N
     writer.close()
 
 
+def test_rehydrate_seeds_sequence_for_session_outside_policy_window(tmp_path: Path) -> None:
+    writer = _synthetic_writer(tmp_path)
+    now_ms = int(time.time() * 1000)
+    writer.record_decision(
+        {
+            "decision_id": "old-sequence",
+            "session_key": "agent:old-sequence",
+            "turn_index": 72,
+            "ts_ms": now_ms - 3600 * 1000,
+            "proposed_tier": "c1",
+            "final_tier": "c1",
+        }
+    )
+
+    assert rehydrate_history_from_writer(writer) == 0
+    assert squilla_router._history_store.get("agent:old-sequence") is None
+    assert squilla_router._history_store.reserve_turn_index("agent:old-sequence") == 73
+    writer.close()
+
+
+async def test_rehydrate_continues_turn_index_from_persisted_max_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    writer = _synthetic_writer(tmp_path)
+    now_ms = int(time.time() * 1000)
+    writer.record_decision(
+        {
+            "decision_id": "older-high",
+            "session_key": "agent:restart",
+            "turn_index": 40,
+            "ts_ms": now_ms - 1900 * 1000,
+            "proposed_tier": "c1",
+            "final_tier": "c1",
+        }
+    )
+    for index in range(1, 6):
+        writer.record_decision(
+            {
+                "decision_id": f"recent{index}",
+                "session_key": "agent:restart",
+                "turn_index": index,
+                "ts_ms": now_ms - (6 - index) * 1000,
+                "proposed_tier": "c1",
+                "final_tier": "c1",
+            }
+        )
+
+    assert rehydrate_history_from_writer(writer) == 1
+
+    class FakeStrategy:
+        async def classify(
+            self,
+            message: str,
+            valid_tiers: list[str],
+            routing_history: list[dict] | None = None,
+        ) -> tuple[str, float, str, dict]:
+            return "c1", 0.91, "v4_phase3", {"route_class": "R1"}
+
+    monkeypatch.setattr(squilla_router, "_get_strategy", lambda _config: FakeStrategy())
+    set_decision_writer(writer)
+    ctx = await apply_squilla_router(_ctx(session_key="agent:restart"))
+
+    assert ctx.metadata["routing_turn_index"] == 41
+    assert ctx.metadata[PENDING_RECORD_KEY]["turn_index"] == 41
+    assert ctx.metadata["routing_history"][-1]["turn_index"] == 41
+    writer.close()
+
+
 def test_seed_routing_history_never_clobbers_live_history() -> None:
     squilla_router._history_store.set("agent:live", [{"turn_index": 0, "final_tier": "c2"}])
     seeded = seed_routing_history(

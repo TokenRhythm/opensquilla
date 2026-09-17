@@ -1,17 +1,12 @@
 import { computed, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import i18n from '@/i18n'
-import { useRpcStore } from '@/stores/rpc'
-import { useRequest } from '@/composables/useRequest'
 import { useToasts } from '@/composables/useToasts'
 import type { CronJob } from '@/types/cron'
+import type { CronScheduler, CronSubscription } from '@/modules/cronScheduler'
 import { humanCountdown, humanTime } from '@/utils/cron/time'
+import { wasCronFinishNotified } from '@/utils/cron/notifications'
 
-interface CronListResponse {
-  jobs?: CronJob[]
-}
-
-export function useCronJobs() {
-  const rpc = useRpcStore()
+export function useCronJobs(scheduler: CronScheduler) {
   const { pushToast } = useToasts()
   const t = i18n.global.t
   const searchText = ref('')
@@ -21,21 +16,18 @@ export function useCronJobs() {
   const sortAsc = ref(true)
   const now = ref(Date.now())
 
-  const { data: cronData, loading, error, refresh } = useRequest<CronListResponse | CronJob[]>(
-    'cron.list',
-    undefined,
-    { errorLabel: t('cronSkills.jobs.errLoad') },
-  )
+  const cronData = ref<readonly CronJob[] | null>(null)
+  const loading = ref(false)
+  const error = ref<string | null>(null)
 
   const jobs = computed<CronJob[]>(() => {
-    const d = cronData.value
-    if (!d) return []
-    return Array.isArray(d) ? d : (d.jobs || [])
+    return cronData.value ? [...cronData.value] : []
   })
+  const hasLoaded = computed(() => cronData.value !== null)
 
   let tickInterval: ReturnType<typeof setInterval> | null = null
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
-  let unsubRunFinished: (() => void) | null = null
+  let runFinishedSubscription: CronSubscription | null = null
 
   const enabledCount = computed(() => jobs.value.filter(j => j.enabled).length)
   const pausedCount = computed(() => jobs.value.length - enabledCount.value)
@@ -57,8 +49,9 @@ export function useCronJobs() {
     const ts = job.last_run ? new Date(job.last_run) : null
     if (ts && !isNaN(ts.getTime()) && now.value - ts.getTime() < 24 * 3600 * 1000) {
       acc.runs += 1
-      if (job.last_status === 'ok' || job.last_status === 'success') acc.ok += 1
-      if (job.last_status === 'error' || job.last_status === 'fail') acc.err += 1
+      const lastStatus = job.lastStatus || job.last_status
+      if (lastStatus === 'ok' || lastStatus === 'success') acc.ok += 1
+      if (lastStatus === 'error' || lastStatus === 'fail') acc.err += 1
     }
     return acc
   }, { runs: 0, ok: 0, err: 0 }))
@@ -94,12 +87,39 @@ export function useCronJobs() {
     })
   })
 
+  async function refresh(): Promise<void> {
+    loading.value = true
+    error.value = null
+    try {
+      cronData.value = await scheduler.listJobs()
+    } catch (err) {
+      error.value = t('cronSkills.jobs.errLoad', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      loading.value = false
+    }
+  }
+
   const loadData = refresh
 
   function scheduleReload() {
     void refresh()
     if (reloadTimer) clearTimeout(reloadTimer)
     reloadTimer = setTimeout(() => { void refresh() }, 750)
+  }
+
+  async function recoverAfterConnectionRecycle(): Promise<void> {
+    try {
+      cronData.value = await scheduler.listJobs()
+      pushToast(t('cronSkills.jobs.toastConnectionRecovered'), { tone: 'info' })
+    } catch {
+      pushToast(t('cronSkills.jobs.toastConnectionRetry'), { tone: 'warn' })
+    }
+  }
+
+  function onRunFinished() {
+    scheduleReload()
   }
 
   function onSort(col: string) {
@@ -113,7 +133,7 @@ export function useCronJobs() {
 
   async function toggleJob(job: CronJob) {
     try {
-      await rpc.call('cron.update', { id: job.id, enabled: !job.enabled })
+      await scheduler.setEnabled(job.id, !job.enabled)
       pushToast(job.enabled ? t('cronSkills.jobs.toastPaused') : t('cronSkills.jobs.toastResumed'), { tone: 'ok' })
       void refresh()
     } catch (err) {
@@ -128,11 +148,18 @@ export function useCronJobs() {
   async function runJob(id: string) {
     runningJobIds.value = new Set(runningJobIds.value).add(id)
     try {
-      const res = await rpc.call<{ reply?: string; error?: string }>('cron.run', { id })
-      if (res?.error) pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error }), { tone: 'danger' })
-      else pushToast(res?.reply ? t('cronSkills.jobs.toastRunComplete', { reply: res.reply.substring(0, 120) }) : t('cronSkills.jobs.toastTriggered'), { tone: 'ok' })
+      const res = await scheduler.runNow(id)
+      if (!res?.runId || !wasCronFinishNotified(res.runId)) {
+        if (res?.error) pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error }), { tone: 'danger' })
+        else pushToast(res?.reply ? t('cronSkills.jobs.toastRunComplete', { reply: res.reply.substring(0, 120) }) : t('cronSkills.jobs.toastTriggered'), { tone: 'ok' })
+      }
     } catch (err) {
-      pushToast(t('cronSkills.jobs.toastRunFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
+      const message = err instanceof Error ? err.message : String(err)
+      if (isConnectionRecycleError(message)) {
+        await recoverAfterConnectionRecycle()
+      } else {
+        pushToast(t('cronSkills.jobs.toastRunFailed', { error: message }), { tone: 'danger' })
+      }
     } finally {
       const next = new Set(runningJobIds.value)
       next.delete(id)
@@ -141,7 +168,7 @@ export function useCronJobs() {
   }
 
   async function removeJob(id: string) {
-    await rpc.call('cron.remove', { id })
+    await scheduler.remove(id)
     pushToast(t('cronSkills.jobs.toastDeleted'), { tone: 'ok' })
     void refresh()
   }
@@ -157,17 +184,14 @@ export function useCronJobs() {
   function teardownLive() {
     if (tickInterval) { clearInterval(tickInterval); tickInterval = null }
     if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null }
-    if (unsubRunFinished) { unsubRunFinished(); unsubRunFinished = null }
-    rpc.call('cron.unsubscribe', {}).catch(() => {})
+    runFinishedSubscription?.close()
+    runFinishedSubscription = null
   }
 
   onActivated(() => {
     void loadData()
     tickInterval = setInterval(() => { now.value = Date.now() }, 1000)
-    rpc.waitForConnection()
-      .then(() => rpc.call('cron.subscribe', {}))
-      .catch(() => { /* subscription is best-effort */ })
-    unsubRunFinished = rpc.on('cron.run.finished', scheduleReload)
+    runFinishedSubscription = scheduler.subscribe(onRunFinished)
   })
 
   onDeactivated(teardownLive)
@@ -175,6 +199,7 @@ export function useCronJobs() {
 
   return {
     jobs,
+    hasLoaded,
     loading,
     error,
     searchText,
@@ -217,34 +242,27 @@ export function nextRunText(job: CronJob, now = Date.now()): string {
   return humanCountdown(ts, now)
 }
 
-export function nextRunAbs(job: CronJob, now = Date.now()): string {
-  if (!job.enabled || job.status === 'running' || !job.next_run) return ''
-  const ts = new Date(job.next_run)
-  if (isNaN(ts.getTime()) || ts.getTime() <= now) return ''
-  return humanTime(ts)
-}
-
 export function dotClass(job: CronJob): string {
   if (!job.enabled) return 'is-off'
-  const lastStatus = job.last_status || (job.last_run ? 'ok' : null)
+  const lastStatus = job.lastStatus || job.last_status || (job.last_run ? 'ok' : null)
   if (lastStatus === 'error' || lastStatus === 'fail') return 'is-error'
   return 'is-on'
-}
-
-export function jobKindLabel(job: CronJob): string {
-  const kind = job.payloadKind || job.payload_kind
-  if (kind === 'reminder') return i18n.global.t('cronSkills.jobs.kindReminder')
-  if (kind === 'system_event') return i18n.global.t('cronSkills.jobs.kindSystemEvent')
-  return i18n.global.t('cronSkills.jobs.kindAgentTask')
-}
-
-export function jobKindClass(job: CronJob): string {
-  const kind = job.payloadKind || job.payload_kind
-  return kind === 'reminder' ? 'is-reminder' : 'is-agent'
 }
 
 export function isImminent(job: CronJob, now = Date.now()): boolean {
   if (!job.next_run) return false
   const left = new Date(job.next_run).getTime() - now
   return left > 0 && left < 60_000
+}
+
+export function isConnectionRecycleError(message: string): boolean {
+  const normalized = message.toLowerCase()
+  return normalized.includes('connection recycled') ||
+    normalized.includes('connection closed') ||
+    normalized.includes('not connected')
+}
+
+export function isJobFailed(job: CronJob): boolean {
+  const status = job.lastStatus || job.last_status
+  return status === 'error' || status === 'fail'
 }

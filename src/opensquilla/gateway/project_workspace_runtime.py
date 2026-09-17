@@ -3,23 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opensquilla.gateway.rpc import RpcHandlerError
+from opensquilla.gateway.session_services import SessionServiceUnavailableError
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
     ValidatedProjectWorkspace,
     resolve_validated_project_workspace,
 )
+from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.run_context import (
     RunContext,
     effective_project_run_mode,
     get_run_context,
+    run_context_from_origin_payload,
 )
-from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
+
+if TYPE_CHECKING:
+    from opensquilla.tools.types import ToolContext
 
 _NOT_FOUND_REASONS = frozenset({"not_found", "removed", "untrusted"})
 
@@ -47,6 +52,39 @@ def apply_accepted_run_mode_override(
         run_mode_source=override.run_mode_source,
         source=override.source,
     )
+
+
+def apply_run_context_route_metadata(
+    route_envelope: Any,
+    run_context: RunContext,
+    *,
+    principal_is_owner: bool,
+) -> None:
+    """Attach one freshly validated run context to an execution envelope.
+
+    This is shared by ordinary session ingress, Goal ingress, and the final
+    TaskRuntime dispatch boundary.  Keeping the projection here prevents a
+    new automatic producer from accidentally omitting sandbox mounts or the
+    execution-only freshness marker.
+    """
+
+    run_context_payload = run_context.to_origin_payload()
+    filtered_run_context = run_context_from_origin_payload(
+        run_context_payload,
+        source="route_metadata",
+        preserve_materialized_user_grants=True,
+    )
+    route_envelope.metadata["run_mode"] = run_context.run_mode.value
+    route_envelope.metadata["run_mode_explicit"] = run_context.source != "default"
+    route_envelope.metadata["sandbox_mounts"] = (
+        filtered_run_context.to_origin_payload()["mounts"]
+        if filtered_run_context is not None
+        else []
+    )
+    route_envelope.metadata["sandbox_run_context"] = run_context_payload
+    object.__setattr__(route_envelope, "sandbox_run_context_fresh", True)
+    if run_context.run_mode.value == "full" and principal_is_owner:
+        route_envelope.metadata["elevated"] = "full"
 
 
 async def resolve_session_project_workspace(
@@ -83,6 +121,36 @@ async def authoritative_project_run_context(
             workspace=validated.canonical_path,
         ),
         validated.guard,
+    )
+
+
+async def prepare_heartbeat_tool_context(
+    session_key: str,
+    tool_context: ToolContext,
+    *,
+    storage: SessionStorage | None,
+    session_manager: Any,
+    config: Any,
+) -> ToolContext:
+    """Refresh the execution root without importing the session owner's authority."""
+    if not isinstance(storage, SessionStorage):
+        raise SessionServiceUnavailableError("Heartbeat requires session storage")
+    session = await session_manager.get_session(session_key)
+    if session is None:
+        raise KeyError(f"Session not found: {session_key}")
+    context, _guard = await authoritative_project_run_context(
+        storage=storage, session_manager=session_manager, session=session,
+        config=config, default_workspace=tool_context.workspace_dir,
+    )
+    workspace = context.workspace or tool_context.workspace_dir
+    # A cron caller may carry its own restricted context. Keep its mode and
+    # grants; the resolved session context supplies only the validated root.
+    sandbox_context = tool_context.sandbox_run_context
+    if isinstance(sandbox_context, RunContext):
+        sandbox_context = replace(sandbox_context, workspace=workspace)
+    return replace(
+        tool_context, session_key=session_key, workspace_dir=workspace,
+        sandbox_run_context=sandbox_context,
     )
 
 
@@ -201,6 +269,7 @@ def map_project_workspace_error(
 __all__ = [
     "AcceptedRunModeOverride",
     "apply_accepted_run_mode_override",
+    "apply_run_context_route_metadata",
     "authoritative_project_run_context",
     "map_project_workspace_error",
     "persisted_project_workspace_snapshot",

@@ -5,6 +5,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from packaging.requirements import Requirement
+
 from opensquilla.mcp_server.server import create_mcp_server
 
 
@@ -98,8 +100,11 @@ def test_create_mcp_server_has_no_benchmark_or_mock_public_tools() -> None:
     assert "mock" not in names
 
 
-def test_optional_mcp_dependency_minimum_supports_fastmcp() -> None:
+def test_optional_mcp_dependency_excludes_vulnerable_fastmcp_releases() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     mcp_specs = pyproject["project"]["optional-dependencies"]["mcp"]
 
-    assert "mcp>=1.2.0" in mcp_specs
+    requirement = next(Requirement(spec) for spec in mcp_specs if spec.startswith("mcp"))
+    assert "1.28.1" in requirement.specifier
+    assert "1.28.0" not in requirement.specifier
+    assert "2.0.0" not in requirement.specifier

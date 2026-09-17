@@ -13,6 +13,7 @@ def test_image_generation_payload_exposes_optional_capability_metadata():
     assert {row["providerId"] for row in payload} == {
         "openai",
         "openrouter",
+        "tokenrhythm",
         "qwen_token_plan",
     }
     for row in payload:
@@ -28,4 +29,13 @@ def test_image_generation_payload_exposes_optional_capability_metadata():
     assert qwen["suggestedModels"] == [
         "qwen_token_plan/wan2.7-image",
         "qwen_token_plan/wan2.7-image-pro",
+    ]
+
+    tokenrhythm = next(row for row in payload if row["providerId"] == "tokenrhythm")
+    assert tokenrhythm["envKey"] == "TOKENRHYTHM_API_KEY"
+    assert tokenrhythm["defaultBaseUrl"] == "https://tokenrhythm.studio/v1"
+    assert tokenrhythm["defaultModel"] == "tokenrhythm/qwen-image-2.0"
+    assert tokenrhythm["suggestedModels"] == [
+        "tokenrhythm/qwen-image-2.0",
+        "tokenrhythm/wan2.7-image",
     ]

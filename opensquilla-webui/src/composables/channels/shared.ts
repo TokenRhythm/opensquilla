@@ -2,7 +2,7 @@ import type { Ref } from 'vue'
 
 // Small helpers shared by the /channels view and its composables so the
 // dashboard cards, the drill page, and the members panel cannot drift on
-// error rendering, in-flight guards, or approval payloads.
+// error rendering or in-flight guards.
 
 /** Human-readable message for a thrown RPC/transport error. */
 export function errorMessage(err: unknown): string {
@@ -28,18 +28,4 @@ export async function withPendingKey(
     next.delete(key)
     pendingActions.value = next
   }
-}
-
-/**
- * Params for channels.pairing.approve. Only include asAdmin when set: a plain
- * approval keeps its minimal payload and never touches channel_admin_senders.
- */
-export function approvePairingParams(
-  channelName: string,
-  pairingId: string,
-  asAdmin: boolean,
-): Record<string, unknown> {
-  const params: Record<string, unknown> = { channelName, pairingId }
-  if (asAdmin) params.asAdmin = true
-  return params
 }

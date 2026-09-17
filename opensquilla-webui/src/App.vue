@@ -80,15 +80,20 @@
     <!-- Recent conversations -->
     <SidebarConversations
       :sections="sidebarSections"
+      :session-order="sidebarSessionOrder"
       :error="sessionListError"
       :loading="isLoading"
+      :loading-more="isLoadingMore"
+      :load-more-error="loadMoreError"
+      :has-more="hasMore"
       :current-key="sidebarCurrentKey"
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
-      :can-manage-projects="rpcStore.canManageProjectWorkspaces"
-      :can-create-projects="rpcStore.canChooseProject"
+      :can-manage-projects="gatewayAccess.canManageProjectWorkspaces"
+      :can-create-projects="gatewayAccess.canChooseProject"
       @select="switchToSession"
       @refresh="loadSidebarData"
+      @load-more="loadMoreSessions"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
@@ -168,7 +173,7 @@
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
-    <header class="topbar" :class="{ 'topbar--chat': isChatRoute }">
+    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
         <button
@@ -190,39 +195,72 @@
           </span>
         </button>
       </div>
-      <!-- Permanent target: Chat teleports its route-owned actions into the
-           same in-flow header as the app controls without duplicating state. -->
+      <!-- App owns the route header and its component tree. Chat only publishes
+           reactive state and commands through the typed route-header bridge. -->
       <div
         id="app-route-header"
         class="topbar-route-header"
         data-testid="route-header-host"
-      ></div>
+      >
+        <ChatHeaderActions
+          v-if="isChatRoute"
+          v-show="chatRouteHeaderVisible"
+          ref="chatHeaderActionsRef"
+          :title="chatRouteHeaderTitle"
+          :copy-state="chatRouteHeaderCopyState"
+          :copy-icon="chatRouteHeaderCopyIcon"
+          :copy-live-text="chatRouteHeaderCopyLiveText"
+          :deliverable-count="chatRouteHeaderDeliverableCount"
+          :has-new-deliverable="chatRouteHeaderHasNewDeliverable"
+          :share-mode="chatRouteHeaderShareMode"
+          :shareable-message-count="chatRouteHeaderShareableMessageCount"
+          @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
+          @start-share="chatRouteHeader.invoke('startShare')"
+          @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
+        />
+      </div>
       <div
         class="topbar-right"
         :class="{ 'topbar-right--attention': appStore.approvalCount > 0 }"
       >
-        <button
-          v-if="appStore.approvalCount > 0"
-          class="approval-inline"
-          @click="openBlockedApprovalSession"
-          :title="t('chrome.openBlockedSession')"
-        >
-          {{ t('chrome.approvalRequired') }}
-        </button>
-        <button
-          v-if="webConfigEnabled"
-          type="button"
-          class="conn-pill conn-pill--link"
-          :class="rpcStore.state"
-          :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
-          :aria-label="t('chrome.manageConnection')"
-          @click="openConnectionSettings"
-        >{{ connectionStateLabel }}</button>
-        <span v-else class="conn-pill" :class="rpcStore.state">{{ connectionStateLabel }}</span>
-        <DesktopUpdateIndicator />
+        <ChatSystemStatus
+          v-if="isChatRoute"
+          :layout="systemHeaderLayout"
+          :connection-state="effectiveConnectionState"
+          :connection-label="connectionStateLabel"
+          :approval-count="appStore.approvalCount"
+          :can-manage-connection="webConfigEnabled"
+          @open-connection="openConnectionSettings"
+          @open-approval="openBlockedApprovalSession"
+          @open-update="openDesktopRuntimeSettings"
+        />
+        <template v-else>
+          <button
+            v-if="appStore.approvalCount > 0"
+            class="approval-inline"
+            @click="openBlockedApprovalSession"
+            :title="t('chrome.openBlockedSession')"
+          >
+            {{ t('chrome.approvalRequired') }}
+          </button>
+          <button
+            v-if="webConfigEnabled"
+            type="button"
+            class="conn-pill conn-pill--link"
+            :class="connectionState"
+            :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
+            :aria-label="t('chrome.manageConnection')"
+            @click="openConnectionSettings"
+          >{{ connectionStateLabel }}</button>
+          <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
+          <DesktopUpdateIndicator />
+        </template>
         <!-- Opt-in (Settings → Appearance or the command palette); off by
              default so the topbar stays music-free until asked for. -->
-        <BgmControl v-if="bgmEnabled" />
+        <BgmControl
+          v-if="bgmEnabled"
+          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
+        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -236,7 +274,13 @@
           >
             <Icon :name="themeIconName" :size="16" />
           </button>
-          <div v-if="themeMenuOpen" class="theme-menu" role="menu" :aria-label="t('chrome.theme')">
+          <div
+            v-if="themeMenuOpen"
+            class="theme-menu"
+            role="menu"
+            :aria-label="t('chrome.theme')"
+            data-chat-topbar-popover="theme"
+          >
             <button
               v-for="opt in themeOptions"
               :key="opt.mode"
@@ -273,7 +317,7 @@
         :data-skin-variant="variants || undefined"
         id="content"
       >
-        <ErrorBoundary>
+        <ErrorBoundary @error-captured="clearChatRouteHeaderAfterError">
           <router-view v-slot="{ Component, route }">
             <!-- out-in: one view in the DOM at a time, so pages never overlap (no
                  double-exposure, and never two composers/textareas mid-swap).
@@ -296,6 +340,11 @@
       </main>
       <AppWorkbench
         :enabled="appStore.features.artifactWorkbench === true"
+        :workbench-resources-enabled="(
+          appStore.features.documentWorkbenchResources === true
+          || appStore.features.artifactPromptAnnotations === true
+        )"
+        :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="currentSessionKey"
         :modal-blocked="workbenchModalBlocked"
@@ -305,8 +354,8 @@
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
-       Chat, Sessions, Overview, then More for the flat drawer containing
-       Sessions / Overview / Skills & Channels / Cron and Settings. -->
+       Chat, Overview, then More for the sidebar drawer with session history,
+       navigation, and Settings. -->
   <nav
     class="mobile-tabbar"
     :class="{ 'is-keyboard-open': mobileKeyboardOpen }"
@@ -321,16 +370,6 @@
     >
       <Icon name="chat" :size="20" />
       <span class="mobile-tab__label">{{ t('nav.chat') }}</span>
-    </router-link>
-    <router-link
-      to="/sessions"
-      class="mobile-tab"
-      :class="{ 'is-active': isNavActive('/sessions') }"
-      @click="handleNavClick"
-    >
-      <Icon name="sessions" :size="20" />
-      <span class="mobile-tab__label">{{ t('nav.sessions') }}</span>
-      <span v-if="appStore.approvalCount > 0" class="mobile-tab__badge">{{ appStore.approvalCount }}</span>
     </router-link>
     <router-link
       to="/overview"
@@ -352,12 +391,14 @@
     </button>
   </nav>
 
-  <ToastHost />
+  <Teleport to="body">
+    <ToastHost />
+  </Teleport>
 
   <ConfirmModal />
 
   <ProjectWorkspaceCreateDialog
-    v-if="rpcStore.canChooseProject"
+    v-if="gatewayAccess.canChooseProject"
     :open="projectCreateOpen && !projectCreateConfirming && !projectSourcePickerOpen"
     :name="projectCreateName"
     :source-path="projectCreateSourcePath"
@@ -370,9 +411,9 @@
   />
 
   <ProjectWorkspacePickerDialog
-    v-if="rpcStore.canChooseProject"
+    v-if="gatewayAccess.canChooseProject"
     :open="projectCreateOpen && projectSourcePickerOpen"
-    :enabled="rpcStore.canChooseProject"
+    :enabled="gatewayAccess.canChooseProject"
     :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
     :initial-path="projectCreateSourcePath"
     @close="projectSourcePickerOpen = false"
@@ -380,7 +421,7 @@
   />
 
   <ProjectWorkspaceEditDialog
-    v-if="rpcStore.canManageProjectWorkspaces"
+    v-if="gatewayAccess.canManageProjectWorkspaces"
     :open="Boolean(editingProject)"
     :initial-name="editingProject?.name || ''"
     :path="editingProject?.path || ''"
@@ -397,13 +438,19 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
 import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
-import { useRpcStore } from './stores/rpc'
+import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
+import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
+import { useProductActivity } from './composables/useProductActivity'
+import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
+import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
+import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
+import { APPROVAL_CENTER_KEY, type ApprovalEvent, type ApprovalItem, type ApprovalSubscription } from './modules/approvalCenter'
 import {
   arrangeSidebarSections,
   useSessions,
@@ -420,6 +467,8 @@ import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.
 import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
+import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
+import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
@@ -429,12 +478,21 @@ import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import { useBgm } from './composables/useBgm'
+import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
+import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
-import { useDialogLayer } from './composables/useDialogA11y'
+import { hasOpenDialogLayer, useDialogLayer } from './composables/useDialogA11y'
+import {
+  provideChatTopbarPopoverCoordinator,
+  useChatTopbarPopoverCoordination,
+} from './composables/useChatTopbarPopoverCoordinator'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
+import {
+  provideChatRouteHeaderBridge,
+  type ChatRouteHeaderHostHandle,
+} from './composables/chat/useChatRouteHeaderBridge'
 import { useAgentOptions } from './composables/useAgentOptions'
-import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useSessionTaskAttention } from './composables/useSessionTaskAttention'
 import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
@@ -444,32 +502,99 @@ import { useNavigation } from './app/useNavigation'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
+import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
+import { reminderToastPreview } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
-import type { RpcEventHandler } from '@/lib/rpc'
 import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
 import { SIDEBAR_MIN_WIDTH, type SidebarWidthPreference } from './utils/sidebarLayout'
+import { sidebarSessionOrderKeys } from './utils/sidebarDisplayProjection'
 import {
   dispatchLocalSessionsDeleted,
   localSessionsDeletedDetail,
   LOCAL_SESSIONS_DELETED_EVENT,
 } from './utils/sessionSync'
 import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
+import { createCoalescedRefresh } from './utils/coalescedRefresh'
 import {
   optionalSessionRpcAllowed,
-  optionalSessionRpcCallOptions,
+  optionalSessionReadOptions,
 } from './composables/chat/sessionBootstrapAdmission'
+import { markCronFinishNotified } from './utils/cron/notifications'
+import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
+import {
+  CRON_SCHEDULER_KEY,
+  type CronRunFinished,
+  type CronSubscription,
+} from './modules/cronScheduler'
+import {
+  buildChatSessionTitles,
+  isSensibleChatTitle,
+  provideChatSessionTitles,
+} from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
-const rpcStore = useRpcStore()
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
+const productActivity = inject(PRODUCT_ACTIVITY_KEY)
+if (productActivity) useProductActivity(gatewayAccess, productActivity)
+const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
+if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
+const sessionDirectory = injectedSessionDirectory
+const injectedSessionDirectoryChanges = inject(SESSION_DIRECTORY_CHANGES_KEY)
+if (!injectedSessionDirectoryChanges) throw new Error('SessionDirectoryChanges was not provided')
+const sessionDirectoryChanges = injectedSessionDirectoryChanges
+const injectedSessionLifecycle = inject(SESSION_LIFECYCLE_KEY)
+if (!injectedSessionLifecycle) throw new Error('SessionLifecycle was not provided')
+const sessionLifecycle = injectedSessionLifecycle
+const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
+if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
+const approvalCenter = injectedApprovalCenter
+const injectedAgentCatalog = inject(AGENT_CATALOG_KEY)
+if (!injectedAgentCatalog) throw new Error('AgentCatalog was not provided')
+const agentCatalog = injectedAgentCatalog
+const injectedCronScheduler = inject(CRON_SCHEDULER_KEY)
+if (!injectedCronScheduler) throw new Error('CronScheduler was not provided')
+const cronScheduler = injectedCronScheduler
 const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
+// Every transient control in the global topbar shares one active owner. The
+// controls render on chat and non-chat routes, so route-scoped coordination
+// would allow sibling menus such as Language and Theme to overlap.
+const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const topbarPopoverCoordinationEnabled = ref(true)
+const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
+  topbarPopoverCoordinationEnabled,
+)
+const chatRouteHeader = provideChatRouteHeaderBridge()
+const {
+  visible: chatRouteHeaderVisible,
+  title: chatRouteHeaderTitle,
+  copyState: chatRouteHeaderCopyState,
+  copyIcon: chatRouteHeaderCopyIcon,
+  copyLiveText: chatRouteHeaderCopyLiveText,
+  deliverableCount: chatRouteHeaderDeliverableCount,
+  hasNewDeliverable: chatRouteHeaderHasNewDeliverable,
+  shareMode: chatRouteHeaderShareMode,
+  shareableMessageCount: chatRouteHeaderShareableMessageCount,
+} = chatRouteHeader.model
+const chatHeaderActionsRef = ref<ChatRouteHeaderHostHandle | null>(null)
+watch(chatHeaderActionsRef, host => chatRouteHeader.setHost(host), { flush: 'sync' })
+watch(isChatRoute, active => {
+  if (!active) chatRouteHeader.clear()
+}, { flush: 'sync' })
+
+function clearChatRouteHeaderAfterError() {
+  chatRouteHeader.clear()
+}
 const sidebarRef = ref<HTMLElement | null>(null)
 const sidebarDockToggleRef = ref<HTMLButtonElement | null>(null)
 const topbarSidebarToggleRef = ref<HTMLButtonElement | null>(null)
+const topbarRef = ref<HTMLElement | null>(null)
 type SidebarResizerHandle = { cancel: () => boolean }
 const sidebarResizerRef = ref<SidebarResizerHandle | null>(null)
 
@@ -493,17 +618,22 @@ watch(sidebarEffectiveWidth, width => {
   if (!sidebarResizeActive.value) setSidebarCssWidth(width)
 }, { immediate: true })
 
-interface DeleteSessionsResponse {
-  deleted?: string[]
-  errors?: string[]
-}
-
 const APP_SESSION_SYNC_SOURCE = 'app-sidebar'
 
 // Localized connection-state label for the topbar pill and its tooltip. The
-// store state ('connected' | 'connecting' | 'disconnected') is a stable key, not
-// display text; CSS uppercases the result (a no-op for CJK scripts).
-const connectionStateLabel = computed(() => t(`chrome.connectionState.${rpcStore.state}`))
+// Semantic availability is projected into the existing presentation keys;
+// CSS uppercases the result (a no-op for CJK scripts).
+const connectionState = computed(() => gatewayAccess.availability === 'available'
+  ? 'connected'
+  : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
+const effectiveConnectionState = computed(() => effectiveChatConnectionState(
+  connectionState.value,
+  appStore.chatLivePhase,
+  isChatRoute.value,
+))
+const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewayAccess.requiresCredential
+  ? t('setup.connection.tokenRequired')
+  : t(`chrome.connectionState.${effectiveConnectionState.value}`))
 const router = useRouter()
 
 // afterEach only fires on navigation, so a same-route language switch needs an
@@ -511,9 +641,16 @@ const router = useRouter()
 watch(() => appStore.locale, () => {
   document.title = `${routeTitle($route)} — OpenSquilla`
 })
-const { allSessions, sessionListError, isLoading, loadSessions } = useSessions(
-  optionalSessionRpcCallOptions,
-)
+const {
+  allSessions,
+  sessionListError,
+  isLoading,
+  isLoadingMore,
+  loadMoreError,
+  hasMore,
+  loadSessions,
+  loadMoreSessions,
+} = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
 // Axis-B: the active expressive skin for the routed content area (meta.skin).
 const { skinId, variants } = useSurfaceSkin()
@@ -535,7 +672,7 @@ const editingProject = computed(() =>
     : null,
 )
 watch(
-  () => rpcStore.canManageProjectWorkspaces,
+  () => gatewayAccess.canManageProjectWorkspaces,
   allowed => {
     if (allowed) {
       scheduleSessionRefresh()
@@ -554,18 +691,63 @@ watch(
 // Feature-gated topbar music control; the singleton `enabled` ref is written by
 // Settings → Appearance and the command palette.
 const { enabled: bgmEnabled } = useBgm()
+const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
+
+let cronFinishedSubscription: CronSubscription | null = null
+
+function handleCronRunFinished(event: CronRunFinished) {
+  const runId = typeof event.runId === 'string' ? event.runId : ''
+  const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
+  markCronFinishNotified(runId)
+  if (event.success === false) {
+    pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
+      tone: 'danger',
+      duration: 9_000,
+    })
+    return
+  }
+  const reminder = event.payloadKind === 'reminder'
+    ? reminderToastPreview(event.summary)
+    : ''
+  if (reminder) {
+    const sessionKey = event.sessionKey?.trim() || ''
+    pushToast(t('cronSkills.jobs.toastBackgroundReminder', {
+      name: jobName,
+      reminder,
+    }), {
+      tone: 'ok',
+      duration: 10_000,
+      action: sessionKey
+        ? {
+            label: t('cronSkills.jobs.toastViewReminder'),
+            onClick: () => switchToSession(sessionKey, 'cron.reminder_toast'),
+          }
+        : undefined,
+    })
+    return
+  }
+  pushToast(t('cronSkills.jobs.toastBackgroundComplete', { name: jobName }), {
+    tone: 'ok',
+    duration: 7_000,
+  })
+}
 
 installSessionNavigationDiagConsole()
 
 // Shared agents.list state + fetch (singleton) for sidebar session metadata.
-const { agents, loadAgents } = useAgentOptions(optionalSessionRpcCallOptions)
+const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionReadOptions)
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
 // Pending optimistic renames, keyed by session key; cleared after the next list
 // reload returns the backend's canonical title.
 const renameOverrides = ref<Record<string, string>>({})
+
+const chatSessionTitles = computed(() => (
+  buildChatSessionTitles(allSessions.value, renameOverrides.value)
+))
+provideChatSessionTitles(chatSessionTitles)
 
 const brandMarkUrl = computed(() => {
   if (import.meta.env.DEV) return '/opensquilla-mark.png'
@@ -601,7 +783,12 @@ const themeIconName = computed(() => {
 })
 
 const themeMenuOpen = ref(false)
-useDialogLayer(themeMenuOpen)
+useChatTopbarPopoverCoordination(
+  'theme',
+  themeMenuOpen,
+  topbarPopoverCoordinator,
+)
+const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
 
 // The compact topbar menu deliberately lists only the basic modes (Light / Dark
@@ -626,7 +813,7 @@ function pickTheme(mode: ThemeMode) {
 function openMoreThemes() {
   themeMenuOpen.value = false
   handleNavClick()
-  router.push('/settings/appearance')
+  router.push('/settings/interface')
 }
 
 useDocumentEvent('click', (e) => {
@@ -664,7 +851,17 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
 })
 
 // Chat layout applies to both the session view and the draft route.
-const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const systemHeaderPressureCount = computed(() => (
+  Number(effectiveConnectionState.value !== 'connected')
+  + Number(appStore.approvalCount > 0)
+  + Number(desktopUpdate.visible.value)
+  + Number(bgmEnabled.value)
+))
+const systemHeaderLayout = useSystemHeaderLayout({
+  target: topbarRef,
+  active: isChatRoute,
+  pressureCount: systemHeaderPressureCount,
+})
 const activeProjectDraftId = computed(() =>
   $route.path === '/chat/new' ? String($route.query.project || '') : '',
 )
@@ -735,24 +932,17 @@ function agentDisplayName(agentId: string): string {
 }
 
 // Raw session keys (agent:…:…) and bare UUIDs must never render in the sidebar.
-const RAW_SESSION_KEY_PATTERN = /\bagent:[a-z0-9_-]+:[a-z0-9_-]+:/i
-const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
-
-function looksLikeRawSessionId(value: string): boolean {
-  return RAW_SESSION_KEY_PATTERN.test(value) || UUID_PATTERN.test(value) || /^(agent|cron):/i.test(value)
-}
-
 function sidebarConversationTitle(item: SessionItem): string {
   for (const candidate of [item.title, item.subtitle, item.groupLabel]) {
     const text = String(candidate || '').trim()
-    if (text && !looksLikeRawSessionId(text)) return text
+    if (isSensibleChatTitle(text)) return text
   }
   return t('shared.sidebar.untitledTask')
 }
 
 // A draft / current-session row the backend list does not yet carry. The
 // sidebar arranger reads only a handful of fields off the SessionItem, so a
-// synthetic chat row carries just those plus a stub `raw` (no parent → root).
+// synthetic chat row carries canonical defaults for the remaining fields.
 function syntheticChatSession(
   key: string,
   effectiveAgentId: string,
@@ -778,19 +968,16 @@ function syntheticChatSession(
     sessionKind: 'chat',
     surface: 'webchat',
     conversationKind: 'direct',
-    threadLabel: '',
-    channelContext: null,
     status: 'idle',
-    visualStatus: 'idle',
     runStatus: 'idle',
     runLabel: 'Idle',
     messageCount: null,
     updatedAt,
-    interactive: true,
+    model: '',
+    parent: null,
     provisional: project?.provisional,
     forkedFromParent: false,
-    contractGaps: [],
-    raw: { key },
+    hasContractGaps: false,
   }
 }
 
@@ -909,7 +1096,7 @@ const sidebarSections = computed((): SidebarSection[] => {
   const byKey = new Map(sidebarSessionItems.value.map(item => [item.key, item]))
   return arrangeSidebarSections(
     sidebarSessionItems.value,
-    rpcStore.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
+    gatewayAccess.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
       ? projectWorkspaces.workspaces.value
       : undefined,
     sidebarSessionOrder.value,
@@ -936,10 +1123,10 @@ function onReorderSidebarSession(payload: {
   targetKey: string
   position: 'before' | 'after'
 }) {
-  const orderedKeys = sidebarSections.value
-    .flatMap(section => section.rows)
-    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
-    .map(row => row.key)
+  const orderedKeys = sidebarSessionOrderKeys(
+    sidebarSections.value,
+    sidebarSessionOrder.value,
+  )
   const from = orderedKeys.indexOf(payload.draggedKey)
   if (from < 0 || !orderedKeys.includes(payload.targetKey) || payload.draggedKey === payload.targetKey) return
 
@@ -958,19 +1145,16 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   writeStoredSessionKeys(SIDEBAR_PINNED_SESSIONS_KEY, sidebarPinnedSessionKeys.value)
 
   if (!payload.pinned) return
-  const currentOrder = sidebarSections.value
-    .flatMap(section => section.rows)
-    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
-    .map(row => row.key)
+  const currentOrder = sidebarSessionOrderKeys(
+    sidebarSections.value,
+    sidebarSessionOrder.value,
+  )
     .filter(key => key !== payload.key)
   currentOrder.unshift(payload.key)
   sidebarSessionOrder.value = currentOrder
   writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, currentOrder)
 }
 
-let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
-let sidebarRefreshPending = false
-let sidebarLoadPromise: Promise<void> | null = null
 let appAutomaticRpcMounted = false
 let appAutomaticRpcStarted = false
 
@@ -1098,7 +1282,7 @@ function startNewChatInstant() {
 }
 
 function startProjectTask(workspaceId: string) {
-  if (!workspaceId || !rpcStore.canManageProjectWorkspaces) return
+  if (!workspaceId || !gatewayAccess.canManageProjectWorkspaces) return
   handleNavClick()
   freshTaskDraft.requestFreshTask('main', workspaceId)
   void router.push({
@@ -1123,7 +1307,7 @@ function resetProjectCreator() {
 }
 
 function openProjectCreator() {
-  if (!rpcStore.canChooseProject) return
+  if (!gatewayAccess.canChooseProject) return
   projectCreateName.value = ''
   projectCreateSourcePath.value = ''
   projectCreateBusy.value = false
@@ -1139,7 +1323,7 @@ function closeProjectCreator() {
 }
 
 function onProjectPathChosen(path: string) {
-  if (!projectCreateOpen.value || !rpcStore.canChooseProject) return
+  if (!projectCreateOpen.value || !gatewayAccess.canChooseProject) return
   projectCreateSourcePath.value = path
   if (!projectCreateName.value.trim()) {
     projectCreateName.value = projectNameFromPath(path)
@@ -1154,7 +1338,7 @@ function onProjectSourcePathChosen(path: string) {
 async function chooseProjectSourceDirectory() {
   if (
     !projectCreateOpen.value
-    || !rpcStore.canChooseProject
+    || !gatewayAccess.canChooseProject
     || projectCreateBusy.value
     || projectCreateSourcePicking.value
     || projectSourcePickerOpen.value
@@ -1183,7 +1367,7 @@ async function chooseProjectSourceDirectory() {
 async function createProjectWorkspace(payload: { name: string; path: string }) {
   if (
     !projectCreateOpen.value
-    || !rpcStore.canChooseProject
+    || !gatewayAccess.canChooseProject
     || projectCreateBusy.value
     || projectCreateSourcePicking.value
     || projectSourcePickerOpen.value
@@ -1204,14 +1388,28 @@ async function createProjectWorkspace(payload: { name: string; path: string }) {
     return
   }
   projectCreateBusy.value = true
+  const existingWorkspaceIds = new Set(
+    projectWorkspaces.workspaces.value.map(workspace => workspace.id),
+  )
   try {
     const workspace = await projectWorkspaces.openWorkspace(path)
     if (!workspace) throw new Error('Gateway returned an empty project.')
+    const alreadyExists = existingWorkspaceIds.has(workspace.id)
+    const renamedExisting = alreadyExists && workspace.name !== name
     if (workspace.name !== name) {
       await projectWorkspaces.renameWorkspace(workspace.id, name)
     }
     resetProjectCreator()
-    pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+    if (alreadyExists) {
+      pushToast(t(
+        renamedExisting
+          ? 'workspaces.projectExistingRenamed'
+          : 'workspaces.projectAlreadyExists',
+        { name },
+      ), { tone: 'info' })
+    } else {
+      pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+    }
   } catch (err) {
     projectCreateBusy.value = false
     projectCreateConfirming.value = false
@@ -1220,7 +1418,7 @@ async function createProjectWorkspace(payload: { name: string; path: string }) {
 }
 
 async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   try {
     await projectWorkspaces.setPinned(payload.workspaceId, payload.pinned)
   } catch (err) {
@@ -1229,12 +1427,12 @@ async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
 }
 
 function openProjectEditor(workspaceId: string) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   editingProjectId.value = workspaceId
 }
 
 async function onProjectRename(name: string) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   const workspaceId = editingProjectId.value
   if (!workspaceId) return
   try {
@@ -1246,7 +1444,7 @@ async function onProjectRename(name: string) {
 }
 
 async function onProjectDeleteHistory(workspaceId: string) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   try {
     const result = await projectWorkspaces.deleteWorkspaceHistory(workspaceId)
     const leaveDeletedTask = activeTaskWasDeletedWithProjectHistory({
@@ -1265,12 +1463,26 @@ async function onProjectDeleteHistory(workspaceId: string) {
 }
 
 async function onProjectRemove(workspaceId: string) {
-  if (!rpcStore.canManageProjectWorkspaces) return
+  if (!gatewayAccess.canManageProjectWorkspaces) return
   const project = projectWorkspaces.byId.value.get(workspaceId)
   if (!project) return
+  let affectedCronJobs = 0
+  try {
+    const jobs = await cronScheduler.listJobs()
+    affectedCronJobs = (jobs || []).filter(
+      job => job.workspaceId === workspaceId,
+    ).length
+  } catch {
+    // The backend still enforces the pause atomically during removal.
+  }
   const approved = await confirm({
     title: t('workspaces.removeTitle'),
-    body: t('workspaces.removeBody', { name: project.name }),
+    body: affectedCronJobs > 0
+      ? t('workspaces.removeBodyWithCronJobs', {
+          name: project.name,
+          count: affectedCronJobs,
+        })
+      : t('workspaces.removeBody', { name: project.name }),
     primaryLabel: t('workspaces.removeConfirm'),
   })
   if (!approved) return
@@ -1326,9 +1538,9 @@ function switchToSession(key: string, source = 'app.switchToSession') {
   router.push({ path: '/chat', query: { session: key } })
 }
 
-// Optimistic rename: show the new title immediately, then persist via
-// sessions.patch (display_name is the top-precedence title) and reload so the
-// backend's canonical title wins. The override clears once the reload lands.
+// Optimistic rename: show the new title immediately, then persist through the
+// SessionLifecycle seam and reload so the backend's canonical title wins. The
+// override clears once the reload lands.
 async function onRenameSession({ key, title }: { key: string; title: string }) {
   const next = title.trim()
   if (!key || !next) return
@@ -1336,10 +1548,10 @@ async function onRenameSession({ key, title }: { key: string; title: string }) {
   const local = localChatSessions.value[key]
   if (local) localChatSessions.value[key] = { ...local, title: next }
   try {
-    await rpcStore.call('sessions.patch', { key, displayName: next })
+    await sessionLifecycle.rename({ key, title: next })
     pushToast('Session renamed', { tone: 'ok' })
   } catch (err: unknown) {
-    console.warn('[App] sessions.patch error:', errorMessage(err))
+    console.warn('[App] session rename error:', errorMessage(err))
     pushToast('Failed to rename session', { tone: 'danger' })
   } finally {
     await loadSessions()
@@ -1371,13 +1583,13 @@ function handleLocalSessionsDeleted(event: Event) {
   scheduleSessionRefresh()
 }
 
-async function deleteSessions(keys: string[]): Promise<DeleteSessionsResponse | null> {
+async function deleteSessions(keys: string[]) {
   const uniqueKeys = [...new Set(keys.map(key => key.trim()).filter(Boolean))]
   if (uniqueKeys.length === 0) return null
   try {
-    return await rpcStore.call<DeleteSessionsResponse>('sessions.delete', { keys: uniqueKeys })
+    return await sessionLifecycle.remove(uniqueKeys)
   } catch (err: unknown) {
-    console.warn('[App] sessions.delete error:', errorMessage(err))
+    console.warn('[App] session deletion error:', errorMessage(err))
     return null
   }
 }
@@ -1392,7 +1604,7 @@ async function onBulkDeleteSessions(keys: string[]) {
   const result = await deleteSessions(uniqueKeys)
   const deleted = new Set(result?.deleted || [])
   if (!result || deleted.size === 0) {
-    console.warn('[App] sessions.delete reported failure:', result?.errors)
+    console.warn('[App] session deletion reported failure:', result?.errors)
     pushToast(t('shared.sidebar.bulkDeleteFailed'), { tone: 'danger' })
     return
   }
@@ -1403,7 +1615,7 @@ async function onBulkDeleteSessions(keys: string[]) {
   const failedCount = Math.max(0, uniqueKeys.length - deleted.size)
   pushToast(t('shared.sidebar.bulkDeleteDone', { count: deleted.size }), { tone: 'ok' })
   if (failedCount > 0 || (result.errors?.length || 0) > 0) {
-    console.warn('[App] sessions.delete partial failure:', result.errors)
+    console.warn('[App] session deletion partial failure:', result.errors)
     pushToast(t('shared.sidebar.bulkDeletePartial', { count: failedCount || result.errors?.length || 0 }), { tone: 'danger' })
   }
   await loadSessions()
@@ -1417,7 +1629,7 @@ async function onDeleteSession(key: string) {
   const wasCurrent = key === currentSessionKey.value
   const result = await deleteSessions([key])
   if (!result?.deleted?.includes(key)) {
-    console.warn('[App] sessions.delete reported failure:', result?.errors)
+    console.warn('[App] session deletion reported failure:', result?.errors)
     pushToast('Failed to delete session', { tone: 'danger' })
     return
   }
@@ -1437,7 +1649,7 @@ async function onDeleteSession(key: string) {
 // in-thread card can be answered. The live `pendingApprovals` list (kept fresh
 // by the push subscription + reconnect seed) is the source of truth — no
 // re-fetch — and the oldest pending session is the deterministic target. With
-// no routable session, fall back to the Sessions page.
+// no routable session, fall back to Chat; the topbar retains the pending count.
 function openBlockedApprovalSession() {
   const oldest = appStore.oldestPendingWithSession
   if (oldest?.sessionKey) {
@@ -1445,9 +1657,8 @@ function openBlockedApprovalSession() {
     switchToSession(oldest.sessionKey, 'approval.openBlockedSession')
     return
   }
-  // No session attached to the pending approval: land on Sessions, whose
-  // attention strip shows the pending count (the /approvals page is retired).
-  router.push('/sessions')
+  // No session attached to the pending approval: return to chat.
+  router.push('/chat')
 }
 
 // Footer settings row. Both platforms mount the same `/settings` overlay now, so
@@ -1461,78 +1672,79 @@ function openSettings() {
 // Topbar connection pill (web): jump straight to the Connection section so the
 // gateway link can be inspected or re-pointed.
 function openConnectionSettings() {
-  router.push('/settings/connection')
+  router.push('/settings/gateway#connection')
+}
+
+// Compact chat headers hand off to the complete Desktop update workflow rather
+// than recreating update actions inside the status summary.
+function openDesktopRuntimeSettings() {
+  router.push('/settings/gateway#runtime')
 }
 
 function scheduleSessionRefresh() {
-  sidebarRefreshPending = true
-  if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
-  sessionRefreshTimer = setTimeout(() => {
-    sessionRefreshTimer = null
-    flushScheduledSidebarRefresh()
-  }, 150)
+  sidebarRefresh.schedule()
 }
 
 function flushScheduledSidebarRefresh() {
-  if (
-    !sidebarRefreshPending
-    || !appAutomaticRpcMounted
-    || !optionalSessionRpcAllowed.value
-  ) return
-  sidebarRefreshPending = false
-  if (sessionRefreshTimer) {
-    clearTimeout(sessionRefreshTimer)
-    sessionRefreshTimer = null
-  }
-  void loadSidebarData()
+  sidebarRefresh.flush()
 }
 
-function loadSidebarData(): Promise<void> {
-  if (sidebarLoadPromise) return sidebarLoadPromise
+async function performSidebarLoad(): Promise<void> {
   const requests: Promise<unknown>[] = [loadSessions()]
   if (
-    rpcStore.canManageProjectWorkspaces
+    gatewayAccess.canManageProjectWorkspaces
     && optionalSessionRpcAllowed.value
   ) {
     requests.push(
-      projectWorkspaces.loadWorkspaces(optionalSessionRpcCallOptions),
+      projectWorkspaces.loadWorkspaces(optionalSessionReadOptions),
     )
   }
-  const request = Promise.allSettled(requests).then(() => undefined)
-  const tracked = request.finally(() => {
-    if (sidebarLoadPromise === tracked) sidebarLoadPromise = null
-  })
-  sidebarLoadPromise = tracked
-  return tracked
+  await Promise.allSettled(requests)
+}
+
+const sidebarRefresh = createCoalescedRefresh({
+  run: performSidebarLoad,
+  allowed: () => appAutomaticRpcMounted && optionalSessionRpcAllowed.value,
+  delayMs: 150,
+})
+
+function loadSidebarData(): Promise<void> {
+  return sidebarRefresh.load()
 }
 
 function refreshSidebarDataWhenAdmitted(): void | Promise<void> {
   if (!optionalSessionRpcAllowed.value) {
-    sidebarRefreshPending = true
+    sidebarRefresh.defer()
     return
   }
   return loadSidebarData()
 }
 
-const sessionListSubscription = useSessionListSubscription({
-  rpc: rpcStore,
-  callOptions: optionalSessionRpcCallOptions,
-  isConnected: () => rpcStore.isConnected,
-  isAdmitted: () => optionalSessionRpcAllowed.value,
-  refresh: refreshSidebarDataWhenAdmitted,
-  scheduleRefresh: scheduleSessionRefresh,
-  onChanged: payload => {
-    sessionTaskAttention.handleSessionsChanged(payload, {
-      currentSessionKey: currentSessionKey.value,
-      currentSessionVisible: currentSessionIsVisible(),
-    })
-  },
-  warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
+const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
+  scheduleSessionRefresh()
+  sessionTaskAttention.handleSessionDirectoryChange(change, {
+    currentSessionKey: currentSessionKey.value,
+    currentSessionVisible: currentSessionIsVisible(),
+  })
 })
+
+function subscribeCronEventsWhenAdmitted() {
+  if (
+    !appAutomaticRpcMounted
+    || !optionalSessionRpcAllowed.value
+    || !gatewayAccess.isAvailable
+    || cronFinishedSubscription
+  ) return
+  // CronScheduler's Adapter owns its generation-aware remote event lease, but
+  // App owns admission so the optional subscribe frame cannot enter the
+  // Gateway's serial dispatcher ahead of critical session recovery.
+  cronFinishedSubscription = cronScheduler.subscribe(handleCronRunFinished)
+}
 
 function resumeAutomaticAppRpc() {
   if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
-  sessionListSubscription.resume()
+  subscribeCronEventsWhenAdmitted()
+  void sessionDirectoryChanges.resume()
   if (!appAutomaticRpcStarted) {
     appAutomaticRpcStarted = true
     void loadAgents()
@@ -1544,6 +1756,21 @@ function resumeAutomaticAppRpc() {
 watch(optionalSessionRpcAllowed, admitted => {
   if (admitted) resumeAutomaticAppRpc()
 }, { flush: 'sync' })
+
+watch(
+  () => gatewayAccess.availability,
+  state => {
+    if (state !== 'available') return
+    subscribeCronEventsWhenAdmitted()
+    if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
+    // The event stream is live-only. Rebind the logical lease and refresh a
+    // complete directory snapshot after every physical reconnect so events
+    // missed during the gap cannot leave the sidebar stale.
+    void sessionDirectoryChanges.resume().then(() => {
+      if (appAutomaticRpcStarted) void refreshSidebarDataWhenAdmitted()
+    })
+  },
+)
 
 function handleKeydown(e: KeyboardEvent) {
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
@@ -1588,21 +1815,24 @@ function handleKeydown(e: KeyboardEvent) {
   // consumed the key: the composer textarea (@keydown, target phase) and any
   // earlier-registered document listener (e.g. ChatView). Overlays (drawers,
   // modals) attach their document listeners on open — AFTER this one — so they
-  // run later and are NOT covered by this guard; their collision with the
-  // sidebar-Escape branch is ruled out by the mobile-only gate below instead.
+  // run later and are covered separately by the shared dialog-layer guard.
   if (e.defaultPrevented) return
 
-  if (e.key === 'Escape' && themeMenuOpen.value) {
+  if (e.key === 'Escape' && themeMenuOpen.value && themeMenuIsTopmost.value) {
+    e.preventDefault()
     themeMenuOpen.value = false
     themeButtonRef.value?.focus()
     return
   }
+  // Child topbar controls and routed dialogs install their Escape handlers
+  // after App's listener. Let the current dialog-stack owner handle the key
+  // instead of pre-emptively collapsing the mobile sidebar beneath it.
+  if (e.key === 'Escape' && hasOpenDialogLayer()) return
   // Escape dismisses the sidebar only as the mobile slide-over. On desktop the
   // sidebar is a persistent dock toggled by its own button, so it must never
   // collapse as a side effect of an Escape meant for an overlay opened on top of
-  // it. Because those overlays run after this handler (see above), this
-  // mobile-only gate — not the defaultPrevented check — is what prevents that
-  // collision; keep it. The settings overlay owns Escape while open and is excluded.
+  // it. The shared dialog-layer guard above handles that ordering collision;
+  // this branch remains mobile-only because desktop uses a persistent dock.
   if (e.key === 'Escape' && appStore.sidebarOpen && !settingsOverlayOpen.value && isSidebarDrawer.value) {
     closeSidebarDrawer()
   }
@@ -1623,49 +1853,17 @@ function errorMessage(err: unknown): string {
 // socket (e.g. a reload while one is already pending).
 // ---------------------------------------------------------------------------
 
-interface ApprovalPushPayload {
-  approval_id?: string
-  approvalId?: string
-  session_key?: string
-  sessionKey?: string
-  tool_name?: string
-  toolName?: string
-  command?: string
-}
+const approvalSubscriptions: ApprovalSubscription[] = []
+let approvalSeedGeneration = 0
 
-interface ApprovalSnapshotItem {
-  id?: string
-  sessionKey?: string
-  toolName?: string
-  pluginId?: string
-  actionKind?: string
-  command?: string
-  argv?: string[]
-}
-
-const rpcApprovalUnsubs: Array<() => void> = []
-
-function approvalAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {}
-  try {
-    const token = sessionStorage.getItem('opensquilla.wsToken') || ''
-    if (token) headers['Authorization'] = `Bearer ${token}`
-  } catch { /* ignore */ }
-  return headers
-}
-
-function snapshotItemToPending(item: ApprovalSnapshotItem): PendingApproval | null {
-  const approvalId = String(item.id || '').trim()
+function approvalItemToPending(item: ApprovalItem): PendingApproval | null {
+  const approvalId = item.id.trim()
   if (!approvalId) return null
-  let command = String(item.command || '')
-  if (!command && Array.isArray(item.argv) && item.argv.length > 0) {
-    command = item.argv.map(String).join(' ')
-  }
   return {
     approvalId,
-    sessionKey: String(item.sessionKey || ''),
-    tool: String(item.toolName || item.pluginId || item.actionKind || 'Unknown tool'),
-    command,
+    sessionKey: item.sessionKey,
+    tool: item.toolName || 'Unknown tool',
+    command: item.command,
   }
 }
 
@@ -1673,12 +1871,14 @@ function snapshotItemToPending(item: ApprovalSnapshotItem): PendingApproval | nu
 // while a request is already pending. The
 // snapshot is ordered oldest-first, which the deep-link relies on.
 async function seedPendingApprovals() {
+  if (!appAutomaticRpcMounted || gatewayAccess.availability !== 'available') return
+  const generation = ++approvalSeedGeneration
   try {
-    const res = await fetch('/api/approvals', { headers: approvalAuthHeaders() })
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    const data = await res.json() as { pending?: ApprovalSnapshotItem[] }
-    const items = (data.pending || [])
-      .map(snapshotItemToPending)
+    const snapshot = await approvalCenter.snapshot()
+    if (!appAutomaticRpcMounted || generation !== approvalSeedGeneration
+      || gatewayAccess.availability !== 'available') return
+    const items = snapshot.pending
+      .map(approvalItemToPending)
       .filter((item): item is PendingApproval => item !== null)
     appStore.setPendingApprovals(items)
   } catch (err) {
@@ -1686,26 +1886,22 @@ async function seedPendingApprovals() {
   }
 }
 
-function onApprovalRequested(payload: ApprovalPushPayload) {
-  const approvalId = String(payload.approval_id || payload.approvalId || '').trim()
-  if (!approvalId) return
-  appStore.upsertPendingApproval({
-    approvalId,
-    sessionKey: String(payload.session_key || payload.sessionKey || ''),
-    tool: String(payload.tool_name || payload.toolName || 'Unknown tool'),
-    command: String(payload.command || ''),
-  })
-}
-
-function onApprovalResolved(payload: ApprovalPushPayload) {
-  const approvalId = String(payload.approval_id || payload.approvalId || '').trim()
-  if (approvalId) appStore.removePendingApproval(approvalId)
+function onApprovalEvent(event: ApprovalEvent) {
+  if (event.kind === 'resolved') {
+    appStore.removePendingApproval(event.approvalId)
+    return
+  }
+  if (event.approval) {
+    const item = approvalItemToPending(event.approval)
+    if (item) appStore.upsertPendingApproval(item)
+  }
 }
 
 // Reconnect re-seeds the list (recovers approvals that arrived while the socket
 // was down); the push events keep it live thereafter.
-function onApprovalConnectionState(state: unknown) {
-  if (state !== 'connected') {
+function onApprovalAvailability(state: 'available' | 'recovering' | 'unavailable') {
+  if (state !== 'available') {
+    approvalSeedGeneration++
     appStore.setPendingApprovals([])
     return
   }
@@ -1713,18 +1909,16 @@ function onApprovalConnectionState(state: unknown) {
 }
 
 function subscribeApprovals() {
-  rpcApprovalUnsubs.push(
-    rpcStore.on('exec.approval.requested', onApprovalRequested as RpcEventHandler),
-    rpcStore.on('exec.approval.resolved', onApprovalResolved as RpcEventHandler),
-    rpcStore.on('plugin.approval.requested', onApprovalRequested as RpcEventHandler),
-    rpcStore.on('plugin.approval.resolved', onApprovalResolved as RpcEventHandler),
-    rpcStore.on('_state', onApprovalConnectionState as RpcEventHandler),
+  approvalSubscriptions.push(
+    approvalCenter.subscribe(onApprovalEvent),
+    approvalCenter.subscribeAvailability(onApprovalAvailability),
   )
 }
 
 function unsubscribeApprovals() {
-  rpcApprovalUnsubs.forEach(unsub => unsub())
-  rpcApprovalUnsubs.length = 0
+  approvalSeedGeneration++
+  approvalSubscriptions.splice(0).forEach(subscription => subscription.close())
+  approvalCenter.dispose()
 }
 
 // ---------------------------------------------------------------------------
@@ -1759,24 +1953,25 @@ onMounted(() => {
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.addEventListener('focus', markCurrentSessionReadIfVisible)
   document.addEventListener('visibilitychange', markCurrentSessionReadIfVisible)
-  sessionListSubscription.subscribe()
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
-  // Seed now in case the socket is already connected (the `_state` listener
-  // covers later reconnects); recovers a request pending before mount.
-  if (rpcStore.isConnected) void seedPendingApprovals()
+  // Seed now in case an approval was pending before mount. Availability events
+  // re-seed after reconnects and clear stale data while transport recovers.
+  void seedPendingApprovals()
 })
 
 onUnmounted(() => {
   appAutomaticRpcMounted = false
-  sidebarRefreshPending = false
+  sidebarRefresh.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.removeEventListener('focus', markCurrentSessionReadIfVisible)
   document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
-  if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
-  sessionListSubscription.cleanup()
+  sessionDirectoryChangesSubscription.close()
+  sessionDirectoryChanges.dispose()
   unsubscribeApprovals()
+  cronFinishedSubscription?.close()
+  cronFinishedSubscription = null
   if (titleDebounce) {
     clearTimeout(titleDebounce)
     titleDebounce = null

@@ -16,7 +16,9 @@ root release README with task-oriented guides.
 7. [`web-ui.md`](web-ui.md) - local control console and chat UI.
 8. [`sessions.md`](sessions.md) - session continuity, export, resume, abort,
    and cleanup.
-9. [`glossary.md`](glossary.md) - user-facing terminology.
+9. [`goal-mode.md`](goal-mode.md) - persistent multi-turn Goals, progress,
+   guardrails, pause/resume, and Plan-mode interaction.
+10. [`glossary.md`](glossary.md) - user-facing terminology.
 
 ## Feature Guides
 
@@ -38,9 +40,13 @@ root release README with task-oriented guides.
   authoring.
 - [`features/compaction-and-cache.md`](features/compaction-and-cache.md) -
   long-session compaction and prompt-cache continuity.
+- [`goal-mode.md`](goal-mode.md) - durable session Goals and safe automatic
+  continuation.
 
 ## Surfaces and Operations
 
+- [`releases/0.5.4.md`](releases/0.5.4.md) - OpenSquilla 0.5.4 release notes.
+- [`releases/0.5.3.md`](releases/0.5.3.md) - OpenSquilla 0.5.3 release notes.
 - [`releases/0.5.2.md`](releases/0.5.2.md) - OpenSquilla 0.5.2 release notes.
 - [`releases/0.5.1.md`](releases/0.5.1.md) - OpenSquilla 0.5.1 release notes.
 - [`releases/0.5.0.md`](releases/0.5.0.md) - OpenSquilla 0.5.0 release notes.
@@ -58,6 +64,8 @@ root release README with task-oriented guides.
   files, images, PDF, and TTS.
 - [`tools-and-sandbox.md`](tools-and-sandbox.md) - built-in tools, approvals,
   sandbox posture, and write policy.
+- [`sandbox-security.md`](sandbox-security.md) - Safe and Full execution modes,
+  guest isolation, policy behavior, bundled runtimes, and upgrade compatibility.
 - [`approvals-and-permissions.md`](approvals-and-permissions.md) - permission
   profiles, approval commands, workspace containment, and sandbox posture.
 - [`agents.md`](agents.md) - durable named agents and workspace defaults.
@@ -69,8 +77,6 @@ root release README with task-oriented guides.
   raw capture guidance, read-only turn replay, and developer replay benchmarks.
 - [`tui-real-terminal-harness.md`](tui-real-terminal-harness.md) - maintainer
   real-terminal TUI integration harness and evidence capture.
-- [`experiments.md`](experiments.md) - opt-in runtime toggle conventions and
-  the delivery-verification tooling in `scripts/experiments/`.
 - [`docker.md`](docker.md) - Docker/Compose deployment on home servers and
   NAS: prebuilt GHCR images, LAN exposure with token auth, and upgrades.
 - [`operations.md`](operations.md) - sessions, cron, usage, diagnostics,
@@ -87,7 +93,7 @@ open a small pull request against `main`.
 Fast paths:
 
 - Report a stale command, broken link, or confusing page with the
-  [documentation issue template](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml).
+  [documentation issue template](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml).
 - Edit the affected Markdown page on GitHub and open a focused pull request
   against `main`.
 - For new feature documentation, keep independent features on independent pages
@@ -101,4 +107,4 @@ developer design notes or source comments, not in the first-run path.
 
 ---
 
-[Product guide](../README.product.md) · [中文](../README.zh-Hans.md) · [日本語](../README.ja.md) · [Français](../README.fr.md) · [Deutsch](../README.de.md) · [Español](../README.es.md) · [Improve these docs](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml) · [Contributing](../CONTRIBUTING.md)
+[Product guide](../README.product.md) · [中文](../README.zh-Hans.md) · [日本語](../README.ja.md) · [Français](../README.fr.md) · [Deutsch](../README.de.md) · [Español](../README.es.md) · [Improve these docs](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml) · [Contributing](../CONTRIBUTING.md)

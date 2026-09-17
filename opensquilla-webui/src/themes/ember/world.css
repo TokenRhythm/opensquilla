@@ -25,22 +25,37 @@
                0 0 22px color-mix(in srgb, var(--accent-deep) 24%, transparent);
 }
 
-/* Hard warm frame + ember bloom on the primary action, the live connection
-   pill, and new-chat -- the "lit coals" of the UI. */
+/* Hard warm frame + ember bloom on elevated accent surfaces. Sidebar
+   destinations remain flat and visually grouped. Semantic topbar controls opt
+   in below only while they carry attention; healthy states stay quiet. */
 [data-theme="ember"] .btn--primary,
-[data-theme="ember"] .conn-pill,
-[data-theme="ember"] .sidebar-new-session {
+[data-theme="ember"] .conn-pill:not(.topbar-state) {
   box-shadow: var(--elev-1),
               0 0 16px color-mix(in srgb, var(--accent) 34%, transparent),
               inset 0 0 0 1px color-mix(in srgb, var(--accent-secondary) 22%, transparent);
 }
 
+[data-theme="ember"] .topbar .topbar-state:is(
+  [data-state="info"],
+  [data-state="warning"],
+  [data-state="danger"]
+) {
+  box-shadow: var(--elev-1),
+              0 0 16px color-mix(in srgb, var(--topbar-state-channel) 34%, transparent),
+              inset 0 0 0 1px color-mix(in srgb, var(--topbar-state-channel) 22%, transparent);
+}
+
 /* A breathing coal glow behind the live pill -- a dedicated layer so the pill
    itself (and its text) stays fully opaque and crisp; only this glow pulses. */
-[data-theme="ember"] .conn-pill {
+[data-theme="ember"] .conn-pill:not(.topbar-state),
+[data-theme="ember"] .topbar .topbar-state:not([data-state="normal"]) {
   position: relative;
 }
-[data-theme="ember"] .conn-pill::after {
+[data-theme="ember"] .conn-pill:not(.topbar-state) {
+  --topbar-state-channel: var(--accent);
+}
+[data-theme="ember"] .conn-pill:not(.topbar-state)::after,
+[data-theme="ember"] .topbar .topbar-state:not([data-state="normal"])::after {
   content: "";
   position: absolute;
   inset: -3px;
@@ -48,7 +63,7 @@
   pointer-events: none;
   opacity: 0.85;
   background: radial-gradient(70% 140% at 50% 50%,
-    color-mix(in srgb, var(--accent) 30%, transparent) 0%,
+    color-mix(in srgb, var(--topbar-state-channel) 30%, transparent) 0%,
     transparent 74%);
 }
 
@@ -149,7 +164,8 @@
     animation: ember-flicker calc(var(--dur-pulse) * 2) var(--ease-standard) infinite; /* motion-allow */
   }
   /* The lit coal behind the live pill breathes gently in and out. */
-  [data-theme="ember"] .conn-pill::after {
+  [data-theme="ember"] .conn-pill:not(.topbar-state)::after,
+  [data-theme="ember"] .topbar .topbar-state:not([data-state="normal"])::after {
     animation: ember-coal var(--dur-pulse) var(--ease-standard) infinite; /* motion-allow */
   }
 }

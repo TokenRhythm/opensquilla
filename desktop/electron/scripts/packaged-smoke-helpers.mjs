@@ -31,6 +31,7 @@ export async function waitFor(check, label, timeoutMs = 60_000) {
 export async function writeSyntheticCredential(
   userDataDir,
   {
+    baseUrl = 'http://127.0.0.1:11434',
     disableNetworkObservability = false,
     model = 'opensquilla-packaged-smoke',
   } = {},
@@ -42,7 +43,7 @@ export async function writeSyntheticCredential(
     JSON.stringify({
       provider: 'ollama',
       model,
-      baseUrl: 'http://127.0.0.1:11434',
+      baseUrl,
       apiKeyEnv: '',
       encryptedApiKey: '',
       modelRoutingMode: 'direct',
@@ -64,14 +65,20 @@ export async function writeSyntheticCredential(
 export async function launchPackagedCandidate({
   executablePath,
   userDataDir,
+  baseUrl,
   disableNetworkObservability = false,
   model,
   env = {},
+  scrubProviderSecrets = false,
 }) {
   await writeSyntheticCredential(userDataDir, {
+    baseUrl,
     disableNetworkObservability,
     model,
   })
+  const inheritedEnv = scrubProviderSecrets
+    ? environmentWithoutProviderSecrets(process.env)
+    : process.env
   return electron.launch({
     executablePath,
     args: [
@@ -79,10 +86,27 @@ export async function launchPackagedCandidate({
       `--user-data-dir=${userDataDir}`,
     ],
     env: {
-      ...process.env,
+      ...inheritedEnv,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
       ...env,
     },
   })
+}
+
+const PROVIDER_SECRET_ENV_NAME = /(?:^|_)(?:API_?KEY|ACCESS_?KEY|AUTH_?TOKEN|ACCESS_?TOKEN|SESSION_?TOKEN|BEARER_?TOKEN|TOKEN|PASSWORD|PASSWD|PRIVATE_?KEY|CLIENT_?SECRET|SECRET|CREDENTIALS?|WEBHOOK|KEY)(?:$|_)/i
+
+/**
+ * Copy process metadata without ever reading values whose names identify
+ * provider credentials. Packaged offline gates use this before launching the
+ * candidate so a developer's shell credentials cannot reach the child.
+ */
+export function environmentWithoutProviderSecrets(source) {
+  const output = {}
+  for (const name of Object.keys(source)) {
+    if (PROVIDER_SECRET_ENV_NAME.test(name)) continue
+    const value = source[name]
+    if (value !== undefined) output[name] = value
+  }
+  return output
 }

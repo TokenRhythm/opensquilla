@@ -1,10 +1,37 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useChatFeatureToggles } from './useChatFeatureToggles'
 import source from './useChatFeatureToggles.ts?raw'
+import chatViewSource from '@/views/ChatView.vue?raw'
 import type { RpcCallOptions } from '@/lib/rpc'
-import type { ModelRoutingMode } from '@/types/modelRouting'
+import type {
+  ModelRoutingCapabilitiesByMode,
+  ModelRoutingMode,
+} from '@/types/modelRouting'
+import {
+  ProviderConfigurationError,
+  type ModelRoutingSnapshot,
+} from '@/modules/providerConfiguration'
 
 type RpcResult = Record<string, unknown> | Error | Promise<unknown>
+
+const CAPABILITIES_BY_MODE: ModelRoutingCapabilitiesByMode = {
+  direct: {
+    image_input: { admission: 'allowed', reason: 'model_vision_supported' },
+  },
+  router: {
+    image_input: { admission: 'allowed', reason: 'router_image_route_available' },
+  },
+  ensemble: {
+    image_input: { admission: 'blocked', reason: 'ensemble_mode_unsupported' },
+  },
+}
+
+const EFFECTIVE_CAPABILITIES_BY_MODE: ModelRoutingCapabilitiesByMode = {
+  ...CAPABILITIES_BY_MODE,
+  ensemble: {
+    image_input: { admission: 'allowed', reason: 'ensemble_mode_unsupported' },
+  },
+}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -19,12 +46,21 @@ function createHarness(options: {
   routingGetResults?: RpcResult[]
   patchResults?: RpcResult[]
   readCallOptions?: RpcCallOptions
+  hasRpcMethod?: (method: string) => boolean
 } = {}) {
   const configGetResults = [...(options.configGetResults ?? [{}])]
   const routingGetResults = [...(options.routingGetResults ?? [])]
   const patchResults = [...(options.patchResults ?? [])]
-  const eventHandlers = new Map<string, (payload: unknown) => void>()
-  const waitForConnection = vi.fn(async () => {})
+  const ready = vi.fn(async () => {})
+  let routingChangedListener: ((snapshot: ModelRoutingSnapshot) => void) | null = null
+  const subscribeChanged = vi.fn((listener: (snapshot: ModelRoutingSnapshot) => void) => {
+    routingChangedListener = listener
+    return {
+      close() {
+        if (routingChangedListener === listener) routingChangedListener = null
+      },
+    }
+  })
   const setGlobalElevatedMode = vi.fn()
   const loadCurrentSessionUsage = vi.fn()
   const call = vi.fn(async (method: string, _params?: Record<string, unknown>): Promise<unknown> => {
@@ -34,6 +70,12 @@ function createHarness(options: {
       return await Promise.resolve(result)
     }
     if (method === 'models.routing.get') {
+      if (options.hasRpcMethod?.('models.routing.get') === false) {
+        throw new ProviderConfigurationError(
+          'unsupported',
+          'Model routing is unsupported.',
+        )
+      }
       const result = routingGetResults.shift()
       if (result === undefined) throw new Error('canonical routing unavailable')
       if (result instanceof Error) throw result
@@ -47,24 +89,48 @@ function createHarness(options: {
     }
     throw new Error(`Unexpected RPC method: ${method}`)
   })
-  const rpc = {
-    waitForConnection,
-    call: call as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
-    on: vi.fn((event: string, handler: (payload: unknown) => void) => {
-      eventHandlers.set(event, handler)
-      return () => eventHandlers.delete(event)
-    }),
-  }
+  const rpcRequest = call as unknown as (
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<unknown>
   const api = useChatFeatureToggles({
-    rpc,
-    readCallOptions: options.readCallOptions,
+    appSettings: {
+      readAll: vi.fn(async () => {
+        return await rpcRequest('config.get', undefined, options.readCallOptions) as import('@/modules/appSettings').SettingsObject
+      }),
+      read: vi.fn(async () => null),
+      readEffective: vi.fn(async () => ({ fields: {} })),
+      patch: vi.fn(async () => ({})),
+      patchSafe: vi.fn(async (changes: readonly { path: string; value: unknown }[]) => {
+        const patches = Object.fromEntries(changes.map(change => [change.path, change.value]))
+        await call('config.patch.safe', { patches })
+        return {}
+      }),
+      merge: vi.fn(async () => ({})),
+      setTelemetryConsent: vi.fn(async (scope, enabled) => ({
+        scope,
+        enabled,
+        noticeVersion: enabled ? `${scope}-v1` : null,
+        consentedAtUtc: enabled ? '2026-09-03T00:00:00Z' : null,
+      })),
+    },
+    modelRouting: {
+      get: vi.fn(async () => await rpcRequest('models.routing.get', undefined, options.readCallOptions) as import('@/modules/providerConfiguration').ModelRoutingSnapshot),
+      setRouting: vi.fn(async (mode: string) => {
+        await rpcRequest('models.routing.set', { mode })
+        return { mode: mode as import('@/modules/providerConfiguration').RoutingMode }
+      }),
+      subscribeChanged,
+    },
+    readOptions: options.readCallOptions,
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   })
   return {
     api,
-    rpc: { waitForConnection, call, on: rpc.on },
-    emit: (event: string, payload: unknown) => eventHandlers.get(event)?.(payload),
+    rpc: { ready, call, subscribeChanged },
+    emitRouting: (snapshot: ModelRoutingSnapshot) => routingChangedListener?.(snapshot),
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   }
@@ -98,14 +164,6 @@ describe('useChatFeatureToggles coding mode', () => {
     await api.loadFeatureToggles()
 
     expect(api.codingModeEnabled.value).toBe(true)
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
-      2_000,
-      undefined,
-      {
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
-      },
-    )
     expect(rpc.call).toHaveBeenCalledWith(
       'config.get',
       undefined,
@@ -295,6 +353,53 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.modelRoutingMode.value).toBe('off')
   })
 
+  it('allows capability degradation while preserving real Gateway blocks', async () => {
+    const degraded = createHarness({
+      configGetResults: [{}],
+      routingGetResults: [{
+        mode: 'direct',
+        image_input: {
+          admission: 'blocked',
+          reason: 'model_vision_unsupported',
+        },
+      }],
+    })
+    await degraded.api.loadFeatureToggles()
+    expect(degraded.api.globalImageInputAdmission.value).toBe('allowed')
+    expect(degraded.api.globalImageInputAdmissionReason.value).toBe('model_vision_unsupported')
+
+    const policyBlocked = createHarness({
+      configGetResults: [{}],
+      routingGetResults: [{
+        mode: 'direct',
+        image_input: {
+          admission: 'blocked',
+          reason: 'attachment_policy_denied',
+        },
+      }],
+    })
+    await policyBlocked.api.loadFeatureToggles()
+    expect(policyBlocked.api.globalImageInputAdmission.value).toBe('blocked')
+    expect(policyBlocked.api.globalImageInputAdmissionReason.value).toBe('attachment_policy_denied')
+
+    const legacyDirect = createHarness({
+      configGetResults: [{ llm_ensemble: { enabled: false } }],
+      routingGetResults: [{ mode: 'direct' }],
+    })
+    await legacyDirect.api.loadFeatureToggles()
+    expect(legacyDirect.api.globalImageInputAdmission.value).toBe('unknown')
+
+    const legacyEnsemble = createHarness({
+      configGetResults: [{ llm_ensemble: { enabled: true } }],
+      routingGetResults: [{ mode: 'ensemble' }],
+    })
+    await legacyEnsemble.api.loadFeatureToggles()
+    expect(legacyEnsemble.api.globalImageInputAdmission.value).toBe('allowed')
+    expect(legacyEnsemble.api.globalImageInputAdmissionReason.value).toBe(
+      'ensemble_mode_unsupported',
+    )
+  })
+
   it('applies Gateway routing changes live and unsubscribes on cleanup', async () => {
     vi.stubGlobal('document', {
       visibilityState: 'visible',
@@ -305,17 +410,282 @@ describe('useChatFeatureToggles model routing mode', () => {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
     })
-    const { api, rpc, emit } = createHarness()
+    const { api, rpc, emitRouting } = createHarness()
     const cleanup = api.bindFeatureRefresh()
 
-    emit('models.routing.changed', { mode: 'ensemble', selection_mode: 'router_dynamic' })
+    emitRouting({ mode: 'ensemble', selection_mode: 'router_dynamic' })
     expect(api.modelRoutingMode.value).toBe('llm_ensemble')
     expect(api.llmEnsembleSelectionMode.value).toBe('router_dynamic')
 
+    emitRouting({
+      mode: 'router',
+      image_input: {
+        admission: 'allowed',
+        reason: 'router_image_route_available',
+      },
+    })
+    expect(api.globalImageInputAdmission.value).toBe('allowed')
+
     cleanup()
-    expect(rpc.on).toHaveBeenCalledWith('models.routing.changed', expect.any(Function))
-    emit('models.routing.changed', { mode: 'direct' })
+    expect(rpc.subscribeChanged).toHaveBeenCalledWith(expect.any(Function))
+    emitRouting({ mode: 'direct' })
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+  })
+
+  it('atomically applies a complete capability matrix', async () => {
+    const { api } = createHarness({
+      configGetResults: [{}],
+      routingGetResults: [{
+        mode: 'ensemble',
+        image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+        capabilities_by_mode: CAPABILITIES_BY_MODE,
+      }],
+    })
+
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+    expect(api.globalImageInputAdmission.value).toBe('allowed')
+  })
+
+  it('clears the whole matrix when a later snapshot is missing or partial', async () => {
+    const { api } = createHarness({
+      configGetResults: [{}, {}, {}],
+      routingGetResults: [
+        {
+          mode: 'ensemble',
+          image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+          capabilities_by_mode: CAPABILITIES_BY_MODE,
+        },
+        {
+          mode: 'ensemble',
+          image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+          capabilities_by_mode: {
+            direct: CAPABILITIES_BY_MODE.direct,
+            ensemble: CAPABILITIES_BY_MODE.ensemble,
+          },
+        },
+        {
+          mode: 'ensemble',
+          image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+        },
+      ],
+    })
+
+    await api.loadFeatureToggles()
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+
+    await api.loadFeatureToggles()
+    expect(api.modelRoutingCapabilitiesByMode.value).toBeNull()
+
+    await api.loadFeatureToggles()
+    expect(api.modelRoutingCapabilitiesByMode.value).toBeNull()
+  })
+
+  it('normalizes capability limits in the per-mode matrix while retaining policy blocks', async () => {
+    const { api } = createHarness({
+      configGetResults: [{}],
+      routingGetResults: [{
+        mode: 'direct',
+        capabilities_by_mode: {
+          direct: {
+            image_input: { admission: 'blocked', reason: 'model_vision_unsupported' },
+          },
+          router: {
+            image_input: { admission: 'blocked', reason: 'attachment_policy_denied' },
+          },
+          ensemble: CAPABILITIES_BY_MODE.ensemble,
+        },
+      }],
+    })
+
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual({
+      direct: {
+        image_input: { admission: 'allowed', reason: 'model_vision_unsupported' },
+      },
+      router: {
+        image_input: { admission: 'blocked', reason: 'attachment_policy_denied' },
+      },
+      ensemble: EFFECTIVE_CAPABILITIES_BY_MODE.ensemble,
+    })
+  })
+
+  it('does not let a late routing GET overwrite a newer changed event', async () => {
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    vi.stubGlobal('window', {
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const pending = deferred<Record<string, unknown>>()
+    const { api, emitRouting, rpc } = createHarness({
+      configGetResults: [{}],
+      routingGetResults: [pending.promise],
+    })
+    const cleanup = api.bindFeatureRefresh()
+    const load = api.loadFeatureToggles()
+    await vi.waitFor(() => {
+      expect(rpc.call.mock.calls.filter(([method]) => method === 'models.routing.get')).toHaveLength(1)
+    })
+
+    emitRouting({
+      mode: 'router',
+      image_input: CAPABILITIES_BY_MODE.router.image_input,
+      capabilities_by_mode: CAPABILITIES_BY_MODE,
+    })
+    pending.resolve({
+      mode: 'ensemble',
+      image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+      capabilities_by_mode: CAPABILITIES_BY_MODE,
+    })
+    await load
+
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(api.globalImageInputAdmission.value).toBe('allowed')
+    cleanup()
+  })
+
+  it('only applies the latest overlapping routing GET', async () => {
+    const first = deferred<Record<string, unknown>>()
+    const second = deferred<Record<string, unknown>>()
+    const { api, rpc } = createHarness({
+      configGetResults: [{}, {}],
+      routingGetResults: [first.promise, second.promise],
+    })
+    const firstLoad = api.loadFeatureToggles()
+    await vi.waitFor(() => {
+      expect(rpc.call.mock.calls.filter(([method]) => method === 'models.routing.get')).toHaveLength(1)
+    })
+    const secondLoad = api.loadFeatureToggles()
+    await vi.waitFor(() => {
+      expect(rpc.call.mock.calls.filter(([method]) => method === 'models.routing.get')).toHaveLength(2)
+    })
+
+    second.resolve({
+      mode: 'router',
+      image_input: CAPABILITIES_BY_MODE.router.image_input,
+      capabilities_by_mode: CAPABILITIES_BY_MODE,
+    })
+    await secondLoad
+    first.resolve({
+      mode: 'ensemble',
+      image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
+      capabilities_by_mode: CAPABILITIES_BY_MODE,
+    })
+    await firstLoad
+
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(api.globalImageInputAdmission.value).toBe('allowed')
+  })
+
+  it('does not let an older overlapping config response overwrite the latest refresh', async () => {
+    const firstConfig = deferred<Record<string, unknown>>()
+    const { api, rpc } = createHarness({
+      configGetResults: [
+        firstConfig.promise,
+        {
+          skills: { coding_mode: false },
+          squilla_router: { enabled: true, rollout_phase: 'full' },
+        },
+      ],
+      routingGetResults: [{
+        mode: 'router',
+        image_input: CAPABILITIES_BY_MODE.router.image_input,
+        capabilities_by_mode: CAPABILITIES_BY_MODE,
+      }],
+    })
+    const firstLoad = api.loadFeatureToggles()
+    await vi.waitFor(() => {
+      expect(rpc.call.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+    })
+
+    await api.loadFeatureToggles()
+    firstConfig.resolve({
+      skills: { coding_mode: true },
+      llm_ensemble: { enabled: true },
+    })
+    await firstLoad
+
+    expect(api.codingModeEnabled.value).toBe(false)
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+  })
+
+  it('clears a prior canonical matrix when the connected Gateway lacks routing RPC', async () => {
+    let supportsRouting = true
+    const { api } = createHarness({
+      configGetResults: [
+        {},
+        { llm_ensemble: { enabled: true } },
+      ],
+      routingGetResults: [
+        {
+          mode: 'router',
+          image_input: CAPABILITIES_BY_MODE.router.image_input,
+          capabilities_by_mode: CAPABILITIES_BY_MODE,
+        },
+      ],
+      hasRpcMethod: method => method !== 'models.routing.get' || supportsRouting,
+    })
+
+    await api.loadFeatureToggles()
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+
+    supportsRouting = false
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingCapabilitiesByMode.value).toBeNull()
     expect(api.modelRoutingMode.value).toBe('llm_ensemble')
+    expect(api.globalImageInputAdmission.value).toBe('allowed')
+    expect(api.globalImageInputAdmissionReason.value).toBe('ensemble_mode_unsupported')
+  })
+
+  it('preserves the last canonical matrix on a transient routing RPC failure', async () => {
+    const { api } = createHarness({
+      configGetResults: [
+        {},
+        { llm_ensemble: { enabled: true } },
+      ],
+      routingGetResults: [
+        {
+          mode: 'router',
+          image_input: CAPABILITIES_BY_MODE.router.image_input,
+          capabilities_by_mode: CAPABILITIES_BY_MODE,
+        },
+        Object.assign(new Error('routing request timed out'), { code: 'RPC_TIMEOUT' }),
+      ],
+    })
+
+    await api.loadFeatureToggles()
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(api.globalImageInputAdmission.value).toBe('allowed')
+  })
+
+  it('refreshes the capability matrix when the chat reconnects', () => {
+    const watcherStart = chatViewSource.indexOf('// Hello refreshes method capabilities on reconnect')
+    const watcherEnd = chatViewSource.indexOf('watch(shareableMessageCount', watcherStart)
+    const reconnectWatcher = chatViewSource.slice(watcherStart, watcherEnd)
+
+    expect(watcherStart).toBeGreaterThanOrEqual(0)
+    expect(watcherEnd).toBeGreaterThan(watcherStart)
+    expect(reconnectWatcher).toContain('pendingFeatureToggleRefresh = true')
+    expect(reconnectWatcher).toContain('flushSessionOptionalReads()')
+    const flushStart = chatViewSource.indexOf('function flushSessionOptionalReads()')
+    const flushEnd = chatViewSource.indexOf('function scheduleSessionOptionalReads(', flushStart)
+    const admittedRefresh = chatViewSource.slice(flushStart, flushEnd)
+    expect(flushStart).toBeGreaterThanOrEqual(0)
+    expect(flushEnd).toBeGreaterThan(flushStart)
+    expect(admittedRefresh).toContain('if (!optionalSessionRpcAllowed.value) return')
+    expect(admittedRefresh).toContain('if (pendingFeatureToggleRefresh) {')
+    expect(admittedRefresh).toContain('if (postBootstrapMetadataStarted) void loadFeatureToggles()')
   })
 
   it.each([
@@ -334,6 +704,35 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.modelRoutingMode.value).toBe(mode)
     expect(api.routerEnabled.value).toBe(routerActive)
     expect(api.llmEnsembleEnabled.value).toBe(ensembleActive)
+  })
+
+  it('maps tier-scoped ensemble execution independently from the global mode', async () => {
+    const { api } = createHarness({
+      configGetResults: [{
+        squilla_router: {
+          enabled: true,
+          rollout_phase: 'full',
+          tiers: {
+            c2: {
+              model: 'z-ai/glm-5.2',
+              ensemble_selection_mode: 'router_dynamic',
+            },
+            c3: {
+              model: 'anthropic/claude-opus-4.8',
+              ensemble_enabled: false,
+              ensemble_selection_mode: 'router_dynamic',
+            },
+          },
+        },
+        llm_ensemble: { enabled: false },
+      }],
+    })
+
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(api.routerTierConfigs.value.c2?.ensembleEnabled).toBe(true)
+    expect(api.routerTierConfigs.value.c3?.ensembleEnabled).toBe(false)
   })
 
   it.each<[ModelRoutingMode, string]>([
@@ -418,8 +817,8 @@ describe('useChatFeatureToggles model routing mode', () => {
     const setterEnd = source.indexOf('function bindFeatureRefresh', setterStart)
     const setterSource = source.slice(setterStart, setterEnd)
 
-    expect(setterSource).toContain("options.rpc.call('models.routing.set'")
-    expect(setterSource).not.toContain("options.rpc.call('config.patch.safe'")
+    expect(setterSource).toContain('options.modelRouting.setRouting')
+    expect(source).toContain('options.appSettings.patchSafe')
     expect(setterSource).not.toMatch(/localStorage|sessionStorage/)
   })
 })

@@ -7,7 +7,7 @@ import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import { useChatTextRendering } from './useChatTextRendering'
-import { buildShareDom } from './useChatShareExport'
+import { buildShareDom, staticAssetUrl } from './useChatShareExport'
 
 describe('buildShareDom protocol-shaped documentation', () => {
   it('clones the complete rendered message into the share image stage', () => {
@@ -67,6 +67,40 @@ describe('buildShareDom protocol-shaped documentation', () => {
 
     expect(stage.querySelector('.tool-timeline__toolbar')).toBeNull()
     expect(stage.querySelector('.tool-row-body')?.textContent).toBe('tool output')
+  })
+
+  it('removes turn usage details from the static share image', () => {
+    const source = document.createElement('article')
+    source.dataset.shareMessageId = 'assistant-usage'
+    source.innerHTML = [
+      '<div data-share-activity data-share-expanded="true">',
+      '<button data-share-activity-label data-share-control>Completed · 2s</button>',
+      '<div data-share-activity-body>',
+      '<div class="turn-usage-details">model-a · 321 input tokens</div>',
+      '<div data-turn-usage-details>reasoning 45 · $0.0012</div>',
+      '<div class="msg-ai-meta"><button class="msg-meta__more">Usage details</button></div>',
+      '<div class="tool-row-body">Kept activity output</div>',
+      '</div>',
+      '</div>',
+      '<div class="msg-meta__more">Legacy usage trigger</div>',
+      '<div class="msg-meta__cost">$0.0012</div>',
+      '<div class="msg-ai-text">Canonical answer</div>',
+    ].join('')
+
+    const stage = buildShareDom([source])
+
+    expect(stage.querySelector('.turn-usage-details')).toBeNull()
+    expect(stage.querySelector('[data-turn-usage-details]')).toBeNull()
+    expect(stage.querySelector('.msg-ai-meta')).toBeNull()
+    expect(stage.querySelector('.msg-meta__more')).toBeNull()
+    expect(stage.querySelector('.msg-meta__cost')).toBeNull()
+    expect(stage.textContent).toContain('Kept activity output')
+    expect(stage.textContent).toContain('Canonical answer')
+    expect(stage.textContent).not.toContain('model-a')
+    expect(stage.textContent).not.toContain('321 input tokens')
+    expect(stage.textContent).not.toContain('reasoning 45')
+    expect(stage.textContent).not.toContain('$0.0012')
+    expect(stage.textContent).not.toContain('Legacy usage trigger')
   })
 
   it('omits collapsed execution activity while keeping the canonical answer', () => {
@@ -221,6 +255,34 @@ describe('share export label localization', () => {
 
     expect(stage.querySelector('.chat-share-export-activity__label')?.textContent).toBe('活动')
     expect(stage.querySelector('.chat-share-export-thinking__label')?.textContent).toBe('思考中')
+  })
+})
+
+describe('share export static asset URLs', () => {
+  afterEach(() => {
+    document.getElementById('opensquilla-data')?.remove()
+  })
+
+  it('keeps Desktop root assets on the current origin', () => {
+    const data = document.createElement('div')
+    data.id = 'opensquilla-data'
+    data.dataset.basePath = '/'
+    document.body.appendChild(data)
+
+    const assetUrl = staticAssetUrl('img/QRcode.png')
+    expect(assetUrl).toBe('/static/img/QRcode.png')
+    expect(new URL(assetUrl, 'opensquilla-app://desktop/chat/new').href)
+      .toBe('opensquilla-app://desktop/static/img/QRcode.png')
+  })
+
+  it('preserves a trailing-slash gateway base path', () => {
+    const data = document.createElement('div')
+    data.id = 'opensquilla-data'
+    data.dataset.basePath = '/control/'
+    document.body.appendChild(data)
+
+    expect(staticAssetUrl('/img/opensquilla-mark.png'))
+      .toBe('/control/static/img/opensquilla-mark.png')
   })
 })
 

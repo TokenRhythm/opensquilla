@@ -19,6 +19,19 @@ corpus through the current code and compares the canonical JSON
 serialization (sorted keys, ``_ts`` monotonic timestamps scrubbed) of each
 observation against that golden.
 
+The large-context cases were intentionally recaptured for Issue #976 after
+the capacity floor became a hard lower bound for physical fallback. Their
+goldens therefore include the sanitized floor tier and omit fallback models
+below it; the remaining corpus still pins the original extraction parity.
+
+The image-bypass cases were intentionally recaptured for the configured-only
+multimodal policy. Router now evaluates only c0-c3, treats omitted capability
+as probeable, prefers proven support, and never executes the legacy
+``image_model`` row. Their goldens pin the strict configured fallback chain
+and image projection metadata. Active image history no longer relies on a
+selection gate or sets a separate history turn limit; non-attachment cases retain their prior
+byte-identical behavior.
+
 Classifier outputs are injected through a fake strategy: the corpus never
 loads the LightGBM/ONNX bundle, touches the network, or needs credentials.
 All tier/model/provider names and messages are synthetic dummy data; tier
@@ -42,6 +55,8 @@ import pytest
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.steps import squilla_router as squilla_router_step
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.provider import model_catalog as model_catalog_module
+from opensquilla.provider.model_catalog import ModelCatalog
 
 GOLDEN_PATH = Path(__file__).parent / "goldens" / "routing_policy_parity_golden.json"
 
@@ -227,8 +242,8 @@ def build_corpus() -> list[Case]:
     )
     cases.append(
         Case(
-            name="image_gate_history_bypass",
-            metadata={"router_vision_followup_needs_image": True},
+            name="image_active_history_bypass",
+            metadata={"image_context_has_images": True},
             classify_expected=False,
         )
     )
@@ -242,7 +257,7 @@ def build_corpus() -> list[Case]:
     )
     cases.append(
         Case(
-            name="image_without_image_tier_errors",
+            name="image_without_legacy_image_tier_uses_c_ladder",
             tiers={k: v for k, v in synthetic_tiers().items() if k != "image_model"},
             attachments=[{"type": "image/png"}],
             classify_expected=False,
@@ -713,6 +728,24 @@ def run_case(case: Case) -> dict:
         strategy = _UnexpectedClassifyStrategy()
 
     original_get_strategy = sr._get_strategy
+    original_catalog = model_catalog_module._shared_catalog
+    capacity_catalog = ModelCatalog()
+    capacity_catalog.set_user_overrides(
+        {
+            model: {
+                "context_window": 300_000,
+                "max_output_tokens": 10_000,
+            }
+            for model in (
+                "dummy-nano-1",
+                "dummy-mini-1",
+                "dummy-pro-1",
+                "dummy-max-1",
+                "dummy-vision-1",
+            )
+        }
+    )
+    model_catalog_module._shared_catalog = capacity_catalog
     sr._get_strategy = lambda _config: strategy  # type: ignore[assignment]
     error: str | None = None
     try:
@@ -721,6 +754,7 @@ def run_case(case: Case) -> dict:
         error = f"{type(exc).__name__}: {exc}"
     finally:
         sr._get_strategy = original_get_strategy  # type: ignore[assignment]
+        model_catalog_module._shared_catalog = original_catalog
         sr._history_store.clear()
 
     return observation(ctx, error)

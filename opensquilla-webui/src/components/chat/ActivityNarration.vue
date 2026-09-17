@@ -3,6 +3,10 @@
     v-if="shouldFold"
     class="activity-narration activity-narration--folded"
     :class="{ 'activity-narration--technical': technical }"
+    data-activity-entry="true"
+    data-activity-type="segment"
+    :data-activity-id="item.key"
+    :data-activity-order="item.activityOrder"
   >
     <summary class="activity-narration__summary">
       <Icon
@@ -23,6 +27,10 @@
   <div
     v-else
     class="activity-narration activity-narration--plain"
+    data-activity-entry="true"
+    data-activity-type="segment"
+    :data-activity-id="item.key"
+    :data-activity-order="item.activityOrder"
     v-html="item.html"
   />
 </template>

@@ -125,6 +125,14 @@ def test_matching_llm_key_does_not_configure_image_generation_until_enabled(monk
     s = get_onboarding_status(cfg)
     assert s.image_generation_configured is False
     assert s.image_generation_enabled is False
+    assert s.image_generation_state["mode"] == "unconfigured"
+    assert s.image_generation_state["operatorManaged"] is False
+    assert s.image_generation_state["recommendation"] == {
+        "providerId": "openrouter",
+        "reason": "active_llm_provider",
+        "canReuseCredential": True,
+        "actionRequired": True,
+    }
     assert s.image_generation_source == "none"
     assert s.image_generation_provider == ""
 
@@ -145,6 +153,173 @@ def test_enabled_image_generation_can_use_matching_llm_key(monkeypatch):
     assert s.image_generation_enabled is True
     assert s.image_generation_source == "llm_fallback"
     assert s.image_generation_provider == "openrouter"
+    assert s.image_generation_state["effective"]["providerId"] == "openrouter"
+
+
+def test_image_generation_reuses_a_demoted_tokenrhythm_profile(monkeypatch):
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key": "synthetic-profile-key",
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+        image_generation={
+            "enabled": True,
+            "binding": "custom",
+            "primary": "tokenrhythm/qwen-image-2.0",
+        },
+    )
+
+    status = get_onboarding_status(cfg)
+    option = next(
+        item
+        for item in status.image_generation_state["credentialOptions"]
+        if item["providerId"] == "tokenrhythm"
+    )
+
+    assert status.image_generation_source == "llm_fallback"
+    assert status.image_generation_state["effective"]["credentialOwner"] == "profile"
+    assert option == {
+        "providerId": "tokenrhythm",
+        "available": True,
+        "source": "llm_fallback",
+        "owner": "profile",
+        "kind": "direct",
+        "envKey": "",
+        "reason": "ready",
+    }
+
+
+def test_explicit_missing_image_env_does_not_fall_back_to_profile(monkeypatch):
+    monkeypatch.delenv("MISSING_IMAGE_ONLY_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "api_key": "synthetic-profile-key",
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+        image_generation={
+            "enabled": True,
+            "primary": "tokenrhythm/qwen-image-2.0",
+            "providers": {
+                "tokenrhythm": {"api_key_env": "MISSING_IMAGE_ONLY_KEY"}
+            },
+        },
+    )
+
+    status = get_onboarding_status(cfg)
+    option = next(
+        item
+        for item in status.image_generation_state["credentialOptions"]
+        if item["providerId"] == "tokenrhythm"
+    )
+
+    assert status.image_generation_source == "missing_env"
+    assert option["available"] is False
+    assert option["owner"] == "image"
+    assert option["reason"] == "image_env_missing"
+
+
+def test_explicit_default_image_env_does_not_fall_back_to_profile(monkeypatch):
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "api_key": "synthetic-profile-key",
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+        image_generation={
+            "enabled": True,
+            "primary": "tokenrhythm/qwen-image-2.0",
+            "providers": {
+                "tokenrhythm": {"api_key_env": "TOKENRHYTHM_API_KEY"}
+            },
+        },
+    )
+
+    status = get_onboarding_status(cfg)
+    option = next(
+        item
+        for item in status.image_generation_state["credentialOptions"]
+        if item["providerId"] == "tokenrhythm"
+    )
+
+    assert status.image_generation_source == "missing_env"
+    assert option["available"] is False
+    assert option["owner"] == "image"
+    assert option["envKey"] == "TOKENRHYTHM_API_KEY"
+    assert option["reason"] == "image_env_missing"
+
+
+def test_legacy_default_image_route_reports_effective_tokenrhythm_provider(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig()
+    cfg.llm = LlmProviderConfig(
+        provider="tokenrhythm",
+        model="deepseek-v4-flash",
+        api_key="synthetic-tokenrhythm-key",
+        base_url="https://tokenrhythm.studio/v1",
+    )
+    cfg.image_generation.enabled = True
+
+    status = get_onboarding_status(cfg)
+
+    assert status.image_generation_provider == "tokenrhythm"
+    assert status.image_generation_source == "llm_fallback"
+    assert status.image_generation_state["effective"]["providerId"] == "tokenrhythm"
+
+
+def test_other_active_llm_keeps_tokenrhythm_as_non_intrusive_image_recommendation(
+    monkeypatch,
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "api_key": "synthetic-llm-key",
+        },
+        image_generation={
+            "enabled": True,
+            "binding": "custom",
+            "primary": "openai/gpt-image-1",
+            "providers": {"openai": {"api_key": "synthetic-image-key"}},
+        },
+    )
+
+    recommendation = get_onboarding_status(cfg).image_generation_state["recommendation"]
+
+    assert recommendation == {
+        "providerId": "tokenrhythm",
+        "reason": "recommended_standalone",
+        "canReuseCredential": False,
+        "actionRequired": False,
+    }
 
 
 def test_image_generation_disabled_is_not_configured():

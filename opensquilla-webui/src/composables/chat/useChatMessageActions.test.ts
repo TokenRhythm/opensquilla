@@ -5,8 +5,14 @@ import { nextTick, ref } from 'vue'
 
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
-import type { ChatMessage, ChatRenderedMessage } from '@/types/chat'
+import type {
+  ChatMessage,
+  ChatRenderedMessage,
+  ChatTurnOutcome,
+  DisplayAttachment,
+} from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
+import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 
 vi.mock('@/utils/browser', () => ({
   copyTextWithFallback: vi.fn().mockResolvedValue(undefined),
@@ -24,9 +30,40 @@ function renderedMessage(overrides: Partial<ChatRenderedMessage>): ChatRenderedM
   }
 }
 
+function safeUsageOutcome(
+  turnId: string,
+  userMessageId = 'msg-user',
+): ChatTurnOutcome {
+  return {
+    turnId,
+    status: 'failed',
+    errorClass: 'usage_accounting_busy',
+    retryable: true,
+    usageCallIndex: 1,
+    noPriorProviderDispatch: true,
+    replaySafe: true,
+    userMessageId,
+  }
+}
+
+function displayAttachment(kind: DisplayAttachment['kind']): DisplayAttachment {
+  return {
+    kind,
+    displayId: `history:${kind}`,
+    renderKey: `history:${kind}`,
+    name: `${kind}.txt`,
+    mime: 'text/plain',
+    ...(kind === 'inline' ? { downloadData: 'cmVxdWVzdA==' } : {}),
+    ...(kind === 'staged' ? { sha256_ref: 'a'.repeat(64) } : {}),
+  }
+}
+
 function makeOptions(
   messages: ChatMessage[],
-  sanitizeCopyText: (text: string) => string = text => text,
+  sanitizeCopyText: (
+    text: string,
+    opts?: { assistantBoundary?: boolean },
+  ) => string = text => text,
   aiGeneratedLabel?: () => string,
 ) {
   const pendingForkBeforeMessageId = ref<string | null>(null)
@@ -38,6 +75,7 @@ function makeOptions(
     stripTimePrefix: text => text,
     autoResizeTextarea: vi.fn(),
     sendCurrentInput: vi.fn(),
+    sendUsageBarrierReplay: vi.fn(async () => true),
     focusComposer: vi.fn(),
     pendingForkBeforeMessageId,
     aiGeneratedLabel,
@@ -75,6 +113,235 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.focusComposer).toHaveBeenCalledOnce()
   })
 
+  it('puts the transcript and the draft back when the edit is cancelled', () => {
+    // #1372: entering edit mode empties the transcript on the first click.
+    // Without a way back, Escape cleared the composer and left the empty state
+    // on screen, which reads as the conversation having been deleted.
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+    options.inputText.value = 'half-written draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+
+    expect(api.cancelEdit()).toBe(true)
+
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'B', 'ack B',
+    ])
+    // The draft the edit overwrote is part of what was lost, so it comes back
+    // too rather than the composer being left holding the edited message.
+    expect(options.inputText.value).toBe('half-written draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+  })
+
+  it('reports nothing to cancel when no edit is in flight', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ])
+    options.inputText.value = 'just a draft'
+
+    // Escape distinguishes the two: a false here is what lets it fall through
+    // to clearing the composer instead of swallowing the key.
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.inputText.value).toBe('just a draft')
+    expect(options.messages.value.map(message => message.text)).toEqual(['A'])
+  })
+
+  it('cancels only once, so a later Escape cannot resurrect the transcript', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    expect(api.cancelEdit()).toBe(true)
+    options.messages.value = [{ role: 'user', text: 'sent since', ts: null, messageId: 'msg-C' }]
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['sent since'])
+  })
+
+  it('does not restore while the fork id has been consumed', () => {
+    // A send consumes the fork id before admission. Cancellation must remain
+    // unavailable until a rejected send restores that id.
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 2,
+      messageId: 'msg-B',
+      text: 'B',
+    }))
+    pendingForkBeforeMessageId.value = null
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+  })
+
+  it('restores the original transcript and draft after consecutive unsubmitted edits', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
+    ])
+
+    options.inputText.value = 'half-written draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 0, messageId: 'msg-A', text: 'A',
+    }))
+
+    expect(pendingForkBeforeMessageId.value).toBe('msg-A')
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'B', 'ack B',
+    ])
+    expect(options.inputText.value).toBe('half-written draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(api.cancelEdit()).toBe(false)
+  })
+
+  it.each([null, 'msg-other'])('keeps the restore point while the fork id is %s', (forkId) => {
+    // Escape consults `cancelEdit` on every press now, so a press made while
+    // the frame is unusable must not spend the undo: the fork id can come back
+    // (a rejected send restores its own attempt), and the user still has only
+    // this one exit.
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    pendingForkBeforeMessageId.value = forkId
+    expect(api.cancelEdit()).toBe(false)
+
+    pendingForkBeforeMessageId.value = 'msg-B'
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
+  })
+
+  it('leaves composer text the edit did not put there', () => {
+    // Between the edit and the Escape the composer can pick up text that is
+    // not the edited message — a pending item popped back with Alt+ArrowUp, a
+    // draft recovered from a rejected send. That text is the user's, and
+    // restoring the pre-edit draft over it would destroy it.
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    options.inputText.value = 'older draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    expect(options.inputText.value).toBe('B')
+    options.inputText.value = 'popped off the queue'
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
+    expect(options.inputText.value).toBe('popped off the queue')
+  })
+
+  it.each(['', 'replacement draft'])(
+    'preserves newer composer content after consecutive edits: %j',
+    replacement => {
+      const { api, options } = makeOptions([
+        { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+        { role: 'assistant', text: 'ack A', ts: null },
+        { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      ])
+      options.inputText.value = 'original draft'
+      api.editMessage(renderedMessage({ sourceIndex: 2, messageId: 'msg-B' }))
+      api.editMessage(renderedMessage({ sourceIndex: 0, messageId: 'msg-A' }))
+      options.inputText.value = replacement
+
+      expect(api.cancelEdit()).toBe(true)
+      expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
+      expect(options.inputText.value).toBe(replacement)
+    },
+  )
+
+  it('keeps cancellation unavailable during streaming without spending the restore point', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ])
+    api.editMessage(renderedMessage({ sourceIndex: 0, messageId: 'msg-A' }))
+    options.isStreaming.value = true
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value).toEqual([])
+    options.isStreaming.value = false
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value[0]?.messageId).toBe('msg-A')
+  })
+
+  it('discards the old restore point when leaving a session', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ])
+    api.editMessage(renderedMessage({ sourceIndex: 0, messageId: 'msg-A' }))
+    api.discardEditRestorePoint()
+    options.messages.value = [{ role: 'user', text: 'another session', ts: null }]
+    options.inputText.value = 'another draft'
+    pendingForkBeforeMessageId.value = 'msg-A'
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value[0]?.text).toBe('another session')
+    expect(options.inputText.value).toBe('another draft')
+  })
+
+  it('starts a new restore point after the previous edit has been sent', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    api.editMessage(renderedMessage({ sourceIndex: 2, messageId: 'msg-B' }))
+    pendingForkBeforeMessageId.value = null
+    const submitted: ChatMessage[] = [
+      ...options.messages.value,
+      { role: 'user', text: 'revised B', ts: null, messageId: 'msg-revised-B' },
+    ]
+    options.messages.value = submitted
+    options.inputText.value = 'new draft'
+    api.editMessage(renderedMessage({ sourceIndex: 0, messageId: 'msg-A' }))
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value).toEqual(submitted)
+    expect(options.inputText.value).toBe('new draft')
+  })
+
   it('records the previous user message id before regenerating', async () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
@@ -84,7 +351,7 @@ describe('useChatMessageActions branching edits', () => {
       { role: 'user', text: 'C', ts: null, messageId: 'msg-C' },
     ])
 
-    api.regenerateMessage(renderedMessage({
+    const accepted = await api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 3,
@@ -97,6 +364,475 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
     expect(options.inputText.value).toBe('B')
     expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(accepted).toBe(true)
+  })
+
+  it('dispatches usage replay directly even when Goal/Replan blocks the composer', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      {
+        role: 'user',
+        text: 'bill this safely',
+        ts: null,
+        messageId: 'msg-user',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-1',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-1',
+      },
+    ])
+    options.inputText.value = 'unrelated draft'
+    options.canDeliver = () => false
+
+    const accepted = await api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 2,
+      messageId: 'terminal-error:task-1',
+      errorCode: 'usage_accounting_busy',
+      turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1'),
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'bill this safely',
+      forkBeforeMessageId: 'msg-user',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('unrelated draft')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(accepted).toBe(true)
+  })
+
+  it.each(['inline', 'staged', 'file'] as const)(
+    'rejects programmatic whole-turn retry when the primary request has a %s display attachment',
+    async (kind) => {
+      const messages: ChatMessage[] = [
+        {
+          role: 'user',
+          text: 'request with attachment',
+          ts: null,
+          messageId: 'msg-primary',
+          turnId: 'turn-attachment',
+          attachments: [displayAttachment(kind)],
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:attachment',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-attachment',
+        },
+      ]
+      const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+      options.inputText.value = 'unrelated draft'
+
+      const accepted = api.regenerateMessage(renderedMessage({
+        role: 'error',
+        displayRole: 'error',
+        sourceIndex: 1,
+        messageId: 'terminal-error:attachment',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-attachment',
+        turnOutcome: safeUsageOutcome('turn-attachment', 'msg-primary'),
+        text: 'Usage accounting temporarily unavailable.',
+      }))
+      await nextTick()
+
+      expect(accepted).toBe(false)
+      expect(options.messages.value).toEqual(messages)
+      expect(options.inputText.value).toBe('unrelated draft')
+      expect(pendingForkBeforeMessageId.value).toBeNull()
+      expect(options.sendUsageBarrierReplay).not.toHaveBeenCalled()
+      expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    },
+  )
+
+  it('retries the authoritative primary user instead of a later same-turn steer', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-1',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-1',
+      },
+    ])
+
+    const accepted = await api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 2,
+      messageId: 'terminal-error:task-1',
+      errorCode: 'usage_accounting_busy',
+      turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1', 'msg-primary'),
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(true)
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'primary request',
+      forkBeforeMessageId: 'msg-primary',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('blocks an unsafe usage barrier on an assistant status-only bubble', async () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = await api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      turnId: 'turn-1',
+      turnOutcome: {
+        ...safeUsageOutcome('turn-1', 'msg-primary'),
+        usageCallIndex: 2,
+        noPriorProviderDispatch: false,
+        replaySafe: false,
+      },
+      text: '',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('blocks an assistant bubble when normalized error classes conflict around a barrier', () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+    const turnOutcome = normalizeTurnOutcome({
+      turn_id: 'turn-1',
+      status: 'failed',
+      error_class: 'provider_error',
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      user_message_id: 'msg-primary',
+      outcome: {
+        error_class: 'usage_accounting_busy',
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+        user_message_id: 'msg-primary',
+      },
+    })
+
+    expect(turnOutcome).toMatchObject({
+      errorClass: 'usage_accounting_busy',
+      replaySafe: false,
+    })
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      errorCode: 'provider_error',
+      turnId: 'turn-1',
+      turnOutcome,
+      text: '',
+    }))
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('retries the exact primary from a safe assistant status-only bubble', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ])
+
+    const accepted = await api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1', 'msg-primary'),
+      text: '',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(true)
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'primary request',
+      forkBeforeMessageId: 'msg-primary',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [
+      'the current page only has a previous-turn user',
+      [
+        {
+          role: 'user',
+          text: 'previous turn',
+          ts: null,
+          messageId: 'msg-old',
+          turnId: 'turn-old',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-new',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-new',
+        },
+      ] satisfies ChatMessage[],
+      'turn-new',
+    ],
+    [
+      'the error has no durable turn id',
+      [
+        {
+          role: 'user',
+          text: 'unknown turn',
+          ts: null,
+          messageId: 'msg-user',
+          turnId: 'turn-known',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-unknown',
+          errorCode: 'usage_accounting_busy',
+        },
+      ] satisfies ChatMessage[],
+      undefined,
+    ],
+    [
+      'the same-turn user is not durable',
+      [
+        {
+          role: 'user',
+          text: 'previous durable turn',
+          ts: null,
+          messageId: 'msg-old',
+          turnId: 'turn-old',
+        },
+        {
+          role: 'user',
+          text: 'same turn but pending',
+          ts: null,
+          clientId: 'client-new',
+          turnId: 'turn-new',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-new',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-new',
+        },
+      ] satisfies ChatMessage[],
+      'turn-new',
+    ],
+  ])('fails closed when %s', async (_label, messages, turnId) => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: messages.length - 1,
+      messageId: messages[messages.length - 1]?.messageId,
+      errorCode: 'usage_accounting_busy',
+      turnId,
+      turnOutcome: safeUsageOutcome(turnId || '', 'missing-or-pending-user'),
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['missing proof', undefined],
+    ['second call', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: 2,
+    }],
+    ['string call index', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: '1',
+    } as unknown as ChatTurnOutcome],
+    ['false no-prior proof', {
+      ...safeUsageOutcome('turn-safe'),
+      noPriorProviderDispatch: false,
+    }],
+    ['false replay-safe proof', {
+      ...safeUsageOutcome('turn-safe'),
+      replaySafe: false,
+    }],
+    ['missing primary user id', {
+      ...safeUsageOutcome('turn-safe'),
+      userMessageId: undefined,
+    }],
+    ['wrong primary user id', {
+      ...safeUsageOutcome('turn-safe'),
+      userMessageId: 'msg-steer',
+    }],
+    ['conflicting second-call proof', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: 2,
+      noPriorProviderDispatch: true,
+      replaySafe: true,
+    }],
+  ])('rejects programmatic usage retry with %s', async (_label, turnOutcome) => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'do not resend without proof',
+        ts: null,
+        messageId: 'msg-user',
+        turnId: 'turn-safe',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-safe',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-safe',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 1,
+      messageId: 'terminal-error:task-safe',
+      errorCode: 'usage_accounting_busy',
+      turnId: 'turn-safe',
+      turnOutcome,
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
   })
 
   it('preserves history, fork state, and the current draft when live delivery is unavailable', async () => {
@@ -108,7 +844,7 @@ describe('useChatMessageActions branching edits', () => {
     options.inputText.value = 'unrelated draft'
     options.canDeliver = () => false
 
-    api.regenerateMessage(renderedMessage({
+    const accepted = api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 1,
@@ -122,6 +858,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.sendCurrentInput).not.toHaveBeenCalled()
     expect(options.notifyDeliveryBlocked).toHaveBeenCalledOnce()
+    expect(accepted).toBe(false)
   })
 
   it('keeps an optimistic user row intact until its durable fork id arrives', () => {
@@ -147,20 +884,45 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.notifyMessagePending).toHaveBeenCalledOnce()
   })
 
-  it('does not regenerate as a parent send when the durable fork id is missing', async () => {
+  it('blocks edit while streaming with visible feedback instead of a silent no-op', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+    options.isStreaming.value = true
+    const notifyEditBlocked = vi.fn()
+    options.notifyEditBlocked = notifyEditBlocked
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+
+    expect(options.messages.value.map(message => message.text)).toEqual(['A'])
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.focusComposer).not.toHaveBeenCalled()
+    expect(notifyEditBlocked).toHaveBeenCalledOnce()
+  })
+
+  it('accepts retry after its durable fork id is bound later', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', text: 'still saving', ts: null, clientId: 'client-only' },
       { role: 'assistant', text: 'partial answer', ts: null, messageId: 'assistant-local' },
     ]
     const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
 
-    api.regenerateMessage(renderedMessage({
+    const rendered = renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 1,
       messageId: 'assistant-local',
       text: 'partial answer',
-    }))
+    })
+    const firstAccepted = api.regenerateMessage(rendered)
     await nextTick()
 
     expect(options.messages.value).toEqual(messages)
@@ -168,6 +930,15 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.sendCurrentInput).not.toHaveBeenCalled()
     expect(options.notifyMessagePending).toHaveBeenCalledOnce()
+
+    options.messages.value[0]!.messageId = 'msg-now-durable'
+    const secondAccepted = api.regenerateMessage(rendered)
+    await nextTick()
+
+    expect(firstAccepted).toBe(false)
+    expect(secondAccepted).toBe(true)
+    expect(pendingForkBeforeMessageId.value).toBe('msg-now-durable')
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
   })
 
   it('regenerates and edits without pending feedback when ids are durable', async () => {
@@ -222,6 +993,42 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     await api.copyMessage(renderedMessage({ text: 'Keep my words unchanged.' }))
 
     expect(copyTextWithFallback).toHaveBeenCalledWith('Keep my words unchanged.')
+  })
+
+  it('copies the canonical projection without assistant boundary markers', async () => {
+    const { sanitizeCopyText } = useChatTextRendering()
+    const { api } = makeOptions([], sanitizeCopyText)
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'NO_REPLY\nBeforeNO_REPLYAfter\nHEARTBEAT_OK',
+      turnRunKind: 'goal',
+      timelineItems: [
+        { type: 'text', key: 'leading', html: '', rawText: 'NO_REPLY' },
+        { type: 'text', key: 'before', html: '', rawText: 'Before' },
+        { type: 'text', key: 'middle', html: '', rawText: 'NO_REPLY' },
+        { type: 'text', key: 'after', html: '', rawText: 'After' },
+        { type: 'text', key: 'trailing', html: '', rawText: 'HEARTBEAT_OK' },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith('BeforeNO_REPLYAfter')
+  })
+
+  it('preserves a mixed sentinel-looking boundary when copying a direct-user answer', async () => {
+    const { sanitizeCopyText } = useChatTextRendering()
+    const { api } = makeOptions([], sanitizeCopyText)
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'NO_REPLY\nLiteral explanation',
+      turnInputMode: 'user',
+      turnRunKind: 'default',
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith('NO_REPLY\nLiteral explanation')
   })
 
   it('copies the same terminal PlanRun delivery shown outside activity', async () => {
@@ -312,7 +1119,85 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     )
   })
 
-  it('copies only the terminal answer from an ordinary tool transcript', async () => {
+  it('copies only the explicit final answer after intermediate commentary', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working note.Final answer.',
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: 'Working note.',
+          rawText: 'Working note.',
+          presentation: 'intermediate',
+        },
+        {
+          type: 'text',
+          key: 'answer',
+          html: 'Final answer.',
+          rawText: 'Final answer.',
+          presentation: 'answer',
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith('Final answer.\n\nAI generated')
+  })
+
+  it('does not copy explicit intermediate-only activity as an answer', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    const copied = await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Work narration.',
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: 'Work narration.',
+          rawText: 'Work narration.',
+          presentation: 'intermediate',
+        },
+        {
+          type: 'tool-group',
+          key: 'finish',
+          group: {
+            groupId: 'finish',
+            operationKey: 'file.read',
+            label: 'Read',
+            iconName: 'edit',
+            calls: [{
+              toolId: 'finish',
+              renderKey: 'finish',
+              name: 'read_file',
+              displayName: 'Read',
+              inputRaw: '{"path":"README.md"}',
+              inputPreview: 'README.md',
+              isRunning: false,
+              status: 'success',
+              isError: false,
+              result: 'ok',
+              resultPreview: 'ok',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: false,
+            status: 'success',
+          },
+        },
+      ],
+    }))
+
+    expect(copied).toBe(false)
+    expect(copyTextWithFallback).not.toHaveBeenCalled()
+  })
+
+  it('copies the complete terminal Markdown answer from an ordinary tool transcript', async () => {
     const { api } = makeOptions([], text => text, () => 'AI generated')
 
     await api.copyMessage(renderedMessage({
@@ -359,7 +1244,77 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     }))
 
     expect(copyTextWithFallback).toHaveBeenCalledWith(
-      '## Final answer\n\nAI generated',
+      'Preparing.\n\n---\n\n## Final answer\n\nAI generated',
+    )
+  })
+
+  it('fails open to the complete visible transcript when the turn timed out', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working.Partial delivery.',
+      turnOutcome: { turnId: 'turn-timeout', status: 'timeout' },
+      timelineItems: [
+        { type: 'text', key: 'work', html: 'Working.', rawText: 'Working.' },
+        {
+          type: 'tool-group',
+          key: 'request',
+          group: {
+            groupId: 'request',
+            operationKey: 'web.read',
+            label: 'Read',
+            iconName: 'search',
+            calls: [{
+              toolId: 'request',
+              renderKey: 'request',
+              name: 'http_request',
+              displayName: 'Request',
+              inputRaw: '{}',
+              inputPreview: '',
+              isRunning: false,
+              status: 'success',
+              isError: false,
+              result: 'ok',
+              resultPreview: 'ok',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: false,
+            status: 'success',
+          },
+        },
+        {
+          type: 'text',
+          key: 'partial',
+          html: 'Partial delivery.',
+          rawText: 'Partial delivery.',
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith(
+      'Working.Partial delivery.\n\nAI generated',
+    )
+  })
+
+  it('does not add paragraph breaks when canonical text already owns spacing', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working.\n\nPartial delivery.',
+      timelineItems: [
+        { type: 'text', key: 'work', html: 'Working.', rawText: 'Working.\n\n' },
+        { type: 'text', key: 'partial', html: 'Partial delivery.', rawText: 'Partial delivery.' },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith(
+      'Working.\n\nPartial delivery.\n\nAI generated',
     )
   })
 })

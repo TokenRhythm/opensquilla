@@ -82,20 +82,36 @@ def test_enumerate_workspace_files_uses_git_ls_files_when_available(
     calls: dict[str, list[str]] = {}
 
     def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
         calls["cmd"] = cmd
         return SimpleNamespace(
-            returncode=0,
+            ok=True,
             stdout=b"src/compact.py\0src/.env\0docs/reset.md\0",
-            stderr=b"",
         )
 
-    monkeypatch.setattr(completion.shutil, "which", lambda name: "/usr/bin/git")
-    monkeypatch.setattr(completion.subprocess, "run", fake_run)
+    monkeypatch.setattr(completion, "run_git", fake_run)
 
     assert enumerate_workspace_files(tmp_path, query="cmp") == ["src/compact.py"]
     # NUL-separated output keeps non-ASCII paths verbatim (no core.quotePath
     # C-quoting), so -z is load-bearing.
     assert "-z" in calls["cmd"]
+
+
+def test_git_files_probe_repository_from_a_subdirectory_without_dot_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subdirectory = tmp_path / "src"
+    subdirectory.mkdir()
+    calls: list[Path] = []
+
+    def fake_run(_args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(Path(str(kwargs["cwd"])))
+        return SimpleNamespace(ok=True, stdout=b"module.py\0")
+
+    monkeypatch.setattr(completion, "run_git", fake_run)
+
+    assert completion._git_files(subdirectory) == ["module.py"]
+    assert calls == [subdirectory]
 
 
 def test_git_files_returns_non_ascii_paths_verbatim(
@@ -105,11 +121,10 @@ def test_git_files_returns_non_ascii_paths_verbatim(
     _touch(tmp_path / "café.md")
     _touch(tmp_path / "日本語.txt")
     stdout = "café.md".encode() + b"\0" + "日本語.txt".encode() + b"\0"
-    monkeypatch.setattr(completion.shutil, "which", lambda name: "/usr/bin/git")
     monkeypatch.setattr(
-        completion.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=stdout, stderr=b""),
+        completion,
+        "run_git",
+        lambda *args, **kwargs: SimpleNamespace(ok=True, stdout=stdout),
     )
 
     assert enumerate_workspace_files(tmp_path) == ["café.md", "日本語.txt"]
@@ -121,7 +136,6 @@ def test_git_files_tolerates_undecodable_path_bytes(
     # A non-UTF-8 filename byte (e.g. latin-1 0xE9) must never crash completion;
     # it decodes through the filesystem rules (surrogateescape) instead.
     (tmp_path / ".git").mkdir()
-    monkeypatch.setattr(completion.shutil, "which", lambda name: "/usr/bin/git")
     # Windows uses surrogatepass for filesystem decoding, which still raises
     # for this malformed UTF-8 byte. Simulate that handler on every platform so
     # the fallback remains covered outside the Windows CI job too.
@@ -131,10 +145,10 @@ def test_git_files_tolerates_undecodable_path_bytes(
         lambda entry: entry.decode("utf-8", errors="surrogatepass"),
     )
     monkeypatch.setattr(
-        completion.subprocess,
-        "run",
+        completion,
+        "run_git",
         lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=b"caf\xe9.md\0plain.txt\0", stderr=b""
+            ok=True, stdout=b"caf\xe9.md\0plain.txt\0"
         ),
     )
 

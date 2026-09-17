@@ -13,6 +13,7 @@
         <span class="artifact-preview__meta">{{ artifactFileSubtitle(artifact) }}</span>
       </span>
       <span class="artifact-preview__actions">
+        <ResourceActionsMenu :artifact="artifact" :session-key="sessionKey" :previewable="false" trigger />
         <button
           v-if="preview.kind.value !== 'unsupported'"
           type="button"
@@ -167,6 +168,7 @@
           :sandbox="htmlSandbox"
           :allow="htmlPermissions"
           referrerpolicy="no-referrer"
+          @load="onHtmlFrameLoad"
         />
         <div
           v-else-if="preview.kind.value === 'html'"
@@ -184,15 +186,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import {
-  useArtifactPreviewResource,
+  ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewResourceState,
   type NativeHtmlArtifactResource,
-} from '@/composables/workbench/useArtifactPreviewResource'
-import type { ArtifactPayload } from '@/types/rpc'
+} from '@/modules/artifactWorkbench'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 import {
   artifactFileSubtitle,
@@ -203,7 +206,6 @@ import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPrevi
 
 const props = withDefaults(defineProps<{
   artifact: ArtifactPayload
-  authToken?: string
   baseOrigin?: string
   nativeHtml?: boolean
   nativeSurfaceState?: 'crashed' | 'error' | 'loading' | 'ready'
@@ -212,11 +214,12 @@ const props = withDefaults(defineProps<{
   previewErrorMessage?: string
   previewLaunchUrl?: string
   previewMode?: 'full' | 'offline'
+  previewNetworkAllowed?: boolean
+  previewSandboxProfile?: 'default' | 'opaque-offline'
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
 }>(), {
-  authToken: '',
   baseOrigin: '',
   nativeHtml: false,
   nativeSurfaceState: 'loading',
@@ -225,6 +228,8 @@ const props = withDefaults(defineProps<{
   previewErrorMessage: '',
   previewLaunchUrl: '',
   previewMode: 'offline',
+  previewNetworkAllowed: true,
+  previewSandboxProfile: 'default',
   sessionKey: '',
   showHeader: true,
   suspended: false,
@@ -239,13 +244,22 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
+let loadedFrame: HTMLIFrameElement | null = null
 
-const preview = useArtifactPreviewResource({
+function onHtmlFrameLoad(event: Event) {
+  const frame = event.currentTarget as HTMLIFrameElement
+  // A cross-origin/opaque iframe cannot attest its new URL after navigation.
+  // Keep previewing it, but do not offer file operations for a guessed page.
+  if (loadedFrame === frame) emit('workbench-event', { type: 'preview-page-unknown' })
+  loadedFrame = frame
+}
+
+const preview = artifactWorkbench.previews.createResource({
   artifact: () => props.artifact,
-  authToken: () => props.authToken,
-  baseOrigin: () => props.baseOrigin,
   htmlCollectionStatus: () => props.previewCollectionStatus,
   htmlLaunchUrl: () => props.previewLaunchUrl,
   htmlLeaseState: () => props.previewBlocked
@@ -266,7 +280,6 @@ const resourceSignature = computed(() => [
   props.artifact.mime || '',
   props.artifact.size || '',
   props.sessionKey,
-  props.authToken,
   props.baseOrigin,
   props.nativeHtml ? 'native' : 'web',
   props.previewBlocked ? 'blocked' : 'unblocked',
@@ -274,18 +287,55 @@ const resourceSignature = computed(() => [
   props.previewErrorMessage,
   props.previewLaunchUrl,
   props.previewMode,
+  props.previewNetworkAllowed ? 'network' : 'no-network',
+  props.previewSandboxProfile,
 ].join('\u0000'))
+
+let loadedResourceSignature: string | null = null
+let resourceSyncGeneration = 0
+
+async function syncPreviewResource(
+  signature: string,
+  suspended: boolean,
+  returningFromSuspend: boolean,
+) {
+  const generation = ++resourceSyncGeneration
+  if (suspended) {
+    preview.suspend()
+    return
+  }
+
+  if (returningFromSuspend) await preview.resume()
+  if (
+    generation !== resourceSyncGeneration
+    || props.suspended
+    || resourceSignature.value !== signature
+  ) return
+
+  // A panel opened directly on Source has never loaded preview bytes. Its
+  // first resume performs that initial load, so recording the signature here
+  // avoids fetching the same revision twice.
+  if (returningFromSuspend && loadedResourceSignature === null) {
+    loadedResourceSignature = signature
+    return
+  }
+
+  // Vue's watch tuple remembers signatures even while the panel is hidden.
+  // Keep a separate identity for the bytes actually loaded by the preview so
+  // resuming after a Source save cannot revive an older native lease or Blob.
+  if (loadedResourceSignature !== signature) await preview.reload()
+  else if (!returningFromSuspend) await preview.resume()
+  if (
+    generation === resourceSyncGeneration
+    && !props.suspended
+    && resourceSignature.value === signature
+  ) loadedResourceSignature = signature
+}
 
 watch(
   [resourceSignature, () => props.suspended],
   ([signature, suspended], previous) => {
-    if (suspended) {
-      preview.suspend()
-      return
-    }
-    const previousSignature = previous?.[0]
-    if (!previous || signature !== previousSignature) void preview.reload()
-    else void preview.resume()
+    void syncPreviewResource(signature, suspended, previous?.[1] === true)
   },
   { immediate: true },
 )
@@ -323,16 +373,24 @@ const isRenderable = computed(() =>
   || preview.state.value === 'ready-with-warnings'
   || preview.state.value === 'missing-resource')
 
+const opaqueOfflinePreview = computed(() =>
+  props.previewSandboxProfile === 'opaque-offline'
+  || props.previewNetworkAllowed === false)
+
+const fullHtmlPreview = computed(() =>
+  props.previewMode === 'full'
+  && !opaqueOfflinePreview.value)
+
 const showOfflineWebLimits = computed(() =>
   !props.nativeHtml
-  && props.previewMode === 'offline'
+  && !fullHtmlPreview.value
   && preview.kind.value === 'html')
 
-const htmlSandbox = computed(() => props.previewMode === 'full'
+const htmlSandbox = computed(() => fullHtmlPreview.value
   ? 'allow-scripts allow-same-origin allow-forms allow-modals allow-pointer-lock allow-presentation'
   : 'allow-scripts')
 
-const htmlPermissions = computed(() => props.previewMode === 'full'
+const htmlPermissions = computed(() => fullHtmlPreview.value
   ? 'camera; microphone; geolocation; clipboard-read; clipboard-write; fullscreen; display-capture'
   : '')
 
@@ -365,7 +423,10 @@ async function reloadPreview() {
 }
 
 onMounted(() => window.addEventListener('message', onPreviewFrameMessage))
-onBeforeUnmount(() => window.removeEventListener('message', onPreviewFrameMessage))
+onBeforeUnmount(() => {
+  window.removeEventListener('message', onPreviewFrameMessage)
+  preview.dispose()
+})
 
 const isFailureState = computed(() =>
   preview.state.value === 'crashed'

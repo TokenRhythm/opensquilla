@@ -132,6 +132,8 @@ def test_pooled_credential_repr_omits_secret(pool_env) -> None:
     pooled = profile_credential_pools().acquire_for_session("openai", [_ENV_A], "s")
     assert pooled is not None
     assert _SECRET_A not in repr(pooled)
+    assert pooled.lease_token
+    assert pooled.lease_token not in repr(pooled)
     assert pooled.env_name == _ENV_A
     assert pooled.key_id == masked_key_id(_SECRET_A)
     assert _SECRET_A not in pooled.key_id
@@ -204,6 +206,7 @@ def test_pool_stamps_non_secret_metadata(pool_env) -> None:
     assert stamp["provider"] == "openai"
     assert stamp["session_key"] == "s1"
     assert stamp["env_name"] in {_ENV_A, _ENV_B}
+    assert "lease_token" not in stamp
     assert _SECRET_A not in str(stamp) and _SECRET_B not in str(stamp)
 
 
@@ -284,6 +287,80 @@ def test_auth_invalid_marks_key_bad_for_process(monkeypatch) -> None:
         assert acquired.env_name != first.env_name
 
 
+def test_exact_lease_report_rejects_stale_result_after_rotation(pool_env) -> None:
+    pools = profile_credential_pools()
+    names = [_ENV_A, _ENV_B]
+    session = "media-session"
+
+    first = pools.acquire_for_session("openai", names, session)
+    assert first is not None and first.lease_token
+    assert pools.report_failure_for_lease(
+        "openai",
+        session,
+        first.lease_token,
+        ProviderFailureKind.AUTH_INVALID,
+    )
+
+    second = pools.acquire_for_session("openai", names, session)
+    assert second is not None and second.lease_token
+    assert second.env_name != first.env_name
+    assert second.lease_token != first.lease_token
+
+    # A late completion from the first paid request cannot park the key now
+    # pinned to the same session for the next explicit run.
+    assert not pools.report_failure_for_lease(
+        "openai",
+        session,
+        first.lease_token,
+        ProviderFailureKind.AUTH_INVALID,
+    )
+    reused = pools.acquire_for_session("openai", names, session)
+    assert reused is not None
+    assert reused.env_name == second.env_name
+    assert reused.lease_token == second.lease_token
+
+    assert pools.report_failure_for_lease(
+        "openai",
+        session,
+        second.lease_token,
+        ProviderFailureKind.AUTH_INVALID,
+    )
+    with pytest.raises(NoCredentialsAvailable):
+        pools.acquire_for_session("openai", names, session)
+
+
+def test_exact_lease_report_rejects_empty_random_and_pre_rebuild_tokens(
+    pool_env,
+) -> None:
+    pools = profile_credential_pools()
+    session = "media-session"
+    first = pools.acquire_for_session("openai", [_ENV_A], session)
+    assert first is not None
+
+    for invalid_token in ("", "synthetic-unrelated-opaque-token"):
+        assert not pools.report_failure_for_lease(
+            "openai",
+            session,
+            invalid_token,
+            ProviderFailureKind.AUTH_INVALID,
+        )
+
+    # A profile-pool config rebuild creates a fresh pin. The old token must
+    # not remain authoritative even when the provider and session are equal.
+    rebuilt = pools.acquire_for_session("openai", [_ENV_B], session)
+    assert rebuilt is not None
+    assert rebuilt.lease_token != first.lease_token
+    assert not pools.report_failure_for_lease(
+        "openai",
+        session,
+        first.lease_token,
+        ProviderFailureKind.AUTH_INVALID,
+    )
+    reused = pools.acquire_for_session("openai", [_ENV_B], session)
+    assert reused is not None
+    assert reused.lease_token == rebuilt.lease_token
+
+
 def test_all_parked_surfaces_as_unresolved_credentials(pool_env) -> None:
     cfg = _config(LlmProviderProfile(api_key_env_pool=[_ENV_A, _ENV_B]))
     assert _resolve(cfg, "s1") is not None
@@ -345,12 +422,15 @@ def test_no_secret_values_in_rotation_or_cooldown_logs(pool_env, log_recorder) -
     assert _resolve(cfg, "s1") is not None  # pin reuse (debug event)
     assert _resolve(cfg, "s2") is not None
     pools = profile_credential_pools()
+    pinned = pools.acquire_for_session("openai", [_ENV_A, _ENV_B], "s1")
+    assert pinned is not None
     pools.report_failure("openai", "s1", ProviderFailureKind.RATE_LIMITED)
     pools.report_failure("openai", "s2", ProviderFailureKind.AUTH_INVALID)
     captured = log_recorder.events
     everything = repr(captured)
     assert _SECRET_A not in everything
     assert _SECRET_B not in everything
+    assert pinned.lease_token not in everything
     rotations = [e for e in captured if e["event"] == "credential_pool.rotation"]
     assert rotations
     for event in rotations:

@@ -9,18 +9,41 @@ is a data change (a new matcher row), not a new branch.
 from __future__ import annotations
 
 import re
+import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+import httpx
 import structlog
 
 from opensquilla.http_retry import parse_retry_after
-from opensquilla.redaction import redact_error_text
 
 from .registry import UnknownProviderError, get_provider_spec
 
 log = structlog.get_logger(__name__)
+
+CONNECTION_FAILED_CODE = "connection_failed"
+
+
+def is_connection_failure(error: BaseException) -> bool:
+    """Identify connection establishment failures without matching upstream prose.
+
+    Read/write timeouts and protocol errors do not prove that reconnecting is
+    appropriate. TLS failures can be wrapped in ConnectError, but require a
+    configuration fix rather than an open-ended connection wait.
+    """
+
+    if not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return False
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLError):
+            return False
+        current = current.__cause__ or current.__context__
+    return True
 
 
 class ProviderFailureKind(StrEnum):
@@ -177,13 +200,52 @@ _MODEL_UNAVAILABLE_SUBSTRINGS = (
 
 # Family-independent kinds checked before any family table.
 _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
+    # Provider-specific adapters use several raw spellings for exhausted
+    # credits.  Normalize them once here so every runtime consumer (including
+    # Goal settlement) observes the same failure taxonomy.
+    FailureMatcher(
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        status_codes=frozenset({402}),
+    ),
+    FailureMatcher(
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        raw_codes=frozenset(
+            {
+                "billing_hard_limit",
+                "insufficient_quota",
+                "provider_quota_exceeded",
+                "usage_limit",
+                "usage_limit_reached",
+                "usage_limited",
+            }
+        ),
+    ),
+    # HTTP adapters preserve provider machine codes in the error detail even
+    # when the event code is the HTTP status. Check explicit quota evidence
+    # before a 429 is interpreted as a recoverable rate limit.
+    FailureMatcher(
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        message_substrings=(
+            "insufficient_quota",
+            "billing_hard_limit",
+            "provider_quota_exceeded",
+            "insufficient credits",
+            "insufficient balance",
+        ),
+    ),
+    FailureMatcher(
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        message_substrings_all=("exceeded your current quota", "billing"),
+    ),
     # Local composite-provider validation.  This must classify before a
     # provider-family "does not support" matcher can turn it into
     # UNSUPPORTED_FEATURE: that kind deliberately hops to a fallback provider,
     # which would bypass Ensemble's text-only contract.
     FailureMatcher(
         ProviderFailureKind.BAD_REQUEST,
-        raw_codes=frozenset({"ensemble_multimodal_unsupported"}),
+        raw_codes=frozenset(
+            {"ensemble_multimodal_unsupported", "image_input_unsupported"}
+        ),
     ),
     FailureMatcher(
         ProviderFailureKind.CONTEXT_OVERFLOW,
@@ -312,6 +374,10 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
     FailureMatcher(ProviderFailureKind.RATE_LIMITED, status_codes=frozenset({429})),
     FailureMatcher(ProviderFailureKind.RATE_LIMITED, message_substrings=("rate limit",)),
     FailureMatcher(
+        ProviderFailureKind.RATE_LIMITED,
+        raw_codes=frozenset({"provider_retry_after_deadline", "rate_limit_retry_exhausted"}),
+    ),
+    FailureMatcher(
         ProviderFailureKind.PROVIDER_OVERLOADED,
         status_codes=_GATEWAY_TRANSIENT_STATUS_CODES,
     ),
@@ -329,7 +395,17 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
     # would downgrade recovery to SURFACE.
     FailureMatcher(
         ProviderFailureKind.TRANSPORT_TRANSIENT,
-        raw_codes=frozenset({"incomplete_stream", "incomplete_tool_call"}),
+        raw_codes=frozenset(
+            {
+                "incomplete_stream",
+                "incomplete_tool_call",
+                "incomplete_tool_stream",
+                "provider_pretext_buffer_exhausted",
+                "request_error",
+                CONNECTION_FAILED_CODE,
+                "response_incomplete",
+            }
+        ),
     ),
     FailureMatcher(
         ProviderFailureKind.MALFORMED_RESPONSE,
@@ -371,8 +447,8 @@ def classify_provider_error(
         provider=provider,
         failure_family=family,
         status_code=status_code,
-        raw_code=raw_code,
-        message_head=redact_error_text(message),
+        raw_code_chars=len(raw_code or ""),
+        message_chars=len(message or ""),
     )
     return ProviderFailureKind.UNKNOWN
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import click
+import pytest
 from rich.console import Console
 from typer import rich_utils
 from typer.testing import CliRunner
@@ -115,14 +116,15 @@ def test_help_theme_supports_click_make_metavar_without_context(monkeypatch) -> 
     assert "--router MODE" in output
 
 
-def test_help_theme_accepts_typer_vendored_click_parameters() -> None:
+@pytest.mark.parametrize("string_type_name", ["text", "str"])
+def test_help_theme_accepts_typer_vendored_click_parameters(string_type_name: str) -> None:
     option = SimpleNamespace(
         param_type_name="option",
         name="provider",
         opts=["--provider"],
         secondary_opts=[],
         metavar=None,
-        type=SimpleNamespace(name="text"),
+        type=SimpleNamespace(name=string_type_name),
         required=False,
         help="Provider id to configure.",
     )

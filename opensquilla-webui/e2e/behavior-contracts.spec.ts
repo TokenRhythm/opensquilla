@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2ebehaviorcontracts'
@@ -23,6 +24,7 @@ type MockGatewayOptions = {
   sandboxEnsureCalls?: { value: number }
   sandboxStatus?: () => Record<string, unknown>
   sandboxStatusCalls?: { value: number }
+  runModeSetCalls?: Array<Record<string, unknown>>
 }
 
 function response(id: string | number | undefined, payload: unknown) {
@@ -59,13 +61,11 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30000 },
+        ws.send(helloOkResponse({
           auth: {
             runModePolicy: {
-              allowedRunModes: ['trusted', 'standard', 'full'],
-              defaultRunMode: 'standard',
+              allowedRunModes: ['safe', 'full'],
+              defaultRunMode: 'full',
             },
           },
         }))
@@ -124,6 +124,25 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
         return
       }
 
+      if (method === 'sandbox.capability.status') {
+        ws.send(response(frame.id, { available: false }))
+        return
+      }
+
+      if (method === 'sandbox.run_mode.preference.get') {
+        ws.send(response(frame.id, { runMode: 'full', source: 'config' }))
+        return
+      }
+
+      if (method === 'sandbox.run_mode.preference.set') {
+        options.runModeSetCalls?.push(frame.params || {})
+        ws.send(response(frame.id, {
+          runMode: frame.params?.runMode === 'safe' ? 'safe' : 'full',
+          source: 'preference',
+        }))
+        return
+      }
+
       if (method.endsWith('.approval.status')) {
         ws.send(response(frame.id, { found: true, pending: true }))
         return
@@ -138,7 +157,7 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.unsubscribe': { subscribed: false },
         'usage.status': { sessions: [] },
       }
@@ -160,7 +179,7 @@ const PNG_1X1 = Buffer.from(
 
 test.describe('Vue behavior contracts', () => {
   test('unknown routes render the 404 actions without replacing the last stable route', async ({ page }) => {
-    await page.addInitScript(() => localStorage.setItem('opensquilla-last-route', '/sessions'))
+    await page.addInitScript(() => localStorage.setItem('opensquilla-last-route', '/chat'))
     await installMockGateway(page)
 
     await page.goto(CONTROL_URL + 'removed-legacy-screen')
@@ -168,16 +187,15 @@ test.describe('Vue behavior contracts', () => {
     await expect(notFound).toBeVisible()
     await expect(notFound.getByText('404', { exact: true })).toBeVisible()
     await expect(notFound.getByRole('button', { name: 'Go to Chat' })).toBeVisible()
-    await expect(notFound.getByRole('button', { name: 'Sessions' })).toBeVisible()
     await expect.poll(() => page.evaluate(() => localStorage.getItem('opensquilla-last-route')))
-      .toBe('/sessions')
+      .toBe('/chat')
 
     await notFound.getByRole('button', { name: 'Go to Chat' }).click()
     await expect(page).toHaveURL(/\/control\/chat(?:\?|$)/)
 
     await page.goto(CONTROL_URL + 'still-not-a-route')
-    await page.locator('.not-found').getByRole('button', { name: 'Sessions' }).click()
-    await expect(page).toHaveURL(/\/control\/sessions(?:\?|$)/)
+    await page.locator('.not-found').getByRole('button', { name: 'Go to Chat' }).click()
+    await expect(page).toHaveURL(/\/control\/chat(?:\?|$)/)
   })
 
   test('drawer, nested preview, and lightbox own Escape while composer Escape aborts once', async ({ page }) => {
@@ -300,12 +318,6 @@ test.describe('Vue behavior contracts', () => {
     })
     await openChat(page)
 
-    const approvalNote = page.locator('.approval-card__note')
-    await expect(approvalNote).toBeVisible({ timeout: 10000 })
-    await approvalNote.focus()
-    await page.keyboard.press('Escape')
-    expect(abortCalls).toHaveLength(0)
-
     const clarifyInput = page.locator('.clarify-field__input')
     await expect(clarifyInput).toBeVisible({ timeout: 10000 })
     await clarifyInput.focus()
@@ -368,15 +380,14 @@ test.describe('Vue behavior contracts', () => {
     await expect(cronMessage).toHaveCount(1)
   })
 
-  test('Windows Standard mode offers setup and preserves the selected run mode', async ({ page }) => {
+  test('Windows Safe mode requests setup and keeps Full until verification succeeds', async ({ page }) => {
     const statusCalls = { value: 0 }
     const ensureCalls = { value: 0 }
-    await page.addInitScript(() => {
-      localStorage.setItem('opensquilla.chat.runMode', 'standard')
-    })
+    const runModeSetCalls: Array<Record<string, unknown>> = []
     await installMockGateway(page, {
       sandboxStatusCalls: statusCalls,
       sandboxEnsureCalls: ensureCalls,
+      runModeSetCalls,
       sandboxStatus: () => ({
         state: 'not_setup',
         platform: 'windows',
@@ -390,17 +401,22 @@ test.describe('Vue behavior contracts', () => {
     })
     await openChat(page)
 
-    const banner = page.locator('.sandbox-setup')
-    await expect(banner).toBeVisible({ timeout: 10000 })
-    await expect(banner).toContainText('Sandbox setup required')
     await expect.poll(() => statusCalls.value).toBeGreaterThanOrEqual(1)
+    const runModeButton = page.locator('.chat-run-mode-btn')
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    await runModeButton.click()
+    const safeOption = page.locator('.composer-run-mode__option').first()
+    await expect(safeOption).toBeEnabled()
+    await safeOption.click()
 
-    await banner.getByRole('button', { name: 'Set up' }).click()
+    const setupDialog = page.getByTestId('sandbox-setup-confirm')
+    await expect(setupDialog).toBeVisible()
+    expect(runModeSetCalls).toHaveLength(0)
+
+    await page.getByTestId('sandbox-setup-continue').click()
     await expect.poll(() => ensureCalls.value).toBe(1)
-    await expect(banner).toHaveClass(/sandbox-setup--setting_up/)
-    await expect(banner).toContainText('Setting up Windows Sandbox')
-    await expect(banner.getByRole('progressbar')).toBeVisible()
-    await expect.poll(() => page.evaluate(() => localStorage.getItem('opensquilla.chat.runMode')))
-      .toBe('standard')
+    await expect(setupDialog).toBeVisible()
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    expect(runModeSetCalls).toHaveLength(0)
   })
 })

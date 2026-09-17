@@ -6,6 +6,7 @@ export interface ArtifactPreviewLeaseCreateRequest {
   scopeId: string
   mode: ArtifactPreviewLeaseMode
   authToken?: string
+  pagePath?: string
 }
 
 export interface ArtifactPreviewLeaseControlRequest {
@@ -29,10 +30,12 @@ export interface ArtifactPreviewLeasePayload {
   effective_mode: ArtifactPreviewLeaseMode
   launch_url: string
   entrypoint: string
+  page_path?: string
   expires_at: string
   preview_origin: string
   idle_timeout_seconds: number
   source: ArtifactPreviewLeaseSource
+  workingDocumentId?: string
 }
 
 export interface ArtifactPreviewLeaseRenewalPayload {
@@ -65,12 +68,16 @@ export interface ArtifactPreviewSurfaceGrant {
 }
 
 interface IssuedArtifactPreview {
+  leaseId: string
+  artifactId: string
   gatewayOrigin: string
   launchUrl: string
   expectedOrigin: string
   scopeId: string
+  authToken?: string
   mode: ArtifactPreviewLeaseMode
   expiresAtMs: number
+
 }
 
 interface ArtifactPreviewLeaseBrokerOptions {
@@ -129,13 +136,22 @@ function parseAuthToken(value: unknown): string | undefined {
   return parseBoundedString(value, 'The preview credential', MAX_CREDENTIAL_BYTES)
 }
 
+function parsePagePath(value: unknown): string {
+  const path = parseBoundedString(value, 'The preview page', 4096)
+  if (/[\\:%?#]/.test(path) || !/\.(html?|xhtml)$/i.test(path)
+    || path.split('/').some(part => !part || part === '.' || part === '..')) {
+    throw new Error('The preview page is invalid.')
+  }
+  return path
+}
+
 export function parseArtifactPreviewLeaseCreateRequest(
   value: unknown,
 ): ArtifactPreviewLeaseCreateRequest {
   const raw = objectRecord(value)
   if (
     !raw
-    || !exactKeys(raw, ['version', 'artifactId', 'scopeId', 'mode'], ['authToken'])
+    || !exactKeys(raw, ['version', 'artifactId', 'scopeId', 'mode'], ['authToken', 'pagePath'])
     || raw.version !== 1
     || typeof raw.version === 'boolean'
     || !ARTIFACT_ID_PATTERN.test(String(raw.artifactId ?? ''))
@@ -150,6 +166,7 @@ export function parseArtifactPreviewLeaseCreateRequest(
     scopeId: parseScopeId(raw.scopeId),
     mode: raw.mode,
     ...(authToken ? { authToken } : {}),
+    ...(Object.hasOwn(raw, 'pagePath') ? { pagePath: parsePagePath(raw.pagePath) } : {}),
   }
 }
 
@@ -260,7 +277,7 @@ function parseLeasePayload(
       'preview_origin',
       'idle_timeout_seconds',
       'source',
-    ])
+    ], ['workingDocumentId', 'page_path'])
     || raw.version !== 1
     || typeof raw.version === 'boolean'
     || !LEASE_ID_PATTERN.test(String(raw.lease_id ?? ''))
@@ -296,6 +313,7 @@ function parseLeasePayload(
       effective_mode: raw.effective_mode,
       launch_url: launch.href,
       entrypoint: parseBoundedString(raw.entrypoint, 'The preview entrypoint', 4096),
+      ...(Object.hasOwn(raw, 'page_path') ? { page_path: parsePagePath(raw.page_path) } : {}),
       expires_at: expiry.value,
       preview_origin: previewOrigin,
       idle_timeout_seconds: parsePositiveInteger(
@@ -303,6 +321,9 @@ function parseLeasePayload(
         'The preview idle timeout',
       ),
       source: parseLeaseSource(raw.source),
+      ...(Object.hasOwn(raw, 'workingDocumentId')
+        ? { workingDocumentId: parseBoundedString(raw.workingDocumentId, 'The working document', 512) }
+        : {}),
     },
   }
 }
@@ -343,6 +364,10 @@ export class ArtifactPreviewLeaseBroker {
   private readonly now: () => number
   private readonly timeoutMs: number
   private readonly issued = new Map<string, IssuedArtifactPreview>()
+  private readonly inFlightCreates = new Set<
+    Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>>
+  >()
+  private generation = 0
 
   constructor(private readonly options: ArtifactPreviewLeaseBrokerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch
@@ -351,12 +376,55 @@ export class ArtifactPreviewLeaseBroker {
   }
 
   clear(): void {
+    this.generation += 1
     this.issued.clear()
   }
 
-  async create(
+  /**
+   * Revoke every lease owned by the current renderer generation.
+   *
+   * Local authority is removed synchronously before any network request. The
+   * snapshot also keeps leases created by a replacement renderer out of this
+   * cleanup, even while the old Gateway DELETE requests are still pending.
+   * Creates admitted before this call are joined so their stale-lease DELETE
+   * completes while the owned Gateway is still available.
+   */
+  async revokeAll(): Promise<void> {
+    this.generation += 1
+    const issued = [...this.issued.entries()]
+    const inFlightCreates = [...this.inFlightCreates]
+    for (const [leaseId] of issued) this.issued.delete(leaseId)
+    const revocations = issued.map(([leaseId, lease]) => {
+      if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== lease.gatewayOrigin) {
+        return Promise.resolve()
+      }
+      return this.request(
+        new URL(
+          `/api/v1/artifact-preview-leases/${encodeURIComponent(leaseId)}`,
+          lease.gatewayOrigin,
+        ),
+        'DELETE',
+        lease.scopeId,
+        lease.authToken,
+      )
+    })
+    await Promise.allSettled([...revocations, ...inFlightCreates])
+  }
+
+  create(
     value: unknown,
   ): Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>> {
+    const create = this.createNow(value)
+    this.inFlightCreates.add(create)
+    return create.finally(() => {
+      this.inFlightCreates.delete(create)
+    })
+  }
+
+  private async createNow(
+    value: unknown,
+  ): Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>> {
+    const generation = this.generation
     let request: ArtifactPreviewLeaseCreateRequest
     try {
       request = parseArtifactPreviewLeaseCreateRequest(value)
@@ -384,7 +452,8 @@ export class ArtifactPreviewLeaseBroker {
       'POST',
       request.scopeId,
       request.authToken,
-      JSON.stringify({ version: 1, mode: request.mode, client: 'desktop' }),
+      JSON.stringify({ version: 1, mode: request.mode, client: 'desktop',
+        ...(request.pagePath ? { pagePath: request.pagePath } : {}) }),
     )
     if (!response.ok) return response
     if (response.status !== 201) {
@@ -392,14 +461,46 @@ export class ArtifactPreviewLeaseBroker {
     }
     try {
       const parsed = parseLeasePayload(response.payload, request.mode)
+      if (request.pagePath && (parsed.payload.page_path !== request.pagePath
+        || decodeURIComponent(new URL(parsed.payload.launch_url).pathname) !== `/${request.pagePath}`)) {
+        await this.request(
+          new URL(`/api/v1/artifact-preview-leases/${encodeURIComponent(parsed.payload.lease_id)}`, gatewayOrigin),
+          'DELETE', request.scopeId, request.authToken,
+        )
+        return failure(409, 'PREVIEW_PAGE_UNSUPPORTED', 'The Gateway cannot open this preview page.')
+      }
+      if (
+        generation !== this.generation
+        || parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== gatewayOrigin
+      ) {
+        if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) === gatewayOrigin) {
+          await this.request(
+            new URL(
+              `/api/v1/artifact-preview-leases/${encodeURIComponent(parsed.payload.lease_id)}`,
+              gatewayOrigin,
+            ),
+            'DELETE',
+            request.scopeId,
+            request.authToken,
+          )
+        }
+        return failure(
+          409,
+          'PREVIEW_LEASE_RETIRED',
+          'The Desktop preview request was retired.',
+        )
+      }
       if (parsed.expiresAtMs <= this.now()) {
         return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an expired preview lease.')
       }
       this.issued.set(parsed.payload.lease_id, {
+        leaseId: parsed.payload.lease_id,
+        artifactId: request.artifactId,
         gatewayOrigin,
         launchUrl: parsed.payload.launch_url,
         expectedOrigin: parsed.payload.preview_origin,
         scopeId: request.scopeId,
+        authToken: request.authToken,
         mode: parsed.payload.effective_mode,
         expiresAtMs: parsed.expiresAtMs,
       })
@@ -494,14 +595,23 @@ export class ArtifactPreviewLeaseBroker {
   }
 
   authorizesSurface(grant: ArtifactPreviewSurfaceGrant): boolean {
+    return this.resolveSurfaceArtifactId(grant) !== null
+  }
+
+  /**
+   * Resolve the immutable artifact identity attached to an exact lease grant.
+   * The renderer never supplies this value to the surface contract: Desktop
+   * derives it only from the authenticated lease issuance it performed.
+   */
+  resolveSurfaceArtifactId(grant: ArtifactPreviewSurfaceGrant): string | null {
     const gatewayOrigin = parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl())
-    if (!gatewayOrigin) return false
+    if (!gatewayOrigin) return null
     for (const [leaseId, issued] of this.issued) {
       if (
         issued.expiresAtMs <= this.now()
         || issued.gatewayOrigin !== gatewayOrigin
       ) {
-        this.issued.delete(leaseId)
+            this.issued.delete(leaseId)
         continue
       }
       if (
@@ -509,9 +619,9 @@ export class ArtifactPreviewLeaseBroker {
         && issued.expectedOrigin === grant.expectedOrigin
         && issued.scopeId === grant.scopeId
         && issued.mode === grant.mode
-      ) return true
+      ) return issued.artifactId
     }
-    return false
+    return null
   }
 
   private currentIssuedLease(
@@ -527,7 +637,7 @@ export class ArtifactPreviewLeaseBroker {
       || issued.scopeId !== scopeId
       || issued.expiresAtMs <= this.now()
     ) {
-      this.issued.delete(leaseId)
+        this.issued.delete(leaseId)
       return null
     }
     return issued
@@ -581,6 +691,7 @@ export class ArtifactPreviewLeaseBroker {
         method,
         headers: {
           'x-opensquilla-session-key': scopeId,
+          ...(method === 'POST' ? { 'x-opensquilla-preview-working-document': '1' } : {}),
           ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
           ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
         },

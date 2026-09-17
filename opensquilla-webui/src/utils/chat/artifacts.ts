@@ -1,4 +1,4 @@
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { IconName } from '@/utils/icons'
 
 const ARTIFACT_MIME_CATEGORIES: Record<string, string> = {
@@ -17,6 +17,12 @@ const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
   ndjson: 'data', pdf: 'document', sql: 'code', tsv: 'data', txt: 'document',
 }
 
+const OFFICE_EXTENSIONS = new Set([
+  'doc', 'docm', 'docx', 'dot', 'dotm', 'dotx', 'odt', 'ott', 'rtf',
+  'csv', 'fods', 'ods', 'ots', 'xls', 'xlsb', 'xlsm', 'xlsx', 'xlt', 'xltm', 'xltx',
+  'odp', 'otp', 'pot', 'potm', 'potx', 'pps', 'ppsm', 'ppsx', 'ppt', 'pptm', 'pptx',
+])
+
 export function artifactMime(artifact: ArtifactPayload): string {
   return artifact?.mime
     ? String(artifact.mime).split(';', 1)[0].trim().toLowerCase()
@@ -32,6 +38,10 @@ export function artifactExtension(name: string): string {
   const idx = trimmed.lastIndexOf('.')
   if (idx < 0 || idx === trimmed.length - 1) return ''
   return trimmed.slice(idx + 1)
+}
+
+export function isOfficeArtifact(artifact: ArtifactPayload): boolean {
+  return OFFICE_EXTENSIONS.has(artifactExtension(artifactName(artifact)))
 }
 
 export function artifactCategory(artifact: ArtifactPayload): string {
@@ -112,74 +122,8 @@ export function canPreview(artifact: ArtifactPayload): boolean {
   return cat === 'visual' || cat === 'document'
 }
 
-export function artifactActionLabel(artifact: ArtifactPayload): string {
-  return canPreview(artifact) ? 'Open' : 'Download'
-}
-
 export function artifactMeta(artifact: ArtifactPayload): string {
   const mime = artifact?.mime ? String(artifact.mime) : ''
   const size = artifactSizeLabel(artifact)
   return [mime, size].filter(Boolean).join(' · ')
-}
-
-export interface ArtifactUrlOptions {
-  sessionKey?: string
-  absolute?: boolean
-  includeSessionKey?: boolean
-}
-
-export function artifactDownloadUrl(
-  artifact: ArtifactPayload,
-  baseOrigin: string,
-  options: ArtifactUrlOptions = {},
-): string {
-  let raw = artifact?.download_url ? String(artifact.download_url) : ''
-  if (!raw && artifact?.id) raw = `/api/v1/artifacts/${encodeURIComponent(artifact.id)}`
-  if (!raw) return ''
-  try {
-    const url = new URL(raw, baseOrigin)
-    const base = new URL(baseOrigin)
-    const sameOrigin = url.origin === base.origin
-    if (sameOrigin) {
-      url.searchParams.delete('token')
-      url.searchParams.delete('sessionKey')
-      url.searchParams.delete('session_key')
-    }
-    const artifactSession = artifact.sessionKey || artifact.session_key
-    const sessionKey = options.sessionKey || (artifactSession ? String(artifactSession) : '')
-    if (
-      sameOrigin &&
-      options.includeSessionKey === true &&
-      sessionKey &&
-      !url.searchParams.get('sessionKey') &&
-      !url.searchParams.get('session_key')
-    ) {
-      url.searchParams.set('sessionKey', sessionKey)
-    }
-    if (!sameOrigin || options.absolute) return url.toString()
-    return url.pathname + url.search + url.hash
-  } catch { return raw }
-}
-
-export function artifactPreviewUrl(
-  artifact: ArtifactPayload,
-  baseOrigin: string,
-  options: ArtifactUrlOptions = {},
-): string {
-  return artifactDownloadUrl(artifact, baseOrigin, options)
-}
-
-/**
- * Small thumbnail URL for grid/inline previews. Prefers the backend-supplied
- * `thumbnail_url` (a `{download_url}?variant=thumb` webp); when it is absent we
- * fall back to the full download URL so older artifacts still render a preview.
- */
-export function artifactThumbnailUrl(
-  artifact: ArtifactPayload,
-  baseOrigin: string,
-  options: ArtifactUrlOptions = {},
-): string {
-  const thumb = artifact?.thumbnail_url ? String(artifact.thumbnail_url) : ''
-  if (thumb) return artifactDownloadUrl({ ...artifact, download_url: thumb }, baseOrigin, options)
-  return artifactDownloadUrl(artifact, baseOrigin, options)
 }

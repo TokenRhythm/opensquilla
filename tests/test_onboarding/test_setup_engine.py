@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import tomllib
 
+import pytest
+
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config
 from opensquilla.onboarding.section_status import SectionStatus
@@ -33,6 +35,40 @@ def test_setup_engine_applies_provider_and_router_without_persisting_secret(tmp_
     assert "api_key" not in data["llm"]
     assert data["squilla_router"]["tier_profile"] == "deepseek"
     assert "tiers" not in data["squilla_router"]
+
+
+def test_setup_engine_enables_openrouter_image_default_on_first_configuration():
+    engine = SetupEngine(config=GatewayConfig())
+
+    result = engine.apply(
+        "provider",
+        {
+            "providerId": "openrouter",
+            "model": "openai/gpt-test",
+            "apiKey": "synthetic-openrouter-key",
+        },
+    )
+
+    image = result.config.image_generation
+    assert image.enabled is True
+    assert image.binding == "follow_llm"
+    assert image.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+
+
+@pytest.mark.parametrize("intent", ["", False])
+def test_setup_engine_rejects_invalid_image_generation_intent(intent):
+    engine = SetupEngine(config=GatewayConfig())
+
+    with pytest.raises(ValueError, match="image_generation_intent"):
+        engine.apply(
+            "provider",
+            {
+                "providerId": "openrouter",
+                "model": "openai/gpt-test",
+                "apiKey": "synthetic-openrouter-key",
+                "imageGenerationIntent": intent,
+            },
+        )
 
 
 def test_setup_engine_optional_key_preservation_is_explicit_and_legacy_safe():
@@ -88,7 +124,7 @@ def test_setup_engine_can_derive_provider_model_from_router_default_tier(tmp_pat
     data = tomllib.loads(target.read_text())
     assert result.path == target
     assert data["llm"]["provider"] == "deepseek"
-    assert data["llm"]["model"] == "deepseek-v4-flash"
+    assert data["llm"]["model"] == "deepseek-flash"
     assert data["squilla_router"]["tier_profile"] == "deepseek"
     assert load_config(target).squilla_router.default_tier == "c1"
 
@@ -278,6 +314,7 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
             "selectionMode": "router_dynamic",
             "modelOptions": ["prov/model-a", "prov/model-b"],
             "minSuccessfulProposers": 2,
+            "proposerMaxRetries": 2,
             "allFailedPolicy": "error",
         },
     )
@@ -289,7 +326,9 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["model_options"] == ["prov/model-a", "prov/model-b"]
     assert ensemble["min_successful_proposers"] == 2
+    assert ensemble["proposer_max_retries"] == 2
     assert ensemble["all_failed_policy"] == "error"
+    assert engine.warnings == []
 
     # A partial payload must only touch the keys it names.
     second = SetupEngine(path=target)
@@ -302,6 +341,7 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["model_options"] == ["prov/model-a", "prov/model-b"]
     assert ensemble["min_successful_proposers"] == 2
+    assert ensemble["proposer_max_retries"] == 2
     assert ensemble["all_failed_policy"] == "error"
 
     with pytest.raises(ValueError, match="modelOptions must be a list"):

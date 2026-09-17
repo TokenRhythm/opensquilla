@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-contextBridge.exposeInMainWorld('opensquillaDesktop', {
+if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
   isAutoUpdateEnabled: () => ipcRenderer.invoke('desktop:update:supported'),
   isDesktopUpdateManaged: () => ipcRenderer.invoke('desktop:update:managed'),
@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   relaunchToUpdate: () => ipcRenderer.invoke('desktop:update:relaunch'),
   dismissUpdate: () => ipcRenderer.invoke('desktop:update:dismiss'),
   getGatewayStatus: () => ipcRenderer.invoke('gateway:status'),
+  getGatewayConnection: () => ipcRenderer.invoke('gateway:connection'),
   getCliInvocation: () => ipcRenderer.invoke('gateway:cli-invocation'),
   revealGatewayLog: () => ipcRenderer.invoke('gateway:reveal-log'),
   getDesktopSettings: () => ipcRenderer.invoke('desktop:settings:get'),
@@ -19,10 +20,27 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
+  saveArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:save', payload),
+  sourceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:source-file:action', payload),
   chooseProjectDirectory: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workspace:choose-directory', payload)
   ),
   getWorkbenchCapabilities: () => ipcRenderer.invoke('desktop:workbench:capabilities'),
+  getArtifactAnnotationCapabilities: () => (
+    ipcRenderer.invoke('desktop:workbench:annotation:capabilities')
+  ),
+  setArtifactAnnotationMode: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:set-mode', payload)
+  ),
+  showArtifactAnnotationOverlay: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:show-overlay', payload)
+  ),
+  closeArtifactAnnotationOverlay: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:close-overlay', payload)
+  ),
+  getWorkbenchBrowserTarget: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:target', payload),
+  focusWorkbenchAnnotation: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:annotation:focus', payload),
+  captureWorkbenchScreenshot: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:screenshot', payload),
   createArtifactPreviewLease: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:preview-lease:create', payload)
   ),
@@ -55,6 +73,8 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),
+  openKeychainAccess: () => ipcRenderer.invoke('desktop:boot:open-keychain'),
+  resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume'),
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
   getRecoveryState: () => ipcRenderer.invoke('desktop:recovery:state'),
@@ -64,7 +84,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   recoverProfileTransaction: () => ipcRenderer.invoke('desktop:recovery:recover-transaction'),
   revealRecoveryPath: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:reveal-path', payload),
   copyRecoveryDiagnostics: () => ipcRenderer.invoke('desktop:recovery:copy-diagnostics'),
-  abandonCleanupTransaction: () => ipcRenderer.invoke('desktop:recovery:abandon-cleanup'),
+  openLatestDownloadPage: () => ipcRenderer.invoke('desktop:recovery:open-download'),
   inspectDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:inspect', payload),
   discardDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:discard', payload),
   applyDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:apply', payload),
@@ -84,6 +104,16 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:boot:error', listener)
     return () => ipcRenderer.removeListener('desktop:boot:error', listener)
+  },
+  onGatewayConnectionChanged: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
+    ipcRenderer.on('gateway:connection-changed', listener)
+    return () => ipcRenderer.removeListener('gateway:connection-changed', listener)
+  },
+  onSystemResume: (callback: () => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('desktop:system:resume', listener)
+    return () => ipcRenderer.removeListener('desktop:system:resume', listener)
   },
   onRecoveryState: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)

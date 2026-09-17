@@ -50,15 +50,46 @@ def _resolve_cli(name: str) -> str:
     directly. Falls back to the bare name on POSIX (or when not found, so the
     later ``FileNotFoundError`` surfaces with a clear message).
     """
+    managed = _runtime_pack_node_binary(name)
+    prefer_managed = _runtime_pack_precedes_host()
+    if prefer_managed and managed is not None:
+        return managed
     on_path = shutil.which(name)
     if on_path:
         return on_path
+    if managed is not None:
+        return managed
     for node_bin_dir in _node_bin_dirs():
         for candidate_name in _cli_candidate_names(name):
             candidate = node_bin_dir / candidate_name
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return str(candidate)
     return name
+
+
+def _runtime_pack_precedes_host() -> bool:
+    try:
+        from opensquilla.run_mode import RunMode, normalize_run_mode
+        from opensquilla.tools.run_mode import current_run_mode
+
+        mode = current_run_mode()
+        return mode is not None and normalize_run_mode(mode) is not RunMode.FULL
+    except (ImportError, RuntimeError, ValueError):
+        return False
+
+
+def _runtime_pack_node_binary(name: str) -> str | None:
+    try:
+        from opensquilla.runtime_packs import resolve_component_binary
+        from opensquilla.sandbox.integration import active_sandbox_policy
+
+        policy = active_sandbox_policy().runtimes
+        if not policy.enabled or not policy.node:
+            return None
+        path = resolve_component_binary("node", name, allow_host=False)
+        return str(path) if path is not None else None
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _cli_candidate_names(name: str) -> tuple[str, ...]:
@@ -117,6 +148,22 @@ def _build_env() -> dict[str, str]:
         env["PATH"] = os.pathsep.join(merged)
         if sys.platform == "win32":
             env["Path"] = env["PATH"]
+    try:
+        from opensquilla.runtime_packs import apply_runtime_environment
+        from opensquilla.sandbox.integration import active_sandbox_policy
+        from opensquilla.tools.run_mode import current_run_mode
+
+        env = apply_runtime_environment(
+            env,
+            mode=current_run_mode() or "full",
+            policy=active_sandbox_policy().runtimes,
+        )
+        if sys.platform == "win32":
+            env["Path"] = env.get("PATH", env.get("Path", ""))
+    except (OSError, RuntimeError, ValueError):
+        # Optional Runtime Pack state cannot turn build verification setup into
+        # a Gateway or CodeTask failure; the existing host lookup remains.
+        pass
     return env
 
 # Build unsigned, deterministically: never auto-discover a keychain identity

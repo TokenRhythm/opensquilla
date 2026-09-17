@@ -4,32 +4,28 @@ import { describe, expect, it, vi, afterEach } from 'vitest'
 import { effectScope, ref } from 'vue'
 
 import {
-  persistMaterializedSessionRunMode,
   RUN_MODE_STORAGE_KEY,
   useChatRunModePreference,
   type RunModePolicy,
 } from './useChatRunModePreference'
-import type { RpcCallOptions } from '@/lib/rpc'
 
-function createRpc() {
+function createSandbox() {
   return {
-    waitForConnection: vi.fn().mockResolvedValue(undefined),
-    call: vi.fn().mockResolvedValue({ runMode: 'full', source: 'preference' }),
+    preference: vi.fn().mockResolvedValue({ runMode: 'full' as const, source: 'preference' }),
+    selectMode: vi.fn().mockResolvedValue({ runMode: 'full' as const, source: 'preference' }),
   }
 }
 
 function runInScope(
   policy: ReturnType<typeof ref<RunModePolicy | null>>,
-  rpc = createRpc(),
-  hydrateCallOptions?: RpcCallOptions,
+  sandbox = createSandbox(),
 ) {
   const scope = effectScope()
   const api = scope.run(() => useChatRunModePreference({
     runModePolicy: () => policy.value,
-    rpc,
-    hydrateCallOptions,
+    sandbox,
   }))!
-  return { api, scope, rpc }
+  return { api, scope, sandbox }
 }
 
 afterEach(() => {
@@ -38,10 +34,20 @@ afterEach(() => {
 })
 
 describe('useChatRunModePreference', () => {
+  it('starts in Full Access before the principal policy arrives', () => {
+    const policy = ref<RunModePolicy | null>(null)
+
+    const { api, scope } = runInScope(policy)
+
+    expect(api.runMode.value).toBe('full')
+    expect(api.runModeUserSelected.value).toBe(false)
+    scope.stop()
+  })
+
   it('uses policy default on a fresh browser with no saved user preference', () => {
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
 
     const { api, scope } = runInScope(policy)
@@ -55,12 +61,13 @@ describe('useChatRunModePreference', () => {
     localStorage.setItem(RUN_MODE_STORAGE_KEY, 'trusted')
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
 
     const { api, scope } = runInScope(policy)
 
-    expect(api.runMode.value).toBe('trusted')
+    expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     expect(api.runModeUserSelected.value).toBe(true)
     scope.stop()
   })
@@ -69,67 +76,72 @@ describe('useChatRunModePreference', () => {
     localStorage.setItem(RUN_MODE_STORAGE_KEY, 'standard')
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
-    const rpc = createRpc()
-    const hydrateCallOptions: RpcCallOptions = {
-      timeoutMs: 2_000,
-      timeoutAction: 'reconnect',
-      abortAction: 'reconnect',
-    }
-    rpc.call.mockResolvedValueOnce({ runMode: 'trusted', source: 'preference' })
-    const { api, scope } = runInScope(policy, rpc, hydrateCallOptions)
+    const sandbox = createSandbox()
+    sandbox.preference.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
+    const { api, scope } = runInScope(policy, sandbox)
 
     await api.hydrateRunModePreference()
 
-    expect(rpc.call).toHaveBeenCalledWith(
-      'sandbox.run_mode.preference.get',
-      undefined,
-      hydrateCallOptions,
-    )
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
-      2_000,
-      undefined,
-      {
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
-      },
-    )
-    expect(api.runMode.value).toBe('trusted')
-    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('trusted')
+    expect(sandbox.preference).toHaveBeenCalledWith({ timeoutMs: 10_000 })
+    expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
   })
 
   it('persists manual selections through the backend before updating cache', async () => {
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
-    const rpc = createRpc()
-    rpc.call.mockResolvedValueOnce({ runMode: 'standard', source: 'preference' })
-    const { api, scope } = runInScope(policy, rpc)
+    const sandbox = createSandbox()
+    sandbox.selectMode.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
+    const { api, scope } = runInScope(policy, sandbox)
 
-    const selected = await api.setGlobalRunMode('standard')
+    const selected = await api.setGlobalRunMode('safe')
 
-    expect(selected).toBe('standard')
-    expect(rpc.call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', {
-      runMode: 'standard',
+    expect(selected).toBe('safe')
+    expect(sandbox.selectMode).toHaveBeenCalledWith('safe', { timeoutMs: 5_000 })
+    expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
+    scope.stop()
+  })
+
+  it('updates the visible selection immediately while persistence is pending', async () => {
+    const policy = ref<RunModePolicy | null>({
+      defaultRunMode: 'full',
+      allowedRunModes: ['safe', 'full'],
     })
-    expect(api.runMode.value).toBe('standard')
-    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('standard')
+    const sandbox = createSandbox()
+    let resolveWrite!: (payload: unknown) => void
+    sandbox.selectMode.mockReturnValueOnce(new Promise(resolve => {
+      resolveWrite = resolve
+    }))
+    const { api, scope } = runInScope(policy, sandbox)
+
+    const pending = api.setGlobalRunMode('safe')
+
+    expect(api.runMode.value).toBe('safe')
+    await Promise.resolve()
+    expect(sandbox.selectMode).toHaveBeenCalledWith('safe', { timeoutMs: 5_000 })
+
+    resolveWrite({ runMode: 'safe', source: 'preference' })
+    await expect(pending).resolves.toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
   })
 
   it('keeps the confirmed preference when a backend write fails', async () => {
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
-    const rpc = createRpc()
-    rpc.call.mockRejectedValueOnce(new Error('write failed'))
-    const { api, scope } = runInScope(policy, rpc)
+    const sandbox = createSandbox()
+    sandbox.selectMode.mockRejectedValueOnce(new Error('write failed'))
+    const { api, scope } = runInScope(policy, sandbox)
 
-    await expect(api.setGlobalRunMode('standard')).rejects.toThrow('write failed')
+    await expect(api.setGlobalRunMode('safe')).rejects.toThrow('write failed')
 
     expect(api.runMode.value).toBe('full')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBeNull()
@@ -145,8 +157,8 @@ describe('useChatRunModePreference', () => {
 
     api.applyRunModePreferenceChanged({ runMode: 'full' })
 
-    expect(api.runMode.value).toBe('trusted')
-    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('trusted')
+    expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
   })
 
@@ -159,48 +171,9 @@ describe('useChatRunModePreference', () => {
 
     const { api, scope } = runInScope(policy)
 
-    expect(api.runMode.value).toBe('trusted')
+    expect(api.runMode.value).toBe('safe')
     expect(api.runModeUserSelected.value).toBe(false)
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBeNull()
     scope.stop()
-  })
-})
-
-describe('persistMaterializedSessionRunMode', () => {
-  it('persists the selected mode for an existing session', async () => {
-    const rpc = {
-      waitForConnection: vi.fn().mockResolvedValue(undefined),
-      call: vi.fn().mockResolvedValue({}),
-    }
-
-    await persistMaterializedSessionRunMode({
-      rpc,
-      sessionKey: 'agent:main:webchat:one',
-      isDraft: false,
-      runMode: 'standard',
-    })
-
-    expect(rpc.waitForConnection).toHaveBeenCalledOnce()
-    expect(rpc.call).toHaveBeenCalledWith('sandbox.run_context.set', {
-      sessionKey: 'agent:main:webchat:one',
-      runMode: 'standard',
-    })
-  })
-
-  it('does not create or mutate a session while the route is still a draft', async () => {
-    const rpc = {
-      waitForConnection: vi.fn().mockResolvedValue(undefined),
-      call: vi.fn().mockResolvedValue({}),
-    }
-
-    await persistMaterializedSessionRunMode({
-      rpc,
-      sessionKey: 'agent:main:webchat:draft',
-      isDraft: true,
-      runMode: 'full',
-    })
-
-    expect(rpc.waitForConnection).not.toHaveBeenCalled()
-    expect(rpc.call).not.toHaveBeenCalled()
   })
 })

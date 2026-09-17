@@ -23,4 +23,21 @@ describe('createHistoryNavigationScrollLock', () => {
     lock.updateFromScroll(180)
     expect(autoScroll.value).toBe(false)
   })
+
+  it('reports reader interruption without restoring follow at navigation end', () => {
+    const autoScroll = ref(true)
+    const lock = createHistoryNavigationScrollLock(autoScroll)
+
+    lock.start()
+    expect(lock.interrupt()).toBe(true)
+    expect(lock.interrupt()).toBe(false)
+    lock.updateFromScroll(12)
+
+    expect(autoScroll.value).toBe(false)
+    expect(lock.finish()).toBe(true)
+    expect(lock.locked).toBe(false)
+
+    lock.start()
+    expect(lock.finish()).toBe(false)
+  })
 })

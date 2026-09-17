@@ -4,6 +4,7 @@
   "description": "Compact Mocha output while preserving failing tests and summary counts.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["mocha"],
     "commandIncludes": ["mocha"]
   },
   "transforms": {

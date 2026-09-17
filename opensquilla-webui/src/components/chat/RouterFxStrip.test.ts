@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, reactive } from 'vue'
+import { createApp, nextTick, reactive, ref } from 'vue'
+import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import RouterFxStrip from './RouterFxStrip.vue'
@@ -56,6 +57,51 @@ function routerStrip(overrides: Partial<ChatRenderedMessage> = {}): ChatRendered
   }
 }
 
+function combinedStrip(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
+  return routerStrip({
+    routerPanel: 'router-ensemble-sequence',
+    routerMode: 'squilla_router',
+    routerSource: 'squilla_router',
+    gridCells: [
+      { kind: 'real', tier: 'c0', tiers: ['c0'], displayName: 'qwen3.7-flash' },
+      { kind: 'real', tier: 'c1', tiers: ['c1'], displayName: 'deepseek-v4-flash' },
+      { kind: 'real', tier: 'c2', tiers: ['c2'], displayName: 'glm-5.2' },
+      {
+        kind: 'real',
+        tier: 'c3',
+        tiers: ['c3'],
+        displayName: 'claude-opus-4.8',
+        executionKind: 'ensemble',
+      },
+    ],
+    winnerIdx: 3,
+    messageId: 'router-c3-ensemble',
+    ensemble: {
+      profile: 'default',
+      modelCount: 1,
+      totalCandidates: 4,
+      requestCount: 1,
+      fallbackUsed: false,
+      fallbackReason: '',
+      costUsd: 0,
+      savedUsd: 0,
+      savedPct: 0,
+      models: [{
+        role: 'anchor',
+        label: 'anchor',
+        provider: 'openrouter',
+        model: 'qwen/qwen3.7-plus',
+        modelShort: 'qwen3.7-plus',
+        input: 0,
+        output: 0,
+        costUsd: 0,
+        status: 'running',
+      }],
+    },
+    ...overrides,
+  })
+}
+
 function mockReducedMotion(matches: boolean) {
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
@@ -99,6 +145,28 @@ afterEach(() => {
 })
 
 describe('RouterFxStrip model selection motion', () => {
+  it('shows an ensemble tier as a logical fusion target instead of its backing model', async () => {
+    const { app, el } = await mountStrip(routerStrip({
+      routerStatic: true,
+      gridCells: [
+        {
+          kind: 'real',
+          tier: 'c3',
+          tiers: ['c3'],
+          displayName: 'claude-opus-4.8',
+          model: 'anthropic/claude-opus-4.8',
+          executionKind: 'ensemble',
+        },
+        { kind: 'real', tier: 'c2', tiers: ['c2'], displayName: 'glm-5.2' },
+      ],
+      winnerIdx: 1,
+    }))
+
+    expect(el.textContent).toContain('Multi-model fusion')
+    expect(el.textContent).not.toContain('claude-opus-4.8')
+    app.unmount()
+  })
+
   it('scans real candidates, locks the winner, and announces only the result', async () => {
     vi.useFakeTimers()
     const { app, el } = await mountStrip(routerStrip())
@@ -132,6 +200,142 @@ describe('RouterFxStrip model selection motion', () => {
     expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.dataset.cellIdx).toBe('2')
     expect(announcer?.textContent).toBe('Router selected deepseek-v4-flash')
     expect(root?.getAttribute('aria-label')).toBe('Router selected deepseek-v4-flash')
+    app.unmount()
+  })
+
+  it('moves the live highlight across physical fallbacks without changing the route choice', async () => {
+    vi.useFakeTimers()
+    const message = reactive(routerStrip({
+      routerSelectedModel: 'deepseek-v4-pro',
+      routerExecutionModel: 'deepseek-v4-pro',
+      gridCells: [
+        {
+          kind: 'real', tier: 'c0', tiers: ['c0'],
+          displayName: 'deepseek-v4-pro', model: 'deepseek-v4-pro',
+        },
+        {
+          kind: 'real', tier: 'c1', tiers: ['c1'],
+          displayName: 'kimi-k2.7-code', model: 'kimi-k2.7-code',
+        },
+      ],
+      winnerIdx: 0,
+    }))
+    const { app, el } = await mountStrip(message)
+
+    await vi.advanceTimersByTimeAsync(600)
+    await nextTick()
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.dataset.cellIdx).toBe('0')
+    expect(el.querySelector('[data-testid="router-execution-model"]')).toBeFalsy()
+
+    message.routerExecutionModel = 'kimi-k2.7-code'
+    await nextTick()
+    expect(message.routerSelectedModel).toBe('deepseek-v4-pro')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.dataset.cellIdx).toBe('1')
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toContain('Currently executing kimi-k2.7-code')
+
+    message.routerExecutionModel = 'deepseek-v4-pro-0813'
+    await nextTick()
+    expect(el.querySelector('.router-fx-cell.win')).toBeFalsy()
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toContain('Currently executing deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx-grid')?.textContent).not.toContain('deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx-sr-only')?.textContent)
+      .not.toContain('Router selected deepseek-v4-pro-0813')
+    expect(message.routerSelectedModel).toBe('deepseek-v4-pro')
+    expect(el.querySelector('.router-fx')?.getAttribute('aria-label'))
+      .toBe('Currently executing deepseek-v4-pro-0813')
+    app.unmount()
+  })
+
+  it('uses completed physical model wording at settlement and remains silent on history mount', async () => {
+    const message = reactive(routerStrip({
+      routerSelectedModel: 'deepseek-v4-pro',
+      routerExecutionModel: 'deepseek-v4-pro-0813',
+    }))
+    const { app, el } = await mountStrip(message)
+    expect(el.querySelector('.router-fx-sr-only')?.textContent)
+      .toBe('Currently executing deepseek-v4-pro-0813')
+    message.routerSettled = true
+    await nextTick()
+    expect(el.querySelector('.router-fx-sr-only')?.textContent)
+      .toBe('Executed by deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx')?.getAttribute('aria-label'))
+      .toBe('Executed by deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx-cell.win')).toBeFalsy()
+    app.unmount()
+
+    const historyMessage = reactive(routerStrip({ ...message, routerStatic: true }))
+    const history = await mountStrip(historyMessage)
+    expect(history.el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
+    expect(history.el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toBe('Executed by deepseek-v4-pro-0813')
+    historyMessage.routerExecutionModel = 'kimi-k2.7-code'
+    await nextTick()
+    expect(history.el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
+    expect(history.el.querySelector('.router-fx')?.getAttribute('aria-label'))
+      .toBe('Executed by kimi-k2.7-code')
+    history.app.unmount()
+  })
+
+  it('announces consecutive physical fallbacks outside the router candidate pool', async () => {
+    vi.useFakeTimers()
+    const message = reactive(routerStrip({
+      routerSelectedModel: 'deepseek-v4-pro',
+      routerExecutionModel: 'deepseek-v4-pro',
+      gridCells: [
+        {
+          kind: 'real', tier: 'c0', tiers: ['c0'],
+          displayName: 'deepseek-v4-pro', model: 'deepseek-v4-pro',
+        },
+        {
+          kind: 'real', tier: 'c1', tiers: ['c1'],
+          displayName: 'glm-5.2', model: 'glm-5.2',
+        },
+      ],
+      winnerIdx: 0,
+    }))
+    const { app, el } = await mountStrip(message)
+    const announcer = el.querySelector<HTMLElement>('.router-fx-sr-only')
+
+    await vi.advanceTimersByTimeAsync(600)
+    await nextTick()
+
+    message.routerExecutionModel = 'kimi-k2.7-code'
+    await nextTick()
+    expect(el.querySelector('.router-fx-cell.win')).toBeFalsy()
+    expect(announcer?.textContent).toBe('Currently executing kimi-k2.7-code')
+
+    message.routerExecutionModel = 'deepseek-v4-pro-0813'
+    await nextTick()
+    expect(announcer?.textContent).toBe('Currently executing deepseek-v4-pro-0813')
+    expect(announcer?.textContent).not.toContain('Router selected')
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toContain('Currently executing deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx')?.getAttribute('aria-label'))
+      .toBe('Currently executing deepseek-v4-pro-0813')
+    expect(el.querySelector('.router-fx-grid')?.textContent).not.toContain('kimi-k2.7-code')
+    expect(el.querySelector('.router-fx-grid')?.textContent).not.toContain('deepseek-v4-pro-0813')
+    expect(message.routerSelectedModel).toBe('deepseek-v4-pro')
+
+    message.routerExecutionModel = 'deepseek-v4-pro'
+    await nextTick()
+    expect(announcer?.textContent).toBe('Router selected deepseek-v4-pro')
+    expect(el.querySelector('.router-fx')?.getAttribute('aria-label'))
+      .toBe('Router selected deepseek-v4-pro')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.dataset.cellIdx).toBe('0')
+    expect(el.querySelector('[data-testid="router-execution-model"]')).toBeFalsy()
+    app.unmount()
+  })
+
+  it('announces an outside-pool execution model when the live strip mounts', async () => {
+    const { app, el } = await mountStrip(routerStrip({
+      routerSelectedModel: 'deepseek-v4-pro',
+      routerExecutionModel: 'deepseek-v4-pro-0813',
+    }))
+    expect(el.querySelector('.router-fx-cell.win')).toBeFalsy()
+    expect(el.querySelector('.router-fx-sr-only')?.textContent)
+      .toBe('Currently executing deepseek-v4-pro-0813')
     app.unmount()
   })
 
@@ -188,15 +392,139 @@ describe('RouterFxStrip model selection motion', () => {
     app.unmount()
     expect(vi.getTimerCount()).toBe(0)
   })
+
+  it('plays the tier router first, then reveals the existing ensemble animation', async () => {
+    vi.useFakeTimers()
+    const { app, el } = await mountStrip(combinedStrip())
+    const root = el.querySelector<HTMLElement>('.router-fx')
+
+    expect(root?.dataset.panel).toBe('router-ensemble-sequence')
+    expect(root?.dataset.phase).toBe('scanning')
+    expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeFalsy()
+
+    await vi.advanceTimersByTimeAsync(599)
+    await nextTick()
+    expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeFalsy()
+
+    await vi.advanceTimersByTimeAsync(1)
+    await nextTick()
+
+    expect(root?.dataset.phase).toBe('locked')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.textContent).toContain('Multi-model fusion')
+    expect(el.querySelector('[data-testid="router-ensemble-handoff"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeTruthy()
+    expect(el.querySelector('.router-fx-ensemble__dot')).toBeTruthy()
+    expect(el.textContent).toContain('4 candidates synthesizing')
+    app.unmount()
+  })
+
+  it('shows both stages immediately for reduced motion', async () => {
+    vi.useFakeTimers()
+    mockReducedMotion(true)
+    const { app, el } = await mountStrip(combinedStrip())
+
+    expect(el.querySelector<HTMLElement>('.router-fx')?.dataset.phase).toBe('static')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.textContent).toContain('Multi-model fusion')
+    expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeTruthy()
+    expect(vi.getTimerCount()).toBe(0)
+    app.unmount()
+  })
 })
 
 describe('RouterFxStrip ensemble panel', () => {
+  it.each([false, true])('shows the lower handoff only for actual fusion (fusion=%s)', async actualFusion => {
+    const { renderedMessages } = useChatRenderedMessages({
+      messages: ref([
+        { role: 'user', text: 'Question', ts: 0 },
+        {
+          role: 'router', text: '', ts: 1, restoredFromHistory: true,
+          routerDecision: { tier: 'c1', model: 'deepseek-v4-pro-0813', source: 'v4_phase3' },
+        },
+        {
+          role: 'assistant', text: 'Answer', ts: 2, restoredFromHistory: true,
+          turn_usage: {
+            model: 'deepseek-v4-pro-0813',
+            model_usage_breakdown: [{ role: 'member', model: 'deepseek-v4-pro-0813' }],
+            ...(actualFusion ? { ensemble_trace: { profile: 'custom_b5', fallback_used: true } } : {}),
+          },
+        },
+      ]),
+      sessionKey: ref('fusion-classification'),
+      routerSlots: ref(['c1']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+    const strip = renderedMessages.value.find(message => message.isRouterStrip)!
+    const { app, el } = await mountStrip(strip)
+
+    expect(Boolean(el.querySelector('[data-testid="router-ensemble-handoff"]'))).toBe(actualFusion)
+    expect(Boolean(el.querySelector('[data-testid="router-ensemble-stage"]'))).toBe(actualFusion)
+    expect(Boolean(el.querySelector('[data-testid="router-ensemble-toggle"]'))).toBe(actualFusion)
+    app.unmount()
+  })
+
+  it('shows every candidate as Proposer and the fuser as Aggregator', async () => {
+    const roles = ['primary', 'contrast', 'fast_check', 'critic', 'aggregator']
+    const { app, el } = await mountStrip(ensembleStrip({
+      routerSettled: true,
+      ensemble: {
+        profile: 'custom_b5',
+        modelCount: 4,
+        totalCandidates: 4,
+        requestCount: 5,
+        fallbackUsed: false,
+        fallbackReason: '',
+        costUsd: 0,
+        savedUsd: 0,
+        savedPct: 0,
+        models: roles.map((role, index) => ({
+          role,
+          label: role,
+          provider: 'tokenrhythm',
+          model: `model-${index + 1}`,
+          modelShort: `model-${index + 1}`,
+          input: 10,
+          output: 2,
+          costUsd: 0,
+          status: 'done' as const,
+        })),
+      },
+    }))
+
+    el.querySelector<HTMLButtonElement>('[data-testid="router-ensemble-toggle"]')?.click()
+    await nextTick()
+
+    const displayedRoles = Array.from(
+      el.querySelectorAll<HTMLElement>('.router-fx-inspector__role'),
+      node => node.textContent?.trim(),
+    )
+    expect(displayedRoles).toEqual([
+      'Proposer ·',
+      'Proposer ·',
+      'Proposer ·',
+      'Proposer ·',
+      'Aggregator ·',
+    ])
+    expect(el.textContent).not.toContain('primary')
+    expect(el.textContent).not.toContain('contrast')
+    expect(el.textContent).not.toContain('fast_check')
+    expect(el.textContent).not.toContain('critic')
+    app.unmount()
+  })
+
   it('keeps an empty pending ensemble panel openable', async () => {
     const { app, el } = await mountStrip(ensembleStrip())
 
     const button = el.querySelector<HTMLButtonElement>('[data-testid="router-ensemble-toggle"]')
     expect(button).toBeTruthy()
     expect(button?.disabled).toBe(false)
+    expect(el.querySelector('.router-fx-ensemble__dot.pending')).toBeTruthy()
 
     button?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await nextTick()
@@ -227,7 +555,7 @@ describe('RouterFxStrip ensemble panel', () => {
     app.unmount()
   })
 
-  it('shows candidate failures and waits for the aggregator before completing', async () => {
+  it('shows candidate failures and waits for the whole turn before completing', async () => {
     const message = reactive(ensembleStrip({
       ensemble: {
         profile: 'llm_ensemble',
@@ -288,12 +616,13 @@ describe('RouterFxStrip ensemble panel', () => {
     expect(el.querySelectorAll('[data-status="done"]')).toHaveLength(1)
     expect(el.querySelectorAll('[data-status="failed"]')).toHaveLength(1)
     expect(el.querySelectorAll('[data-status="running"]')).toHaveLength(1)
-    expect(el.textContent).toContain('120 tok · 105s')
+    expect(el.textContent).toContain('120 token · 105s')
     expect(el.textContent).toContain('failed · 118s')
     expect(el.querySelector('[data-status="failed"] .router-fx-inspector__usage')?.getAttribute('title'))
       .toBe('provider timed out')
     expect(el.querySelector('.router-fx-ensemble__scan')).toBeTruthy()
     expect(el.textContent).toContain('2 candidates synthesizing')
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeFalsy()
 
     const aggregator = message.ensemble?.models.find(model => model.role === 'aggregator')
     if (!aggregator) throw new Error('expected aggregator row')
@@ -303,10 +632,76 @@ describe('RouterFxStrip ensemble panel', () => {
     aggregator.elapsedMs = 12_000
     await nextTick()
 
-    expect(el.textContent).toContain('240 tok · 12s')
+    expect(el.textContent).toContain('240 token · 12s')
+    expect(el.textContent).toContain('2 candidates synthesizing')
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeFalsy()
+    expect(el.querySelector('.router-fx-ensemble__scan')).toBeTruthy()
+    expect(el.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('true')
+
+    message.routerSettled = true
+    await nextTick()
+
     expect(el.textContent).toContain('2 candidates synthesized')
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeTruthy()
     expect(el.querySelector('.router-fx-ensemble__scan')).toBeFalsy()
     expect(el.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('false')
+    app.unmount()
+  })
+
+  it('keeps the fusion animation busy while the fixed fallback is still generating', async () => {
+    const message = reactive(ensembleStrip({
+      ensemble: {
+        profile: 'llm_ensemble',
+        modelCount: 1,
+        totalCandidates: 1,
+        requestCount: 2,
+        fallbackUsed: true,
+        fallbackReason: 'aggregator failed',
+        costUsd: 0,
+        savedUsd: 0,
+        savedPct: 0,
+        models: [
+          {
+            role: 'proposer',
+            label: 'anchor',
+            provider: 'openrouter',
+            model: 'qwen/qwen3.7-plus',
+            modelShort: 'qwen3.7-plus',
+            input: 100,
+            output: 20,
+            costUsd: 0,
+            status: 'done',
+          },
+          {
+            role: 'aggregator',
+            label: 'aggregator',
+            provider: 'openrouter',
+            model: 'anthropic/claude-sonnet',
+            modelShort: 'claude-sonnet',
+            input: 0,
+            output: 0,
+            costUsd: 0,
+            status: 'failed',
+            error: 'provider authentication failed',
+          },
+        ],
+      },
+    }))
+    const { app, el } = await mountStrip(message)
+    const toggle = el.querySelector('[data-testid="router-ensemble-toggle"]')
+
+    expect(el.textContent).toContain('1 candidates synthesizing')
+    expect(toggle?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.router-fx-ensemble__scan')).toBeTruthy()
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeFalsy()
+
+    message.routerSettled = true
+    await nextTick()
+
+    expect(el.textContent).toContain('1 candidates synthesized')
+    expect(toggle?.getAttribute('aria-busy')).toBe('false')
+    expect(el.querySelector('.router-fx-ensemble__scan')).toBeFalsy()
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeTruthy()
     app.unmount()
   })
 

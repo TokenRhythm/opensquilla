@@ -15,6 +15,7 @@ describe('deferred user-input protocol', () => {
       step: 'plan',
       clarify_schema: {
         intro: 'Choose a scope.',
+        presentation: 'plan_questionnaire_v1',
         fields: [{
           name: 'scope',
           header: 'Scope',
@@ -31,6 +32,7 @@ describe('deferred user-input protocol', () => {
       },
     })).toEqual({
       intro: 'Choose a scope.',
+      presentation: 'plan_questionnaire_v1',
       fields: [{
         name: 'scope',
         header: 'Scope',

@@ -12,7 +12,11 @@ from typing import Any, cast
 from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
+from opensquilla.gateway.adapters.workspace_catalog_contract import (
+    register_workspace_catalog_contract,
+)
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.subagent_announce import (
@@ -88,7 +92,6 @@ async def _payload(storage: Any, workspace: ProjectWorkspace) -> dict[str, Any]:
     return await project_workspace_payload(storage, workspace)
 
 
-@_d.method("workspaces.list", scope="operator.read")
 async def _handle_workspaces_list(
     params: dict | None,
     ctx: RpcContext,
@@ -102,7 +105,6 @@ async def _handle_workspaces_list(
     }
 
 
-@_d.method("workspaces.open", scope="operator.write")
 async def _handle_workspaces_open(
     params: dict | None,
     ctx: RpcContext,
@@ -133,7 +135,6 @@ async def _handle_workspaces_open(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.update", scope="operator.write")
 async def _handle_workspaces_update(
     params: dict | None,
     ctx: RpcContext,
@@ -155,7 +156,6 @@ async def _handle_workspaces_update(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.pin", scope="operator.write")
 async def _handle_workspaces_pin(
     params: dict | None,
     ctx: RpcContext,
@@ -174,7 +174,6 @@ async def _handle_workspaces_pin(
     return {"workspace": await _payload(storage, workspace)}
 
 
-@_d.method("workspaces.remove", scope="operator.write")
 async def _handle_workspaces_remove(
     params: dict | None,
     ctx: RpcContext,
@@ -183,11 +182,30 @@ async def _handle_workspaces_remove(
     workspace_id = _workspace_id(params)
     storage = _storage(ctx)
     await _active_workspace(storage, workspace_id)
+    scheduler = getattr(ctx, "cron_scheduler", None)
+    affected_job_ids: list[str] = []
+    if scheduler is not None:
+        jobs = await scheduler.list_jobs()
+        affected = [
+            job
+            for job in jobs
+            if (getattr(job, "payload", None) or {}).get("_workspace_id") == workspace_id
+        ]
+        for job in affected:
+            payload = dict(job.payload)
+            payload["_workspace_unavailable"] = "removed"
+            await scheduler.update_job(job.id, payload=payload)
+            await scheduler.pause_job(job.id)
+            affected_job_ids.append(job.id)
     await storage.remove_project_workspace(workspace_id)
-    return {"removed": True, "workspaceId": workspace_id}
+    return {
+        "removed": True,
+        "workspaceId": workspace_id,
+        "pausedCronJobIds": affected_job_ids,
+        "pausedCronJobCount": len(affected_job_ids),
+    }
 
 
-@_d.method("workspaces.history.delete", scope="operator.write")
 async def _handle_workspaces_history_delete(
     params: dict | None,
     ctx: RpcContext,
@@ -228,14 +246,6 @@ async def _handle_workspaces_history_delete(
                 # tasks above. Let matching work settle naturally: cancelling a
                 # wrapper cannot stop an underlying writer thread.
                 await drain_pending_flushes_for_sessions(candidate_keys)
-                drain_turn_writes = getattr(
-                    ctx.turn_runner,
-                    "drain_session_background_writes",
-                    None,
-                )
-                if callable(drain_turn_writes):
-                    await drain_turn_writes(candidate_keys)
-
                 session_ids: dict[str, str] = {}
                 for session_key in candidate_keys:
                     node = await storage.get_session(session_key)
@@ -278,6 +288,27 @@ async def _handle_workspaces_history_delete(
                 }
 
     return await _settle_despite_cancellation(_delete_fenced_history())
+
+
+_WORKSPACE_CATALOG_CONTRACT_IMPLEMENTATIONS = {
+    "workspaces.list": _handle_workspaces_list,
+    "workspaces.open": _handle_workspaces_open,
+    "workspaces.update": _handle_workspaces_update,
+    "workspaces.pin": _handle_workspaces_pin,
+    "workspaces.remove": _handle_workspaces_remove,
+    "workspaces.history.delete": _handle_workspaces_history_delete,
+}
+
+_WORKSPACE_CATALOG_CONTRACT_HANDLERS = {
+    method: register_workspace_catalog_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _WORKSPACE_CATALOG_CONTRACT_IMPLEMENTATIONS.items()
+}
 
 
 __all__ = [

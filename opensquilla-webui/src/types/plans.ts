@@ -52,7 +52,7 @@ export interface PlanRunSnapshot {
   status: PlanRunStatus
   currentStepId?: string
   stateRevision?: number
-  /** Execution owner. `manual` today; a future durable goal driver can reuse the same run. */
+  /** Execution owner retained for compatibility with already-published run records. */
   driverKind?: string
   driverId?: string
   activeTaskId?: string

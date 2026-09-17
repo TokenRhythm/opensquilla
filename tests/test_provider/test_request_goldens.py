@@ -23,6 +23,14 @@ async def test_provider_request_matches_golden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = await harness.capture_case_record(case, monkeypatch)
+    projection = harness.project_case_request(case)
+    assert projection.payload == record["body"], (
+        f"{case.case_id}: final request projection drifted from transport payload"
+    )
+    assert projection.wire_message_count == len(
+        record["body"].get("messages", record["body"].get("input", []))
+    )
+    assert projection.fits_message_count is None
     harness.assert_or_regen(case.golden_path, record)
 
 

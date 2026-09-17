@@ -1,4 +1,4 @@
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 
 const ARTIFACT_CARD_SELECTOR = [
   '.msg-media-card',
@@ -52,7 +52,12 @@ export function focusArtifactInTranscript(
 ): boolean {
   const card = findArtifactCard(root, artifact)
   if (!card) return false
-  card.scrollIntoView?.({ behavior, block: 'center' })
+  const reduceMotion = typeof window !== 'undefined'
+    && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  card.scrollIntoView?.({
+    behavior: reduceMotion && behavior === 'smooth' ? 'auto' : behavior,
+    block: 'center',
+  })
   const focusable = card.matches(PRIMARY_FOCUS_SELECTOR)
     ? card
     : card.querySelector<HTMLElement>(PRIMARY_FOCUS_SELECTOR)

@@ -3,43 +3,210 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
+import json
 import re
-import sqlite3
+import threading
 import time
 import uuid
-from dataclasses import asdict, replace
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import structlog
 
 from opensquilla.agents.scope import default_workspace_dir, resolve_agent_workspace_dir
-from opensquilla.artifacts import enrich_artifact_event_dict
-from opensquilla.engine.cache_break_monitor import notify_compaction
-from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
+from opensquilla.application.admission_views import AdmissionAcceptance
+from opensquilla.application.admission_views import SessionIdentity as AdmissionSessionIdentity
+from opensquilla.application.pending_input_queue import (
+    PendingCancellationConflictError,
+    PendingDispatchReplay,
+    PendingInputConflictError,
+    PendingInputMissingError,
+    PendingInputProjection,
+    PendingInputQueuePort,
+    PendingInputRevision,
+)
+from opensquilla.application.session_directory import (
+    SessionDirectory,
+    SessionSearchProjection,
+    _resolve_session_record_for_bootstrap,
+)
+from opensquilla.application.session_lifecycle import (
+    ForkSessionSpec,
+    NewSession,
+    SessionCreationKind,
+    SessionCreationPolicyPort,
+    SessionDeletionPort,
+    SessionForked,
+    SessionForkMode,
+    SessionIdentity,
+    SessionLifecycle,
+    SessionLifecycleEventsPort,
+    SessionLifecycleStorePort,
+    SessionWorkspaceBinding,
+)
+from opensquilla.application.session_read import (
+    SessionMetadataQuery,
+    SessionPlanningState,
+    SessionReadApplication,
+    SessionRunModeLock,
+    SessionTaskState,
+    SessionWorkspaceState,
+    deferred_session_read_metadata,
+)
+from opensquilla.application.turn_acceptance import DurableTurnAdmission
+from opensquilla.application.turn_acceptance_ports import (
+    AdmissionPolicy,
+    AdmissionPrimitives,
+    AdmissionStorage,
+)
+from opensquilla.application.turn_admission import (
+    AdmitTurn,
+    AdmitTurnResult,
+    TurnAdmission,
+)
+from opensquilla.application.turn_cancellation import (
+    CancellationPrimitives,
+    CancellationTiming,
+    ExactCancellationUnavailableError,
+    TurnCancellation,
+)
+from opensquilla.application.turn_input import IncomingTurnSource, PlanAdmissionContext
+from opensquilla.application.turn_steering import TurnSteering
+from opensquilla.attachment_refs import (
+    PENDING_CHAT_INPUT_MATERIAL_STORE,
+    cleanup_pending_chat_input_material,
+    read_pending_chat_input_promotions,
+    transcript_material_path,
+)
+from opensquilla.engine.cache_break_monitor import (
+    cancel_active_compactions,
+)
 from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
-from opensquilla.gateway import attachment_ingest as _attachment_ingest
+from opensquilla.gateway.adapters.connection_recovery_contract import (
+    register_connection_recovery_contract,
+)
+from opensquilla.gateway.adapters.pending_input_queue import (
+    GatewayPendingInputQueueAdapter,
+)
+from opensquilla.gateway.adapters.pending_input_queue_contract import (
+    register_pending_input_queue_contract,
+)
+from opensquilla.gateway.adapters.plans_contract import (
+    register_plans_cancel_run_contract,
+    register_plans_capabilities_contract,
+    register_plans_implement_contract,
+    register_plans_revise_contract,
+    register_plans_set_mode_contract,
+)
+from opensquilla.gateway.adapters.session_control_contract import (
+    register_session_control_contract,
+)
+from opensquilla.gateway.adapters.session_history_projection import read_chat_history_v4
+from opensquilla.gateway.adapters.session_lifecycle import (
+    GatewaySessionLifecycleAdapter,
+)
+from opensquilla.gateway.adapters.session_lifecycle_contract import (
+    register_session_lifecycle_contract,
+)
+from opensquilla.gateway.adapters.session_maintenance import (
+    GatewaySessionMaintenanceAdapter,
+    build_gateway_session_maintenance_adapter,
+)
+from opensquilla.gateway.adapters.session_maintenance_contract import (
+    register_session_maintenance_contract,
+)
+from opensquilla.gateway.adapters.session_preview import (
+    SystemClock,
+    preview_params_from_v4,
+    preview_query_from_v4_values,
+    preview_result_to_v4,
+)
+from opensquilla.gateway.adapters.session_read import (
+    GatewaySessionReadPorts,
+    build_v4_session_read_application,
+    session_read_metadata_to_v4,
+    session_read_snapshot_to_v4,
+)
+from opensquilla.gateway.adapters.session_read_contract import (
+    register_sessions_messages_hydrate_contract,
+    register_sessions_messages_snapshot_contract,
+    register_sessions_messages_subscribe_contract,
+    register_sessions_messages_unsubscribe_contract,
+    register_sessions_preview_contract,
+)
+from opensquilla.gateway.adapters.session_reset import (
+    GatewaySessionResetAdapter,
+    build_gateway_session_reset_adapter,
+)
+from opensquilla.gateway.adapters.sessions_list_contract import (
+    register_sessions_list_contract,
+)
+from opensquilla.gateway.adapters.sessions_resolve_contract import (
+    register_sessions_resolve_contract,
+)
+from opensquilla.gateway.adapters.sessions_search_contract import (
+    register_sessions_search_contract,
+)
+from opensquilla.gateway.adapters.turn_admission import (
+    GatewayTurnAdmissionAdapter,
+    map_admission_error,
+)
+from opensquilla.gateway.adapters.turn_admission_contract import (
+    register_turn_admission_contract,
+)
+from opensquilla.gateway.admission_failures import translate_admission_failure
+from opensquilla.gateway.admission_input import decode_admit_turn, source_hint_from_turn
+from opensquilla.gateway.admission_preparation import (
+    PreparedRuntimeRoute,
+)
+from opensquilla.gateway.admission_preparation import (
+    prepare_route as prepare_admission_route,
+)
+from opensquilla.gateway.admission_runtime import GatewayAdmissionRuntime
+from opensquilla.gateway.admission_storage import GatewayAdmissionSessions, GatewayAdmissionStorage
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
-from opensquilla.gateway.config import effective_agent_stream_idle_timeout_seconds
-from opensquilla.gateway.input_normalization import (
-    infer_normalized_input_from_attachments,
-    materialize_generated_text_attachments,
-    normalize_incoming_text,
+from opensquilla.gateway.compaction_target import (
+    validate_gateway_session_deployment_override,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.model_routing import model_routing_patches
+from opensquilla.gateway.page_context import resolve_page_context
+from opensquilla.gateway.pending_input_primitives import (
+    GatewayPendingInputPrimitives,
+    pending_input_projection,
 )
 from opensquilla.gateway.project_workspace_runtime import (
-    AcceptedRunModeOverride,
-    apply_accepted_run_mode_override,
     authoritative_project_run_context,
     map_project_workspace_error,
     persisted_project_workspace_snapshot,
     project_workspace_snapshot,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.session_event_publisher import (
+    buffer_session_event,
+    prepare_session_event_payload,
+    send_prepared_to_subscribers,
+)
 from opensquilla.gateway.session_events import build_sessions_changed_payload
+from opensquilla.gateway.session_maintenance_runtime import (
+    TaskScopedCancelUnsupportedError as _TaskScopedCancelUnsupportedError,
+)
+from opensquilla.gateway.session_maintenance_runtime import (
+    cancel_task_runtime as _cancel_task_runtime,
+)
+from opensquilla.gateway.session_maintenance_runtime import (
+    checkpoint_before_session_rewrite,
+)
 from opensquilla.gateway.session_services import (
     get_session_epoch,
     get_session_lock,
@@ -47,69 +214,53 @@ from opensquilla.gateway.session_services import (
     set_session_epoch,
 )
 from opensquilla.gateway.session_streams import get_session_streams
-from opensquilla.gateway.session_view import build_session_view_item, derive_transcript_title
+from opensquilla.gateway.session_title_recovery import read_refused_title_fallbacks
+from opensquilla.gateway.session_view import (
+    build_session_view_item,
+    derive_transcript_title,
+    has_refused_chat_title,
+)
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
+from opensquilla.gateway.telemetry_connections import is_registered_tui_connection
 from opensquilla.gateway.turn_ingress import (
     accepted_turn_payload,
-    complete_durable_ingress,
-    request_identity,
 )
+from opensquilla.gateway.turn_steering import GatewaySteeringPrimitives
+from opensquilla.gateway.uploads import get_upload_store
 from opensquilla.observability.network_policy import (
     provider_request_correlation_disabled,
 )
-from opensquilla.paths import media_root_from_config
+from opensquilla.paths import media_root_from_config, native_io_path
 from opensquilla.project_workspaces import (
     ProjectWorkspaceStateError,
     resolve_validated_project_workspace,
 )
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
-    derive_provider_request_correlation,
 )
-from opensquilla.sandbox.run_context import (
-    RUN_CONTEXT_ORIGIN_KEY,
-    RunContext,
-    run_context_from_origin_payload,
-)
-from opensquilla.sandbox.run_mode import (
+from opensquilla.run_mode import (
     RunMode,
     config_run_mode,
     normalize_run_mode,
     project_default_run_mode,
 )
+from opensquilla.sandbox.guest_profile import (
+    GuestProfileFactory,
+)
+from opensquilla.sandbox.run_context import (
+    RUN_CONTEXT_ORIGIN_KEY,
+    RunContext,
+)
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
+    principal_has_host_execute,
     run_mode_allowed_for_principal,
-)
-from opensquilla.session.compaction import (
-    build_compaction_config_from_provider,
-    call_compact_with_optional_config,
-)
-from opensquilla.session.compaction_lifecycle import (
-    COMPACTION_CHUNK_SUMMARIZED_EVENT,
-    COMPACTION_PERSISTED_EVENT,
-    COMPACTION_SUMMARY_VERIFIED_EVENT,
-    COMPACTION_TRIGGERED_EVENT,
-    compaction_effect_payload,
-    compaction_lifecycle_payload,
-    compaction_memory_status,
-    compaction_result_payload,
-    durable_receipt_allows_destructive_compaction,
-    flush_receipt_is_successful_flush,
-    flush_receipt_status_for_compaction,
-    flush_receipt_to_dict,
-    flush_trigger_enabled,
-    new_compaction_id,
-    pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from opensquilla.session.models import (
-    AgentTaskRecord,
     AgentTaskStatus,
-    PlanRevisionRecord,
-    PlanRunRecord,
     SessionStatus,
 )
 from opensquilla.session.naming import (
@@ -117,22 +268,43 @@ from opensquilla.session.naming import (
     is_naming_eligible,
     title_slot_is_empty,
 )
+from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
 from opensquilla.session.storage import (
+    PendingChatInput,
+    PendingChatInputConflictError,
+    PendingChatInputNotFoundError,
+    SessionListCursor,
+    SessionRoutingConflictError,
     SessionStorage,
-    StaleEpochError,
-    StorageBusyError,
-    TaskCollectionUnavailableError,
     TurnAcceptanceResult,
-    TurnIngressConflictError,
     bounded_interactive_storage_reads,
 )
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
+    safe_error_id,
+    safe_provider_failure_code,
+    safe_provider_failure_message,
     sanitize_agent_error,
 )
 
 _d = get_dispatcher()
+
+_SESSION_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
+
+_PENDING_INPUT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def _pending_input_lock_for(pending_input_id: str) -> asyncio.Lock:
+    """Serialize filesystem ownership with the SQLite pending-row lifecycle."""
+
+    lock = _PENDING_INPUT_LOCKS.get(pending_input_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PENDING_INPUT_LOCKS[pending_input_id] = lock
+    return lock
+
+
 log = structlog.get_logger(__name__)
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
@@ -149,15 +321,26 @@ def _emit_steer_metric(disposition: str, **labels: Any) -> None:
 
 
 if TYPE_CHECKING:
-    from opensquilla.gateway.task_runtime import TaskRuntime
+    pass
 
-_ALLOWED_MEDIA_TYPES = _attachment_ingest.ALLOWED_MEDIA_TYPES
-_MAX_ATTACHMENT_BYTES = _attachment_ingest.MAX_ATTACHMENT_BYTES
-_MAX_STAGED_PDF_BYTES = _attachment_ingest.MAX_STAGED_PDF_BYTES
-_MAX_TEXT_ATTACHMENT_BYTES = _attachment_ingest.TEXT_ATTACHMENT_BYTES
-_MAX_TOTAL_ATTACHMENT_BYTES = _attachment_ingest.MAX_TOTAL_ATTACHMENT_BYTES
-_MAX_ATTACHMENTS = _attachment_ingest.MAX_ATTACHMENTS
 _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
+_ARTIFACT_STATE_EVENT_FIELDS = (
+    "artifactEventSeq",
+    "documentId",
+    "revisionId",
+    "changeSetId",
+    "action",
+)
+
+
+def _coerce_positive_int(value: object, *, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _accepts_keyword_arg(func: Any, name: str) -> bool:
@@ -170,115 +353,342 @@ def _accepts_keyword_arg(func: Any, name: str) -> bool:
     )
 
 
-def _build_session_flush_correlation(
-    ctx: RpcContext,
-    session_id: object,
-) -> tuple[str, ProviderRequestCorrelation | None]:
-    """Create one root operation and execution for a session-bound maintenance flush."""
+def _accepts_explicit_keyword_arg(func: Any, name: str) -> bool:
+    try:
+        parameter = inspect.signature(func).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
 
-    turn_id = uuid.uuid4().hex
+
+def _initial_user_message_owner_kwargs(
+    manager: Any,
+    identity: SessionIdentity,
+) -> dict[str, Any]:
+    append_message = getattr(manager, "append_message", None)
+    if not callable(append_message):
+        return {}
+
+    session_id = identity.session_id
+    session_epoch = identity.epoch
     if (
         not isinstance(session_id, str)
         or not session_id
-        or provider_request_correlation_disabled(config=ctx.config)
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
     ):
-        return turn_id, None
-    return (
-        turn_id,
-        ProviderRequestCorrelation(
-            session_id=session_id,
-            turn_id=turn_id,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.session_flush",
-        ),
+        raise RuntimeError("sessions.create(message=...) received an invalid session owner")
+
+    owner_supported = all(
+        _accepts_explicit_keyword_arg(append_message, name)
+        for name in ("expected_session_id", "expected_session_epoch")
     )
+    if owner_supported:
+        return {
+            "expected_session_id": session_id,
+            "expected_session_epoch": session_epoch,
+        }
+
+    if isinstance(get_session_storage(manager), SessionStorage):
+        raise RuntimeError(
+            "sessions.create(message=...) cannot enforce a durable owner; "
+            "append_message must accept expected_session_id and expected_session_epoch"
+        )
+    return {}
 
 
-async def _branch_with_session_mutation_lock(
-    session_manager: Any,
-    turn_runner: Any,
+def _artifact_state_event_emitter(
+    ctx: RpcContext,
+    session_key: str,
+) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    """Bind a metadata-only ArtifactSession event sink to this RPC connection."""
+
+    from opensquilla.gateway.event_bridge import EventBridge
+    from opensquilla.gateway.websocket import get_registry
+
+    bridge = EventBridge(ctx.subscription_manager, get_registry())
+
+    async def emit(payload: dict[str, Any]) -> None:
+        sequence = payload.get("artifactEventSeq")
+        document_id = payload.get("documentId")
+        action = payload.get("action")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 1
+            or not isinstance(document_id, str)
+            or not document_id
+            or not isinstance(action, str)
+            or not action
+        ):
+            raise ValueError("invalid artifact state event metadata")
+        for field_name in ("revisionId", "changeSetId"):
+            value = payload.get(field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError("invalid artifact state event identifier")
+        safe_payload = {
+            field_name: payload.get(field_name) for field_name in _ARTIFACT_STATE_EVENT_FIELDS
+        }
+        # Dual-publish while existing clients still subscribe to the artifact
+        # event name. Both notifications carry the same metadata-only payload.
+        await bridge.emit(session_key, "session.event.artifact_state", safe_payload)
+        await bridge.emit(session_key, "document.state_changed", safe_payload)
+
+    return emit
+
+
+_FORK_TITLE_SUFFIX_RE = re.compile(r"^(?P<base>.+) \((?P<number>[2-9][0-9]*)\)$")
+_FORK_TITLE_SCAN_PAGE_SIZE = 500
+_FORK_TITLE_ALLOCATOR_GUARD = threading.Lock()
+_FORK_TITLE_ALLOCATOR_LOCKS: weakref.WeakValueDictionary[
+    tuple[int, int, str, str],
+    asyncio.Lock,
+] = weakref.WeakValueDictionary()
+
+
+def _fork_title_family(title: str) -> tuple[str, int]:
+    """Parse a possible copy suffix without deciding whether it is system-owned."""
+
+    match = _FORK_TITLE_SUFFIX_RE.fullmatch(title)
+    if match is None:
+        return title, 1
+    try:
+        number = int(match.group("number"))
+    except ValueError:
+        return title, 1
+    return match.group("base"), number
+
+
+def _session_fork_title_family(
+    session: Any,
+    *,
+    titles_by_key: dict[str, str],
+    sessions_by_key: dict[str, Any],
+    memo: dict[str, tuple[str, int]],
+    visiting: set[str],
+) -> tuple[str, int]:
+    """Resolve a title family only when fork lineage proves the suffix is generated."""
+
+    session_key = str(getattr(session, "session_key", "") or "")
+    title = titles_by_key.get(session_key, "")
+    cached = memo.get(session_key)
+    if cached is not None:
+        return cached
+    literal = (title, 1)
+    if not session_key or session_key in visiting:
+        return literal
+    if not getattr(session, "forked_from_parent", False):
+        memo[session_key] = literal
+        return literal
+    parent_key = str(getattr(session, "parent_session_key", "") or "")
+    parent = sessions_by_key.get(parent_key)
+    parsed_base, parsed_number = _fork_title_family(title)
+    if parent is None or parsed_number == 1:
+        memo[session_key] = literal
+        return literal
+
+    visiting.add(session_key)
+    try:
+        parent_base, parent_number = _session_fork_title_family(
+            parent,
+            titles_by_key=titles_by_key,
+            sessions_by_key=sessions_by_key,
+            memo=memo,
+            visiting=visiting,
+        )
+    finally:
+        visiting.discard(session_key)
+    resolved = (
+        (parsed_base, parsed_number)
+        if parsed_base == parent_base and parsed_number > parent_number
+        else literal
+    )
+    memo[session_key] = resolved
+    return resolved
+
+
+def _fork_title_allocator_lock(
+    storage: Any,
+    *,
+    agent_id: str,
+    base_title: str,
+) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = (id(loop), id(storage), agent_id, base_title)
+    with _FORK_TITLE_ALLOCATOR_GUARD:
+        lock = _FORK_TITLE_ALLOCATOR_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _FORK_TITLE_ALLOCATOR_LOCKS[key] = lock
+        return lock
+
+
+def _session_sidebar_title(
+    session: Any,
+    *,
+    transcript_title: str,
+    channel_types: dict[str, str],
+) -> str:
+    view = build_session_view_item(
+        session,
+        entry_count=0,
+        task_rows=[],
+        now_ms=int(time.time() * 1000),
+        transcript_title=transcript_title,
+        channel_types=channel_types,
+    )
+    return str(view.get("title") or "")
+
+
+async def _fork_title_state(
+    ctx: RpcContext,
+    storage: Any,
+    parent: Any,
+) -> tuple[str, int]:
+    """Return the lineage-aware title family and current highest copy number."""
+
+    parent_key = str(getattr(parent, "session_key", "") or "")
+    agent_id = _effective_agent_id_for_session(parent, parent_key)
+    sessions: list[Any] = []
+    offset = 0
+    while True:
+        page = await storage.list_sessions(
+            agent_id=agent_id,
+            limit=_FORK_TITLE_SCAN_PAGE_SIZE,
+            offset=offset,
+        )
+        sessions.extend(page)
+        if len(page) < _FORK_TITLE_SCAN_PAGE_SIZE:
+            break
+        offset += len(page)
+
+    if all(getattr(session, "session_key", None) != parent.session_key for session in sessions):
+        sessions.append(parent)
+
+    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    transcript_titles = await _list_transcript_titles(
+        storage, sessions, channel_types=channel_types
+    )
+    sessions_by_key = {
+        str(getattr(session, "session_key", "") or ""): session for session in sessions
+    }
+    titles_by_key = {
+        str(getattr(session, "session_key", "") or ""): _session_sidebar_title(
+            session,
+            transcript_title=transcript_titles.get(getattr(session, "session_id", ""), ""),
+            channel_types=channel_types,
+        )
+        for session in sessions
+    }
+    memo: dict[str, tuple[str, int]] = {}
+    base_title, parent_number = _session_fork_title_family(
+        parent,
+        titles_by_key=titles_by_key,
+        sessions_by_key=sessions_by_key,
+        memo=memo,
+        visiting=set(),
+    )
+    highest_number = parent_number
+    for candidate in sessions:
+        candidate_base, candidate_number = _session_fork_title_family(
+            candidate,
+            titles_by_key=titles_by_key,
+            sessions_by_key=sessions_by_key,
+            memo=memo,
+            visiting=set(),
+        )
+        if candidate_base == base_title:
+            highest_number = max(highest_number, candidate_number)
+    return base_title, highest_number
+
+
+async def _next_fork_display_name(ctx: RpcContext, storage: Any, parent: Any) -> str:
+    """Allocate the next copy-style title using the same title contract as sessions.list."""
+
+    base_title, highest_number = await _fork_title_state(ctx, storage, parent)
+    return f"{base_title} ({highest_number + 1})"
+
+
+@contextlib.asynccontextmanager
+async def _fork_title_allocation_context(
+    ctx: RpcContext,
+    storage: Any,
+    parent: Any,
+):
+    """Serialize one title family while holding the source session mutation lock."""
+
+    parent_key = str(getattr(parent, "session_key", "") or "")
+    parent_lock = get_session_lock(ctx.turn_runner, parent_key)
+
+    @contextlib.asynccontextmanager
+    async def allocation_locked():
+        current_parent = await storage.get_session(parent_key)
+        if current_parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        base_title, _highest_number = await _fork_title_state(ctx, storage, current_parent)
+        agent_id = _effective_agent_id_for_session(current_parent, parent_key)
+        allocator_lock = _fork_title_allocator_lock(
+            storage,
+            agent_id=agent_id,
+            base_title=base_title,
+        )
+        async with allocator_lock:
+            yield
+
+    if parent_lock is None:
+        async with allocation_locked():
+            yield
+        return
+    async with parent_lock:
+        async with allocation_locked():
+            yield
+
+
+async def _fork_with_numbered_title(
+    ctx: RpcContext,
+    storage: Any,
     parent_key: str,
     child_key: str,
-    **kwargs: Any,
+    *,
+    explicit_title: str | None,
+    **branch_kwargs: Any,
 ) -> Any:
-    """Fork against the same parent write lock used by turns and compaction."""
-    branch = session_manager.branch
-    lock = get_session_lock(turn_runner, parent_key)
-    if lock is None:
-        return await branch(parent_key, child_key, **kwargs)
-    if _accepts_keyword_arg(branch, "mutation_context"):
-        return await branch(
+    """Create and title a fork while holding the parent's mutation lock when available."""
+
+    async def create_with_display_name(display_name: str) -> Any:
+        return await ctx.session_manager.branch(
             parent_key,
             child_key,
-            mutation_context=lambda: lock,
-            **kwargs,
+            display_name=display_name,
+            **branch_kwargs,
         )
-    # Preserve compatibility with older manager-like implementations that do
-    # not yet expose the mutation-context seam.
-    async with lock:
-        return await branch(parent_key, child_key, **kwargs)
 
+    async def create_explicit_locked() -> Any:
+        parent = await storage.get_session(parent_key)
+        if parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        assert explicit_title is not None
+        return await create_with_display_name(explicit_title)
 
-def _clean_cancel_source(value: Any, default: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return default
-    safe = "".join(ch if ch.isalnum() or ch in {"_", "-", ".", ":"} else "_" for ch in text)
-    return (safe.strip("_") or default)[:80]
-
-
-def _cancel_source_from_params(params: dict | None, default: str) -> str:
-    return _clean_cancel_source((params or {}).get("source"), default)
-
-
-async def _cancel_task_runtime(
-    task_runtime: Any,
-    *,
-    session_key: str,
-    task_id: str | None = None,
-    source: str,
-    reason: str,
-) -> int:
-    cancel = getattr(task_runtime, "cancel")
-    kwargs: dict[str, Any] = {}
-    if task_id and _accepts_keyword_arg(cancel, "task_id"):
-        kwargs["task_id"] = task_id
-    else:
-        kwargs["session_key"] = session_key
-    if _accepts_keyword_arg(cancel, "source"):
-        kwargs["source"] = source
-    if _accepts_keyword_arg(cancel, "reason"):
-        kwargs["reason"] = reason
-    return int(await cancel(**kwargs))
-
-
-async def _durable_receipt_allows_covered_destructive_compaction(
-    storage: Any,
-    session_key: str,
-    session_id: str | None,
-    entries: list[Any],
-) -> bool:
-    if not entries:
-        return True
-    from opensquilla.memory.checkpoint import (
-        checkpoint_coverage_hash,
-        checkpoint_turn_id,
-    )
-
-    list_receipts = getattr(storage, "list_memory_durable_receipts", None)
-    if not callable(list_receipts):
-        return False
-    receipts = await list_receipts(
-        session_key=session_key,
-        session_id=session_id,
-        scope="checkpoint",
-        status="checkpoint_saved",
-        coverage_turn_id=checkpoint_turn_id(entries),
-        coverage_hash=checkpoint_coverage_hash(entries),
-        coverage_entry_count=len(entries),
-        limit=1,
-    )
-    return any(durable_receipt_allows_destructive_compaction(receipt) for receipt in receipts)
+    parent = await storage.get_session(parent_key)
+    if parent is None:
+        raise KeyError(f"Session not found: {parent_key}")
+    if explicit_title:
+        lock = get_session_lock(ctx.turn_runner, parent_key)
+        if lock is None:
+            return await create_explicit_locked()
+        async with lock:
+            return await create_explicit_locked()
+    async with _fork_title_allocation_context(ctx, storage, parent):
+        current_parent = await storage.get_session(parent_key)
+        if current_parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        display_name = await _next_fork_display_name(ctx, storage, current_parent)
+        return await create_with_display_name(display_name)
 
 
 def _truncate_removed_entries(transcript: list[Any], max_messages: int) -> list[Any]:
@@ -289,19 +699,6 @@ def _truncate_removed_entries(transcript: list[Any], max_messages: int) -> list[
     if max_messages == 0:
         return list(transcript)
     return list(transcript[:-max_messages])
-
-
-def _truncate_checkpoint_scope_entries(
-    transcript: list[Any],
-    max_messages: int,
-) -> list[Any]:
-    removed_entries = _truncate_removed_entries(transcript, max_messages)
-    return removed_entries or list(transcript)
-
-
-_attachment_media_type = _attachment_ingest.attachment_media_type
-_normalize_attachments = _attachment_ingest.normalize_attachments
-_sniff_mime_from_bytes = _attachment_ingest.sniff_mime_from_bytes
 
 
 def _trusted_elevated_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> str | None:
@@ -320,10 +717,13 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
             run_mode = normalize_run_mode(value)
         except ValueError:
             return None
+        if run_mode == RunMode.FULL and not principal_has_host_execute(ctx.principal):
+            raise RpcHandlerError(
+                "HOST_CAPABILITY_REQUIRED",
+                "Full access requires a valid token with host execution permission.",
+            )
         if run_mode_allowed_for_principal(run_mode, ctx.principal):
             return run_mode
-        if run_mode == RunMode.FULL and not ctx.principal.is_owner:
-            return RunMode.TRUSTED
         return None
 
     elevated = source_hint.get("elevated")
@@ -332,37 +732,61 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
     if not ctx.principal.is_owner:
         return None
     if elevated in _TRUSTED_ELEVATED_ALIASES:
-        return RunMode.TRUSTED
+        return RunMode.SAFE
     if elevated == "full":
         return RunMode.FULL
     return None
 
 
-def _apply_run_context_route_metadata(
-    route_envelope: Any,
-    run_context: Any,
+def _guest_profile_for_principal(
+    principal: Any,
+    task_id: str,
     *,
-    principal_is_owner: bool,
-) -> None:
-    run_context_payload = run_context.to_origin_payload()
-    filtered_run_context = run_context_from_origin_payload(
-        run_context_payload,
-        source="route_metadata",
-        preserve_materialized_user_grants=True,
-    )
-    route_envelope.metadata["run_mode"] = run_context.run_mode.value
-    # Preserve whether this is the default or an explicit per-session choice
-    # for route consumers that need to display or audit its origin.
-    route_envelope.metadata["run_mode_explicit"] = run_context.source != "default"
-    route_envelope.metadata["sandbox_mounts"] = (
-        filtered_run_context.to_origin_payload()["mounts"]
-        if filtered_run_context is not None
-        else []
-    )
-    route_envelope.metadata["sandbox_run_context"] = run_context_payload
-    object.__setattr__(route_envelope, "sandbox_run_context_fresh", True)
-    if run_context.run_mode.value == "full" and principal_is_owner:
-        route_envelope.metadata["elevated"] = "full"
+    state_dir: str | Path,
+):
+    has_capability = getattr(principal, "has", lambda _capability: False)
+    if has_capability("guest.safe") and not principal_has_host_execute(principal):
+        runtime_roots: tuple[Path, ...] = ()
+        runtime_path: tuple[Path, ...] = ()
+        try:
+            from opensquilla.runtime_packs import (
+                RuntimePackResolver,
+                get_runtime_pack_service,
+            )
+            from opensquilla.sandbox.policy_store import SandboxPolicyStore
+
+            runtime_policy = SandboxPolicyStore(Path(state_dir) / "sessions.db").read().runtimes
+            service = get_runtime_pack_service(state_dir)
+            if service.management_supported:
+                resolver = RuntimePackResolver(service)
+                runtime_roots = resolver.runtime_roots(runtime_policy)
+                runtime_path = resolver.managed_path(runtime_policy)
+            else:
+                from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+
+                legacy = bundled_runtime_resolver()
+                runtime_roots = legacy.runtime_roots(runtime_policy) if legacy is not None else ()
+                runtime_path = legacy.bundled_path(runtime_policy) if legacy is not None else ()
+        except (OSError, RuntimeError, ValueError):
+            # Guest remains strictly managed with an empty PATH. Runtime state
+            # corruption must not make session creation or Gateway boot fail.
+            runtime_roots = ()
+            runtime_path = ()
+        return GuestProfileFactory.create(
+            task_id,
+            state_dir=state_dir,
+            runtime_roots=runtime_roots,
+            runtime_path=runtime_path,
+        )
+    return None
+
+
+def _is_remote_web_guest(principal: Any, source_hint: dict[str, Any]) -> bool:
+    # Source hints are client-controlled presentation metadata.  They must not
+    # weaken the server-computed authority of an unauthenticated guest.
+    del source_hint
+    has_capability = getattr(principal, "has", lambda _capability: False)
+    return bool(has_capability("guest.safe") and not principal_has_host_execute(principal))
 
 
 def _channel_types_from_config(config: Any) -> dict[str, str]:
@@ -377,33 +801,93 @@ def _channel_types_from_config(config: Any) -> dict[str, str]:
     return out
 
 
-def _normalize_session_send_source_hint(params: dict[str, Any]) -> dict[str, Any]:
-    raw_hint = params.get("_source")
-    source_hint = dict(raw_hint) if isinstance(raw_hint, dict) else {}
-    caller_kind = (
-        str(source_hint.get("caller_kind") or source_hint.get("callerKind") or "").strip().lower()
-    )
-    channel_kind = (
-        str(source_hint.get("channel_kind") or source_hint.get("channelKind") or "").strip().lower()
-    )
-    if caller_kind:
-        source_hint.setdefault("caller_kind", caller_kind)
-    if channel_kind:
-        source_hint.setdefault("channel_kind", channel_kind)
-    if caller_kind == "cli" or channel_kind == "cli":
-        return source_hint
-    source_hint.setdefault("caller_kind", "web")
-    source_hint.setdefault("channel_kind", "web")
-    return source_hint
-
-
-_STREAM_IDLE_TIMEOUT_CODE = "stream_idle_timeout"
-_STREAM_IDLE_TIMEOUT_MESSAGE = "Session event stream idle before terminal event"
-_RESET_RUNTIME_SETTLE_SECONDS = 0.25
-_RESET_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
 _ABORT_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
+_ABORT_OWNED_CLEANUP_SECONDS = 30.0
+_ABORT_SESSION_LOOKUP_SECONDS = 0.05
 _ABORT_TREE_STABILIZATION_PASSES = 8
 _ACTIVE_TASK_STATUSES = frozenset({"queued", "running"})
+
+
+def _consume_abort_background_result(task: asyncio.Future[Any]) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+async def _await_abort_operation(
+    awaitable: Any,
+    *,
+    deadline_at_monotonic: float,
+    operation: str,
+    default: Any,
+) -> Any:
+    """Run one Stop operation without letting it extend the shared deadline.
+
+    ``asyncio.wait_for`` may wait past its timeout while a callee handles task
+    cancellation.  Stop must return promptly, so a timed-out operation is
+    cancelled and consumed in the background instead of being synchronously
+    drained.  Cancellation requests already issued by that operation remain
+    best-effort and may still settle after the RPC returns.
+    """
+
+    if isinstance(awaitable, asyncio.Future) and awaitable.done():
+        return awaitable.result()
+    remaining = max(0.0, deadline_at_monotonic - time.monotonic())
+    if remaining <= 0:
+        if isinstance(awaitable, asyncio.Future):
+            awaitable.cancel()
+            awaitable.add_done_callback(_consume_abort_background_result)
+            log.warning("sessions.abort.operation_budget_exhausted", operation=operation)
+            return default
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        log.warning("sessions.abort.operation_budget_exhausted", operation=operation)
+        return default
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+    except asyncio.CancelledError:
+        task.cancel()
+        task.add_done_callback(_consume_abort_background_result)
+        raise
+    if task in done:
+        return task.result()
+
+    task.cancel()
+    task.add_done_callback(_consume_abort_background_result)
+    log.warning("sessions.abort.operation_timed_out", operation=operation)
+    return default
+
+
+async def _await_abort_background_task(
+    task: asyncio.Task[Any],
+    *,
+    deadline_at_monotonic: float,
+    operation: str,
+    default: Any,
+) -> Any:
+    """Observe safety cleanup within the RPC budget without cancelling it.
+
+    Process-tree ownership has its own bounded cleanup deadline.  The Stop RPC
+    may return first, but it must never cancel a cleanup task that has already
+    discovered or started terminating exact task-owned descendants.
+    """
+
+    if task.done():
+        return task.result()
+    remaining = max(0.0, deadline_at_monotonic - time.monotonic())
+    if remaining > 0:
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            task.add_done_callback(_consume_abort_background_result)
+            raise
+        if task in done:
+            return task.result()
+    task.add_done_callback(_consume_abort_background_result)
+    log.warning("sessions.abort.cleanup_continuing", operation=operation)
+    return default
 
 
 def _task_status_value(status: Any) -> str:
@@ -426,6 +910,169 @@ async def _active_task_runtime_ids(task_runtime: Any, session_key: str) -> tuple
         if isinstance(task_id, str) and task_id and task_id not in task_ids:
             task_ids.append(task_id)
     return tuple(task_ids)
+
+
+def _task_record_session_key(row: Any) -> str | None:
+    session_key = getattr(row, "session_key", None)
+    if isinstance(session_key, str) and session_key:
+        return session_key
+    return None
+
+
+def _task_record_parent_identity(row: Any) -> tuple[str, str] | None:
+    """Return the exact parent task/session for one durable subagent task row."""
+
+    if str(getattr(row, "run_kind", "") or "") != "subagent":
+        return None
+    details = getattr(row, "details", None)
+    metadata = details.get("metadata") if isinstance(details, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    parent_task_id = metadata.get("parent_task_id")
+    parent_session_key = metadata.get("parent_session_key")
+    if not isinstance(parent_task_id, str) or not parent_task_id:
+        return None
+    if not isinstance(parent_session_key, str) or not parent_session_key:
+        return None
+    return parent_task_id, parent_session_key
+
+
+async def _task_runtime_rows(task_runtime: Any) -> tuple[Any, ...]:
+    """Read active/background-owner rows plus their bounded durable ancestry."""
+
+    list_tasks = getattr(task_runtime, "list", None)
+    if not callable(list_tasks):
+        return ()
+    try:
+        rows: list[Any] = []
+        for status_value in _ACTIVE_TASK_STATUSES:
+            rows.extend(await list_tasks(status=status_value))
+    except TypeError:
+        try:
+            rows = list(await list_tasks())
+        except (TypeError, NotImplementedError):
+            return ()
+        except Exception:
+            log.warning("sessions.abort.task_runtime_tree_list_failed")
+            return ()
+    except NotImplementedError:
+        return ()
+    except Exception:
+        log.warning("sessions.abort.task_runtime_tree_list_failed")
+        return ()
+
+    # A child may have already yielded after spawning a still-running
+    # grandchild. Hydrate only the parent chain of active rows instead of
+    # scanning the unbounded task ledger.
+    status = getattr(task_runtime, "status", None)
+    rows_by_id = {
+        str(task_id): row
+        for row in rows
+        if isinstance((task_id := getattr(row, "task_id", None)), str) and task_id
+    }
+    from opensquilla.tools.builtin.shell import active_background_process_task_owners
+
+    if callable(status):
+        for owner_session_key, owner_task_id in active_background_process_task_owners():
+            if owner_task_id in rows_by_id:
+                continue
+            try:
+                owner = await status(owner_task_id)
+            except (KeyError, NotImplementedError):
+                continue
+            except Exception:
+                log.warning(
+                    "sessions.abort.background_owner_status_failed",
+                    task_id=owner_task_id,
+                )
+                continue
+            if _task_record_session_key(owner) == owner_session_key:
+                rows_by_id[owner_task_id] = owner
+    pending_parent_ids = [
+        parent_task_id
+        for row in tuple(rows_by_id.values())
+        if (identity := _task_record_parent_identity(row)) is not None
+        for parent_task_id in (identity[0],)
+        if parent_task_id not in rows_by_id
+    ]
+    while callable(status) and pending_parent_ids:
+        parent_task_id = pending_parent_ids.pop()
+        if parent_task_id in rows_by_id:
+            continue
+        try:
+            parent = await status(parent_task_id)
+        except (KeyError, NotImplementedError):
+            continue
+        except Exception:
+            log.warning(
+                "sessions.abort.task_runtime_ancestor_status_failed",
+                task_id=parent_task_id,
+            )
+            continue
+        rows_by_id[parent_task_id] = parent
+        identity = _task_record_parent_identity(parent)
+        if identity is not None and identity[0] not in rows_by_id:
+            pending_parent_ids.append(identity[0])
+    return tuple(rows_by_id.values())
+
+
+async def _task_runtime_owns_session(
+    task_runtime: Any,
+    *,
+    task_id: str,
+    session_key: str,
+) -> bool:
+    """Verify a durable root identity before following child-supplied lineage."""
+
+    status = getattr(task_runtime, "status", None)
+    if not callable(status):
+        return False
+    try:
+        record = await status(task_id)
+    except (KeyError, NotImplementedError):
+        return False
+    except Exception:
+        log.warning(
+            "sessions.abort.task_runtime_status_failed",
+            session_key=session_key,
+            task_id=task_id,
+        )
+        return False
+    return _task_record_session_key(record) == session_key
+
+
+def _task_owned_descendant_rows(
+    rows: tuple[Any, ...],
+    *,
+    owned_tasks: dict[str, str],
+) -> tuple[Any, ...]:
+    """Expand exact task ancestry without widening to sibling session work."""
+
+    discovered: list[Any] = []
+    discovered_ids: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            task_id = getattr(row, "task_id", None)
+            session_key = _task_record_session_key(row)
+            parent_identity = _task_record_parent_identity(row)
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or session_key is None
+                or parent_identity is None
+                or task_id in owned_tasks
+            ):
+                continue
+            parent_task_id, parent_session_key = parent_identity
+            if owned_tasks.get(parent_task_id) != parent_session_key:
+                continue
+            owned_tasks[task_id] = session_key
+            discovered_ids.add(task_id)
+            discovered.append(row)
+            changed = True
+    return tuple(row for row in discovered if getattr(row, "task_id", None) in discovered_ids)
 
 
 def _session_row_value(row: Any, name: str) -> Any:
@@ -491,88 +1138,230 @@ async def _drain_cancelled_task_runtime(
     *,
     session_key: str,
     task_ids: tuple[str, ...],
+    deadline_at_monotonic: float | None = None,
 ) -> None:
     if not task_ids or not hasattr(task_runtime, "wait"):
         return
-    for task_id in task_ids:
-        try:
-            await asyncio.wait_for(
-                task_runtime.wait(task_id),
-                timeout=_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS,
-            )
-        except TimeoutError:
+
+    timeout = _ABORT_RUNTIME_CANCEL_DRAIN_SECONDS
+    if deadline_at_monotonic is not None:
+        timeout = max(0.0, deadline_at_monotonic - time.monotonic())
+    if timeout <= 0:
+        for task_id in task_ids:
             log.warning(
                 "sessions.abort.task_runtime_drain_timeout",
                 session_key=session_key,
                 task_id=task_id,
             )
+        return
+
+    waiters = {asyncio.create_task(task_runtime.wait(task_id)): task_id for task_id in task_ids}
+    done, pending = await asyncio.wait(waiters, timeout=timeout)
+    for waiter in done:
+        try:
+            waiter.result()
+        except asyncio.CancelledError:
+            pass
         except Exception:
             log.warning(
                 "sessions.abort.task_runtime_drain_failed",
                 session_key=session_key,
-                task_id=task_id,
+                task_id=waiters[waiter],
             )
+    for waiter in pending:
+        waiter.cancel()
+        waiter.add_done_callback(_consume_abort_background_result)
+        log.warning(
+            "sessions.abort.task_runtime_drain_timeout",
+            session_key=session_key,
+            task_id=waiters[waiter],
+        )
+    if pending:
+        # Give cooperative waiters one loop turn to observe cancellation, but
+        # never synchronously join a waiter that delays or suppresses it.
+        await asyncio.sleep(0)
 
 
-async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> None:
-    """Cancel live runtime work without racing a just-finished turn.
+async def _cancel_task_owned_auxiliary_work(
+    *,
+    session_key: str,
+    task_id: str,
+    deadline_at_monotonic: float,
+    process_state_dir: str | Path | None = None,
+) -> int:
+    """Stop task-owned completion delivery and registered background processes."""
 
-    The task runtime emits ``session.event.done`` from inside the turn handler,
-    then marks the runtime task terminal immediately after the handler returns.
-    A client that calls reset on the done event can arrive during that narrow
-    post-done/pre-terminal window. Give running tasks a short chance to settle
-    before issuing cancellation so reset does not append a false
-    ``[interrupted]`` marker into the transcript being flushed.
-    """
-    has_runtime_listing = hasattr(task_runtime, "list") and hasattr(task_runtime, "wait")
+    from opensquilla.gateway.subagent_announce import (
+        cancel_background_completion_for_task,
+    )
+    from opensquilla.process_tree import cancel_persisted_processes_for_task
+    from opensquilla.tools.builtin.shell import cancel_background_processes_for_task
 
-    if has_runtime_listing:
-        try:
-            rows = await task_runtime.list(session_key=session_key)
-            for row in rows:
-                if _task_status_value(getattr(row, "status", None)) != "running":
-                    continue
-                try:
-                    await asyncio.wait_for(
-                        task_runtime.wait(row.task_id),
-                        timeout=_RESET_RUNTIME_SETTLE_SECONDS,
-                    )
-                except TimeoutError:
-                    pass
-        except Exception:
-            log.warning("sessions.reset.task_runtime_settle_failed", session_key=session_key)
-
-    await _cancel_task_runtime(
-        task_runtime,
-        session_key=session_key,
-        source="sessions_reset",
-        reason="session_reset",
+    completion_task = asyncio.create_task(
+        cancel_background_completion_for_task(session_key, task_id)
+    )
+    process_task = asyncio.create_task(cancel_background_processes_for_task(session_key, task_id))
+    persisted_process_task = asyncio.create_task(
+        cancel_persisted_processes_for_task(process_state_dir, session_key, task_id)
+    )
+    cancelled_completions = await _await_abort_operation(
+        completion_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_background_completion",
+        default=0,
+    )
+    cancelled_processes = await _await_abort_background_task(
+        process_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_background_processes",
+        default=0,
+    )
+    cancelled_persisted_processes = await _await_abort_background_task(
+        persisted_process_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_persisted_processes",
+        default=0,
+    )
+    return (
+        int(cancelled_completions) + int(cancelled_processes) + int(cancelled_persisted_processes)
     )
 
-    if not has_runtime_listing:
-        return
 
-    try:
-        rows = await task_runtime.list(session_key=session_key)
-        for row in rows:
-            if _task_status_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES:
-                await asyncio.wait_for(
-                    task_runtime.wait(row.task_id),
-                    timeout=_RESET_RUNTIME_CANCEL_DRAIN_SECONDS,
+async def _cancel_task_owned_descendants(
+    task_runtime: Any,
+    *,
+    root_session_key: str,
+    root_task_id: str,
+    source: str,
+    reason: str,
+    deadline_at_monotonic: float,
+    process_state_dir: str | Path | None = None,
+) -> int:
+    """Cancel active subagent descendants proven to belong to one exact task."""
+
+    initial_rows_task = asyncio.create_task(_task_runtime_rows(task_runtime))
+    root_status_task = asyncio.create_task(
+        _task_runtime_owns_session(
+            task_runtime,
+            task_id=root_task_id,
+            session_key=root_session_key,
+        )
+    )
+    initial_rows = await _await_abort_operation(
+        initial_rows_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="initial_list_task_owned_descendants",
+        default=(),
+    )
+    root_verified = any(
+        getattr(row, "task_id", None) == root_task_id
+        and _task_record_session_key(row) == root_session_key
+        for row in initial_rows
+    )
+    root_verified = root_verified or bool(
+        await _await_abort_operation(
+            root_status_task,
+            deadline_at_monotonic=deadline_at_monotonic,
+            operation="verify_task_owned_descendant_root",
+            default=False,
+        )
+    )
+    if not root_verified:
+        return 0
+
+    owned_tasks = {root_task_id: root_session_key}
+    processed_task_ids = {root_task_id}
+    cancelled_task_ids: list[str] = []
+    stable_passes = 0
+
+    for pass_index in range(_ABORT_TREE_STABILIZATION_PASSES):
+        if time.monotonic() >= deadline_at_monotonic:
+            break
+        if pass_index == 0:
+            rows = initial_rows
+        else:
+            rows = await _await_abort_operation(
+                _task_runtime_rows(task_runtime),
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="list_task_owned_descendants",
+                default=(),
+            )
+        descendants = _task_owned_descendant_rows(rows, owned_tasks=owned_tasks)
+        new_rows = [
+            row
+            for row in descendants
+            if isinstance(getattr(row, "task_id", None), str)
+            and getattr(row, "task_id") not in processed_task_ids
+        ]
+        if not new_rows:
+            stable_passes += 1
+            if stable_passes >= 2:
+                break
+            await asyncio.sleep(0)
+            continue
+
+        stable_passes = 0
+        auxiliary_tasks: list[asyncio.Task[int]] = []
+        runtime_cancel_tasks: list[tuple[str, asyncio.Task[int]]] = []
+        for row in new_rows:
+            task_id = str(getattr(row, "task_id"))
+            session_key = _task_record_session_key(row)
+            if session_key is None:
+                continue
+            processed_task_ids.add(task_id)
+            auxiliary_tasks.append(
+                asyncio.create_task(
+                    _cancel_task_owned_auxiliary_work(
+                        session_key=session_key,
+                        task_id=task_id,
+                        deadline_at_monotonic=deadline_at_monotonic,
+                        process_state_dir=process_state_dir,
+                    )
                 )
-    except TimeoutError:
-        log.warning("sessions.reset.task_runtime_drain_timeout", session_key=session_key)
-    except Exception:
-        log.warning("sessions.reset.task_runtime_drain_failed", session_key=session_key)
+            )
+            if _task_status_value(getattr(row, "status", None)) not in _ACTIVE_TASK_STATUSES:
+                continue
+            runtime_cancel_tasks.append(
+                (
+                    task_id,
+                    asyncio.create_task(
+                        _cancel_task_runtime(
+                            task_runtime,
+                            session_key=session_key,
+                            task_id=task_id,
+                            source=source,
+                            reason=reason,
+                        )
+                    ),
+                )
+            )
 
+        for auxiliary_task in auxiliary_tasks:
+            await _await_abort_background_task(
+                auxiliary_task,
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="cancel_task_owned_descendant_auxiliary_work",
+                default=0,
+            )
+        for task_id, runtime_cancel_task in runtime_cancel_tasks:
+            cancelled = await _await_abort_operation(
+                runtime_cancel_task,
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="cancel_task_owned_descendant",
+                default=0,
+            )
+            if int(cancelled) > 0:
+                cancelled_task_ids.append(task_id)
 
-def _optional_positive_timeout(config: Any, attr: str, default: float) -> float | None:
-    raw = getattr(config, attr, default)
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        value = default
-    return value if value > 0 else None
+        if cancelled_task_ids:
+            await _drain_cancelled_task_runtime(
+                task_runtime,
+                session_key=root_session_key,
+                task_ids=tuple(cancelled_task_ids),
+                deadline_at_monotonic=deadline_at_monotonic,
+            )
+
+    return len(set(cancelled_task_ids))
 
 
 def _optional_stream_seq(params: dict | None) -> int | None:
@@ -588,106 +1377,30 @@ def _optional_stream_seq(params: dict | None) -> int | None:
     return max(0, value)
 
 
+def _optional_stream_generation(params: dict | None) -> str | None:
+    if not isinstance(params, dict):
+        return None
+    raw = params.get(
+        "since_stream_generation",
+        params.get("sinceStreamGeneration"),
+    )
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    return value if value else None
+
+
 def _buffer_session_event(
     session_key: str,
     event_name: str,
     payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if event_name.startswith("session.event."):
-        return get_session_streams().record(session_key, event_name, payload)
-    return dict(payload or {})
-
-
-async def _resolve_attachments(
-    validated: list[dict[str, Any]],
-    store: Any | None = None,
-    *,
-    material_root: Any | None = None,
-    session_id: str | None = None,
-    disk_budget_bytes: int | None = None,
-) -> list[dict[str, Any]]:
-    resolved, _consumed = await _attachment_ingest.resolve_attachments(
-        validated,
-        store=store,
-        material_root=material_root,
-        session_id=session_id,
-        disk_budget_bytes=disk_budget_bytes,
+    return buffer_session_event(
+        session_key,
+        event_name,
+        payload,
+        streams=get_session_streams(),
     )
-    return resolved
-
-
-def _validate_attachments(raw_attachments: Any) -> list[dict[str, Any]]:
-    validated, _failures = _attachment_ingest.validate_attachments(
-        raw_attachments,
-        logger=log,
-    )
-    return validated
-
-
-def _coerce_optional_bool(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off", ""}:
-            return False
-    return bool(value)
-
-
-def _first_dict_value(*values: Any) -> dict[str, Any] | None:
-    for value in values:
-        if isinstance(value, dict):
-            return dict(value)
-    return None
-
-
-def _normalize_memory_capture_controls(params: dict[str, Any]) -> dict[str, Any]:
-    """Normalize RPC/chat memory-capture controls onto snake_case fields."""
-
-    source_hint = params.get("_source")
-    if not isinstance(source_hint, dict):
-        source_hint = {}
-
-    no_memory_capture = _coerce_optional_bool(
-        params.get("no_memory_capture", params.get("noMemoryCapture"))
-    )
-    if no_memory_capture is None:
-        no_memory_capture = _coerce_optional_bool(
-            source_hint.get("no_memory_capture", source_hint.get("noMemoryCapture"))
-        )
-
-    input_provenance = _first_dict_value(
-        params.get("input_provenance"),
-        params.get("inputProvenance"),
-        source_hint.get("input_provenance"),
-        source_hint.get("inputProvenance"),
-    )
-    provenance_kind = (
-        params.get("input_provenance_kind")
-        or params.get("inputProvenanceKind")
-        or params.get("provenance_kind")
-        or source_hint.get("input_provenance_kind")
-        or source_hint.get("inputProvenanceKind")
-        or source_hint.get("provenance_kind")
-    )
-    if input_provenance is None and provenance_kind:
-        input_provenance = {"kind": str(provenance_kind)}
-    elif input_provenance is not None and "kind" not in input_provenance and provenance_kind:
-        input_provenance["kind"] = str(provenance_kind)
-
-    run_kind = params.get("run_kind", params.get("runKind"))
-    if run_kind is None:
-        run_kind = source_hint.get("run_kind", source_hint.get("runKind"))
-
-    return {
-        "no_memory_capture": bool(no_memory_capture),
-        "input_provenance": input_provenance,
-        "run_kind": str(run_kind) if run_kind is not None and str(run_kind) else None,
-    }
 
 
 def _require_key(params: dict | None) -> str:
@@ -699,8 +1412,8 @@ def _require_key(params: dict | None) -> str:
     return canonicalize_session_key(key)
 
 
-def _optional_string_param(params: dict | None, *names: str) -> str | None:
-    if not isinstance(params, dict):
+def _optional_string_param(params: Mapping[str, Any] | None, *names: str) -> str | None:
+    if params is None:
         return None
     for name in names:
         if name not in params:
@@ -809,6 +1522,17 @@ def _workspace_metadata_for_session(session: Any, config: Any) -> dict[str, str]
     workspace = context_payload.get("workspace") if isinstance(context_payload, dict) else None
     workspace_path = _normalize_workspace_display_path(workspace)
 
+    binding = getattr(session, "execution_workspace", None)
+    if binding is not None and not getattr(session, "workspace_id", None):
+        from opensquilla.execution_workspaces import normalize_execution_workspace
+
+        try:
+            # Listing metadata must not probe the filesystem. A missing task
+            # directory still belongs to this task; execution validates it later.
+            workspace_path = normalize_execution_workspace(binding)["root"]
+        except ProjectWorkspaceStateError:
+            return {}
+
     if workspace_path is None:
         session_key = str(getattr(session, "session_key", "") or "")
         agent_id = _effective_agent_id_for_session(session, session_key)
@@ -827,60 +1551,6 @@ def _workspace_metadata_for_session(session: Any, config: Any) -> dict[str, str]
     }
 
 
-def _context_window_tokens(params: dict | None, ctx: RpcContext) -> int:
-    raw: Any = None
-    if isinstance(params, dict):
-        raw = params.get("contextWindowTokens", params.get("context_window_tokens"))
-    if raw is None:
-        raw = getattr(ctx.config, "context_budget_tokens", 100_000)
-    if isinstance(raw, bool):
-        raise ValueError("contextWindowTokens must be a positive integer")
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("contextWindowTokens must be a positive integer") from exc
-    if value <= 0:
-        raise ValueError("contextWindowTokens must be a positive integer")
-    return value
-
-
-def _effective_compaction_model(session: Any | None) -> str | None:
-    if session is None:
-        return None
-    return getattr(session, "model_override", None) or getattr(session, "model", None)
-
-
-def _resolve_compaction_provider(ctx: RpcContext, session: Any | None) -> Any | None:
-    selector = getattr(ctx, "provider_selector", None)
-    if selector is None:
-        return None
-
-    resolved_selector = selector
-    clone = getattr(selector, "clone", None)
-    if callable(clone):
-        try:
-            resolved_selector = clone()
-        except Exception:  # noqa: BLE001
-            resolved_selector = selector
-
-    model = _effective_compaction_model(session)
-    if model and resolved_selector is not selector:
-        override = getattr(resolved_selector, "override_model", None)
-        if callable(override):
-            try:
-                override(model)
-            except Exception:  # noqa: BLE001
-                pass
-
-    resolver = getattr(resolved_selector, "resolve", None)
-    if not callable(resolver):
-        return None
-    try:
-        return resolver()
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
@@ -890,6 +1560,82 @@ def _model_value(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _aliased_optional_string_param(
+    params: dict[str, Any],
+    *names: str,
+) -> tuple[bool, str | None]:
+    """Read one nullable string field while rejecting conflicting aliases."""
+
+    values: list[str | None] = []
+    for name in names:
+        if name not in params:
+            continue
+        value = params[name]
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"params.{name} must be a string or null")
+        values.append(value.strip() or None if isinstance(value, str) else None)
+    if not values:
+        return False, None
+    if any(value != values[0] for value in values[1:]):
+        raise ValueError(f"params aliases for {names[0]} must agree")
+    return True, values[0]
+
+
+def _rpc_session_deployment_fields(
+    params: dict[str, Any],
+) -> tuple[bool, str | None, bool, str | None]:
+    provider_present, provider = _aliased_optional_string_param(
+        params,
+        "provider",
+        "providerOverride",
+        "provider_override",
+    )
+    auth_profile_present, auth_profile = _aliased_optional_string_param(
+        params,
+        "authProfile",
+        "authProfileOverride",
+        "auth_profile",
+        "auth_profile_override",
+    )
+    return (
+        provider_present,
+        provider.lower() if provider else None,
+        auth_profile_present,
+        auth_profile,
+    )
+
+
+def _validate_rpc_session_deployment(
+    ctx: RpcContext,
+    *,
+    session_key: str,
+    provider: str | None,
+    model: str | None,
+    auth_profile: str | None,
+) -> None:
+    reason = validate_gateway_session_deployment_override(
+        getattr(ctx, "config", None),
+        provider_id=provider or "",
+        model=model or "",
+        auth_profile_id=auth_profile or "",
+        session_key=session_key,
+    )
+    if reason:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="Invalid session deployment override.",
+            details={"reason": reason},
+        )
+
+
+def _raise_explicit_session_deployment_model_required() -> NoReturn:
+    raise RpcHandlerError(
+        code="INVALID_PARAMS",
+        message="A session provider binding requires an explicit model.",
+        details={"reason": "session_deployment_requires_explicit_model"},
+    )
 
 
 def _agent_registry_model(ctx: RpcContext, agent_id: str) -> str | None:
@@ -963,6 +1709,8 @@ def _task_summary(row: Any) -> dict[str, Any]:
         steer_capability = details.get("steer_capability")
         if isinstance(steer_capability, dict):
             summary["steer_capability"] = dict(steer_capability)
+        if isinstance(details.get("cancellation_requested"), dict):
+            summary["cancel_requested"] = True
     finished_at = getattr(row, "finished_at", None)
     if finished_at is not None:
         summary["finished_at"] = finished_at
@@ -970,14 +1718,19 @@ def _task_summary(row: Any) -> dict[str, Any]:
     if terminal_reason is not None:
         summary["terminal_reason"] = terminal_reason
     if summary.get("status") in {"failed", "timeout", "abandoned", "cancelled"}:
-        summary["terminal_message"] = build_terminal_reply(
+        outcome = summary.get("turn_outcome", {})
+        summary["terminal_message"] = append_error_ref(build_terminal_reply(
             {
                 "status": summary.get("status"),
                 "terminal_reason": terminal_reason,
                 "error_class": getattr(row, "error_class", None),
                 "error_message": getattr(row, "error_message", None),
+                "failure_kind": outcome.get("failure_kind"),
+                **{key: outcome[key] for key in (
+                    "usage_call_index", "no_prior_provider_dispatch", "replay_safe"
+                ) if key in outcome},
             }
-        )
+        ), safe_error_id(outcome.get("error_id")))
     return summary
 
 
@@ -985,20 +1738,37 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     if event_name != "session.event.error":
         return payload
 
+    prior_outcome = payload.get("turn_outcome")
+    prior_outcome = prior_outcome if isinstance(prior_outcome, dict) else {}
+    prior_failure_kind = (
+        prior_outcome.get("failure_kind") or payload.get("failure_kind")
+    )
     message = payload.get("message")
     error_message = payload.get("error_message")
     raw_message = error_message if isinstance(error_message, str) and error_message else message
     raw_text = raw_message if isinstance(raw_message, str) and raw_message else "Agent error"
+    if isinstance(prior_failure_kind, str) and prior_failure_kind:
+        raw_text = safe_provider_failure_message(
+            prior_failure_kind, code=payload.get("code"), message=raw_text
+        )
     code = payload.get("code")
+    if isinstance(prior_failure_kind, str) and prior_failure_kind:
+        code = safe_provider_failure_code(
+            str(code) if code is not None else None,
+            prior_failure_kind,
+        )
     code_text = str(code or "").lower()
     is_timeout = "timeout" in code_text or "stream idle" in raw_text.lower()
     terminal_payload = {
-        "status": "timeout" if is_timeout else "failed",
+        **payload,
+        "status": payload.get("status") or ("timeout" if is_timeout else "failed"),
         "terminal_reason": payload.get("terminal_reason") or ("timeout" if is_timeout else "error"),
         "error_class": code,
         "error_message": raw_text,
-        **payload,
+        "failure_kind": prior_failure_kind,
     }
+    if prior_failure_kind:
+        terminal_payload.pop("terminal_message", None)
     _, safe_error_message = sanitize_agent_error(
         terminal_payload,
         fallback_error_class=str(code) if code else None,
@@ -1007,8 +1777,13 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     # Join the user-visible reply to its durable turn_errors row: hex ids keep
     # substring-based timeout classification stable, and append_error_ref is
     # idempotent so the CLI client's re-normalization cannot double-suffix.
-    error_id = payload.get("error_id")
-    error_ref = error_id if isinstance(error_id, str) else None
+    error_ids = [
+        source["error_id"] for source in (payload, prior_outcome)
+        if "error_id" in source and source["error_id"] != ""
+    ]
+    error_ref = safe_error_id(error_ids[0]) if error_ids else None
+    if any(safe_error_id(value) != error_ref for value in error_ids):
+        error_ref = None
     terminal_message = append_error_ref(build_terminal_reply(terminal_payload), error_ref)
     # Serialize the typed turn outcome onto the wire so every surface (Web UI,
     # CLI, channels) can render a specific cause + retryability + recovery
@@ -1021,14 +1796,44 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         code=str(code) if code else None,
         message=safe_error_message,
         error_class=str(code) if code else None,
-    )
+        failure_kind=(str(prior_failure_kind) if isinstance(prior_failure_kind, str) else None),
+    ).to_dict()
+    # Preserve existing public extensions, not arbitrary provider fields. In
+    # particular, re-normalization must not erase the stricter usage proof.
+    for key in (
+        "retry_after_ms", "usage_call_index", "no_prior_provider_dispatch", "replay_safe",
+        "user_message_id", "cancellation_source", "document_mutation_outcome",
+        "documentMutationOutcome",
+    ):
+        if key in prior_outcome:
+            outcome[key] = prior_outcome[key]
+    if error_ref is not None:
+        outcome["error_id"] = error_ref
+    elif error_ids:
+        # Preserve invalid/conflicting evidence across repeated normalization;
+        # omission would let a later pass trust the surviving top-level id.
+        outcome["error_id"] = None
+    sensitive_provider_fields = {
+        "provider_error_message",
+        "provider_response_body",
+        "raw_error_body",
+        "request_payload",
+        "request_payload_head",
+        "response_body",
+    }
+    safe_payload = {
+        key: value for key, value in payload.items() if key not in sensitive_provider_fields
+    }
+    if safe_payload.get("model_capacity") is None:
+        safe_payload.pop("model_capacity", None)
     return {
-        **payload,
+        **safe_payload,
+        "code": code,
         "message": terminal_message,
         "terminal_message": terminal_message,
         "terminal_reason": terminal_payload["terminal_reason"],
         "error_message": safe_error_message,
-        "turn_outcome": outcome.to_dict(),
+        "turn_outcome": outcome,
     }
 
 
@@ -1045,7 +1850,17 @@ def _active_task_summary(rows: list[Any]) -> dict[str, Any] | None:
     running = [row for row in active if _enum_value(getattr(row, "status", None)) == "running"]
     if running:
         return _task_summary(_sorted_task_rows(running)[0])
-    return _task_summary(_sorted_task_rows(active)[0])
+    # TaskRuntime executes a session's pending lane FIFO. Hydration must expose
+    # that same oldest queued owner; choosing the newest accepted row would make
+    # reconnecting clients target Stop/steer at a later task that is not next.
+    queued = sorted(
+        active,
+        key=lambda row: (
+            getattr(row, "created_at", 0) or 0,
+            str(getattr(row, "task_id", "")),
+        ),
+    )
+    return _task_summary(queued[0])
 
 
 def _last_task_summary(rows: list[Any]) -> dict[str, Any] | None:
@@ -1077,6 +1892,110 @@ def _task_state_summary(rows: list[Any]) -> dict[str, Any]:
         "last_task": last_task,
         "run_status": _task_run_status(active_task, last_task),
     }
+
+
+async def _overlay_runtime_task_snapshot(
+    ctx: RpcContext,
+    session_key: str,
+    task_state: dict[str, Any],
+) -> None:
+    """Overlay live FIFO ownership onto a durable task-ledger snapshot.
+
+    SQLite timestamps cannot encode the exact ordering of two same-millisecond
+    admissions. While this process owns the runtime, its state-locked pending
+    lane is authoritative for both foreground selection and ordered queued ids.
+    A non-empty durable projection is retained when the live snapshot is empty
+    during the short acceptance-commit-to-runtime-activation window; startup
+    recovery abandons stale unfinished rows before requests can reach here.
+    """
+
+    getter = getattr(getattr(ctx, "task_runtime", None), "session_task_snapshot", None)
+    if not callable(getter):
+        return
+    try:
+        candidate = getter(session_key)
+        snapshot = await candidate if inspect.isawaitable(candidate) else candidate
+    except Exception:  # noqa: BLE001 - durable hydration remains a safe fallback.
+        log.warning(
+            "sessions.runtime_task_snapshot_failed",
+            session_key=session_key,
+            exc_info=True,
+        )
+        return
+
+    running_value = getattr(snapshot, "running_task_id", None)
+    running_task_id = (
+        running_value.strip() if isinstance(running_value, str) and running_value.strip() else None
+    )
+    raw_queued_ids = getattr(snapshot, "queued_task_ids", ())
+    queued_task_ids: list[str] = []
+    if isinstance(raw_queued_ids, (list, tuple)):
+        for value in raw_queued_ids:
+            task_id = value.strip() if isinstance(value, str) else ""
+            if task_id and task_id != running_task_id and task_id not in queued_task_ids:
+                queued_task_ids.append(task_id)
+    raw_cancel_requested_ids = getattr(snapshot, "cancel_requested_task_ids", ())
+    cancel_requested_task_ids = {
+        value.strip()
+        for value in raw_cancel_requested_ids
+        if isinstance(value, str) and value.strip()
+    }
+
+    active_task_id = running_task_id or (queued_task_ids[0] if queued_task_ids else None)
+    durable_active = task_state.get("active_task")
+    if active_task_id is None and isinstance(durable_active, dict):
+        durable_status = str(durable_active.get("status") or "").strip().lower()
+        durable_task_id = str(durable_active.get("task_id") or "").strip()
+        if durable_task_id and durable_status in {"queued", "running"}:
+            # accept_turn persists the QUEUED ledger row before activating it
+            # into TaskRuntime. A hydrate in that commit-to-activation window
+            # therefore sees durable work and an empty runtime snapshot. Keep
+            # the durable fail-closed projection; process-start recovery has
+            # already abandoned stale rows before requests can reach here.
+            if durable_status == "queued":
+                queued_task_ids = [
+                    str(task.get("task_id") or "").strip()
+                    for task in sorted(
+                        (
+                            task
+                            for task in task_state.get("tasks", [])
+                            if isinstance(task, dict)
+                            and str(task.get("status") or "").strip().lower() == "queued"
+                        ),
+                        key=lambda task: (
+                            int(task.get("created_at") or 0),
+                            str(task.get("task_id") or ""),
+                        ),
+                    )
+                    if isinstance(task, dict) and str(task.get("task_id") or "").strip()
+                ]
+                if durable_task_id not in queued_task_ids:
+                    queued_task_ids.insert(0, durable_task_id)
+            task_state["queued_task_ids"] = queued_task_ids
+            return
+    active_status = "running" if running_task_id is not None else "queued"
+    active_task: dict[str, Any] | None = None
+    if active_task_id is not None:
+        active_task = next(
+            (
+                dict(task)
+                for task in task_state.get("tasks", [])
+                if isinstance(task, dict) and task.get("task_id") == active_task_id
+            ),
+            None,
+        )
+        if active_task is None:
+            active_task = {"task_id": active_task_id}
+        active_task["status"] = active_status
+        if active_task_id in cancel_requested_task_ids:
+            active_task["cancel_requested"] = True
+
+    task_state["active_task"] = active_task
+    task_state["queued_task_ids"] = queued_task_ids
+    task_state["run_status"] = _task_run_status(
+        active_task,
+        task_state.get("last_task"),
+    )
 
 
 async def _attach_active_steer_capability(
@@ -1115,15 +2034,9 @@ async def _attach_active_steer_capability(
 
 def _active_task_run_mode(rows: list[Any]) -> str | None:
     active = [
-        row
-        for row in rows
-        if _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES
+        row for row in rows if _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES
     ]
-    running = [
-        row
-        for row in active
-        if _enum_value(getattr(row, "status", None)) == "running"
-    ]
+    running = [row for row in active if _enum_value(getattr(row, "status", None)) == "running"]
     candidates = _sorted_task_rows(running or active)
     for row in candidates:
         details = getattr(row, "details", None)
@@ -1150,8 +2063,7 @@ def _run_mode_lock_payload(
     principal: Any,
 ) -> dict[str, Any]:
     has_active_task = any(
-        _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES
-        for row in task_rows
+        _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES for row in task_rows
     )
     has_background_group = bool(active_task_group_ids)
     if not has_active_task and not has_background_group:
@@ -1231,11 +2143,37 @@ async def _list_task_rows_by_session(
     return {key: await _list_task_rows(ctx, storage, key) for key in keys}
 
 
-async def _list_transcript_titles(storage: Any, sessions: list[Any]) -> dict[str, str]:
+async def _list_transcript_titles(
+    storage: Any,
+    sessions: Sequence[Any],
+    *,
+    channel_types: dict[str, str] | None = None,
+) -> dict[str, str]:
+    affected = [
+        session
+        for session in sessions
+        if has_refused_chat_title(session, channel_types=channel_types)
+    ]
+    titles = {
+        str(getattr(session, "session_id", "") or ""): ""
+        for session in affected
+        if getattr(session, "session_id", None)
+    }
+    if affected:
+        try:
+            titles.update(
+                await read_refused_title_fallbacks(storage, affected, channel_types=channel_types)
+            )
+        except Exception:
+            # Keep list/search enrichment best-effort. A failed historical read
+            # selects the existing default, never an unrelated active-tail topic.
+            log.warning("sessions.refused_title_recovery_failed", exc_info=True)
     session_ids = [str(getattr(session, "session_id", "") or "") for session in sessions]
-    session_ids = [session_id for session_id in session_ids if session_id]
+    session_ids = [
+        session_id for session_id in session_ids if session_id and session_id not in titles
+    ]
     if not session_ids:
-        return {}
+        return titles
 
     title_inputs: dict[str, list[str]] = {session_id: [] for session_id in session_ids}
     storage_batch = getattr(storage, "list_user_transcript_content_batch", None)
@@ -1269,7 +2207,6 @@ async def _list_transcript_titles(storage: Any, sessions: list[Any]) -> dict[str
                     if str(getattr(entry, "role", "") or "").lower() == "user"
                 ][:3]
 
-    titles: dict[str, str] = {}
     for session_id, values in title_inputs.items():
         for value in values:
             title = derive_transcript_title(value)
@@ -1287,11 +2224,6 @@ def _create_session_key(agent_id: str, kind: object = None) -> str:
     if normalized_kind in {"cli", "webchat"}:
         return f"agent:{agent_id}:{normalized_kind}:{short_id}"
     return f"agent:{agent_id}:{short_id}"
-
-
-def _is_ephemeral_webchat_session_key(key: str) -> bool:
-    parts = key.split(":")
-    return len(parts) == 4 and parts[0] == "agent" and parts[2] == "webchat" and bool(parts[3])
 
 
 def _derive_source_metadata(session: Any) -> dict[str, Any]:
@@ -1326,51 +2258,207 @@ def _derive_source_metadata(session: Any) -> dict[str, Any]:
     }
 
 
-async def _resolve_session_node(storage: Any, key: str) -> Any:
-    session = await storage.get_session(key)
-    if session is not None:
-        return session
-
-    sessions = await storage.list_sessions(limit=500)
-    matches: list[Any] = []
-    for candidate in sessions:
-        values = [
-            getattr(candidate, "session_key", ""),
-            getattr(candidate, "session_id", ""),
-            getattr(candidate, "display_name", "") or "",
-            getattr(candidate, "derived_title", "") or "",
-        ]
-        if any(str(value) == key or str(value).startswith(key) for value in values if value):
-            matches.append(candidate)
-
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        candidates = ", ".join(str(getattr(match, "session_key", "")) for match in matches[:5])
-        raise ValueError(f"Ambiguous session id {key!r}; matches: {candidates}")
-    raise KeyError(f"Session not found: {key}")
+_SESSION_COUNT_VIEW = "session-count-v1"
+_SESSION_LIST_VIEW = "session-list-v1"
+_SESSION_LIST_CURSOR_VERSION = 1
+_SESSION_LIST_CURSOR_MAX_CHARS = 8192
+_MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
-@_d.method("sessions.list", scope="operator.read")
+def _encode_session_list_cursor(cursor: SessionListCursor | None) -> str | None:
+    if cursor is None:
+        return None
+    payload = json.dumps(
+        {
+            "v": _SESSION_LIST_CURSOR_VERSION,
+            "a": cursor.activity_at,
+            "u": cursor.updated_at,
+            "k": cursor.session_key,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > _SESSION_LIST_CURSOR_MAX_CHARS:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(base64.b64decode(value + padding, altchars=b"-_", validate=True))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("v") != _SESSION_LIST_CURSOR_VERSION:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    activity_at = payload.get("a")
+    updated_at = payload.get("u")
+    session_key = payload.get("k")
+    if (
+        isinstance(activity_at, bool)
+        or not isinstance(activity_at, int)
+        or not 0 <= activity_at <= _MAX_SQLITE_INTEGER
+        or isinstance(updated_at, bool)
+        or not isinstance(updated_at, int)
+        or not 0 <= updated_at <= _MAX_SQLITE_INTEGER
+        or not isinstance(session_key, str)
+        or not session_key
+        or len(session_key) > 512
+    ):
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    try:
+        session_key.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        ) from exc
+    return SessionListCursor(
+        activity_at=activity_at,
+        updated_at=updated_at,
+        session_key=session_key,
+    )
+
+
 async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
     """List all sessions."""
     now_ms = int(time.time() * 1000)
+    request = params or {}
+    count_only = request.get("view") == _SESSION_COUNT_VIEW
+    paginated = request.get("view") == _SESSION_LIST_VIEW
+
+    def empty_payload() -> dict[str, Any]:
+        payload: dict[str, Any] = {"sessions": [], "count": 0, "ts": now_ms}
+        if count_only:
+            payload.update({"totalCount": 0, "total_count": 0})
+        if paginated:
+            payload.update(
+                {
+                    "has_more": False,
+                    "hasMore": False,
+                    "next_cursor": None,
+                    "nextCursor": None,
+                }
+            )
+        return payload
 
     if ctx.session_manager is None:
-        return {"sessions": [], "count": 0, "ts": now_ms}
+        return empty_payload()
 
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
-        return {"sessions": [], "count": 0, "ts": now_ms}
+        return empty_payload()
 
-    limit = (params or {}).get("limit", 50)
-    sessions = await storage.list_sessions(limit=limit)
+    limit = request.get("limit", 50)
+    cursor = _decode_session_list_cursor(request.get("cursor")) if paginated else None
+    if request.get("cursor") is not None and not paginated:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor requires view=session-list-v1",
+        )
+    from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, guest_owns_session_key
+
+    is_guest = GuestRpcPolicy.is_guest(ctx)
+    owner_id = getattr(ctx.principal, "guest_owner_id", None) if is_guest else None
+    if not is_guest:
+        try:
+            numeric_limit = int(limit)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if numeric_limit < 1:
+                raise ValueError("params.limit must be >= 1")
+    if count_only:
+        count_sessions = getattr(storage, "count_sessions", None)
+        if callable(count_sessions):
+            try:
+                total_count = (
+                    await count_sessions(guest_owner_id=owner_id)
+                    if is_guest
+                    else await count_sessions()
+                )
+            except TypeError:
+                # Older test doubles and alternative storage adapters may not
+                # implement the additive count contract. Fall through to the
+                # legacy list response so mixed-version clients still render.
+                pass
+            else:
+                total_count = max(0, int(total_count))
+                return {
+                    "sessions": [],
+                    "count": 0,
+                    "totalCount": total_count,
+                    "total_count": total_count,
+                    "ts": now_ms,
+                }
+
+    if paginated:
+        try:
+            page_limit = int(limit)
+        except (TypeError, ValueError):
+            page_limit = 50
+        page_limit = max(1, page_limit)
+        if is_guest:
+            page_limit = min(page_limit, 100)
+        list_page = getattr(storage, "list_sessions_page", None)
+        if callable(list_page):
+            page = await list_page(
+                limit=page_limit,
+                cursor=cursor,
+                guest_owner_id=owner_id if is_guest else None,
+            )
+            sessions = page.sessions
+            has_more = bool(page.has_more)
+            next_cursor = _encode_session_list_cursor(page.next_cursor)
+        else:
+            # Additive compatibility for older storage adapters and test
+            # doubles: return one legacy page and mark it terminal so a newer
+            # client never loops over the same first page.
+            legacy_kwargs: dict[str, Any] = {"limit": page_limit}
+            if is_guest:
+                legacy_kwargs["guest_owner_id"] = owner_id
+            sessions = await storage.list_sessions(**legacy_kwargs)
+            has_more = False
+            next_cursor = None
+    elif is_guest:
+        try:
+            guest_limit = int(limit)
+        except (TypeError, ValueError):
+            guest_limit = 50
+        limit = max(1, min(guest_limit, 100))
+        sessions = await storage.list_sessions(limit=limit, guest_owner_id=owner_id)
+    else:
+        sessions = await storage.list_sessions(limit=limit)
+
+    if is_guest:
+        sessions = [
+            session
+            for session in sessions
+            if guest_owns_session_key(owner_id, getattr(session, "session_key", None))
+        ]
     task_rows_by_session = await _list_task_rows_by_session(
         ctx,
         storage,
         [s.session_key for s in sessions],
     )
-    transcript_titles = await _list_transcript_titles(storage, sessions)
+    channel_types = _channel_types_from_config(ctx.config)
+    transcript_titles = await _list_transcript_titles(
+        storage, sessions, channel_types=channel_types
+    )
 
     # Batch transcript counts in one round-trip to avoid N+1 against
     # count_transcript_entries. Storage layers that don't implement the batch
@@ -1386,7 +2474,6 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
             entry_counts = {}
 
     result = []
-    channel_types = _channel_types_from_config(ctx.config)
     for s in sessions:
         # Fetch entry count for metadata
         entry_count = entry_counts.get(s.session_id, 0)
@@ -1453,47 +2540,27 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         row.update(_workspace_metadata_for_session(s, ctx.config))
         result.append(row)
 
-    return {"sessions": result, "count": len(result), "ts": now_ms}
-
-
-async def _titles_for_keys(
-    storage: Any,
-    keys: list[str],
-    now_ms: int,
-    channel_types: dict[str, str] | None = None,
-) -> dict[str, str]:
-    """Resolve canonical session_key -> sidebar title for a small set of keys.
-
-    Labels transcript (content) hits without rebuilding the whole session list.
-    Bounded by the search limit, so this is a handful of point lookups.
-    """
-    unique = list(dict.fromkeys(canonicalize_session_key(k) for k in keys if k))
-    sessions: list[Any] = []
-    for key in unique:
-        try:
-            node = await storage.get_session(key)
-        except Exception:
-            node = None
-        if node is not None:
-            sessions.append(node)
-    if not sessions:
-        return {}
-    transcript_titles = await _list_transcript_titles(storage, sessions)
-    out: dict[str, str] = {}
-    for node in sessions:
-        view = build_session_view_item(
-            node,
-            entry_count=0,
-            task_rows=[],
-            now_ms=now_ms,
-            transcript_title=transcript_titles.get(getattr(node, "session_id", ""), ""),
-            channel_types=channel_types,
+    payload = {"sessions": result, "count": len(result), "ts": now_ms}
+    if paginated:
+        payload.update(
+            {
+                "has_more": has_more,
+                "hasMore": has_more,
+                "next_cursor": next_cursor,
+                "nextCursor": next_cursor,
+            }
         )
-        out[canonicalize_session_key(node.session_key)] = str(view.get("title") or "")
-    return out
+    return payload
 
 
-@_d.method("sessions.search", scope="operator.read")
+_handle_sessions_list_contract = register_sessions_list_contract(
+    _d,
+    _handle_sessions_list,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     """Search sessions by title and by transcript content.
 
@@ -1506,16 +2573,12 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     way ``sessions.list`` derives them so results read like the sidebar.
     """
     now_ms = int(time.time() * 1000)
-    query = ""
-    limit = 20
+    raw_query: object = ""
+    raw_limit: object = 20
     if isinstance(params, dict):
-        query = str(params.get("query") or "").strip()
-        try:
-            limit = int(params.get("limit", 20))
-        except (TypeError, ValueError):
-            limit = 20
-    limit = max(1, min(limit, 50))
-
+        raw_query = params.get("query")
+        raw_limit = params.get("limit", 20)
+    query, _ = SessionDirectory.normalize_search_input(raw_query, raw_limit)
     empty = {"sessions": [], "messages": [], "query": query, "ts": now_ms}
     if not query or ctx.session_manager is None:
         return empty
@@ -1523,204 +2586,331 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     if storage is None:
         return empty
 
-    # Title hits.
-    # Prefer the dedicated global query (matches every session, builds view rows
-    # only for the matches). Fall back to a bounded recent scan for storage
-    # doubles that don't implement it.
-    title_search = getattr(storage, "search_sessions_by_title", None)
-    if callable(title_search):
-        title_sessions = await title_search(query, limit)
-    else:
-        needle = query.lower()
-        recent = await storage.list_sessions(limit=200)
-        title_sessions = [
-            s
-            for s in recent
-            if needle
-            in " ".join(
-                p
-                for p in (
-                    str(getattr(s, "display_name", "") or ""),
-                    str(getattr(s, "derived_title", "") or ""),
-                    str(getattr(s, "subject", "") or ""),
-                )
-                if p
-            ).lower()
-        ][:limit]
-
-    transcript_titles = await _list_transcript_titles(storage, title_sessions)
-    session_hits: list[dict[str, Any]] = []
-    title_keys: set[str] = set()
     channel_types = _channel_types_from_config(getattr(ctx, "config", None))
-    for s in title_sessions:
+
+    def project(session: Any, transcript_title: str) -> SessionSearchProjection:
         view = build_session_view_item(
-            s,
+            session,
             entry_count=0,
             task_rows=[],
             now_ms=now_ms,
-            transcript_title=transcript_titles.get(getattr(s, "session_id", ""), ""),
+            transcript_title=transcript_title,
             channel_types=channel_types,
         )
-        title_keys.add(canonicalize_session_key(s.session_key))
-        session_hits.append(
-            {
-                "key": s.session_key,
-                "title": str(view.get("title") or ""),
-                "effectiveAgentId": view.get("effectiveAgentId"),
-                "surface": view.get("surface"),
-                "updatedAt": view.get("updatedAt"),
-            }
+        return SessionSearchProjection(
+            title=str(view.get("title") or ""),
+            effective_agent_id=view.get("effectiveAgentId"),
+            surface=view.get("surface"),
+            updated_at=view.get("updatedAt"),
         )
 
-    # Content hits.
-    # ASCII queries use the ranked, indexed FTS path. Non-ASCII queries (CJK and
-    # other scripts the FTS tokenizer can't segment) use a substring LIKE scan,
-    # the only option for them. ASCII deliberately has NO LIKE fallback so a
-    # common keystroke can never trigger an unbounded full-table content scan.
-    has_like = hasattr(storage, "search_transcript_like")
-    non_ascii = any(ord(ch) > 127 for ch in query)
-    rows: list[dict[str, Any]] = []
-    try:
-        if non_ascii:
-            if has_like:
-                rows = await storage.search_transcript_like(query, limit=limit)
-        else:
-            rows = await storage.search_transcript(query, limit=limit)
-    except Exception:
-        log.warning("sessions.search.transcript_failed", exc_info=True)
-        rows = []
+    async def read_titles(sessions: Sequence[Any]) -> dict[str, str]:
+        return await _list_transcript_titles(storage, sessions, channel_types=channel_types)
 
-    # One row per session, never repeating a session already shown as a title
-    # hit, enriched with the session title via a small bounded lookup.
-    pending: list[tuple[str, str, dict[str, Any]]] = []
-    content_keys: set[str] = set()
-    for row in rows:
-        raw_key = str(row.get("session_key") or "")
-        canon = canonicalize_session_key(raw_key)
-        if not canon or canon in title_keys or canon in content_keys:
-            continue
-        content_keys.add(canon)
-        pending.append((raw_key, canon, row))
-
-    title_map = await _titles_for_keys(
-        storage,
-        [canon for _, canon, _ in pending],
-        now_ms,
-        channel_types=channel_types,
+    result = await SessionDirectory(storage).search(
+        raw_query,
+        raw_limit,
+        now_ms=now_ms,
+        project=project,
+        derive_transcript_title=derive_transcript_title,
+        read_transcript_titles=read_titles,
     )
-    message_hits: list[dict[str, Any]] = []
-    for raw_key, canon, row in pending:
-        message_hits.append(
+    return {
+        "sessions": [
             {
-                "key": raw_key,
-                "title": title_map.get(canon, ""),
-                "role": row.get("role"),
-                "snippet": row.get("snippet") or "",
-                "createdAt": row.get("created_at"),
+                "key": hit.key,
+                "title": hit.projection.title,
+                "effectiveAgentId": hit.projection.effective_agent_id,
+                "surface": hit.projection.surface,
+                "updatedAt": hit.projection.updated_at,
             }
+            for hit in result.sessions
+        ],
+        "messages": [
+            {
+                "key": hit.key,
+                "title": hit.title,
+                "role": hit.role,
+                "snippet": hit.snippet,
+                "createdAt": hit.created_at,
+            }
+            for hit in result.messages
+        ],
+        "query": result.query,
+        "ts": result.ts,
+    }
+
+
+_handle_sessions_search_contract = register_sessions_search_contract(
+    _d,
+    _handle_sessions_search,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+class _GatewaySessionLifecyclePorts(
+    SessionCreationPolicyPort,
+    SessionLifecycleStorePort,
+    SessionDeletionPort,
+    SessionLifecycleEventsPort,
+):
+    """Concrete Application Ports over the one SessionManager runtime."""
+
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+        self._manager = context.session_manager
+        self._storage = get_session_storage(self._manager)
+
+    @property
+    def available(self) -> bool:
+        return self._manager is not None
+
+    @property
+    def deletion_available(self) -> bool:
+        return self._manager is not None and self._storage is not None
+
+    def new_session_key(self, agent_id: str, kind: SessionCreationKind) -> str:
+        wire_kind: str | None = None if kind is SessionCreationKind.DEFAULT else kind.value
+        return _create_session_key(agent_id, wire_kind)
+
+    async def default_model(self, agent_id: str) -> str | None:
+        return _agent_registry_model(self._context, agent_id)
+
+    async def agent_exists(self, agent_id: str) -> bool:
+        return await _agent_registry_has(self._context, agent_id)
+
+    def validate_deployment(
+        self,
+        *,
+        session_key: str,
+        provider: str | None,
+        model: str | None,
+        auth_profile: str | None,
+    ) -> None:
+        _validate_rpc_session_deployment(
+            self._context,
+            session_key=session_key,
+            provider=provider,
+            model=model,
+            auth_profile=auth_profile,
         )
 
-    return {"sessions": session_hits, "messages": message_hits, "query": query, "ts": now_ms}
-
-
-@_d.method("sessions.create", scope="operator.write")
-async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
-    if not isinstance(params, dict):
-        params = {}
-    agent_id = normalize_agent_id(params.get("agentId", "main"))
-    display_name = params.get("displayName")
-    message = params.get("message")
-    model = _model_value(params.get("model")) or _agent_registry_model(ctx, agent_id)
-    kind = params.get("kind") or params.get("sessionKind")
-    if message is not None and not isinstance(message, str):
-        raise ValueError("params.message must be a string")
-
-    if not await _agent_registry_has(ctx, agent_id):
-        raise RpcHandlerError(
-            "agent.not_found",
-            f"Agent '{agent_id}' does not exist",
-            details={"agentId": agent_id},
+    async def resolve_workspace(self, workspace_id: str) -> SessionWorkspaceBinding:
+        if self._storage is None:
+            raise RpcUnavailableError("sessions.create(workspaceId=...) requires session storage")
+        try:
+            validated = await resolve_validated_project_workspace(
+                self._storage,
+                workspace_id,
+            )
+        except ProjectWorkspaceStateError as exc:
+            raise map_project_workspace_error(
+                exc,
+                owner=self._context.principal.is_owner,
+            ) from exc
+        mode = project_default_run_mode(self._context.config)
+        source = (
+            "project_default"
+            if mode is RunMode.SAFE and config_run_mode(self._context.config) is RunMode.FULL
+            else "operator_default"
+        )
+        return SessionWorkspaceBinding(
+            workspace_id=validated.workspace.workspace_id,
+            path=str(validated.workspace.path),
+            run_mode=mode.value,
+            run_mode_source=source,
         )
 
-    if ctx.session_manager is None:
-        if message:
-            raise RpcUnavailableError("sessions.create(message=...) requires a session manager")
-        key = _create_session_key(agent_id, kind)
-        return {
-            "key": key,
-            "sessionId": key.rsplit(":", 1)[-1],
-            "note": "session manager not available",
+    async def create(self, session: NewSession) -> SessionIdentity:
+        if self._manager is None:
+            raise RpcUnavailableError("sessions.create requires a session manager")
+        create_kwargs: dict[str, Any] = {
+            "session_key": session.session_key,
+            "agent_id": session.agent_id,
+            "display_name": session.display_name,
+            "model": session.model,
         }
+        if session.provider.present:
+            create_kwargs["provider_override"] = session.provider.value
+        if session.auth_profile.present:
+            create_kwargs["auth_profile_override"] = session.auth_profile.value
+            create_kwargs["auth_profile_override_source"] = (
+                "rpc" if session.auth_profile.value else None
+            )
+        if session.workspace is not None:
+            workspace = session.workspace
+            create_kwargs["workspace_id"] = workspace.workspace_id
+            create_kwargs["origin"] = {
+                RUN_CONTEXT_ORIGIN_KEY: RunContext(
+                    run_mode=RunMode(workspace.run_mode),
+                    workspace=workspace.path,
+                    run_mode_source=workspace.run_mode_source,
+                    source=workspace.source,
+                ).to_origin_payload()
+            }
+        created = await self._manager.create(**create_kwargs)
+        return SessionIdentity(
+            session_key=str(created.session_key),
+            session_id=str(created.session_id),
+            epoch=int(getattr(created, "epoch", 0) or 0),
+        )
 
-    session = await ctx.session_manager.create(
-        session_key=_create_session_key(agent_id, kind),
-        agent_id=agent_id,
-        display_name=display_name,
-        model=model,
-    )
-    result = {"key": session.session_key, "sessionId": session.session_id}
-
-    if message:
-        _persisted = await ctx.session_manager.append_message(
+    async def append_initial_user_message(
+        self,
+        session: SessionIdentity,
+        message: str,
+    ) -> None:
+        if self._manager is None:
+            raise RpcUnavailableError("sessions.create(message=...) requires a session manager")
+        await self._manager.append_message(
             session.session_key,
             role="user",
             content=message,
+            **_initial_user_message_owner_kwargs(self._manager, session),
         )
-        if _persisted is not None and isinstance(_persisted.content, str):
-            message = _persisted.content
-        result["seededMessage"] = True
 
-    return result
+    async def rename(self, session_key: str, display_name: str) -> None:
+        if self._manager is None:
+            raise KeyError("No session manager available")
+        if self._storage is None:
+            raise KeyError("No session storage available")
+        session = await self._storage.get_session(session_key)
+        if session is None:
+            raise KeyError(f"Session not found: {session_key}")
+        update = getattr(self._manager, "update", None)
+        if callable(update):
+            await update(session_key, display_name=display_name)
+            return
+        setattr(session, "display_name", display_name)
+        upsert = getattr(self._storage, "upsert_session", None)
+        if callable(upsert):
+            await upsert(session)
+
+    async def fork_agent_id(self, parent_key: str) -> str:
+        if self._storage is None:
+            raise KeyError("No session storage available")
+        parent = await self._storage.get_session(parent_key)
+        if parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        return _effective_agent_id_for_session(parent, parent_key)
+
+    async def fork(self, spec: ForkSessionSpec) -> SessionIdentity:
+        if self._manager is None:
+            raise KeyError("No session manager available")
+        if self._storage is None:
+            raise KeyError("No session storage available")
+        fork_kwargs: dict[str, Any] = {
+            "fork_transcript": True,
+            "status": SessionStatus.DONE,
+        }
+        if spec.point.mode is SessionForkMode.BEFORE_MESSAGE:
+            fork_kwargs["fork_before_message_id"] = spec.point.anchor_id
+        elif spec.point.mode is SessionForkMode.THROUGH_TURN:
+            fork_kwargs["fork_through_turn_id"] = spec.point.anchor_id
+        child = await _fork_with_numbered_title(
+            self._context,
+            self._storage,
+            spec.parent_key,
+            spec.child_key,
+            explicit_title=spec.title,
+            **fork_kwargs,
+        )
+        return SessionIdentity(
+            session_key=str(getattr(child, "session_key")),
+            session_id=str(getattr(child, "session_id")),
+        )
+
+    async def delete_one(self, canonical_key: str) -> None:
+        if self._storage is None:
+            raise KeyError("No session storage available")
+        await _delete_session_with_lifecycle(
+            canonical_key=canonical_key,
+            ctx=self._context,
+            storage=self._storage,
+        )
+
+    async def publish_forked(self, event: SessionForked) -> None:
+        await _emit_to_subscribers(
+            self._context,
+            event.child_key,
+            "sessions.changed",
+            build_sessions_changed_payload(
+                event.child_key,
+                "forked",
+                run_status="idle",
+            ),
+        )
 
 
-@_d.method("sessions.fork", scope="operator.write")
+class _SessionLifecycleDeletionPort(SessionDeletionPort):
+    def __init__(self, ports: _GatewaySessionLifecyclePorts) -> None:
+        self._ports = ports
+
+    @property
+    def available(self) -> bool:
+        return self._ports.deletion_available
+
+    async def delete_one(self, canonical_key: str) -> None:
+        await self._ports.delete_one(canonical_key)
+
+
+def _session_lifecycle_adapter(ctx: RpcContext) -> GatewaySessionLifecycleAdapter:
+    ports = _GatewaySessionLifecyclePorts(ctx)
+    application = SessionLifecycle(
+        creation_policy=ports,
+        store=ports,
+        deletion=_SessionLifecycleDeletionPort(ports),
+        events=ports,
+    )
+    return GatewaySessionLifecycleAdapter(ctx, application)
+
+
+async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
+    return await _session_lifecycle_adapter(ctx).create(params)
+
+
+_handle_sessions_create_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.create",
+    _handle_sessions_create,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
-    """Fork a session into a new webchat-routable child with a copied transcript."""
-    key = _require_key(params)
-    assert isinstance(params, dict)
-    title = params.get("title")
-    if title is not None and not isinstance(title, str):
-        raise ValueError("params.title must be a string")
-    before_message_id = _optional_string_param(
+    """Fork a session using the backwards-compatible full/prefix contract."""
+
+    return await _session_lifecycle_adapter(ctx).fork(
         params,
-        "beforeMessageId",
-        "before_message_id",
+        require_through_turn=False,
     )
 
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
 
-    parent = await storage.get_session(key)
-    if parent is None:
-        raise KeyError(f"Session not found: {key}")
+async def _handle_sessions_fork_through_turn(params: dict | None, ctx: RpcContext) -> dict:
+    """Fork through one terminal turn without a silent full-fork fallback."""
 
-    agent_id = _effective_agent_id_for_session(parent, key)
-    child_key = _create_session_key(agent_id, "webchat")
-    child = await _branch_with_session_mutation_lock(
-        ctx.session_manager,
-        ctx.turn_runner,
-        key,
-        child_key,
-        fork_transcript=True,
-        status=SessionStatus.DONE,
-        fork_before_message_id=before_message_id,
+    return await _session_lifecycle_adapter(ctx).fork(
+        params,
+        require_through_turn=True,
     )
 
-    display_name = title or getattr(parent, "display_name", None)
-    if display_name:
-        await ctx.session_manager.update(child.session_key, display_name=display_name)
 
-    await _emit_to_subscribers(
-        ctx,
-        child.session_key,
-        "sessions.changed",
-        build_sessions_changed_payload(child.session_key, "forked", run_status="idle"),
-    )
-
-    return {"key": child.session_key, "parentKey": key}
+_handle_sessions_fork_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.fork",
+    _handle_sessions_fork,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_fork_through_turn_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.forkThroughTurn",
+    _handle_sessions_fork_through_turn,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _should_auto_title(
@@ -1800,13 +2990,53 @@ async def _accepted_turn_response(
     client_request_id: str,
     storage: SessionStorage,
     turn_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> AdmitTurnResult:
     payload = accepted_turn_payload(result, client_request_id=client_request_id)
     receipt = result.receipt
     payload["session_key"] = receipt.accepted_session_key
     payload["user_message_id"] = receipt.message_id
     if receipt.task_id is not None:
         payload["turn_id"] = receipt.task_id
+    normalized_annotation_ids: list[str] = []
+    # A pending-input dispatch can be replayed after the staged row has been
+    # consumed.  That replay only has the ingress receipt, not the original
+    # RPC payload, so it cannot pass promptAnnotationIds directly.  Recover
+    # the immutable ids from the accepted user transcript envelope; otherwise
+    # the renderer keeps the local draft and sends it again on the next
+    # annotation turn, where preflight correctly rejects the already-SENT row.
+    if not normalized_annotation_ids and result.replayed:
+        try:
+            get_entry = getattr(storage, "get_canonical_transcript_entry", None)
+            if callable(get_entry):
+                accepted_entry = await get_entry(receipt.session_id, receipt.message_id)
+            else:
+                get_transcript = getattr(storage, "get_canonical_transcript", None)
+                if not callable(get_transcript):
+                    get_transcript = storage.get_transcript
+                entries = await get_transcript(receipt.session_id)
+                accepted_entry = next(
+                    (entry for entry in entries if entry.message_id == receipt.message_id),
+                    None,
+                )
+            content = getattr(accepted_entry, "content", None)
+            from opensquilla.prompt_annotations import (
+                prompt_annotations_from_transcript_envelope,
+            )
+
+            normalized_annotation_ids = [
+                str(snapshot["annotationId"])
+                for snapshot in prompt_annotations_from_transcript_envelope(content)
+                if isinstance(snapshot.get("annotationId"), str)
+                and snapshot["annotationId"].strip()
+            ]
+        except Exception:  # noqa: BLE001 - replay response must remain deliverable.
+            log.exception(
+                "sessions.send.accepted_annotation_recovery_failed",
+                session_id=receipt.session_id,
+                message_id=receipt.message_id,
+            )
+    if normalized_annotation_ids:
+        payload["acceptedPromptAnnotationIds"] = normalized_annotation_ids
 
     def _apply_identity_context(context: dict[str, Any]) -> None:
         stable_turn_id = context.get("turn_id")
@@ -1903,2583 +3133,173 @@ async def _accepted_turn_response(
     return payload
 
 
-@_d.method("sessions.send", scope="operator.write")
-async def _handle_sessions_send(
-    params: dict | None,
-    ctx: RpcContext,
-    *,
-    fingerprint_params: dict[str, Any] | None = None,
-    plan_revision_id: str | None = None,
-    plan_context_revision_id: str | None = None,
-    required_collaboration_mode: str | None = None,
-    required_collaboration_revision: int | None = None,
-    initial_collaboration_mode: str | None = None,
-) -> dict:
-    key = _require_key(params)
-    if not isinstance(params, dict) or "message" not in params:
-        raise ValueError("params.message is required")
-
-    message_text: str = params["message"]
-    source_hint = _normalize_session_send_source_hint(params)
-    requested_client_message_id = _optional_string_param(
-        params, "client_message_id", "clientMessageId"
-    ) or _optional_string_param(source_hint, "client_message_id", "clientMessageId")
-    requested_surface_id = _optional_string_param(
-        params, "surface_id", "surfaceId"
-    ) or _optional_string_param(source_hint, "surface_id", "surfaceId")
-    incoming_attachments = params.get("attachments", [])
-    normalized_input = normalize_incoming_text(
-        message_text,
-        source_hint=source_hint,
-        attachments=incoming_attachments if isinstance(incoming_attachments, list) else [],
-    )
-    message_text = normalized_input.message_text
-    semantic_message_text = normalized_input.semantic_message
-    combined_attachments = [
-        *normalized_input.generated_attachments,
-        *(incoming_attachments if isinstance(incoming_attachments, list) else []),
-    ]
-    attachments_cfg = getattr(ctx.config, "attachments", None)
-    persist_enabled = bool(getattr(attachments_cfg, "persist_transcripts", True))
-    media_root = media_root_from_config(ctx.config)
-    from opensquilla.session.models import SessionIntent
-
-    try:
-        session_intent = SessionIntent(params.get("intent", SessionIntent.CONTINUE.value))
-    except ValueError as exc:
-        raise ValueError(f"Invalid session intent: {params.get('intent')}") from exc
-    fork_before_message_id = _optional_string_param(
-        params,
-        "forkBeforeMessageId",
-        "fork_before_message_id",
-    )
-    if fork_before_message_id is not None and session_intent is not SessionIntent.CONTINUE:
-        raise ValueError("forkBeforeMessageId cannot be combined with non-continue intent")
-    raw_workspace_id = params.get("workspaceId", params.get("workspace_id"))
-    workspace_id: str | None = None
-    if raw_workspace_id is not None:
-        if not isinstance(raw_workspace_id, str) or not raw_workspace_id.strip():
-            raise ValueError("workspaceId must be a non-empty string")
-        workspace_id = raw_workspace_id.strip()
-        if session_intent is not SessionIntent.NEW_CHAT:
-            raise ValueError("workspaceId is only valid for a new task")
-        if not ctx.principal.is_owner:
-            raise RpcHandlerError(
-                "OWNER_REQUIRED",
-                "Project workspaces require a locally proven owner.",
-            )
-    if plan_revision_id is not None:
-        plan_revision_id = plan_revision_id.strip()
-        if not plan_revision_id:
-            raise ValueError("plan_revision_id must not be empty")
-        if session_intent not in {
-            SessionIntent.CONTINUE,
-            SessionIntent.NEW_CHAT,
-        }:
-            raise ValueError(
-                "Plan implementation supports continue or new_chat intent only"
-            )
-        if fork_before_message_id is not None:
-            raise ValueError("Plan implementation cannot be combined with a transcript fork")
-    if plan_context_revision_id is not None:
-        plan_context_revision_id = plan_context_revision_id.strip()
-        if not plan_context_revision_id:
-            raise ValueError("plan_context_revision_id must not be empty")
-    if required_collaboration_mode not in {None, "default", "plan"}:
-        raise ValueError("required_collaboration_mode must be default or plan")
-    if (
-        required_collaboration_revision is not None
-        and (
-            not isinstance(required_collaboration_revision, int)
-            or isinstance(required_collaboration_revision, bool)
-            or required_collaboration_revision < 0
-        )
-    ):
-        raise ValueError("required_collaboration_revision must be a non-negative integer")
-    if (
-        initial_collaboration_mode is not None
-        and (
-            not isinstance(initial_collaboration_mode, str)
-            or initial_collaboration_mode not in {"default", "plan"}
-        )
-    ):
-        raise ValueError("initial_collaboration_mode must be default or plan")
-    if initial_collaboration_mode is not None:
-        if session_intent is not SessionIntent.NEW_CHAT:
-            raise ValueError(
-                "initial_collaboration_mode requires new_chat intent"
-            )
-        if fork_before_message_id is not None:
-            raise ValueError(
-                "initial_collaboration_mode cannot be combined with a transcript fork"
-            )
-        if plan_revision_id is not None or plan_context_revision_id is not None:
-            raise ValueError(
-                "initial_collaboration_mode cannot be combined with a plan operation"
-            )
-        if (
-            required_collaboration_mode is not None
-            and required_collaboration_mode != initial_collaboration_mode
-        ):
-            raise ValueError("Conflicting required collaboration modes")
-        required_collaboration_mode = initial_collaboration_mode
-        required_collaboration_revision = (
-            1 if initial_collaboration_mode == "plan" else 0
-        )
-
+def _pending_input_storage(ctx: RpcContext) -> SessionStorage:
     if ctx.session_manager is None:
-        raise KeyError("No session manager available")
+        raise RpcUnavailableError("Session manager is unavailable")
+    candidate = get_session_storage(ctx.session_manager)
+    if candidate is None:
+        raise RpcUnavailableError("Session storage is unavailable")
+    return cast(SessionStorage, candidate)
 
-    storage_candidate = get_session_storage(ctx.session_manager)
-    if storage_candidate is None:
-        raise KeyError("No session storage available")
-    storage = cast(SessionStorage, storage_candidate)
 
-    ingress_identity = request_identity(
-        params,
-        request_session_key=key,
-        source_scope=_turn_source_scope(source_hint, ctx),
-        fingerprint_params=fingerprint_params,
-    )
-    get_ingress_receipt = getattr(storage, "get_turn_ingress_receipt", None)
-    if callable(get_ingress_receipt):
-        previous_acceptance = await get_ingress_receipt(
-            source_scope=ingress_identity.source_scope,
-            request_session_key=ingress_identity.request_session_key,
-            client_request_id=ingress_identity.client_request_id,
-        )
-        if previous_acceptance is not None:
-            if (
-                previous_acceptance.receipt.request_fingerprint
-                != ingress_identity.request_fingerprint
-            ):
-                raise RpcHandlerError(
-                    "IDEMPOTENCY_CONFLICT",
-                    "clientRequestId was already used for a different turn",
-                    retryable=False,
-                    accepted=False,
-                )
-            replay_response = await _accepted_turn_response(
-                previous_acceptance,
-                client_request_id=ingress_identity.client_request_id,
-                storage=storage,
-            )
-            if initial_collaboration_mode is not None:
-                replay_response["acceptedCollaboration"] = {
-                    "mode": initial_collaboration_mode,
-                    "revision": required_collaboration_revision or 0,
-                }
-                current_session = await storage.get_session(
-                    previous_acceptance.receipt.accepted_session_key
-                )
-                if current_session is not None:
-                    replay_response["collaboration"] = (
-                        _plan_collaboration_snapshot(current_session)
-                    )
-            return replay_response
-
-    def _project_workspace_error(exc: ProjectWorkspaceStateError) -> RpcHandlerError:
-        return map_project_workspace_error(
-            exc,
-            owner=ctx.principal.is_owner,
-        )
-
-    selected_workspace = None
-    workspace_guard = None
-    if workspace_id is not None:
-        try:
-            validated_workspace = await resolve_validated_project_workspace(
-                storage,
-                workspace_id,
-            )
-        except ProjectWorkspaceStateError as exc:
-            raise _project_workspace_error(exc) from exc
-        selected_workspace = validated_workspace.workspace
-        workspace_guard = validated_workspace.guard
-
-    task_runtime_candidate = cast("TaskRuntime | None", getattr(ctx, "task_runtime", None))
-    prepare_intent = getattr(ctx.session_manager, "prepare_intent", None)
-    prepare_message = getattr(ctx.session_manager, "prepare_message", None)
-    create_kwargs: dict[str, Any] = {}
-    if source_hint.get("caller_kind") == "web":
-        create_kwargs["display_name"] = "WebChat"
-    if selected_workspace is not None:
-        mode = project_default_run_mode(ctx.config)
-        mode_source = (
-            "project_default"
-            if mode is RunMode.STANDARD and config_run_mode(ctx.config) is RunMode.FULL
-            else "operator_default"
-        )
-        create_kwargs["workspace_id"] = selected_workspace.workspace_id
-        create_kwargs["origin"] = {
-            RUN_CONTEXT_ORIGIN_KEY: RunContext(
-                run_mode=mode,
-                workspace=selected_workspace.path,
-                run_mode_source=mode_source,
-                source="project_workspace",
-            ).to_origin_payload()
-        }
-    supports_prepared_acceptance = all(
-        callable(value)
-        for value in (
-            prepare_intent,
-            prepare_message,
-            getattr(storage, "accept_turn", None),
-        )
-    )
-    supports_task_runtime_activation = (
-        supports_prepared_acceptance
-        and task_runtime_candidate is not None
-        and callable(getattr(task_runtime_candidate, "reserve", None))
-        and callable(getattr(task_runtime_candidate, "activate", None))
-        and callable(getattr(task_runtime_candidate, "abort_reservation", None))
-    )
-    if initial_collaboration_mode is not None and not supports_task_runtime_activation:
-        raise RpcUnavailableError(
-            "Initial collaboration mode requires atomic turn acceptance"
-        )
-
-    async def _prepare_or_apply_intent() -> tuple[Any, Any | None]:
-        existing_session = await storage.get_session(key)
-        if existing_session is None and session_intent is SessionIntent.CONTINUE:
-            raise KeyError(f"Session not found: {key}")
-        if fork_before_message_id is None and supports_prepared_acceptance:
-            assert callable(prepare_intent)
-            plan = await prepare_intent(
-                key,
-                session_intent,
-                agent_id=_effective_agent_id_for_session(existing_session, key),
-                **create_kwargs,
-            )
-            return plan.node, plan
-        if "apply_intent" in dir(ctx.session_manager):
-            applied_session, _intent_applied = await ctx.session_manager.apply_intent(
-                key,
-                session_intent,
-                agent_id=_effective_agent_id_for_session(existing_session, key),
-                **create_kwargs,
-            )
-            return applied_session, None
-        if session_intent is not SessionIntent.CONTINUE:
-            raise RuntimeError("Session intent handling requires SessionManager.apply_intent")
-        return existing_session, None
-
-    intent_lock = get_session_lock(ctx.turn_runner, key)
-    if intent_lock is None:
-        session, atomic_intent_plan = await _prepare_or_apply_intent()
-    else:
-        async with intent_lock:
-            session, atomic_intent_plan = await _prepare_or_apply_intent()
-
-    if initial_collaboration_mode is not None and (
-        atomic_intent_plan is None
-        or getattr(atomic_intent_plan, "action", None) != "create"
-    ):
-        raise ValueError(
-            "Initial collaboration mode requires atomic session creation"
-        )
-
-    if fork_before_message_id is not None:
-        parent_key = key
-        parent_display_name = getattr(session, "display_name", None)
-        agent_id = _effective_agent_id_for_session(session, parent_key)
-        child_key = _create_session_key(agent_id, "webchat")
-        prepare_prefix_branch = getattr(ctx.session_manager, "prepare_prefix_branch", None)
+def _pending_input_attachment_scopes(row: PendingChatInput | None) -> set[str]:
+    scopes: set[str] = set()
+    if row is None:
+        return scopes
+    for attachment in row.payload.get("attachments") or []:
         if (
-            callable(prepare_prefix_branch)
-            and callable(prepare_message)
-            and callable(getattr(storage, "accept_turn", None))
+            isinstance(attachment, dict)
+            and attachment.get("store") == PENDING_CHAT_INPUT_MATERIAL_STORE
+            and attachment.get("pending_input_id") == row.pending_input_id
+            and isinstance(attachment.get("scope"), str)
+            and attachment["scope"]
         ):
+            scopes.add(cast(str, attachment["scope"]))
+    return scopes
 
-            async def _prepare_prefix_intent() -> Any:
-                return await prepare_prefix_branch(
-                    parent_key,
-                    child_key,
-                    fork_before_message_id=fork_before_message_id,
-                    status=SessionStatus.DONE,
-                )
 
-            parent_lock = get_session_lock(ctx.turn_runner, parent_key)
-            if parent_lock is None:
-                atomic_intent_plan = await _prepare_prefix_intent()
-            else:
-                async with parent_lock:
-                    atomic_intent_plan = await _prepare_prefix_intent()
-            session = atomic_intent_plan.node
-            key = child_key
-        else:
-            session = await _branch_with_session_mutation_lock(
-                ctx.session_manager,
-                ctx.turn_runner,
-                parent_key,
-                child_key,
-                fork_transcript=True,
-                status=SessionStatus.DONE,
-                fork_before_message_id=fork_before_message_id,
-            )
-            key = child_key
-            if parent_display_name:
-                session = await ctx.session_manager.update(key, display_name=parent_display_name)
-            await _emit_to_subscribers(
-                ctx,
-                key,
-                "sessions.changed",
-                build_sessions_changed_payload(key, "forked", run_status="idle"),
-            )
-
-    bound_workspace_id = getattr(session, "workspace_id", None)
-    if isinstance(bound_workspace_id, str) and bound_workspace_id:
-        if workspace_guard is None or workspace_guard.workspace_id != bound_workspace_id:
-            try:
-                validated_workspace = await resolve_validated_project_workspace(
-                    storage,
-                    bound_workspace_id,
-                )
-            except ProjectWorkspaceStateError as exc:
-                raise _project_workspace_error(exc) from exc
-            workspace_guard = validated_workspace.guard
-
-    canonical_session_id = getattr(session, "session_id", None)
-    session_id = (
-        canonical_session_id
-        if isinstance(canonical_session_id, str) and canonical_session_id
-        else key.split(":")[-1] or key
-    )
-    plan_run: PlanRunRecord | None = None
-    plan_revision_to_create: PlanRevisionRecord | None = None
-    selected_plan_revision_id = plan_revision_id
-    if plan_revision_id is not None:
-        selected_revision = await storage.get_plan_revision(plan_revision_id)
-        if selected_revision is None:
-            raise KeyError(f"Plan revision not found: {plan_revision_id}")
-        intent_action = getattr(atomic_intent_plan, "action", "continue")
-        if intent_action == "continue":
-            current_revision_id = getattr(session, "active_plan_revision_id", None)
-            if current_revision_id != plan_revision_id:
-                raise RpcHandlerError(
-                    "PLAN_REVISION_CHANGED",
-                    "The selected plan is no longer the current revision.",
-                    retryable=False,
-                    accepted=False,
-                )
-            active_run = await storage.get_active_plan_run(key)
-            if active_run is not None:
-                if active_run.status in {"queued", "running"}:
-                    raise RpcHandlerError(
-                        "PLAN_RUN_ACTIVE",
-                        "This plan already has an implementation task in progress.",
-                        details={"runId": active_run.run_id, "status": active_run.status},
-                        retryable=False,
-                        accepted=False,
-                    )
-                if active_run.driver_kind == "goal":
-                    raise RpcHandlerError(
-                        "PLAN_RUN_GOAL_OWNED",
-                        "A Goal controller owns the active plan run.",
-                        details={"runId": active_run.run_id, "status": active_run.status},
-                        retryable=False,
-                        accepted=False,
-                    )
-                if active_run.plan_revision_id == plan_revision_id:
-                    # Resume the same mutable overlay; never hide progress by
-                    # manufacturing a replacement run for the same revision.
-                    plan_run = active_run
-        elif intent_action != "create":
-            raise ValueError("A new-task plan implementation must create a fresh session")
-        else:
-            # A new task gets an independent immutable lineage. Sharing the
-            # source plan_id would make two valid replans collide on the global
-            # (plan_id, generation) invariant and would couple deletion
-            # lifecycles across sessions.
-            from opensquilla.session.plans import new_plan_revision
-
-            plan_revision_to_create = new_plan_revision(
-                source_session_key=key,
-                source_session_id=session_id,
-                source_epoch=int(getattr(session, "epoch", 0) or 0),
-                title=selected_revision.title,
-                markdown=selected_revision.markdown,
-                steps=selected_revision.steps,
-                parent=None,
-            )
-            selected_plan_revision_id = plan_revision_to_create.revision_id
-        if plan_run is None:
-            assert selected_plan_revision_id is not None
-            plan_run = PlanRunRecord(
-                run_id=str(uuid.uuid4()),
-                session_key=key,
-                session_id=session_id,
-                session_epoch=int(getattr(session, "epoch", 0) or 0),
-                plan_revision_id=selected_plan_revision_id,
-                driver_kind="manual",
-                status="queued",
-                step_states=[],
-            )
-    if plan_context_revision_id is not None:
-        context_revision = await storage.get_plan_revision(plan_context_revision_id)
-        if context_revision is None:
-            raise KeyError(f"Plan revision not found: {plan_context_revision_id}")
-        if (
-            getattr(atomic_intent_plan, "action", "continue") == "continue"
-            and getattr(session, "active_plan_revision_id", None)
-            != plan_context_revision_id
-        ):
-            raise RpcHandlerError(
-                "PLAN_REVISION_CHANGED",
-                "The selected plan is no longer the current revision.",
-                retryable=False,
-                accepted=False,
-            )
-    generate_title = await _should_auto_title(ctx, storage, session, key, session_id)
-    disk_budget = getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
-    opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
-    try:
-        ingested_attachments = await _attachment_ingest.ingest_attachments(
-            message_text,
-            combined_attachments,
-            failure_mode="raise",
-            material_root=media_root,
-            session_id=session_id,
-            disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
-            accept_opaque=bool(getattr(attachments_cfg, "accept_opaque", True)),
-            opaque_limit_bytes=opaque_cap if isinstance(opaque_cap, int) else None,
-        )
-    except _attachment_ingest.AttachmentResolutionError as exc:
-        # A staged upload expired / was lost before this send. Surface a typed,
-        # retryable error carrying the attachment index + uuid so the client can
-        # re-upload and resend instead of hitting a generic INVALID_REQUEST dead
-        # end. The uuid is intentionally NOT evicted (it is already gone).
-        raise RpcHandlerError(
-            exc.code,
-            str(exc),
-            details={
-                "attachmentIndex": exc.attachment_index,
-                "fileUuid": exc.file_uuid,
-                "recovery": "reupload" if exc.recoverable else None,
-            },
-            retryable=exc.recoverable,
-        ) from exc
-    message_text = ingested_attachments.text
-    raw_attachments = ingested_attachments.attachments
-    inferred_normalized_input = None
-    if normalized_input.metadata.get("guard_action") == "none":
-        inferred_normalized_input = infer_normalized_input_from_attachments(
-            message_text,
-            raw_attachments,
-        )
-        if inferred_normalized_input is not None:
-            message_text = inferred_normalized_input.message_text
-            semantic_message_text = inferred_normalized_input.semantic_message
-
-    normalization_metadata = (
-        normalized_input.metadata
-        if normalized_input.metadata.get("guard_action") != "none"
-        else (
-            inferred_normalized_input.metadata
-            if inferred_normalized_input is not None
-            and inferred_normalized_input.metadata.get("guard_action") != "none"
-            else None
-        )
-    )
-    if normalization_metadata is not None:
-        raw_attachments = materialize_generated_text_attachments(
-            raw_attachments,
-            media_root=media_root,
-            session_id=session_id,
-            normalization_metadata=normalization_metadata,
-            disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
-        )
-    # Evict consumed uuids only after the turn is accepted.
-    _consumed_file_uuids: list[str] = list(ingested_attachments.consumed_file_uuids)
-    log.info(
-        "sessions.send.params",
-        session_key=key,
-        message_len=len(message_text),
-        attachments_count=len(raw_attachments),
-    )
-
-    display_text = params.get("displayText") if source_hint.get("caller_kind") == "web" else None
-    if display_text is not None and not isinstance(display_text, str):
-        display_text = None
-    if display_text is None and source_hint.get("caller_kind") == "web":
-        from opensquilla.meta_preflight_protocol import (
-            display_text_from_preflight_confirmation,
-        )
-
-        display_text = display_text_from_preflight_confirmation(message_text)
-    provider_message_text = message_text
-    if source_hint.get("caller_kind") == "web":
-        from opensquilla.meta_preflight_protocol import (
-            strip_preflight_confirmation_protocol_text,
-        )
-
-        stripped_message = strip_preflight_confirmation_protocol_text(message_text)
-        if stripped_message is not None:
-            provider_message_text = stripped_message.strip()
-
-    from opensquilla.agents.scope import resolve_agent_workspace_dir
-    from opensquilla.gateway.routing import (
-        build_cli_route_envelope,
-        build_web_route_envelope,
-    )
-
-    agent_id = _effective_agent_id_for_session(session, key)
-    workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
-    configured_workspace_dir = str(workspace_path) if workspace_path is not None else None
-    workspace_dir = configured_workspace_dir
-    run_mode_hint = _trusted_run_mode_hint(ctx, source_hint)
-    try:
-        run_context, authoritative_guard = await authoritative_project_run_context(
-            storage=storage,
-            session_manager=ctx.session_manager,
-            session=session,
-            config=ctx.config,
-            default_workspace=workspace_dir,
-        )
-    except ProjectWorkspaceStateError as exc:
-        raise _project_workspace_error(exc) from exc
-    if authoritative_guard is not None:
-        workspace_guard = authoritative_guard
-    run_context = replace(
-        run_context,
-        run_mode=coerce_run_mode_for_principal(run_context.run_mode, ctx.principal),
-    )
-    accepted_run_mode_override = None
-    accepted_run_mode_origin: dict[str, Any] | None = None
-    if run_mode_hint is not None:
-        accepted_run_mode_override = AcceptedRunModeOverride(
-            run_mode=run_mode_hint,
-            run_mode_source="user",
-            source="request",
-        )
-        run_context = apply_accepted_run_mode_override(
-            run_context,
-            accepted_run_mode_override,
-        )
-        current_origin = getattr(session, "origin", None)
-        accepted_run_mode_origin = {
-            **(current_origin if isinstance(current_origin, dict) else {}),
-            RUN_CONTEXT_ORIGIN_KEY: run_context.to_origin_payload(),
-        }
-        if atomic_intent_plan is None:
-            update_session = getattr(ctx.session_manager, "update", None)
-            if callable(update_session):
-                session = await update_session(
-                    key,
-                    origin=accepted_run_mode_origin,
-                )
-    workspace_dir = run_context.workspace or workspace_dir
-    if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":
-        route_envelope = build_cli_route_envelope(
-            session_key=key,
-            agent_id=agent_id,
-            source_name=source_hint.get("source_name") or "rpc",
-            channel_id=source_hint.get("channel_id") or "cli:rpc",
-            sender_id=source_hint.get("sender_id"),
-            session_id=getattr(session, "session_id", None),
-            principal_is_owner=ctx.principal.is_owner,
-            run_mode=run_context.run_mode.value,
-        )
-    else:
-        route_envelope = build_web_route_envelope(
-            session_key=key,
-            agent_id=agent_id,
-            conn_id=ctx.conn_id,
-            sender_id=source_hint.get("sender_id"),
-            channel_id=source_hint.get("channel_id") or f"web:{ctx.conn_id}",
-            source_name=source_hint.get("source_name") or "RPC",
-            tool_source_kind=source_hint.get("source_kind"),
-            session_id=getattr(session, "session_id", None),
-            principal_is_owner=ctx.principal.is_owner,
-        )
-    _apply_run_context_route_metadata(
-        route_envelope,
-        run_context,
-        principal_is_owner=ctx.principal.is_owner,
-    )
-    elevated_hint = _trusted_elevated_hint(ctx, source_hint)
-    if elevated_hint is not None:
-        route_envelope.metadata["elevated"] = elevated_hint
-
-    capture_controls = _normalize_memory_capture_controls(params)
-    input_provenance = capture_controls["input_provenance"]
-    if input_provenance is not None:
-        input_provenance = dict(input_provenance)
-    else:
-        input_provenance = dict(route_envelope.input_provenance)
-    if normalization_metadata is not None:
-        input_provenance["input_normalization"] = normalization_metadata
-    if input_provenance != route_envelope.input_provenance:
-        route_envelope = replace(
-            route_envelope,
-            input_provenance=input_provenance,
-        )
-    run_kind = capture_controls["run_kind"] or "session_turn"
-
-    # Allocate the durable causal identity before persistence.  The same id is
-    # handed to TaskRuntime, live events, bootstrap history, and every transcript
-    # row produced by this turn.
-    turn_id = uuid.uuid4().hex
-    client_message_id = requested_client_message_id or uuid.uuid4().hex
-    surface_id = (
-        requested_surface_id
-        or getattr(route_envelope, "channel_id", None)
-        or str(getattr(route_envelope, "source_kind", "unknown"))
-    )
-    route_envelope = replace(
-        route_envelope,
-        metadata={
-            **route_envelope.metadata,
-            "client_message_id": client_message_id,
-            "surface_id": surface_id,
-            "turn_context_intent": "send",
-            "turn_context_revision": 1,
-            **(
-                {
-                    "plan_run_id": plan_run.run_id,
-                    "plan_revision_id": selected_plan_revision_id,
-                    "require_current_plan_revision": True,
-                }
-                if plan_run is not None
-                else {}
-            ),
-            **(
-                {
-                    "plan_revision_id": plan_context_revision_id,
-                    "require_current_plan_revision": True,
-                }
-                if plan_context_revision_id is not None
-                else {}
-            ),
-            **(
-                {"required_collaboration_mode": required_collaboration_mode}
-                if required_collaboration_mode is not None
-                else {}
-            ),
-            **(
-                {
-                    "required_collaboration_revision": (
-                        required_collaboration_revision
-                    )
-                }
-                if required_collaboration_revision is not None
-                else {}
-            ),
-        },
-    )
-    ingress_turn_context = {
-        "turn_id": turn_id,
-        "client_message_id": client_message_id,
-        "surface_id": surface_id,
-        "intent": "send",
-        "disposition": "queued" if getattr(ctx, "task_runtime", None) is not None else "applied",
-        "revision": 1,
-    }
-    fresh_user_session = False
-    user_message_id: str | None = None
-
-    def _turn_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        enriched = dict(payload)
-        enriched.setdefault("session_id", session_id)
-        enriched.setdefault("turn_id", turn_id)
-        enriched.setdefault("client_message_id", client_message_id)
-        if user_message_id:
-            enriched.setdefault("user_message_id", user_message_id)
-        enriched.setdefault("surface_id", surface_id)
-        return enriched
-
-    async def _run_direct_turn() -> None:
-        _terminal_emitted = False
-
-        def _current_task() -> asyncio.Task | None:
-            task = asyncio.current_task()
-            return task if isinstance(task, asyncio.Task) else None
-
-        def _mark_started() -> None:
-            task = _current_task()
-            if task is not None:
-                setattr(task, "_opensquilla_started", True)
-
-        async def _emit_terminal_once(event_name: str, payload: dict[str, Any]) -> None:
-            nonlocal _terminal_emitted
-            task = _current_task()
-            if _terminal_emitted or (
-                task is not None and getattr(task, "_opensquilla_terminal_emitted", False)
-            ):
-                return
-            _terminal_emitted = True
-            if task is not None:
-                setattr(task, "_opensquilla_terminal_emitted", True)
-            payload = _normalize_terminal_event_payload(event_name, payload)
-            await _emit_to_subscribers(
-                ctx,
-                key,
-                event_name,
-                _turn_event_payload(payload),
-            )
-
-        try:
-            _mark_started()
-            from opensquilla.session.turn_context import turn_context_scope
-
-            turn_scope = turn_context_scope(
-                {
-                    **ingress_turn_context,
-                    "disposition": "applied",
-                }
-            )
-            turn_scope.__enter__()
-            if ctx.turn_runner is None:
-                log.error("sessions.send.no_turn_runner", session_key=key)
-                await ctx.session_manager.append_message(
-                    key, role="system", content="Error: No turn runner available"
-                )
-                await _emit_terminal_once(
-                    "session.event.error",
-                    {"message": "No turn runner available", "code": "no_turn_runner"},
-                )
-                return
-
-            from opensquilla.engine.stream_wrappers import wrap_stream
-            from opensquilla.gateway.routing import tool_context_from_envelope
-            from opensquilla.permissions import configured_default_elevated
-
-            execution_session = await storage.get_session(key)
-            if execution_session is None:
-                raise KeyError(f"Session not found: {key}")
-            (
-                execution_run_context,
-                _execution_workspace_guard,
-            ) = await authoritative_project_run_context(
-                storage=storage,
-                session_manager=ctx.session_manager,
-                session=execution_session,
-                config=ctx.config,
-                default_workspace=configured_workspace_dir,
-            )
-            execution_run_context = apply_accepted_run_mode_override(
-                execution_run_context,
-                accepted_run_mode_override,
-            )
-            _apply_run_context_route_metadata(
-                route_envelope,
-                execution_run_context,
-                principal_is_owner=ctx.principal.is_owner,
-            )
-            execution_workspace_dir = (
-                execution_run_context.workspace or configured_workspace_dir
-            )
-            workspace_strict = getattr(ctx.config, "workspace_strict", None)
-            if not isinstance(workspace_strict, bool):
-                workspace_strict = bool(execution_workspace_dir)
-            tool_ctx = tool_context_from_envelope(
-                route_envelope,
-                is_owner=ctx.principal.is_owner,
-                workspace_dir=execution_workspace_dir,
-                workspace_strict=workspace_strict,
-                default_elevated=configured_default_elevated(ctx.config),
-            )
-            raw_stream = ctx.turn_runner.run(
-                provider_message_text,
-                key,
-                tool_context=tool_ctx,
-                agent_id=agent_id,
-                model=_session_turn_model(ctx, execution_session, agent_id),
-                attachments=raw_attachments,
-                session_intent=session_intent.value,
-                input_provenance=route_envelope.input_provenance,
-                run_kind=run_kind,
-                no_memory_capture=capture_controls["no_memory_capture"],
-                semantic_message=semantic_message_text,
-                fresh_user_session=fresh_user_session,
-                root_turn_id=turn_id,
-            )
-            raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(ctx.config)
-            stream_idle_timeout: float | None = (
-                raw_stream_idle_timeout if raw_stream_idle_timeout > 0 else None
-            )
-            heartbeat_interval = _optional_positive_timeout(
-                ctx.config, "agent_stream_heartbeat_interval_seconds", 15.0
-            )
-            async for event in wrap_stream(
-                raw_stream,
-                idle_timeout=stream_idle_timeout,
-                heartbeat_interval=heartbeat_interval,
-                heartbeat_message="Agent run is still active",
-            ):
-                event_dict = asdict(event)
-                event_kind = event_dict.pop("kind", event.__class__.__name__)
-                if event_kind == "artifact":
-                    event_dict = enrich_artifact_event_dict(event_dict)
-                if event_kind in ("done", "error"):
-                    await _emit_terminal_once(f"session.event.{event_kind}", event_dict)
-                else:
-                    await _emit_to_subscribers(
-                        ctx,
-                        key,
-                        f"session.event.{event_kind}",
-                        _turn_event_payload(event_dict),
-                    )
-
-            await _emit_to_subscribers(
-                ctx,
-                key,
-                "sessions.changed",
-                _turn_event_payload(build_sessions_changed_payload(key, "turn_complete")),
-            )
-        except asyncio.CancelledError:
-            log.info("sessions.send.aborted", session_key=key)
-            try:
-                await _emit_terminal_once("session.event.done", {"reason": "aborted"})
-            except Exception:
-                pass
-        except TimeoutError:
-            log.warning("sessions.send.stream_idle_timeout", session_key=key)
-            timeout_message = build_terminal_reply(
-                {
-                    "status": "timeout",
-                    "terminal_reason": "timeout",
-                    "error_class": _STREAM_IDLE_TIMEOUT_CODE,
-                    "error_message": _STREAM_IDLE_TIMEOUT_MESSAGE,
-                }
-            )
-            await ctx.session_manager.append_message(key, role="system", content=timeout_message)
-            await _emit_terminal_once(
-                "session.event.error",
-                {"message": _STREAM_IDLE_TIMEOUT_MESSAGE, "code": _STREAM_IDLE_TIMEOUT_CODE},
-            )
-        except ProjectWorkspaceStateError as exc:
-            mapped = _project_workspace_error(exc)
-            log.warning(
-                "sessions.send.project_workspace_unavailable",
-                session_key=key,
-                reason=exc.reason,
-            )
-            await ctx.session_manager.append_message(
-                key,
-                role="system",
-                content=f"Error: {mapped.message}",
-            )
-            await _emit_terminal_once(
-                "session.event.error",
-                {
-                    "message": mapped.message,
-                    "code": mapped.code,
-                    "details": mapped.details,
-                },
-            )
-        except Exception as exc:
-            error_code, error_message = sanitize_agent_error(
-                {
-                    "status": "failed",
-                    "terminal_reason": "error",
-                    "error_class": type(exc).__name__,
-                    "error_message": str(exc),
-                },
-                fallback_error_class="agent_error",
-                fallback_error_message=str(exc) or "Agent error",
-            )
-            event_code = error_code if error_code == "provider_request_too_large" else "agent_error"
-            log.error("sessions.send.agent_failed", session_key=key, error=str(exc), exc_info=True)
-            await ctx.session_manager.append_message(
-                key,
-                role="system",
-                content=f"Error: {error_message}",
-            )
-            await _emit_terminal_once(
-                "session.event.error",
-                {"message": error_message, "code": event_code},
-            )
-        finally:
-            if "turn_scope" in locals():
-                turn_scope.__exit__(None, None, None)
-            if not _terminal_emitted:
-                try:
-                    await _emit_terminal_once(
-                        "session.event.error",
-                        {"message": "Agent task terminated unexpectedly", "code": "task_cancelled"},
-                    )
-                except Exception:
-                    pass
-
-    task_runtime = task_runtime_candidate
-    requested_mode = (
-        params.get("queueMode")
-        or params.get("queue_mode")
-        or getattr(session, "queue_mode", None)
-        or "followup"
-    )
-    if requested_mode == "steer":
-        log.info(
-            "sessions.send.legacy_steer_queue_mode_used",
-            session_key=key,
-            deprecated=True,
-            runtime_mode="interrupt",
-            replacement="sessions.steer.v2",
-        )
-        _emit_steer_metric("legacy_interrupt_requested", session_key=key)
-    runtime_mode = "interrupt" if requested_mode == "steer" else requested_mode
-    if atomic_intent_plan is not None and atomic_intent_plan.action == "reset":
-        # A reset rotates the session identity. Any old-key task must be stopped
-        # only after that rotation commits so it cannot append into the new epoch.
-        runtime_mode = "interrupt"
-    atomic_runtime_acceptance = (
-        supports_task_runtime_activation
-        and task_runtime is not None
-        and atomic_intent_plan is not None
-        and callable(getattr(task_runtime, "collect_admission", None))
-        and (
-            runtime_mode != "collect"
-            or callable(getattr(task_runtime, "try_collect_atomically", None))
-        )
-    )
-    prepared_acceptance = (
-        atomic_intent_plan is not None
-        and callable(prepare_message)
-        and callable(getattr(storage, "accept_turn", None))
-    )
-    persisted_entry = None
-    expected_epoch = 0
-    if plan_run is not None and not atomic_runtime_acceptance:
-        raise RpcUnavailableError(
-            "Plan implementation requires atomic TaskRuntime acceptance"
-        )
-    if initial_collaboration_mode is not None and not atomic_runtime_acceptance:
-        raise RpcUnavailableError(
-            "Initial collaboration mode requires atomic TaskRuntime acceptance"
-        )
-
-    if prepared_acceptance:
-        persist_content = message_text
-        if raw_attachments or display_text is not None:
-            from opensquilla.gateway.transcripts import (
-                build_transcript_attachment_envelope,
-            )
-
-            if raw_attachments and hasattr(ctx.session_manager, "stamp_user_text"):
-                stamped = ctx.session_manager.stamp_user_text(message_text)
-                if isinstance(stamped, str):
-                    message_text = stamped
-            persist_content, _writes = build_transcript_attachment_envelope(
-                text=message_text,
-                display_text=display_text,
-                attachments=raw_attachments,
-                session_id=session_id,
-                media_root=media_root,
-                persist_enabled=persist_enabled,
-                disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
-            )
-
-        assert callable(prepare_message)
-        persisted_entry, expected_epoch = await prepare_message(
-            key,
-            role="user",
-            content=persist_content,
-            turn_context=ingress_turn_context,
-            session_node=session,
-        )
-        if (
-            not raw_attachments
-            and display_text is None
-            and isinstance(persisted_entry.content, str)
-        ):
-            message_text = persisted_entry.content
-
-    if atomic_runtime_acceptance:
-        assert task_runtime is not None
-        assert atomic_intent_plan is not None
-        assert persisted_entry is not None
-        atomic_task_runtime = task_runtime
-
-        from opensquilla.gateway.task_runtime import TaskQueueFullError
-
-        async def _accept_task_record(
-            task_record: AgentTaskRecord,
-            *,
-            merge_into_task: bool = False,
-        ) -> TurnAcceptanceResult:
-            reset_archive_writer = None
-            if atomic_intent_plan.action == "reset":
-                write_session_archive = getattr(
-                    ctx.session_manager,
-                    "write_session_archive",
-                    None,
-                )
-                if not callable(write_session_archive):
-                    raise RuntimeError("Reset requires durable session archive support")
-
-                async def reset_archive_writer(snapshot: Any) -> None:
-                    await write_session_archive(
-                        snapshot.node,
-                        list(snapshot.entries),
-                        list(snapshot.summaries),
-                    )
-
-            accepted_plan_run = (
-                plan_run.model_copy(
-                    update={"active_task_id": task_record.task_id},
-                )
-                if plan_run is not None
-                else None
-            )
-            accepted_session_updates: dict[str, Any] = {}
-            if accepted_run_mode_origin is not None:
-                accepted_session_updates["origin"] = accepted_run_mode_origin
-            if plan_run is not None:
-                accepted_session_updates["collaboration_mode"] = "default"
-                if plan_revision_to_create is None:
-                    accepted_session_updates["active_plan_revision_id"] = (
-                        selected_plan_revision_id
-                    )
-            elif initial_collaboration_mode == "plan":
-                accepted_session_updates["collaboration_mode"] = "plan"
-            return await storage.accept_turn(
-                persisted_entry,
-                expected_epoch=expected_epoch,
-                updated_at=int(time.time() * 1000),
-                task_record=task_record,
-                source_scope=ingress_identity.source_scope,
-                request_session_key=ingress_identity.request_session_key,
-                client_request_id=ingress_identity.client_request_id,
-                request_fingerprint=ingress_identity.request_fingerprint,
-                session_node=(
-                    atomic_intent_plan.node
-                    if atomic_intent_plan.action in {"create", "reset", "fork"}
-                    else None
-                ),
-                reset_from_session_id=(
-                    atomic_intent_plan.previous_session_id
-                    if atomic_intent_plan.action == "reset"
-                    else None
-                ),
-                reset_archive_writer=reset_archive_writer,
-                initial_transcript_entries=(
-                    atomic_intent_plan.initial_transcript_entries
-                    if atomic_intent_plan.action == "fork"
-                    else ()
-                ),
-                session_updates=accepted_session_updates or None,
-                plan_revision=plan_revision_to_create,
-                # Associate the task while the run is still queued.  The UI
-                # remains gated by ``status == running``, but cancellation can
-                # now stop a queued implementation before it begins.
-                plan_run=accepted_plan_run,
-                merge_into_task=merge_into_task,
-                workspace_guard=workspace_guard,
-            )
-
-        async def _commit_and_activate() -> TurnAcceptanceResult:
-            if runtime_mode == "collect" and atomic_intent_plan.action == "continue":
-
-                async def _persist_collection(
-                    handle: Any,
-                    details: dict[str, Any],
-                ) -> TurnAcceptanceResult:
-                    collected_context = {
-                        **ingress_turn_context,
-                        "turn_id": handle.task_id,
-                        "target_turn_id": handle.task_id,
-                        "revision": max(
-                            2,
-                            int(ingress_turn_context.get("revision", 1)) + 1,
-                        ),
-                    }
-                    persisted_entry.turn_context = collected_context
-                    task_record = AgentTaskRecord(
-                        task_id=handle.task_id,
-                        session_key=handle.session_key,
-                        agent_id=route_envelope.agent_id,
-                        source_kind=route_envelope.source_kind.value,
-                        queue_mode="collect",
-                        run_kind=run_kind,
-                        status=AgentTaskStatus.QUEUED,
-                        details=details,
-                    )
-                    return await _accept_task_record(
-                        task_record,
-                        merge_into_task=True,
-                    )
-
-                collected = await atomic_task_runtime.try_collect_atomically(
-                    envelope=route_envelope,
-                    message=provider_message_text,
-                    attachments=raw_attachments,
-                    run_kind=run_kind,
-                    no_memory_capture=bool(capture_controls["no_memory_capture"]),
-                    semantic_message=semantic_message_text,
-                    persisted_user_message_id=persisted_entry.message_id,
-                    message_count=1,
-                    accepted_run_mode_override=accepted_run_mode_override,
-                    persist=_persist_collection,
-                )
-                if collected is not None:
-                    _handle, collected_acceptance = collected
-                    return cast(TurnAcceptanceResult, collected_acceptance)
-
-            reservation = await reserve_turn_via_runtime(
-                atomic_task_runtime,
-                route_envelope,
-                provider_message_text,
-                attachments=raw_attachments,
-                mode=runtime_mode,
-                run_kind=run_kind,
-                no_memory_capture=bool(capture_controls["no_memory_capture"]),
-                semantic_message=semantic_message_text,
-                turn_id=turn_id,
-                accepted_run_mode_override=accepted_run_mode_override,
-            )
-            try:
-                acceptance = await _accept_task_record(reservation.task_record)
-            except BaseException:
-                await atomic_task_runtime.abort_reservation(reservation)
-                raise
-
-            if acceptance.replayed:
-                await atomic_task_runtime.abort_reservation(reservation)
-                return acceptance
-
-            if atomic_intent_plan.action == "reset":
-                set_cached_epoch = getattr(ctx.session_manager, "set_cached_epoch", None)
-                if callable(set_cached_epoch):
-                    set_cached_epoch(key, expected_epoch)
-            try:
-                await atomic_task_runtime.activate(
-                    reservation,
-                    persisted_user_message_id=acceptance.receipt.message_id,
-                    fresh_user_session=acceptance.fresh_user_session,
-                )
-            except Exception as exc:  # noqa: BLE001 - acceptance already committed.
-                log.error(
-                    "sessions.send.activation_failed",
-                    session_key=key,
-                    task_id=acceptance.receipt.task_id,
-                    error=str(exc),
-                    exc_info=True,
-                )
-                if acceptance.receipt.task_id:
-                    try:
-                        await storage.update_agent_task(
-                            acceptance.receipt.task_id,
-                            status="failed",
-                            finished_at=int(time.time() * 1000),
-                            terminal_reason="activation_failed",
-                            error_class=type(exc).__name__,
-                            error_message=str(exc),
-                        )
-                    except Exception:  # noqa: BLE001 - preserve accepted response.
-                        log.exception(
-                            "sessions.send.activation_failure_record_failed",
-                            task_id=acceptance.receipt.task_id,
-                        )
-                if not reservation.activated:
-                    try:
-                        await atomic_task_runtime.abort_reservation(reservation)
-                    except Exception:  # noqa: BLE001 - preserve accepted response.
-                        log.exception(
-                            "sessions.send.activation_abort_failed",
-                            task_id=acceptance.receipt.task_id,
-                        )
-                acceptance = replace(
-                    acceptance,
-                    task_status=AgentTaskStatus.FAILED,
-                )
-            return acceptance
-
-        async def _commit_with_session_admission() -> TurnAcceptanceResult:
-            # Serialize the full durable commit -> runtime activation boundary
-            # for every queue mode. In particular, a reset/interrupt must not
-            # overtake a committed-but-inert continue reservation: interrupt
-            # activation can only cancel tasks that have crossed activation.
-            async with atomic_task_runtime.collect_admission(route_envelope.session_key):
-                return await _commit_and_activate()
-
-        try:
-            acceptance = await complete_durable_ingress(_commit_with_session_admission())
-        except TaskQueueFullError as exc:
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "QUEUE_FULL",
-                "The session task queue is full. Try again after queued work completes.",
-                details={
-                    "session_key": exc.session_key,
-                    "max_pending": exc.max_pending,
-                },
-                retryable=True,
-                accepted=False,
-            ) from exc
-        except StorageBusyError as exc:
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "STORAGE_BUSY",
-                "Session storage is temporarily busy. Retry this send.",
-                details={
-                    "operation": exc.operation,
-                    "waited_ms": exc.waited_ms,
-                },
-                retryable=True,
-                retry_after_ms=exc.retry_after_ms,
-                accepted=False,
-            ) from exc
-        except StaleEpochError as exc:
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "SESSION_CHANGED",
-                "The session changed while this turn was being accepted. Retry the send.",
-                retryable=True,
-                accepted=False,
-            ) from exc
-        except TurnIngressConflictError as exc:
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "IDEMPOTENCY_CONFLICT",
-                str(exc),
-                retryable=False,
-                accepted=False,
-            ) from exc
-        except ProjectWorkspaceStateError as exc:
-            _consumed_file_uuids = []
-            raise _project_workspace_error(exc) from exc
-        except TaskCollectionUnavailableError as exc:
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "COLLECT_RACE",
-                "The queued task started before this message could be collected. Retry it.",
-                retryable=True,
-                accepted=False,
-            ) from exc
-        except sqlite3.IntegrityError as exc:
-            if atomic_intent_plan.action != "create" or "sessions.session_key" not in str(exc):
-                raise
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "SESSION_CONFLICT",
-                "Another request created this session first. Start a new chat and retry.",
-                retryable=False,
-                accepted=False,
-            ) from exc
-
-        if not acceptance.replayed:
-            notify_message_appended = getattr(ctx.session_manager, "notify_message_appended", None)
-            if callable(notify_message_appended):
-                try:
-                    notify_message_appended(persisted_entry)
-                except Exception:  # noqa: BLE001 - turn is already accepted.
-                    log.exception(
-                        "sessions.send.post_accept_notify_failed",
-                        session_key=key,
-                        task_id=acceptance.receipt.task_id,
-                    )
-            reset_archive = acceptance.reset_archive_snapshot
-            if reset_archive is not None:
-                write_session_archive = getattr(ctx.session_manager, "write_session_archive", None)
-                if callable(write_session_archive):
-                    try:
-                        await write_session_archive(
-                            reset_archive.node,
-                            list(reset_archive.entries),
-                            list(reset_archive.summaries),
-                        )
-                    except Exception:  # noqa: BLE001 - turn is already accepted.
-                        log.exception(
-                            "sessions.send.post_accept_archive_failed",
-                            session_key=key,
-                            task_id=acceptance.receipt.task_id,
-                        )
-            if (
-                atomic_intent_plan.action == "fork"
-                and atomic_intent_plan.previous_session_id is not None
-            ):
-                copy_fork_materials = getattr(ctx.session_manager, "_copy_fork_materials", None)
-                if callable(copy_fork_materials):
-                    try:
-                        await copy_fork_materials(
-                            atomic_intent_plan.previous_session_id,
-                            session_id,
-                            key,
-                        )
-                    except Exception:  # noqa: BLE001 - turn is already accepted.
-                        log.exception(
-                            "sessions.send.post_accept_fork_copy_failed",
-                            session_key=key,
-                            task_id=acceptance.receipt.task_id,
-                        )
-                try:
-                    await _emit_to_subscribers(
-                        ctx,
-                        key,
-                        "sessions.changed",
-                        build_sessions_changed_payload(key, "forked", run_status="idle"),
-                    )
-                except Exception:  # noqa: BLE001 - turn is already accepted.
-                    log.exception(
-                        "sessions.send.post_accept_fork_event_failed",
-                        session_key=key,
-                        task_id=acceptance.receipt.task_id,
-                    )
-
-        if _consumed_file_uuids:
-            from opensquilla.gateway.uploads import get_upload_store
-
-            upload_store = get_upload_store()
-            for file_uuid in _consumed_file_uuids:
-                try:
-                    await upload_store.evict(file_uuid)
-                except Exception:  # noqa: BLE001 - eviction is best-effort
-                    log.warning("uploads.evict_failed_post_turn uuid=%s", file_uuid[:8])
-        if not acceptance.replayed:
-            try:
-                _schedule_auto_title(
-                    ctx,
-                    key,
-                    semantic_message_text or message_text,
-                    enabled=generate_title,
-                    session_id=session_id,
-                    root_turn_id=acceptance.receipt.task_id,
-                )
-            except Exception:  # noqa: BLE001 - turn is already accepted.
-                log.exception(
-                    "sessions.send.post_accept_title_failed",
-                    session_key=key,
-                    task_id=acceptance.receipt.task_id,
-                )
-        response = await _accepted_turn_response(
-            acceptance,
-            client_request_id=ingress_identity.client_request_id,
-            storage=storage,
-            turn_context=(persisted_entry.turn_context if not acceptance.replayed else None),
-        )
-        if initial_collaboration_mode is not None:
-            accepted_collaboration = {
-                "mode": initial_collaboration_mode,
-                "revision": required_collaboration_revision or 0,
-            }
-            response["acceptedCollaboration"] = accepted_collaboration
-            current_session = await storage.get_session(key)
-            if current_session is not None:
-                response["collaboration"] = _plan_collaboration_snapshot(
-                    current_session
-                )
-            if not acceptance.replayed:
-                try:
-                    await _emit_to_subscribers(
-                        ctx,
-                        key,
-                        "session.event.collaboration_mode",
-                        {
-                            "session_key": key,
-                            "collaboration": accepted_collaboration,
-                            "appliesTo": "current_turn",
-                        },
-                    )
-                except Exception:  # noqa: BLE001 - turn is already accepted.
-                    log.exception(
-                        "sessions.send.initial_collaboration_emit_failed",
-                        session_key=key,
-                    )
-        return response
-
-    if prepared_acceptance:
-        assert atomic_intent_plan is not None
-        assert persisted_entry is not None
-        direct_registry = get_agent_task_registry()
-
-        async def _commit_and_schedule_direct() -> TurnAcceptanceResult:
-            nonlocal fresh_user_session, user_message_id
-            acceptance = await storage.accept_turn(
-                persisted_entry,
-                expected_epoch=expected_epoch,
-                updated_at=int(time.time() * 1000),
-                task_record=None,
-                source_scope=ingress_identity.source_scope,
-                request_session_key=ingress_identity.request_session_key,
-                client_request_id=ingress_identity.client_request_id,
-                request_fingerprint=ingress_identity.request_fingerprint,
-                session_node=(
-                    atomic_intent_plan.node
-                    if atomic_intent_plan.action in {"create", "reset", "fork"}
-                    else None
-                ),
-                reset_from_session_id=(
-                    atomic_intent_plan.previous_session_id
-                    if atomic_intent_plan.action == "reset"
-                    else None
-                ),
-                initial_transcript_entries=(
-                    atomic_intent_plan.initial_transcript_entries
-                    if atomic_intent_plan.action == "fork"
-                    else ()
-                ),
-                session_updates=(
-                    {"origin": accepted_run_mode_origin}
-                    if accepted_run_mode_origin is not None
-                    else None
-                ),
-                workspace_guard=workspace_guard,
-            )
-            if acceptance.replayed:
-                return acceptance
-            fresh_user_session = acceptance.fresh_user_session
-            user_message_id = acceptance.receipt.message_id
-            if atomic_intent_plan.action == "reset":
-                set_cached_epoch = getattr(ctx.session_manager, "set_cached_epoch", None)
-                if callable(set_cached_epoch):
-                    set_cached_epoch(key, expected_epoch)
-            task = asyncio.create_task(_run_direct_turn())
-            setattr(task, "_opensquilla_started", False)
-            setattr(task, "_opensquilla_terminal_emitted", False)
-            direct_registry.register(key, task)
-            return acceptance
-
-        try:
-            async with direct_registry.admission(key):
-                acceptance = await complete_durable_ingress(_commit_and_schedule_direct())
-        except StorageBusyError as exc:
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "STORAGE_BUSY",
-                "Session storage is temporarily busy. Retry this send.",
-                details={
-                    "operation": exc.operation,
-                    "waited_ms": exc.waited_ms,
-                },
-                retryable=True,
-                retry_after_ms=exc.retry_after_ms,
-                accepted=False,
-            ) from exc
-        except StaleEpochError as exc:
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "SESSION_CHANGED",
-                "The session changed while this turn was being accepted. Retry the send.",
-                retryable=True,
-                accepted=False,
-            ) from exc
-        except TurnIngressConflictError as exc:
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "IDEMPOTENCY_CONFLICT",
-                str(exc),
-                retryable=False,
-                accepted=False,
-            ) from exc
-        except ProjectWorkspaceStateError as exc:
-            _consumed_file_uuids = []
-            raise _project_workspace_error(exc) from exc
-        except sqlite3.IntegrityError as exc:
-            if atomic_intent_plan.action != "create" or "sessions.session_key" not in str(exc):
-                raise
-            _consumed_file_uuids = []
-            raise RpcHandlerError(
-                "SESSION_CONFLICT",
-                "Another request created this session first. Start a new chat and retry.",
-                retryable=False,
-                accepted=False,
-            ) from exc
-
-        if not acceptance.replayed:
-            notify_message_appended = getattr(
-                ctx.session_manager,
-                "notify_message_appended",
-                None,
-            )
-            if callable(notify_message_appended):
-                try:
-                    notify_message_appended(persisted_entry)
-                except Exception:  # noqa: BLE001 - turn is already accepted.
-                    log.exception(
-                        "sessions.send.post_accept_notify_failed",
-                        session_key=key,
-                    )
-            reset_archive = acceptance.reset_archive_snapshot
-            if reset_archive is not None:
-                write_session_archive = getattr(
-                    ctx.session_manager,
-                    "write_session_archive",
-                    None,
-                )
-                if callable(write_session_archive):
-                    try:
-                        await write_session_archive(
-                            reset_archive.node,
-                            list(reset_archive.entries),
-                            list(reset_archive.summaries),
-                        )
-                    except Exception:  # noqa: BLE001 - turn is already accepted.
-                        log.exception(
-                            "sessions.send.post_accept_archive_failed",
-                            session_key=key,
-                        )
-            if (
-                atomic_intent_plan.action == "fork"
-                and atomic_intent_plan.previous_session_id is not None
-            ):
-                copy_fork_materials = getattr(
-                    ctx.session_manager,
-                    "_copy_fork_materials",
-                    None,
-                )
-                if callable(copy_fork_materials):
-                    try:
-                        await copy_fork_materials(
-                            atomic_intent_plan.previous_session_id,
-                            session_id,
-                            key,
-                        )
-                    except Exception:  # noqa: BLE001 - turn is already accepted.
-                        log.exception(
-                            "sessions.send.post_accept_fork_copy_failed",
-                            session_key=key,
-                        )
-                try:
-                    await _emit_to_subscribers(
-                        ctx,
-                        key,
-                        "sessions.changed",
-                        build_sessions_changed_payload(
-                            key,
-                            "forked",
-                            run_status="idle",
-                        ),
-                    )
-                except Exception:  # noqa: BLE001 - turn is already accepted.
-                    log.exception(
-                        "sessions.send.post_accept_fork_event_failed",
-                        session_key=key,
-                    )
-            await _emit_to_subscribers(
-                ctx,
-                key,
-                "session.event.input_disposition",
-                {
-                    "session_key": key,
-                    "user_message_id": user_message_id,
-                    **ingress_turn_context,
-                },
-            )
-            if _consumed_file_uuids:
-                from opensquilla.gateway.uploads import get_upload_store
-
-                upload_store = get_upload_store()
-                for file_uuid in _consumed_file_uuids:
-                    try:
-                        await upload_store.evict(file_uuid)
-                    except Exception:  # noqa: BLE001 - eviction is best-effort
-                        log.warning(
-                            "uploads.evict_failed_post_turn uuid=%s",
-                            file_uuid[:8],
-                        )
-            try:
-                _schedule_auto_title(
-                    ctx,
-                    key,
-                    semantic_message_text or message_text,
-                    enabled=generate_title,
-                )
-            except Exception:  # noqa: BLE001 - turn is already accepted.
-                log.exception(
-                    "sessions.send.post_accept_title_failed",
-                    session_key=key,
-                )
-        return await _accepted_turn_response(
-            acceptance,
-            client_request_id=ingress_identity.client_request_id,
-            storage=storage,
-            turn_context=(persisted_entry.turn_context if not acceptance.replayed else None),
-        )
-
-    # 1. Persist user message to transcript (include attachment metadata).
-    # Hold the per-session lock used by /reset so a concurrent reset cannot
-    # tear the append and leak an orphan user turn into the cleared transcript.
-    _persist_lock = get_session_lock(ctx.turn_runner, key)
-    legacy_persisted_entry: Any = None
-    fresh_user_session = False
-
-    async def _persist_user_message() -> None:
-        nonlocal message_text, legacy_persisted_entry, fresh_user_session
-        from opensquilla.session.turn_context import turn_context_scope
-
-        get_transcript = getattr(ctx.session_manager, "get_transcript", None)
-        if callable(get_transcript):
-            fresh_user_session = not bool(await get_transcript(key))
-        if raw_attachments or display_text is not None:
-            from opensquilla.gateway.transcripts import (
-                build_transcript_attachment_envelope,
-            )
-
-            # Stamp up-front so both the stored envelope and the LLM path agree.
-            if raw_attachments and hasattr(ctx.session_manager, "stamp_user_text"):
-                _stamped = ctx.session_manager.stamp_user_text(message_text)
-                if isinstance(_stamped, str):
-                    message_text = _stamped
-
-            persist_content, _writes = build_transcript_attachment_envelope(
-                text=message_text,
-                display_text=display_text,
-                attachments=raw_attachments,
-                session_id=session_id,
-                media_root=media_root,
-                persist_enabled=persist_enabled,
-                disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
-            )
-            with turn_context_scope(ingress_turn_context):
-                legacy_persisted_entry = await ctx.session_manager.append_message(
-                    key,
-                    role="user",
-                    content=persist_content,
-                )
-        else:
-            with turn_context_scope(ingress_turn_context):
-                legacy_persisted_entry = await ctx.session_manager.append_message(
-                    key,
-                    role="user",
-                    content=message_text,
-                )
-            if legacy_persisted_entry is not None and isinstance(
-                legacy_persisted_entry.content, str
-            ):
-                message_text = legacy_persisted_entry.content
-
-    async def _persist_user_message_with_lock() -> None:
-        if _persist_lock is None:
-            await _persist_user_message()
-        else:
-            async with _persist_lock:
-                await _persist_user_message()
-
-    task_runtime = task_runtime_candidate
-    if task_runtime is None:
-        direct_registry = get_agent_task_registry()
-        async with direct_registry.admission(key):
-            await _persist_user_message_with_lock()
-            user_message_id = getattr(legacy_persisted_entry, "message_id", None)
-            task = asyncio.create_task(_run_direct_turn())
-            setattr(task, "_opensquilla_started", False)
-            setattr(task, "_opensquilla_terminal_emitted", False)
-            direct_registry.register(key, task)
-
-        await _emit_to_subscribers(
-            ctx,
-            key,
-            "session.event.input_disposition",
-            {
-                "session_key": key,
-                "user_message_id": user_message_id,
-                **ingress_turn_context,
-            },
-        )
-        # Same eviction semantic as the task_runtime success path: the turn was
-        # accepted into a background TurnRunner task, so consumed uuids can be
-        # evicted from the upload store rather than waiting out the TTL window.
-        if _consumed_file_uuids:
-            from opensquilla.gateway.uploads import get_upload_store
-
-            _store = get_upload_store()
-            for _u in _consumed_file_uuids:
-                try:
-                    await _store.evict(_u)
-                except Exception:  # noqa: BLE001 — eviction is best-effort
-                    log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-        _schedule_auto_title(
-            ctx,
-            key,
-            semantic_message_text or message_text,
-            enabled=generate_title,
-        )
-        return {
-            "status": "accepted",
-            "key": key,
-            "session_key": key,
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "client_message_id": client_message_id,
-            "user_message_id": user_message_id,
-            "surface_id": surface_id,
-        }
-
-    await _persist_user_message_with_lock()
-    user_message_id = getattr(legacy_persisted_entry, "message_id", None)
-
-    async def _rollback_persisted_user_message(reason: str) -> tuple[str | None, bool]:
-        message_id = getattr(legacy_persisted_entry, "message_id", None)
-        if not message_id or not hasattr(ctx.session_manager, "remove_message"):
-            return message_id, False
-        try:
-            if _persist_lock is None:
-                removed = await ctx.session_manager.remove_message(key, message_id)
-            else:
-                async with _persist_lock:
-                    removed = await ctx.session_manager.remove_message(key, message_id)
-        except Exception as rb_exc:  # noqa: BLE001 — rollback is best-effort
-            log.warning(
-                "sessions.send.rollback_failed",
-                session_key=key,
-                message_id=message_id,
-                reason=reason,
-                error=str(rb_exc),
-            )
-            return message_id, False
-        if removed:
-            log.info(
-                "sessions.send.rollback_succeeded",
-                session_key=key,
-                message_id=message_id,
-                reason=reason,
-            )
-        return message_id, bool(removed)
-
-    if task_runtime is not None:
-        requested_mode = (
-            params.get("queueMode")
-            or params.get("queue_mode")
-            or getattr(session, "queue_mode", None)
-            or "followup"
-        )
-        runtime_mode = "interrupt" if requested_mode == "steer" else requested_mode
-        try:
-            handle = await start_turn_via_runtime(
-                task_runtime,
-                route_envelope,
-                provider_message_text,
-                attachments=raw_attachments,
-                mode=runtime_mode,
-                run_kind=run_kind,
-                no_memory_capture=bool(capture_controls["no_memory_capture"]),
-                semantic_message=semantic_message_text,
-                persisted_user_message_id=getattr(legacy_persisted_entry, "message_id", None),
-                fresh_user_session=fresh_user_session,
-                turn_id=turn_id,
-                accepted_run_mode_override=accepted_run_mode_override,
-            )
-        except Exception as exc:
-            # Ensure the uuid eviction does NOT fire on this
-            # path. The locked semantic mandates that any rejection /
-            # rollback / queue-full leaves the uuid alive until TTL so
-            # the user can retry against the same uuid.
-            _consumed_file_uuids = []  # noqa: F841 — explicit no-evict marker
-            from opensquilla.gateway.task_runtime import TaskQueueFullError
-
-            if not isinstance(exc, TaskQueueFullError):
-                raise
-
-            # Roll back the just-appended user turn so a retry doesn't leave
-            # a ghost message in the transcript. If rollback fails (e.g.
-            # storage error under load), surface a non-retryable error and
-            # hand the orphan message_id to the client as an idempotency
-            # token — clients must dedup before retrying.
-            orphan_id, rollback_ok = await _rollback_persisted_user_message("queue_full")
-
-            if rollback_ok:
-                raise RpcHandlerError(
-                    "QUEUE_FULL",
-                    "The session task queue is full. Try again after queued work completes.",
-                    details={
-                        "session_key": exc.session_key,
-                        "max_pending": exc.max_pending,
-                        "rollback_message_id": orphan_id,
-                    },
-                    retryable=True,
-                    accepted=False,
-                ) from exc
-            raise RpcHandlerError(
-                "QUEUE_FULL_DIRTY",
-                (
-                    "The session task queue is full and the just-appended user "
-                    "turn could not be rolled back. The transcript now contains "
-                    "an orphan message; clients must dedup by orphan_message_id "
-                    "before retrying."
-                ),
-                details={
-                    "session_key": exc.session_key,
-                    "max_pending": exc.max_pending,
-                    "orphan_message_id": orphan_id,
-                    "remediation": "client must dedup by message_id before retry",
-                },
-                retryable=False,
-                accepted=True,
-            ) from exc
-        if handle.task_id != turn_id:
-            # ``collect`` coalesces this durable prompt into an already queued
-            # runtime turn. TaskRuntime has rebound the stored row; project and
-            # return that same canonical identity instead of the unused
-            # preallocation so live consumers and a later hydrate agree.
-            turn_id = handle.task_id
-            ingress_turn_context = {
-                **ingress_turn_context,
-                "turn_id": turn_id,
-                "target_turn_id": turn_id,
-                "revision": max(2, int(ingress_turn_context.get("revision", 1)) + 1),
-            }
-        # Eviction hook: turn was accepted into the runtime,
-        # post-resolution + post-engine-acceptance. Evict consumed uuids
-        # so memory does not linger for the full TTL window. Locked
-        # semantic mandates this fires ONLY here on the success path.
-        if _consumed_file_uuids:
-            from opensquilla.gateway.uploads import get_upload_store
-
-            _store = get_upload_store()
-            for _u in _consumed_file_uuids:
-                try:
-                    await _store.evict(_u)
-                except Exception:  # noqa: BLE001 — eviction is best-effort
-                    log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-        _schedule_auto_title(
-            ctx,
-            key,
-            semantic_message_text or message_text,
-            enabled=generate_title,
-            session_id=session_id,
-            root_turn_id=turn_id,
-        )
-        await _emit_to_subscribers(
-            ctx,
-            key,
-            "session.event.input_disposition",
-            {
-                "session_key": key,
-                "user_message_id": user_message_id,
-                **ingress_turn_context,
-            },
-        )
-        return {
-            "status": "accepted",
-            "key": key,
-            "session_key": key,
-            "session_id": session_id,
-            "task_id": handle.task_id,
-            "turn_id": turn_id,
-            "client_message_id": client_message_id,
-            "user_message_id": user_message_id,
-            "surface_id": surface_id,
-        }
-
-    raise AssertionError("unreachable: direct sends return before runtime dispatch")
-
-
-def _steer_v2_failure(
-    *,
-    key: str,
-    expected_turn_id: str,
-    failure_code: str,
-    capability: dict[str, Any] | None = None,
-    active_turn_id: str | None = None,
-) -> dict[str, Any]:
-    _emit_steer_metric(
-        "rejected",
-        session_key=key,
-        failure_code=failure_code,
-    )
-    payload: dict[str, Any] = {
-        "status": "not_accepted",
-        "accepted": False,
-        "key": key,
-        "session_key": key,
-        "expected_turn_id": expected_turn_id,
-        "failure_code": failure_code,
-        "retryable": False,
-        "fallback_safe": True,
-    }
-    if active_turn_id:
-        payload["active_turn_id"] = active_turn_id
-    if capability is not None:
-        payload["steer_capability"] = capability
-    return payload
-
-
-async def _steer_v2_response(
-    acceptance: TurnAcceptanceResult,
-    *,
-    client_request_id: str,
-    client_message_id: str,
-    surface_id: str,
+async def _pending_input_current_session_id(
     storage: SessionStorage,
-) -> dict[str, Any]:
-    """Project one durable same-turn receipt, including its latest disposition."""
-
-    receipt = acceptance.receipt
-    context: dict[str, Any] = {}
-    try:
-        get_entry = getattr(storage, "get_canonical_transcript_entry", None)
-        if callable(get_entry):
-            entry = await get_entry(receipt.session_id, receipt.message_id)
-        else:
-            get_transcript = getattr(storage, "get_canonical_transcript", None)
-            if not callable(get_transcript):
-                get_transcript = storage.get_transcript
-            entries = await get_transcript(receipt.session_id)
-            entry = next(
-                (item for item in entries if item.message_id == receipt.message_id),
-                None,
-            )
-        if entry is not None and isinstance(entry.turn_context, dict):
-            context = dict(entry.turn_context)
-    except Exception:  # noqa: BLE001 - the durable receipt remains authoritative.
-        log.warning(
-            "sessions.steer_v2.disposition_read_failed",
-            session_key=receipt.accepted_session_key,
-            message_id=receipt.message_id,
-            exc_info=True,
-        )
-
-    target_turn_id = receipt.task_id
-    disposition = str(context.get("disposition") or "steering")
-    payload: dict[str, Any] = {
-        "status": "accepted",
-        "accepted": True,
-        "replayed": acceptance.replayed,
-        "key": receipt.accepted_session_key,
-        "session_key": receipt.accepted_session_key,
-        "session_id": receipt.session_id,
-        "task_id": target_turn_id,
-        "turn_id": target_turn_id,
-        "client_request_id": client_request_id,
-        "client_message_id": (
-            context.get("client_message_id") or client_message_id
-        ),
-        "user_message_id": receipt.message_id,
-        "surface_id": context.get("surface_id") or surface_id,
-        "disposition": disposition,
-        "revision": int(context.get("revision") or 1),
-        "fallback_safe": True,
-    }
-    if disposition == "promoted":
-        promoted_turn_id = context.get("promoted_turn_id") or context.get("turn_id")
-        if isinstance(promoted_turn_id, str) and promoted_turn_id:
-            payload["promoted_turn_id"] = promoted_turn_id
-    for field in (
-        "applied_iteration",
-        "model_call_id",
-        "promoted_from_turn_id",
-        "failure_code",
-        "retryable",
-        "recovery",
-    ):
-        value = context.get(field)
-        if value is not None:
-            payload[field] = value
-    return payload
+    session_key: str,
+) -> str | None:
+    session = await storage.get_session(session_key)
+    session_id = getattr(session, "session_id", None)
+    return session_id if isinstance(session_id, str) and session_id else None
 
 
-@_d.method("sessions.steer.v2", scope="operator.write")
-async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dict:
-    """Durably attach text to one explicitly named running turn."""
-
-    key = _require_key(params)
-    assert isinstance(params, dict)
-    raw_message = params.get("message")
-    if not isinstance(raw_message, str):
-        raise ValueError("params.message is required")
-    if not raw_message.strip():
-        raise ValueError("params.message must not be blank")
-    expected_turn_id = _optional_string_param(
-        params,
-        "expected_turn_id",
-        "expectedTurnId",
-    )
-    if expected_turn_id is None:
-        raise ValueError("params.expected_turn_id is required")
-    client_request_id = _optional_string_param(
-        params,
-        "client_request_id",
-        "clientRequestId",
-    )
-    if client_request_id is None:
-        raise ValueError("params.client_request_id is required")
-    client_message_id = _optional_string_param(
-        params,
-        "client_message_id",
-        "clientMessageId",
-    )
-    if client_message_id is None:
-        raise ValueError("params.client_message_id is required")
-    for field, value in (
-        ("expected_turn_id", expected_turn_id),
-        ("client_request_id", client_request_id),
-        ("client_message_id", client_message_id),
-    ):
-        if len(value) > 256:
-            raise ValueError(f"params.{field} must not exceed 256 characters")
-
-    unsupported = raw_message.lstrip().startswith(("/", "!"))
-    attachments = params.get("attachments")
-    if attachments not in (None, []):
-        unsupported = True
-    for field in (
-        "intent",
-        "model",
-        "model_id",
-        "workspaceId",
-        "workspace_id",
-        "collaborationMode",
-        "collaboration_mode",
-        "runMode",
-        "run_mode",
-    ):
-        if params.get(field) is not None:
-            unsupported = True
-            break
-    if unsupported:
-        return _steer_v2_failure(
-            key=key,
-            expected_turn_id=expected_turn_id,
-            failure_code="STEER_UNSUPPORTED_INPUT",
-            capability={
-                "mode": "queue_only",
-                "expected_turn_id": expected_turn_id,
-                "input_kinds": ["text"],
-                "reason": "text_only",
-            },
-        )
-
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-    storage_candidate = get_session_storage(ctx.session_manager)
-    if storage_candidate is None:
-        raise KeyError("No session storage available")
-    storage = cast(SessionStorage, storage_candidate)
-    session = await storage.get_session(key)
-    if session is None:
-        raise KeyError(f"Session not found: {key}")
-
-    task_runtime = getattr(ctx, "task_runtime", None)
-    admit_steer = getattr(task_runtime, "admit_steer", None)
-    if not callable(admit_steer):
-        return _steer_v2_failure(
-            key=key,
-            expected_turn_id=expected_turn_id,
-            failure_code="STEER_V2_UNAVAILABLE",
-            capability={
-                "mode": "disabled",
-                "expected_turn_id": expected_turn_id,
-                "input_kinds": [],
-                "reason": "gateway_upgrade_required",
-            },
-        )
-
-    source_hint = _normalize_session_send_source_hint(params)
-    normalized = normalize_incoming_text(
-        raw_message,
-        source_hint=source_hint,
-        attachments=[],
-    )
-    if normalized.generated_attachments:
-        return _steer_v2_failure(
-            key=key,
-            expected_turn_id=expected_turn_id,
-            failure_code="STEER_UNSUPPORTED_INPUT",
-            capability={
-                "mode": "queue_only",
-                "expected_turn_id": expected_turn_id,
-                "input_kinds": ["text"],
-                "reason": "generated_attachment",
-            },
-        )
-    message_text = normalized.message_text
-    semantic_message = normalized.semantic_message
-    default_surface_id = str(
-        source_hint.get("channel_id")
-        or (
-            f"{source_hint.get('caller_kind', 'rpc')}:"
-            f"{source_hint.get('channel_kind', 'rpc')}"
-        )
-    )
-    surface_id = (
-        _optional_string_param(params, "surface_id", "surfaceId")
-        or default_surface_id
-    )
-    source_scope = f"{_turn_source_scope(source_hint, ctx)}:steer.v2"[:256]
-    ingress_identity = request_identity(
-        params,
-        request_session_key=key,
-        source_scope=source_scope,
-        fingerprint_params={
-            "message": raw_message,
-            "intent": "steer.v2",
-            "queueMode": {
-                "expected_turn_id": expected_turn_id,
-                "client_message_id": client_message_id,
-                "surface_id": surface_id,
-            },
-        },
-    )
-    log.info(
-        "sessions.steer_v2.requested",
-        session_key=key,
-        expected_turn_id=expected_turn_id,
-    )
-    _emit_steer_metric("requested", session_key=key)
-
-    get_ingress_receipt = getattr(storage, "get_turn_ingress_receipt", None)
-    if callable(get_ingress_receipt):
-        previous = await get_ingress_receipt(
-            source_scope=ingress_identity.source_scope,
-            request_session_key=ingress_identity.request_session_key,
-            client_request_id=ingress_identity.client_request_id,
-        )
-        if previous is not None:
-            if (
-                previous.receipt.request_fingerprint
-                != ingress_identity.request_fingerprint
-            ):
-                raise RpcHandlerError(
-                    "IDEMPOTENCY_CONFLICT",
-                    "client_request_id was already used for a different steer",
-                    retryable=False,
-                    accepted=False,
-                )
-            log.info(
-                "sessions.steer_v2.replayed",
-                session_key=key,
-                expected_turn_id=expected_turn_id,
-            )
-            _emit_steer_metric("replayed", session_key=key)
-            return await _steer_v2_response(
-                previous,
-                client_request_id=ingress_identity.client_request_id,
-                client_message_id=client_message_id,
-                surface_id=surface_id,
-                storage=storage,
-            )
-
-    prepare_message = getattr(ctx.session_manager, "prepare_message", None)
-    accept_turn = getattr(storage, "accept_turn", None)
-    if not callable(prepare_message) or not callable(accept_turn):
-        raise RpcUnavailableError(
-            "Same-turn steer requires durable atomic session storage"
-        )
-    turn_context = {
-        "turn_id": expected_turn_id,
-        "target_turn_id": expected_turn_id,
-        "client_request_id": ingress_identity.client_request_id,
-        "client_message_id": client_message_id,
-        "surface_id": surface_id,
-        "intent": "steer",
-        "disposition": "steering",
-        "revision": 1,
-    }
-    prepared_entry, expected_epoch = await prepare_message(
-        key,
-        role="user",
-        content=message_text,
-        turn_context=turn_context,
-        session_node=session,
-    )
-    if isinstance(prepared_entry.content, str):
-        message_text = prepared_entry.content
-
-    async def _persist(active_turn_id: str) -> TurnAcceptanceResult:
-        if active_turn_id != expected_turn_id:
-            raise RuntimeError("steer admission changed the expected turn")
-        return cast(
-            TurnAcceptanceResult,
-            await accept_turn(
-                prepared_entry,
-                expected_epoch=expected_epoch,
-                updated_at=int(time.time() * 1000),
-                task_record=None,
-                receipt_task_id=active_turn_id,
-                source_scope=ingress_identity.source_scope,
-                request_session_key=ingress_identity.request_session_key,
-                client_request_id=ingress_identity.client_request_id,
-                request_fingerprint=ingress_identity.request_fingerprint,
-            ),
-        )
-
-    try:
-        admission = await complete_durable_ingress(
-            admit_steer(
-                key,
-                expected_turn_id,
-                message_text,
-                persist=_persist,
-                semantic_message=semantic_message,
-                client_request_id=ingress_identity.client_request_id,
-                client_message_id=client_message_id,
-                surface_id=surface_id,
-            )
-        )
-    except StorageBusyError as exc:
-        raise RpcHandlerError(
-            "STORAGE_BUSY",
-            "Session storage is temporarily busy. Retry with the same client_request_id.",
-            details={
-                "operation": exc.operation,
-                "waited_ms": exc.waited_ms,
-                "fallback_safe": False,
-            },
-            retryable=True,
-            retry_after_ms=exc.retry_after_ms,
-            accepted=False,
-        ) from exc
-    except StaleEpochError as exc:
-        raise RpcHandlerError(
-            "SESSION_CHANGED",
-            "The session changed while the steer was being accepted.",
-            details={"fallback_safe": True},
-            retryable=True,
-            accepted=False,
-        ) from exc
-    except TurnIngressConflictError as exc:
-        raise RpcHandlerError(
-            "IDEMPOTENCY_CONFLICT",
-            str(exc),
-            details={"fallback_safe": False},
-            retryable=False,
-            accepted=False,
-        ) from exc
-
-    if not admission.accepted:
-        # A concurrent duplicate may have committed before this admission
-        # observed terminal closure. Re-read the receipt before reporting a
-        # fallback-safe rejection.
-        if callable(get_ingress_receipt):
-            previous = await get_ingress_receipt(
-                source_scope=ingress_identity.source_scope,
-                request_session_key=ingress_identity.request_session_key,
-                client_request_id=ingress_identity.client_request_id,
-            )
-            if previous is not None:
-                return await _steer_v2_response(
-                    previous,
-                    client_request_id=ingress_identity.client_request_id,
-                    client_message_id=client_message_id,
-                    surface_id=surface_id,
-                    storage=storage,
-                )
-        log.info(
-            "sessions.steer_v2.not_accepted",
-            session_key=key,
-            expected_turn_id=expected_turn_id,
-            failure_code=admission.failure_code,
-        )
-        return _steer_v2_failure(
-            key=key,
-            expected_turn_id=expected_turn_id,
-            failure_code=admission.failure_code or "ACTIVE_TURN_NOT_STEERABLE",
-            capability=admission.capability,
-            active_turn_id=admission.task_id,
-        )
-
-    acceptance = cast(TurnAcceptanceResult, admission.persisted)
-    if not acceptance.replayed:
-        notify_message_appended = getattr(
-            ctx.session_manager,
-            "notify_message_appended",
-            None,
-        )
-        if callable(notify_message_appended):
-            notify_message_appended(prepared_entry)
-        event_payload = {
-            "key": key,
-            "session_key": key,
-            "task_id": expected_turn_id,
-            "turn_id": expected_turn_id,
-            "target_turn_id": expected_turn_id,
-            "client_request_id": ingress_identity.client_request_id,
-            "client_message_id": client_message_id,
-            "user_message_id": acceptance.receipt.message_id,
-            "surface_id": surface_id,
-            "intent": "steer",
-            "disposition": "steering",
-            "revision": 1,
-        }
+def _cleanup_pending_input_scopes(
+    *,
+    ctx: RpcContext,
+    pending_input_id: str,
+    session_ids: set[str],
+) -> None:
+    media_root = media_root_from_config(ctx.config)
+    for session_id in session_ids:
         try:
-            await _emit_to_subscribers(
-                ctx,
-                key,
-                "session.event.steer",
-                event_payload,
+            cleanup_pending_chat_input_material(
+                media_root=media_root,
+                session_id=session_id,
+                pending_input_id=pending_input_id,
             )
-            await _emit_to_subscribers(
-                ctx,
-                key,
-                "session.event.input_disposition",
-                event_payload,
-            )
-        except Exception:  # noqa: BLE001 - durable acceptance is authoritative.
+        except OSError:
+            # The durable row lifecycle is authoritative. A filesystem cleanup
+            # failure is retried by session deletion and must not turn a
+            # committed cancel/dispatch into a misleading RPC failure.
             log.warning(
-                "sessions.steer_v2.accepted_event_emit_failed",
-                session_key=key,
-                message_id=acceptance.receipt.message_id,
-                exc_info=True,
+                "pending_inputs.material_cleanup_failed",
+                pending_input_id=pending_input_id,
+                session_id=session_id,
             )
-    log.info(
-        "sessions.steer_v2.accepted",
-        session_key=key,
-        expected_turn_id=expected_turn_id,
-        replayed=acceptance.replayed,
-    )
-    _emit_steer_metric("accepted", session_key=key)
-    return await _steer_v2_response(
-        acceptance,
-        client_request_id=ingress_identity.client_request_id,
-        client_message_id=client_message_id,
-        surface_id=surface_id,
-        storage=storage,
-    )
 
 
-@_d.method("sessions.steer", scope="operator.write")
-async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
-    """Inject text into the active turn, with a durable follow-up fallback."""
+def _material_ids_in_transcript_content(content: Any) -> set[str]:
+    if not isinstance(content, str):
+        return set()
+    try:
+        root = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    found: set[str] = set()
+    stack = [root]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            material_id = value.get("sha256_ref")
+            if isinstance(material_id, str) and len(material_id) == 64:
+                found.add(material_id.lower())
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return found
 
-    key = _require_key(params)
-    log.info(
-        "sessions.steer.legacy_used",
-        session_key=key,
-        deprecated=True,
-        replacement="sessions.steer.v2",
-    )
-    _emit_steer_metric("legacy_requested", session_key=key)
-    if not isinstance(params, dict) or not isinstance(params.get("message"), str):
-        raise ValueError("params.message is required")
-    raw_message = params["message"]
-    if not raw_message.strip():
-        raise ValueError("params.message must not be blank")
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
-    session = await storage.get_session(key)
-    if session is None:
-        raise KeyError(f"Session not found: {key}")
 
-    task_runtime = getattr(ctx, "task_runtime", None)
-    active_task_id = getattr(task_runtime, "active_task_id", None)
-    steer = getattr(task_runtime, "steer", None)
-    if not callable(active_task_id) or not callable(steer):
-        return {"status": "unavailable", "accepted": False, "key": key}
-    current_turn_id = await active_task_id(key)
-    if not current_turn_id:
-        return {"status": "idle", "accepted": False, "key": key}
+async def _cleanup_unreferenced_pending_promotions(
+    *,
+    ctx: RpcContext,
+    storage: SessionStorage,
+    session_key: str,
+    pending_input_id: str,
+    source_session_ids: set[str],
+) -> None:
+    """Delete failed-dispatch canonical copies only when no durable owner remains."""
 
-    source_hint = _normalize_session_send_source_hint(params)
-    normalized = normalize_incoming_text(raw_message, source_hint=source_hint, attachments=[])
-    if normalized.generated_attachments:
-        raise ValueError("Steering does not support generated attachments")
-    message_text = normalized.message_text
-    semantic_message = normalized.semantic_message
-    client_message_id = (
-        _optional_string_param(params, "client_message_id", "clientMessageId") or uuid.uuid4().hex
-    )
-    surface_id = _optional_string_param(params, "surface_id", "surfaceId") or str(
-        source_hint.get("channel_id") or f"web:{ctx.conn_id}"
-    )
+    media_root = media_root_from_config(ctx.config)
+    promotions: dict[str, set[str]] = {}
+    for source_session_id in source_session_ids:
+        for target_session_id, material_ids in read_pending_chat_input_promotions(
+            media_root=media_root,
+            source_session_id=source_session_id,
+            pending_input_id=pending_input_id,
+        ).items():
+            promotions.setdefault(target_session_id, set()).update(material_ids)
+    if not promotions:
+        return
 
-    persisted_entry: Any = None
+    current_session = await storage.get_session(session_key)
+    current_session_id = getattr(current_session, "session_id", None)
+    if not isinstance(current_session_id, str) or not current_session_id:
+        return
 
-    async def _persist() -> None:
-        nonlocal persisted_entry, message_text
-        from opensquilla.session.turn_context import turn_context_scope
+    # Another staged input with the same content is a live reference even if
+    # its canonical promotion has not yet been accepted.
+    other_pending_ids: set[str] = set()
+    try:
+        for pending in await storage.list_pending_chat_inputs(session_key):
+            if pending.pending_input_id == pending_input_id:
+                continue
+            for attachment in pending.payload.get("attachments") or []:
+                if not isinstance(attachment, dict):
+                    continue
+                material_id = attachment.get("sha256") or attachment.get("material_id")
+                if isinstance(material_id, str) and len(material_id) == 64:
+                    other_pending_ids.add(material_id.lower())
+    except Exception:  # noqa: BLE001 - cleanup must fail closed.
+        return
 
-        with turn_context_scope(
-            {
-                "turn_id": current_turn_id,
-                "client_message_id": client_message_id,
-                "surface_id": surface_id,
-                "intent": "steer",
-                "disposition": "steering",
-                "target_turn_id": current_turn_id,
-                "revision": 1,
-            }
-        ):
-            persisted_entry = await ctx.session_manager.append_message(
-                key,
-                role="user",
-                content=message_text,
+    for target_session_id, material_ids in promotions.items():
+        if target_session_id != current_session_id:
+            # A reset archive or child session can still reference a retired
+            # generation outside the active SQLite transcript. Without a
+            # complete reference proof, preserve its canonical material.
+            continue
+        try:
+            transcript = await storage.get_canonical_transcript(target_session_id)
+        except Exception:  # noqa: BLE001 - never delete without a reference proof.
+            continue
+        transcript_ids: set[str] = set()
+        for entry in transcript:
+            transcript_ids.update(_material_ids_in_transcript_content(entry.content))
+        for material_id in material_ids - transcript_ids - other_pending_ids:
+            path = native_io_path(
+                transcript_material_path(media_root, target_session_id, material_id)
             )
-        if persisted_entry is not None and isinstance(persisted_entry.content, str):
-            message_text = persisted_entry.content
-
-    persist_lock = get_session_lock(ctx.turn_runner, key)
-    if persist_lock is None:
-        await _persist()
-    else:
-        async with persist_lock:
-            await _persist()
-    user_message_id = getattr(persisted_entry, "message_id", None)
-
-    accepted_turn_id = await steer(
-        key,
-        message_text,
-        semantic_message=semantic_message,
-        persisted_user_message_id=user_message_id,
-        client_message_id=client_message_id,
-        surface_id=surface_id,
-    )
-    if not accepted_turn_id:
-        # The turn crossed its terminal boundary between the optimistic active
-        # check and the append. Roll back so the caller can honestly queue the
-        # text through sessions.send without leaving a duplicate transcript row.
-        remove_message = getattr(ctx.session_manager, "remove_message", None)
-        removed = False
-        rollback_error: str | None = None
-        if user_message_id and callable(remove_message):
             try:
-                removed = bool(await remove_message(key, user_message_id))
-            except Exception as exc:  # noqa: BLE001 - classify dirty rollback
-                rollback_error = str(exc)
-        if removed:
-            return {
-                "status": "idle",
-                "accepted": False,
-                "key": key,
-            }
-
-        # The durable row still exists.  Returning the ordinary idle response
-        # would make TUI enqueue the same text through sessions.send and create
-        # a duplicate.  Mark the orphan explicitly, emit the causal failure,
-        # and fail closed with the same dirty-rollback semantics used by
-        # sessions.send's QUEUE_FULL_DIRTY path.
-        rejected_context = {
-            "turn_id": current_turn_id,
-            "client_message_id": client_message_id,
-            "surface_id": surface_id,
-            "intent": "steer",
-            "disposition": "rejected",
-            "target_turn_id": current_turn_id,
-            "revision": 2,
-        }
-        update_turn_context = getattr(
-            ctx.session_manager,
-            "update_message_turn_context",
-            None,
-        )
-        if user_message_id and callable(update_turn_context):
-            try:
-                updated = bool(
-                    await update_turn_context(
-                        key,
-                        user_message_id,
-                        rejected_context,
-                    )
-                )
-                if not updated:
-                    log.warning(
-                        "sessions.steer.dirty_context_update_missed",
-                        session_key=key,
-                        message_id=user_message_id,
-                    )
-            except Exception:  # noqa: BLE001 - RPC error below remains authoritative
+                path.unlink(missing_ok=True)
+            except OSError:
                 log.warning(
-                    "sessions.steer.dirty_context_update_failed",
-                    session_key=key,
-                    message_id=user_message_id,
-                    exc_info=True,
+                    "pending_inputs.promotion_cleanup_failed",
+                    pending_input_id=pending_input_id,
+                    session_id=target_session_id,
+                    material_id=material_id,
                 )
-        try:
-            await _emit_to_subscribers(
-                ctx,
-                key,
-                "session.event.input_disposition",
-                {
-                    "session_key": key,
-                    "user_message_id": user_message_id,
-                    **rejected_context,
-                    "failure_code": "STEER_RACE_DIRTY",
-                    "retryable": False,
-                    "fallback_safe": False,
-                },
-            )
-        except Exception:  # noqa: BLE001 - explicit RPC error still reaches caller
-            log.warning(
-                "sessions.steer.dirty_disposition_emit_failed",
-                session_key=key,
-                message_id=user_message_id,
-                exc_info=True,
-            )
-        log.warning(
-            "sessions.steer.rollback_failed",
-            session_key=key,
-            message_id=user_message_id,
-            error=rollback_error,
-        )
-        raise RpcHandlerError(
-            "STEER_RACE_DIRTY",
-            (
-                "The active turn ended and the just-appended steer input could "
-                "not be rolled back. The transcript contains a rejected orphan; "
-                "automatic queue fallback is disabled to prevent duplication."
-            ),
-            details={
-                "session_key": key,
-                "orphan_message_id": user_message_id,
-                "target_turn_id": current_turn_id,
-                "fallback_safe": False,
-                "remediation": "dedup by orphan_message_id before resending",
-            },
-            retryable=False,
-        )
 
-    accepted_context = {
-        "turn_id": accepted_turn_id,
-        "client_message_id": client_message_id,
-        "surface_id": surface_id,
-        "intent": "steer",
-        # Acceptance reserves the input for the next safe boundary.  The task
-        # runtime advances this to ``applied`` only after a provider call starts,
-        # or to ``promoted``/``rejected`` if the turn ends first.
-        "disposition": "steering",
-        "target_turn_id": accepted_turn_id,
-        "revision": 1,
-    }
-    update_turn_context = getattr(
-        ctx.session_manager,
-        "update_message_turn_context",
-        None,
-    )
-    if user_message_id and callable(update_turn_context):
-        try:
-            await update_turn_context(key, user_message_id, accepted_context)
-        except Exception:  # noqa: BLE001 - steer is already accepted in runtime
-            log.warning(
-                "sessions.steer.context_update_failed",
-                session_key=key,
-                message_id=user_message_id,
-                exc_info=True,
-            )
 
-    try:
-        await _emit_to_subscribers(
-            ctx,
-            key,
-            "session.event.steer",
-            {
-                "session_key": key,
-                "turn_id": accepted_turn_id,
-                "client_message_id": client_message_id,
-                "user_message_id": user_message_id,
-                "surface_id": surface_id,
-                "disposition": "next_safe_boundary",
-            },
-        )
-        await _emit_to_subscribers(
-            ctx,
-            key,
-            "session.event.input_disposition",
-            {
-                "session_key": key,
-                "user_message_id": user_message_id,
-                **accepted_context,
-            },
-        )
-    except Exception:  # noqa: BLE001 - runtime acceptance is authoritative
-        log.warning(
-            "sessions.steer.accepted_event_emit_failed",
-            session_key=key,
-            message_id=user_message_id,
-            exc_info=True,
-        )
-    return {
-        "status": "accepted",
-        "accepted": True,
-        "key": key,
-        "turn_id": accepted_turn_id,
-        "client_message_id": client_message_id,
-        "user_message_id": user_message_id,
-        "surface_id": surface_id,
-        "disposition": "next_safe_boundary",
-    }
+async def _prepare_session_event_payload(
+    ctx: RpcContext,
+    session_key: str,
+    event_name: str,
+    payload: dict,
+) -> dict:
+    return await prepare_session_event_payload(ctx, session_key, event_name, payload)
+
+
+async def _send_prepared_to_subscribers(
+    ctx: RpcContext,
+    session_key: str,
+    event_name: str,
+    send_payload: dict,
+) -> None:
+    await send_prepared_to_subscribers(ctx, session_key, event_name, send_payload)
 
 
 async def _emit_to_subscribers(
@@ -4488,215 +3308,239 @@ async def _emit_to_subscribers(
     event_name: str,
     payload: dict,
 ) -> None:
-    """Send an event to all connections subscribed to a session's messages."""
-    from opensquilla.gateway.websocket import get_registry
-
-    # Inject current epoch into session.event.* and sessions.changed
-    # payloads so the frontend _isStaleEpoch guard can filter pre-reset frames.
-    # Read from the in-process cache on SessionManager (populated by reset path) to
-    # avoid a DB SELECT on every high-frequency event such as text_delta.
-    if event_name.startswith("session.event.") or event_name == "sessions.changed":
-        session_manager = getattr(ctx, "session_manager", None)
-        cached_epoch = get_session_epoch(session_manager, session_key)
-        if cached_epoch is not None:
-            payload = {**payload, "epoch": cached_epoch}
-        else:
-            storage = get_session_storage(session_manager)
-            if storage is not None and hasattr(storage, "get_epoch"):
-                try:
-                    epoch = await storage.get_epoch(session_key)
-                    # Populate cache for subsequent emits.
-                    set_session_epoch(session_manager, session_key, epoch)
-                    payload = {**payload, "epoch": epoch}
-                except Exception:
-                    pass  # best-effort; never block event delivery
-
-    send_payload = _buffer_session_event(session_key, event_name, payload)
-
-    sub_mgr = getattr(ctx, "subscription_manager", None)
-    if sub_mgr is None:
-        return
-
-    registry = get_registry()
-    conn_ids = sub_mgr.get_message_subscribers(session_key)
-
-    # For session-level events, also include session subscribers
-    if event_name.startswith("sessions."):
-        conn_ids = conn_ids | sub_mgr.get_session_subscribers()
-
-    for conn_id in conn_ids:
-        conn = registry.get(conn_id)
-        if conn is not None:
-            try:
-                await conn.send_event(event_name, send_payload)
-            except Exception:
-                log.warning("emit.send_failed", conn_id=conn_id, ws_event=event_name)
+    """Prepare, durably replay-buffer, then broadcast one session event."""
+    prepared = await _prepare_session_event_payload(
+        ctx,
+        session_key,
+        event_name,
+        payload,
+    )
+    send_payload = _buffer_session_event(session_key, event_name, prepared)
+    await _send_prepared_to_subscribers(
+        ctx,
+        session_key,
+        event_name,
+        send_payload,
+    )
 
 
-@_d.method("sessions.abort", scope="operator.write")
-async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
-    key = _require_key(params)
+class _GatewayCancellationPorts(CancellationPrimitives):
+    """Adapt individual cancellation primitives, never an entire RPC command."""
 
-    if ctx.session_manager is None:
-        return {"aborted": False, "key": key}
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
 
-    storage = get_session_storage(ctx.session_manager)
-    if storage:
-        session = await storage.get_session(key)
-        if session is None:
-            raise KeyError(f"Session not found: {key}")
+    @property
+    def session_available(self) -> bool:
+        return self._context.session_manager is not None
 
-    task_runtime = getattr(ctx, "task_runtime", None)
-    if task_runtime is not None:
-        from opensquilla.gateway.approval_queue import get_approval_queue
-        from opensquilla.gateway.subagent_announce import (
-            cancel_background_completion_for_session,
-        )
+    @property
+    def runtime_available(self) -> bool:
+        return self._context.task_runtime is not None
 
-        requested_task_id = _optional_string_param(params, "task_id", "taskId")
-        if requested_task_id is not None:
-            await cancel_background_completion_for_session(key)
-            get_approval_queue().resolve_pending_for_session(key, approved=False)
-            active_task_ids = await _active_task_runtime_ids(task_runtime, key)
-            if active_task_ids and requested_task_id not in active_task_ids:
-                return {"aborted": False, "key": key}
-            active_task_ids = (requested_task_id,)
-            cancelled_count = await _cancel_task_runtime(
-                task_runtime,
+    async def session_exists(self, key: str) -> bool:
+        storage = get_session_storage(self._context.session_manager)
+        return not storage or await storage.get_session(key) is not None
+
+    def cancel_compactions(self, key: str) -> tuple[asyncio.Task[object], ...]:
+        return cancel_active_compactions(key)
+
+    async def cancel_runtime(self, key: str, task_id: str | None, source: str) -> int:
+        try:
+            return await _cancel_task_runtime(
+                self._context.task_runtime,
                 session_key=key,
-                task_id=requested_task_id,
-                source=_cancel_source_from_params(params, "sessions_abort"),
+                task_id=task_id,
+                source=source,
                 reason="user_abort",
             )
-            if cancelled_count > 0:
-                await _drain_cancelled_task_runtime(
-                    task_runtime,
-                    session_key=key,
-                    task_ids=active_task_ids,
-                )
-            return {"aborted": cancelled_count > 0, "key": key}
+        except _TaskScopedCancelUnsupportedError as exc:
+            raise ExactCancellationUnavailableError from exc
 
-        cancel_source = _cancel_source_from_params(params, "sessions_abort")
-        approval_queue = get_approval_queue()
-        processed_keys: set[str] = set()
-        cancel_requested_task_ids: set[str] = set()
-        cancelled_tasks = 0
-        cancelled_session_keys: set[str] = set()
-        cancelled_groups = 0
-        resolved_approvals = 0
+    async def cancel_auxiliary(self, key: str, task_id: str, deadline: float) -> int:
+        return await _cancel_task_owned_auxiliary_work(
+            session_key=key,
+            task_id=task_id,
+            deadline_at_monotonic=deadline,
+            process_state_dir=getattr(self._context.config, "state_dir", None),
+        )
 
-        # Re-scan after each drained batch. A child may have committed a nested
-        # spawn immediately before receiving cancellation; the next pass picks
-        # that session up before the abort is considered complete.
-        for pass_index in range(_ABORT_TREE_STABILIZATION_PASSES):
-            tree_keys = await _session_tree_keys(ctx.session_manager, key)
-            new_keys = [
-                session_key for session_key in tree_keys if session_key not in processed_keys
-            ]
-            drains: list[tuple[str, tuple[str, ...]]] = []
-            cancelled_this_pass = 0
-            for session_key in tree_keys:
-                first_visit = session_key in new_keys
-                if first_visit:
-                    processed_keys.add(session_key)
-                    cancelled_groups += await cancel_background_completion_for_session(session_key)
-                active_task_ids = await _active_task_runtime_ids(task_runtime, session_key)
-                new_active_task_ids = tuple(
-                    task_id
-                    for task_id in active_task_ids
-                    if task_id not in cancel_requested_task_ids
-                )
-                if not first_visit and not new_active_task_ids:
-                    continue
-                cancelled_count = await _cancel_task_runtime(
-                    task_runtime,
-                    session_key=session_key,
-                    source=cancel_source,
-                    reason="user_abort",
-                )
-                cancelled_tasks += cancelled_count
-                cancelled_this_pass += cancelled_count
-                resolved_approvals += approval_queue.resolve_pending_for_session(
-                    session_key,
-                    approved=False,
-                )
-                if cancelled_count > 0:
-                    cancel_requested_task_ids.update(new_active_task_ids)
-                    cancelled_session_keys.add(session_key)
-                    drains.append((session_key, new_active_task_ids))
+    async def cancel_descendants(
+        self,
+        key: str,
+        task_id: str,
+        source: str,
+        deadline: float,
+    ) -> int:
+        return await _cancel_task_owned_descendants(
+            self._context.task_runtime,
+            root_session_key=key,
+            root_task_id=task_id,
+            source=source,
+            reason="user_abort",
+            deadline_at_monotonic=deadline,
+            process_state_dir=getattr(self._context.config, "state_dir", None),
+        )
 
-            for session_key, active_task_ids in drains:
-                await _drain_cancelled_task_runtime(
-                    task_runtime,
-                    session_key=session_key,
-                    task_ids=active_task_ids,
-                )
-            if pass_index > 0 and not new_keys and cancelled_this_pass == 0:
-                break
-        else:
-            log.warning(
-                "sessions.abort.tree_stabilization_exhausted",
-                session_key=key,
-                passes=_ABORT_TREE_STABILIZATION_PASSES,
-            )
+    async def active_task_ids(self, key: str) -> tuple[str, ...]:
+        return await _active_task_runtime_ids(self._context.task_runtime, key)
 
-        aborted = any((cancelled_tasks, cancelled_groups, resolved_approvals))
-        if aborted:
+    async def session_tree(self, key: str) -> tuple[str, ...]:
+        return await _session_tree_keys(self._context.session_manager, key)
+
+    async def cancel_completion(self, key: str) -> int:
+        from opensquilla.gateway.subagent_announce import cancel_background_completion_for_session
+
+        return await cancel_background_completion_for_session(key)
+
+    async def cancel_processes(self, key: str) -> int:
+        from opensquilla.process_tree import cancel_persisted_processes_for_session
+
+        return await cancel_persisted_processes_for_session(
+            getattr(self._context.config, "state_dir", None),
+            key,
+        )
+
+    def reject_approvals(self, key: str) -> int:
+        from opensquilla.gateway.approval_queue import get_approval_queue
+
+        return get_approval_queue().resolve_pending_for_session(key, approved=False)
+
+    async def drain(self, key: str, task_ids: tuple[str, ...], deadline: float) -> None:
+        await _drain_cancelled_task_runtime(
+            self._context.task_runtime,
+            session_key=key,
+            task_ids=task_ids,
+            deadline_at_monotonic=deadline,
+        )
+
+    def cancel_legacy(self, key: str) -> tuple[bool, bool]:
+        registry = get_agent_task_registry()
+        task = registry.get(key)
+        cancelled = registry.cancel(key)
+        needs_terminal = bool(
+            cancelled
+            and task is not None
+            and not getattr(task, "_opensquilla_started", True)
+            and not getattr(task, "_opensquilla_terminal_emitted", False)
+        )
+        if needs_terminal:
+            setattr(task, "_opensquilla_terminal_emitted", True)
+        return cancelled, needs_terminal
+
+    async def publish_terminal(self, key: str, *, legacy: bool) -> None:
+        if legacy:
             await _emit_to_subscribers(
-                ctx,
+                self._context,
+                key,
+                "session.event.done",
+                {"reason": "aborted"},
+            )
+        else:
+            await _emit_to_subscribers(
+                self._context,
                 key,
                 "sessions.changed",
                 build_sessions_changed_payload(
                     key,
                     "task_terminal",
                     run_status="cancelled",
-                    last_task={
-                        "status": "cancelled",
-                        "terminal_reason": "user_abort",
-                    },
+                    last_task={"status": "cancelled", "terminal_reason": "user_abort"},
                 ),
             )
-        return {
-            "aborted": aborted,
-            "key": key,
-            "cancelled_tasks": cancelled_tasks,
-            "cancelled_sessions": len(cancelled_session_keys),
-        }
 
-    # Cancel running agent task via registry
-    registry = get_agent_task_registry()
-    task = registry.get(key)
-    cancelled = registry.cancel(key)
+    async def bounded[T](
+        self,
+        operation: Awaitable[T],
+        deadline: float,
+        label: str,
+        default: T,
+    ) -> T:
+        return cast(
+            T,
+            await _await_abort_operation(
+                operation,
+                deadline_at_monotonic=deadline,
+                operation=label,
+                default=default,
+            ),
+        )
 
-    if (
-        cancelled
-        and task is not None
-        and not getattr(task, "_opensquilla_started", True)
-        and not getattr(task, "_opensquilla_terminal_emitted", False)
-    ):
-        setattr(task, "_opensquilla_terminal_emitted", True)
-        await _emit_to_subscribers(ctx, key, "session.event.done", {"reason": "aborted"})
+    async def observe[T](
+        self,
+        task: asyncio.Task[T],
+        deadline: float,
+        label: str,
+        default: T,
+    ) -> T:
+        return cast(
+            T,
+            await _await_abort_background_task(
+                task,
+                deadline_at_monotonic=deadline,
+                operation=label,
+                default=default,
+            ),
+        )
 
-    return {"aborted": cancelled, "key": key}
 
-
-@_d.method("sessions.patch", scope="operator.admin")
-async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
-    key = _require_key(params)
-
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
+async def _apply_sessions_patch(
+    params: dict[str, Any],
+    ctx: RpcContext,
+    *,
+    key: str,
+    storage: Any,
+) -> dict[str, Any]:
+    """Validate and persist one patch while the caller holds its turn fence."""
 
     session = await storage.get_session(key)
     if session is None:
         raise KeyError(f"Session not found: {key}")
 
     update_values: dict[str, Any] = {}
-    assert isinstance(params, dict)
+    (
+        provider_present,
+        provider_override,
+        auth_profile_present,
+        auth_profile_override,
+    ) = _rpc_session_deployment_fields(params)
+    model_present = "model" in params
+    existing_provider_value = _model_value(getattr(session, "provider_override", None))
+    existing_provider = existing_provider_value.lower() if existing_provider_value else None
+    existing_model = _model_value(getattr(session, "model", None))
+    existing_auth_profile = _model_value(getattr(session, "auth_profile_override", None))
+    final_provider = provider_override if provider_present else existing_provider
+    final_auth_profile = auth_profile_override if auth_profile_present else existing_auth_profile
+    raw_model = params.get("model")
+    requested_model = _model_value(raw_model) if model_present else existing_model
+    final_model = requested_model if model_present else existing_model
+
+    provider_changed = bool(provider_present and provider_override != existing_provider)
+    auth_profile_changed = bool(
+        auth_profile_present and auth_profile_override != existing_auth_profile
+    )
+    if (provider_changed and provider_override) or (auth_profile_changed and auth_profile_override):
+        if not model_present or not isinstance(raw_model, str) or requested_model is None:
+            _raise_explicit_session_deployment_model_required()
+
+    if model_present and (
+        provider_present or auth_profile_present or existing_provider or existing_auth_profile
+    ):
+        if raw_model is not None and not isinstance(raw_model, str):
+            raise ValueError("params.model must be a string or null")
+    if (
+        provider_present
+        or auth_profile_present
+        or (model_present and (existing_provider or existing_auth_profile))
+    ):
+        _validate_rpc_session_deployment(
+            ctx,
+            session_key=key,
+            provider=final_provider,
+            model=final_model,
+            auth_profile=final_auth_profile,
+        )
+
     field_map = {
         "displayName": "display_name",
         "model": "model",
@@ -4708,6 +3552,27 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
         if field in params and hasattr(session, attr):
             update_values[attr] = params[field]
             updated_fields.append(field)
+    if model_present and (
+        provider_present or auth_profile_present or existing_provider or existing_auth_profile
+    ):
+        update_values["model"] = final_model
+    if provider_present:
+        update_values["provider_override"] = provider_override
+        updated_fields.append("provider")
+    if auth_profile_present:
+        update_values["auth_profile_override"] = auth_profile_override
+        update_values["auth_profile_override_source"] = "rpc" if auth_profile_override else None
+        updated_fields.append("authProfile")
+
+    model_changed = bool(model_present and final_model != existing_model)
+    deployment_binding_changed = bool(provider_changed or auth_profile_changed or model_changed)
+    if deployment_binding_changed:
+        # Physical provenance describes the deployment that already executed.
+        # Once an operator changes the future session binding it is no longer a
+        # valid pair for compaction target/consumer resolution, so clear rather
+        # than forge it as the newly requested deployment.
+        update_values["model_provider"] = None
+        update_values["model_override"] = None
 
     if update_values:
         update = getattr(ctx.session_manager, "update", None)
@@ -4723,24 +3588,22 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
     return {"key": key, "updated": updated_fields}
 
 
-@_d.method("sessions.reset", scope="operator.write")
-async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Synchronous session reset with FlushReceipt.
+_SESSION_DEPLOYMENT_PATCH_FIELDS = frozenset(
+    {
+        "model",
+        "provider",
+        "providerOverride",
+        "provider_override",
+        "authProfile",
+        "authProfileOverride",
+        "auth_profile",
+        "auth_profile_override",
+    }
+)
 
-    Sequence when ``ctx.flush_service`` is wired:
-    1. Drain any in-flight turn task so the per-session lock is free.
-    2. Acquire the per-session lock for the whole snapshot → flush → rotate
-       window (prevents a late turn write after flush).
-    3. Snapshot the transcript, execute the flush, then rotate via
-       ``apply_intent(RESET_SAME_KEY)``.
 
-    When ``ctx.flush_service`` is None (kill-switch path), falls back to
-    PR2-pre behavior: no flush, no ``flush_receipt`` field in the response.
-    """
-    from opensquilla.gateway.rpc import RpcHandlerError
-    from opensquilla.memory.session_flush import FlushReceipt
-    from opensquilla.session.models import SessionIntent
-
+@_d.method("sessions.patch", scope="operator.admin")
+async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
 
     if ctx.session_manager is None:
@@ -4750,336 +3613,44 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
     if storage is None:
         raise KeyError("No session storage available")
 
-    task_runtime = getattr(ctx, "task_runtime", None)
-    # Drain MUST run before any branch that clears session state — including the
-    # flush_service=None (kill-switch) path.  Skipping drain here would let a
-    # still-running turn write its final message into the transcript *after*
-    # apply_intent has rotated the session_id, producing an orphaned transcript
-    # entry that is never flushed and never visible to the new session.
-    # force=True does not bypass this: the operator wants a clean slate, not a
-    # corrupted one.  drain() is idempotent when no task is running.
-    if task_runtime is not None:
-        await _drain_task_runtime_for_reset(task_runtime, key)
-
-    force = bool((params or {}).get("force", False))
-
-    registry = get_agent_task_registry()
-    active = registry.get(key)
-    if active is not None and not active.done():
-        registry.cancel(key)
-        try:
-            await asyncio.wait_for(active, timeout=2.0)
-        except TimeoutError:
-            log.warning("sessions.reset.drain_timeout", session_key=key)
-        except asyncio.CancelledError:
-            log.debug("sessions.reset.drain_cancelled", session_key=key)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("sessions.reset.drain_failed", session_key=key, error=str(exc))
-
-    turn_runner = ctx.turn_runner
-    lock = get_session_lock(turn_runner, key)
-
-    async def _run_locked() -> dict[str, Any]:
-        session = await storage.get_session(key)
-        if session is None:
-            raise KeyError(f"Session not found: {key}")
-        previous_session_id = session.session_id
-        previous_epoch = int(getattr(session, "epoch", 0) or 0)
-        agent_id = normalize_agent_id(getattr(session, "agent_id", None) or "main")
-
-        transcript = await ctx.session_manager.get_transcript(key)
-        reset_flush_enabled = flush_trigger_enabled(ctx.config, "session_reset")
-
-        if not reset_flush_enabled:
-            updated, rotated = await ctx.session_manager.apply_intent(
-                key,
-                SessionIntent.RESET_SAME_KEY,
-            )
-            new_epoch = await _ensure_and_emit_reset_epoch(
-                ctx, storage, key, previous_epoch=previous_epoch
-            )
-            return {
-                "key": key,
-                "reset": True,
-                "rotated": rotated,
-                "previous_session_id": previous_session_id,
-                "session_id": updated.session_id,
-                "epoch": new_epoch,
-            }
-
-        if ctx.flush_service is None:
-            # Fail-closed when flush is unavailable: refuse to clear a non-empty
-            # transcript without an explicit admin override or a covering
-            # checkpoint receipt. The whole read -> gate -> rotate window stays
-            # under the same per-session lock used by sends.
-            if transcript and not force:
-                checkpoint_safe = await _durable_receipt_allows_covered_destructive_compaction(
-                    storage,
-                    key,
-                    previous_session_id,
-                    transcript,
-                )
-                if not checkpoint_safe:
-                    raise RpcHandlerError(
-                        code="flush_unavailable",
-                        message=(
-                            "Reset aborted: flush service is unavailable and the "
-                            "transcript is non-empty. Re-run with force=true (admin) "
-                            "to discard without backup."
-                        ),
-                        details={
-                            "key": key,
-                            "session_id": previous_session_id,
-                            "reason": "flush_service_disabled",
-                            "message_count": len(transcript),
-                        },
-                    )
-            if transcript and force and "operator.admin" not in ctx.principal.scopes:
-                raise RpcHandlerError(
-                    code="permission_denied",
-                    message="force=true on sessions.reset requires operator.admin scope.",
-                    details={"key": key, "session_id": previous_session_id},
-                )
-
-            updated, rotated = await ctx.session_manager.apply_intent(
-                key,
-                SessionIntent.RESET_SAME_KEY,
-            )
-            new_epoch = await _ensure_and_emit_reset_epoch(
-                ctx, storage, key, previous_epoch=previous_epoch
-            )
-            return {
-                "key": key,
-                "reset": True,
-                "rotated": rotated,
-                "previous_session_id": previous_session_id,
-                "session_id": updated.session_id,
-                "epoch": new_epoch,
-            }
-
-        if not transcript:
-            updated, rotated = await ctx.session_manager.apply_intent(
-                key, SessionIntent.RESET_SAME_KEY
-            )
-            new_epoch = await _ensure_and_emit_reset_epoch(
-                ctx, storage, key, previous_epoch=previous_epoch
-            )
-            receipt = FlushReceipt(
-                mode="skipped",
-                flushed_paths=[],
-                slug=None,
-                message_count=0,
-                duration_ms=0,
-                raw_reason=None,
-                error=None,
-            )
-            return _reset_response(
-                key,
-                rotated,
-                previous_session_id,
-                updated.session_id,
-                receipt,
-                new_epoch,
-            )
-
-        try:
-            flush_turn_id, flush_correlation = _build_session_flush_correlation(
+    assert isinstance(params, dict)
+    deployment_patch = any(field in params for field in _SESSION_DEPLOYMENT_PATCH_FIELDS)
+    lock = get_session_lock(ctx.turn_runner, key) if deployment_patch else None
+    if lock is not None:
+        async with lock:
+            result = await _apply_sessions_patch(
+                params,
                 ctx,
-                previous_session_id,
+                key=key,
+                storage=storage,
             )
-            flush_kwargs: dict[str, Any] = {
-                "agent_id": agent_id,
-                "timeout": 30.0,
-                "message_window": 0,
-                "segment_mode": "auto",
-                "raw_capture_policy": "required",
-            }
-            if _accepts_keyword_arg(ctx.flush_service.execute, "turn_id"):
-                flush_kwargs["turn_id"] = flush_turn_id
-            if (
-                flush_correlation is not None
-                and _accepts_keyword_arg(
-                    ctx.flush_service.execute,
-                    "provider_request_correlation",
-                )
-            ):
-                flush_kwargs["provider_request_correlation"] = flush_correlation
-            receipt = await ctx.flush_service.execute(
-                transcript,
-                key,
-                **flush_kwargs,
-            )
-        except Exception as exc:  # noqa: BLE001 — both LLM and raw-dump failed
-            receipt = FlushReceipt(
-                mode="error",
-                flushed_paths=[],
-                slug=None,
-                message_count=len(transcript),
-                duration_ms=0,
-                raw_reason=None,
-                error=str(exc),
-                result_status="archive_failed",
-            )
-            raise RpcHandlerError(
-                code="flush_disk_error",
-                message=f"Reset aborted: flush failed ({receipt.error})",
-                details={
-                    "flush_receipt": receipt.to_dict(),
-                    "key": key,
-                    "session_id": previous_session_id,
-                },
-            ) from exc
-
-        durable_receipt_safe = await _durable_receipt_allows_covered_destructive_compaction(
-            storage,
-            key,
-            previous_session_id,
-            transcript,
-        )
-        memory_status = compaction_memory_status(
-            receipt,
-            deterministic_receipt_safe=durable_receipt_safe,
-            required=True,
-        )
-        if not memory_status.allows_destructive_compaction:
-            flush_status = flush_receipt_status_for_compaction(receipt, ctx.config)
-            raise RpcHandlerError(
-                code="flush_disk_error",
-                message=(
-                    f"Reset aborted: flush status {flush_status!r} is not sufficient "
-                    "for destructive reset."
-                ),
-                details={
-                    "flush_receipt": receipt.to_dict(),
-                    "key": key,
-                    "session_id": previous_session_id,
-                    "reason": "destructive_reset_requires_safe_flush",
-                    "flush_receipt_status": flush_status,
-                    "memory_safety_status": memory_status.safety_status,
-                    "semantic_memory_status": memory_status.semantic_status,
-                },
-            )
-
-        updated, rotated = await ctx.session_manager.apply_intent(key, SessionIntent.RESET_SAME_KEY)
-        new_epoch = await _ensure_and_emit_reset_epoch(
-            ctx, storage, key, previous_epoch=previous_epoch
-        )
-        return _reset_response(
-            key,
-            rotated,
-            previous_session_id,
-            updated.session_id,
-            receipt,
-            new_epoch,
-        )
-
-    async def _run_accounted() -> dict[str, Any]:
-        from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
-        from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
-
-        usage_scope = await build_session_usage_scope(
-            getattr(ctx, "usage_event_sink", None),
-            ctx.session_manager,
-            key,
-            run_kind="memory_flush",
-        )
-        with bind_usage_accounting_scope(usage_scope):
-            return await _run_locked()
-
-    if lock is None:
-        return await _run_accounted()
-    async with lock:
-        return await _run_accounted()
-
-
-async def _ensure_and_emit_reset_epoch(
-    ctx: RpcContext,
-    storage: Any,
-    session_key: str,
-    *,
-    previous_epoch: int,
-) -> int:
-    """Broadcast the manager's reset epoch, incrementing only as a fallback.
-
-    ``SessionManager._rotate_session_id`` normally increments before rotating
-    to fence stale writers. Older/test managers may not, and the manager keeps
-    reset best-effort if that increment fails, so this RPC performs one durable
-    increment only when the stored epoch did not advance.
-    """
-    increment_fn = getattr(storage, "increment_epoch", None)
-    if not callable(increment_fn):
-        return 0
-    new_epoch = previous_epoch
-    get_session = getattr(storage, "get_session", None)
-    if callable(get_session):
-        try:
-            current = await get_session(session_key)
-            new_epoch = int(getattr(current, "epoch", previous_epoch) or 0)
-        except Exception:
-            new_epoch = previous_epoch
-    try:
-        if new_epoch <= previous_epoch:
-            # Durable commit happens inside increment_epoch before it returns.
-            new_epoch = int(await increment_fn(session_key))
-    except Exception:
-        log.warning("sessions.reset.epoch_increment_failed", session_key=session_key)
-        return 0
-    # Invalidate / update the in-process epoch cache so subsequent _emit_to_subscribers
-    # calls read the new epoch without hitting the DB.
-    session_manager = getattr(ctx, "session_manager", None)
-    set_session_epoch(session_manager, session_key, new_epoch)
-    # Emit after the storage commit — failure here is non-fatal; epoch is already
-    # persisted and the client will re-sync on next reconnect.
-    try:
-        await _emit_to_subscribers(
+    else:
+        result = await _apply_sessions_patch(
+            params,
             ctx,
-            session_key,
-            "session.epoch_changed",
-            {"key": session_key, "epoch": new_epoch},
+            key=key,
+            storage=storage,
         )
-    except Exception:
-        log.warning(
-            "sessions.reset.epoch_emit_failed",
-            session_key=session_key,
-            new_epoch=new_epoch,
-        )
-    return new_epoch
+    if deployment_patch:
+        keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+        if keepalive_service is not None:
+            keepalive_service.refresh_required(key, "session_deployment_changed")
+    return result
 
 
-def _reset_response(
-    key: str,
-    rotated: bool,
-    previous_session_id: str,
-    session_id: str,
-    receipt: Any,
-    epoch: int = 0,
-) -> dict[str, Any]:
-    return {
-        "key": key,
-        "reset": True,
-        "rotated": rotated,
-        "previous_session_id": previous_session_id,
-        "session_id": session_id,
-        "epoch": epoch,
-        "flush_receipt": flush_receipt_to_dict(receipt),
-    }
+async def _handle_sessions_rename(params: dict | None, ctx: RpcContext) -> dict:
+    """Rename one session without exposing admin-only deployment fields."""
+
+    return await _session_lifecycle_adapter(ctx).rename(params)
 
 
-async def _settle_session_delete_despite_cancellation(awaitable: Any) -> Any:
-    """Finish one fenced delete before propagating caller cancellation."""
-
-    operation = asyncio.ensure_future(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            cancellation = cancellation or exc
-    if cancellation is not None:
-        with contextlib.suppress(BaseException):
-            operation.result()
-        raise cancellation
-    return operation.result()
+_handle_sessions_rename_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.rename",
+    _handle_sessions_rename,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _delete_session_with_lifecycle(
@@ -5094,39 +3665,38 @@ async def _delete_session_with_lifecycle(
     async with contextlib.AsyncExitStack() as fences:
         # Child completion can schedule a parent wake while the runtime task is
         # draining, so fence that path before cancelling the task driver.
-        await fences.enter_async_context(
-            quiesce_background_completion_sessions(session_keys)
-        )
+        await fences.enter_async_context(quiesce_background_completion_sessions(session_keys))
 
         task_runtime = getattr(ctx, "task_runtime", None)
         quiesce_runtime = getattr(task_runtime, "quiesce_sessions", None)
         if callable(quiesce_runtime):
             await fences.enter_async_context(quiesce_runtime(session_keys))
 
-        await fences.enter_async_context(
-            get_agent_task_registry().quiesce_sessions(session_keys)
-        )
+        await fences.enter_async_context(get_agent_task_registry().quiesce_sessions(session_keys))
 
         lock = get_session_lock(ctx.turn_runner, canonical_key)
         if lock is not None:
             await fences.enter_async_context(lock)
 
-        # These durable writers may outlive the task coroutine that scheduled
-        # them. Settle both before the row and its generation disappear.
         await drain_pending_flushes_for_sessions(session_keys)
-        drain_turn_writes = getattr(
-            ctx.turn_runner,
-            "drain_session_background_writes",
-            None,
-        )
-        if callable(drain_turn_writes):
-            await drain_turn_writes(session_keys)
 
         get_session = getattr(storage, "get_session", None)
         session = await get_session(canonical_key) if callable(get_session) else None
         session_id = getattr(session, "session_id", None)
         if not isinstance(session_id, str) or not session_id:
             session_id = None
+
+        # Pending owners can still live under a pre-reset session id while the
+        # stable session key points at a newer generation. Capture every owner
+        # before the DB cascade removes the rows, then reclaim only those
+        # private directories after the delete commits.
+        pending_material_owners: dict[str, set[str]] = {}
+        list_pending = getattr(storage, "list_pending_chat_inputs", None)
+        if callable(list_pending):
+            for pending in await list_pending(canonical_key):
+                scopes = _pending_input_attachment_scopes(pending)
+                if scopes:
+                    pending_material_owners[pending.pending_input_id] = scopes
 
         # Terminal task cleanup normally expires owned approvals. Repeat the
         # operation here so already-orphaned and claimed approvals also fail
@@ -5135,6 +3705,25 @@ async def _delete_session_with_lifecycle(
 
         get_approval_queue().expire_pending_for_session(canonical_key)
         await storage.delete_session(canonical_key)
+        hold_store = getattr(ctx.turn_runner, "router_control_hold_store", None)
+        forget_routing = getattr(hold_store, "forget_session", None)
+        if callable(forget_routing):
+            forget_routing(canonical_key)
+        get_session_streams().evict(canonical_key)
+        for pending_input_id, session_ids in pending_material_owners.items():
+            _cleanup_pending_input_scopes(
+                ctx=ctx,
+                pending_input_id=pending_input_id,
+                session_ids=session_ids,
+            )
+        keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+        if keepalive_service is not None:
+            await keepalive_service.invalidate(canonical_key)
+
+        goal_service = getattr(getattr(ctx, "task_runtime", None), "goal_service", None)
+        revoke_goal_lease = getattr(goal_service, "revoke_session", None)
+        if callable(revoke_goal_lease):
+            revoke_goal_lease(canonical_key)
 
         evict_runtime_state = getattr(
             ctx.session_manager,
@@ -5145,479 +3734,54 @@ async def _delete_session_with_lifecycle(
             evict_runtime_state(canonical_key, session_id=session_id)
 
 
-@_d.method("sessions.delete", scope="operator.write")
 async def _handle_sessions_delete(params: dict | None, ctx: RpcContext) -> dict:
     """Delete one or more sessions. Accepts {key} for single or {keys} for bulk."""
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
-
-    # Support both single key and bulk keys
-    keys: list[str] = []
-    if isinstance(params, dict):
-        if "keys" in params:
-            keys = params["keys"]
-        elif "key" in params:
-            keys = [params["key"]]
-
-    if not keys:
-        raise ValueError("params.key or params.keys is required")
-
-    deleted: list[str] = []
-    errors: list[str] = []
-    for k in keys:
-        try:
-            canonical_key = canonicalize_session_key(k)
-            await _settle_session_delete_despite_cancellation(
-                _delete_session_with_lifecycle(
-                    canonical_key=canonical_key,
-                    ctx=ctx,
-                    storage=storage,
-                )
-            )
-            deleted.append(k)
-        except Exception as exc:
-            errors.append(f"{k}: {exc}")
-
-    return {"deleted": deleted, "errors": errors}
+    return await _session_lifecycle_adapter(ctx).delete(params)
 
 
-@_d.method("sessions.contextCompact", scope="operator.write")
+_handle_sessions_delete_contract = register_session_lifecycle_contract(
+    _d,
+    "sessions.delete",
+    _handle_sessions_delete,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+def _session_maintenance_adapter(ctx: RpcContext) -> GatewaySessionMaintenanceAdapter:
+    return build_gateway_session_maintenance_adapter(ctx)
+
+
+def _session_reset_adapter(ctx: RpcContext) -> GatewaySessionResetAdapter:
+    return build_gateway_session_reset_adapter(ctx)
+
+
+async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    return await _session_reset_adapter(ctx).reset(params)
+
+
 async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext) -> dict:
-    key = _require_key(params)
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-
-    context_window_tokens = _context_window_tokens(params, ctx)
-    custom_instructions = (params or {}).get("instructions")
-    if custom_instructions is not None and not isinstance(custom_instructions, str):
-        raise RpcHandlerError(
-            code="INVALID_PARAMS",
-            message="instructions must be a string when provided.",
-            details={"field": "instructions"},
-        )
-    turn_runner = ctx.turn_runner
-    lock = get_session_lock(turn_runner, key)
-
-    async def _publish_manual_compaction_event(**payload: Any) -> None:
-        status = str(payload.get("status") or "")
-        reason = payload.get("reason") or payload.get("skip_reason")
-        event_payload = {
-            "source": "manual",
-            "phase": "manual",
-            "context_window_tokens": context_window_tokens,
-            **compaction_effect_payload(
-                status=status,
-                source="manual",
-                reason=str(reason) if reason is not None else None,
-                user_visible=True,
-            ),
-            **payload,
-        }
-        notify_compaction(key, notify_listeners=False, **event_payload)
-        await _emit_to_subscribers(
-            ctx,
-            key,
-            "session.event.compaction",
-            dict(event_payload),
-        )
-
-    async def _run_locked() -> dict[str, Any]:
-        receipt = None
-        flush_receipt_status: str | None = None
-        compaction_id = new_compaction_id()
-        storage = get_session_storage(ctx.session_manager)
-        session = None
-        if storage is not None:
-            session = await storage.get_session(key)
-            if session is None:
-                if _is_ephemeral_webchat_session_key(key):
-                    await _publish_manual_compaction_event(
-                        status="started",
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
-                        ),
-                    )
-                    await _publish_manual_compaction_event(
-                        status="skipped",
-                        reason="empty_ephemeral_webchat_session",
-                        **compaction_lifecycle_payload(
-                            compaction_id,
-                            COMPACTION_TRIGGERED_EVENT,
-                        ),
-                    )
-                    return {
-                        "key": key,
-                        "compacted": False,
-                        "status": "skipped",
-                        "reason": "empty_ephemeral_webchat_session",
-                        "skip_reason": "empty_ephemeral_webchat_session",
-                        "applied": False,
-                        "durability": "none",
-                        "user_visible": True,
-                        "mode": "summary",
-                        "summary_len": 0,
-                        "summary_source": "none",
-                        "context_window_tokens": context_window_tokens,
-                        "tokens_before": 0,
-                        "tokens_after": 0,
-                        "remaining_budget_tokens": context_window_tokens,
-                        "removed_count": 0,
-                        "kept_count": 0,
-                        "chunk_count": 0,
-                        "coverage_status": "unknown",
-                        "missing_obligation_count": 0,
-                        "critical_carry_forward_count": 0,
-                        "state_kind": "text",
-                    }
-                raise KeyError(f"Session not found: {key}")
-        elif hasattr(ctx.session_manager, "get_session"):
-            session = await ctx.session_manager.get_session(key)
-            if session is None:
-                raise KeyError(f"Session not found: {key}")
-        durable_session_id = getattr(session, "session_id", None)
-        compaction_correlation = (
-            ProviderRequestCorrelation(
-                session_id=durable_session_id,
-                turn_id=compaction_id,
-                execution_id=uuid.uuid4().hex,
-                call_kind="auxiliary.compaction",
-            )
-            if isinstance(durable_session_id, str)
-            and durable_session_id
-            and not provider_request_correlation_disabled(config=ctx.config)
-            else None
-        )
-        flush_correlation = derive_provider_request_correlation(
-            compaction_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.session_flush",
-        )
-        await _publish_manual_compaction_event(
-            status="started",
-            **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-        )
-        transcript = []
-        flush_enabled = flush_trigger_enabled(ctx.config, "manual")
-        try:
-            if flush_enabled:
-                get_transcript = getattr(ctx.session_manager, "get_transcript", None)
-                if not callable(get_transcript):
-                    log.warning(
-                        "sessions.context_compact.flush_skipped",
-                        key=key,
-                        reason="transcript_reader_unavailable",
-                    )
-                    flush_enabled = False
-                else:
-                    transcript = await get_transcript(key)
-
-            if flush_enabled and transcript:
-                if ctx.flush_service is None:
-                    log.warning(
-                        "sessions.context_compact.flush_skipped",
-                        key=key,
-                        reason="flush_service_unavailable",
-                    )
-                    flush_receipt_status = flush_receipt_status_for_compaction(
-                        None,
-                        ctx.config,
-                    )
-                else:
-                    agent_id = normalize_agent_id(getattr(session, "agent_id", None) or "main")
-                    memory_cfg = getattr(getattr(ctx, "config", None), "memory", None)
-                    raw_timeout = getattr(
-                        memory_cfg,
-                        "flush_background_timeout_seconds",
-                        120.0,
-                    )
-                    try:
-                        flush_timeout = max(float(raw_timeout), 0.0)
-                    except (TypeError, ValueError):
-                        flush_timeout = 120.0
-                    try:
-                        flush_kwargs: dict[str, Any] = {
-                            "agent_id": agent_id,
-                            "timeout": flush_timeout,
-                            "message_window": 0,
-                            "segment_mode": "auto",
-                            "raw_capture_policy": "required",
-                            "turn_id": compaction_id,
-                        }
-                        if (
-                            flush_correlation is not None
-                            and _accepts_keyword_arg(
-                                ctx.flush_service.execute,
-                                "provider_request_correlation",
-                            )
-                        ):
-                            flush_kwargs["provider_request_correlation"] = (
-                                flush_correlation
-                            )
-                        receipt = await ctx.flush_service.execute(
-                            transcript,
-                            key,
-                            **flush_kwargs,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning(
-                            "sessions.context_compact.flush_failed",
-                            key=key,
-                            error=str(exc),
-                        )
-                        flush_receipt_status = flush_receipt_status_for_compaction(
-                            None,
-                            ctx.config,
-                        )
-                    else:
-                        flush_receipt_status = flush_receipt_status_for_compaction(
-                            receipt,
-                            ctx.config,
-                        )
-                        if not flush_receipt_is_successful_flush(receipt):
-                            log.warning(
-                                "sessions.context_compact.flush_degraded",
-                                key=key,
-                                flush_receipt_status=flush_receipt_status,
-                                flush_receipt=flush_receipt_to_dict(receipt),
-                            )
-                        else:
-                            log.info(
-                                "sessions.context_compact.flush_done",
-                                key=key,
-                                flush_receipt_status=flush_receipt_status,
-                                flush_receipt=flush_receipt_to_dict(receipt),
-                            )
-
-            if (
-                flush_enabled
-                and transcript
-                and pre_compaction_flush_requires_safe_receipt(ctx.config)
-            ):
-                durable_receipt_safe = False
-                if storage is not None:
-                    durable_receipt_safe = (
-                        await _durable_receipt_allows_covered_destructive_compaction(
-                            storage,
-                            key,
-                            getattr(session, "session_id", None) if session else None,
-                            transcript,
-                        )
-                    )
-                memory_status = compaction_memory_status(
-                    receipt,
-                    deterministic_receipt_safe=durable_receipt_safe,
-                    required=flush_enabled,
-                )
-                if not memory_status.allows_destructive_compaction:
-                    raise RpcHandlerError(
-                        code="CONTEXT_FLUSH_FAILED",
-                        message=(
-                            "Manual compaction aborted: flush receipt is not sufficient "
-                            "for destructive compaction."
-                        ),
-                        details={
-                            "flush_receipt": flush_receipt_to_dict(receipt),
-                            "key": key,
-                            "session_id": getattr(session, "session_id", None),
-                            "reason": "destructive_manual_compact_requires_safe_flush",
-                            "flush_receipt_status": flush_receipt_status,
-                            "memory_safety_status": memory_status.safety_status,
-                            "semantic_memory_status": memory_status.semantic_status,
-                        },
-                    )
-
-            compaction_config = build_compaction_config_from_provider(
-                _resolve_compaction_provider(ctx, session),
-                model_override=_effective_compaction_model(session),
-                compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
-            )
-
-            chunk_count = 0
-            coverage_status = "unknown"
-            missing_obligation_count = 0
-            critical_carry_forward_count = 0
-            state_kind = "text"
-            quality_report: dict[str, Any] = {}
-            skip_reason = ""
-            compact_with_result = getattr(ctx.session_manager, "compact_with_result", None)
-            if callable(compact_with_result):
-                compact_kwargs: dict[str, Any] = {
-                    "custom_instructions": custom_instructions,
-                }
-                if _accepts_keyword_arg(compact_with_result, "compaction_id"):
-                    compact_kwargs["compaction_id"] = compaction_id
-                if _accepts_keyword_arg(compact_with_result, "trigger_reason"):
-                    compact_kwargs["trigger_reason"] = "manual"
-                if flush_receipt_status is not None and _accepts_keyword_arg(
-                    compact_with_result, "flush_receipt_status"
-                ):
-                    compact_kwargs["flush_receipt_status"] = flush_receipt_status
-                if (
-                    compaction_correlation is not None
-                    and _accepts_keyword_arg(
-                        compact_with_result,
-                        "provider_request_correlation",
-                    )
-                ):
-                    compact_kwargs["provider_request_correlation"] = (
-                        compaction_correlation
-                    )
-                result = await compact_with_result(
-                    key,
-                    context_window_tokens,
-                    compaction_config,
-                    **compact_kwargs,
-                )
-                summary = getattr(result, "summary", "") or ""
-                removed_count = int(getattr(result, "removed_count", 0) or 0)
-                summary_source = getattr(result, "summary_source", "unknown") or "unknown"
-                kept_count = len(getattr(result, "kept_entries", []) or [])
-                tokens_before = int(getattr(result, "tokens_before", 0) or 0)
-                tokens_after = int(getattr(result, "tokens_after", 0) or 0)
-                remaining_budget_tokens = int(getattr(result, "remaining_budget_tokens", 0) or 0)
-                chunk_count = int(getattr(result, "chunks_processed", 0) or 0)
-                coverage_status = str(getattr(result, "coverage_status", "unknown") or "unknown")
-                skip_reason = str(getattr(result, "skip_reason", "") or "")
-                missing_obligation_count = len(getattr(result, "missing_obligations", None) or [])
-                critical_carry_forward_count = len(
-                    getattr(result, "critical_carry_forward", None) or []
-                )
-                state_kind = str(getattr(result, "summary_format", "text") or "text")
-                quality_report = dict(getattr(result, "quality_report", None) or {})
-                if removed_count > 0 and summary:
-                    for event in (
-                        COMPACTION_CHUNK_SUMMARIZED_EVENT,
-                        COMPACTION_SUMMARY_VERIFIED_EVENT,
-                    ):
-                        observed_payload = compaction_lifecycle_payload(compaction_id, event)
-                        observed_payload.update(compaction_result_payload(result))
-                        await _publish_manual_compaction_event(
-                            status="observed",
-                            **observed_payload,
-                        )
-            else:
-                compact = ctx.session_manager.compact
-                summary = await call_compact_with_optional_config(
-                    compact,
-                    key,
-                    context_window_tokens,
-                    compaction_config,
-                    provider_request_correlation=compaction_correlation,
-                )
-                removed_count = 1 if summary else 0
-                summary_source = "unknown"
-                skip_reason = "" if summary else "empty_summary"
-                kept_count = 0
-                tokens_before = 0
-                tokens_after = 0
-                remaining_budget_tokens = 0
-        except asyncio.CancelledError:
-            await _publish_manual_compaction_event(
-                status="cancelled",
-                message="Compaction was cancelled.",
-                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-            )
-            raise
-        except Exception as exc:
-            await _publish_manual_compaction_event(
-                status="failed",
-                message=str(exc),
-                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-            )
-            raise
-        payload = {
-            "key": key,
-            "compacted": removed_count > 0,
-            "applied": removed_count > 0,
-            "durability": "durable" if removed_count > 0 else "none",
-            "user_visible": True,
-            "mode": "summary",
-            "summary_len": len(summary),
-            "summary_source": summary_source,
-            "context_window_tokens": context_window_tokens,
-            "tokens_before": tokens_before,
-            "tokens_after": tokens_after,
-            "remaining_budget_tokens": remaining_budget_tokens,
-            "removed_count": removed_count,
-            "kept_count": kept_count,
-            "chunk_count": chunk_count,
-            "coverage_status": coverage_status,
-            "missing_obligation_count": missing_obligation_count,
-            "critical_carry_forward_count": critical_carry_forward_count,
-            "state_kind": state_kind,
-        }
-        if quality_report:
-            payload["quality_report"] = quality_report
-        if not removed_count:
-            payload["skip_reason"] = skip_reason or "empty_summary"
-            payload["reason"] = payload["skip_reason"]
-        if receipt is not None:
-            payload["flush_receipt"] = flush_receipt_to_dict(receipt)
-        if flush_receipt_status is not None:
-            payload["flush_receipt_status"] = flush_receipt_status
-        final_event = (
-            COMPACTION_PERSISTED_EVENT if removed_count > 0 else COMPACTION_TRIGGERED_EVENT
-        )
-        final_lifecycle_payload = compaction_lifecycle_payload(compaction_id, final_event)
-        final_lifecycle_payload.pop("coverage_status", None)
-        final_status = "completed" if removed_count > 0 else "skipped"
-        final_payload: dict[str, Any] = {}
-        if removed_count <= 0:
-            final_payload["reason"] = skip_reason or "empty_summary"
-        await _publish_manual_compaction_event(
-            status=final_status,
-            **final_payload,
-            tokens_before=tokens_before,
-            tokens_after=tokens_after,
-            remaining_budget_tokens=remaining_budget_tokens,
-            removed_count=removed_count,
-            kept_count=kept_count,
-            chunk_count=chunk_count,
-            coverage_status=coverage_status,
-            missing_obligation_count=missing_obligation_count,
-            critical_carry_forward_count=critical_carry_forward_count,
-            state_kind=state_kind,
-            quality_report=quality_report,
-            summary_len=len(summary),
-            summary_source=summary_source,
-            flush_receipt_status=flush_receipt_status,
-            **final_lifecycle_payload,
-        )
-        return payload
-
-    async def _run_accounted() -> dict[str, Any]:
-        from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
-        from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
-
-        usage_scope = await build_session_usage_scope(
-            getattr(ctx, "usage_event_sink", None),
-            ctx.session_manager,
-            key,
-            run_kind="session_compaction",
-        )
-        with bind_usage_accounting_scope(usage_scope):
-            return await _run_locked()
-
-    if lock is None:
-        return await _run_accounted()
-    async with lock:
-        return await _run_accounted()
+    return await _session_maintenance_adapter(ctx).compact(params)
 
 
-@_d.method("sessions.compact", scope="operator.write")
-async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict:
-    return cast(dict, await _handle_sessions_context_compact(params, ctx))
+_handle_sessions_reset_contract = register_session_maintenance_contract(
+    _d,
+    "sessions.reset",
+    _handle_sessions_reset,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
+_handle_sessions_context_compact_contract = register_session_maintenance_contract(
+    _d,
+    "sessions.contextCompact",
+    _handle_sessions_context_compact,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 @_d.method("sessions.truncate", scope="operator.write")
 async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dict:
-    from opensquilla.memory.session_flush import FlushReceipt
-
     key = _require_key(params)
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -5629,144 +3793,37 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
     lock = get_session_lock(turn_runner, key)
 
     async def _run_locked() -> dict[str, Any]:
-        receipt: FlushReceipt | None = None
         storage = get_session_storage(ctx.session_manager)
         session = None
         if storage is not None:
             session = await storage.get_session(key)
         previous_session_id = getattr(session, "session_id", None) if session else None
 
-        truncate_flush_enabled = flush_trigger_enabled(ctx.config, "session_reset")
-        if truncate_flush_enabled and ctx.flush_service is None:
-            # Fail-closed: refuse to truncate a non-empty transcript without
-            # an admin force override. Empty transcripts are safe to truncate.
-            transcript = await ctx.session_manager.get_transcript(key)
-            if transcript and not force:
-                checkpoint_safe = (
-                    storage is not None
-                    and await _durable_receipt_allows_covered_destructive_compaction(
-                        storage,
-                        key,
-                        previous_session_id,
-                        _truncate_checkpoint_scope_entries(transcript, max_messages),
-                    )
-                )
-                if not checkpoint_safe:
-                    raise RpcHandlerError(
-                        code="flush_unavailable",
-                        message=(
-                            "Truncate aborted: flush service is unavailable and "
-                            "the transcript is non-empty. Re-run with force=true "
-                            "(admin) to truncate without backup."
-                        ),
-                        details={
-                            "key": key,
-                            "session_id": previous_session_id,
-                            "reason": "flush_service_disabled",
-                            "message_count": len(transcript),
-                        },
-                    )
-            if transcript and force and "operator.admin" not in ctx.principal.scopes:
-                raise RpcHandlerError(
-                    code="permission_denied",
-                    message="force=true on sessions.truncate requires operator.admin scope.",
-                    details={"key": key, "session_id": previous_session_id},
-                )
-        elif truncate_flush_enabled:
-            if storage is None:
-                raise KeyError("No session storage available")
-            if session is None:
-                raise KeyError(f"Session not found: {key}")
-            agent_id = normalize_agent_id(getattr(session, "agent_id", None) or "main")
-            transcript = await ctx.session_manager.get_transcript(key)
-            if transcript:
-                try:
-                    flush_turn_id, flush_correlation = _build_session_flush_correlation(
-                        ctx,
-                        previous_session_id,
-                    )
-                    flush_kwargs: dict[str, Any] = {
-                        "agent_id": agent_id,
-                        "timeout": 30.0,
-                        "message_window": 0,
-                        "segment_mode": "auto",
-                        "raw_capture_policy": "required",
-                    }
-                    if _accepts_keyword_arg(ctx.flush_service.execute, "turn_id"):
-                        flush_kwargs["turn_id"] = flush_turn_id
-                    if (
-                        flush_correlation is not None
-                        and _accepts_keyword_arg(
-                            ctx.flush_service.execute,
-                            "provider_request_correlation",
-                        )
-                    ):
-                        flush_kwargs["provider_request_correlation"] = flush_correlation
-                    receipt = await ctx.flush_service.execute(
-                        transcript,
-                        key,
-                        **flush_kwargs,
-                    )
-                except Exception as exc:  # noqa: BLE001 — both LLM and raw-dump failed
-                    receipt = FlushReceipt(
-                        mode="error",
-                        flushed_paths=[],
-                        slug=None,
-                        message_count=len(transcript),
-                        duration_ms=0,
-                        raw_reason=None,
-                        error=str(exc),
-                        result_status="archive_failed",
-                    )
-                    raise RpcHandlerError(
-                        code="CONTEXT_FLUSH_FAILED",
-                        message=f"Truncate aborted: flush failed ({receipt.error})",
-                        details={
-                            "flush_receipt": receipt.to_dict(),
-                            "key": key,
-                            "session_id": previous_session_id,
-                        },
-                    ) from exc
-
-                durable_receipt_safe = await _durable_receipt_allows_covered_destructive_compaction(
+        if force and not ctx.has_scope("operator.admin"):
+            raise RpcHandlerError(
+                code="permission_denied",
+                message="force=true on sessions.truncate requires operator.admin scope.",
+                details={"key": key, "session_id": previous_session_id},
+            )
+        transcript = await ctx.session_manager.get_transcript(key)
+        removed_entries = _truncate_removed_entries(transcript, max_messages)
+        if removed_entries and not force:
+            try:
+                await checkpoint_before_session_rewrite(
+                    ctx.session_manager,
                     storage,
                     key,
                     previous_session_id,
-                    _truncate_checkpoint_scope_entries(transcript, max_messages),
+                    removed_entries,
+                    expected_session_epoch=getattr(session, "epoch", None),
+                    source="session_truncate",
                 )
-                memory_status = compaction_memory_status(
-                    receipt,
-                    deterministic_receipt_safe=durable_receipt_safe,
-                    required=True,
-                )
-                if not memory_status.allows_destructive_compaction:
-                    flush_status = flush_receipt_status_for_compaction(receipt, ctx.config)
-                    raise RpcHandlerError(
-                        code="CONTEXT_FLUSH_FAILED",
-                        message=(
-                            f"Truncate aborted: flush status {flush_status!r} is not "
-                            "sufficient for destructive truncate."
-                        ),
-                        details={
-                            "flush_receipt": flush_receipt_to_dict(receipt),
-                            "key": key,
-                            "session_id": previous_session_id,
-                            "reason": "destructive_truncate_requires_safe_flush",
-                            "flush_receipt_status": flush_status,
-                            "memory_safety_status": memory_status.safety_status,
-                            "semantic_memory_status": memory_status.semantic_status,
-                        },
-                    )
-            else:
-                receipt = FlushReceipt(
-                    mode="skipped",
-                    flushed_paths=[],
-                    slug=None,
-                    message_count=0,
-                    duration_ms=0,
-                    raw_reason=None,
-                    error=None,
-                )
+            except Exception as exc:
+                raise RpcHandlerError(
+                    code="CHECKPOINT_FAILED",
+                    message="Truncate aborted: transcript checkpoint could not be saved.",
+                    details={"key": key, "session_id": previous_session_id},
+                ) from exc
 
         result = await ctx.session_manager.truncate(key, max_messages=max_messages)
         payload = {
@@ -5776,30 +3833,14 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
             "before_count": result["before_count"],
             "after_count": result["after_count"],
         }
-        if receipt is not None:
-            payload["flush_receipt"] = flush_receipt_to_dict(receipt)
         return payload
 
-    async def _run_accounted() -> dict[str, Any]:
-        from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
-        from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
-
-        usage_scope = await build_session_usage_scope(
-            getattr(ctx, "usage_event_sink", None),
-            ctx.session_manager,
-            key,
-            run_kind="memory_flush",
-        )
-        with bind_usage_accounting_scope(usage_scope):
-            return await _run_locked()
-
     if lock is None:
-        return await _run_accounted()
+        return await _run_locked()
     async with lock:
-        return await _run_accounted()
+        return await _run_locked()
 
 
-@_d.method("sessions.subscribe", scope="operator.read")
 async def _handle_sessions_subscribe(params: dict | None, ctx: RpcContext) -> None:
     subscription_mgr = getattr(ctx, "subscription_manager", None)
     if subscription_mgr is not None:
@@ -5807,7 +3848,6 @@ async def _handle_sessions_subscribe(params: dict | None, ctx: RpcContext) -> No
     return None
 
 
-@_d.method("sessions.unsubscribe", scope="operator.read")
 async def _handle_sessions_unsubscribe(params: dict | None, ctx: RpcContext) -> None:
     subscription_mgr = getattr(ctx, "subscription_manager", None)
     if subscription_mgr is not None:
@@ -5823,25 +3863,50 @@ async def _build_sessions_messages_subscription_payload(
     subscribed: bool,
     fast_ack: bool,
 ) -> dict[str, Any]:
-    replay = get_session_streams().replay(key, _optional_stream_seq(params))
+    streams = get_session_streams()
+    since_stream_seq = _optional_stream_seq(params)
+    since_stream_generation = _optional_stream_generation(params)
+    if since_stream_generation is None:
+        # Pre-generation clients retain only a numeric cursor.  Lift the new
+        # process counter before replay/ACK so the next live event is visible
+        # even when this Gateway restarted at sequence zero.
+        promote_legacy_cursor = getattr(streams, "promote_legacy_cursor", None)
+        if callable(promote_legacy_cursor):
+            promote_legacy_cursor(key, since_stream_seq)
+        replay = streams.replay(key, since_stream_seq)
+    else:
+        replay = streams.replay(
+            key,
+            since_stream_seq,
+            since_stream_generation,
+        )
     replayed_count = 0
     if subscribed and replay.events:
+        from opensquilla.gateway.protocol import project_session_event_for_client
         from opensquilla.gateway.websocket import get_registry
 
         conn = get_registry().get(ctx.conn_id)
         if conn is not None:
+            client_caps: frozenset[str] = getattr(conn, "client_caps", frozenset())
             replay_deadline = (
-                asyncio.get_running_loop().time()
-                + _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS
+                asyncio.get_running_loop().time() + _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS
             )
             for event in replay.events:
+                projected = project_session_event_for_client(
+                    event.event_name,
+                    event.payload,
+                    client_caps=client_caps,
+                )
+                if projected is None:
+                    continue
+                event_name, event_payload = projected
                 remaining = replay_deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise TimeoutError("Session replay send budget exhausted")
                 async with asyncio.timeout(remaining):
                     await conn.send_event(
-                        event.event_name,
-                        event.payload,
+                        event_name,
+                        event_payload,
                         meta={"replayed": True},
                     )
                 replayed_count += 1
@@ -5849,6 +3914,7 @@ async def _build_sessions_messages_subscription_payload(
     replay_payload = {
         "subscribed": subscribed,
         "key": key,
+        "stream_generation": replay.stream_generation,
         "current_stream_seq": replay.current_stream_seq,
         "replay_complete": replay.replay_complete,
         "replay_gap_reason": replay.gap_reason,
@@ -5872,38 +3938,187 @@ async def _build_sessions_messages_subscription_payload(
 
 
 def _deferred_sessions_messages_metadata() -> dict[str, Any]:
-    deferred_fields = [
-        "workspaceId",
-        "projectWorkspace",
-        "tasks",
-        "active_task",
-        "last_task",
-        "run_status",
-        "active_task_group_ids",
-        "run_mode_lock",
-        "pendingUserInputs",
-        "collaboration",
-        "currentPlan",
-        "activePlanRun",
-        "epoch",
-    ]
-    return {
-        "workspaceId": None,
-        "projectWorkspace": None,
-        "projectWorkspaceDeferred": True,
-        "active_task_group_ids": [],
-        "run_mode_lock": {"locked": True, "source": "deferred"},
-        "pendingUserInputs": [],
-        "collaboration": None,
-        "currentPlan": None,
-        "activePlanRun": None,
-        "tasks": [],
-        "active_task": None,
-        "last_task": None,
-        "run_status": "idle",
-        "hydration_complete": False,
-        "deferred_fields": deferred_fields,
-    }
+    return session_read_metadata_to_v4(
+        deferred_session_read_metadata("deferred"),
+        include_key=False,
+    )
+
+
+def _build_session_read_application(
+    ctx: RpcContext,
+    *,
+    clock: SystemClock | None = None,
+) -> SessionReadApplication:
+    """Compose request-scoped Ports without exposing ``RpcContext`` upstream."""
+
+    streams = get_session_streams()
+    manager = getattr(ctx, "session_manager", None)
+    storage = cast(SessionStorage | None, get_session_storage(manager))
+    session_missing = object()
+    cached_session: object = session_missing
+
+    async def read_session(session_key: str) -> Any | None:
+        nonlocal cached_session
+        if cached_session is session_missing:
+            cached_session = await storage.get_session(session_key) if storage is not None else None
+        return cached_session
+
+    async def read_tasks(session_key: str) -> SessionTaskState:
+        task_rows = await _list_task_rows(ctx, storage, session_key)
+        task_state = _task_state_summary(task_rows)
+        await _overlay_runtime_task_snapshot(ctx, session_key, task_state)
+        await _attach_active_steer_capability(ctx, session_key, task_state)
+        from opensquilla.gateway.subagent_announce import (
+            active_background_completion_group_ids,
+            active_background_completion_run_mode_override,
+        )
+
+        active_task_group_ids = await active_background_completion_group_ids(session_key)
+        background_run_mode_override = (
+            await active_background_completion_run_mode_override(session_key)
+            if active_task_group_ids
+            else None
+        )
+        session = await read_session(session_key)
+        lock = _run_mode_lock_payload(
+            task_rows=task_rows,
+            active_task_group_ids=active_task_group_ids,
+            background_override=background_run_mode_override,
+            session=session,
+            principal=ctx.principal,
+        )
+        queued_task_ids = task_state.get("queued_task_ids")
+        return SessionTaskState(
+            tasks=tuple(cast(Sequence[Mapping[str, Any]], task_state.get("tasks", ()))),
+            active_task=cast(
+                Mapping[str, Any] | None,
+                task_state.get("active_task"),
+            ),
+            last_task=cast(
+                Mapping[str, Any] | None,
+                task_state.get("last_task"),
+            ),
+            run_status=str(task_state.get("run_status") or "idle"),
+            queued_task_ids=(
+                tuple(cast(Sequence[str], queued_task_ids)) if queued_task_ids is not None else None
+            ),
+            active_task_group_ids=tuple(active_task_group_ids),
+            run_mode_lock=SessionRunModeLock(
+                locked=bool(lock.get("locked")),
+                run_mode=(lock.get("runMode") if isinstance(lock.get("runMode"), str) else None),
+                source=(lock.get("source") if isinstance(lock.get("source"), str) else None),
+            ),
+        )
+
+    async def read_workspace(
+        session_key: str,
+        include_project_workspace: bool,
+    ) -> SessionWorkspaceState:
+        session = await read_session(session_key)
+        workspace_id = getattr(session, "workspace_id", None)
+        project_snapshot = (
+            await persisted_project_workspace_snapshot(storage, session)
+            if include_project_workspace and storage is not None and session is not None
+            else None
+        )
+        return SessionWorkspaceState(
+            workspace_id=cast(str | None, workspace_id),
+            project_workspace=cast(Mapping[str, Any] | None, project_snapshot),
+            project_workspace_deferred=(bool(workspace_id) and not include_project_workspace),
+        )
+
+    async def read_pending_inputs(
+        session_key: str,
+    ) -> Sequence[Mapping[str, Any]]:
+        getter = getattr(
+            getattr(ctx, "task_runtime", None),
+            "pending_user_inputs",
+            None,
+        )
+        if not callable(getter):
+            return ()
+        candidate = getter(session_key)
+        result = await candidate if inspect.isawaitable(candidate) else candidate
+        return cast(Sequence[Mapping[str, Any]], result)
+
+    async def read_routing(session_key: str) -> Mapping[str, Any]:
+        return await _resolve_session_routing_snapshot(ctx, session_key)
+
+    async def read_planning(session_key: str) -> SessionPlanningState:
+        session = await read_session(session_key)
+        collaboration: Mapping[str, Any] | None = None
+        current_plan_payload: Mapping[str, Any] | None = None
+        active_plan_run_payload: Mapping[str, Any] | None = None
+        goal_payload: Mapping[str, Any] | None = None
+        session_epoch: int | None = None
+        if storage is not None and session is not None:
+            session_epoch = await _bootstrap_epoch(
+                ctx.session_manager,
+                storage,
+                session,
+                session_key,
+            )
+            collaboration = _plan_collaboration_snapshot(session)
+            get_current_plan = getattr(storage, "get_current_plan_revision", None)
+            get_active_run = getattr(storage, "get_active_plan_run", None)
+            current_plan = (
+                await get_current_plan(session_key) if callable(get_current_plan) else None
+            )
+            active_plan_run = (
+                await get_active_run(session_key) if callable(get_active_run) else None
+            )
+            from opensquilla.session.plans import (
+                plan_revision_snapshot,
+                plan_run_snapshot,
+            )
+
+            if current_plan is not None:
+                current_plan_payload = plan_revision_snapshot(
+                    current_plan,
+                    current=True,
+                )
+            if active_plan_run is not None:
+                active_plan_run_payload = plan_run_snapshot(active_plan_run)
+            get_goal = getattr(storage, "get_goal", None)
+            goal = await get_goal(session_key) if callable(get_goal) else None
+            if goal is not None:
+                goal_service = getattr(
+                    getattr(ctx, "task_runtime", None),
+                    "goal_service",
+                    None,
+                )
+                snapshot = getattr(goal_service, "snapshot", None)
+                if callable(snapshot):
+                    goal_payload = cast(Mapping[str, Any], await snapshot(goal))
+                else:
+                    from opensquilla.session.goals import goal_snapshot
+
+                    goal_payload = goal_snapshot(goal)
+
+        return SessionPlanningState(
+            collaboration=collaboration,
+            current_plan=current_plan_payload,
+            active_plan_run=active_plan_run_payload,
+            goal=goal_payload,
+            epoch=session_epoch,
+        )
+
+    ports = GatewaySessionReadPorts(
+        streams=streams,
+        read_tasks=read_tasks,
+        read_workspace=read_workspace,
+        read_pending_inputs=read_pending_inputs,
+        read_routing=read_routing,
+        read_planning=read_planning,
+    )
+    return build_v4_session_read_application(
+        streams=streams,
+        session_manager=manager,
+        storage=storage,
+        ports=ports,
+        clock=clock,
+        channel_types=_channel_types_from_config(ctx.config),
+    )
 
 
 async def _hydrate_sessions_messages_metadata(
@@ -5914,105 +4129,28 @@ async def _hydrate_sessions_messages_metadata(
 ) -> dict[str, Any]:
     """Load authoritative subscription metadata outside the fast ACK path."""
 
-    storage = get_session_storage(getattr(ctx, "session_manager", None))
-    task_rows = await _list_task_rows(ctx, storage, key)
-    task_state = _task_state_summary(task_rows)
-    await _attach_active_steer_capability(ctx, key, task_state)
-    from opensquilla.gateway.subagent_announce import (
-        active_background_completion_group_ids,
-        active_background_completion_run_mode_override,
+    application = _build_session_read_application(ctx)
+    metadata = await application.read_metadata(
+        SessionMetadataQuery(
+            session_key=key,
+            include_project_workspace=include_project_workspace,
+        )
     )
-
-    active_task_group_ids = await active_background_completion_group_ids(key)
-    background_run_mode_override = (
-        await active_background_completion_run_mode_override(key)
-        if active_task_group_ids
-        else None
-    )
-    session = await storage.get_session(key) if storage is not None else None
-    workspace_id = getattr(session, "workspace_id", None)
-    project_snapshot = (
-        await persisted_project_workspace_snapshot(storage, session)
-        if include_project_workspace and storage is not None and session is not None
-        else None
-    )
-    pending_user_inputs: list[dict[str, Any]] = []
-    pending_user_inputs_getter = getattr(
-        getattr(ctx, "task_runtime", None),
-        "pending_user_inputs",
-        None,
-    )
-    if callable(pending_user_inputs_getter):
-        candidate = pending_user_inputs_getter(key)
-        pending_user_inputs = (
-            await candidate if inspect.isawaitable(candidate) else candidate
-        )
-    collaboration: dict[str, Any] | None = None
-    current_plan_payload: dict[str, Any] | None = None
-    active_plan_run_payload: dict[str, Any] | None = None
-    session_epoch: int | None = None
-    if storage is not None and session is not None:
-        session_epoch = await _bootstrap_epoch(
-            ctx.session_manager,
-            storage,
-            session,
-            key,
-        )
-        collaboration = _plan_collaboration_snapshot(session)
-        get_current_plan = getattr(storage, "get_current_plan_revision", None)
-        get_active_run = getattr(storage, "get_active_plan_run", None)
-        current_plan = (
-            await get_current_plan(key) if callable(get_current_plan) else None
-        )
-        active_plan_run = (
-            await get_active_run(key) if callable(get_active_run) else None
-        )
-        from opensquilla.session.plans import (
-            plan_revision_snapshot,
-            plan_run_snapshot,
-        )
-
-        if current_plan is not None:
-            current_plan_payload = plan_revision_snapshot(
-                current_plan,
-                current=True,
-            )
-        if active_plan_run is not None:
-            active_plan_run_payload = plan_run_snapshot(active_plan_run)
-
-    project_workspace_deferred = bool(workspace_id) and not include_project_workspace
-    return {
-        "key": key,
-        "workspaceId": workspace_id,
-        # New clients opt into a fast subscribe and refresh this field through
-        # the workspace RPC. Legacy callers retain the old payload shape using
-        # persisted binding state; turn ingress still validates the directory.
-        "projectWorkspace": project_snapshot,
-        "projectWorkspaceDeferred": project_workspace_deferred,
-        "active_task_group_ids": active_task_group_ids,
-        "run_mode_lock": _run_mode_lock_payload(
-            task_rows=task_rows,
-            active_task_group_ids=active_task_group_ids,
-            background_override=background_run_mode_override,
-            session=session,
-            principal=ctx.principal,
-        ),
-        "pendingUserInputs": pending_user_inputs,
-        "collaboration": collaboration,
-        "currentPlan": current_plan_payload,
-        "activePlanRun": active_plan_run_payload,
-        **({"epoch": session_epoch} if session_epoch is not None else {}),
-        **task_state,
-        "hydration_complete": True,
-        "deferred_fields": (
-            ["projectWorkspace"] if project_workspace_deferred else []
-        ),
-    }
+    return session_read_metadata_to_v4(metadata)
 
 
-@_d.method("sessions.messages.subscribe", scope="operator.read")
 async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
+    if ":subagent:" in key:
+        storage = get_session_storage(getattr(ctx, "session_manager", None))
+        session = await storage.get_session(key) if storage is not None else None
+        if session is None:
+            raise RpcHandlerError(
+                "SESSION_NOT_FOUND",
+                "Session was deleted or does not exist.",
+                retryable=False,
+                accepted=False,
+            )
     fast_ack = (params or {}).get("fast_ack") is True
     subscription_mgr = getattr(ctx, "subscription_manager", None)
     registered_new = False
@@ -6037,7 +4175,6 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         raise
 
 
-@_d.method("sessions.messages.hydrate", scope="operator.read")
 async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
     # This is an interactive continuation of the fast subscribe ACK. Keep all
@@ -6047,27 +4184,100 @@ async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext
         return await _hydrate_sessions_messages_metadata(ctx, key)
 
 
-@_d.method("sessions.messages.snapshot", scope="operator.read")
 async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContext) -> dict:
     """Return a compact active-turn base before a client subscribes for deltas."""
 
+    from opensquilla.gateway.websocket import get_registry
+
     key = _require_key(params)
-    snapshot = get_session_streams().live_snapshot(key)
-    return {
-        "key": key,
-        "task_id": snapshot.task_id,
-        "current_stream_seq": snapshot.current_stream_seq,
-        "events": [
-            {
-                "event": event.event_name,
-                "payload": dict(event.payload),
-            }
-            for event in snapshot.events
-        ],
-    }
+    connection = get_registry().get(ctx.conn_id)
+    client_caps: frozenset[str] = getattr(connection, "client_caps", frozenset())
+    application = _build_session_read_application(ctx)
+    return session_read_snapshot_to_v4(
+        key,
+        application.read_snapshot(key, client_caps=client_caps),
+    )
 
 
-@_d.method("sessions.messages.unsubscribe", scope="operator.read")
+async def _snapshot_session_identity(ctx: RpcContext, key: str) -> tuple[str | None, int | None]:
+    from opensquilla.gateway.session_services import read_session_identity
+
+    return await read_session_identity(getattr(ctx, "session_manager", None), key)
+
+
+async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.gateway.adapters.connection_recovery_contract import validate_recovery_params
+    from opensquilla.gateway.snapshot_transfer import SnapshotTransfer, SnapshotTransferError
+    from opensquilla.gateway.websocket import get_registry
+
+    try:
+        validate_recovery_params("sessions.messages.snapshot.read", params)
+    except ValueError as exc:
+        raise RpcHandlerError("INVALID_REQUEST", str(exc), accepted=False) from exc
+    assert isinstance(params, dict)
+    key = _require_key(params)
+    sync_revision = params["sync_revision"]
+    registry = get_registry()
+    connection = registry.get(ctx.conn_id)
+    if connection is None or connection.principal != ctx.principal:
+        raise RpcHandlerError("UNAUTHORIZED", "Connection identity is no longer current")
+    transfer = connection._snapshot_transfer
+    if transfer is None:
+        transfer = SnapshotTransfer(
+            connection.reserve_transport_bytes, connection.release_transport_bytes
+        )
+        connection._snapshot_transfer = transfer
+        connection.add_transport_cleanup(transfer.close)
+    identity = await _snapshot_session_identity(ctx, key)
+    if registry.get(ctx.conn_id) is not connection:
+        raise RpcHandlerError("SNAPSHOT_STALE", "Connection is no longer current", accepted=False)
+    try:
+        snapshot_id = params.get("snapshot_id")
+        if snapshot_id is not None:
+            if transfer.identity != identity:
+                transfer.close()
+                raise SnapshotTransferError("SNAPSHOT_STALE")
+            if "segment_index" not in params:
+                raise SnapshotTransferError("INVALID_REQUEST")
+            result = transfer.read(key, sync_revision, snapshot_id, params["segment_index"])
+        else:
+            if params.get("segment_index", 0) != 0:
+                raise SnapshotTransferError("INVALID_REQUEST")
+            application = _build_session_read_application(ctx)
+            result = await transfer.create(
+                key,
+                sync_revision,
+                lambda: session_read_snapshot_to_v4(
+                    key,
+                    application.read_snapshot(key, client_caps=connection.client_caps),
+                ),
+                identity=identity,
+            )
+        # Encoding yields; a reset/delete-recreate or disconnect may have
+        # invalidated the captured owner while those bytes were being built.
+        current_identity = await _snapshot_session_identity(ctx, key)
+        if registry.get(ctx.conn_id) is not connection or current_identity != identity:
+            transfer.close()
+            raise SnapshotTransferError("SNAPSHOT_STALE")
+        if getattr(connection, "flow_enabled", False):
+            # Segment credit is released after bounded staging, not after the
+            # complete snapshot installs. The latter would deadlock recovery.
+            result["delivery"] = connection.reserve_snapshot_delivery(
+                len(result["data"]) + 4096, key, result["snapshot_id"], sync_revision
+            )
+        return result
+    except SnapshotTransferError as exc:
+        raise RpcHandlerError(
+            exc.code,
+            "Snapshot synchronization is temporarily unavailable"
+            if exc.code != "SNAPSHOT_TOO_LARGE"
+            else "Use paginated history for this snapshot",
+            retryable=exc.code in {"SNAPSHOT_BUSY", "SNAPSHOT_EXPIRED", "SNAPSHOT_STALE"},
+            retry_after_ms=250 if exc.code == "SNAPSHOT_BUSY" else None,
+            accepted=False,
+        ) from exc
+
+
 async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcContext) -> None:
     key = _require_key(params)
     subscription_mgr = getattr(ctx, "subscription_manager", None)
@@ -6076,11 +4286,12 @@ async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcCon
     return None
 
 
-@_d.method("sessions.preview", scope="operator.read")
 async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict:
-    keys = (params or {}).get("keys")
-    limit = (params or {}).get("limit", 50)
-    now_ms = int(time.time() * 1000)
+    # Preserve the legacy order: a truthy non-mapping params value raises from
+    # ``.get`` before an unavailable manager can produce an empty response.
+    raw_keys, raw_limit = preview_params_from_v4(params)
+    clock = SystemClock()
+    now_ms = clock.now_ms()
 
     if ctx.session_manager is None:
         return {"ts": now_ms, "previews": []}
@@ -6089,46 +4300,58 @@ async def _handle_sessions_preview(params: dict | None, ctx: RpcContext) -> dict
     if storage is None:
         return {"ts": now_ms, "previews": []}
 
-    if keys:
-        sessions = []
-        for k in keys:
-            s = await storage.get_session(k)
-            if s is not None:
-                sessions.append(s)
-    else:
-        sessions = await storage.list_sessions(limit=limit)
+    application = _build_session_read_application(ctx, clock=clock)
 
-    previews = []
-    for s in sessions:
-        title = (
-            getattr(s, "display_name", None)
-            or getattr(s, "derived_title", None)
-            or s.session_id[:8]
-        )
-        last_msg = ""
-        try:
-            transcript = await storage.get_transcript(s.session_id, limit=-1)
-            if transcript:
-                # Find the last user or assistant message for preview
-                for entry in reversed(transcript):
-                    if entry.role in ("user", "assistant") and entry.content:
-                        last_msg = entry.content[:120]
-                        break
-        except Exception:
-            pass
-        previews.append(
-            {
-                "key": s.session_key,
-                "title": title,
-                "lastMessage": last_msg,
-                "updatedAt": getattr(s, "updated_at", now_ms),
-            }
-        )
+    # Preview is an interactive read. Keep storage lock acquisition bounded
+    # while preserving the existing key/list selection and response shape.
+    with bounded_interactive_storage_reads():
+        # Key iteration stays inside the same bounded section as the old
+        # handler; malformed iterables therefore fail at the same point.
+        query = preview_query_from_v4_values(raw_keys, raw_limit)
+        result = await application.read_previews(query)
 
-    return {"ts": now_ms, "previews": previews}
+    return preview_result_to_v4(result)
 
 
-@_d.method("sessions.resolve", scope="operator.read")
+_handle_sessions_messages_subscribe_contract = register_sessions_messages_subscribe_contract(
+    _d,
+    _handle_sessions_messages_subscribe,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_messages_hydrate_contract = register_sessions_messages_hydrate_contract(
+    _d,
+    _handle_sessions_messages_hydrate,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_messages_snapshot_read_contract = register_connection_recovery_contract(
+    _d,
+    "sessions.messages.snapshot.read",
+    _handle_sessions_messages_snapshot_read,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_messages_snapshot_contract = register_sessions_messages_snapshot_contract(
+    _d,
+    _handle_sessions_messages_snapshot,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_messages_unsubscribe_contract = register_sessions_messages_unsubscribe_contract(
+    _d,
+    _handle_sessions_messages_unsubscribe,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_preview_contract = register_sessions_preview_contract(
+    _d,
+    _handle_sessions_preview,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
 
@@ -6139,19 +4362,27 @@ async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict
     if storage is None:
         raise KeyError("No session storage available")
 
-    session = await _resolve_session_node(storage, key)
+    resolution = await SessionDirectory(storage).resolve(key)
 
     return {
-        "session_key": session.session_key,
-        "session_id": session.session_id,
-        "status": session.status,
-        "agent_id": session.agent_id,
-        "model": getattr(session, "model", None),
-        "workspaceId": getattr(session, "workspace_id", None),
-        "projectWorkspaceDeferred": bool(getattr(session, "workspace_id", None)),
-        "created_at": session.created_at,
-        "updated_at": session.updated_at,
+        "session_key": resolution.key,
+        "session_id": resolution.session_id,
+        "status": resolution.status,
+        "agent_id": resolution.agent_id,
+        "model": resolution.model,
+        "workspaceId": resolution.workspace_id,
+        "projectWorkspaceDeferred": bool(resolution.workspace_id),
+        "created_at": resolution.created_at,
+        "updated_at": resolution.updated_at,
     }
+
+
+_handle_sessions_resolve_contract = register_sessions_resolve_contract(
+    _d,
+    _handle_sessions_resolve,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _bootstrap_epoch(
@@ -6200,7 +4431,91 @@ def _plan_collaboration_snapshot(
     }
 
 
-@_d.method("plans.capabilities", scope="operator.read")
+def _session_routing_snapshot(
+    value: Any,
+    *,
+    applies_to: str = "next_accepted_turn",
+) -> dict[str, Any]:
+    """Normalize the storage/manager routing result for public RPCs."""
+
+    if isinstance(value, dict):
+        raw_mode = value.get("mode")
+        revision = value.get("revision", 0)
+        source = value.get("source", "session")
+        initialized = value.get("initialized", False)
+    else:
+        raw_mode = getattr(value, "mode", None)
+        revision = getattr(value, "revision", 0)
+        source = getattr(value, "source", "session")
+        initialized = getattr(value, "initialized", False)
+    mode = str(raw_mode or "direct").strip().lower()
+    if mode not in _SESSION_ROUTING_MODES:
+        mode = "direct"
+    return {
+        "mode": mode,
+        "revision": max(0, int(revision or 0)),
+        "source": str(source or "session"),
+        "initialized": bool(initialized),
+        "appliesTo": applies_to,
+    }
+
+
+def _global_session_routing_snapshot(ctx: RpcContext) -> dict[str, Any]:
+    """Return the current global default for a not-yet-created session."""
+
+    from opensquilla.gateway.model_routing import model_routing_snapshot
+
+    mode = str(model_routing_snapshot(ctx.config).get("mode") or "direct")
+    return _session_routing_snapshot(
+        {
+            "mode": mode,
+            "revision": 0,
+            "source": "global",
+            "initialized": False,
+        }
+    )
+
+
+async def _resolve_session_routing_snapshot(
+    ctx: RpcContext,
+    key: str,
+) -> dict[str, Any]:
+    """Resolve one durable row; draft keys expose their global creation default."""
+
+    manager = ctx.session_manager
+    if manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    fallback = _global_session_routing_snapshot(ctx)["mode"]
+    getter = getattr(manager, "get_session_routing", None)
+    try:
+        if callable(getter):
+            return _session_routing_snapshot(await getter(key, fallback_mode=fallback))
+        storage = get_session_storage(manager)
+        resolver = getattr(storage, "resolve_model_routing_mode", None)
+        if callable(resolver):
+            return _session_routing_snapshot(await resolver(key, fallback))
+    except KeyError:
+        # This is a new-chat draft, not a durable inherited value. The first
+        # accepted turn writes its `initialRoutingMode` or this global value.
+        return _global_session_routing_snapshot(ctx)
+    # Mixed-version/in-memory session services can still provide the global
+    # default until their durable resolver is available.
+    return _global_session_routing_snapshot(ctx)
+
+
+async def _goal_owned_plan_run_for_revision(
+    storage: Any,
+    revision_id: str,
+) -> Any | None:
+    """Return the Goal-owned execution overlay for an internal revision."""
+
+    getter = getattr(storage, "get_latest_plan_run_for_revision", None)
+    if not callable(getter):
+        return None
+    run = await getter(revision_id)
+    return run if run is not None and str(getattr(run, "driver_kind", "") or "") == "goal" else None
+
+
 async def _handle_plans_capabilities(
     _params: dict | None,
     _ctx: RpcContext,
@@ -6214,9 +4529,155 @@ async def _handle_plans_capabilities(
     }
 
 
-@_d.method("plans.setMode", scope="operator.write")
-async def _handle_plans_set_mode(params: dict | None, ctx: RpcContext) -> dict:
+async def _handle_sessions_routing_get(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Return a session's effective routing strategy and CAS generation."""
+
     key = _require_plan_session_key(params)
+    snapshot = await _resolve_session_routing_snapshot(ctx, key)
+    return {
+        "key": key,
+        "sessionKey": key,
+        **snapshot,
+        "routing": snapshot,
+    }
+
+
+async def _handle_sessions_routing_set(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    _explicit_ingress_intent_registered: bool = False,
+) -> dict[str, Any]:
+    """CAS-update a durable session mode before the next admitted turn."""
+
+    key = _require_plan_session_key(params)
+    runtime = getattr(ctx, "task_runtime", None)
+    register = getattr(runtime, "explicit_ingress_intent", None)
+    if not _explicit_ingress_intent_registered and callable(register):
+        async with register(key):
+            return cast(
+                dict[str, Any],
+                await _handle_sessions_routing_set(
+                    params,
+                    ctx,
+                    _explicit_ingress_intent_registered=True,
+                ),
+            )
+    mode = _optional_string_param(params, "mode")
+    if mode not in _SESSION_ROUTING_MODES:
+        raise ValueError("params.mode must be direct, router, or ensemble")
+    expected_revision = (params or {}).get(
+        "expectedRevision",
+        (params or {}).get("expected_revision"),
+    )
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 0
+    ):
+        raise ValueError("params.expectedRevision must be a non-negative integer")
+    # Reuse the global control's activation planner as validation only. It
+    # catches an unbuildable Ensemble lineup without changing shared config.
+    from opensquilla.gateway.model_routing import model_routing_patches
+
+    model_routing_patches(ctx.config, mode)
+    manager = ctx.session_manager
+    if manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    setter = getattr(manager, "set_session_routing", None)
+    storage = get_session_storage(manager)
+    if not callable(setter):
+        setter = getattr(storage, "set_model_routing_mode", None)
+    if not callable(setter):
+        raise RpcUnavailableError("Session routing storage is not configured")
+
+    async def _commit() -> dict[str, Any]:
+        try:
+            stored = await setter(key, mode, expected_revision=expected_revision)
+            snapshot = _session_routing_snapshot(stored)
+            changed = (
+                stored.get("changed") is True
+                if isinstance(stored, dict)
+                else getattr(stored, "changed", None) is True
+            )
+            if changed:
+                # A router hold is an instruction within one routing strategy,
+                # not durable session configuration. Do not let an old tier pin
+                # disappear in Direct/Ensemble and silently reactivate after a
+                # later mode switch. Keep lost-ack retries side-effect free by
+                # clearing only when the atomic storage write changed the mode.
+                # Advancing the revision also rejects late writes by old turns.
+                hold_store = getattr(
+                    getattr(ctx, "turn_runner", None),
+                    "router_control_hold_store",
+                    None,
+                )
+                advance_revision = getattr(hold_store, "advance_routing_revision", None)
+                if callable(advance_revision):
+                    advance_revision(key, snapshot["revision"])
+            return snapshot
+        except KeyError as exc:
+            raise RpcHandlerError(
+                "SESSION_NOT_FOUND",
+                "Set a new chat's initialRoutingMode with its first message instead.",
+                retryable=False,
+                accepted=False,
+            ) from exc
+
+    try:
+        collector = getattr(runtime, "collect_admission", None)
+        if callable(collector):
+            async with collector(key):
+                snapshot = await _commit()
+        else:
+            lock = get_session_lock(ctx.turn_runner, key)
+            if lock is None:
+                snapshot = await _commit()
+            else:
+                async with lock:
+                    snapshot = await _commit()
+    except SessionRoutingConflictError as exc:
+        latest = await _resolve_session_routing_snapshot(ctx, key)
+        raise RpcHandlerError(
+            "SESSION_ROUTING_CHANGED",
+            str(exc),
+            details={"routing": latest},
+            retryable=True,
+            accepted=False,
+        ) from exc
+
+    event = {
+        "key": key,
+        "sessionKey": key,
+        "routing": snapshot,
+        **snapshot,
+    }
+    await _emit_to_subscribers(ctx, key, "sessions.routing.changed", event)
+    return event
+
+
+async def _handle_plans_set_mode(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    _explicit_ingress_intent_registered: bool = False,
+) -> dict:
+    key = _require_plan_session_key(params)
+    runtime = getattr(ctx, "task_runtime", None)
+    register = getattr(runtime, "explicit_ingress_intent", None)
+    if not _explicit_ingress_intent_registered and callable(register):
+        async with register(key):
+            return cast(
+                dict[Any, Any],
+                await _handle_plans_set_mode(
+                    params,
+                    ctx,
+                    _explicit_ingress_intent_registered=True,
+                ),
+            )
     mode = _optional_string_param(params, "mode")
     if mode not in {"default", "plan"}:
         raise ValueError("params.mode must be default or plan")
@@ -6282,14 +4743,24 @@ async def _handle_plans_set_mode(params: dict | None, ctx: RpcContext) -> dict:
         expected_revision = int(current.collaboration_revision or 0)
     else:
         expected_revision = expected_raw
-    from opensquilla.session.plans import PlanConflictError
 
-    try:
-        updated = await storage.set_collaboration_mode(
+    async def _commit_mode() -> Any:
+        return await storage.set_collaboration_mode(
             key,
             mode,
             expected_revision=expected_revision,
         )
+
+    try:
+        if (
+            runtime is not None
+            and callable(getattr(runtime, "explicit_ingress_intent", None))
+            and callable(getattr(runtime, "collect_admission", None))
+        ):
+            async with runtime.collect_admission(key):
+                updated = await _commit_mode()
+        else:
+            updated = await _commit_mode()
     except PlanConflictError as exc:
         latest = await storage.get_session(key)
         raise RpcHandlerError(
@@ -6297,9 +4768,7 @@ async def _handle_plans_set_mode(params: dict | None, ctx: RpcContext) -> dict:
             str(exc),
             details={
                 "collaboration": (
-                    _plan_collaboration_snapshot(latest)
-                    if latest is not None
-                    else None
+                    _plan_collaboration_snapshot(latest) if latest is not None else None
                 )
             },
             retryable=True,
@@ -6317,11 +4786,26 @@ async def _handle_plans_set_mode(params: dict | None, ctx: RpcContext) -> dict:
         "session.event.collaboration_mode",
         {"session_key": key, "collaboration": snapshot},
     )
+    goal_service = getattr(getattr(ctx, "task_runtime", None), "goal_service", None)
+    on_mode_committed = getattr(goal_service, "on_mode_committed", None)
+    if callable(on_mode_committed):
+        try:
+            await on_mode_committed(key, mode)
+        except Exception:  # noqa: BLE001 - collaboration commit is authoritative.
+            log.warning(
+                "plans.set_mode.goal_hook_failed",
+                session_key=key,
+                exc_info=True,
+            )
     return {"sessionKey": key, "collaboration": snapshot}
 
 
-@_d.method("plans.implement", scope="operator.write")
-async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
+async def _handle_plans_implement(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    _explicit_ingress_intent_registered: bool = False,
+) -> dict:
     key = _require_plan_session_key(params)
     revision_id = _optional_string_param(
         params,
@@ -6330,16 +4814,41 @@ async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
     )
     if revision_id is None:
         raise ValueError("params.planRevisionId is required")
+    if not _explicit_ingress_intent_registered:
+        runtime = getattr(ctx, "task_runtime", None)
+        register = getattr(runtime, "explicit_ingress_intent", None)
+        if callable(register):
+            async with register(key):
+                return cast(
+                    dict[Any, Any],
+                    await _handle_plans_implement(
+                        params,
+                        ctx,
+                        _explicit_ingress_intent_registered=True,
+                    ),
+                )
     if ctx.session_manager is None:
         raise RpcUnavailableError("Session manager is not configured")
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
         raise RpcUnavailableError("Session storage is not configured")
-    client_request_id = _optional_string_param(
-        params,
-        "clientRequestId",
-        "client_request_id",
-    ) or uuid.uuid4().hex
+    goal_run = await _goal_owned_plan_run_for_revision(storage, revision_id)
+    if goal_run is not None:
+        raise RpcHandlerError(
+            "PLAN_RUN_GOAL_OWNED",
+            "This revision belongs to a Goal run and is not a Plan proposal.",
+            details={"runId": goal_run.run_id},
+            retryable=False,
+            accepted=False,
+        )
+    client_request_id = (
+        _optional_string_param(
+            params,
+            "clientRequestId",
+            "client_request_id",
+        )
+        or uuid.uuid4().hex
+    )
     intent = _optional_string_param(params, "intent")
     revision = await storage.get_plan_revision(revision_id)
     if revision is None:
@@ -6358,31 +4867,18 @@ async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
             request_session_key=key,
             client_request_id=client_request_id,
         )
-        previous_task_id = (
-            previous.receipt.task_id if previous is not None else None
-        )
-        previous_task = (
-            await storage.get_agent_task(previous_task_id)
-            if previous_task_id
-            else None
-        )
+        previous_task_id = previous.receipt.task_id if previous is not None else None
+        previous_task = await storage.get_agent_task(previous_task_id) if previous_task_id else None
         previous_details = (
             previous_task.details
-            if previous_task is not None
-            and isinstance(previous_task.details, dict)
+            if previous_task is not None and isinstance(previous_task.details, dict)
             else {}
         )
         previous_metadata = previous_details.get("metadata")
-        previous_metadata = (
-            previous_metadata if isinstance(previous_metadata, dict) else {}
-        )
-        accepted_revision_id = str(
-            previous_metadata.get("plan_revision_id") or ""
-        ).strip()
+        previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
+        accepted_revision_id = str(previous_metadata.get("plan_revision_id") or "").strip()
         accepted_revision = (
-            await storage.get_plan_revision(accepted_revision_id)
-            if accepted_revision_id
-            else None
+            await storage.get_plan_revision(accepted_revision_id) if accepted_revision_id else None
         )
         if accepted_revision is None:
             raise KeyError(f"Plan revision not found: {revision_id}")
@@ -6413,25 +4909,39 @@ async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
         # display surfaces to omit it from the visible transcript.
         send_params["displayText"] = ""
     target_before_acceptance = await storage.get_session(key)
-    required_collaboration_revision = (
-        int(target_before_acceptance.collaboration_revision or 0) + 1
-        if target_before_acceptance is not None
-        else 1
+    current_session_implementation = send_params["intent"] == "continue"
+    command = replace(
+        decode_admit_turn(
+            send_params,
+            principal_role=str(ctx.principal.role),
+            fingerprint_params={
+                "action": "plans.implement",
+                "sessionKey": key,
+                "planRevisionId": revision_id,
+                "message": message,
+                "intent": send_params["intent"],
+            },
+        ),
+        plan=PlanAdmissionContext(
+            revision_id=revision_id,
+            required_collaboration_mode="default",
+            expected_collaboration_revision=(
+                int(target_before_acceptance.collaboration_revision or 0)
+                if current_session_implementation and target_before_acceptance is not None
+                else None
+            ),
+            expected_active_revision_id=revision_id if current_session_implementation else None,
+            require_idle=current_session_implementation,
+        ),
+        explicit_intent_registered=_explicit_ingress_intent_registered,
     )
-    result = await _handle_sessions_send(
-        send_params,
-        ctx,
-        fingerprint_params={
-            "action": "plans.implement",
-            "sessionKey": key,
-            "planRevisionId": revision_id,
-            "message": message,
-            "intent": send_params["intent"],
-        },
-        plan_revision_id=revision_id,
-        required_collaboration_mode="default",
-        required_collaboration_revision=required_collaboration_revision,
-    )
+    try:
+        result = await build_turn_admission_application(ctx).admit(command)
+    except Exception as exc:
+        mapped = map_admission_error(exc)
+        if mapped is exc:
+            raise
+        raise mapped from exc
     accepted_key = str(result.get("session_key") or key)
     task_id = str(result.get("turn_id") or result.get("task_id") or "").strip()
     task_record = await storage.get_agent_task(task_id) if task_id else None
@@ -6443,9 +4953,7 @@ async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
     task_metadata = task_details.get("metadata")
     task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
     accepted_run_id = str(task_metadata.get("plan_run_id") or "").strip()
-    accepted_revision_id = str(
-        task_metadata.get("plan_revision_id") or ""
-    ).strip()
+    accepted_revision_id = str(task_metadata.get("plan_revision_id") or "").strip()
     if not accepted_run_id or not accepted_revision_id:
         raise RuntimeError("Accepted plan implementation lost its durable binding")
     accepted_run = await storage.get_plan_run(accepted_run_id)
@@ -6482,8 +4990,12 @@ async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
     }
 
 
-@_d.method("plans.revise", scope="operator.write")
-async def _handle_plans_revise(params: dict | None, ctx: RpcContext) -> dict:
+async def _handle_plans_revise(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    _explicit_ingress_intent_registered: bool = False,
+) -> dict:
     key = _require_plan_session_key(params)
     revision_id = _optional_string_param(
         params,
@@ -6495,16 +5007,41 @@ async def _handle_plans_revise(params: dict | None, ctx: RpcContext) -> dict:
         raise ValueError("params.planRevisionId is required")
     if prompt is None:
         raise ValueError("params.prompt is required")
+    if not _explicit_ingress_intent_registered:
+        runtime = getattr(ctx, "task_runtime", None)
+        register = getattr(runtime, "explicit_ingress_intent", None)
+        if callable(register):
+            async with register(key):
+                return cast(
+                    dict[Any, Any],
+                    await _handle_plans_revise(
+                        params,
+                        ctx,
+                        _explicit_ingress_intent_registered=True,
+                    ),
+                )
     if ctx.session_manager is None:
         raise RpcUnavailableError("Session manager is not configured")
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
         raise RpcUnavailableError("Session storage is not configured")
-    client_request_id = _optional_string_param(
-        params,
-        "clientRequestId",
-        "client_request_id",
-    ) or uuid.uuid4().hex
+    goal_run = await _goal_owned_plan_run_for_revision(storage, revision_id)
+    if goal_run is not None:
+        raise RpcHandlerError(
+            "PLAN_RUN_GOAL_OWNED",
+            "This revision belongs to a Goal run and cannot be revised through Plan mode.",
+            details={"runId": goal_run.run_id},
+            retryable=False,
+            accepted=False,
+        )
+    client_request_id = (
+        _optional_string_param(
+            params,
+            "clientRequestId",
+            "client_request_id",
+        )
+        or uuid.uuid4().hex
+    )
     provider_message = (
         "Create a complete replacement for the current plan revision. "
         "Preserve still-valid context, incorporate the user's requested changes, "
@@ -6530,82 +5067,48 @@ async def _handle_plans_revise(params: dict | None, ctx: RpcContext) -> dict:
         "prompt": prompt,
     }
 
-    # Idempotent retries must replay even after the first request has already
-    # committed a replacement and made ``revision_id`` non-current.
-    get_ingress_receipt = getattr(storage, "get_turn_ingress_receipt", None)
-    if callable(get_ingress_receipt):
-        source_hint = _normalize_session_send_source_hint(send_params)
-        identity = request_identity(
-            send_params,
-            request_session_key=key,
-            source_scope=_turn_source_scope(source_hint, ctx),
-            fingerprint_params=fingerprint_params,
-        )
-        previous = await get_ingress_receipt(
-            source_scope=identity.source_scope,
-            request_session_key=identity.request_session_key,
-            client_request_id=identity.client_request_id,
-        )
-        if previous is not None:
-            replay_session_before_send = await storage.get_session(key)
-            result = await _handle_sessions_send(
-                send_params,
-                ctx,
-                fingerprint_params=fingerprint_params,
-                plan_context_revision_id=revision_id,
-                required_collaboration_mode="plan",
-                required_collaboration_revision=(
-                    int(replay_session_before_send.collaboration_revision or 0)
-                    if replay_session_before_send is not None
-                    else None
-                ),
-            )
-            replay_session = await storage.get_session(key)
-            collaboration = (
-                _plan_collaboration_snapshot(replay_session)
-                if replay_session is not None
-                else {"mode": "plan", "revision": 0, "appliesTo": "next_turn"}
-            )
-            return {
-                **result,
-                "sessionKey": key,
-                "collaboration": collaboration,
-            }
     session = await storage.get_session(key)
     if session is None:
         raise KeyError(f"Session not found: {key}")
-    if session.active_plan_revision_id != revision_id:
-        raise RpcHandlerError(
-            "PLAN_REVISION_CHANGED",
-            "The selected plan is no longer the current revision.",
-            retryable=False,
-            accepted=False,
-        )
-    if session.collaboration_mode != "plan":
-        session = await storage.set_collaboration_mode(
+    command = replace(
+        decode_admit_turn(
+            send_params,
+            principal_role=str(ctx.principal.role),
+            connection_id=ctx.conn_id,
+            fingerprint_params=fingerprint_params,
+        ),
+        plan=PlanAdmissionContext(
+            context_revision_id=revision_id,
+            required_collaboration_mode="plan",
+            expected_collaboration_revision=int(session.collaboration_revision or 0),
+            expected_active_revision_id=revision_id,
+            atomic_mode_update=True,
+        ),
+        explicit_intent_registered=_explicit_ingress_intent_registered,
+    )
+    try:
+        result = await build_turn_admission_application(ctx).admit(command)
+    except Exception as exc:
+        mapped = map_admission_error(exc)
+        if mapped is exc:
+            raise
+        raise mapped from exc
+    accepted_session = await storage.get_session(key)
+    collaboration = (
+        _plan_collaboration_snapshot(accepted_session)
+        if accepted_session is not None
+        else {"mode": "plan", "revision": 0, "appliesTo": "next_turn"}
+    )
+    if not bool(result.get("replayed")):
+        await _emit_to_subscribers(
+            ctx,
             key,
-            "plan",
-            expected_revision=int(session.collaboration_revision or 0),
+            "session.event.collaboration_mode",
+            {"session_key": key, "collaboration": collaboration},
         )
-    collaboration = _plan_collaboration_snapshot(session)
-    await _emit_to_subscribers(
-        ctx,
-        key,
-        "session.event.collaboration_mode",
-        {"session_key": key, "collaboration": collaboration},
-    )
-    result = await _handle_sessions_send(
-        send_params,
-        ctx,
-        fingerprint_params=fingerprint_params,
-        plan_context_revision_id=revision_id,
-        required_collaboration_mode="plan",
-        required_collaboration_revision=int(session.collaboration_revision or 0),
-    )
     return {**result, "sessionKey": key, "collaboration": collaboration}
 
 
-@_d.method("plans.cancelRun", scope="operator.write")
 async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_plan_session_key(params)
     run_id = _optional_string_param(params, "runId", "run_id")
@@ -6619,6 +5122,14 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
     run = await storage.get_plan_run(run_id)
     if run is None or run.session_key != key:
         raise KeyError(f"Plan run not found: {run_id}")
+    if str(getattr(run, "driver_kind", "") or "") == "goal":
+        raise RpcHandlerError(
+            "PLAN_RUN_GOAL_OWNED",
+            "This execution belongs to Goal mode; use the Goal controls to pause or clear it.",
+            details={"runId": run.run_id},
+            retryable=False,
+            accepted=False,
+        )
     expected_raw = (params or {}).get(
         "expectedStateRevision",
         (params or {}).get("expected_state_revision"),
@@ -6631,7 +5142,6 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
         expected_revision = expected_raw
     from opensquilla.session.plans import (
         PLAN_RUN_ACTIVE_STATUSES,
-        PlanRunConflictError,
         plan_run_snapshot,
     )
 
@@ -6639,9 +5149,7 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
         return RpcHandlerError(
             "PLAN_RUN_CHANGED",
             str(exc),
-            details={
-                "planRun": plan_run_snapshot(latest) if latest is not None else None
-            },
+            details={"planRun": plan_run_snapshot(latest) if latest is not None else None},
             retryable=True,
             accepted=False,
         )
@@ -6672,11 +5180,7 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
             task_runtime = getattr(ctx, "task_runtime", None)
             runtime_cancel = getattr(task_runtime, "cancel", None)
             runtime_wait = getattr(task_runtime, "wait", None)
-            if (
-                task_runtime is None
-                or not callable(runtime_cancel)
-                or not callable(runtime_wait)
-            ):
+            if task_runtime is None or not callable(runtime_cancel) or not callable(runtime_wait):
                 raise RpcUnavailableError(
                     "Task runtime is unavailable; the implementation was not cancelled"
                 )
@@ -6746,6 +5250,38 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
     return {"sessionKey": key, "planRun": snapshot}
 
 
+_handle_plans_set_mode_contract = register_plans_set_mode_contract(
+    _d,
+    _handle_plans_set_mode,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_plans_implement_contract = register_plans_implement_contract(
+    _d,
+    _handle_plans_implement,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_plans_revise_contract = register_plans_revise_contract(
+    _d,
+    _handle_plans_revise,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_plans_cancel_run_contract = register_plans_cancel_run_contract(
+    _d,
+    _handle_plans_cancel_run,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_plans_capabilities_contract = register_plans_capabilities_contract(
+    _d,
+    _handle_plans_capabilities,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 @_d.method("sessions.bootstrap", scope="operator.read")
 async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> dict:
     """Return the canonical startup snapshot for an interactive session client.
@@ -6763,7 +5299,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     if storage is None:
         raise KeyError("No session storage available")
 
-    session = await _resolve_session_node(storage, key)
+    session = await _resolve_session_record_for_bootstrap(storage, key)
     session_key = canonicalize_session_key(session.session_key)
     # Capture the cursor before the slower durable reads below.  A client that
     # subscribes from this cursor may see duplicate state (deduped by stable
@@ -6784,68 +5320,95 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         if isinstance(params, dict) and source in params:
             history_params[target] = params[source]
 
-    # Local import avoids making rpc_chat/rpc_sessions module registration
-    # order part of the public RPC contract.
-    from opensquilla.gateway.rpc_chat import _handle_chat_history
-
-    history = await _handle_chat_history(history_params, ctx)
+    history = await read_chat_history_v4(history_params, ctx)
     task_rows = await _list_task_rows(ctx, storage, session_key)
     task_state = _task_state_summary(task_rows)
+    await _overlay_runtime_task_snapshot(ctx, session_key, task_state)
     await _attach_active_steer_capability(ctx, session_key, task_state)
     epoch = await _bootstrap_epoch(ctx.session_manager, storage, session, session_key)
-    queued_count = sum(
-        1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "queued"
-    )
-    running_count = sum(
-        1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "running"
-    )
+    live_queued_ids = task_state.get("queued_task_ids")
+    if isinstance(live_queued_ids, list):
+        queued_count = len(live_queued_ids)
+        active_task = task_state.get("active_task")
+        running_count = int(
+            isinstance(active_task, dict) and active_task.get("status") == "running"
+        )
+    else:
+        queued_count = sum(
+            1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "queued"
+        )
+        running_count = sum(
+            1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "running"
+        )
     agent_id = _effective_agent_id_for_session(session, session_key)
     agent_identity = await _bootstrap_agent_identity(ctx, agent_id)
     effective_model = _session_turn_model(ctx, session, agent_id)
-    from opensquilla.agents.scope import resolve_agent_workspace_dir
+    guest_safe = _is_remote_web_guest(ctx.principal, {})
+    workspace: str | None = None
+    project_snapshot: dict[str, Any] | None = None
+    if not guest_safe:
+        from opensquilla.agents.scope import resolve_agent_workspace_dir
 
-    workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
-    default_workspace = str(workspace_path) if workspace_path is not None else None
-    project_snapshot = await project_workspace_snapshot(storage, session)
-    try:
-        bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
-            storage=storage,
-            session_manager=ctx.session_manager,
-            session=session,
-            config=ctx.config,
-            default_workspace=default_workspace,
-        )
-        workspace: str | None = bootstrap_run_context.workspace or default_workspace
-    except ProjectWorkspaceStateError:
-        snapshot_path = project_snapshot.get("path") if project_snapshot is not None else None
-        workspace = str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
-    from opensquilla.gateway.model_routing import model_routing_snapshot
+        workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
+        default_workspace = str(workspace_path) if workspace_path is not None else None
+        project_snapshot = await project_workspace_snapshot(storage, session)
+        try:
+            bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=ctx.session_manager,
+                session=session,
+                config=ctx.config,
+                default_workspace=default_workspace,
+            )
+            workspace = bootstrap_run_context.workspace or default_workspace
+        except ProjectWorkspaceStateError:
+            snapshot_path = project_snapshot.get("path") if project_snapshot is not None else None
+            workspace = str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
+    from opensquilla.gateway.model_routing import (
+        capture_model_routing_config,
+        model_routing_snapshot,
+    )
 
-    metadata = {
+    routing = await _resolve_session_routing_snapshot(ctx, session_key)
+    effective_routing_config = capture_model_routing_config(
+        ctx.config,
+        session_mode=routing["mode"],
+        session_routing_revision=routing["revision"],
+        session_routing_source=routing["source"],
+    )
+    overlay_live_config = getattr(effective_routing_config, "overlay_live_config", None)
+    effective_runtime_config = (
+        overlay_live_config(ctx.config)
+        if callable(overlay_live_config)
+        else effective_routing_config
+    )
+
+    metadata: dict[str, Any] = {
         "session_key": session_key,
         "session_id": session.session_id,
         "status": session.status,
         "agent_id": session.agent_id,
         "model": getattr(session, "model", None),
         "effective_model": effective_model,
-        "workspace": workspace,
-        "workspace_id": getattr(session, "workspace_id", None),
-        "workspaceId": getattr(session, "workspace_id", None),
-        "projectWorkspace": project_snapshot,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "display_name": getattr(session, "display_name", None),
         "queue_mode": getattr(session, "queue_mode", None),
         **_derive_source_metadata(session),
     }
+    if not guest_safe:
+        metadata.update(
+            {
+                "workspace": workspace,
+                "workspace_id": getattr(session, "workspace_id", None),
+                "workspaceId": getattr(session, "workspace_id", None),
+                "projectWorkspace": project_snapshot,
+            }
+        )
     get_current_plan = getattr(storage, "get_current_plan_revision", None)
     get_active_run = getattr(storage, "get_active_plan_run", None)
-    current_plan = (
-        await get_current_plan(session_key) if callable(get_current_plan) else None
-    )
-    active_plan_run = (
-        await get_active_run(session_key) if callable(get_active_run) else None
-    )
+    current_plan = await get_current_plan(session_key) if callable(get_current_plan) else None
+    active_plan_run = await get_active_run(session_key) if callable(get_active_run) else None
     from opensquilla.session.plans import plan_revision_snapshot, plan_run_snapshot
 
     return {
@@ -6859,25 +5422,564 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             "running_count": running_count,
         },
         "runtime": {
-            "model_routing": model_routing_snapshot(ctx.config),
+            "model_routing": model_routing_snapshot(effective_runtime_config),
         },
+        "routing": routing,
         "collaboration": _plan_collaboration_snapshot(session),
         "currentPlan": (
-            plan_revision_snapshot(current_plan, current=True)
-            if current_plan is not None
-            else None
+            plan_revision_snapshot(current_plan, current=True) if current_plan is not None else None
         ),
         "activePlanRun": (
-            plan_run_snapshot(active_plan_run)
-            if active_plan_run is not None
-            else None
+            plan_run_snapshot(active_plan_run) if active_plan_run is not None else None
         ),
         "planCapabilities": {
             "planMode": True,
             "implementation": ctx.task_runtime is not None,
             "newTaskImplementation": ctx.task_runtime is not None,
-            "goalDriver": False,
+            "goalDriver": True,
         },
         "epoch": epoch,
         "stream_cursor": stream_cursor,
     }
+
+
+class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
+    """Compose fixed storage, authority, content and runtime primitives."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        super().__init__(
+            config=ctx.config,
+            manager=ctx.session_manager,
+            runtime=ctx.task_runtime,
+            runner=ctx.turn_runner,
+            is_owner=ctx.principal.is_owner,
+            host_execute_allowed=principal_has_host_execute(ctx.principal),
+            publish=partial(_emit_to_subscribers, ctx),
+            normalize_terminal=_normalize_terminal_event_payload,
+            session_model=partial(_session_turn_model, ctx),
+            tui_connection=is_registered_tui_connection(ctx.conn_id),
+        )
+        self._native_sessions = ctx.session_manager
+        self.sessions = (
+            GatewayAdmissionSessions(ctx.session_manager)
+            if ctx.session_manager is not None
+            else None
+        )
+        self.runtime = ctx.task_runtime
+        self._native_storage = get_session_storage(ctx.session_manager)
+        self.storage = (
+            GatewayAdmissionStorage(self._native_storage)
+            if self._native_storage is not None
+            else None
+        )
+        self.is_owner = ctx.principal.is_owner
+        self.direct_registry = get_agent_task_registry()
+        self.uploads = get_upload_store()
+        attachments = getattr(ctx.config, "attachments", None)
+        self.policy = AdmissionPolicy(
+            media_root=media_root_from_config(ctx.config),
+            persist_transcripts=bool(getattr(attachments, "persist_transcripts", True)),
+            disk_budget_bytes=getattr(attachments, "transcript_disk_budget_bytes", None),
+            opaque_max_bytes=getattr(attachments, "opaque_max_bytes", None),
+            accept_opaque=bool(getattr(attachments, "accept_opaque", True)),
+            project_run_mode=project_default_run_mode(ctx.config),
+            default_run_mode=config_run_mode(ctx.config),
+        )
+        self.session_lock = partial(get_session_lock, ctx.turn_runner)
+        self.effective_agent_id = _effective_agent_id_for_session
+        self.new_session_key = _create_session_key
+        self.collaboration_snapshot = _plan_collaboration_snapshot
+        self.routing_snapshot = partial(_resolve_session_routing_snapshot, ctx)
+        self._should_auto_title = partial(_should_auto_title, ctx)
+        self._fork_session = partial(_fork_with_numbered_title, ctx)
+        self._fork_title_allocation = partial(_fork_title_allocation_context, ctx)
+        self._next_fork_title = partial(_next_fork_display_name, ctx)
+        self.schedule_auto_title = partial(_schedule_auto_title, ctx)
+        self.steer_metric = _emit_steer_metric
+        self.positive_int = _coerce_positive_int
+        self.workspace_error = partial(map_project_workspace_error, owner=self.is_owner)
+        self.validate_initial_routing = partial(model_routing_patches, ctx.config)
+        self._emit_disposition = partial(
+            _publish_admission_disposition,
+            ctx,
+        )
+        self._emit_forked = partial(_publish_admission_forked, ctx)
+        self._emit_collaboration = partial(_publish_admission_collaboration, ctx)
+        self._principal = ctx.principal
+        self._clear_compaction = getattr(ctx.turn_runner, "clear_compacted_this_turn", None)
+        self._route_preparation = partial(
+            prepare_admission_route,
+            config=ctx.config,
+            principal=ctx.principal,
+            conn_id=ctx.conn_id,
+            media_root=self.policy.media_root,
+            preview_service=getattr(ctx, "artifact_preview_service", None),
+            effective_agent_id=_effective_agent_id_for_session,
+            guest_profile_factory=lambda task_id: _guest_profile_for_principal(
+                ctx.principal, task_id, state_dir=ctx.config.state_dir
+            ),
+            event_emitter_factory=partial(_artifact_state_event_emitter, ctx),
+            page_context_resolver=partial(resolve_page_context, ctx=ctx),
+        )
+        self._run_mode_hint = partial(_trusted_run_mode_hint, ctx)
+        self._elevated_hint = partial(_trusted_elevated_hint, ctx)
+
+    def _require_storage(self, storage: AdmissionStorage) -> None:
+        if storage is not self.storage or self._native_storage is None:
+            raise ValueError("Admission storage is not bound to this operation")
+
+    async def accepted_response(
+        self,
+        acceptance: AdmissionAcceptance,
+        *,
+        client_request_id: str,
+        storage: AdmissionStorage,
+        turn_context: dict[str, Any] | None = None,
+        ) -> AdmitTurnResult:
+        self._require_storage(storage)
+        if not isinstance(acceptance, TurnAcceptanceResult):
+            raise TypeError("Accepted response requires a durable acceptance result")
+        return await _accepted_turn_response(
+            acceptance,
+            client_request_id=client_request_id,
+            storage=self._native_storage,
+            turn_context=turn_context,
+        )
+
+    async def should_auto_title(
+        self,
+        storage: AdmissionStorage,
+        session: AdmissionSessionIdentity,
+        key: str,
+        session_id: str,
+    ) -> bool:
+        self._require_storage(storage)
+        return await self._should_auto_title(self._native_storage, session, key, session_id)
+
+    async def fork_session(
+        self,
+        storage: AdmissionStorage,
+        parent_key: str,
+        child_key: str,
+        *,
+        explicit_title: str | None,
+        fork_transcript: bool,
+        status: str,
+        fork_before_message_id: str,
+    ) -> AdmissionSessionIdentity:
+        self._require_storage(storage)
+        with translate_admission_failure():
+            node = await self._fork_session(
+                self._native_storage,
+                parent_key,
+                child_key,
+                explicit_title=explicit_title,
+                fork_transcript=fork_transcript,
+                status=SessionStatus(status),
+                fork_before_message_id=fork_before_message_id,
+            )
+        if not isinstance(node, AdmissionSessionIdentity):
+            raise TypeError("Fork did not return a session identity")
+        return node
+
+    @contextlib.asynccontextmanager
+    async def fork_title_allocation(
+        self, storage: AdmissionStorage, parent: AdmissionSessionIdentity
+    ):
+        self._require_storage(storage)
+        with translate_admission_failure():
+            async with self._fork_title_allocation(self._native_storage, parent):
+                yield
+
+    async def next_fork_title(
+        self, storage: AdmissionStorage, parent: AdmissionSessionIdentity
+    ) -> str:
+        self._require_storage(storage)
+        with translate_admission_failure():
+            return await self._next_fork_title(self._native_storage, parent)
+
+    def is_remote_guest(self, source: IncomingTurnSource) -> bool:
+        return _is_remote_web_guest(self._principal, source_hint_from_turn(source))
+
+
+    async def prepare_route(
+        self,
+        command: AdmitTurn,
+        *,
+        session: Any,
+        key: str,
+        session_id: str,
+        atomic_intent_plan: Any,
+        workspace_guard: Any,
+    ) -> PreparedRuntimeRoute:
+        if self.storage is None or self.sessions is None or self._native_storage is None:
+            raise KeyError("No session storage available")
+        source = source_hint_from_turn(command.source)
+        return await self._route_preparation(
+            command,
+            storage=self._native_storage,
+            sessions=self._native_sessions,
+            session=session,
+            key=key,
+            session_id=session_id,
+            atomic_intent_plan=atomic_intent_plan,
+            workspace_guard=workspace_guard,
+            run_mode_hint=self._run_mode_hint(source),
+            elevated_hint=self._elevated_hint(source),
+            guest_safe=self.is_remote_guest(command.source),
+        )
+
+    @contextlib.asynccontextmanager
+    async def explicit_ingress_intent(self, key: str):
+        register = getattr(self.runtime, "explicit_ingress_intent", None)
+        if callable(register):
+            async with register(key):
+                yield
+        else:
+            yield
+
+
+    def clear_compaction_marker(self, key: str) -> None:
+        if callable(self._clear_compaction):
+            self._clear_compaction(key)
+
+
+    async def publish_forked(self, key: str) -> None:
+        await self._emit_forked(key)
+
+    async def publish_collaboration(self, key: str, collaboration: dict[str, Any]) -> None:
+        await self._emit_collaboration(key, collaboration)
+
+    async def publish_disposition(self, key: str, content: dict[str, Any]) -> None:
+        await self._emit_disposition(key, content)
+
+
+async def _publish_admission_forked(ctx: RpcContext, key: str) -> None:
+    await _emit_to_subscribers(
+        ctx,
+        key,
+        "sessions.changed",
+        build_sessions_changed_payload(key, "forked", run_status="idle"),
+    )
+
+
+async def _publish_admission_collaboration(
+    ctx: RpcContext,
+    key: str,
+    collaboration: dict[str, Any],
+) -> None:
+    await _emit_to_subscribers(
+        ctx,
+        key,
+        "session.event.collaboration_mode",
+        {
+            "session_key": key,
+            "collaboration": collaboration,
+            "appliesTo": "current_turn",
+        },
+    )
+
+
+async def _publish_admission_disposition(
+    ctx: RpcContext,
+    key: str,
+    content: dict[str, Any],
+) -> None:
+    await _emit_to_subscribers(ctx, key, "session.event.input_disposition", content)
+
+
+def build_turn_admission_application(ctx: RpcContext) -> TurnAdmission:
+    return TurnAdmission(
+        ingress=DurableTurnAdmission(cast(AdmissionPrimitives, _GatewayAdmissionPrimitives(ctx))),
+        cancellation=TurnCancellation(
+            _GatewayCancellationPorts(ctx),
+            timing=CancellationTiming(
+                response_seconds=_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS,
+                cleanup_seconds=_ABORT_OWNED_CLEANUP_SECONDS,
+                lookup_seconds=_ABORT_SESSION_LOOKUP_SECONDS,
+                tree_passes=_ABORT_TREE_STABILIZATION_PASSES,
+            ),
+            clock=time.monotonic,
+        ),
+        steering=TurnSteering(
+            GatewaySteeringPrimitives(
+                session_manager=ctx.session_manager,
+                task_runtime=ctx.task_runtime,
+                emit_steer=partial(_publish_admission_steer, ctx),
+                emit_disposition=partial(_publish_admission_disposition, ctx),
+            )
+        ),
+    )
+
+
+async def _publish_admission_steer(ctx: RpcContext, key: str, content: dict[str, Any]) -> None:
+    await _emit_to_subscribers(ctx, key, "session.event.steer", content)
+
+
+def build_gateway_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
+    """Bind aliases to the same application, preserving request authority."""
+    return GatewayTurnAdmissionAdapter(
+        build_turn_admission_application(ctx),
+        principal_role=str(ctx.principal.role),
+        connection_id=ctx.conn_id,
+        is_owner=ctx.principal.is_owner,
+    )
+
+
+def _session_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
+    return build_gateway_turn_admission_adapter(ctx)
+
+
+async def _handle_sessions_send_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).admit(params, surface="session")
+
+
+async def _handle_sessions_abort_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).cancel(params, surface="session")
+
+
+async def _handle_sessions_steer_v2_contract(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    return await _session_turn_admission_adapter(ctx).steer(params)
+
+
+_handle_sessions_send_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.send",
+    _handle_sessions_send_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_abort_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.abort",
+    _handle_sessions_abort_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_steer_v2_generated_contract = register_turn_admission_contract(
+    _d,
+    "sessions.steer.v2",
+    _handle_sessions_steer_v2_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+class _GatewayPendingInputQueuePort(GatewayPendingInputPrimitives, PendingInputQueuePort):
+    """Concrete queue Port backed by the single durable SessionStorage path."""
+
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    @property
+    def storage(self) -> SessionStorage:
+        return _pending_input_storage(self._context)
+
+    @property
+    def config(self) -> object:
+        return self._context.config
+
+    def owner_lock(self, pending_input_id: str) -> asyncio.Lock:
+        return _pending_input_lock_for(pending_input_id)
+
+    def session_lock(self, key: str):
+        return get_session_lock(self._context.turn_runner, key) or contextlib.nullcontext()
+
+    async def replay_dispatch(
+        self,
+        source_scope: str,
+        key: str,
+        request_id: str,
+    ) -> PendingDispatchReplay | None:
+        storage = self.storage
+        replay = await storage.replay_turn_ingress_receipt(
+            source_scope=source_scope,
+            request_session_key=key,
+            client_request_id=request_id,
+        )
+        if replay is None:
+            return None
+        result = await _accepted_turn_response(
+            replay, client_request_id=request_id, storage=storage
+        )
+        return PendingDispatchReplay(
+            replay.receipt.request_fingerprint,
+            replay.receipt.session_id,
+            cast(AdmitTurnResult, result),
+        )
+
+    async def list_items(self, key: str) -> list[PendingInputProjection]:
+        rows = await _pending_input_storage(self._context).list_pending_chat_inputs(key)
+        return [cast(PendingInputProjection, pending_input_projection(row)) for row in rows]
+
+    async def reposition(
+        self,
+        key: str,
+        pending_input_id: str,
+        revision: int,
+        position: int,
+    ) -> PendingInputProjection:
+        try:
+            row = await _pending_input_storage(self._context).update_pending_chat_input(
+                pending_input_id,
+                session_key=key,
+                expected_revision=revision,
+                position=position,
+            )
+        except PendingChatInputNotFoundError as exc:
+            raise PendingInputMissingError from exc
+        except PendingChatInputConflictError as exc:
+            raise PendingInputConflictError from exc
+        return cast(PendingInputProjection, pending_input_projection(row))
+
+    async def reorder_durable(
+        self,
+        key: str,
+        revisions: tuple[PendingInputRevision, ...],
+    ) -> list[PendingInputProjection]:
+        try:
+            rows = await _pending_input_storage(self._context).reorder_pending_chat_inputs(
+                session_key=key,
+                expected_revisions=[
+                    (item.pending_input_id, item.expected_revision) for item in revisions
+                ],
+            )
+        except PendingChatInputConflictError as exc:
+            raise PendingInputConflictError from exc
+        return [cast(PendingInputProjection, pending_input_projection(row)) for row in rows]
+
+    @asynccontextmanager
+    async def cancellation_lock(self, pending_input_id: str) -> AsyncIterator[None]:
+        try:
+            async with _pending_input_lock_for(pending_input_id):
+                yield
+        except PendingChatInputConflictError as exc:
+            raise PendingCancellationConflictError from exc
+
+    async def cancellation_material_scopes(self, key: str, pending_input_id: str) -> set[str]:
+        storage = _pending_input_storage(self._context)
+        row = await storage.get_pending_chat_input(pending_input_id)
+        scopes = _pending_input_attachment_scopes(row)
+        current = await _pending_input_current_session_id(storage, key)
+        if current is not None:
+            # Recover an owner materialized before an interrupted queue insert.
+            scopes.add(current)
+        return scopes
+
+    async def cancel_durable(self, key: str, pending_input_id: str, revision: int | None) -> bool:
+        return await _pending_input_storage(self._context).cancel_pending_chat_input(
+            pending_input_id,
+            session_key=key,
+            expected_revision=revision,
+        )
+
+    async def cleanup_promotions(self, key: str, pending_input_id: str, scopes: set[str]) -> None:
+        await _cleanup_unreferenced_pending_promotions(
+            ctx=self._context,
+            storage=_pending_input_storage(self._context),
+            session_key=key,
+            pending_input_id=pending_input_id,
+            source_session_ids=scopes,
+        )
+
+    def cleanup_material(self, pending_input_id: str, scopes: set[str]) -> None:
+        _cleanup_pending_input_scopes(
+            ctx=self._context,
+            pending_input_id=pending_input_id,
+            session_ids=scopes,
+        )
+
+
+def _pending_input_queue_adapter(ctx: RpcContext) -> GatewayPendingInputQueueAdapter:
+    return GatewayPendingInputQueueAdapter(
+        _GatewayPendingInputQueuePort(ctx),
+        turns=build_turn_admission_application(ctx),
+        principal_role=str(getattr(ctx.principal, "role", "operator") or "operator"),
+        is_owner=ctx.principal.is_owner,
+    )
+
+
+async def _handle_pending_inputs_enqueue_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).enqueue(params)
+
+
+async def _handle_pending_inputs_list_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).list(params)
+
+
+async def _handle_pending_inputs_update_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).update(params)
+
+
+async def _handle_pending_inputs_reorder_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).reorder(params)
+
+
+async def _handle_pending_inputs_cancel_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).cancel(params)
+
+
+async def _handle_pending_inputs_dispatch_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).dispatch(params)
+
+
+async def _handle_pending_inputs_steer_contract(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    return await _pending_input_queue_adapter(ctx).steer(params)
+
+
+for _pending_method, _pending_implementation in (
+    ("sessions.pending_inputs.enqueue", _handle_pending_inputs_enqueue_contract),
+    ("sessions.pending_inputs.list", _handle_pending_inputs_list_contract),
+    ("sessions.pending_inputs.update", _handle_pending_inputs_update_contract),
+    ("sessions.pending_inputs.reorder", _handle_pending_inputs_reorder_contract),
+    ("sessions.pending_inputs.cancel", _handle_pending_inputs_cancel_contract),
+    ("sessions.pending_inputs.dispatch", _handle_pending_inputs_dispatch_contract),
+    ("sessions.pending_inputs.steer", _handle_pending_inputs_steer_contract),
+):
+    register_pending_input_queue_contract(
+        _d,
+        _pending_method,
+        _pending_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+
+
+_SESSION_CONTROL_CONTRACT_IMPLEMENTATIONS = {
+    "sessions.subscribe": _handle_sessions_subscribe,
+    "sessions.unsubscribe": _handle_sessions_unsubscribe,
+    "sessions.routing.get": _handle_sessions_routing_get,
+    "sessions.routing.set": _handle_sessions_routing_set,
+}
+
+_SESSION_CONTROL_CONTRACT_HANDLERS = {
+    method: register_session_control_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _SESSION_CONTROL_CONTRACT_IMPLEMENTATIONS.items()
+}

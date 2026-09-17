@@ -12,7 +12,7 @@ from opensquilla.onboarding.config_store import (
     persist_config,
     resolve_config_path,
 )
-from opensquilla.sandbox.run_mode import RunMode, run_mode_config_patch
+from opensquilla.run_mode import RunMode, run_mode_config_patch
 from opensquilla.sandbox.status import status_payload as _status_payload
 
 sandbox_app = typer.Typer(help="Show or change the default sandbox posture.")
@@ -35,6 +35,7 @@ def _resolve_path(config_path: Path | None) -> Path:
 def _apply_run_mode(config, run_mode: RunMode):
     patch = run_mode_config_patch(run_mode)
     config.sandbox.run_mode = patch.run_mode.value
+    config.mark_force_persist("sandbox.run_mode")
     config.sandbox.sandbox = patch.sandbox
     config.sandbox.security_grading = patch.security_grading
     config.sandbox.network_default = patch.network_default
@@ -81,22 +82,9 @@ def sandbox_status(
 def sandbox_bypass(
     config_path: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Use Full Host Access for owner calls while retaining sandbox capability."""
+    """Legacy alias for Full Host Access."""
 
-    target = _resolve_path(config_path)
-    config = load_config(target)
-    capability = run_mode_config_patch(RunMode.STANDARD)
-    config.sandbox.run_mode = None
-    config.sandbox.sandbox = capability.sandbox
-    config.sandbox.security_grading = capability.security_grading
-    config.sandbox.network_default = capability.network_default
-    config.permissions.default_mode = "bypass"
-    persist_config(config, path=target, restart_required=True)
-    payload = _status_payload(config, restart_required=True)
-    typer.echo(
-        "Sandbox run mode set to "
-        f"{payload['run_mode_label']}. Restart the gateway for running processes to apply it."
-    )
+    _write_run_mode(config_path, RunMode.FULL)
 
 
 @sandbox_app.command("full")
@@ -108,22 +96,31 @@ def sandbox_full(
     _write_run_mode(config_path, RunMode.FULL)
 
 
-@sandbox_app.command("on")
+@sandbox_app.command("safe")
+def sandbox_safe(
+    config_path: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """Use the system sandbox and configured Safe policies."""
+
+    _write_run_mode(config_path, RunMode.SAFE)
+
+
+@sandbox_app.command("on", hidden=True)
 def sandbox_on(
     config_path: Path | None = typer.Option(None, "--config"),
 ) -> None:
     """Restore the default sandboxed posture."""
 
-    _write_run_mode(config_path, RunMode.TRUSTED)
+    _write_run_mode(config_path, RunMode.SAFE)
 
 
-@sandbox_app.command("trust")
+@sandbox_app.command("trust", hidden=True)
 def sandbox_trust(
     config_path: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Keep sandboxing enabled while using Managed Execution."""
+    """Legacy alias for Safe."""
 
-    _write_run_mode(config_path, RunMode.TRUSTED)
+    _write_run_mode(config_path, RunMode.SAFE)
 
 
 @sandbox_app.command("reset")
@@ -132,4 +129,4 @@ def sandbox_reset(
 ) -> None:
     """Reset sandbox posture to OpenSquilla defaults."""
 
-    sandbox_bypass(config_path)
+    sandbox_safe(config_path)

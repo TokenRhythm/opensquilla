@@ -5,6 +5,8 @@ import { useChatRenderedMessages } from './useChatRenderedMessages'
 import type { ChatMessage, ChatRouterTierConfig } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type { TimeTranslator } from '@/utils/messageTime'
+import { workspacePreviewOpenAction, workspacePreviewsFromMessage } from '@/utils/chat/workspacePreviews'
 
 function renderedMessagesForRouterVisualMode(
   visualMode: 'real_candidates' | 'legacy_grid',
@@ -36,6 +38,7 @@ function renderedMessagesFor(
   messages: ChatMessage[],
   interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map()),
   routerVisualEffectsEnabled = false,
+  timeTranslator?: TimeTranslator,
 ) {
   return useChatRenderedMessages({
     messages: ref<ChatMessage[]>(messages),
@@ -50,8 +53,179 @@ function renderedMessagesFor(
     stripGeneratedArtifactMarkers: text => text,
     stripTimePrefix: text => text,
     isSubagentCompletionMessage: () => false,
+    timeTranslator,
   })
 }
+
+describe('useChatRenderedMessages scheduled provenance', () => {
+  it('keeps persisted sources and labels live cron completions before history arrives', () => {
+    const api = renderedMessagesFor([
+      { role: 'user', text: 'Run the inventory check.', ts: 1, provenanceKind: 'cron' },
+      { role: 'assistant', text: '12 items.', ts: 2, turnRunKind: 'cron_turn' },
+      { role: 'user', text: 'Scheduled trigger is a useful label.', ts: 3 },
+      { role: 'assistant', text: 'A normal follow-up.', ts: 4, turnRunKind: 'session_turn' },
+      { role: 'assistant', text: 'Persisted result.', ts: 5, provenanceKind: 'cron' },
+    ])
+
+    expect(api.renderedMessages.value.map(message => message.provenanceKind))
+      .toEqual(['cron', 'cron', undefined, undefined, 'cron'])
+  })
+})
+
+describe('useChatRenderedMessages annotation-only user turns', () => {
+  it('keeps the live optimistic row when prompt annotations are the only visible payload', () => {
+    const api = renderedMessagesFor([{
+      role: 'user',
+      text: '',
+      ts: 1,
+      clientId: 'client-annotation-1',
+      promptAnnotations: [{
+        annotationId: 'annotation-1',
+        documentId: 'document-1',
+        documentName: 'page.html',
+        revisionId: 'revision-1',
+        generation: 1,
+        anchorId: 'anchor-1',
+        body: 'Make the primary action red.',
+        tagName: 'button',
+        locator: { start_offset: 7 },
+        quote: '<button>',
+        sourceExcerpt: null,
+        sentOrder: 0,
+      }],
+    }])
+
+    expect(api.renderedMessages.value).toHaveLength(1)
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      displayRole: 'user',
+      text: '',
+      clientId: 'client-annotation-1',
+      promptAnnotations: [{
+        annotationId: 'annotation-1',
+        body: 'Make the primary action red.',
+      }],
+    })
+  })
+
+  it('still suppresses internal empty control turns without visible payload', () => {
+    const api = renderedMessagesFor([{
+      role: 'user',
+      text: '',
+      ts: 1,
+      clientId: 'client-control-1',
+    }])
+
+    expect(api.renderedMessages.value).toEqual([])
+  })
+})
+
+describe('useChatRenderedMessages maintenance events', () => {
+  it('localizes projected relative times for shared chat consumers', () => {
+    const api = renderedMessagesFor(
+      [{ role: 'user', text: 'hello', ts: Date.now() - 5 * 60_000 }],
+      undefined,
+      false,
+      (key, named) => `localized:${key}:${named?.n ?? ''}`,
+    )
+
+    expect(api.renderedMessages.value[0]?.timeStr).toBe(
+      'localized:chat.time.minutesAgo:5',
+    )
+  })
+
+  it('preserves the dedicated compaction payload for ChatMessageList', () => {
+    const api = renderedMessagesFor([{
+      role: 'maintenance',
+      text: '',
+      ts: 2_000,
+      messageId: 'maintenance:context-compaction:summary:7',
+      restoredFromHistory: true,
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+        source: 'manual',
+        state: 'completed',
+        durability: 'durable',
+      },
+    }])
+
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      displayRole: 'maintenance',
+      messageId: 'maintenance:context-compaction:summary:7',
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+      },
+    })
+  })
+})
+
+describe('useChatRenderedMessages workspace preview history', () => {
+  it('projects a completed historical preview call into an open action independent of activity disclosure', () => {
+    const result = JSON.stringify({
+      resourceId: 'document:doc_preview',
+      documentId: 'doc_preview',
+      entrypoint: '/tasks/a/beijing-weather.html',
+      previewStatus: 'ready',
+      open: { resourceId: 'document:doc_preview' },
+    })
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: '页面已完成：beijing-weather.html',
+      ts: 1,
+      messageId: 'assistant-preview',
+      turnId: 'turn-preview',
+      restoredFromHistory: true,
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'preview-call',
+          name: 'open_workspace_preview',
+          input: { path: 'beijing-weather.html' },
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'preview-call',
+          name: 'open_workspace_preview',
+          result,
+          is_error: false,
+        },
+      ],
+    }, {
+      role: 'assistant',
+      text: `beijing-weather.html ${result}`,
+      ts: 2,
+      restoredFromHistory: true,
+    }])
+
+    const [message, textOnlyMessage] = api.renderedMessages.value
+    expect(message.toolCalls).toEqual([
+      expect.objectContaining({ toolId: 'preview-call', name: 'open_workspace_preview', status: 'success' }),
+    ])
+    expect(message.timelineItems).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+    ])
+    const links = workspacePreviewsFromMessage(message)
+    expect(links).toEqual([{
+      callId: 'preview-call',
+      documentId: 'doc_preview',
+      name: 'beijing-weather.html',
+      entrypoint: '/tasks/a/beijing-weather.html',
+      relativePath: undefined,
+    }])
+    // The open action does not depend on expanding or rendering the tool timeline.
+    expect(workspacePreviewsFromMessage({ ...message, timelineItems: [] })).toEqual(links)
+    expect(workspacePreviewOpenAction(links[0], 'agent:main:webchat:test')).toEqual({
+      source: 'workspace-preview',
+      documentId: 'doc_preview',
+      name: 'beijing-weather.html',
+      mime: 'text/html',
+      session_key: 'agent:main:webchat:test',
+    })
+    expect(message.artifacts ?? []).toEqual([])
+    expect(workspacePreviewsFromMessage(textOnlyMessage)).toEqual([])
+  })
+})
 
 describe('useChatRenderedMessages plan revisions', () => {
   it('renders a typed plan part once and derives currentness from the active pointer', () => {
@@ -84,6 +258,19 @@ describe('useChatRenderedMessages plan revisions', () => {
             is_error: false,
           },
           {
+            type: 'tool_use',
+            tool_use_id: 'list-dir-1',
+            name: 'list_dir',
+            input: { path: '.' },
+          },
+          {
+            type: 'tool_result',
+            tool_use_id: 'list-dir-1',
+            name: 'list_dir',
+            result: 'README.md',
+            is_error: false,
+          },
+          {
             type: 'plan',
             snapshot: { revisionId: 'revision-2' },
           },
@@ -104,15 +291,26 @@ describe('useChatRenderedMessages plan revisions', () => {
 
     const message = api.renderedMessages.value[0]
     expect(message.text).toBe('')
-    expect(message.timelineItems).toEqual([])
-    expect(message.toolCalls).toEqual([])
+    expect(message.timelineItems).toEqual([
+      expect.objectContaining({
+        type: 'tool-group',
+        group: expect.objectContaining({
+          calls: [expect.objectContaining({ name: 'list_dir', toolId: 'list-dir-1', status: 'success' })],
+        }),
+      }),
+    ])
+    expect(message.toolCalls).toEqual([
+      expect.objectContaining({ name: 'list_dir', toolId: 'list-dir-1', status: 'success' }),
+    ])
     expect(message.planRevisions?.[0]?.current).toBe(true)
-    expect(message.parts).toEqual([
+    expect(message.parts).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'plan',
         plan: expect.objectContaining({ revisionId: 'revision-2', current: true }),
       }),
-    ])
+      expect.objectContaining({ type: 'tool', toolName: 'list_dir' }),
+    ]))
+    expect(message.parts?.filter(part => part.type === 'plan')).toHaveLength(1)
     expect(message.parts?.some(part => part.type === 'text')).toBe(false)
 
     currentPlanRevisionId.value = 'revision-3'
@@ -157,9 +355,703 @@ describe('useChatRenderedMessages internal control turns', () => {
     expect(api.renderedMessages.value).toHaveLength(1)
     expect(api.renderedMessages.value[0]?.hasAttachments).toBe(true)
   })
+
+  it('keeps subagent completion control rows out while retaining the parent creation route', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'Create a child chat', ts: 1, turnId: 'parent-turn' },
+      {
+        role: 'router',
+        text: '',
+        ts: 2,
+        turnId: 'parent-turn',
+        provenanceKind: 'router_decision',
+        routerDecision: {
+          tier: 'c0',
+          model: 'deepseek-v4-flash',
+          source: 'heuristic',
+        },
+      },
+      {
+        role: 'system',
+        text: '{"type":"subagent_completion","child_session_key":"agent:main:subagent:child1"}',
+        ts: 3,
+        provenanceKind: 'internal_system',
+        provenanceSourceTool: 'subagent_completion',
+        provenanceSourceSessionKey: 'agent:main:subagent:child1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: 4,
+        turnId: 'parent-turn',
+        usage: {
+          routed_tier: 'c0',
+          routed_model: 'deepseek-v4-flash',
+          routing_source: 'heuristic',
+        },
+        tool_calls: [
+          {
+            type: 'tool_use',
+            tool_use_id: 'spawn-1',
+            name: 'sessions_spawn',
+            input: { task: 'Do the work' },
+          },
+          {
+            type: 'tool_result',
+            tool_use_id: 'spawn-1',
+            name: 'sessions_spawn',
+            result: '{"session_key":"agent:main:subagent:child1"}',
+            is_error: false,
+          },
+        ],
+      },
+      { role: 'assistant', text: 'Child completed', ts: 5, turnId: 'parent-resume' },
+    ]
+    const api = useChatRenderedMessages({
+      messages: ref(messages),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'deepseek-v4-flash', c1: 'deepseek-v4-pro' }),
+      routerTierConfigs: ref({
+        c0: { model: 'deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek-v4-pro', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: (role, text, message) => (
+        role === 'system'
+        && (
+          message?.provenanceSourceTool === 'subagent_completion'
+          || text.includes('"type":"subagent_completion"')
+        )
+      ),
+    })
+
+    expect(api.renderedMessages.value.find(message => message.isRouterStrip)?.gridCells)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ model: 'deepseek-v4-flash' })]))
+    expect(api.renderedMessages.value.some(message => message.displayRole === 'subagent')).toBe(false)
+    expect(api.renderedMessages.value.some(message => message.text.includes('subagent_completion'))).toBe(false)
+    expect(api.renderedMessages.value.find(message => (
+      message.sourceIndex === 3 && message.displayRole === 'assistant'
+    ))?.toolCalls)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ name: 'sessions_spawn' })]))
+    expect(api.renderedMessages.value.find(message => (
+      message.sourceIndex === 3 && message.displayRole === 'assistant'
+    ))?.createdSessionLinks)
+      .toEqual([])
+    const parentReply = api.renderedMessages.value[api.renderedMessages.value.length - 1]
+    expect(parentReply?.text).toBe('Child completed')
+    expect(parentReply?.createdSessionLinks).toEqual([{
+      callId: 'spawn-1',
+      sessionKey: 'agent:main:subagent:child1',
+    }])
+  })
+
+  it('shows the actual inherited model route on the child session', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Do the work', ts: 1 },
+        {
+          role: 'assistant',
+          text: 'Done',
+          ts: 2,
+          restoredFromHistory: true,
+          usage: {
+            model: 'deepseek-v4-pro',
+            routed_model: 'deepseek-v4-pro',
+            routing_source: 'none',
+            routing_applied: true,
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:subagent:child1'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'deepseek-v4-flash', c1: 'deepseek-v4-pro' }),
+      routerTierConfigs: ref({
+        c0: { model: 'deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek-v4-pro', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerSource).toBe('session_model')
+    expect(strip?.gridCells?.[strip.winnerIdx ?? -1]?.model).toBe('deepseek-v4-pro')
+    expect(api.renderedMessages.value[api.renderedMessages.value.length - 1]?.text).toBe('Done')
+  })
+
+  it('keeps the card at its source when completion identity is missing', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        {
+          role: 'assistant',
+          text: '',
+          ts: 1,
+          tool_calls: [{
+            type: 'tool_result',
+            tool_use_id: 'spawn-1',
+            name: 'sessions_spawn',
+            result: '{"session_key":"agent:main:subagent:child1"}',
+            is_error: false,
+          }],
+        },
+        {
+          role: 'system',
+          text: '{"type":"subagent_completion"}',
+          ts: 2,
+          provenanceSourceTool: 'subagent_completion',
+        },
+        { role: 'assistant', text: 'Unrelated parent reply', ts: 3 },
+      ]),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(false),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: (role, text, message) => (
+        role === 'system'
+        && (message?.provenanceSourceTool === 'subagent_completion'
+          || text.includes('"type":"subagent_completion"'))
+      ),
+    })
+
+    expect(api.renderedMessages.value.find(message => message.sourceIndex === 0)?.createdSessionLinks)
+      .toEqual([{ callId: 'spawn-1', sessionKey: 'agent:main:subagent:child1' }])
+    expect(api.renderedMessages.value.find(message => message.sourceIndex === 2)?.createdSessionLinks)
+      .toEqual([])
+  })
+
+  it('does not rehome a completed card across the next visible user turn', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        {
+          role: 'assistant',
+          text: '',
+          ts: 1,
+          tool_calls: [{
+            type: 'tool_result',
+            tool_use_id: 'spawn-1',
+            name: 'sessions_spawn',
+            result: '{"session_key":"agent:main:subagent:child1"}',
+            is_error: false,
+          }],
+        },
+        {
+          role: 'system',
+          text: '{"type":"subagent_completion","child_session_key":"agent:main:subagent:child1"}',
+          ts: 2,
+          provenanceSourceTool: 'subagent_completion',
+          provenanceSourceSessionKey: 'agent:main:subagent:child1',
+        },
+        { role: 'user', text: 'A separate question', ts: 3 },
+        { role: 'assistant', text: 'A separate answer', ts: 4 },
+      ]),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(false),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: (role, text, message) => (
+        role === 'system'
+        && (message?.provenanceSourceTool === 'subagent_completion'
+          || text.includes('"type":"subagent_completion"'))
+      ),
+    })
+
+    expect(api.renderedMessages.value.find(message => message.sourceIndex === 0)?.createdSessionLinks)
+      .toEqual([{ callId: 'spawn-1', sessionKey: 'agent:main:subagent:child1' }])
+    expect(api.renderedMessages.value.find(message => message.sourceIndex === 3)?.createdSessionLinks)
+      .toEqual([])
+  })
+
+  it.each([
+    ['agent:main:subagent:child1', 'none'],
+    ['subagent:agent:main:webchat:parent', 'session_model'],
+  ])('shows a fixed route for %s with a non-slot model', (childSessionKey, routingSource) => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([{
+        role: 'assistant',
+        text: 'Done',
+        ts: 1,
+        usage: {
+          routed_model: 'provider/custom-child-model',
+          routing_source: routingSource,
+        },
+      }]),
+      sessionKey: ref(childSessionKey),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerSource).toBe('session_model')
+    expect(strip?.gridCells).toHaveLength(1)
+    expect(strip?.gridCells?.[strip.winnerIdx ?? -1]?.model)
+      .toBe('provider/custom-child-model')
+  })
+
+  it('does not infer a fixed-model route for a regular parent session', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([{
+        role: 'assistant',
+        text: 'Done',
+        ts: 1,
+        usage: {
+          routed_model: 'deepseek-v4-pro',
+          routing_source: 'none',
+        },
+      }]),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'deepseek-v4-flash', c1: 'deepseek-v4-pro' }),
+      routerTierConfigs: ref({
+        c0: { model: 'deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek-v4-pro', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    expect(api.renderedMessages.value.some(message => message.isRouterStrip)).toBe(false)
+  })
+
+  it('keeps parent routing visible when session creation fails or returns no child key', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Create a child chat', ts: 1 },
+        {
+          role: 'assistant',
+          text: '',
+          ts: 2,
+          usage: {
+            routed_tier: 'c0',
+            routed_model: 'deepseek-v4-flash',
+            routing_source: 'heuristic',
+          },
+          tool_calls: [{
+            type: 'tool_result',
+            tool_use_id: 'spawn-failed',
+            name: 'sessions_spawn',
+            result: '{"status":"error"}',
+            is_error: true,
+          }],
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'deepseek-v4-flash', c1: 'deepseek-v4-pro' }),
+      routerTierConfigs: ref({
+        c0: { model: 'deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek-v4-pro', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    expect(api.renderedMessages.value.find(message => message.isRouterStrip)?.routerSource)
+      .toBe('heuristic')
+  })
+})
+
+describe('useChatRenderedMessages silent sentinel compatibility', () => {
+  it('preserves presentation from explicit and legacy persisted timelines', () => {
+    const explicit = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'Working note.Final answer.',
+      ts: 1,
+      timeline: [
+        { type: 'text', raw: 'Working note.', presentation: 'intermediate' },
+        { type: 'text', raw: 'Final answer.', presentation: 'answer' },
+      ],
+    }]).renderedMessages.value[0]!
+    const legacy = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'Working note.Final answer.',
+      ts: 1,
+      tool_calls: [
+        { type: 'text', text: 'Working note.', presentation: 'intermediate' },
+        { type: 'text', text: 'Final answer.', presentation: 'answer' },
+      ],
+    }]).renderedMessages.value[0]!
+
+    expect(explicit.timelineItems?.map(item => (
+      item.type === 'text' ? item.presentation : item.type
+    ))).toEqual(['intermediate', 'answer'])
+    expect(legacy.timelineItems?.map(item => (
+      item.type === 'text' ? item.presentation : item.type
+    ))).toEqual(['intermediate', 'answer'])
+  })
+
+  it('projects mixed legacy text and explicit timeline markers without mutating history', () => {
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: 'NO_REPLY\nVisible answer.\nHEARTBEAT_OK',
+      ts: 1,
+      turnRunKind: 'goal',
+      timeline: [
+        { type: 'text', raw: 'NO_REPLY\nFirst' },
+        { type: 'text', raw: 'NO_REPLY' },
+        { type: 'text', raw: 'Last\nHEARTBEAT_OK' },
+      ],
+    }
+    const api = renderedMessagesFor([source])
+    const message = api.renderedMessages.value[0]!
+
+    expect(message.text).toBe('Visible answer.')
+    expect(message.turnRunKind).toBe('goal')
+    expect(message.timelineItems?.map(item => item.type === 'text' ? item.rawText : item.type))
+      .toEqual(['First', 'NO_REPLY', 'Last'])
+    expect(message.parts?.filter(part => part.type === 'text').map(part => part.rawText))
+      .toEqual(['First', 'NO_REPLY', 'Last'])
+    expect(source.text).toBe('NO_REPLY\nVisible answer.\nHEARTBEAT_OK')
+    expect(source.timeline?.[0]?.raw).toBe('NO_REPLY\nFirst')
+  })
+
+  it('projects persisted text segments while preserving their tool group', () => {
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: 'HEARTBEAT_OK\nDone.',
+      ts: 1,
+      turnInputMode: 'system_event',
+      tool_calls: [
+        { type: 'text', text: 'HEARTBEAT_OK' },
+        { type: 'tool_use', tool_use_id: 'tool-1', name: 'web_search', input: '{}' },
+        { type: 'tool_result', tool_use_id: 'tool-1', name: 'web_search', result: 'found' },
+        { type: 'text', text: 'Done.' },
+      ],
+    }
+    const api = renderedMessagesFor([source])
+    const message = api.renderedMessages.value[0]!
+
+    expect(message.text).toBe('Done.')
+    expect(message.timelineItems?.map(item => item.type === 'text' ? item.rawText : item.type))
+      .toEqual(['tool-group', 'Done.'])
+    expect(message.parts?.some(part => part.type === 'tool')).toBe(true)
+    expect(source.tool_calls?.[0]?.text).toBe('HEARTBEAT_OK')
+  })
+
+  it('projects persisted primary-only tool inputs from server metadata', () => {
+    const presentation = {
+      category: 'file_read' as const,
+      primaryArguments: ['path'],
+      argumentDisplay: 'primary' as const,
+      lifecycleDisplay: 'boundary' as const,
+    }
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: '',
+      ts: 1,
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'read-1',
+          name: 'read_file',
+          input: { path: 'src/app.py', offset: 500, limit: 10_000 },
+          tool_presentation: presentation,
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'read-1',
+          name: 'read_file',
+          result: 'file contents',
+          tool_presentation: presentation,
+        },
+      ],
+    }
+
+    const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+    const call = message.timelineItems?.flatMap(item =>
+      item.type === 'tool-group' ? item.group.calls : [],
+    )[0]
+
+    expect(call?.inputRaw).toBe(JSON.stringify({ path: 'src/app.py' }, null, 2))
+    expect(call?.inputRaw).not.toContain('offset')
+    expect(source.tool_calls?.[0]?.input).toEqual({
+      path: 'src/app.py',
+      offset: 500,
+      limit: 10_000,
+    })
+  })
+
+  it('reprojects legacy persisted input when presentation metadata arrives later', () => {
+    const presentation = {
+      category: 'network_read' as const,
+      primaryArguments: ['url'],
+      argumentDisplay: 'primary' as const,
+      lifecycleDisplay: 'boundary' as const,
+    }
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: '',
+      ts: 1,
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'fetch-legacy',
+          name: 'http_request',
+          input: {
+            url: 'https://example.test/report',
+            headers: { Authorization: 'secret' },
+          },
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'fetch-legacy',
+          name: 'http_request',
+          arguments: { url: 'https://example.test/report' },
+          result: 'ok',
+          tool_presentation: presentation,
+        },
+      ],
+    }
+
+    const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+    const call = message.timelineItems?.flatMap(item =>
+      item.type === 'tool-group' ? item.group.calls : [],
+    )[0]
+
+    expect(call?.inputRaw).toBe(
+      JSON.stringify({ url: 'https://example.test/report' }, null, 2),
+    )
+    expect(call?.inputRaw).not.toContain('secret')
+  })
+
+  it('projects narration and parallel legacy calls into one ordered activity timeline', () => {
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: '',
+      ts: 1,
+      tool_calls: [
+        { type: 'text', text: 'Inspect the source.' },
+        { type: 'tool_use', tool_use_id: 'call-read', name: 'read_file', input: {} },
+        { type: 'text', text: 'Compare the directory.' },
+        { type: 'tool_use', tool_use_id: 'call-list', name: 'list_dir', input: {} },
+        { type: 'tool_result', tool_use_id: 'call-read', name: 'read_file', result: 'source payload' },
+        { type: 'tool_result', tool_use_id: 'call-list', name: 'list_dir', result: 'directory payload' },
+      ],
+    }
+
+    const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+
+    expect(message.timelineItems?.map(item => item.type === 'text' ? item.rawText : item.type))
+      .toEqual(['Inspect the source.', 'tool-group', 'Compare the directory.', 'tool-group'])
+    const calls = message.timelineItems?.flatMap(item =>
+      item.type === 'tool-group' ? item.group.calls : [],
+    ) ?? []
+    expect(calls.map(call => ({ id: call.toolId, result: call.result }))).toEqual([
+      { id: 'call-read', result: 'source payload' },
+      { id: 'call-list', result: 'directory payload' },
+    ])
+    expect(message.parts?.map(part => part.type)).toEqual([
+      'text',
+      'tool',
+      'text',
+      'tool',
+    ])
+    expect(source.tool_calls?.[0]?.text).toBe('Inspect the source.')
+  })
+
+  it('preserves mixed sentinel-looking text on an ordinary direct-user turn', () => {
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: 'NO_REPLY\nThis is a literal explanation.',
+      ts: 1,
+      turnInputMode: 'user',
+      turnRunKind: 'default',
+      timeline: [
+        { type: 'text', raw: 'NO_REPLY' },
+        { type: 'text', raw: 'This is a literal explanation.' },
+      ],
+    }
+
+    const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+
+    expect(message.text).toBe('NO_REPLY\nThis is a literal explanation.')
+    expect(message.timelineItems?.map(item => item.type === 'text' ? item.rawText : item.type))
+      .toEqual(['NO_REPLY', 'This is a literal explanation.'])
+    expect(message.turnInputMode).toBe('user')
+    expect(message.turnRunKind).toBe('default')
+  })
+
+  it('omits an exact legacy sentinel row but keeps rows with durable output', () => {
+    const api = renderedMessagesFor([
+      { role: 'assistant', text: 'NO_REPLY', ts: 1 },
+      {
+        role: 'assistant',
+        text: 'HEARTBEAT_OK',
+        ts: 2,
+        artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+      },
+    ])
+
+    expect(api.renderedMessages.value).toHaveLength(1)
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      text: '',
+      artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+    })
+  })
 })
 
 describe('useChatRenderedMessages immutable route history', () => {
+  it('keeps a restored steered route card on its physical answer segment', () => {
+    const routerUsage = {
+      routed_tier: 'c1',
+      routed_model: 'provider/initial',
+      routing_source: 'squilla_router',
+      router_model_call_id: '1.0',
+      router_iteration: 1,
+      input_tokens: 12,
+      output_tokens: 3,
+      cost_usd: 0.004,
+    }
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'question', ts: 1, turnId: 'turn-steer' },
+        {
+          role: 'assistant',
+          text: 'first segment',
+          ts: 2,
+          turnId: 'turn-steer',
+          clientId: 'history-prefix',
+          routerUsage,
+          routerModelCallId: '1.0',
+          restoredFromHistory: true,
+        },
+        {
+          role: 'user',
+          text: 'guide it',
+          ts: 3,
+          turnId: 'turn-steer',
+          inputDisposition: 'applied',
+        },
+        {
+          role: 'assistant',
+          text: 'continued segment',
+          ts: 4,
+          turnId: 'turn-steer',
+          messageId: 'assistant-final',
+          usage: routerUsage,
+          restoredFromHistory: true,
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:steer-router'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'provider/fast', c1: 'provider/initial' }),
+      routerTierConfigs: ref({
+        c0: { model: 'provider/fast', supportsImage: false, imageOnly: false },
+        c1: { model: 'provider/initial', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const rendered = api.renderedMessages.value
+    expect(rendered.map(message => message.displayRole)).toEqual([
+      'user',
+      'router',
+      'assistant',
+      'user',
+      'assistant',
+    ])
+    expect(rendered.filter(message => message.isRouterStrip)).toHaveLength(1)
+    expect(rendered[1]).toMatchObject({
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+      routerTurnKey: 'router-call:turn-steer:1.0',
+    })
+    expect(rendered[2]?.meta).toBeUndefined()
+    expect(rendered[4]?.meta).toMatchObject({
+      input: 12,
+      output: 3,
+      costUsd: 0.004,
+    })
+  })
+
+  it('projects the live execution model without replacing the selected route model', () => {
+    const routerMessage: ChatMessage = {
+      role: 'router',
+      text: '',
+      ts: 2,
+      turnId: 'turn-live-route',
+      provenanceKind: 'router_decision',
+      routerDecision: {
+        tier: 'c2',
+        model: 'deepseek-v4-pro',
+        source: 'classifier',
+      },
+      routerExecutionModel: 'deepseek-v4-pro-0813',
+    }
+    const api = renderedMessagesFor([
+      { role: 'user', text: 'Solve this', ts: 1, turnId: 'turn-live-route' },
+      routerMessage,
+    ], undefined, true)
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerSelectedModel).toBe('deepseek-v4-pro')
+    expect(strip?.routerExecutionModel).toBe('deepseek-v4-pro-0813')
+    expect(routerMessage.routerDecision?.model).toBe('deepseek-v4-pro')
+  })
+
+  it('retains live physical evidence when a terminal receipt omits execution legs', () => {
+    const api = renderedMessagesFor([
+      { role: 'user', text: 'Solve this', ts: 1, turnId: 'turn-legacy-receipt' },
+      {
+        role: 'router', text: '', ts: 2, turnId: 'turn-legacy-receipt',
+        provenanceKind: 'router_decision', routerModelCallId: '1.0',
+        routerDecision: { tier: 'c2', model: 'deepseek-v4-pro', source: 'classifier' },
+        routerExecutionModel: 'kimi-k2.7-code',
+      },
+      {
+        role: 'assistant', text: 'Solved', ts: 3, turnId: 'turn-legacy-receipt',
+        usage: {
+          router_model_call_id: '1.0', routed_tier: 'c2', routed_model: 'deepseek-v4-pro',
+          routing_source: 'classifier', routing_applied: true,
+        },
+      },
+    ], undefined, true)
+    const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+    expect(strips).toHaveLength(1)
+    expect(strips[0]).toMatchObject({
+      routerSelectedModel: 'deepseek-v4-pro', routerExecutionModel: 'kimi-k2.7-code',
+      routerSettled: true,
+    })
+  })
+
   it('keeps the logical RoutePlan model after a provider fallback leg', () => {
     const api = useChatRenderedMessages({
       messages: ref<ChatMessage[]>([
@@ -169,20 +1061,22 @@ describe('useChatRenderedMessages immutable route history', () => {
           text: 'Solved',
           ts: 2,
           turnId: 'turn-route',
+          restoredFromHistory: true,
           usage: {
             routed_tier: 'c2',
-            routed_model: 'provider/fallback-model',
+            routed_model: 'deepseek-v4-pro-0813',
             routing_source: 'classifier',
             routing_applied: true,
             route_plan: {
               tier: 'c2',
-              model: 'provider/original-model',
+              model: 'deepseek-v4-pro',
               source: 'classifier',
               routing_applied: true,
             },
             execution_legs: [
-              { kind: 'primary', model: 'provider/original-model' },
-              { kind: 'provider_fallback', model: 'provider/fallback-model' },
+              { kind: 'primary', model: 'deepseek-v4-pro' },
+              { kind: 'provider_fallback', model: 'kimi-k2.7-code' },
+              { kind: 'provider_fallback', model: 'deepseek-v4-pro-0813' },
             ],
           },
         },
@@ -204,9 +1098,372 @@ describe('useChatRenderedMessages immutable route history', () => {
 
     const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
     const winner = strip?.gridCells?.[strip.winnerIdx ?? -1]
-    expect(winner?.model).toBe('provider/original-model')
+    expect(winner?.model).toBe('deepseek-v4-pro')
+    expect(strip?.routerSelectedModel).toBe('deepseek-v4-pro')
+    expect(strip?.routerExecutionModel).toBe('deepseek-v4-pro-0813')
+    expect(strip?.routerStatic).toBe(true)
     expect(strip?.routerSource).toBe('classifier')
   })
+
+  it('restores the frozen candidate pool and lets the historical winner override it', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Historical question', ts: 1, turnId: 'turn-snapshot' },
+        {
+          role: 'assistant',
+          text: 'Historical answer',
+          ts: 2,
+          turnId: 'turn-snapshot',
+          restoredFromHistory: true,
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'historical/winner',
+            routing_source: 'classifier',
+            route_plan: {
+              version: 2,
+              tier: 'c1',
+              model: 'historical/winner',
+              source: 'classifier',
+              router_tier_snapshot: {
+                version: 1,
+                request_kind: 'text',
+                tiers: [
+                  { tier: 'c0', model: 'historical/fast', execution_kind: 'single_model' },
+                  { tier: 'c1', model: 'stale/conflict', execution_kind: 'ensemble' },
+                ],
+              },
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:snapshot'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'current/fast', supportsImage: false, imageOnly: false },
+        c1: { model: 'current/balanced', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells?.map(cell => cell.model)).toEqual([
+      'historical/fast',
+      'historical/winner',
+    ])
+    expect(strip?.gridCells?.[strip.winnerIdx ?? -1]).toMatchObject({
+      model: 'historical/winner',
+      executionKind: 'ensemble',
+    })
+    expect(strip?.routerSelectedModel).toBe('historical/winner')
+  })
+
+  it('rejects a damaged snapshot atomically and rebuilds with the historical winner', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Old question', ts: 1, turnId: 'turn-damaged' },
+        {
+          role: 'assistant',
+          text: 'Old answer',
+          ts: 2,
+          turnId: 'turn-damaged',
+          restoredFromHistory: true,
+          usage: {
+            routed_tier: 'c2',
+            routed_model: 'historical/winner',
+            routing_source: 'classifier',
+            route_plan: {
+              version: 2,
+              tier: 'c2',
+              model: 'historical/winner',
+              source: 'classifier',
+              router_tier_snapshot: {
+                version: 1,
+                request_kind: 'text',
+                tiers: [
+                  { tier: 'c0', model: 'damaged/one', execution_kind: 'single_model' },
+                  { tier: 't0', model: 'damaged/two', execution_kind: 'single_model' },
+                ],
+              },
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:damaged-snapshot'),
+      routerSlots: ref(['c0']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'current/fast', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells).toEqual(expect.arrayContaining([
+      expect.objectContaining({ model: 'current/fast' }),
+      expect.objectContaining({ model: 'historical/winner', tiers: ['c2'] }),
+    ]))
+    expect(strip?.gridCells?.some(cell => cell.model?.startsWith('damaged/'))).toBe(false)
+    expect(strip?.gridCells?.[strip.winnerIdx ?? -1]?.model).toBe('historical/winner')
+  })
+
+  it('shows only the historical winner when an old turn has no usable current pool', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Old question', ts: 1, turnId: 'turn-winner-only' },
+        {
+          role: 'assistant',
+          text: 'Old answer',
+          ts: 2,
+          turnId: 'turn-winner-only',
+          restoredFromHistory: true,
+          usage: {
+            routed_tier: 'c2',
+            routed_model: 'historical/only-winner',
+            routing_source: 'classifier',
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:winner-only'),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells).toEqual([
+      expect.objectContaining({
+        tiers: ['c2'],
+        model: 'historical/only-winner',
+      }),
+    ])
+    expect(strip?.winnerIdx).toBe(0)
+  })
+
+  it('retains a valid live snapshot when an older done event omits it', () => {
+    const liveSnapshot = {
+      version: 1,
+      request_kind: 'text',
+      tiers: [
+        { tier: 'c0', model: 'frozen/fast', execution_kind: 'single_model' },
+        { tier: 'c1', model: 'frozen/winner', execution_kind: 'single_model' },
+      ],
+    }
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Live question', ts: 1, turnId: 'turn-live' },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          turnId: 'turn-live',
+          messageId: 'router-live',
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'c1',
+            model: 'frozen/winner',
+            source: 'classifier',
+            router_tier_snapshot: liveSnapshot,
+          },
+        },
+        {
+          role: 'assistant',
+          text: 'Done',
+          ts: 3,
+          turnId: 'turn-live',
+          messageId: 'assistant-live',
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'frozen/winner',
+            routing_source: 'classifier',
+            route_plan: {
+              version: 1,
+              tier: 'c1',
+              model: 'frozen/winner',
+              source: 'classifier',
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:live-snapshot'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'current/fast', supportsImage: false, imageOnly: false },
+        c1: { model: 'current/balanced', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells?.map(cell => cell.model)).toEqual(['frozen/fast', 'frozen/winner'])
+    expect(strip?.routerSettled).toBe(true)
+  })
+})
+
+describe('useChatRenderedMessages image router candidates', () => {
+  it('preserves an actually executed legacy winner in restored history', () => {
+    const api = renderedMessagesFor([{
+      role: 'user',
+      text: 'Describe the shape.',
+      ts: 1,
+      attachments: [{
+        kind: 'file',
+        displayId: 'historical-image',
+        renderKey: 'historical-image',
+        name: 'shape.png',
+        mime: 'image/png',
+      }],
+    }, {
+      role: 'assistant',
+      text: 'A circle.',
+      ts: 2,
+      restoredFromHistory: true,
+      usage: {
+        routed_tier: 'image_model',
+        routed_model: 'historical/actual-winner',
+        routing_source: 'image_route',
+        router_tier_snapshot: {
+          version: 1,
+          request_kind: 'image',
+          tiers: [{
+            tier: 'image_model',
+            model: 'historical/actual-winner',
+            execution_kind: 'single_model',
+          }],
+        },
+      },
+    }], undefined, true)
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells?.map(cell => cell.model)).toEqual(['historical/actual-winner'])
+    expect(strip?.winnerIdx).toBe(0)
+    expect(strip?.routerStatic).toBe(true)
+  })
+
+  it.each(['live', 'settled', 'restored'])(
+    'excludes implicit legacy image candidates from %s image routes',
+    (stage) => {
+      for (const snapshotKind of ['none', 'legacy', 'current']) {
+        const textEntries = [0, 1, 2, 3].map(index => ({
+          tier: `c${index}`,
+          model: `text/configured-${index}`,
+          execution_kind: 'single_model',
+        }))
+        const snapshot = snapshotKind === 'none' ? undefined : {
+          version: 1,
+          request_kind: 'image',
+          tiers: snapshotKind === 'legacy' ? [
+            textEntries[1],
+            { tier: 'image_model', model: 'legacy/unused-vision', execution_kind: 'single_model' },
+          ] : textEntries,
+        }
+        const route = {
+          tier: 'c1',
+          model: 'text/actual-winner',
+          source: 'image_route',
+          ...(snapshot ? { router_tier_snapshot: snapshot } : {}),
+        }
+        const messages: ChatMessage[] = [{
+          role: 'user',
+          text: 'Describe the attached shapes.',
+          ts: 1,
+          turnId: 'turn-image-candidates',
+          attachments: [{
+            kind: 'file',
+            displayId: 'synthetic-image',
+            renderKey: 'synthetic-image',
+            name: 'shapes.png',
+            mime: 'image/png',
+          }],
+        }]
+        if (stage !== 'restored') {
+          messages.push({
+            role: 'router',
+            text: '',
+            ts: 2,
+            turnId: 'turn-image-candidates',
+            provenanceKind: 'router_decision',
+            routerDecision: route,
+          })
+        }
+        if (stage !== 'live') {
+          messages.push({
+            role: 'assistant',
+            text: 'The image was not analyzed.',
+            ts: 3,
+            turnId: 'turn-image-candidates',
+            restoredFromHistory: stage === 'restored',
+            usage: {
+              routed_tier: route.tier,
+              routed_model: route.model,
+              routing_source: route.source,
+              route_plan: route,
+            },
+          })
+        }
+        const configs: Record<string, ChatRouterTierConfig> = Object.fromEntries(
+          textEntries.map(entry => [entry.tier, {
+            model: entry.model,
+            supportsImage: false,
+            imageOnly: false,
+          }]),
+        )
+        configs.image_model = {
+          model: 'legacy/unused-vision',
+          supportsImage: true,
+          imageOnly: true,
+        }
+        const before = JSON.stringify(messages)
+        const api = useChatRenderedMessages({
+          messages: ref(messages),
+          sessionKey: ref('agent:main:webchat:image-candidates'),
+          routerSlots: ref(Object.keys(configs)),
+          routerModels: ref({}),
+          routerTierConfigs: ref(configs),
+          routerVisualEffectsEnabled: ref(true),
+          routerVisualMode: ref('real_candidates'),
+          renderMarkdown: text => text,
+          stripGeneratedArtifactMarkers: text => text,
+          stripTimePrefix: text => text,
+          isSubagentCompletionMessage: () => false,
+        })
+
+        const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+        expect(strips).toHaveLength(1)
+        const strip = strips[0]!
+        expect(strip.gridCells?.flatMap(cell => cell.tiers).sort()).toEqual(
+          snapshotKind === 'legacy' ? ['c1'] : ['c0', 'c1', 'c2', 'c3'],
+        )
+        expect(strip.gridCells?.some(cell => cell.model === 'legacy/unused-vision')).toBe(false)
+        expect(strip.gridCells?.[strip.winnerIdx ?? -1]?.model).toBe('text/actual-winner')
+        expect(strip.routerStatic).toBe(stage === 'restored')
+        expect(strip.routerSettled).toBe(stage === 'settled')
+        expect(JSON.stringify(messages)).toBe(before)
+      }
+    },
+  )
 })
 
 describe('useChatRenderedMessages router visual mode', () => {
@@ -285,7 +1542,12 @@ describe('useChatRenderedMessages router visual mode', () => {
       routerModels: ref({}),
       routerTierConfigs: ref({
         fast: { model: 'openai/gpt-5.4-mini', supportsImage: false, imageOnly: false },
-        balanced: { model: 'anthropic/claude-sonnet-4.6', supportsImage: false, imageOnly: false },
+        balanced: {
+          model: 'anthropic/claude-sonnet-4.6',
+          supportsImage: false,
+          imageOnly: false,
+          ensembleEnabled: true,
+        },
         strong: { model: 'openai/gpt-5.5', supportsImage: false, imageOnly: false },
       }),
       routerVisualEffectsEnabled: ref(true),
@@ -302,24 +1564,25 @@ describe('useChatRenderedMessages router visual mode', () => {
     expect((strip?.gridCells || []).length).toBeGreaterThan(1)
   })
 
-  it('shows the ensemble strip for the live turn while ensemble mode is on', () => {
-    // Live (non-history) squilla_router decision + active ensemble mode → the
-    // ensemble panel immediately, not the tier grid.
-    const withMessages = useChatRenderedMessages({
-      messages: ref<ChatMessage[]>([
-        { role: 'user', text: 'hard question', ts: 0 },
-        {
-          role: 'router',
-          text: '',
-          ts: 1,
-          provenanceKind: 'router_decision',
-          routerDecision: {
-            tier: 'balanced',
-            model: 'anthropic/claude-sonnet-4.6',
-            source: 'squilla_router',
-          },
+  it('keeps the accepted ensemble strip stable when the next-turn mode changes', () => {
+    const nextTurnMode = ref<ModelRoutingMode>('llm_ensemble')
+    const messages = ref<ChatMessage[]>([
+      { role: 'user', text: 'hard question', ts: 0 },
+      {
+        role: 'router',
+        text: '',
+        ts: 1,
+        provenanceKind: 'router_decision',
+        routerDecision: {
+          tier: 'balanced',
+          model: 'anthropic/claude-sonnet-4.6',
+          source: 'squilla_router',
+          accepted_routing_mode: 'ensemble',
         },
-      ]),
+      },
+    ])
+    const withMessages = useChatRenderedMessages({
+      messages,
       sessionKey: ref('router-ensemble-live-test'),
       routerSlots: ref(['fast', 'balanced', 'strong']),
       routerModels: ref({}),
@@ -334,12 +1597,296 @@ describe('useChatRenderedMessages router visual mode', () => {
       stripGeneratedArtifactMarkers: text => text,
       stripTimePrefix: text => text,
       isSubagentCompletionMessage: () => false,
-      modelRoutingMode: ref('llm_ensemble'),
+      modelRoutingMode: nextTurnMode,
+    })
+
+    const before = withMessages.renderedMessages.value
+      .find(message => message.isRouterStrip)
+    nextTurnMode.value = 'off'
+    messages.value[1].restoredFromHistory = true
+    const after = withMessages.renderedMessages.value
+      .find(message => message.isRouterStrip)
+
+    expect(before?.routerPanel).toBe('llm-ensemble')
+    expect(before?.gridCells || []).toHaveLength(0)
+    expect(after?.routerPanel).toBe('llm-ensemble')
+    expect(after?.routerTurnKey).toBe(before?.routerTurnKey)
+  })
+
+  it('restores an accepted ensemble panel from durable cold-history outcome metadata', () => {
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'hard question', ts: 0, turnId: 'turn-cold' },
+        {
+          role: 'assistant',
+          text: 'answer',
+          ts: 1,
+          turnId: 'turn-cold',
+          restoredFromHistory: true,
+          turnOutcome: {
+            turnId: 'turn-cold',
+            status: 'succeeded',
+            acceptedRoutingMode: 'ensemble',
+          },
+          usage: {
+            routing_source: 'squilla_router',
+            routed_tier: 'balanced',
+            routed_model: 'anthropic/claude-sonnet-4.6',
+            model_usage_breakdown: [
+              { role: 'primary', provider: 'openrouter', model: 'openai/gpt-5.5' },
+              { role: 'critic', provider: 'openrouter', model: 'z-ai/glm-5.2' },
+            ],
+            ensemble_trace: {
+              profile: 'default',
+              mode: 'custom_b5',
+              llm_request_count: 2,
+              total_candidates: 2,
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('router-ensemble-cold-history-test'),
+      routerSlots: ref(['fast', 'balanced', 'strong']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('off'),
     })
 
     const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
     expect(strip?.routerPanel).toBe('llm-ensemble')
-    expect(strip?.gridCells || []).toHaveLength(0)
+    expect(strip?.routerTurnKey).toBe('router-event:turn-cold:1-ensemble-router')
+  })
+
+  it('does not reclassify a live router turn from the next-turn session mode', () => {
+    const nextTurnMode = ref<ModelRoutingMode>('squilla_router')
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'hard question', ts: 0 },
+        {
+          role: 'router',
+          text: '',
+          ts: 1,
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'balanced',
+            model: 'anthropic/claude-sonnet-4.6',
+            source: 'squilla_router',
+            accepted_routing_mode: 'router',
+          },
+        },
+      ]),
+      sessionKey: ref('router-next-turn-change-test'),
+      routerSlots: ref(['fast', 'balanced', 'strong']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        fast: { model: 'openai/gpt-5.4-mini', supportsImage: false, imageOnly: false },
+        balanced: { model: 'anthropic/claude-sonnet-4.6', supportsImage: false, imageOnly: false },
+        strong: { model: 'openai/gpt-5.5', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: nextTurnMode,
+    })
+
+    const before = withMessages.renderedMessages.value
+      .find(message => message.isRouterStrip)
+    nextTurnMode.value = 'llm_ensemble'
+    const after = withMessages.renderedMessages.value
+      .find(message => message.isRouterStrip)
+
+    expect(before?.routerPanel).toBe('real-candidates')
+    expect(after?.routerPanel).toBe('real-candidates')
+    expect(after?.routerTurnKey).toBe(before?.routerTurnKey)
+  })
+
+  it.each([undefined, 'single_model', 'ensemble'] as const)('uses accepted C3 %s, not current config', (executionKind) => {
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'hard question', ts: 0 },
+        {
+          role: 'router',
+          text: '',
+          ts: 1,
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'c3',
+            model: 'anthropic/claude-opus-4.8',
+            source: 'squilla_router',
+            ...(executionKind ? {
+              router_tier_snapshot: {
+                version: 1,
+                request_kind: 'text',
+                tiers: [
+                  { tier: 'c0', model: 'qwen/qwen3.7-flash', execution_kind: 'single_model' },
+                  { tier: 'c1', model: 'deepseek/deepseek-v4-flash', execution_kind: 'single_model' },
+                  { tier: 'c2', model: 'z-ai/glm-5.2', execution_kind: 'single_model' },
+                  { tier: 'c3', model: 'anthropic/claude-opus-4.8', execution_kind: executionKind },
+                ],
+              },
+            } : {}),
+          },
+        },
+      ]),
+      sessionKey: ref('router-c3-ensemble-live-test'),
+      routerSlots: ref(['c0', 'c1', 'c2', 'c3']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'qwen/qwen3.7-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek/deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c2: { model: 'z-ai/glm-5.2', supportsImage: false, imageOnly: false },
+        c3: {
+          model: 'anthropic/claude-opus-4.8',
+          supportsImage: false,
+          imageOnly: false,
+          ensembleEnabled: true,
+        },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('squilla_router'),
+    })
+
+    const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
+    const c3Index = strip?.gridCells?.findIndex(cell => cell.tiers.includes('c3')) ?? -1
+    expect(strip?.routerPanel).toBe(
+      executionKind === 'ensemble' ? 'router-ensemble-sequence' : 'real-candidates',
+    )
+    expect(strip?.routerMode).toBe('squilla_router')
+    expect(strip?.gridCells || []).toHaveLength(4)
+    expect(c3Index).toBeGreaterThanOrEqual(0)
+    expect(strip?.winnerIdx).toBe(c3Index)
+    expect(strip?.gridCells?.[c3Index]).toMatchObject({
+      executionKind: executionKind ?? 'ensemble',
+      tiers: ['c3'],
+    })
+  })
+
+  it('keeps the original C3 route decision when live ensemble members arrive', () => {
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'hard question', ts: 0 },
+        {
+          role: 'router',
+          text: '',
+          ts: 1,
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'c3',
+            model: 'anthropic/claude-opus-4.8',
+            source: 'squilla_router',
+          },
+          ensemble: {
+            profile: 'default',
+            modelCount: 1,
+            totalCandidates: 4,
+            requestCount: 1,
+            fallbackUsed: false,
+            fallbackReason: '',
+            costUsd: 0,
+            savedUsd: 0,
+            savedPct: 0,
+            models: [{
+              role: 'anchor',
+              label: 'anchor',
+              provider: 'openrouter',
+              model: 'qwen/qwen3.7-plus',
+              modelShort: 'qwen3.7-plus',
+              input: 0,
+              output: 0,
+              costUsd: 0,
+              status: 'running',
+            }],
+          },
+        },
+      ]),
+      sessionKey: ref('router-c3-ensemble-progress-test'),
+      routerSlots: ref(['c0', 'c1', 'c2', 'c3']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'qwen/qwen3.7-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek/deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c2: { model: 'z-ai/glm-5.2', supportsImage: false, imageOnly: false },
+        c3: {
+          model: 'anthropic/claude-opus-4.8',
+          supportsImage: false,
+          imageOnly: false,
+          ensembleEnabled: true,
+        },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('squilla_router'),
+    })
+
+    const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerPanel).toBe('router-ensemble-sequence')
+    expect(strip?.routerSource).toBe('squilla_router')
+    expect(strip?.gridCells || []).toHaveLength(4)
+    expect(strip?.ensemble?.models.map(model => model.modelShort)).toEqual(['qwen3.7-plus'])
+  })
+
+  it('labels an ensemble-enabled C3 as fusion inside a lower-tier routing decision', () => {
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'quick question', ts: 0 },
+        {
+          role: 'router',
+          text: '',
+          ts: 1,
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'c0',
+            model: 'qwen/qwen3.7-flash',
+            source: 'squilla_router',
+          },
+        },
+      ]),
+      sessionKey: ref('router-c3-logical-cell-test'),
+      routerSlots: ref(['c0', 'c3']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'qwen/qwen3.7-flash', supportsImage: false, imageOnly: false },
+        c3: {
+          model: 'anthropic/claude-opus-4.8',
+          supportsImage: false,
+          imageOnly: false,
+          ensembleEnabled: true,
+        },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('squilla_router'),
+    })
+
+    const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
+    const c3Cell = strip?.gridCells?.find(cell => cell.tiers.includes('c3'))
+    expect(strip?.routerPanel).toBe('real-candidates')
+    expect(c3Cell).toMatchObject({
+      displayName: 'claude-opus-4.8',
+      executionKind: 'ensemble',
+    })
   })
 
   it('renders the ensemble strip when the decision source is ensemble (per-message)', () => {
@@ -595,6 +2142,7 @@ describe('useChatRenderedMessages router visual mode', () => {
         role: 'user',
         text: 'compare candidates',
         ts: 1,
+        turnId: 'turn-live',
         clientId: 'local-user-turn',
         messageId: 'server-user-turn',
       },
@@ -602,6 +2150,7 @@ describe('useChatRenderedMessages router visual mode', () => {
         role: 'router',
         text: '',
         ts: 2,
+        turnId: 'turn-live',
         messageId: 'router-live-event',
         provenanceKind: 'router_decision',
         routerDecision: {
@@ -630,12 +2179,21 @@ describe('useChatRenderedMessages router visual mode', () => {
 
     const liveKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
 
+    Object.assign(messages.value[1]!, {
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+    })
+    const boundKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
+
     messages.value.push({
       role: 'assistant',
       text: 'Settled answer.',
       ts: 3,
+      turnId: 'turn-live',
       messageId: 'assistant-settled',
       usage: {
+        router_model_call_id: '1.0',
+        router_iteration: 1,
         model_usage_breakdown: [
           { role: 'proposer', provider: 'openrouter', model: 'qwen/qwen3.7-plus' },
           { role: 'aggregator', provider: 'openrouter', model: 'z-ai/glm-5.2' },
@@ -650,8 +2208,250 @@ describe('useChatRenderedMessages router visual mode', () => {
     isStreaming.value = false
 
     const settledKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
-    expect(liveKey).toBe('router-turn:local-user-turn')
+    expect(liveKey).toBe('router-event:turn-live:router-live-event')
+    expect(boundKey).toBe(liveKey)
     expect(settledKey).toBe(liveKey)
+
+    messages.value = [
+      {
+        role: 'user',
+        text: 'compare candidates',
+        ts: 1,
+        turnId: 'turn-live',
+        messageId: 'server-user-turn',
+      },
+      {
+        role: 'assistant',
+        text: 'Partial answer.',
+        ts: 2,
+        turnId: 'turn-live',
+        clientId: 'history-prefix',
+        routerUsage: messages.value[2]!.usage,
+        routerModelCallId: '1.0',
+        restoredFromHistory: true,
+      },
+      {
+        role: 'user',
+        text: 'guide it',
+        ts: 2.5,
+        turnId: 'turn-live',
+        inputDisposition: 'applied',
+      },
+      {
+        role: 'assistant',
+        text: 'Settled answer.',
+        ts: 3,
+        turnId: 'turn-live',
+        messageId: 'assistant-settled',
+        usage: messages.value[2]!.usage,
+        restoredFromHistory: true,
+      },
+    ]
+    const restoredKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
+    expect(restoredKey).toBe(liveKey)
+  })
+
+  it('settles the exact physical route card without replacing another card in the turn', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'question', ts: 1, turnId: 'turn-multi' },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          turnId: 'turn-multi',
+          messageId: 'router-first',
+          provenanceKind: 'router_decision',
+          routerModelCallId: '1.0',
+          routerDecision: { tier: 'c1', model: 'provider/first', source: 'squilla_router' },
+        },
+        { role: 'assistant', text: 'first segment', ts: 3, turnId: 'turn-multi' },
+        {
+          role: 'user',
+          text: 'guide it',
+          ts: 4,
+          turnId: 'turn-multi',
+          inputDisposition: 'applied',
+        },
+        {
+          role: 'router',
+          text: '',
+          ts: 5,
+          turnId: 'turn-multi',
+          messageId: 'router-second',
+          provenanceKind: 'router_decision',
+          routerModelCallId: '2.0',
+          routerDecision: { tier: 'c2', model: 'provider/second', source: 'squilla_router' },
+        },
+        {
+          role: 'assistant',
+          text: 'settled first call',
+          ts: 6,
+          turnId: 'turn-multi',
+          messageId: 'assistant-terminal',
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'provider/first',
+            routing_source: 'squilla_router',
+            router_model_call_id: '1.0',
+          },
+        },
+      ]),
+      sessionKey: ref('router-exact-settlement-test'),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({ c1: 'provider/first', c2: 'provider/second' }),
+      routerTierConfigs: ref({
+        c1: { model: 'provider/first', supportsImage: false, imageOnly: false },
+        c2: { model: 'provider/second', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+    expect(strips).toHaveLength(2)
+    expect(strips.map(strip => strip.routerModelCallId)).toEqual(['1.0', '2.0'])
+    expect(strips.map(strip => strip.routerTurnKey)).toEqual([
+      'router-call:turn-multi:1.0',
+      'router-call:turn-multi:2.0',
+    ])
+    expect(strips.map(strip => strip.gridCells?.[strip.winnerIdx ?? -1]?.model)).toEqual([
+      'provider/first',
+      'provider/second',
+    ])
+    expect(strips.map(strip => strip.routerSettled)).toEqual([true, false])
+  })
+
+  it('does not reuse an incompatible card key for an anchored ensemble settlement', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'question', ts: 1, turnId: 'turn-ensemble-anchor' },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          turnId: 'turn-ensemble-anchor',
+          messageId: 'router-second-call',
+          provenanceKind: 'router_decision',
+          routerModelCallId: '2.0',
+          routerDecision: { tier: 'c2', model: 'provider/second', source: 'squilla_router' },
+        },
+        {
+          role: 'assistant',
+          text: 'settled ensemble call',
+          ts: 3,
+          turnId: 'turn-ensemble-anchor',
+          messageId: 'assistant-terminal',
+          usage: {
+            routed_tier: 'c1',
+            routed_model: 'provider/first',
+            routing_source: 'squilla_router',
+            router_model_call_id: '1.0',
+            model_usage_breakdown: [
+              { role: 'proposer', provider: 'provider', model: 'member/one' },
+              { role: 'aggregator', provider: 'provider', model: 'member/final' },
+            ],
+            ensemble_trace: {
+              profile: 'default',
+              total_candidates: 1,
+              llm_request_count: 2,
+            },
+          },
+        },
+      ]),
+      sessionKey: ref('router-ensemble-anchor-test'),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({ c1: 'provider/first', c2: 'provider/second' }),
+      routerTierConfigs: ref({
+        c1: { model: 'provider/first', supportsImage: false, imageOnly: false },
+        c2: { model: 'provider/second', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('squilla_router'),
+    })
+
+    const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+    expect(strips).toHaveLength(2)
+    expect(strips.map(strip => strip.routerModelCallId)).toEqual(['2.0', '1.0'])
+    expect(strips.map(strip => strip.routerTurnKey)).toEqual([
+      'router-call:turn-ensemble-anchor:2.0',
+      'router-call:turn-ensemble-anchor:1.0',
+    ])
+    expect(new Set(strips.map(strip => strip.routerTurnKey)).size).toBe(2)
+    expect(strips[1]?.routerPanel).toBe('router-ensemble-sequence')
+  })
+
+  it('uses latest-unresolved fallback settlement for gateway events without call anchors', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'question', ts: 1, turnId: 'turn-legacy' },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          turnId: 'turn-legacy',
+          messageId: 'router-first',
+          provenanceKind: 'router_decision',
+          routerDecision: { tier: 'c1', model: 'provider/first', source: 'squilla_router' },
+        },
+        { role: 'assistant', text: 'first segment', ts: 3, turnId: 'turn-legacy' },
+        {
+          role: 'router',
+          text: '',
+          ts: 4,
+          turnId: 'turn-legacy',
+          messageId: 'router-second',
+          provenanceKind: 'router_decision',
+          routerDecision: { tier: 'c2', model: 'provider/second', source: 'squilla_router' },
+        },
+        {
+          role: 'assistant',
+          text: 'legacy terminal',
+          ts: 5,
+          turnId: 'turn-legacy',
+          messageId: 'assistant-terminal',
+          usage: {
+            routed_tier: 'c2',
+            routed_model: 'provider/second',
+            routing_source: 'squilla_router',
+          },
+        },
+      ]),
+      sessionKey: ref('router-fallback-settlement-test'),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({ c1: 'provider/first', c2: 'provider/second' }),
+      routerTierConfigs: ref({
+        c1: { model: 'provider/first', supportsImage: false, imageOnly: false },
+        c2: { model: 'provider/second', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+    expect(strips).toHaveLength(2)
+    expect(strips.map(strip => strip.routerTurnKey)).toEqual([
+      'router-event:turn-legacy:router-first',
+      'router-event:turn-legacy:router-second',
+    ])
+    expect(strips.map(strip => strip.gridCells?.[strip.winnerIdx ?? -1]?.model)).toEqual([
+      'provider/first',
+      'provider/second',
+    ])
+    expect(strips.map(strip => strip.routerSettled)).toEqual([false, true])
   })
 
   it('keeps same-turn steer rows under one explicit turn and one Router strip', () => {
@@ -669,6 +2469,8 @@ describe('useChatRenderedMessages router visual mode', () => {
         messageId: 'router-turn-1',
         turnId: 'turn-1',
         provenanceKind: 'router_decision',
+        routerModelCallId: '1.0',
+        routerIteration: 1,
         routerDecision: {
           tier: 'c1',
           model: 'qwen/qwen3.7-plus',
@@ -717,7 +2519,19 @@ describe('useChatRenderedMessages router visual mode', () => {
     })
 
     const rendered = api.renderedMessages.value
+    expect(rendered.map(message => message.displayRole)).toEqual([
+      'user',
+      'router',
+      'assistant',
+      'user',
+      'assistant',
+    ])
     expect(rendered.filter(message => message.isRouterStrip)).toHaveLength(1)
+    expect(rendered[1]).toMatchObject({
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+      routerTurnKey: 'router-call:turn-1:1.0',
+    })
     expect(rendered.filter(message => !message.isRouterStrip).map(message => message.turnKey))
       .toEqual([
         'turn:turn-1',
@@ -840,7 +2654,9 @@ describe('useChatRenderedMessages router visual mode', () => {
       'turn:turn-server',
       'turn:turn-server',
     ])
-    expect(api.renderedMessages.value[1]?.routerTurnKey).toBe('router-turn:turn-server')
+    expect(api.renderedMessages.value[1]?.routerTurnKey).toBe(
+      'router-event:turn-server:router-server',
+    )
   })
 })
 
@@ -1031,6 +2847,82 @@ describe('useChatRenderedMessages per-turn usage', () => {
     expect(assistantMessages.map(message => message.meta?.input)).toEqual([11, 22])
     expect(assistantMessages.map(message => message.meta?.output)).toEqual([3, 5])
   })
+
+  it('normalizes additive per-turn coverage while older usage remains exact', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: 'known subtotal',
+        ts: 1,
+        usage: {
+          input_tokens: 11,
+          output_tokens: 3,
+          cost_usd: 0.001,
+          coverage_status: 'usage_unknown',
+          usage_unknown: true,
+          unknown_usage_events: 1,
+        },
+      },
+      {
+        role: 'assistant',
+        text: 'unknown only',
+        ts: 2,
+        usage: {
+          coverageStatus: 'usage_unknown',
+          usageUnknown: true,
+          unknownUsageEvents: 2,
+        },
+      },
+      {
+        role: 'assistant',
+        text: 'legacy exact usage',
+        ts: 3,
+        usage: { input_tokens: 7, output_tokens: 2 },
+      },
+    ])
+
+    const [partial, unknownOnly, legacy] = api.renderedMessages.value
+    expect(partial?.meta).toMatchObject({
+      coverageStatus: 'usage_unknown',
+      usageUnknown: true,
+      unknownUsageEvents: 1,
+      hasKnownUsage: true,
+    })
+    expect(unknownOnly?.meta).toMatchObject({
+      coverageStatus: 'usage_unknown',
+      usageUnknown: true,
+      unknownUsageEvents: 2,
+      hasKnownUsage: false,
+    })
+    expect(legacy?.meta).toMatchObject({
+      usageUnknown: false,
+      unknownUsageEvents: 0,
+      hasKnownUsage: true,
+    })
+    expect(legacy?.meta?.coverageStatus).toBeUndefined()
+  })
+
+  it('does not reinterpret missing cost entries as a presentation state', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'restored cost',
+      ts: 1,
+      usage: {
+        input_tokens: 11,
+        output_tokens: 3,
+        cost_usd: 0.0123,
+        missing_cost_entries: 1,
+      },
+    }])
+
+    expect(api.renderedMessages.value[0]?.meta).toMatchObject({
+      usageUnknown: false,
+      costUsd: 0.0123,
+    })
+    expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('costKnown')
+    expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('costIncomplete')
+    expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('missingCostEntries')
+  })
 })
 
 describe('useChatRenderedMessages clarify history recovery', () => {
@@ -1152,6 +3044,232 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     })
   })
 
+  it.each([
+    ['answered', 'replied'],
+    ['cancelled', 'expired'],
+    ['expired', 'expired'],
+  ] as const)('restores a %s request as %s from its preserved payload', (status, resolution) => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: '',
+        ts: 0,
+        messageId: 'm-terminal-request-user-input',
+        tool_calls: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'request-input-terminal',
+            name: 'request_user_input',
+            user_input_request: {
+              status: 'input_required',
+              kind: 'user_input',
+              paused: true,
+              request_id: 'request-terminal-1',
+              run_id: 'plan-run-2',
+              step: 'choose_target',
+              clarify_schema: {
+                mode: 'form',
+                presentation: 'plan_questionnaire_v1',
+                fields: [{
+                  name: 'target',
+                  type: 'enum',
+                  required: true,
+                  choices: ['current', 'new'],
+                }],
+              },
+            },
+            result: JSON.stringify({
+              status,
+              kind: 'user_input',
+              paused: false,
+              request_id: 'request-terminal-1',
+              answers: { target: 'current' },
+            }),
+          },
+        ],
+      },
+    ])
+
+    const [message] = api.renderedMessages.value
+    const clarify = message.parts?.find((part): part is ChatPart & {
+      type: 'interrupt'
+      interruptKind: 'clarify'
+    } => part.type === 'interrupt' && part.interruptKind === 'clarify')
+
+    expect(clarify?.key).toBe(
+      'm-terminal-request-user-input:interrupt:request-terminal-1',
+    )
+    expect(clarify?.resolution).toBe(resolution)
+    expect(clarify?.clarify?.presentation).toBe('plan_questionnaire_v1')
+  })
+
+  it.each(['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted'])(
+    'expires only unresolved structured input owned by the %s historical turn',
+    (status) => {
+      const request = (requestId: string | undefined, runId: string) => ({
+        status: 'input_required',
+        kind: 'user_input',
+        paused: true,
+        request_id: requestId,
+        run_id: runId,
+        step: 'scope',
+        clarify_schema: { fields: [{ name: 'scope', type: 'string' }] },
+      })
+      for (const hasTaskId of [true, false]) {
+        const owner = hasTaskId ? 'terminal-task' : 'terminal-turn'
+        const api = renderedMessagesFor([{
+          role: 'assistant', text: '', ts: 0, messageId: 'historical-questionnaire',
+          restoredFromHistory: true,
+          turnOutcome: {
+            turnId: 'terminal-turn',
+            ...(hasTaskId ? { taskId: owner } : {}),
+            status,
+          },
+          tool_calls: [
+            { type: 'tool_result', tool_use_id: 'pending', result: request('pending', owner) },
+            { type: 'tool_result', tool_use_id: 'accepted', result: request('accepted', owner) },
+            { type: 'tool_result', tool_use_id: 'other', result: request('other', 'other-task') },
+            { type: 'tool_result', tool_use_id: 'legacy', result: request(undefined, owner) },
+            {
+              type: 'tool_result', tool_use_id: 'accepted',
+              result: { kind: 'user_input', status: 'answered', paused: false, request_id: 'accepted' },
+            },
+          ],
+        }])
+        const clarifies = api.renderedMessages.value[0].parts?.filter(
+          (part): part is Extract<ChatPart, { type: 'interrupt' }> =>
+            part.type === 'interrupt' && part.interruptKind === 'clarify',
+        ) ?? []
+        expect(clarifies.map(part => part.resolution)).toEqual([
+          'expired', 'replied', null, null,
+        ])
+      }
+    },
+  )
+
+  it.each([
+    ['answered', 'expired'],
+    ['expired', 'answered'],
+  ] as const)('keeps accepted history after %s then %s and an expired live projection', (first, last) => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: '', ts: 0, messageId: 'reordered-questionnaire',
+      turnOutcome: { turnId: 'terminal-turn', taskId: 'terminal-task', status: 'cancelled' },
+      tool_calls: [
+        {
+          type: 'tool_result', tool_use_id: 'question',
+          result: {
+            status: 'input_required', kind: 'user_input', paused: true,
+            request_id: 'accepted', run_id: 'terminal-task', step: 'scope',
+            clarify_schema: { fields: [{ name: 'scope', type: 'string' }] },
+          },
+        },
+        ...[first, last].map(status => ({
+          type: 'tool_result', tool_use_id: 'question',
+          result: { kind: 'user_input', status, paused: false, request_id: 'accepted' },
+        })),
+      ],
+    }], ref<ReadonlyMap<string, InterruptViewState>>(
+      new Map([['accepted', { resolution: 'expired', busy: false, error: '' }]]),
+    ))
+    const clarify = api.renderedMessages.value[0].parts?.find(
+      (part): part is Extract<ChatPart, { type: 'interrupt' }> =>
+        part.type === 'interrupt' && part.interruptKind === 'clarify',
+    )
+    expect(clarify?.resolution).toBe('replied')
+  })
+
+  it('updates a detached questionnaire timeline when its live request expires', () => {
+    const interrupt: Extract<ChatPart, { type: 'interrupt' }> = {
+      type: 'interrupt', interruptKind: 'clarify',
+      key: 'detached:interrupt:request-1',
+      clarify: { requestId: 'request-1', runId: 'task-1', step: 'scope', intro: '', fields: [] },
+      resolution: null, busy: false, error: '',
+    }
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: '', ts: 0, messageId: 'detached',
+      tool_calls: [],
+      timeline: [{ type: 'interrupt', approvalId: 'request-1' }],
+      interrupts: [interrupt],
+    }], interruptState)
+    const resolutions = () => {
+      const rendered = api.renderedMessages.value[0]
+      const part = rendered.parts?.find(item => item.type === 'interrupt')
+      const timeline = rendered.timelineItems?.find(item => item.type === 'interrupt')
+      return [part?.resolution, timeline?.part.resolution]
+    }
+    expect(resolutions()).toEqual([null, null])
+
+    interruptState.value = new Map([
+      ['request-1', { resolution: 'expired', busy: false, error: '' }],
+    ])
+    expect(resolutions()).toEqual(['expired', 'expired'])
+    expect(interrupt.resolution).toBeNull()
+  })
+
+  it.each([null, 'replied'] as const)(
+    'settles a frozen historical timeline while preserving its %s accepted outcome',
+    (resolution) => {
+      const api = renderedMessagesFor([{
+        role: 'assistant', text: '', ts: 0, messageId: 'frozen',
+        turnOutcome: { turnId: 'turn-1', taskId: 'task-1', status: 'cancelled' },
+        tool_calls: [],
+        timeline: [{ type: 'interrupt', approvalId: 'request-1' }],
+        interrupts: [{
+          type: 'interrupt', interruptKind: 'clarify', key: 'frozen:interrupt:request-1',
+          clarify: { requestId: 'request-1', runId: 'task-1', step: 'scope', intro: '', fields: [] },
+          resolution, busy: false, error: '',
+        }],
+      }])
+      const rendered = api.renderedMessages.value[0]
+      const expected = resolution || 'expired'
+      expect(rendered.parts?.find(part => part.type === 'interrupt')?.resolution).toBe(expected)
+      expect(rendered.timelineItems?.find(item => item.type === 'interrupt')?.part.resolution).toBe(expected)
+    },
+  )
+
+  it('keeps consecutive requests distinct by requestId', () => {
+    const request = (requestId: string) => ({
+      status: 'input_required',
+      kind: 'user_input',
+      paused: true,
+      request_id: requestId,
+      run_id: 'same-run',
+      step: 'same-step',
+      clarify_schema: {
+        fields: [{ name: 'scope', type: 'string' }],
+      },
+    })
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: '',
+        ts: 0,
+        messageId: 'm-consecutive-requests',
+        tool_calls: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'request-input-1',
+            result: request('request-1'),
+          },
+          {
+            type: 'tool_result',
+            tool_use_id: 'request-input-2',
+            result: request('request-2'),
+          },
+        ],
+      },
+    ])
+
+    const keys = api.renderedMessages.value[0].parts
+      ?.filter(part => part.type === 'interrupt')
+      .map(part => part.key)
+    expect(keys).toEqual([
+      'm-consecutive-requests:interrupt:request-1',
+      'm-consecutive-requests:interrupt:request-2',
+    ])
+  })
+
   it('applies clarify submit state to recovered historical interrupt cards', () => {
     const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map([
       ['run-1|project_clarify', {
@@ -1204,6 +3322,104 @@ describe('useChatRenderedMessages clarify history recovery', () => {
 })
 
 describe('useChatRenderedMessages ensemble metadata', () => {
+  it.each([
+    ['live direct', 'usage', false],
+    ['restored direct', 'turn_usage', false],
+    ['live router', 'usage', true],
+    ['restored router', 'turn_usage', true],
+  ] as const)('does not classify ordinary model accounting as fusion: %s', (_, usageKey, routed) => {
+    const messages: ChatMessage[] = [{ role: 'user', text: 'Build a weather page.', ts: 0 }]
+    if (routed) messages.push({
+      role: 'router', text: '', ts: 1,
+      restoredFromHistory: usageKey === 'turn_usage',
+      routerDecision: { tier: 'c1', model: 'deepseek-v4-pro-0813', source: 'v4_phase3' },
+    })
+    messages.push({
+      role: 'assistant', text: 'Page ready.', ts: 2,
+      restoredFromHistory: usageKey === 'turn_usage',
+      [usageKey]: {
+        model: 'deepseek-v4-pro-0813',
+        routing_source: routed ? 'v4_phase3' : 'none',
+        routed_tier: routed ? 'c1' : undefined,
+        input_tokens: 45_432,
+        output_tokens: 2_217,
+        model_usage_breakdown: [{
+          role: 'member', profile: null, model: 'deepseek-v4-pro-0813',
+          input_tokens: 45_432, output_tokens: 2_217, request_count: 3,
+        }],
+      },
+    })
+
+    const rendered = renderedMessagesFor(messages, undefined, true).renderedMessages.value
+    const strips = rendered.filter(message => message.isRouterStrip)
+    const assistant = rendered.find(message => message.displayRole === 'assistant')
+
+    expect(assistant?.meta?.ensemble).toBeUndefined()
+    expect(assistant?.meta?.input).toBe(45_432)
+    expect(assistant?.meta?.output).toBe(2_217)
+    expect(strips).toHaveLength(routed ? 1 : 0)
+    if (routed) {
+      expect(strips[0].routerPanel).toBe('real-candidates')
+      expect(strips[0].ensemble).toBeUndefined()
+    }
+  })
+
+  it('does not infer fusion from several ordinary model or subagent usage rows', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'Done.', ts: 0,
+      usage: {
+        model_usage_breakdown: [
+          { role: 'member', model: 'model-1' },
+          { role: 'subagent', model: 'model-2' },
+          { role: 'fallback', model: 'model-3' },
+        ],
+      },
+    }], undefined, true)
+
+    expect(api.renderedMessages.value.some(message => message.isRouterStrip)).toBe(false)
+    expect(api.renderedMessages.value[0].meta?.ensemble).toBeUndefined()
+  })
+
+  it.each(['ensemble_trace', 'ensembleTrace'] as const)(
+    'preserves real ensemble execution with one fallback model using %s', traceKey => {
+      const api = renderedMessagesFor([{
+        role: 'assistant', text: 'Fallback answer.', ts: 0, restoredFromHistory: true,
+        turn_usage: {
+          model_usage_breakdown: [{ role: 'fixed_direct', model: 'fallback-model' }],
+          [traceKey]: { profile: 'custom_b5', fallback_used: true, llm_request_count: 1 },
+        },
+      }], undefined, true)
+
+      const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+      expect(strip?.routerPanel).toBe('llm-ensemble')
+      expect(strip?.ensemble?.modelCount).toBe(1)
+      expect(strip?.ensemble?.fallbackUsed).toBe(true)
+    },
+  )
+
+  it.each([false, true])('requires a trace for legacy ensemble roles (trace=%s)', hasTrace => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'Fused answer.', ts: 0, restoredFromHistory: true,
+      turn_usage: {
+        ...(hasTrace ? { ensemble_trace: { profile: 'legacy-fusion' } } : {}),
+        model_usage_breakdown: [
+          { role: 'proposer', model: 'proposer-model' },
+          { role: 'primary_aggregator', model: 'aggregator-model' },
+        ],
+      },
+    }], undefined, true)
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    if (!hasTrace) {
+      // Ordinary parents can inherit these exact roles from child usage.
+      expect(strip).toBeUndefined()
+      expect(api.renderedMessages.value[0].meta?.ensemble).toBeUndefined()
+      return
+    }
+    expect(strip?.routerPanel).toBe('llm-ensemble')
+    expect(strip?.ensemble?.modelCount).toBe(2)
+  })
+
   it('reconstructs a settled ensemble strip from completed assistant usage', () => {
     const api = renderedMessagesFor([
       {
@@ -1308,6 +3524,231 @@ describe('useChatRenderedMessages ensemble metadata', () => {
       105_000,
       12_000,
     ])
+  })
+
+  it.each([
+    ['current API', 'aggregator'],
+    ['legacy API', 'primary_aggregator'],
+  ])('folds a %s continuation into the logical aggregator member', (_, continuationRole) => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: 'tool-assisted fused answer',
+        ts: 0,
+        usage: {
+          model_usage_breakdown: [
+            {
+              role: 'proposer',
+              label: 'primary',
+              provider: 'tokenrhythm',
+              model: 'deepseek-v4-flash-0731',
+              input_tokens: 10,
+              output_tokens: 2,
+              cost_usd: 0.01,
+              elapsed_ms: 1_000,
+            },
+            {
+              role: 'aggregator',
+              label: 'aggregator',
+              provider: 'tokenrhythm',
+              model: 'deepseek-v4-flash-0731',
+              input_tokens: 20,
+              output_tokens: 4,
+              cost_usd: 0.02,
+              elapsed_ms: 2_000,
+            },
+            {
+              role: continuationRole,
+              label: continuationRole,
+              provider: 'tokenrhythm',
+              model: 'deepseek-v4-flash-0731',
+              input_tokens: 30,
+              output_tokens: 6,
+              cost_usd: 0.03,
+              elapsed_ms: 3_000,
+            },
+          ],
+          ensemble_trace: {
+            profile: 'custom_b5',
+            llm_request_count: 3,
+            fallback_used: false,
+          },
+        },
+      },
+    ])
+
+    const ensemble = api.renderedMessages.value[0].meta?.ensemble
+    expect(ensemble?.requestCount).toBe(3)
+    expect(ensemble?.modelCount).toBe(2)
+    expect(ensemble?.models.map(model => model.role)).toEqual([
+      'proposer',
+      'aggregator',
+    ])
+    expect(ensemble?.models[1]).toMatchObject({
+      role: 'aggregator',
+      label: 'aggregator',
+      provider: 'tokenrhythm',
+      model: 'deepseek-v4-flash-0731',
+      input: 50,
+      output: 10,
+      costUsd: 0.05,
+      elapsedMs: 5_000,
+    })
+  })
+
+  it('keeps the numeric aggregator subtotal without adding display-only completeness state', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'tool-assisted fused answer',
+      ts: 0,
+      usage: {
+        model_usage_breakdown: [
+          {
+            role: 'proposer',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.01,
+            cost_source: 'provider_billed',
+          },
+          {
+            role: 'aggregator',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.02,
+            cost_source: 'provider_billed',
+          },
+          {
+            role: 'primary_aggregator',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0,
+            cost_source: 'unavailable',
+            missing_cost_entries: 1,
+          },
+        ],
+        ensemble_trace: {
+          profile: 'custom_b5',
+          llm_request_count: 3,
+          fallback_used: false,
+        },
+      },
+    }])
+
+    const message = api.renderedMessages.value[0]
+    expect(message.meta).toMatchObject({
+      usageUnknown: false,
+    })
+    expect(message.meta?.ensemble?.models[1]).toMatchObject({
+      role: 'aggregator',
+      costUsd: 0.02,
+    })
+    expect(message.meta).not.toHaveProperty('costIncomplete')
+    expect(message.meta?.ensemble?.models[1]).not.toHaveProperty('costIncomplete')
+  })
+
+  it('normalizes legacy candidate labels to one public proposer role', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'fused answer',
+      ts: 0,
+      usage: {
+        model_usage_breakdown: ['primary', 'contrast', 'fast_check', 'critic'].map((label, index) => ({
+          role: 'proposer',
+          label,
+          provider: 'tokenrhythm',
+          model: `model-${index + 1}`,
+          input_tokens: 10,
+          output_tokens: 2,
+        })),
+        ensemble_trace: {
+          profile: 'custom_b5',
+          llm_request_count: 4,
+          fallback_used: false,
+        },
+      },
+    }])
+
+    expect(api.renderedMessages.value[0].meta?.ensemble?.models.map(model => ({
+      role: model.role,
+      label: model.label,
+    }))).toEqual([
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+    ])
+  })
+
+  it('keeps an authoritative zero ledger total over stale breakdown subtotals', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'settled free turn',
+      ts: 0,
+      usage: {
+        // Authoritative ledger total for the turn: genuinely $0.
+        cost_usd: 0,
+        // A richer historical projection can still carry non-zero per-row
+        // subtotals from an earlier receipt. They must not win.
+        model_usage_breakdown: [
+          {
+            role: 'proposer',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.01,
+            cost_source: 'provider_billed',
+          },
+          {
+            role: 'aggregator',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.02,
+            cost_source: 'provider_billed',
+          },
+        ],
+        ensemble_trace: {
+          profile: 'custom_b5',
+          llm_request_count: 2,
+          fallback_used: false,
+        },
+      },
+    }])
+
+    expect(api.renderedMessages.value[0].meta?.ensemble?.costUsd).toBe(0)
+  })
+
+  it('falls back to breakdown subtotals when the ledger omits a cost field', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'legacy row without a ledger total',
+      ts: 0,
+      usage: {
+        // No cost_usd/costUsd key at all — legacy shape, so the per-row
+        // subtotals remain the only available signal.
+        model_usage_breakdown: [
+          {
+            role: 'proposer',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.01,
+            cost_source: 'provider_billed',
+          },
+          {
+            role: 'aggregator',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.02,
+            cost_source: 'provider_billed',
+          },
+        ],
+        ensemble_trace: {
+          profile: 'custom_b5',
+          llm_request_count: 2,
+          fallback_used: false,
+        },
+      },
+    }])
+
+    expect(api.renderedMessages.value[0].meta?.ensemble?.costUsd).toBeCloseTo(0.03, 10)
   })
 
   it('preserves candidate terminal status from the ensemble trace after settlement', () => {

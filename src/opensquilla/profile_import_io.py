@@ -15,7 +15,11 @@ from opensquilla.recovery.atomic import (
 from opensquilla.recovery.atomic import (
     _native_io_path as native_io_path,
 )
-from opensquilla.recovery.atomic import native_move_no_replace
+from opensquilla.recovery.atomic import (
+    is_path_redirecting_stat,
+    native_move_no_replace,
+    reparse_tag_redirects,
+)
 from opensquilla.recovery.config_patch import (
     ConfigSnapshot,
 )
@@ -566,6 +570,8 @@ __all__ = [
     "chmod_open_file",
     "copy_macos_config_metadata",
     "copy_windows_config_dacl",
+    "is_path_redirecting_stat",
     "native_io_path",
     "native_move_no_replace",
+    "reparse_tag_redirects",
 ]

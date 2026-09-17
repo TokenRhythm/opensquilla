@@ -2,9 +2,32 @@
 
 from __future__ import annotations
 
-from urllib.parse import urlsplit
+import hashlib
+import json
+from urllib.parse import urlparse, urlsplit
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def endpoint_replay_source(protocol: str, provider_id: str, endpoint: str) -> str:
+    """Hash the actual request route without persisting endpoint credentials."""
+    parsed = urlparse(endpoint)
+    scheme = parsed.scheme.lower()
+    port: int | str | None
+    try:
+        port = parsed.port
+    except ValueError:
+        # Leave URL rejection to the HTTP boundary while keeping invalid
+        # ports distinct from valid routes in the stored provenance.
+        port = f"invalid:{parsed.netloc.rsplit('@', 1)[-1]}"
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    identity = (
+        provider_id, scheme, (parsed.hostname or "").lower().rstrip("."), port,
+        parsed.path, parsed.params, parsed.query,
+    )
+    digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8"))
+    return f"{protocol}:{digest.hexdigest()}"
 
 
 def _http_origin(value: str) -> tuple[str, str, int] | None:
@@ -44,6 +67,51 @@ def base_url_allows_credential_reuse(
     return stored_origin is not None and candidate_origin == stored_origin
 
 
+def base_url_matches_official_api(
+    official_base_url: str,
+    candidate_base_url: str | None,
+) -> bool:
+    """Return whether ``candidate_base_url`` names the same provider API root.
+
+    Credential reuse is intentionally origin-scoped, but capability defaults
+    also depend on the provider's canonical API path.  This stricter identity
+    allows a trailing slash and rejects query/fragment/user-info variations.
+    """
+
+    official = str(official_base_url or "").strip()
+    candidate = str(candidate_base_url or "").strip() or official
+    if not official or not candidate:
+        return False
+    # ``urlsplit`` normalizes a present-but-empty query or fragment to an
+    # empty string. Preserve strict root identity by rejecting the raw URL
+    # delimiters themselves; percent-encoded path characters remain valid.
+    if "?" in official or "#" in official or "?" in candidate or "#" in candidate:
+        return False
+    try:
+        official_parts = urlsplit(official)
+        candidate_parts = urlsplit(candidate)
+    except (UnicodeError, ValueError):
+        return False
+    if (
+        official_parts.username is not None
+        or official_parts.password is not None
+        or candidate_parts.username is not None
+        or candidate_parts.password is not None
+        or official_parts.query
+        or official_parts.fragment
+        or candidate_parts.query
+        or candidate_parts.fragment
+    ):
+        return False
+    official_path = official_parts.path.rstrip("/") or "/"
+    candidate_path = candidate_parts.path.rstrip("/") or "/"
+    return (
+        _http_origin(official) is not None
+        and _http_origin(official) == _http_origin(candidate)
+        and official_path == candidate_path
+    )
+
+
 def credential_env_for_endpoint(
     *,
     configured_env: str,
@@ -69,4 +137,9 @@ def credential_env_for_endpoint(
     return ""
 
 
-__all__ = ["base_url_allows_credential_reuse", "credential_env_for_endpoint"]
+__all__ = [
+    "base_url_allows_credential_reuse",
+    "base_url_matches_official_api",
+    "credential_env_for_endpoint",
+    "endpoint_replay_source",
+]

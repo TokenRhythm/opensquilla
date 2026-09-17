@@ -22,6 +22,7 @@ from opensquilla.recovery.atomic import (
     _chmod_open_file,
     _native_io_path,
     _windows_extended_path,
+    is_path_redirecting_stat,
     native_move_no_replace,
 )
 from opensquilla.recovery.errors import (
@@ -44,7 +45,6 @@ MEDIA_OVERRIDE_ENV_VARS = (
     "OPENSQUILLA_ATTACHMENTS_MEDIA_ROOT",
 )
 _DOTENV_MAX_BYTES = 1024 * 1024
-_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _COPYFILE_ACL = 1 << 0
 _COPYFILE_XATTR = 1 << 2
 _WORKSPACE_PATCH_SCHEMA_VERSION = 1
@@ -89,10 +89,8 @@ class ConfigSnapshot:
             raise UnsafePathError(
                 f"cannot inspect config without following links: {config_path}"
             ) from exc
-        path_attributes = int(getattr(path_stat, "st_file_attributes", 0))
         if (
-            stat.S_ISLNK(path_stat.st_mode)
-            or path_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            is_path_redirecting_stat(path_stat)
             or not stat.S_ISREG(path_stat.st_mode)
             or path_stat.st_nlink != 1
         ):
@@ -113,12 +111,11 @@ class ConfigSnapshot:
             ) from exc
         try:
             before = os.fstat(fd)
-            before_attributes = int(getattr(before, "st_file_attributes", 0))
-            if (
-                before_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
-                or not stat.S_ISREG(before.st_mode)
-                or before.st_nlink != 1
-            ):
+            # fstat cannot observe reparse tags, so a data-only cloud
+            # placeholder must not be re-rejected here; the no-follow lstat
+            # above vetted the shape and the metadata comparison below pins
+            # this handle to that same entry.
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 raise UnsafePathError(f"config must be a regular single-link file: {config_path}")
             if (
                 PathIdentity.from_stat(path_stat).metadata_tuple()

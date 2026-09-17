@@ -16,7 +16,6 @@ canonical inline behavior unless a caller explicitly supplies additional hooks.
 from __future__ import annotations
 
 from opensquilla.engine.hooks.defaults import (
-    DefaultMemoryFlushHook,
     DefaultTraceEmitterHook,
     DefaultTranscriptHook,
     NoopCompactionHook,
@@ -39,7 +38,6 @@ from opensquilla.engine.hooks.types import (
 __all__ = [
     "CompactionHook",
     "CompactionState",
-    "DefaultMemoryFlushHook",
     "DefaultTraceEmitterHook",
     "DefaultTranscriptHook",
     "NoopCompactionHook",

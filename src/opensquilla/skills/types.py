@@ -19,6 +19,26 @@ class SkillLayer(StrEnum):
     WORKSPACE = "workspace"
 
 
+class SkillVisibility(StrEnum):
+    """Which catalog surface may disclose a Skill."""
+
+    PUBLIC = "public"
+    META = "meta"
+    INTERNAL = "internal"
+    TOMBSTONE = "tombstone"
+    EXPERIMENTAL = "experimental"
+
+
+class SkillInvocation(StrEnum):
+    """Which execution domain may load or invoke a Skill."""
+
+    DIRECT = "direct"
+    META_ONLY = "meta_only"
+    CODING_ONLY = "coding_only"
+    HISTORICAL_ONLY = "historical_only"
+    EXPERIMENTAL_INTERNAL = "experimental_internal"
+
+
 @dataclass
 class SkillRequires:
     """Binary/env/config requirements for a skill."""
@@ -34,7 +54,7 @@ class SkillRequires:
 class SkillInstallSpec:
     """How to install a skill's dependencies."""
 
-    kind: str = ""  # brew | node | go | uv | download
+    kind: str = ""  # brew | node | go | uv | download | toolchain
     id: str = ""
     label: str = ""
     bins: list[str] = field(default_factory=list)
@@ -137,3 +157,20 @@ class SkillSpec:
     #   timeout: float         — seconds before the subprocess is killed
     #   cwd: str               — working directory (defaults to base_dir)
     entrypoint: dict[str, Any] | None = None
+    # Stable identity of this physical skill instance. Kept last so adding the
+    # field does not shift any historical positional ``SkillSpec`` arguments.
+    # Multiple layers may contribute the same logical ``name``; ``instance_id``
+    # distinguishes the winning instance from shadowed candidates without
+    # exposing host paths.
+    instance_id: str = ""
+    # Full content/type digest of the physical Skill tree at catalog compile
+    # time. Supporting-resource reads compare this value with the live tree so
+    # a turn pinned to an older catalog cannot combine old instructions with
+    # files published by a newer install or reload.
+    tree_digest: str = ""
+    # Visibility and invocation are independent: a stable Meta root is visible
+    # on the Meta surface but never body-loadable through ordinary skill_view.
+    visibility: SkillVisibility = SkillVisibility.PUBLIC
+    invocation: SkillInvocation = SkillInvocation.DIRECT
+    # Stable Meta roots authorized to load this internal dependency.
+    owner_meta_skills: list[str] = field(default_factory=list)

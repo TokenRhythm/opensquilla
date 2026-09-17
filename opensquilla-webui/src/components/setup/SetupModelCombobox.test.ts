@@ -27,6 +27,56 @@ const MODELS: DiscoveredModel[] = [
   },
 ]
 
+const PUBLISHED_METADATA: NonNullable<DiscoveredModel['metadata']> = {
+  schemaVersion: 1,
+  published: {
+    name: 'Alpha Official',
+    providerDisplayName: 'Test Vendor',
+    modelType: 'chat',
+    status: 'available',
+    modalities: ['text'],
+    contextWindow: 1048576,
+    maxOutputTokens: 131072,
+    reasoningMode: 'hybrid',
+    reasoningDefault: 'provider',
+    reasoningSupportedEfforts: [],
+    reasoningSupportsMaxTokens: false,
+    capabilities: {
+      tools: true,
+      reasoning: true,
+      vision: false,
+      anthropic: false,
+      responses: true,
+      streaming: true,
+    },
+    responses: null,
+    pricing: null,
+  },
+  declared: null,
+}
+
+const AUTH_ONLY_METADATA: NonNullable<DiscoveredModel['metadata']> = {
+  schemaVersion: 1,
+  published: null,
+  declared: {
+    displayName: 'Alpha Preview',
+    modelType: 'chat',
+    status: 'testing',
+    contextWindow: 262144,
+    maxOutputTokens: 16384,
+    capabilities: {
+      tools: true,
+      reasoning: true,
+      vision: false,
+      anthropic: false,
+      responses: true,
+      streaming: true,
+    },
+    responses: null,
+    pricing: null,
+  },
+}
+
 const FIELD = { name: 'model', label: 'Model' }
 
 function makeModel(id: string, capabilitySource = 'provider'): DiscoveredModel {
@@ -116,6 +166,46 @@ describe('SetupModelCombobox', () => {
     expect(popup()?.textContent).not.toContain('Live')
   })
 
+  it('pins an optional semantic choice above models and supports keyboard selection', async () => {
+    const onUpdate = vi.fn()
+    const leadingOption = {
+      value: '__ensemble__',
+      label: 'Multi-model fusion',
+      description: 'Use the shared plan',
+    }
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption,
+      onUpdate,
+    })
+
+    const input = await openList(el)
+    expect(input.value).toBe('Multi-model fusion')
+    const rows = optionRows()
+    expect(rows[0]?.textContent).toContain('Multi-model fusion')
+    expect(rows[0]?.getAttribute('aria-selected')).toBe('true')
+    expect(rows[1]?.textContent).toContain('test-vendor/alpha')
+    expect(rows).toHaveLength(3)
+    expect(listbox()?.textContent).not.toContain('__ensemble__')
+
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }))
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))
+    await nextTick()
+    expect(onUpdate).toHaveBeenCalledWith('__ensemble__')
+  })
+
+  it('keeps the semantic choice available without a discovered model catalog', async () => {
+    const { el } = await mountCombobox({
+      models: [],
+      modelSource: 'none',
+      leadingOption: { value: '__ensemble__', label: 'Multi-model fusion' },
+    })
+
+    await openList(el)
+    expect(optionRows()).toHaveLength(1)
+    expect(optionRows()[0]?.textContent).toContain('Multi-model fusion')
+  })
+
   it('opts out of password-manager field classification', async () => {
     const { el } = await mountCombobox()
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
@@ -135,13 +225,14 @@ describe('SetupModelCombobox', () => {
   it('associates field help and live catalog context with the input', async () => {
     const { el } = await mountCombobox({
       field: { ...FIELD, description: 'Used for direct requests and fallback.' },
+      externalDescriptionId: 'external-model-status',
     })
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
     const description = el.querySelector<HTMLElement>('#setup-provider-model-description')
 
     expect(description?.textContent).toBe('Used for direct requests and fallback.')
     expect(input?.getAttribute('aria-describedby'))
-      .toBe('setup-provider-model-description setup-provider-model-catalog-count')
+      .toBe('setup-provider-model-description external-model-status setup-provider-model-catalog-count')
   })
 
   it('keeps field help associated when no live catalog is available', async () => {
@@ -155,7 +246,7 @@ describe('SetupModelCombobox', () => {
     expect(input?.getAttribute('aria-describedby')).toBe('setup-provider-model-description')
   })
 
-  it('lists compact context, maximum output, and capability hints', async () => {
+  it('lists compact context and output metrics without capability clutter', async () => {
     const { el } = await mountCombobox()
     await openList(el)
 
@@ -163,13 +254,110 @@ describe('SetupModelCombobox', () => {
     expect(rows).toHaveLength(2)
     expect(rows[0].textContent).toContain('test-vendor/alpha')
     expect(rows[0].textContent).toContain('Alpha')
+    expect(rows[0].textContent).toContain('Context')
     expect(rows[0].textContent).toContain('262k')
-    expect(rows[0].textContent).toContain('Max output 16k')
-    expect(rows[0].textContent).toContain('tools')
-    expect(rows[0].textContent).not.toContain('chat') // baseline capability is noise
+    expect(rows[0].textContent).toContain('Output')
+    expect(rows[0].textContent).toContain('16k')
+    expect(rows[0].textContent).not.toContain('tools')
+    expect(rows[0].textContent).not.toContain('chat')
+    expect(rows[1].textContent).toContain('Context')
     expect(rows[1].textContent).toContain('128k')
-    expect(rows[1].textContent).not.toContain('Max output')
-    expect(rows[1].textContent).toContain('vision')
+    expect(rows[1].textContent).not.toContain('Output')
+    expect(rows[1].querySelector('.setup-model-combobox__meta')?.textContent)
+      .not.toContain('vision')
+    expect(rows[1].querySelectorAll('.setup-model-combobox__metric-separator')).toHaveLength(0)
+
+    const metricSemantics = Array.from(
+      rows[0].querySelectorAll<HTMLElement>('.setup-model-combobox__metric'),
+      metric => ({
+        title: metric.title,
+        screenReaderText: metric.querySelector('.setup-model-combobox__sr-only')?.textContent?.trim(),
+      }),
+    )
+    expect(metricSemantics).toEqual([
+      { title: 'Catalog context 262k', screenReaderText: 'Catalog context 262k' },
+      { title: 'Catalog max output 16k', screenReaderText: 'Catalog max output 16k' },
+    ])
+  })
+
+  it('marks models that accept image input as multimodal', async () => {
+    const { el } = await mountCombobox()
+    await openList(el)
+
+    const rows = optionRows()
+    expect(rows[0].textContent).not.toContain('Multimodal')
+    expect(rows[1].querySelector('.setup-model-combobox__badge--multimodal')?.textContent)
+      .toContain('Multimodal')
+    expect(rows[1].querySelector<HTMLElement>('.setup-model-combobox__badge--multimodal')?.title)
+      .toBe('Supports image input')
+  })
+
+  it('prefers published limits, suppresses normal status, and labels accessible sources', async () => {
+    const { el } = await mountCombobox({
+      models: [
+        { ...MODELS[0], metadata: PUBLISHED_METADATA },
+        MODELS[1],
+      ],
+    })
+    await openList(el)
+
+    const rows = optionRows()
+    expect(rows[0].textContent).toContain('Context')
+    expect(rows[0].textContent).toContain('1M')
+    expect(rows[0].textContent).toContain('Output')
+    expect(rows[0].textContent).toContain('131k')
+    expect(rows[0].textContent).not.toContain('available')
+    expect(rows[0].querySelector('.setup-model-combobox__badge--status')).toBeNull()
+    expect(Array.from(
+      rows[0].querySelectorAll<HTMLElement>('.setup-model-combobox__metric'),
+      metric => metric.querySelector('.setup-model-combobox__sr-only')?.textContent?.trim(),
+    )).toEqual(['Official context 1M', 'Official max output 131k'])
+    expect(rows[1].querySelector<HTMLElement>('.setup-model-combobox__metric')?.title)
+      .toBe('Catalog context 128k')
+    expect(footerRows().map(row => row.textContent).join(' '))
+      .toContain('official values when available')
+  })
+
+  it('preserves per-field source semantics when only one published limit is available', async () => {
+    const mixedMetadata: NonNullable<DiscoveredModel['metadata']> = {
+      ...PUBLISHED_METADATA,
+      published: {
+        ...PUBLISHED_METADATA.published!,
+        maxOutputTokens: null,
+      },
+    }
+    const { el } = await mountCombobox({
+      models: [{ ...MODELS[0], metadata: mixedMetadata }],
+    })
+    await openList(el)
+
+    expect(Array.from(
+      optionRows()[0].querySelectorAll<HTMLElement>('.setup-model-combobox__metric'),
+      metric => ({
+        title: metric.title,
+        screenReaderText: metric.querySelector('.setup-model-combobox__sr-only')?.textContent?.trim(),
+      }),
+    )).toEqual([
+      { title: 'Official context 1M', screenReaderText: 'Official context 1M' },
+      { title: 'Catalog max output 16k', screenReaderText: 'Catalog max output 16k' },
+    ])
+  })
+
+  it('marks auth-only testing models without repeating ordinary metadata', async () => {
+    const { el } = await mountCombobox({
+      models: [{ ...MODELS[0], metadata: AUTH_ONLY_METADATA }],
+    })
+    await openList(el)
+
+    const row = optionRows()[0]
+    expect(row.querySelector('.setup-model-combobox__badge--status')?.textContent).toContain('Testing')
+    expect(row.querySelector('.setup-model-combobox__badge--catalog')?.textContent)
+      .toContain('Catalog value')
+    expect(row.textContent).not.toContain('tools')
+    expect(Array.from(
+      row.querySelectorAll<HTMLElement>('.setup-model-combobox__metric'),
+      metric => metric.querySelector('.setup-model-combobox__sr-only')?.textContent?.trim(),
+    )).toEqual(['Catalog context 262k', 'Catalog max output 16k'])
   })
 
   it('keeps the model count in the catalog header instead of the input chrome', async () => {
@@ -250,8 +438,10 @@ describe('SetupModelCombobox', () => {
     await openList(el)
 
     const selected = document.querySelector<HTMLElement>('[role="option"][aria-selected="true"]')
-    expect(selected?.querySelector('.setup-model-combobox__selected')).toBeTruthy()
-    expect(selected?.textContent).toContain('Selected')
+    const selectedMark = selected?.querySelector('.setup-model-combobox__selected')
+    expect(selectedMark?.querySelector('svg')).toBeTruthy()
+    expect(selectedMark?.querySelector('.setup-model-combobox__sr-only')?.textContent)
+      .toContain('Selected')
   })
 
   it('pins the saved model to the top when the list exceeds the visible window', async () => {
@@ -362,6 +552,72 @@ describe('SetupModelCombobox', () => {
 
     expect(onUpdate).toHaveBeenCalledWith('alp')
     expect(listbox()).toBeTruthy()
+  })
+
+  it('keeps search local in commit-on-select mode and restores the committed choice on blur', async () => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption: {
+        value: '__ensemble__',
+        label: 'Multi-model fusion',
+      },
+      commitOnSelect: true,
+      onUpdate,
+    })
+    const input = el.querySelector<HTMLInputElement>('input[role="combobox"]')!
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'alpha'
+    input.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    expect(onUpdate).not.toHaveBeenCalled()
+    expect(input.value).toBe('alpha')
+    expect(optionRows().map(row => row.textContent)).toEqual(expect.arrayContaining([
+      expect.stringContaining('test-vendor/alpha'),
+      expect.stringContaining('Use "alpha"'),
+    ]))
+
+    input.dispatchEvent(new Event('blur'))
+    await nextTick()
+    expect(input.value).toBe('Multi-model fusion')
+    expect(onUpdate).not.toHaveBeenCalled()
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'beta'
+    input.dispatchEvent(new Event('input'))
+    input.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Escape',
+      cancelable: true,
+      bubbles: true,
+    }))
+    await nextTick()
+    expect(input.value).toBe('Multi-model fusion')
+    expect(onUpdate).not.toHaveBeenCalled()
+  })
+
+  it('commits a typed custom id only through the explicit free-text row', async () => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption: { value: '__ensemble__', label: 'Multi-model fusion' },
+      commitOnSelect: true,
+      onUpdate,
+    })
+    const input = el.querySelector<HTMLInputElement>('input[role="combobox"]')!
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'my/custom-model'
+    input.dispatchEvent(new Event('input'))
+    await nextTick()
+    const custom = optionRows().find(row => row.textContent?.includes('Use "my/custom-model"'))!
+    custom.click()
+    await nextTick()
+
+    expect(onUpdate).toHaveBeenCalledTimes(1)
+    expect(onUpdate).toHaveBeenCalledWith('my/custom-model')
+    expect(listbox()).toBeNull()
   })
 
   it('selects the active row with Enter after arrow-key navigation', async () => {

@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
-import { useRpcStore } from '@/stores/rpc'
+import type { AppSettings } from '@/modules/appSettings'
+import type { Observability, SelfLearningStatus } from '@/modules/observability'
 
 /** Config slice + status consumed by the Settings › Advanced
  *  "memory & self-learning" group. Dream and self-learning are separate
@@ -19,33 +20,12 @@ interface PatchResponse {
   linkedLive?: boolean
 }
 
-export interface SelfLearningStatus {
-  enabled?: boolean
-  captureEnabled?: boolean
-  trainingReachable?: boolean
-  dream?: { enabled?: boolean; autoSchedule?: boolean; killSwitchActive?: boolean }
-  activeModel?: { kind?: string; version?: string | null; promotedAt?: string | null }
-  samples?: {
-    total?: number
-    highValue?: number
-    requiredHighValue?: number
-    complaintRate?: number
-    lastCapturedAt?: string | null
-    feedback?: { up?: number; down?: number; downSingle?: number }
-  } | null
-  gate?: {
-    wouldTrain?: boolean
-    reason?: string
-    lastAttemptAt?: string | null
-    lastTrainedAt?: string | null
-    killSwitchActive?: boolean
-  } | null
-  lastReceipt?: { kind?: string; version?: string | null; reason?: string | null } | null
-  error?: string
-}
+export type { SelfLearningStatus } from '@/modules/observability'
 
-export function useMemoryLearningSettings() {
-  const rpc = useRpcStore()
+export function useMemoryLearningSettings(
+  appSettings: AppSettings,
+  observability: Pick<Observability, 'selfLearningStatus'>,
+) {
 
   const loaded = ref(false)
   const dreamEnabled = ref(false)
@@ -66,8 +46,7 @@ export function useMemoryLearningSettings() {
 
   async function load(): Promise<void> {
     try {
-      await rpc.waitForConnection()
-      const cfg = await rpc.call<MemoryLearningConfig>('config.get')
+      const cfg = await appSettings.readAll() as MemoryLearningConfig
       dreamEnabled.value = cfg?.memory?.dream?.enabled === true
       dreamAutoSchedule.value = cfg?.memory?.dream?.auto_schedule === true
       selfLearningEnabled.value = cfg?.squilla_router?.self_learning?.enabled === true
@@ -82,7 +61,7 @@ export function useMemoryLearningSettings() {
     if (statusLoading.value) return
     statusLoading.value = true
     try {
-      status.value = await rpc.call<SelfLearningStatus>('router.selflearning.status')
+      status.value = await observability.selfLearningStatus()
     } catch {
       status.value = null
     } finally {
@@ -96,9 +75,9 @@ export function useMemoryLearningSettings() {
     const prev = selfLearningEnabled.value
     selfLearningEnabled.value = on
     try {
-      const res = await rpc.call<PatchResponse>('config.patch.safe', {
-        patches: { 'squilla_router.self_learning.enabled': on },
-      })
+      const res = await appSettings.patchSafe([
+        { path: 'squilla_router.self_learning.enabled', value: on },
+      ]) as PatchResponse
       if (res?.linked?.length) {
         // The backend enabled the dream chain alongside; mirror it.
         dreamEnabled.value = true
@@ -127,9 +106,10 @@ export function useMemoryLearningSettings() {
     dreamAutoSchedule.value = on
     dreamLinkedOn.value = false // the user has now touched it themselves
     try {
-      const res = await rpc.call<PatchResponse>('config.patch.safe', {
-        patches: { 'memory.dream.enabled': on, 'memory.dream.auto_schedule': on },
-      })
+      const res = await appSettings.patchSafe([
+        { path: 'memory.dream.enabled', value: on },
+        { path: 'memory.dream.auto_schedule', value: on },
+      ]) as PatchResponse
       if (res?.restartRequired) restartRequired.value = true
       if (selfLearningEnabled.value) void refreshStatus()
       return true

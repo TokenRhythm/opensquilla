@@ -1,4 +1,11 @@
 import { expect, test, type Download, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/chat/new'
 const HISTORY_IMAGE_DATA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
@@ -16,6 +23,7 @@ type MockRpcOptions = {
   replayHistoryAfterSend?: boolean
   historyAttachmentFixture?: HistoryAttachmentFixture
   historyRequests?: Array<Record<string, unknown>>
+  runningSessionKey?: string
 }
 
 function wsResponse(id: string, payload: unknown) {
@@ -42,10 +50,20 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (frame?.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong' }))
+          return
+        }
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
+        const sessionKey = String(frame.params?.key || frame.params?.sessionKey || '')
+        const runtime = sessionKey === options.runningSessionKey
+          ? { run_status: 'running', active_task: { task_id: 'attachment-queue-task', status: 'running' } }
+          : {}
         if (method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloOkResponse({
+            auth: { principal: { isOwner: true, authenticated: true, authState: 'authenticated' } },
+          }))
           return
         }
         if (method === 'chat.send') {
@@ -71,6 +89,7 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
               key: params.sessionKey || '',
               sessionKey: params.sessionKey || '',
               status: 'succeeded',
+              stream_generation: 'e2e-stream-generation',
               stream_seq: capturedSends.length,
             }))
           }
@@ -78,7 +97,7 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
         }
         if (method === 'chat.history') {
           options.historyRequests?.push(frame.params || {})
-          ws.send(wsResponse(String(frame.id), { messages: historyMessages, has_more: false }))
+          ws.send(wsResponse(String(frame.id), chatHistoryPayload(historyMessages)))
           return
         }
 
@@ -90,13 +109,10 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
-          'sessions.messages.subscribe': {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey, runtime),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey, runtime),
           'usage.status': { sessions: [] },
         }
 
@@ -148,21 +164,22 @@ async function readDownloadBytes(download: Download): Promise<Buffer> {
   return Buffer.concat(chunks)
 }
 
-async function openMockedChat(page: Page, capturedSends: CapturedSend[], options: MockRpcOptions = {}) {
+async function openMockedChat(page: Page, capturedSends: CapturedSend[], options: MockRpcOptions = {}, url = CONTROL_URL) {
   await mockApprovals(page)
   await mockRpc(page, capturedSends, options)
-  await page.goto(CONTROL_URL)
+  await page.goto(url)
   await expect(page.locator('.chat-textarea')).toBeVisible()
   await expect(page.locator('.conn-pill.connected')).toBeVisible()
 }
 
-async function dropFiles(page: Page, files: Array<{ name: string; type: string; text?: string; size?: number }>) {
+async function dropFiles(page: Page, files: Array<{ name: string; type: string; text?: string; size?: number; base64?: string }>) {
   await page.evaluate((fileSpecs) => {
     const dataTransfer = new DataTransfer()
     for (const spec of fileSpecs) {
-      const parts = spec.size
-        ? [new Uint8Array(spec.size)]
-        : [spec.text || 'drag upload']
+      const decoded = spec.base64 ? Uint8Array.from(atob(spec.base64), char => char.charCodeAt(0)) : undefined
+      const bytes = spec.size ? new Uint8Array(spec.size) : decoded
+      if (bytes && decoded) bytes.set(decoded)
+      const parts = bytes ? [bytes] : [spec.text || 'drag upload']
       dataTransfer.items.add(new File(parts, spec.name, { type: spec.type }))
     }
     const chat = document.querySelector('.chat')
@@ -214,7 +231,118 @@ async function expectDropOverlayCoversChat(page: Page) {
   expect(layout.pointerEvents).toBe('none')
 }
 
+async function delayJpegReads(page: Page) {
+  await page.addInitScript(() => {
+    const nativeRead = FileReader.prototype.readAsDataURL
+    const pending: Array<() => Promise<void>> = []
+    FileReader.prototype.readAsDataURL = function (blob: Blob) {
+      if (blob.type === 'image/jpeg') {
+        pending.push(() => new Promise(resolve => {
+          this.addEventListener('loadend', () => resolve(), { once: true })
+          nativeRead.call(this, blob)
+        }))
+        return
+      }
+      nativeRead.call(this, blob)
+    }
+    Object.assign(window, {
+      releaseJpegReads: () => Promise.all(pending.splice(0).map(read => read())),
+    })
+  })
+}
+
+async function releaseJpegReads(page: Page) {
+  await page.evaluate(() => {
+    return (window as unknown as { releaseJpegReads: () => Promise<unknown> }).releaseJpegReads()
+  })
+}
+
+async function jpegData(page: Page, color: string): Promise<string> {
+  return page.evaluate(fill => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 4
+    canvas.height = 4
+    const context = canvas.getContext('2d')!
+    context.fillStyle = fill
+    context.fillRect(0, 0, 4, 4)
+    return canvas.toDataURL('image/jpeg').split(',')[1]!
+  }, color)
+}
+
 test.describe('attachment drag upload', () => {
+  for (const reset of ['agent switch', 'same-route new task'] as const) {
+    test(`discards a delayed JPEG read after ${reset}`, async ({ page }) => {
+      const capturedSends: CapturedSend[] = []
+      await delayJpegReads(page)
+      await page.addInitScript(() => {
+        localStorage.setItem('opensquilla.shortcuts', JSON.stringify({ 'new-chat': { enabled: true } }))
+      })
+      await openMockedChat(page, capturedSends, {}, `${CONTROL_URL}?agent=${reset === 'agent switch' ? 'research' : 'main'}`)
+      await dropFiles(page, [{ name: 'unsent.jpeg', type: 'image/jpeg', base64: await jpegData(page, 'red') }])
+      await expect(page.locator('.attachment-chip--busy')).toHaveCount(1)
+      if (reset === 'agent switch') {
+        await page.locator('.sidebar-new-session').click()
+        await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
+      } else {
+        const hint = await page.locator('.sidebar-new-session .sidebar-kbd').innerText()
+        await page.keyboard.press(hint.includes('⌘') ? 'Meta+Shift+K' : 'Control+Shift+K')
+      }
+      await expect(page.locator('.attachment-chip')).toHaveCount(0)
+      await releaseJpegReads(page)
+      await page.locator('.chat-textarea').fill('Text from the next task')
+      await page.locator('.chat-send-btn[aria-label="Send"]').click()
+      await expect.poll(() => capturedSends.length).toBe(1)
+      expect(capturedSends[0]?.attachments || []).toHaveLength(0)
+      await expect(page.locator('.attachment-chip')).toHaveCount(0)
+      await expect(page.locator('.msg-thumb-button')).toHaveCount(0)
+    })
+  }
+
+  test('keeps only the reselected JPEG when a removed file finishes reading late', async ({ page }) => {
+    const capturedSends: CapturedSend[] = []
+    await delayJpegReads(page)
+    await openMockedChat(page, capturedSends)
+    await dropFiles(page, [{ name: 'photo.jpeg', type: 'image/jpeg', base64: await jpegData(page, 'red') }])
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(1)
+    await page.locator('.attachment-remove').click()
+    const replacement = await jpegData(page, 'blue')
+    await dropFiles(page, [{ name: 'photo.jpeg', type: 'image/jpeg', base64: replacement }])
+    await releaseJpegReads(page)
+    await expect(page.locator('.attachment-chip')).toHaveCount(1)
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => capturedSends.length).toBe(1)
+    expect(capturedSends[0]?.attachments).toHaveLength(1)
+    expect(capturedSends[0]?.attachments?.[0]).toMatchObject({ name: 'photo.jpeg', data: replacement })
+  })
+
+  test('keeps a queued JPEG with its originating task when opening a new task', async ({ page }) => {
+    const capturedSends: CapturedSend[] = []
+    const session = 'agent:main:webchat:jpeg-queue-origin'
+    await openMockedChat(page, capturedSends, { runningSessionKey: session }, `/control/chat?session=${encodeURIComponent(session)}`)
+    await expect(page.getByRole('button', { name: /^Stop .*response$/ })).toBeVisible()
+    await dropFiles(page, [{ name: 'queued.jpeg', type: 'image/jpeg', base64: await jpegData(page, 'red') }])
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+    await page.locator('.chat-textarea').fill('Queued image belongs to the original task')
+    await page.locator('.chat-textarea').press('Enter')
+    await expect(page.locator('.chat-pending-card')).toHaveCount(1)
+    await expect(page.locator('.chat-pending-attachments')).toContainText('1')
+    await page.locator('.sidebar-new-session').click()
+    await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
+    await expect(page.locator('.attachment-chip')).toHaveCount(0)
+    await expect(page.locator('.chat-pending-card')).toHaveCount(0)
+    await page.locator('.chat-textarea').fill('Independent text-only task')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => capturedSends.length).toBe(1)
+    expect(capturedSends[0]?.attachments || []).toHaveLength(0)
+    expect(capturedSends[0]?.sessionKey).not.toBe(session)
+    await page.goBack()
+    await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(session)
+    await expect(page.locator('.chat-pending-card')).toHaveCount(1)
+    await expect(page.locator('.chat-pending-attachments')).toContainText('1')
+    expect(capturedSends).toHaveLength(1)
+  })
+
   test('ignores non-file drags and keeps file drag affordance stable across children', async ({ page }) => {
     const capturedSends: CapturedSend[] = []
     await openMockedChat(page, capturedSends)
@@ -377,9 +505,119 @@ test.describe('attachment drag upload', () => {
     expect(await readDownloadBytes(download)).toEqual(Buffer.from('<html>'))
   })
 
-  test('keeps image history replay attachments as thumbnails', async ({ page }) => {
+  test('previews uploaded images before and immediately after sending', async ({ page }) => {
+    const capturedSends: CapturedSend[] = []
+    const downloads: Download[] = []
+    page.on('download', download => downloads.push(download))
+    await openMockedChat(page, capturedSends)
+
+    await dropFiles(page, [
+      { name: 'draft-image.png', type: 'image/png', base64: HISTORY_IMAGE_DATA },
+    ])
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+    const composerPreview = page.locator('.attachment-chip__preview')
+    await expect(composerPreview).toHaveAccessibleName('Open draft-image.png')
+    await composerPreview.focus()
+    await page.keyboard.press('Enter')
+
+    const preview = page.locator('.deliv-preview[role="dialog"]')
+    const previewImage = preview.locator('.deliv-preview__image')
+    await expect(preview).toBeVisible()
+    await expect(previewImage).toHaveAttribute('alt', 'draft-image.png')
+    await expect.poll(() => previewImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(1)
+    expect(downloads).toHaveLength(0)
+    expect(capturedSends).toHaveLength(0)
+
+    await page.keyboard.press('Escape')
+    await expect(preview).toHaveCount(0)
+    await expect(composerPreview).toBeFocused()
+    await expect(page.locator('.attachment-chip')).toContainText('draft-image.png')
+
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => capturedSends.length).toBe(1)
+    await expect(page.locator('.attachment-chip')).toHaveCount(0)
+    const sentPreview = page.locator('.msg-thumb-button')
+    await expect(sentPreview).toHaveAccessibleName('Open draft-image.png')
+    await sentPreview.click()
+    await expect(preview).toBeVisible()
+    await expect.poll(() => previewImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(1)
+    expect(downloads).toHaveLength(0)
+  })
+
+  test('closes draft image previews when browser history switches agents', async ({ page }) => {
+    const capturedSends: CapturedSend[] = []
+    const downloads: Download[] = []
+    page.on('download', download => downloads.push(download))
+    await openMockedChat(page, capturedSends, {}, `${CONTROL_URL}?agent=research`)
+    await page.locator('.sidebar-new-session').click()
+    await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
+
+    await dropFiles(page, [
+      { name: 'main-draft.png', type: 'image/png', base64: HISTORY_IMAGE_DATA },
+    ])
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+    await page.locator('.attachment-chip__preview').click()
+    const preview = page.locator('.deliv-preview[role="dialog"]')
+    await expect(preview.locator('.deliv-preview__image')).toHaveAttribute('alt', 'main-draft.png')
+
+    await page.goBack()
+    await expect(page).toHaveURL(/\/chat\/new\?agent=research$/)
+    await expect(preview).toHaveCount(0)
+    await expect(page.locator('.attachment-chip')).toHaveCount(0)
+
+    await dropFiles(page, [
+      { name: 'research-draft.png', type: 'image/png', base64: HISTORY_IMAGE_DATA },
+    ])
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+    await page.locator('.attachment-chip__preview').click()
+    await expect(preview.locator('.deliv-preview__image')).toHaveAttribute('alt', 'research-draft.png')
+
+    await page.goForward()
+    await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
+    await expect(preview).toHaveCount(0)
+    await expect(page.locator('.attachment-chip')).toHaveCount(0)
+    expect(capturedSends).toHaveLength(0)
+    expect(downloads).toHaveLength(0)
+  })
+
+  test('closes draft image previews when a new task resets the same URL', async ({ page }) => {
+    const capturedSends: CapturedSend[] = []
+    const downloads: Download[] = []
+    page.on('download', download => downloads.push(download))
+    await page.addInitScript(() => {
+      localStorage.setItem('opensquilla.shortcuts', JSON.stringify({
+        'new-chat': { enabled: true },
+      }))
+    })
+    await openMockedChat(page, capturedSends, {}, `${CONTROL_URL}?agent=main`)
+    await page.locator('.chat-textarea').fill('Describe this draft image')
+    await dropFiles(page, [
+      { name: 'reset-draft.png', type: 'image/png', base64: HISTORY_IMAGE_DATA },
+    ])
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+    await page.locator('.attachment-chip__preview').click()
+    const preview = page.locator('.deliv-preview[role="dialog"]')
+    await expect(preview.locator('.deliv-preview__image')).toHaveAttribute('alt', 'reset-draft.png')
+    const draftUrl = page.url()
+    const shortcutHint = page.locator('.sidebar-new-session .sidebar-kbd')
+    await expect(shortcutHint).toHaveText(/^(Ctrl\+Shift\+K|⌘⇧K)$/)
+    const shortcut = (await shortcutHint.innerText()).includes('⌘') ? 'Meta+Shift+K' : 'Control+Shift+K'
+
+    await page.keyboard.press(shortcut)
+    await expect(page).toHaveURL(draftUrl)
+    await expect(page.locator('.chat-textarea')).toHaveValue('')
+    await expect(preview).toHaveCount(0)
+    await expect(page.locator('.attachment-chip')).toHaveCount(0)
+    await expect(page.locator('.chat-textarea')).toBeFocused()
+    expect(capturedSends).toHaveLength(0)
+    expect(downloads).toHaveLength(0)
+  })
+
+  test('previews image history attachments and downloads only from the preview action', async ({ page }) => {
     const capturedSends: CapturedSend[] = []
     const historyRequests: Array<Record<string, unknown>> = []
+    const downloads: Download[] = []
+    page.on('download', download => downloads.push(download))
     await openMockedChat(page, capturedSends, {
       replayHistoryAfterSend: true,
       historyAttachmentFixture: 'image',
@@ -400,6 +638,105 @@ test.describe('attachment drag upload', () => {
     await expect(thumb).toBeVisible()
     await expect(thumb).toHaveAttribute('src', `data:image/png;base64,${HISTORY_IMAGE_DATA}`)
     await expect(page.locator('.msg-attachments .msg-file-chip')).toHaveCount(0)
+
+    await page.getByRole('button', { name: 'Open photo.png', exact: true }).click()
+    const preview = page.locator('.deliv-preview[role="dialog"]')
+    const previewImage = preview.locator('.deliv-preview__image')
+    await expect(preview).toBeVisible()
+    await expect(previewImage).toHaveAttribute('alt', 'photo.png')
+    await expect.poll(() => previewImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(1)
+    expect(downloads).toHaveLength(0)
+
+    const downloadPromise = page.waitForEvent('download')
+    await preview.locator('.deliv-preview__actions').getByRole('button', { name: 'Download', exact: true }).click()
+    const download = await downloadPromise
+    expect(download.suggestedFilename()).toBe('photo.png')
+    expect(await readDownloadBytes(download)).toEqual(Buffer.from(HISTORY_IMAGE_DATA, 'base64'))
+    expect(downloads).toHaveLength(1)
+  })
+
+  test('previews staged images locally before send and through authenticated history access', async ({ page }) => {
+    const capturedSends: CapturedSend[] = []
+    const historyRequests: Array<Record<string, unknown>> = []
+    const imageRequests: Array<{ authorization?: string; sessionKey?: string; url: string }> = []
+    const downloads: Download[] = []
+    page.on('download', download => downloads.push(download))
+    await page.addInitScript(() => {
+      sessionStorage.setItem('opensquilla.wsToken', 'token-e2e')
+    })
+    await page.route('**/api/v1/files/upload', route => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        file_uuid: 'u-e2e-staged-image',
+        filename: 'staged-image.png',
+        mime: 'image/png',
+        size: 2_000_001,
+      }),
+    }))
+    await page.route('**/api/v1/attachments/**', route => {
+      const request = route.request()
+      imageRequests.push({
+        authorization: request.headers().authorization,
+        sessionKey: request.headers()['x-opensquilla-session-key'],
+        url: request.url(),
+      })
+      return route.fulfill({
+        status: 200,
+        contentType: 'image/png',
+        headers: { 'content-disposition': 'attachment; filename="server-staged-image.png"' },
+        body: Buffer.from(HISTORY_IMAGE_DATA, 'base64'),
+      })
+    })
+    await openMockedChat(page, capturedSends, {
+      replayHistoryAfterSend: true,
+      historyAttachmentFixture: 'staged',
+      historyRequests,
+    })
+
+    await dropFiles(page, [
+      { name: 'staged-image.png', type: 'image/png', base64: HISTORY_IMAGE_DATA, size: 2_000_001 },
+    ])
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+    await page.locator('.attachment-chip__preview').click()
+    const preview = page.locator('.deliv-preview[role="dialog"]')
+    const previewImage = preview.locator('.deliv-preview__image')
+    await expect(preview).toBeVisible()
+    await expect.poll(() => previewImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(1)
+    expect(imageRequests).toHaveLength(0)
+    expect(downloads).toHaveLength(0)
+    await page.keyboard.press('Escape')
+    await expect(preview).toHaveCount(0)
+
+    const historyCallsBeforeSend = historyRequests.length
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => capturedSends.length).toBe(1)
+    await expect.poll(() => historyRequests.length).toBeGreaterThan(historyCallsBeforeSend)
+    expect(capturedSends[0].attachments?.[0]).toMatchObject({
+      file_uuid: 'u-e2e-staged-image',
+      name: 'staged-image.png',
+      mime: 'image/png',
+    })
+
+    await page.locator('.msg-attachments').getByRole('button', { name: 'Open staged-image.png', exact: true }).click()
+    await expect(preview).toBeVisible()
+    await expect.poll(() => previewImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(1)
+    await expect.poll(() => imageRequests.length).toBe(1)
+    expect(downloads).toHaveLength(0)
+
+    const downloadPromise = page.waitForEvent('download')
+    await preview.locator('.deliv-preview__actions').getByRole('button', { name: 'Download', exact: true }).click()
+    const download = await downloadPromise
+    expect(download.suggestedFilename()).toBe('server-staged-image.png')
+    expect(await readDownloadBytes(download)).toEqual(Buffer.from(HISTORY_IMAGE_DATA, 'base64'))
+    expect(downloads).toHaveLength(1)
+    for (const request of imageRequests) {
+      expect(request.authorization).toBe('Bearer token-e2e')
+      expect(request.sessionKey).toBe(capturedSends[0].sessionKey)
+      const requested = new URL(request.url)
+      expect(requested.searchParams.has('token')).toBe(false)
+      expect(requested.searchParams.has('sessionKey')).toBe(false)
+    }
   })
 
   test('drops a large staged file through the authenticated upload path', async ({ page }) => {

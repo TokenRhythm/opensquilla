@@ -23,6 +23,7 @@ export type {
   ArtifactOpenRequest,
   CliInvocation,
   DesktopMainWindowCloseBehavior,
+  DesktopGatewayConnection,
   DesktopPreferences,
   DesktopSettings,
   DesktopSettingsPayload,
@@ -47,4 +48,5 @@ export type {
   PlatformSettingsApi,
   SearchProviderOption,
   WorkbenchPreviewMode,
+  SandboxUpgradeReport,
 } from './types'

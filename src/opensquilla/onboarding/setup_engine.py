@@ -12,6 +12,9 @@ from opensquilla.onboarding.config_store import PersistResult, load_config, pers
 from opensquilla.onboarding.image_generation_specs import (
     image_generation_provider_catalog_payload,
 )
+from opensquilla.onboarding.image_generation_state import (
+    default_image_generation_intent_for_provider,
+)
 from opensquilla.onboarding.memory_embedding_specs import (
     memory_embedding_provider_catalog_payload,
 )
@@ -116,13 +119,14 @@ class SetupEngine:
     def apply(self, section: str, payload: dict[str, Any]) -> MutationResult:
         normalized = section.strip().lower()
         if normalized in {"provider", "providers"}:
+            provider_id = str(payload["providerId"])
             # Keep-current semantics: keys absent from the payload (or set to
             # None) mean "leave the stored value alone" on a same-provider
             # re-save; explicit values — including an explicit empty string —
             # keep their legacy meaning in the mutation.
             res = upsert_llm_provider(
                 self.config,
-                provider_id=str(payload["providerId"]),
+                provider_id=provider_id,
                 model=_optional_str(payload.get("model")),
                 api_key=str(payload.get("apiKey") or ""),
                 api_key_env=str(payload.get("apiKeyEnv") or ""),
@@ -133,6 +137,11 @@ class SetupEngine:
                 base_url=_optional_str(payload.get("baseUrl")),
                 proxy=_optional_str(payload.get("proxy")),
                 preset_id=str(payload.get("presetId") or ""),
+                image_generation_intent=(
+                    default_image_generation_intent_for_provider(provider_id)
+                    if payload.get("imageGenerationIntent") is None
+                    else str(payload.get("imageGenerationIntent"))
+                ),
             )
         elif normalized == "router":
             res = upsert_router(
@@ -172,6 +181,7 @@ class SetupEngine:
                     else [dict(candidate) for candidate in candidates]
                 ),
                 min_successful_proposers=payload.get("minSuccessfulProposers"),
+                proposer_max_retries=payload.get("proposerMaxRetries"),
                 all_failed_policy=(
                     None if all_failed_policy is None else str(all_failed_policy)
                 ),

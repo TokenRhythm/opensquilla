@@ -18,6 +18,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -27,7 +28,10 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla import __version__
-from opensquilla.observability.network_policy import network_observability_disabled
+from opensquilla.observability.network_policy import (
+    network_observability_disabled,
+    telemetry_scope_forced_off_reasons,
+)
 from opensquilla.paths import default_opensquilla_home
 
 log = logging.getLogger(__name__)
@@ -51,10 +55,17 @@ _MAC_HEX_RE = re.compile(r"^[0-9a-f]{12}$")
 _COLLECT_LOCK = threading.Lock()
 _STATE_LOCK = threading.RLock()
 _STATE_TRANSACTION_TIMEOUT_SECONDS = 1.0
+_RESULT_STATE_TRANSACTION_TIMEOUT_SECONDS = 5.0
+_WINDOWS_STATE_REPLACE_RETRY_DELAYS_SECONDS = (0.02, 0.05, 0.1, 0.2)
+_WINDOWS_TRANSIENT_STATE_REPLACE_ERRORS = frozenset({5, 32, 33})
 
 
 @contextmanager
-def _state_transaction(path: Path) -> Iterator[None]:
+def _state_transaction(
+    path: Path,
+    *,
+    timeout: float = _STATE_TRANSACTION_TIMEOUT_SECONDS,
+) -> Iterator[None]:
     """Serialize one short telemetry-state transaction across threads/processes."""
     # Import lazily so merely importing telemetry during boot does not load the
     # platform-specific lock implementation. The exact JSON path is the key, so
@@ -62,7 +73,7 @@ def _state_transaction(path: Path) -> Iterator[None]:
     from opensquilla.profile_operation_lock import ProfileOperationLock
 
     with _STATE_LOCK:
-        with ProfileOperationLock(path, timeout=_STATE_TRANSACTION_TIMEOUT_SECONDS):
+        with ProfileOperationLock(path, timeout=timeout):
             yield
 
 
@@ -165,7 +176,10 @@ def collect_install_telemetry(
                 payload,
                 timeout=DEFAULT_TIMEOUT_SECONDS,
             )
-            with _state_transaction(path):
+            with _state_transaction(
+                path,
+                timeout=_RESULT_STATE_TRANSACTION_TIMEOUT_SECONDS,
+            ):
                 # Merge the result into the latest state rather than overwriting
                 # another telemetry writer's atomic update.
                 state = _load_or_create_state(path)
@@ -273,7 +287,12 @@ def _state_path(*, config: Any | None, explicit: str | Path | None) -> Path:
 
 
 def _telemetry_disabled(*, config: Any | None = None) -> bool:
-    return network_observability_disabled(config=config)
+    privacy = getattr(config, "privacy", None)
+    return (
+        network_observability_disabled(config=config)
+        or getattr(privacy, "reliability_diagnostics_enabled", None) is False
+        or getattr(privacy, "product_analytics_enabled", None) is False
+    )
 
 
 def _telemetry_skip_reason(*, config: Any | None = None) -> str | None:
@@ -282,7 +301,10 @@ def _telemetry_skip_reason(*, config: Any | None = None) -> str | None:
     ci_env = _ci_environment_name()
     if ci_env is not None:
         return f"environment:{ci_env}"
-    return None
+    # Installation and daily usage reports share the product-analytics vetoes.
+    # Keep the original legacy switches above, including the update-check veto.
+    reasons = telemetry_scope_forced_off_reasons("growth", config=config)
+    return reasons[0] if reasons else None
 
 
 def _ci_environment_detected() -> bool:
@@ -493,7 +515,7 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
             json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
             fh.write("\n")
         os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, path)
+        _replace_state_file(tmp_name, path)
         os.chmod(path, 0o600)
     except Exception:
         try:
@@ -501,6 +523,23 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _replace_state_file(source: str | Path, destination: Path) -> None:
+    """Publish telemetry state after transient Windows readers release it."""
+    for delay in (*_WINDOWS_STATE_REPLACE_RETRY_DELAYS_SECONDS, None):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None)
+                not in _WINDOWS_TRANSIENT_STATE_REPLACE_ERRORS
+                or delay is None
+            ):
+                raise
+            time.sleep(delay)
 
 
 def _next_event(state: dict[str, Any], current_version: str) -> str | None:

@@ -95,6 +95,24 @@ def test_router_decision_payload_values_pass_through() -> None:
     assert payload["context_window"] == 128_000
 
 
+def test_router_decision_payload_passes_optional_tier_snapshot() -> None:
+    event = _synthetic_router_decision()
+    event.router_tier_snapshot = {
+        "version": 1,
+        "request_kind": "text",
+        "tiers": [
+            {
+                "tier": "c1",
+                "model": "test-provider/test-model",
+                "execution_kind": "single_model",
+            }
+        ],
+    }
+
+    payload = _router_decision_payload(event)
+    assert payload["router_tier_snapshot"] == event.router_tier_snapshot
+
+
 def test_ensemble_progress_payload_keys_are_frozen() -> None:
     event = EnsembleProgressEvent(
         event_type="proposer_done",

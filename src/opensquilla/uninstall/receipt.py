@@ -58,9 +58,10 @@ def build_receipt(
     entrypoints: list[str],
     owned_paths: list[str],
     data_root: str,
+    source_commit_id: str | None = None,
 ) -> dict[str, Any]:
     """Construct a receipt payload (pure; caller serializes/writes it)."""
-    return {
+    payload = {
         "version": RECEIPT_SCHEMA_VERSION,
         "install_method": install_method,
         "installed_at": installed_at,
@@ -68,6 +69,9 @@ def build_receipt(
         "owned_paths": list(owned_paths),
         "data_root": data_root,
     }
+    if source_commit_id is not None:
+        payload["source_commit_id"] = source_commit_id
+    return payload
 
 
 def write_receipt(payload: dict[str, Any], home: Path | None = None) -> Path:

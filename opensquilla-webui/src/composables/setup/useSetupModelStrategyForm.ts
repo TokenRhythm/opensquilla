@@ -4,6 +4,17 @@ import type { useSetupEnsembleForm } from '@/composables/setup/useSetupEnsembleF
 import type { DiscoveredModelCatalog } from '@/composables/setup/useSetupProviderForm'
 
 export type ModelStrategy = 'router' | 'ensemble' | 'single'
+export interface SavedRoutingSummary {
+  providerId: string
+  providerLabel: string
+  enabled: boolean
+  binding: 'follow_primary' | 'custom' | 'legacy'
+  crossProviderEnabled: boolean
+  hasForeignTierProviders: boolean
+  hasUnsavedChanges: boolean
+  resetPending: boolean
+  resetDisabledReason: string
+}
 
 type RouterForm = ReturnType<typeof useSetupRouterForm>
 type EnsembleForm = ReturnType<typeof useSetupEnsembleForm>
@@ -19,11 +30,13 @@ interface EnsembleTierCandidate {
 
 interface ModelStrategyPanelContext {
   hasSavedProvider: ComputedRef<boolean>
+  profileSaveSupported: ComputedRef<boolean>
   providerLabel: ComputedRef<string>
   routerPanel: ComputedRef<RouterPanel>
   ensemblePanel: ComputedRef<EnsemblePanel>
   routerTemplateState: ComputedRef<string>
   fixedModelCatalog: ComputedRef<DiscoveredModelCatalog>
+  routingSummary?: ComputedRef<SavedRoutingSummary>
 }
 
 export function useSetupModelStrategyForm(
@@ -84,12 +97,16 @@ export function useSetupModelStrategyForm(
     if (next === 'ensemble') {
       routerForm.setRouterMode('disabled')
       ensembleForm.setEnabled(true)
-      // Providers with an official preset land on it; every other provider
-      // gets an explicit custom lineup (seeded from the router tiers), never
-      // the hidden legacy dynamic mode.
+      // Activation changes where the one shared plan applies. The ensemble
+      // form preserves an already configured plan and only materializes a
+      // hidden legacy/empty draft when necessary.
       ensembleForm.activateForProvider(
         activeProvider?.value,
         tierCandidates?.value ?? [],
+      )
+      routerForm.setEnsembleContext(
+        ensembleForm.selectionMode.value,
+        ensembleForm.enabled.value,
       )
       return
     }
@@ -98,10 +115,18 @@ export function useSetupModelStrategyForm(
       if (routerForm.mode.value === 'disabled' || routerForm.mode.value === 'openrouter-mix') {
         routerForm.enableFromSavedBinding()
       }
+      routerForm.setEnsembleContext(
+        ensembleForm.selectionMode.value,
+        ensembleForm.enabled.value,
+      )
       return
     }
     ensembleForm.setEnabled(false)
     routerForm.setRouterMode('disabled')
+    routerForm.setEnsembleContext(
+      ensembleForm.selectionMode.value,
+      ensembleForm.enabled.value,
+    )
   }
 
   function createPanel(context: ModelStrategyPanelContext) {
@@ -112,10 +137,18 @@ export function useSetupModelStrategyForm(
       )
       return {
       activeStrategy: activeStrategy.value,
+      routingSummary: context.routingSummary?.value,
       hasSavedProvider: context.hasSavedProvider.value,
+      profileSaveSupported: context.profileSaveSupported.value,
       providerLabel: context.providerLabel.value,
       routerTemplateState: context.routerTemplateState.value,
-      router: context.routerPanel.value,
+      router: {
+        ...context.routerPanel.value,
+        // Runtime readiness is a snapshot of the last saved configuration.
+        // Once any routing, lineup, or fixed-fallback field changes locally,
+        // the UI must fall back to conservative draft validation until save.
+        tierEnsembleStatusFresh: !isDirty.value,
+      },
       ensemble: context.ensemblePanel.value,
       single: {
         providerId,

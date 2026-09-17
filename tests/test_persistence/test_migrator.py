@@ -27,6 +27,123 @@ from opensquilla.session.storage import SessionStorage
 _REPO_MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
 
+@pytest.mark.asyncio
+async def test_meta_control_migration_chain_rolls_back_without_ordinary_data_loss(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    storage = await SessionStorage.open(str(db_path))
+    await storage.close()
+
+    tail_ids = (
+        "V030__meta_control_intents",
+        "V031__meta_launch_drafts",
+        "V032__meta_launch_discard_tombstones",
+    )
+    tail_tables = (
+        "meta_control_intents",
+        "meta_launch_drafts",
+        "meta_launch_discard_tombstones",
+    )
+    meta_objects = {
+        *tail_tables,
+        "uq_meta_control_intents_correlation",
+        "idx_meta_control_intents_session_status",
+        "uq_meta_launch_drafts_request",
+        "idx_meta_launch_drafts_session_expiry",
+        "idx_meta_launch_discard_tombstones_expiry",
+    }
+    with sqlite3.connect(db_path) as connection:
+        for table in reversed(tail_tables):
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
+
+    backend = migrator.get_backend(migrator._to_yoyo_url(str(db_path)))
+    try:
+        migrations = migrator.read_migrations(str(_REPO_MIGRATIONS_DIR))
+        by_id = {migration.id: migration for migration in migrations}
+        migration_list_type = type(migrations)
+        base = migration_list_type(
+            [migration for migration in migrations if migration.id < tail_ids[0]],
+            migrations.post_apply,
+        )
+        with backend.lock():
+            backend.apply_migrations(backend.to_apply(base))
+
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "INSERT INTO sessions (session_key, session_id, created_at, updated_at) "
+                "VALUES ('agent:main:webchat:rollback-sentinel', 'session-sentinel', 1, 1)"
+            )
+            connection.execute(
+                "INSERT INTO transcript_entries ("
+                "session_id, session_key, message_id, role, content, created_at"
+                ") VALUES ("
+                "'session-sentinel', 'agent:main:webchat:rollback-sentinel', "
+                "'message-sentinel', 'user', 'ordinary data survives', 1"
+                ")"
+            )
+
+        tail = migration_list_type(
+            [by_id[item] for item in tail_ids],
+            migrations.post_apply,
+        )
+        with backend.lock():
+            backend.apply_migrations(backend.to_apply(tail))
+
+        with sqlite3.connect(db_path) as connection:
+            present = {
+                name
+                for (name,) in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name IN ("
+                    + ",".join("?" for _item in meta_objects)
+                    + ")",
+                    tuple(meta_objects),
+                )
+            }
+        assert present == meta_objects
+
+        with backend.lock():
+            backend.rollback_migrations([by_id[item] for item in reversed(tail_ids)])
+    finally:
+        backend.connection.close()
+
+    with sqlite3.connect(db_path) as connection:
+        ordinary_session = connection.execute(
+            "SELECT session_id FROM sessions WHERE session_key = ?",
+            ("agent:main:webchat:rollback-sentinel",),
+        ).fetchone()
+        ordinary_transcript = connection.execute(
+            "SELECT content FROM transcript_entries WHERE message_id = ?",
+            ("message-sentinel",),
+        ).fetchone()
+        remaining_meta_objects = {
+            name
+            for (name,) in connection.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ("
+                + ",".join("?" for _item in meta_objects)
+                + ")",
+                tuple(meta_objects),
+            )
+        }
+    assert ordinary_session == ("session-sentinel",)
+    assert ordinary_transcript == ("ordinary data survives",)
+    assert remaining_meta_objects == set()
+
+    pre_v025_migrations = tmp_path / "pre-v025-migrations"
+    pre_v025_migrations.mkdir()
+    for migration in base:
+        (pre_v025_migrations / f"{migration.id}.py").write_text(
+            "from yoyo import step\n"
+            "__depends__ = set()\n"
+            "steps = [step('SELECT 1')]\n",
+            encoding="utf-8",
+        )
+    migrator.assert_schema_not_ahead(
+        migrator._to_yoyo_url(str(db_path)),
+        pre_v025_migrations,
+    )
+
+
 def test_apply_pending_registers_python312_datetime_adapter(tmp_path: Path) -> None:
     migrations_dir = tmp_path / "migrations"
     migrations_dir.mkdir()
@@ -368,6 +485,58 @@ def _write_demo_migration(migrations_dir: Path, name: str = "V001__demo") -> Non
     )
 
 
+def _write_renumbered_migration_chain(migrations_dir: Path) -> None:
+    migrations_dir.mkdir(exist_ok=True)
+    migrations = (
+        ("V036__session_model_routing", None, "routing_state"),
+        ("V037__artifact_sessions", "V036__session_model_routing", "artifact_sessions"),
+        (
+            "V038__artifact_prompt_annotations",
+            "V037__artifact_sessions",
+            "artifact_prompt_annotations",
+        ),
+        (
+            "V039__artifact_mutation_attempts",
+            "V038__artifact_prompt_annotations",
+            "artifact_mutation_attempts",
+        ),
+        ("V040__document_resources", "V039__artifact_mutation_attempts", "document_resources"),
+    )
+    for migration_id, dependency, table in migrations:
+        depends = "set()" if dependency is None else f"{{{dependency!r}}}"
+        (migrations_dir / f"{migration_id}.py").write_text(
+            "from yoyo import step\n"
+            f"__depends__ = {depends}\n"
+            f"steps = [step('CREATE TABLE IF NOT EXISTS {table} "
+            "(id INTEGER PRIMARY KEY, value TEXT)')]\n",
+            encoding="utf-8",
+        )
+
+
+def _replace_current_ledger_with_legacy_chain(
+    db_path: Path,
+    legacy_hashes: dict[str, tuple[str, str]],
+) -> None:
+    affected_ids = {
+        "V036__session_model_routing",
+        *(replacement_id for replacement_id, _legacy_hash in legacy_hashes.values()),
+    }
+    with sqlite3.connect(db_path) as connection:
+        connection.executemany(
+            "DELETE FROM _yoyo_migration WHERE migration_id = ?",
+            ((migration_id,) for migration_id in affected_ids),
+        )
+        connection.executemany(
+            "INSERT INTO _yoyo_migration "
+            "(migration_hash, migration_id, applied_at_utc) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (
+                (legacy_hash, legacy_id)
+                for legacy_id, (_replacement_id, legacy_hash) in legacy_hashes.items()
+            ),
+        )
+
+
 def _record_applied_migration(db_path: Path, migration_id: str) -> None:
     """Simulate a newer build having applied an extra migration."""
     with sqlite3.connect(db_path) as connection:
@@ -396,6 +565,86 @@ def test_apply_pending_is_idempotent_when_db_matches_code(tmp_path: Path) -> Non
 
     assert first == ["V001__demo"]
     assert second == []  # no SchemaAheadError — every applied id is known
+
+
+def test_apply_pending_atomically_remaps_exact_legacy_migration_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_renumbered_migration_chain(migrations_dir)
+    db_path = tmp_path / "sessions.db"
+    legacy_hashes = {
+        "V036__artifact_sessions": ("V037__artifact_sessions", "legacy-artifact"),
+        "V037__artifact_prompt_annotations": (
+            "V038__artifact_prompt_annotations",
+            "legacy-annotations",
+        ),
+        "V038__artifact_mutation_attempts": (
+            "V039__artifact_mutation_attempts",
+            "legacy-attempts",
+        ),
+        "V039__document_resources": ("V040__document_resources", "legacy-documents"),
+    }
+    monkeypatch.setattr(migrator, "_LEGACY_MIGRATION_ALIASES", legacy_hashes)
+
+    assert apply_pending(str(db_path), migrations_dir) == [
+        "V036__session_model_routing",
+        "V037__artifact_sessions",
+        "V038__artifact_prompt_annotations",
+        "V039__artifact_mutation_attempts",
+        "V040__document_resources",
+    ]
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO artifact_sessions (id, value) VALUES (1, 'preserved')"
+        )
+    _replace_current_ledger_with_legacy_chain(db_path, legacy_hashes)
+
+    applied = apply_pending(str(db_path), migrations_dir)
+
+    assert applied == ["V036__session_model_routing"]
+    assert apply_pending(str(db_path), migrations_dir) == []
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT value FROM artifact_sessions WHERE id = 1"
+        ).fetchone() == ("preserved",)
+        recorded = dict(
+            connection.execute(
+                "SELECT migration_id, migration_hash FROM _yoyo_migration"
+            ).fetchall()
+        )
+    current = {
+        migration.id: migration.hash
+        for migration in migrator.read_migrations(str(migrations_dir))
+    }
+    assert all(
+        recorded[migration_id] == migration_hash
+        for migration_id, migration_hash in current.items()
+    )
+
+
+def test_apply_pending_rejects_legacy_migration_with_unexpected_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_renumbered_migration_chain(migrations_dir)
+    db_path = tmp_path / "sessions.db"
+    legacy_hashes = {
+        "V036__artifact_sessions": ("V037__artifact_sessions", "legacy-artifact"),
+    }
+    monkeypatch.setattr(migrator, "_LEGACY_MIGRATION_ALIASES", legacy_hashes)
+    apply_pending(str(db_path), migrations_dir)
+    _replace_current_ledger_with_legacy_chain(db_path, legacy_hashes)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE _yoyo_migration SET migration_hash = 'unexpected' "
+            "WHERE migration_id = 'V036__artifact_sessions'"
+        )
+
+    with pytest.raises(migrator.SchemaAheadError, match="does not match the exact historical"):
+        apply_pending(str(db_path), migrations_dir)
 
 
 def test_apply_pending_raises_when_database_is_ahead_of_code(tmp_path: Path) -> None:

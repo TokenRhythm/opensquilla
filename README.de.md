@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/opensquilla/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/TokenRhythm/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
   <a href="https://opensquilla.ai/"><img src="https://img.shields.io/badge/website-opensquilla.ai-blue?style=for-the-badge" alt="Website"></a>
-  <a href="https://github.com/opensquilla/opensquilla/releases"><img src="https://img.shields.io/github/v/release/opensquilla/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/releases"><img src="https://img.shields.io/github/v/release/TokenRhythm/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=for-the-badge" alt="Python 3.12+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge" alt="Apache 2.0 License"></a>
 </p>
@@ -30,7 +30,9 @@
 
 ## Neuigkeiten
 
-- 📢 **2026-07-03** — Unser technischer Bericht **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)** (Vorschau) ist erschienen und wurde zusammen mit OpenSquilla **0.5.0 Preview 1** veröffentlicht. Er beschreibt, wie der harness-native Router alltäglichen Agent-Traffic in ein sich selbst verbesserndes Daten-Schwungrad verwandelt.
+- 📢 **2026-08-22** — Die englische Version unseres technischen Berichts ist jetzt auf aiXiv verfügbar: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001), die chinesische Version auf ChinaXiv: [202608.00176](https://chinaxiv.org/abs/202608.00176). Wie man OpenSquilla zitiert, steht unter [Zitieren](#zitieren).
+
+- 📢 **2026-07-14** — Unser technischer Bericht **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** ist jetzt auf arXiv verfügbar. Er zeigt, wie der harness-native Router alltäglichen Agent-Traffic in ein sich selbst verbesserndes Daten-Schwungrad verwandelt und wie **Multi-Modell-Ensemble-Routing Fable 5 übertrifft**.
 
 ---
 
@@ -49,7 +51,7 @@ Provider-Schicht spricht mit TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama,
 DeepSeek, Gemini, Qwen/DashScope und über 20 weiteren LLM-Providern —
 ohne Änderung an deinem Code oder deinem Konfigurationsschema.
 
-OpenSquilla 0.5.2 ist die aktuelle stabile Version.
+OpenSquilla 0.5.4 ist die aktuelle stabile Version.
 
 Für aufgabenorientierte Produktdokumentation beginnst du am besten mit
 dem [OpenSquilla-Produktleitfaden](README.product.md) oder dem
@@ -75,10 +77,10 @@ Python-Wheel-Installationen verwenden versionsbehaftete Wheel-Dateinamen,
 weil die Installationsprogramme die im Wheel-Dateinamen eingebettete
 Version prüfen.
 
-Für den Desktop-Einsatz von 0.5.2 bevorzugst du die gepackten
+Für den Desktop-Einsatz von 0.5.4 bevorzugst du die gepackten
 Desktop-Installationsprogramme aus dem GitHub-Release:
-`OpenSquilla-0.5.2-mac-arm64.dmg` unter macOS und
-`OpenSquilla-0.5.2-win-x64.exe` unter Windows.
+`OpenSquilla-0.5.4-mac-arm64.dmg` unter macOS und
+`OpenSquilla-0.5.4-win-x64.exe` unter Windows.
 
 | Weg | Zielgruppe | Wann verwenden |
 | --- | --- | --- |
@@ -129,11 +131,11 @@ Installationslinks: [Git](https://git-scm.com/downloads) ·
 
 ### Desktop-Installationsprogramme
 
-Die 0.5.2-Desktop-Installationsprogramme bündeln die Vue-Steuerkonsole
+Die 0.5.4-Desktop-Installationsprogramme bündeln die Vue-Steuerkonsole
 und die Gateway-Runtime in einer Electron-Hülle.
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 Für schnellere Downloads in Festlandchina verwende die direkten OSS-Download-Aliasse:
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -183,7 +185,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. OpenSquilla installieren** — derselbe Befehl auf jeder Plattform.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 Damit wird das OpenSquilla-Wheel von der Release-URL installiert;
@@ -211,7 +213,7 @@ opensquilla gateway run
 
 Für eine vollständig festgelegte Installation verwende die
 versionsbehaftete Wheel-URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl`.
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
 
 <a id="install-from-source"></a>
 
@@ -228,7 +230,7 @@ führe nicht `uv run` aus. Wähle stattdessen
 
    ```sh
    git lfs install
-   git clone https://github.com/opensquilla/opensquilla.git
+   git clone https://github.com/TokenRhythm/opensquilla.git
    cd opensquilla
    git lfs pull --include="src/opensquilla/squilla_router/models/**"
    ```
@@ -634,13 +636,13 @@ konfiguriere Token-Authentifizierung, bevor du an `0.0.0.0` bindest.
 **Docker**
 
 Vorgebaute Multi-Arch-Images (`amd64`/`arm64`) werden mit jedem
-Release-Tag auf `ghcr.io/opensquilla/opensquilla` veröffentlicht —
+Release-Tag auf `ghcr.io/tokenrhythm/opensquilla` veröffentlicht —
 [`docs/docker.md`](docs/docker.md) ist der vollständige
 Container-Leitfaden (Heimserver und NAS, LAN-Zugriff mit
 Token-Authentifizierung, Upgrades):
 
 ```sh
-OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/opensquilla/opensquilla:latest docker compose up -d
+OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/tokenrhythm/opensquilla:latest docker compose up -d
 ```
 
 Ohne `OPENSQUILLA_GATEWAY_IMAGE` führt der Compose-Weg ein
@@ -664,91 +666,9 @@ Nebenläufigkeitseinstellungen liegen in `opensquilla.toml.example`.
 
 ---
 
-## Neuerungen in 0.4.1
+## Release-Notizen
 
-OpenSquilla 0.4.1 ist ein Wartungsrelease für die Desktop- und
-Control-UI-Linie:
-
-- **Desktop-Zuverlässigkeit** – die Prüfungen des gepackten Gateways
-  decken nun den Coding-Modus, `code-task` und den SquillaRouter-Start
-  ab, und das Handling von Desktop-Fenstern/Artefakten ist stabiler.
-- **Sechssprachige Client-Unterstützung** – die Control UI und der
-  Desktop-Client unterstützen Englisch, vereinfachtes Chinesisch,
-  Japanisch, Französisch, Deutsch und Spanisch über First-Paint- und
-  Einstellungsoberflächen hinweg.
-- **Coding-Modus und Router-Paketierung** – Desktop-Builds schlagen
-  schnell fehl, wenn Router-Assets fehlen oder noch Git-LFS-Pointer sind,
-  und verhindern so beeinträchtigte Release-Pakete.
-- **Telemetrie und Windows-Feinschliff** – die Installationstelemetrie
-  überspringt CI- und Testumgebungen, und Windows-Desktop-Assets
-  verwenden das OpenSquilla-Logo.
-- **Mainline-Governance** – gewöhnliche Pull Requests und die
-  Release-Integration sind um `main` herum ausgerichtet, während
-  Maintainer-Branches für Release-, Hotfix-, Staging-, Integrations- und
-  Sandbox-Arbeit reserviert sind.
-
-Vollständige Hinweise: [`CHANGELOG.md`](CHANGELOG.md) ·
-[`docs/releases/0.4.1.md`](docs/releases/0.4.1.md).
-
-## Neuerungen in 0.2.1
-
-OpenSquilla 0.2.1 ist ein Wartungsrelease mit Fokus auf den Start von
-Release-Paketen und die Zuverlässigkeit langlaufender Agents:
-
-- **Windows-Portable-Start** – der Portable-Launcher erkennt und bootet
-  die vom gebündelten ONNX-Router benötigte Visual-C++-Runtime besser.
-- **Langlaufende Agent-Turns** – tool-intensive WebUI-Sitzungen erholen
-  sich sauberer von überdimensionierten Tool-Ergebnissen, fehlerhaften
-  Tool-Aufrufen, Übergaben bei der Artefaktauslieferung und
-  beeinträchtigten finalen Antworten.
-- **Sauberere WebUI-Ausgabe** – generierte Artefaktmarker werden aus dem
-  normalen Chat-Replay herausgehalten, während ausgelieferte Dateien
-  sichtbar bleiben.
-- **Bewertung des Gedächtnisabrufs** – lokale und OpenAI-kompatible
-  Embedding-Vektoren werden vor der semantischen Suche normalisiert, und
-  starke Stichwort-Treffer bleiben nutzbar, wenn Vektorwerte niedrig
-  sind.
-
-Vollständige Hinweise: [`CHANGELOG.md`](CHANGELOG.md) ·
-[Release-Notizen](https://opensquilla.ai/news/).
-
-## Neuerungen in 0.2.0
-
-Dieses Release erweitert OpenSquilla über Migration, CLI-Chat, Kanäle,
-Scheduling und langlaufende Tool-Arbeit hinweg:
-
-- **Migrationsweg aus bestehenden Agent-Stammverzeichnissen** –
-  `opensquilla migrate` zeigt Importe aus bestehenden
-  OpenClaw-/Hermes-Stammverzeichnissen in der Vorschau und führt sie
-  aus, einschließlich Gedächtnis, Persona-Dateien, Skills,
-  MCP-/Kanal-Konfiguration, Konfliktbehandlung und Migrationsberichten.
-- **Nutzbare Chat-CLI** – `opensquilla chat` hat eine stabile
-  Terminal-UI, Streaming-Ausgabe, Eingabe-Queue, Slash-Modus-Discovery,
-  Tool-/Status-Leisten und ein deterministischeres Verhalten der
-  Live-Eingabeaufforderung.
-- **Oberflächenübergreifende Cron-Automatisierung** – Cron-Jobs decken
-  nun strukturierte Zeitpläne, zeitzonenbewusste Exact-/Every-/Cron-Läufe,
-  Kanal- oder Webhook-Auslieferung, Fehlerziele, manuelle Läufe und
-  WebUI-/CLI-/RPC-Parität ab.
-- **Bessere Feishu- und Discord-Kanäle** – Kanal-Adapter legen
-  klarere Capability-Metadaten, sichereres DM-/Gruppen-Handling, native
-  Datei- und Artefaktpfade sowie verbessertes Anhang-/Thread-Verhalten
-  offen, während privilegierte Aktionen abgegrenzt bleiben.
-- **Robustere langlaufende Turns** – fehlgeschlagene Turns werden aus dem
-  Provider-Replay herausgehalten, fehlerhafte Tool-Aufrufe werden
-  sicherer behandelt, und freigabepflichtige Wiederholungen warten auf
-  die Entscheidung der Operatoren.
-- **Intelligenteres Kontext- und Tool-Budgeting** –
-  Provider-Budget-Kompaktierung, Bewahrung des Prompt-Caches,
-  begrenzte Tool-Ergebnisse und nebenwirkungsbewusste Nebenläufigkeit
-  machen große, tool-intensive Sitzungen vorhersehbarer.
-- **Feinschliff bei Web UI und Release** – Aktualitätssortierung,
-  Tabellenlayout, mobile Steuerelemente, doppelte Benachrichtigungen,
-  Einrichtungsformulare, Release-URLs und Installationswege wurden für
-  0.2.0 nachgeschärft.
-
-Vollständige Hinweise: [`CHANGELOG.md`](CHANGELOG.md) ·
-[Release-Notizen](https://opensquilla.ai/news/).
+Details zu den einzelnen Versionen stehen in [`CHANGELOG.md`](CHANGELOG.md) und [`docs/releases/`](docs/releases/).
 
 ---
 
@@ -856,8 +776,8 @@ wiedergespielte Arbeit.
 Dank an alle, die zu OpenSquilla beitragen.
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  <a href="https://github.com/TokenRhythm/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TokenRhythm/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
   </a>
 </p>
 
@@ -869,7 +789,27 @@ Beiträge jeder Art sind willkommen — Fehlerberichte, Funktionsideen,
 Dokumentation, neue Provider- oder Kanal-Adapter, Skills und Arbeit an
 der Kern-Runtime. Siehe [`CONTRIBUTING.md`](CONTRIBUTING.md) und
 eröffne dann ein Issue oder einen Pull Request auf
-[GitHub](https://github.com/opensquilla/opensquilla).
+[GitHub](https://github.com/TokenRhythm/opensquilla).
 
 [Verhaltenskodex](CODE_OF_CONDUCT.md) · [Sicherheit](SECURITY.md) ·
 [Support](SUPPORT.md) · [Lizenz](LICENSE) (Apache-2.0)
+
+---
+
+## Zitieren
+
+Wenn Sie OpenSquilla in Ihrer Forschung verwenden, zitieren Sie bitte unseren technischen Bericht:
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

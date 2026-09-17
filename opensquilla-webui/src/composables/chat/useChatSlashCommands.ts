@@ -1,26 +1,33 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
-
-type RpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
+  MetaRunCenterError,
+  type MetaLaunchDraftPayload,
+  type MetaRunCenter,
+} from '@/modules/metaRunCenter'
+import type { CommandCatalog } from '@/modules/commandCatalog'
+import type {
+  UsageReporting,
+  UsageReportingRequestOptions,
+} from '@/modules/usageReporting'
+import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import type { HiddenControlDispatchResult } from '@/types/chat'
+import type { MetaSetupReadiness } from '@/types/metaSetup'
+import { createClientRequestId } from '@/utils/chat/messageIdentity'
+import {
+  formatGoalDuration,
+  type GoalSnapshot,
+} from '@/composables/chat/useChatGoals'
 
 export interface ArgumentChoice {
   value: string
   description: string
+  status?: 'ready' | 'needs_setup'
+  missingBins?: string[]
+  missingEnv?: string[]
+  missingEnvAny?: string[][]
+  missingSkills?: string[]
+  missingCapabilities?: string[]
 }
 
 export interface ChatSlashCommand {
@@ -36,6 +43,12 @@ export interface ChatSlashCommand {
   argumentChoices?: ArgumentChoice[]
   // Set on synthetic entries that represent a chosen argument ("/meta <skill>").
   argValue?: string
+  metaStatus?: 'ready' | 'needs_setup'
+  missingBins?: string[]
+  missingEnv?: string[]
+  missingEnvAny?: string[][]
+  missingSkills?: string[]
+  missingCapabilities?: string[]
   [key: string]: unknown
 }
 
@@ -52,29 +65,69 @@ interface SlashCommandPayload extends Record<string, unknown> {
   }
 }
 
-interface UsageStatusResult {
-  totals?: {
-    tokens?: number
-  }
-  totalTokens?: number
-  total_tokens?: number
-}
+const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
+  '/coding',
+  '/compact',
+  '/goal',
+  '/new',
+  '/plan',
+  '/reset',
+  '/usage',
+  'coding.mode',
+  'compact_context',
+  'goal.set',
+  'meta.menu',
+  'new_chat',
+  'plans.setMode',
+  'plans.toggleMode',
+  'reset_session',
+  'sessions.contextCompact',
+  'sessions.reset',
+  'usage.status',
+  'usage_status',
+])
 
 export interface UseChatSlashCommandsOptions {
-  rpc: RpcClient
-  catalogCallOptions?: RpcCallOptions
+  commandCatalog: CommandCatalog
+  usageReporting: UsageReporting
+  sessionMaintenance: SessionMaintenance
+  /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
+  metaRunCenter?: MetaRunCenter
+  catalogCallOptions?: UsageReportingRequestOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
   newSession: () => void
   resetCurrentSession: () => void
   setCompactInFlight: (active: boolean, key?: string) => void
-  showCompactStatus: (status: string, message: string, options?: { tone?: string; detail?: string; dismissMs?: number }) => void
+  showCompactStatus: (
+    status: string,
+    message: string,
+    options?: { tone?: string; detail?: string; dismissMs?: number; source?: string },
+  ) => void
+  showCompactionToast: (payload: Record<string, unknown>, meta?: Record<string, unknown>) => void
   // Surface a short, client-side notice (e.g. the meta-skill list). No provider call.
   notify: (message: string) => void
   // Send a turn whose provider text bypasses slash parsing (mirrors the TUI
   // override path). Used by /meta <name> to trigger the launch after meta.run.
-  dispatchHidden: (providerText: string, displayText: string) => void
+  dispatchHidden: (
+    providerText: string,
+    displayText: string,
+    clientRequestId?: string,
+    targetSessionKey?: string,
+  ) => void | HiddenControlDispatchResult | Promise<void | HiddenControlDispatchResult>
+  // Recover a request removed from the composer when launch cannot proceed.
+  // The callback owns same-session queueing and cross-session persistence.
+  restoreDraft?: (launchText: string, sessionKey: string) => void
+  // Open a persistent, explicitly-confirmed setup flow. Older embeddings can
+  // omit this callback and keep the compact toast fallback.
+  requestMetaSetup?: (
+    name: string,
+    readiness: MetaSetupReadiness,
+    originatingSessionKey: string,
+    launchText: string,
+    clientRequestId?: string,
+  ) => void | 'visible' | 'deferred' | Promise<void | 'visible' | 'deferred'>
   // Send the optional text after "/plan" through the normal composer path so
   // attachments, intent, optimistic rendering, and retry restoration are kept.
   dispatchPlanPrompt: (prompt: string, composerText: string) => void
@@ -82,6 +135,39 @@ export interface UseChatSlashCommandsOptions {
   planModeAvailable?: () => boolean
   codingModeEnabled: Ref<boolean>
   setCodingModeEnabled: (enabled: boolean) => Promise<boolean>
+  // Arm the goal composer: selecting /goal switches the composer into goal
+  // draft mode so the user types the goal normally and sends it.
+  armGoal?: () => boolean | Promise<boolean>
+  startGoal?: (objective: string) => Promise<boolean>
+  goalStatus?: () => Promise<GoalSnapshot | null>
+  goalEdit?: (objective: string) => Promise<boolean>
+  goalPause?: () => Promise<boolean>
+  goalResume?: () => Promise<boolean>
+  goalClear?: () => Promise<boolean>
+}
+
+export interface MetaCommandInvocation {
+  skillName: string
+  launchText: string
+}
+
+export type DurableMetaDraft = MetaLaunchDraftPayload
+
+export type SlashCommandClassification = 'registered' | 'unknown' | 'unavailable'
+
+export function parseMetaCommandInvocation(args: string): MetaCommandInvocation | null {
+  const trimmed = String(args || '').trim()
+  if (!trimmed) return null
+
+  const firstWhitespace = trimmed.search(/\s/)
+  const skillName = firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace)
+  const suffix = firstWhitespace === -1 ? '' : trimmed.slice(firstWhitespace).trim()
+  const requestMatch = suffix.match(/^--(?:\s+([\s\S]*))?$/)
+  const request = requestMatch ? String(requestMatch[1] || '').trim() : ''
+  return {
+    skillName,
+    launchText: request ? `/meta ${skillName} -- ${request}` : `/meta ${skillName}`,
+  }
 }
 
 function slashCommandKey(value: string): string {
@@ -99,7 +185,7 @@ function slashCommandKeys(command: Pick<ChatSlashCommand, 'aliases' | 'cmd' | 'n
 function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
   const name = cmd?.name || cmd?.cmd || ''
   const rawChoices = Array.isArray((cmd as { argument_choices?: unknown })?.argument_choices)
-    ? (cmd as { argument_choices: Array<{ value?: unknown; description?: unknown }> }).argument_choices
+    ? (cmd as { argument_choices: Array<Record<string, unknown>> }).argument_choices
     : []
   return {
     ...cmd,
@@ -109,9 +195,64 @@ function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
     desc: cmd?.description || cmd?.desc || cmd?.usage || '',
     aliases: Array.isArray(cmd?.aliases) ? cmd.aliases : [],
     argumentChoices: rawChoices
-      .map((c) => ({ value: String(c?.value ?? ''), description: String(c?.description ?? '') }))
+      .map((c) => ({
+        value: String(c?.value ?? ''),
+        description: String(c?.description ?? ''),
+        status: c?.status === 'needs_setup' ? 'needs_setup' as const : 'ready' as const,
+        missingBins: Array.isArray(c?.missing_bins) ? c.missing_bins.map(String) : [],
+        missingEnv: Array.isArray(c?.missing_env) ? c.missing_env.map(String) : [],
+        missingEnvAny: Array.isArray(c?.missing_env_any)
+          ? c.missing_env_any.map(group => Array.isArray(group) ? group.map(String) : [])
+          : [],
+        missingSkills: Array.isArray(c?.missing_skills) ? c.missing_skills.map(String) : [],
+        missingCapabilities: Array.isArray(c?.missing_capabilities)
+          ? c.missing_capabilities.map(String)
+          : [],
+      }))
       .filter((c) => c.value),
   }
+}
+
+function isValidSlashCommandPayload(value: unknown): value is SlashCommandPayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const command = value as SlashCommandPayload
+  const isValidKey = (candidate: unknown): candidate is string => {
+    if (typeof candidate !== 'string') return false
+    const trimmedKey = candidate.trim()
+    return Boolean(
+      trimmedKey
+      && !/\s/.test(trimmedKey)
+      && slashCommandKey(trimmedKey).length > 1,
+    )
+  }
+  const declaredKeys = [command.name, command.cmd]
+  if (!declaredKeys.some(isValidKey)) return false
+  if (declaredKeys.some(key => key !== undefined && !isValidKey(key))) return false
+  if (
+    command.aliases !== undefined
+    && (
+      !Array.isArray(command.aliases)
+      || !command.aliases.every(isValidKey)
+    )
+  ) return false
+  if (command.execution !== undefined) {
+    if (
+      !command.execution
+      || typeof command.execution !== 'object'
+      || Array.isArray(command.execution)
+    ) return false
+    if (
+      command.execution.action !== undefined
+      && (
+        typeof command.execution.action !== 'string'
+        || !command.execution.action.trim()
+      )
+    ) return false
+  }
+  const rawAction = command.execution?.action || command.name || command.cmd
+  return typeof rawAction === 'string'
+    && rawAction === rawAction.trim()
+    && SUPPORTED_WEB_SLASH_ACTIONS.has(rawAction)
 }
 
 function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): ChatSlashCommand {
@@ -124,6 +265,12 @@ function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): Cha
     aliases: [],
     execution: parent.execution,
     argValue: choice.value,
+    metaStatus: choice.status,
+    missingBins: choice.missingBins,
+    missingEnv: choice.missingEnv,
+    missingEnvAny: choice.missingEnvAny,
+    missingSkills: choice.missingSkills,
+    missingCapabilities: choice.missingCapabilities,
   }
 }
 
@@ -140,6 +287,9 @@ function localizedMetaDescription(choice: ArgumentChoice): string {
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
+  const commandCatalog = options.commandCatalog
+  const usageReporting = options.usageReporting
+  const maintenance = options.sessionMaintenance
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])
@@ -158,21 +308,170 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       .filter((choice): choice is ArgumentChoice => Boolean(choice))
   })
 
+  async function runMetaInvocation(input: {
+    skillName: string
+    launchText: string
+    originatingSessionKey: string
+    clientRequestId: string
+  }): Promise<'accepted' | 'queued' | 'setup' | 'failed' | 'discarded'> {
+    const {
+      skillName,
+      launchText,
+      originatingSessionKey,
+      clientRequestId,
+    } = input
+    const retainStableRetry = async (error: string): Promise<void> => {
+      if (options.requestMetaSetup) {
+        try {
+          const disposition = await options.requestMetaSetup(
+            skillName,
+            {
+              ready: false,
+              status: 'needs_setup',
+              reasons: [error],
+              setup_actions: [],
+              manual_setup_actions: [],
+            },
+            originatingSessionKey,
+            launchText,
+            clientRequestId,
+          )
+          if (disposition === 'deferred') {
+            options.notify(i18n.global.t('chat.metaRuns.savedForRetry', { skill: skillName }))
+          }
+          return
+        } catch {
+          // The Gateway outbox still owns this identity. Fall through to an
+          // explicit notice, never to ordinary composer text with a new id.
+        }
+      }
+      options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', { error }))
+    }
+    try {
+      if (!options.metaRunCenter) throw new Error('MetaRunCenter is unavailable')
+      const result = await options.metaRunCenter.launch({
+        name: skillName,
+        sessionKey: originatingSessionKey,
+        clientRequestId,
+        launchText,
+      })
+      if (result?.ok) {
+        const dispatchResult = await options.dispatchHidden(
+          launchText,
+          launchText,
+          clientRequestId,
+          originatingSessionKey,
+        )
+        if (dispatchResult?.status === 'rejected') {
+          await retainStableRetry(dispatchResult.reason)
+          return 'failed'
+        }
+        if (dispatchResult?.status === 'unknown') {
+          // The server and browser outboxes retain the exact id and payload.
+          // Surface uncertainty without creating a second sendable draft.
+          options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
+            error: dispatchResult.reason,
+          }))
+          return 'queued'
+        }
+        return dispatchResult?.status === 'queued' ? 'queued' : 'accepted'
+      }
+      if (result?.setupRequired) {
+        const readiness = result.readiness || {}
+        if (options.requestMetaSetup) {
+          const disposition = await options.requestMetaSetup(
+            skillName,
+            readiness,
+            originatingSessionKey,
+            launchText,
+            clientRequestId,
+          )
+          if (disposition === 'deferred') {
+            options.notify(i18n.global.t('chat.metaRuns.savedForRetry', { skill: skillName }))
+          }
+          return 'setup'
+        }
+        const dependencies = [
+          ...(readiness.missing_bins || []),
+          ...(readiness.missing_env || []),
+          ...(readiness.missing_env_any || []).map(group => group.join(' / ')),
+          ...(readiness.missing_skills || []),
+          ...(readiness.missing_capabilities || []),
+        ].join(', ') || i18n.global.t('chat.metaRuns.unknownDependency')
+        options.notify(i18n.global.t('chat.metaRuns.setupRequired', {
+          skill: skillName,
+          dependencies,
+        }))
+        return 'setup'
+      }
+      const error = result?.error
+        || i18n.global.t('chat.metaRuns.couldNotRunSkill', { skill: skillName })
+      if (result?.drafted) {
+        await retainStableRetry(error)
+        return 'failed'
+      }
+      // Disabled/unknown skills are rejected before the Gateway stages a raw
+      // request, so returning those to the composer cannot create two ids.
+      options.restoreDraft?.(launchText, originatingSessionKey)
+      options.notify(
+        error,
+      )
+      return 'failed'
+    } catch (err: unknown) {
+      if (err instanceof MetaRunCenterError && err.code === 'draft-discarded') {
+        // Another tab already committed the user's cancellation. This identity
+        // is terminal: never recreate a setup card or a sendable composer copy.
+        options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
+          error: err.message,
+        }))
+        return 'discarded'
+      }
+      // A transport error can happen after the Gateway commits the draft. Keep
+      // the same request id in a retry card; restoring plain text would race
+      // server recovery and create a second logical request.
+      await retainStableRetry(err instanceof Error ? err.message : String(err))
+      return 'failed'
+    }
+  }
+
+  async function restoreDurableMetaDrafts(
+    drafts: DurableMetaDraft[],
+    isCurrent: () => boolean = () => true,
+  ): Promise<string[]> {
+    const attemptedRequestIds: string[] = []
+    for (const draft of drafts) {
+      if (!isCurrent() || draft.sessionKey !== options.sessionKey.value) {
+        return attemptedRequestIds
+      }
+      if (
+        !draft.name
+        || !draft.launchText
+        || !/^\S{1,256}$/.test(draft.clientRequestId)
+      ) continue
+      attemptedRequestIds.push(draft.clientRequestId)
+      const outcome = await runMetaInvocation({
+        skillName: draft.name,
+        launchText: draft.launchText,
+        originatingSessionKey: draft.sessionKey,
+        clientRequestId: draft.clientRequestId,
+      })
+      if (!isCurrent()) return attemptedRequestIds
+      if (outcome === 'discarded') continue
+      // A setup card or queued hidden turn owns the next user-visible slot.
+      // Remaining server drafts stay durable and will be resumed later.
+      if (outcome !== 'accepted') return attemptedRequestIds
+    }
+    return attemptedRequestIds
+  }
+
   async function loadSlashCommands() {
     try {
-      await waitForSessionRpcConnection(options.rpc, options.catalogCallOptions)
-      const params = { surface: 'web_chat' }
-      const res = options.catalogCallOptions
-        ? await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-            options.catalogCallOptions,
-          )
-        : await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-          )
-      slashCmds.value = (Array.isArray(res?.commands) ? res.commands : []).map(normalizeSlashCommand)
+      const res = await commandCatalog.list('web_chat', options.catalogCallOptions)
+      if (
+        !Array.isArray(res?.commands)
+        || !res.commands.every(isValidSlashCommandPayload)
+      ) throw new Error('invalid command catalog')
+      slashCmds.value = res.commands.map(normalizeSlashCommand)
       if (
         options.activatePlanMode
         && (options.planModeAvailable?.() ?? true)
@@ -266,6 +565,18 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   function completeSlashCmd(cmd: ChatSlashCommand) {
     closeSlashMenu()
     const needsArgument = !cmd.argValue && (cmd.argumentChoices?.length ?? 0) > 0
+    const action = cmd?.execution?.action || cmd.cmd || cmd.name
+    if (action === 'goal.set' && !cmd.argValue) {
+      // Selecting /goal arms the goal composer: the Goal chip appears next to
+      // the access-mode controls and the user types the goal normally.
+      const originalInput = options.inputText.value
+      void Promise.resolve(options.armGoal?.() ?? false).then((accepted) => {
+        if (!accepted || options.inputText.value !== originalInput) return
+        options.inputText.value = ''
+        options.autoResizeTextarea()
+      })
+      return
+    }
     options.inputText.value = cmd.cmd + (needsArgument ? ' ' : '')
     options.autoResizeTextarea()
     if (needsArgument) handleSlashInput()
@@ -365,6 +676,31 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       return
     }
 
+    if (action === 'goal.set' || action === '/goal') {
+      closeSlashMenu()
+      const goalText = String(args || '').trim()
+      const firstWord = goalText.split(/\s+/, 1)[0]?.toLowerCase() || ''
+      const isSubcommand = ['status', 'clear', 'pause', 'resume', 'edit'].includes(firstWord)
+      if (!isSubcommand && firstWord) {
+        const objective = firstWord === 'set'
+          ? goalText.slice(firstWord.length).trim()
+          : goalText
+        if (!objective) {
+          options.notify(i18n.global.t('chat.slashCommands.goal.usage'))
+          return
+        }
+        // A fully specified slash command accepts the Goal immediately. Menu
+        // selection still arms the Goal composer through completeSlashCmd.
+        const originalInput = options.inputText.value
+        void Promise.resolve(options.startGoal?.(objective) ?? false).then((accepted) => {
+          if (!accepted || options.inputText.value !== originalInput) return
+          options.inputText.value = ''
+          options.autoResizeTextarea()
+        })
+        return
+      }
+    }
+
     closeSlashMenu()
     options.inputText.value = ''
     options.autoResizeTextarea()
@@ -377,7 +713,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'reset_session':
       case 'sessions.reset':
       case '/reset':
-        options.rpc.call('sessions.reset', { key: options.sessionKey.value })
+        maintenance.reset({ key: options.sessionKey.value })
           .then(() => {
             options.resetCurrentSession()
           })
@@ -388,26 +724,32 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case '/compact': {
         const compactKey = options.sessionKey.value
         options.setCompactInFlight(true, compactKey)
-        options.showCompactStatus('started', i18n.global.t('chat.compact.compacting'), { tone: 'info' })
-        options.rpc.call('sessions.contextCompact', { key: compactKey })
-          .then(() => {
+        options.showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
+          tone: 'info',
+          source: 'manual',
+        })
+        maintenance.compact({ key: compactKey, wait: false })
+          .then((result) => {
             if (compactKey !== options.sessionKey.value) return
-            options.showCompactStatus('completed', i18n.global.t('chat.compact.compacted'), { tone: 'ok', dismissMs: 5000 })
+            options.showCompactionToast({ ...result, key: compactKey, source: 'manual' })
           })
           .catch((err: unknown) => {
             if (compactKey !== options.sessionKey.value) return
-            options.showCompactStatus('failed', i18n.global.t('chat.compact.failed') + ': ' + (err instanceof Error ? err.message : String(err)), { tone: 'err', dismissMs: 10000 })
+            options.showCompactionToast({
+              key: compactKey,
+              source: 'manual',
+              status: 'failed',
+              detail: err instanceof Error ? err.message : String(err),
+            })
           })
         break
       }
       case 'usage_status':
       case 'usage.status':
       case '/usage':
-        options.rpc.call<UsageStatusResult>('usage.status')
-          .then((result: UsageStatusResult) => {
-            const totals = result?.totals || {}
-            const tokens = Number(result?.totalTokens ?? result?.total_tokens ?? totals.tokens ?? 0)
-            console.info(`Usage: ${tokens.toLocaleString()} tokens`)
+        usageReporting.status()
+          .then((result) => {
+            console.info(`Usage: ${result.totalTokens.toLocaleString()} tokens`)
           })
           .catch((err: unknown) => console.warn('Usage failed:', err instanceof Error ? err.message : String(err)))
         break
@@ -415,48 +757,150 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         // Bare "/meta" is handled by the argument-completion branch above
         // (it reopens the menu with the skill choices). Here we only reach the
         // run path, with a skill name supplied (e.g. Enter on "/meta <skill>").
-        const skillName = String(args || '').trim()
-        if (!skillName) break
-        void runMetaSkill(skillName)
+        const invocation = parseMetaCommandInvocation(args)
+        if (!invocation) break
+        const { skillName, launchText } = invocation
+        const originatingSessionKey = options.sessionKey.value
+        const clientRequestId = createClientRequestId()
+        // Save the exact request server-side before readiness/setup and retain
+        // its stable identity through the eventual hidden turn.
+        void runMetaInvocation({
+          skillName,
+          launchText,
+          originatingSessionKey,
+          clientRequestId,
+        })
+        break
+      }
+      case 'goal.set':
+      case '/goal': {
+        const goalText = String(args || '').trim()
+        const first = goalText.split(/\s+/, 1)[0]?.toLowerCase() || ''
+        const remainder = first ? goalText.slice(first.length).trim() : ''
+        const fail = (err: unknown) => {
+          options.notify(i18n.global.t('chat.slashCommands.goal.actionError', {
+            error: err instanceof Error ? err.message : String(err),
+          }))
+        }
+        const status = (goal: GoalSnapshot | null, showUsageWhenEmpty = false) => {
+          if (!goal) {
+            options.notify(i18n.global.t(
+              showUsageWhenEmpty
+                ? 'chat.slashCommands.goal.usage'
+                : 'chat.slashCommands.goal.statusNone',
+            ))
+            return
+          }
+          const steps = goal.progress?.steps ?? []
+          const completed = steps.filter(step => step.status === 'completed').length
+          const currentStep = steps.find(step => step.status === 'in_progress')?.text
+          const reason = goal.blockedReason
+            || goal.pauseReason
+            || goal.terminalReason
+            || goal.continuationDeferredReason
+            || ''
+          options.notify(i18n.global.t('chat.slashCommands.goal.statusOk', {
+            status: goal.status,
+            execution: goal.executionState || 'idle',
+            turns: goal.turnsSettled,
+            tokens: (goal.usage?.totalTokens ?? 0).toLocaleString(),
+            runtime: formatGoalDuration(goal.activeTimeMs),
+            progress: `${completed}/${steps.length}${currentStep ? ` (${currentStep})` : ''}`,
+            goal: goal.objective,
+            reason: reason ? ` · ${reason}` : '',
+          }))
+        }
+        if (!first) {
+          Promise.resolve(options.goalStatus?.() ?? null)
+            .then((goal) => {
+              if (goal) {
+                status(goal)
+                return
+              }
+              return Promise.resolve(options.armGoal?.() ?? false)
+            })
+            .catch(fail)
+          break
+        }
+        if (first === 'status') {
+          Promise.resolve(options.goalStatus?.() ?? null)
+            .then(goal => status(goal))
+            .catch(fail)
+          break
+        }
+        if (first === 'clear') {
+          Promise.resolve(options.goalClear?.() ?? false)
+            .then(accepted => {
+              if (accepted) options.notify(i18n.global.t('chat.slashCommands.goal.clearOk'))
+            })
+            .catch(fail)
+          break
+        }
+        if (first === 'pause') {
+          Promise.resolve(options.goalPause?.() ?? false)
+            .then(accepted => {
+              if (accepted) options.notify(i18n.global.t('chat.slashCommands.goal.pauseOk'))
+            })
+            .catch(fail)
+          break
+        }
+        if (first === 'resume') {
+          Promise.resolve(options.goalResume?.() ?? false)
+            .then(accepted => {
+              if (accepted) options.notify(i18n.global.t('chat.slashCommands.goal.resumeOk'))
+            })
+            .catch(fail)
+          break
+        }
+        if (first === 'edit') {
+          if (!remainder) {
+            options.notify(i18n.global.t('chat.slashCommands.goal.usage'))
+            break
+          }
+          Promise.resolve(options.goalEdit?.(remainder) ?? false)
+            .then(accepted => {
+              if (accepted) options.notify(i18n.global.t('chat.goal.editNextTurn'))
+            })
+            .catch(fail)
+        }
         break
       }
     }
   }
 
-  async function runMetaSkill(skillName: string): Promise<void> {
-    const name = String(skillName || '').trim()
-    if (!name) return
-    try {
-      const result = await options.rpc.call<{ ok?: boolean; error?: string }>('meta.run', {
-        name,
-        sessionKey: options.sessionKey.value,
-      })
-      if (result?.ok) {
-        options.dispatchHidden('/meta ' + name, '/meta ' + name)
-      } else {
-        options.notify(result?.error || i18n.global.t('chat.metaRuns.couldNotRunSkill', { skill: name }))
-      }
-    } catch (err: unknown) {
-      options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
-        error: err instanceof Error ? err.message : String(err),
-      }))
+  async function executeSlashCommand(
+    text: string,
+    knownClassification?: SlashCommandClassification,
+  ): Promise<boolean> {
+    const classification = knownClassification ?? await classifySlashCommand(text)
+    const trimmed = text.trim()
+    const firstWhitespace = trimmed.search(/\s/)
+    const cmdText = firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace)
+    const args = firstWhitespace === -1 ? '' : trimmed.slice(firstWhitespace).trimStart()
+    if (classification === 'unavailable') {
+      closeSlashMenu()
+      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
+      return true
     }
-  }
-
-  async function executeSlashCommand(text: string): Promise<boolean> {
-    if (!slashCatalogLoaded.value) await loadSlashCommands()
-    const [cmdText, ...rest] = text.trim().split(/\s+/)
     const commandKey = slashCommandKey(cmdText)
     const cmd = slashCmds.value.find(command =>
       slashCommandKeys(command).includes(commandKey),
     )
     if (!cmd) {
       closeSlashMenu()
-      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
-      return true
+      return false
     }
-    selectSlashCmd(cmd, rest.join(' '))
+    selectSlashCmd(cmd, args)
     return true
+  }
+
+  async function classifySlashCommand(text: string): Promise<SlashCommandClassification> {
+    if (!slashCatalogLoaded.value) await loadSlashCommands()
+    if (!slashCatalogLoaded.value) return 'unavailable'
+    const commandKey = slashCommandKey(text)
+    return slashCmds.value.some(command => slashCommandKeys(command).includes(commandKey))
+      ? 'registered'
+      : 'unknown'
   }
 
   return {
@@ -470,7 +914,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     completeSlashCmd,
     activateSlashCmd,
     selectSlashCmd,
+    classifySlashCommand,
     executeSlashCommand,
-    runMetaSkill,
+    restoreDurableMetaDrafts,
   }
 }

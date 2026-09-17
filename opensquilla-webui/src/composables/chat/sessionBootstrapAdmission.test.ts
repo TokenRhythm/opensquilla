@@ -4,7 +4,9 @@ import { watch } from 'vue'
 import {
   claimSessionBootstrapAdmission,
   clearPrimedSessionBootstrapAdmission,
+  OPTIONAL_SESSION_READ_TIMEOUT_MS,
   optionalSessionRpcAllowed,
+  optionalSessionReadOptions,
   primeSessionBootstrapAdmission,
 } from './sessionBootstrapAdmission'
 
@@ -13,6 +15,13 @@ afterEach(() => {
 })
 
 describe('session bootstrap admission', () => {
+  it('allows ordinary metadata latency before recovering a stuck connection', () => {
+    expect(OPTIONAL_SESSION_READ_TIMEOUT_MS).toBe(10_000)
+    expect(optionalSessionReadOptions).toEqual({
+      timeoutMs: 10_000,
+    })
+  })
+
   it('atomically transfers a router-primed hold to ChatView', () => {
     expect(optionalSessionRpcAllowed.value).toBe(true)
     primeSessionBootstrapAdmission()

@@ -1,9 +1,11 @@
 [
   {
+    "generation_epoch": null,
     "text": "Synthetic reasoning.",
     "type": "ReasoningDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "text": "OK",
     "type": "TextDeltaEvent"
   },
@@ -21,11 +23,20 @@
     "cached_tokens": 5,
     "cost_source": "provider_billed",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 13,
     "model": "deepseek-v4-flash",
     "model_usage_breakdown": [],
     "output_tokens": 17,
-    "provider": "openai",
+    "provider": "tokenrhythm",
+    "provider_replay": {
+      "model": "deepseek-v4-flash",
+      "native_content": null,
+      "native_reasoning_content": "Synthetic reasoning.",
+      "protocol": "openai_chat_completions",
+      "reasoning_details": null,
+      "source": "openai_compat:00f14adb55a194713e29893ae3396f2e17ac1013e03733f8fd485bd0caa5a446"
+    },
     "reasoning_content": "Synthetic reasoning.",
     "reasoning_tokens": 8,
     "stop_reason": "stop",

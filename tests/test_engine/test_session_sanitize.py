@@ -9,13 +9,14 @@ from typing import Any
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult, ToolResultEvent
-from opensquilla.engine.history import limit_turns
+from opensquilla.engine.history import limit_turns, repair_tool_pairing
 from opensquilla.engine.session_sanitize import (
     project_historical_tool_payloads,
+    recoverable_tool_result_reference,
     sanitize_session_messages,
 )
+from opensquilla.engine.tool_result_store import ToolResultStore
 from opensquilla.engine.types import ThinkingLevel
-from opensquilla.memory.session_flush import _usage_from_complete_response
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockText,
@@ -23,6 +24,8 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
     ModelCapabilities,
+    ToolDefinition,
+    ToolInputSchema,
 )
 from opensquilla.provider import (
     DoneEvent as ProviderDone,
@@ -36,7 +39,88 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
-from opensquilla.provider.types import ContentBlockImage
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+    ProviderReplayState,
+)
+
+
+def test_sanitizing_native_replay_keeps_opaque_block_and_carrier_unchanged():
+    native = [{"type": "redacted_thinking", "data": "synthetic-opaque"}]
+    message = Message(
+        role="assistant",
+        content=[ContentBlockRedactedThinking(data="synthetic-opaque")],
+        provider_replay=ProviderReplayState(
+            protocol="anthropic_messages", source="synthetic-route", model="synthetic-model",
+            native_content=native,
+        ),
+    )
+    before = message.model_dump(mode="json")
+    sanitized, _ = sanitize_session_messages([message])
+    assert sanitized[0].model_dump(mode="json") == before
+    assert message.model_dump(mode="json") == before
+
+
+def _tool_definition(name: str) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=f"Mock {name} tool.",
+        input_schema=ToolInputSchema(properties={}, required=[]),
+    )
+
+
+def _retrieval_tool_definition() -> ToolDefinition:
+    return _tool_definition("retrieve_tool_result")
+
+
+async def _unused_retrieval_handler(call: Any) -> ToolResult:
+    raise AssertionError(f"unexpected tool call: {call.tool_name}")
+
+
+def _recoverable_projection_agent(
+    tmp_path: Any,
+    *,
+    provider: Any | None = None,
+    tool_handler: Any = _unused_retrieval_handler,
+    tool_names: tuple[str, ...] = (),
+    **config_overrides: Any,
+) -> Agent:
+    store_dir = tmp_path / "tool-results"
+
+    async def recovery_capable_handler(call: Any) -> ToolResult:
+        if call.tool_name == "retrieve_tool_result":
+            record = ToolResultStore(store_dir).read(
+                call.arguments["handle"],
+                session_id="session-1",
+            )
+            return ToolResult(
+                tool_use_id=call.tool_use_id,
+                tool_name=call.tool_name,
+                content=record.content,
+            )
+        return await tool_handler(call)
+
+    setattr(
+        recovery_capable_handler,
+        "_opensquilla_available_tools",
+        frozenset({"retrieve_tool_result", *tool_names}),
+    )
+    return Agent(
+        provider=provider or CapturingProvider(),
+        config=AgentConfig(
+            tool_result_store_dir=str(store_dir),
+            tool_result_store_session_id="session-1",
+            tool_result_store_session_key="agent:main:session-1",
+            tool_result_store_agent_id="main",
+            **config_overrides,
+        ),
+        tool_definitions=[
+            *(_tool_definition(name) for name in tool_names),
+            _retrieval_tool_definition(),
+        ],
+        tool_handler=recovery_capable_handler,
+    )
 
 
 def test_agent_config_disables_tool_argument_projection_by_default() -> None:
@@ -309,7 +393,7 @@ def test_session_sanitize_strips_block_metadata_without_compressing_content() ->
     assert "timestamp" not in block.model_dump(mode="json")
 
 
-def test_historical_replay_projection_compacts_tool_payloads_and_reasoning() -> None:
+def test_historical_replay_projection_preserves_raw_tool_result_without_handle() -> None:
     large_argument = "STALE_ARGUMENT_START\n" + ("x" * 6000)
     large_result = "STALE_RESULT_START\n" + ("y" * 6000)
     messages = [
@@ -339,7 +423,7 @@ def test_historical_replay_projection_compacts_tool_payloads_and_reasoning() -> 
     projected, result = project_historical_tool_payloads(messages)
 
     assert result.tool_uses_projected == 1
-    assert result.tool_results_projected == 1
+    assert result.tool_results_projected == 0
     assert result.reasoning_chars_removed > 0
     assert projected[0].reasoning_content is None
     tool_use = projected[0].content[0]
@@ -349,16 +433,16 @@ def test_historical_replay_projection_compacts_tool_payloads_and_reasoning() -> 
     assert large_argument not in tool_use.input["content"]
     tool_result = projected[1].content[0]
     assert isinstance(tool_result, ContentBlockToolResult)
-    assert str(tool_result.content).startswith("[historical_tool_result_compacted]")
-    assert large_result not in str(tool_result.content)
+    assert tool_result.content == large_result
     assert messages[0].reasoning_content is not None
     assert messages[0].content[0].input["content"] == large_argument
 
 
 def test_historical_replay_projection_preserves_tool_result_projection_envelope() -> None:
+    handle = "tr-" + ("a" * 32)
     projection = (
         "[tool_result_projection]\n"
-        "tool_result_handle: tr-abc123\n"
+        f"tool_result_handle: {handle}\n"
         "sha256: " + ("a" * 64) + "\n"
         "original_chars: 50000\n"
         "preview_complete: false\n"
@@ -381,14 +465,17 @@ def test_historical_replay_projection_preserves_tool_result_projection_envelope(
         )
     ]
 
-    projected, result = project_historical_tool_payloads(messages)
+    projected, result = project_historical_tool_payloads(
+        messages,
+        recoverable_references=frozenset({(handle, "a" * 64)}),
+    )
 
     assert result.tool_results_projected == 1
     tool_result = projected[0].content[0]
     assert isinstance(tool_result, ContentBlockToolResult)
     assert isinstance(tool_result.content, str)
     assert tool_result.content.startswith("[tool_result_projection]\n")
-    assert "tool_result_handle: tr-abc123" in tool_result.content
+    assert f"tool_result_handle: {handle}" in tool_result.content
     assert "sha256: " + ("a" * 64) in tool_result.content
     assert "original_chars: 50000" in tool_result.content
     assert "preview_complete: false" in tool_result.content
@@ -397,6 +484,321 @@ def test_historical_replay_projection_preserves_tool_result_projection_envelope(
     assert "FAILED tests/test_api.py::test_bad" in tool_result.content
     assert "[historical_tool_result_projection_body_compacted]" in tool_result.content
     assert tool_result.content.count("large projected body") < 50
+
+
+def test_historical_replay_projection_requires_verified_reference() -> None:
+    handle = "tr-" + ("a" * 32)
+    sha256 = "a" * 64
+    projection = (
+        "[tool_result_projection]\n"
+        f"tool_result_handle: {handle}\n"
+        f"sha256: {sha256}\n"
+        "retrieve_hint: use retrieve_tool_result.\n"
+        + ("unverified projected body\n" * 500)
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=projection)],
+        )
+    ]
+
+    without_proof, without_proof_result = project_historical_tool_payloads(messages)
+    wrong_digest, wrong_digest_result = project_historical_tool_payloads(
+        messages,
+        recoverable_references=frozenset({(handle, "b" * 64)}),
+    )
+
+    assert without_proof is messages
+    assert without_proof_result.tool_results_projected == 0
+    assert wrong_digest is messages
+    assert wrong_digest_result.tool_results_projected == 0
+
+
+def test_agent_verifies_historical_references_against_session_store(tmp_path) -> None:
+    agent = _recoverable_projection_agent(tmp_path)
+    store = ToolResultStore(tmp_path / "tool-results")
+    valid = store.write(
+        "valid raw output",
+        tool_use_id="valid",
+        tool_name="exec_command",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        agent_id="main",
+    )
+    same_session_other_writer = store.write(
+        "other agent raw output",
+        tool_use_id="same-session-other-writer",
+        tool_name="exec_command",
+        session_id="session-1",
+        session_key="agent:other:session-1",
+        agent_id="other",
+    )
+
+    def envelope(handle: str, sha256: str, marker: str) -> str:
+        return (
+            "[tool_result_projection]\n"
+            f"tool_result_handle: {handle}\n"
+            f"sha256: {sha256}\n"
+            "retrieve_hint: use retrieve_tool_result.\n"
+            + ((marker + "\n") * 500)
+        )
+
+    contents = {
+        "valid": envelope(valid.handle, valid.sha256, "valid projected body"),
+        "same-session-other-writer": envelope(
+            same_session_other_writer.handle,
+            same_session_other_writer.sha256,
+            "same session projected body",
+        ),
+        "stale": envelope("tr-" + ("f" * 32), "f" * 64, "stale projected body"),
+        "forged": envelope(valid.handle, "0" * 64, "forged projected body"),
+    }
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id=tool_use_id, content=content)],
+        )
+        for tool_use_id, content in contents.items()
+    ]
+
+    verified = agent._verified_tool_result_references(messages)
+    projected, result = project_historical_tool_payloads(
+        messages,
+        recoverable_references=verified,
+    )
+
+    assert verified == frozenset(
+        {
+            (valid.handle, valid.sha256),
+            (same_session_other_writer.handle, same_session_other_writer.sha256),
+        }
+    )
+    assert result.tool_results_projected == 2
+    projected_by_id = {
+        block.tool_use_id: block.content
+        for message in projected
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolResult)
+    }
+    assert projected_by_id["valid"] != contents["valid"]
+    assert (
+        projected_by_id["same-session-other-writer"]
+        != contents["same-session-other-writer"]
+    )
+    for tool_use_id in ("stale", "forged"):
+        assert projected_by_id[tool_use_id] == contents[tool_use_id]
+
+
+def test_historical_reference_verification_bounds_unique_store_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(tmp_path)
+    references: dict[str, str] = {}
+    messages: list[Message] = []
+    for index in range(300):
+        handle = f"tr-{index:032x}"
+        sha256 = f"{index:064x}"
+        references[handle] = sha256
+        messages.append(
+            Message(
+                role="user",
+                content=[
+                    ContentBlockToolResult(
+                        tool_use_id=f"tool-{index}",
+                        content=(
+                            "[tool_result_projection]\n"
+                            f"tool_result_handle: {handle}\n"
+                            f"sha256: {sha256}\n"
+                            "retrieve_hint: use retrieve_tool_result.\n"
+                        ),
+                    )
+                ],
+            )
+        )
+
+    reads: list[str] = []
+
+    def fake_read(
+        _store: ToolResultStore,
+        handle: str,
+        *,
+        session_id: str,
+    ) -> Any:
+        reads.append(handle)
+        return SimpleNamespace(
+            session_id=session_id,
+            sha256=references[handle],
+        )
+
+    monkeypatch.setattr(ToolResultStore, "read", fake_read)
+
+    verified = agent._verified_tool_result_references(messages)
+
+    assert len(reads) == 256
+    assert len(verified) == 256
+    assert reads[0] == "tr-0000000000000000000000000000012b"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_verifies_only_retained_history_turns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    provider = CapturingProvider()
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        provider=provider,
+        max_history_turns=1,
+        max_iterations=1,
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old user turn"),
+            Message(role="assistant", content="old response"),
+            Message(role="user", content="retained user turn"),
+            Message(role="assistant", content="retained response"),
+        ]
+    )
+    verified_messages: list[Message] = []
+
+    def capture_verification(messages: list[Message]) -> frozenset[tuple[str, str]]:
+        verified_messages.extend(messages)
+        return frozenset()
+
+    monkeypatch.setattr(agent, "_verified_tool_result_references", capture_verification)
+
+    events = [event async for event in agent.run_turn("continue")]
+
+    assert any(event.kind == "done" for event in events)
+    assert [message.content for message in verified_messages] == [
+        "retained user turn",
+        "retained response",
+    ]
+
+
+def _deep_recoverable_reference_candidate(*, depth: int = 10_000) -> str:
+    return (
+        '{"result_truncated":true,"retrieve_hint":"retrieve raw output",'
+        '"tool_result_handle":"tr-'
+        + ("a" * 32)
+        + '","tool_result_sha256":"'
+        + ("b" * 64)
+        + '","nested":'
+        + ("[" * depth)
+        + "0"
+        + ("]" * depth)
+        + "}"
+    )
+
+
+def test_recoverable_tool_result_reference_prefilters_unmarked_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_json_loads(_content: str) -> Any:
+        raise AssertionError("unmarked JSON must not reach json.loads")
+
+    monkeypatch.setattr(json, "loads", unexpected_json_loads)
+
+    assert recoverable_tool_result_reference('{"nested":{"value":1}}') is None
+
+
+def test_recoverable_tool_result_reference_rejects_deep_marked_json() -> None:
+    assert (
+        recoverable_tool_result_reference(_deep_recoverable_reference_candidate())
+        is None
+    )
+
+
+def test_recoverable_tool_result_reference_accepts_structured_envelope() -> None:
+    handle = "tr-" + ("a" * 32)
+    sha256 = "b" * 64
+    envelope = json.dumps(
+        {
+            "result_truncated": True,
+            "retrieve_hint": "retrieve raw output",
+            "tool_result_handle": handle,
+            "tool_result_sha256": sha256,
+        },
+        indent=2,
+    )
+
+    assert recoverable_tool_result_reference(f"\n{envelope}\t") == (handle, sha256)
+
+
+@pytest.mark.asyncio
+async def test_agent_run_turn_ignores_deep_historical_json_reference(tmp_path) -> None:
+    provider = CapturingProvider()
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        provider=provider,
+        max_iterations=1,
+    )
+    agent.set_history(
+        [
+            Message(
+                role="assistant",
+                content=[
+                    ContentBlockToolUse(id="deep-json", name="exec_command", input={})
+                ],
+            ),
+            Message(
+                role="user",
+                content=[
+                    ContentBlockToolResult(
+                        tool_use_id="deep-json",
+                        content=_deep_recoverable_reference_candidate(),
+                    )
+                ],
+            ),
+        ]
+    )
+
+    events = [event async for event in agent.run_turn("continue")]
+
+    assert any(event.kind == "done" for event in events)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "handle_line",
+    [
+        "",
+        "tool_result_handle: tr-abc123\n",
+        "tool_result_handle: tr-" + ("g" * 32) + "\n",
+    ],
+)
+def test_historical_replay_projection_preserves_unrecoverable_envelope(
+    handle_line: str,
+) -> None:
+    projection = (
+        "[tool_result_projection]\n"
+        + handle_line
+        + "retrieve_hint: use retrieve_tool_result.\n"
+        + ("unrecoverable projected body\n" * 500)
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(
+                    tool_use_id="tool-1",
+                    content=projection,
+                    is_error=False,
+                )
+            ],
+        )
+    ]
+
+    projected, result = project_historical_tool_payloads(messages)
+
+    assert result.tool_results_projected == 0
+    assert projected is messages
+    tool_result = projected[0].content[0]
+    assert isinstance(tool_result, ContentBlockToolResult)
+    assert tool_result.content == projection
 
 
 def test_historical_replay_projection_compacts_nested_tool_payloads() -> None:
@@ -433,7 +835,7 @@ def test_historical_replay_projection_compacts_nested_tool_payloads() -> None:
     assert messages[0].content[0].input["metadata"] == large_nested
 
 
-def test_historical_replay_projection_compacts_list_tool_results() -> None:
+def test_historical_replay_projection_preserves_list_tool_results_without_handle() -> None:
     large_result = [{"type": "text", "text": "LIST_RESULT_START\n" + ("y" * 8000)}]
     messages = [
         Message(
@@ -450,16 +852,14 @@ def test_historical_replay_projection_compacts_list_tool_results() -> None:
 
     projected, result = project_historical_tool_payloads(messages)
 
-    assert result.tool_results_projected == 1
+    assert result.tool_results_projected == 0
     tool_result = projected[0].content[0]
     assert isinstance(tool_result, ContentBlockToolResult)
-    assert isinstance(tool_result.content, str)
-    assert tool_result.content.startswith("[historical_tool_result_compacted]")
-    assert "y" * 1000 not in tool_result.content
+    assert tool_result.content == large_result
     assert messages[0].content[0].content == large_result
 
 
-def test_agent_aggregate_tool_result_budget_compacts_old_bulky_results() -> None:
+def test_agent_aggregate_tool_result_budget_preserves_raw_without_recovery() -> None:
     raw_old_output = "old bulky output\n" + ("x" * 4000)
     agent = Agent(
         provider=CapturingProvider(),
@@ -526,19 +926,18 @@ def test_agent_aggregate_tool_result_budget_compacts_old_bulky_results() -> None
     assert isinstance(old_result, ContentBlockToolResult)
     assert isinstance(err_result, ContentBlockToolResult)
     assert isinstance(new_result, ContentBlockToolResult)
-    assert "aggregate_tool_result_compacted" in old_result.content
-    assert "tool_result_handle:" not in old_result.content
-    assert len(old_result.content) < 1000
+    assert old_result.content == raw_old_output
     assert "Traceback" in err_result.content
     assert len(err_result.content) > 4000
     assert "recent output" in new_result.content
     assert len(new_result.content) > 4000
-    assert agent.config.metadata["tool_aggregate_projection_applied"] is True
-    assert agent.config.metadata["tool_projection_applied"] is True
-    assert agent.config.metadata["tool_projection_tokens_saved"] > 0
+    assert "tool_aggregate_projection_applied" not in agent.config.metadata
+    assert "tool_projection_applied" not in agent.config.metadata
 
 
-def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> None:
+def test_agent_large_context_compacts_old_local_tool_results_for_provider(
+    tmp_path,
+) -> None:
     def _tool_pair(tool_id: str, body: str, *, is_error: bool = False) -> list[Message]:
         return [
             Message(
@@ -557,11 +956,9 @@ def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> N
             ),
         ]
 
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200_000,
-        ),
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200_000,
     )
     messages = [
         block
@@ -589,7 +986,7 @@ def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> N
     assert isinstance(middle_result, ContentBlockToolResult)
     assert isinstance(recent_result, ContentBlockToolResult)
     assert "[tool_result_projection]" in old_result.content
-    assert "tool_result_handle:" not in old_result.content
+    assert "tool_result_handle: tr-" in old_result.content
     assert len(old_result.content) < 5_000
     assert "Traceback preserved" in error_result.content
     assert len(error_result.content) > 20_000
@@ -607,12 +1004,12 @@ def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> N
 
 
 @pytest.mark.asyncio
-async def test_agent_single_tool_result_projection_does_not_store_raw_content(tmp_path) -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+async def test_agent_single_tool_result_projection_stores_recoverable_raw_content(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     raw_output = "single bulky output\n" + ("x" * 8000)
 
@@ -632,21 +1029,42 @@ async def test_agent_single_tool_result_projection_does_not_store_raw_content(tm
     assert isinstance(result, ContentBlockToolResult)
 
     assert "[tool_result_projection]" in result.content
-    assert "tool_result_handle:" not in result.content
+    assert "tool_result_handle: tr-" in result.content
     assert raw_output not in result.content
-    assert not (tmp_path / "tool-results").exists()
+    stored_contents = list((tmp_path / "tool-results").rglob("content.txt"))
+    assert len(stored_contents) == 1
+    assert stored_contents[0].read_text() == raw_output
 
 
-@pytest.mark.asyncio
-async def test_agent_tool_result_projection_never_writes_raw_store(
+@pytest.mark.parametrize(
+    ("has_store", "has_schema", "has_handler"),
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+def test_agent_tool_result_projection_preserves_raw_when_recovery_is_incomplete(
     tmp_path,
+    has_store: bool,
+    has_schema: bool,
+    has_handler: bool,
 ) -> None:
+    config_kwargs: dict[str, Any] = {"context_window_tokens": 200}
+    if has_store:
+        config_kwargs.update(
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id="session-1",
+            tool_result_store_session_key="agent:main:session-1",
+            tool_result_store_agent_id="main",
+        )
     agent = Agent(
         provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+        config=AgentConfig(**config_kwargs),
+        tool_definitions=[_retrieval_tool_definition()] if has_schema else None,
+        tool_handler=_unused_retrieval_handler if has_handler else None,
     )
+    raw_output = "single bulky output\n" + ("x" * 8000)
 
     messages = [
         Message(
@@ -658,7 +1076,7 @@ async def test_agent_tool_result_projection_never_writes_raw_store(
             content=[
                 ContentBlockToolResult(
                     tool_use_id="tool-1",
-                    content="single bulky output\n" + ("x" * 8000),
+                    content=raw_output,
                 )
             ],
         ),
@@ -668,18 +1086,18 @@ async def test_agent_tool_result_projection_never_writes_raw_store(
     result = projected[1].content[0]
     assert isinstance(result, ContentBlockToolResult)
 
-    assert "[tool_result_projection]" in result.content
-    assert "tool_result_handle:" not in result.content
+    assert result.content == raw_output
+    assert "[tool_result_projection]" not in result.content
     assert not list((tmp_path / "tool-results").rglob("content.txt"))
 
 
-def test_agent_provider_backstop_preserves_historical_read_file_source_context() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1_000_000,
-            tool_result_provider_request_max_chars=1000,
-        ),
+def test_agent_provider_backstop_preserves_historical_read_file_source_context(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1_000_000,
+        tool_result_provider_request_max_chars=1000,
     )
     source = "\n".join(f"{index}: important implementation detail" for index in range(600))
     messages = [
@@ -714,13 +1132,13 @@ def test_agent_provider_backstop_preserves_historical_read_file_source_context()
     assert "tool_provider_guard_projection_applied" not in agent.config.metadata
 
 
-def test_agent_provider_backstop_preserves_historical_exec_source_context() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1_000_000,
-            tool_result_provider_request_max_chars=1000,
-        ),
+def test_agent_provider_backstop_preserves_historical_exec_source_context(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1_000_000,
+        tool_result_provider_request_max_chars=1000,
     )
     source = "\n".join(f"{index}: fn important_{index}() {{}}" for index in range(500))
     messages = [
@@ -755,12 +1173,12 @@ def test_agent_provider_backstop_preserves_historical_exec_source_context() -> N
     assert "tool_provider_guard_projection_applied" not in agent.config.metadata
 
 
-def test_agent_aggregate_tool_result_budget_uses_total_not_single_result_size() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1200,
-        ),
+def test_agent_aggregate_tool_result_budget_uses_total_not_single_result_size(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1200,
     )
     messages: list[Message] = []
     for index in range(5):
@@ -799,13 +1217,13 @@ def test_agent_aggregate_tool_result_budget_uses_total_not_single_result_size() 
     assert "recent output" not in "\n".join(compacted_contents)
 
 
-def test_agent_aggregate_projection_preserves_historical_read_file_source_context() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1200,
-            tool_result_provider_request_max_chars=1_000_000,
-        ),
+def test_agent_aggregate_projection_preserves_historical_read_file_source_context(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1200,
+        tool_result_provider_request_max_chars=1_000_000,
     )
     source = "\n".join(f"{index}: important source line" for index in range(500))
     messages: list[Message] = [
@@ -914,14 +1332,14 @@ def test_agent_aggregate_tool_result_budget_keeps_projected_history_stable() -> 
     assert projected_contents == original_contents
 
 
-def test_agent_provider_backstop_classifies_external_results_from_tool_use_names() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1_000_000,
-            tool_result_provider_request_max_chars=1300,
-            tool_result_external_keep_recent=2,
-        ),
+def test_agent_provider_backstop_classifies_external_results_from_tool_use_names(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1_000_000,
+        tool_result_provider_request_max_chars=1300,
+        tool_result_external_keep_recent=2,
     )
     messages: list[Message] = []
     for index in range(4):
@@ -1380,24 +1798,6 @@ async def test_agent_static_cost_source_is_explicitly_distinct_from_provider_bil
     assert done.cost_source == "opensquilla_static_estimate"
 
 
-def test_complete_response_usage_cost_is_not_provider_billed_for_direct_providers() -> None:
-    response = SimpleNamespace(
-        model="deepseek-v4-flash",
-        usage={
-            "prompt_tokens": 1000,
-            "completion_tokens": 1000,
-            "cost": 0.0123,
-        },
-    )
-    provider = SimpleNamespace(provider_name="deepseek")
-
-    usage = _usage_from_complete_response(response, provider)
-
-    assert usage["billed_cost"] == 0.0
-    assert usage["cost_source"] == "opensquilla_static_estimate"
-    assert usage["estimated_cost_usd"] > 0.0
-
-
 @pytest.mark.asyncio
 async def test_agent_uses_sanitized_request_view_and_records_context_stages() -> None:
     provider = CapturingProvider()
@@ -1450,11 +1850,13 @@ async def test_agent_uses_sanitized_request_view_and_records_context_stages() ->
 
 @pytest.mark.asyncio
 async def test_agent_provider_view_omits_loaded_history_tool_arguments() -> None:
+    from opensquilla.provider.openai import OpenAIProvider
+
     provider = CapturingProvider()
     large_argument = "STALE_HISTORY_ARGUMENT\n" + ("x" * 20_000)
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=1, flush_enabled=False),
+        config=AgentConfig(max_iterations=1, ),
     )
     agent.set_history(
         [
@@ -1492,9 +1894,24 @@ async def test_agent_provider_view_omits_loaded_history_tool_arguments() -> None
     )
     assert large_argument not in payload
     assert "x" * 1000 not in payload
-    assert "old reasoning" not in payload
+    # Engine history retains canonical reasoning; the concrete target adapter
+    # decides whether its wire protocol accepts it.
+    assert "old reasoning" in payload
     assert "historical_tool_argument_omitted" not in payload
     assert "invalid_provider_context_projection:write_file.content" in payload
+    adapter = OpenAIProvider(
+        api_key="synthetic-key", model="gpt-4.1", provider_kind="openai",
+        base_url="https://api.openai.com/v1",
+    )
+    wire, *_ = adapter._build_payload(
+        provider.calls[0]["messages"], provider.calls[0]["tools"], provider.calls[0]["config"],
+    )
+    wire_json = json.dumps(wire, ensure_ascii=False)
+    assert "old reasoning" not in wire_json
+    assert large_argument not in wire_json
+    assert "x" * 1000 not in wire_json
+    assert "invalid_provider_context_projection:write_file.content" in wire_json
+    assert all("reasoning_content" not in message for message in wire["messages"])
 
 
 @pytest.mark.asyncio
@@ -1513,7 +1930,6 @@ async def test_agent_preserves_deepseek_reasoning_while_projecting_history_paylo
                 supports_tools=True,
                 reasoning_format="deepseek",
             ),
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -1582,6 +1998,42 @@ async def test_agent_runtime_context_is_request_only_and_not_system_prefix() -> 
     assert len(call["messages"]) == 1
     assert all(
         "[Runtime context for this turn]" not in message.content
+        for message in agent._history
+        if isinstance(message.content, str)
+    )
+
+
+@pytest.mark.asyncio
+async def test_execution_identity_reuses_runtime_context_without_extra_message() -> None:
+    from opensquilla.provider.types import ExecutionIdentity
+
+    provider = CapturingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            system_prompt="stable system",
+            execution_identity=ExecutionIdentity(provider="example", model="example/model"),
+            cache_breakpoints=[{"text": "stable system", "cache": "true"}],
+            cache_mode="auto",
+            max_iterations=1,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("which model?")]
+
+    assert any(event.kind == "done" for event in events)
+    call = provider.calls[0]
+    assert call["config"].system == "stable system"
+    assert call["config"].cache_breakpoints == [
+        {"text": "stable system", "cache": "true"}
+    ]
+    assert len(call["messages"]) == 1
+    assert call["messages"][0].content.startswith("which model?")
+    assert "[Runtime context for this turn]" in call["messages"][0].content
+    assert "Current response execution:" in call["messages"][0].content
+    assert '"model":"example/model"' in call["messages"][0].content
+    assert all(
+        "Current response execution:" not in message.content
         for message in agent._history
         if isinstance(message.content, str)
     )
@@ -1953,7 +2405,9 @@ async def test_agent_request_context_repeats_across_tool_loop_without_persisting
 
 
 @pytest.mark.asyncio
-async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provider() -> None:
+async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provider(
+    tmp_path,
+) -> None:
     provider = ToolLoopCapturingProvider()
     raw_output = "single bulky output\n" + ("x" * 5000)
 
@@ -1964,18 +2418,18 @@ async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provi
             content=raw_output,
         )
 
-    agent = Agent(
+    agent = _recoverable_projection_agent(
+        tmp_path,
         provider=provider,
-        config=AgentConfig(
-            # Window large enough that the projected (~250-token) tool result
-            # fits: this test exercises tool-result projection/canonicalization,
-            # not compaction. A 200-token window is below the projection floor,
-            # so inline compaction would legitimately fire and prune the result.
-            context_window_tokens=200_000,
-            max_iterations=2,
-            tool_result_projection_max_inline_chars=1000,
-        ),
         tool_handler=tool_handler,
+        tool_names=("echo",),
+        # Window large enough that the projected (~250-token) tool result
+        # fits: this test exercises tool-result projection/canonicalization,
+        # not compaction. A 200-token window is below the projection floor,
+        # so inline compaction would legitimately fire and prune the result.
+        context_window_tokens=200_000,
+        max_iterations=2,
+        tool_result_projection_max_inline_chars=1000,
     )
 
     events = [event async for event in agent.run_turn("hello")]
@@ -1986,7 +2440,7 @@ async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provi
         if isinstance(event, ToolResultEvent) and event.tool_use_id == "tool-1"
     )
     assert result_event.result != raw_output
-    assert "tool_result_handle:" not in result_event.result
+    assert "tool_result_handle: tr-" in result_event.result
     history_result = next(
         block
         for message in agent._history
@@ -2007,17 +2461,17 @@ async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provi
     )
     assert replay_result.content == result_event.result
     assert replay_result.content != raw_output
-    assert "tool_result_handle:" not in replay_result.content
+    assert "tool_result_handle: tr-" in replay_result.content
     assert "single bulky output" in replay_result.content
     assert len(replay_result.content) < len(raw_output)
 
 
-def test_agent_provider_request_messages_project_overflow_retry_tool_results() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+def test_agent_provider_request_messages_project_overflow_retry_tool_results(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     raw_output = "overflow retry bulky output\n" + ("x" * 8000)
     messages = [
@@ -2051,16 +2505,16 @@ def test_agent_provider_request_messages_project_overflow_retry_tool_results() -
     )
     assert request_result.content != raw_output
     assert "[tool_result_projection]" in request_result.content
-    assert "tool_result_handle:" not in request_result.content
+    assert "tool_result_handle: tr-" in request_result.content
     assert len(request_result.content) < len(raw_output)
 
 
-def test_agent_provider_request_guard_reuses_stable_tool_result_projection() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+def test_agent_provider_request_guard_reuses_stable_tool_result_projection(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     raw_output = "overflow retry bulky output\n" + ("x" * 8000)
     messages = [
@@ -2106,12 +2560,12 @@ def test_agent_provider_request_guard_reuses_stable_tool_result_projection() -> 
     assert agent._provider_tool_result_overrides["tool-1"].content == first_content
 
 
-def test_agent_provider_request_reapplies_frozen_projection_after_turn_reset() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+def test_agent_provider_request_reapplies_frozen_projection_after_turn_reset(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     raw_output = "overflow retry bulky output\n" + ("x" * 8000)
     messages = [
@@ -2154,12 +2608,12 @@ def test_agent_provider_request_reapplies_frozen_projection_after_turn_reset() -
     assert "[tool_result_projection]" in _result_content(second_request)
 
 
-def test_agent_provider_request_does_not_project_previously_full_visible_result() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+def test_agent_provider_request_does_not_project_previously_full_visible_result(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     first_raw = "first result stays full"
     first_messages = [
@@ -2231,71 +2685,6 @@ def test_agent_provider_request_does_not_project_previously_full_visible_result(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "strict_flush_config",
-    [
-        {"flush_compaction_requires_safe_receipt": True},
-        {"flush_compaction_safety_mode": "block"},
-    ],
-)
-async def test_agent_inline_strict_flush_receipt_refuses_destructive_compaction(
-    monkeypatch: pytest.MonkeyPatch,
-    strict_flush_config: dict[str, Any],
-) -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=10,
-            context_overflow_threshold=0.1,
-            flush_enabled=True,
-            flush_pre_compaction=True,
-            flush_timeout_seconds=0.1,
-            **strict_flush_config,
-        ),
-    )
-    messages = [Message(role="user", content="important history")]
-    compact_called = False
-
-    monkeypatch.setattr(
-        "opensquilla.memory.flush.should_flush",
-        lambda **_kwargs: True,
-    )
-    monkeypatch.setattr(
-        "opensquilla.memory.flush.resolve_flush_plan",
-        lambda **_kwargs: SimpleNamespace(relative_path="flush.md"),
-    )
-
-    async def degraded_flush(_plan: Any, _messages: list[Message]) -> Any:
-        return SimpleNamespace(
-            mode="llm",
-            indexed_chunk_count=1,
-            integrity_status="missing_chunks",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
-        )
-
-    async def compact_context_should_not_run(_request: Any) -> Any:
-        nonlocal compact_called
-        compact_called = True
-        return SimpleNamespace(summary="", kept_entries=[], removed_count=0)
-
-    monkeypatch.setattr(agent, "_run_flush", degraded_flush)
-    monkeypatch.setattr(
-        "opensquilla.engine.agent.compact_context",
-        compact_context_should_not_run,
-    )
-
-    outcome = await agent._check_context_overflow(messages, estimated_context_tokens=100)
-
-    assert outcome is None
-    assert compact_called is False
-    assert agent._last_compaction_refusal_reason == "memory_flush_degraded_before_compaction"
-
-
-@pytest.mark.asyncio
 async def test_agent_keeps_large_tool_arguments_during_tool_replay(tmp_path) -> None:
     large_code = "print('start')\n" + ("x = 1\n" * 500) + "print('end')\n"
     provider = LargeArgumentToolLoopCapturingProvider(large_code)
@@ -2341,6 +2730,28 @@ async def test_agent_keeps_large_tool_arguments_during_tool_replay(tmp_path) -> 
         if isinstance(block, ContentBlockToolUse)
     )
     assert history_block.input["code"] == large_code
+
+
+def _assert_rejected_tool_pair_visible(
+    messages: list[Message], tool_use_id: str, rejection: str
+) -> None:
+    uses = [
+        block
+        for message in messages if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolUse) and block.id == tool_use_id
+    ]
+    results = [
+        block
+        for message in messages if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolResult) and block.tool_use_id == tool_use_id
+    ]
+    assert len(uses) == len(results) == 1
+    assert uses[0].input["_invalid_provider_context_arguments"] is True
+    assert results[0].is_error is True
+    assert results[0].content == rejection
+    assert repair_tool_pairing(messages) == messages
 
 
 @pytest.mark.asyncio
@@ -2412,7 +2823,11 @@ async def test_agent_refuses_copied_tool_argument_projection_without_dispatch(
         [message.model_dump(mode="json") for message in provider.calls[-1]["messages"]],
         ensure_ascii=False,
     )
-    assert "tool-2" not in replay_payload
+    _assert_rejected_tool_pair_visible(
+        provider.calls[-1]["messages"], "tool-2", result_event.result
+    )
+    assert "compaction placeholder" in result_event.result
+    assert "The tool was not run" in result_event.result
     assert "tool_use_argument_projection" not in replay_payload
 
 
@@ -2485,7 +2900,10 @@ async def test_agent_refuses_unrestorable_tool_argument_projection(tmp_path) -> 
         [message.model_dump(mode="json") for message in provider.calls[-1]["messages"]],
         ensure_ascii=False,
     )
-    assert "tool_use_id: tool-2" not in replay_payload
+    _assert_rejected_tool_pair_visible(
+        provider.calls[-1]["messages"], "tool-2", result_event.result
+    )
+    assert "tool_use_argument_projection" not in replay_payload
     stored_contents = [
         path.read_text(encoding="utf-8")
         for path in (tmp_path / "tool-results").rglob("content.txt")
@@ -2549,9 +2967,11 @@ async def test_agent_refuses_copied_provider_compacted_tool_arguments(tmp_path) 
         ensure_ascii=False,
     )
     assert "_opensquilla_compacted_tool_arguments" not in replay_payload
-    assert "_invalid_provider_context_arguments" not in replay_payload
-    assert "provider_context_omitted" not in replay_payload
-    assert "tool-compact" not in replay_payload
+    _assert_rejected_tool_pair_visible(
+        provider.calls[-1]["messages"], "tool-compact", result_event.result
+    )
+    assert "are not executable" in result_event.result
+    assert "The tool was not run" in result_event.result
 
 
 @pytest.mark.asyncio
@@ -2632,7 +3052,7 @@ async def test_agent_refuses_mid_string_compacted_marker_in_tool_argument(
 
 
 @pytest.mark.asyncio
-async def test_agent_repair_prompt_keeps_provider_request_from_ending_on_assistant(
+async def test_agent_rejection_result_keeps_provider_request_from_ending_on_assistant(
     tmp_path,
 ) -> None:
     provider = TextThenCompactedToolArgumentsProvider()
@@ -2658,18 +3078,24 @@ async def test_agent_repair_prompt_keeps_provider_request_from_ending_on_assista
     assert len(provider.calls) == 2
     repair_messages = provider.calls[1]["messages"]
     assert repair_messages[-1].role == "user"
-    assert isinstance(repair_messages[-1].content, str)
-    assert "Regenerate the complete tool arguments" in repair_messages[-1].content
+    assert isinstance(repair_messages[-1].content, list)
+    assert len(repair_messages[-1].content) == 1
+    assert isinstance(repair_messages[-1].content[0], ContentBlockToolResult)
+    assert len(repair_messages) == len(provider.calls[0]["messages"]) + 2
     replay_payload = json.dumps(
         [message.model_dump(mode="json") for message in repair_messages],
         ensure_ascii=False,
     )
-    assert "tool-compact" not in replay_payload
-    assert "_invalid_provider_context_arguments" not in replay_payload
-    assert "provider_context_omitted" not in replay_payload
+    result_event = next(
+        event for event in events
+        if isinstance(event, ToolResultEvent) and event.tool_use_id == "tool-compact"
+    )
+    _assert_rejected_tool_pair_visible(repair_messages, "tool-compact", result_event.result)
+    assert "_opensquilla_compacted_tool_arguments" not in replay_payload
+    assert "Regenerate the complete tool arguments" not in replay_payload
 
 
-def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
+def test_agent_preserves_missing_tool_result_as_history_without_extra_instruction() -> None:
     agent = Agent(provider=CapturingProvider(), config=AgentConfig())
     messages = [
         Message(role="user", content="make a deck"),
@@ -2691,15 +3117,49 @@ def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
 
     stripped = agent._strip_provider_context_marker_replay_for_provider(messages)
 
+    assert len(stripped) == len(messages)
+    assert stripped[0] == messages[0]
     assert stripped[-1].role == "user"
     assert isinstance(stripped[-1].content, str)
-    assert "Regenerate the complete tool arguments" in stripped[-1].content
+    assert stripped[-1].content.startswith("[Recorded tool history]")
+    assert "verify current state" in stripped[-1].content
     replay_payload = json.dumps(
         [message.model_dump(mode="json") for message in stripped],
         ensure_ascii=False,
     )
-    assert "tool-compact" not in replay_payload
-    assert "provider_context_omitted" not in replay_payload
+    assert "tool-compact" in replay_payload
+    assert "I will prepare the file." in replay_payload
+    assert "Missing results do not establish whether execution occurred" in replay_payload
+    assert "Regenerate the complete tool arguments" not in replay_payload
+    assert '"tool_result"' not in stripped[-1].content
+    assert "_opensquilla_compacted_tool_arguments" not in replay_payload
+    assert repair_tool_pairing(stripped) == stripped
+    assert not any(
+        isinstance(block, ContentBlockToolResult | ContentBlockToolUse)
+        for message in stripped if isinstance(message.content, list)
+        for block in message.content
+    )
+    assert len(messages) == 2
+    assert messages[-1].role == "assistant"
+    for context_index in (0, len(messages)):
+        request_messages = agent._provider_request_messages(
+            messages,
+            request_context_message=None,
+            request_context_insert_index=0,
+            runtime_context_message=Message(role="user", content="[Runtime context]"),
+            runtime_context_insert_index=context_index,
+        )
+        request_payload = json.dumps(
+            [message.model_dump(mode="json") for message in request_messages],
+            ensure_ascii=False,
+        )
+        assert "I will prepare the file." in request_payload
+        assert "Missing results do not establish whether execution occurred" in request_payload
+        assert "Regenerate the complete tool arguments" not in request_payload
+        assert request_payload.count("[Recorded tool history]") == 1
+        assert request_payload.count("[Runtime context]") == 1
+        assert request_messages[-1].role == "user"
+        assert repair_tool_pairing(request_messages) == request_messages
 
 
 def test_agent_strips_string_provider_context_marker_replay() -> None:
@@ -2739,9 +3199,15 @@ def test_agent_strips_string_provider_context_marker_replay() -> None:
         [message.model_dump(mode="json") for message in stripped],
         ensure_ascii=False,
     )
-    assert "tool-compact-string" not in replay_payload
+    _assert_rejected_tool_pair_visible(
+        stripped, "tool-compact-string", "missing required argument command"
+    )
+    assert len(stripped) == len(messages)
+    assert stripped[0] == messages[0]
+    assert stripped[-1] == messages[-1]
+    assert "I will inspect the repo." in replay_payload
     assert "_opensquilla_compacted_tool_arguments" not in replay_payload
-    assert "missing required argument command" not in replay_payload
+    assert "Regenerate the complete tool arguments" not in replay_payload
 
 
 @pytest.mark.asyncio
@@ -2852,14 +3318,25 @@ async def test_agent_preserves_reasoning_content_for_deepseek_text_replay() -> N
 
 
 @pytest.mark.asyncio
-async def test_agent_preserves_direct_deepseek_v4_reasoning_without_capabilities() -> None:
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro-0813",
+        "tokenrhythm/deepseek-v4-pro-0813",
+    ],
+)
+async def test_agent_preserves_direct_deepseek_v4_reasoning_without_capabilities(
+    model_id: str,
+) -> None:
     provider = CapturingProvider()
     agent = Agent(
         provider=provider,
         config=AgentConfig(
             max_iterations=1,
             thinking=ThinkingLevel.HIGH,
-            model_id="deepseek-v4-flash",
+            model_id=model_id,
             model_capabilities=None,
         ),
     )
@@ -2918,7 +3395,9 @@ async def test_agent_preserves_reasoning_content_for_dashscope_qwen_replay() -> 
 
 
 @pytest.mark.asyncio
-async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> None:
+async def test_agent_keeps_reasoning_until_unsupported_provider_wire_projection() -> None:
+    from opensquilla.provider.openai import OpenAIProvider
+
     provider = CapturingProvider()
     agent = Agent(
         provider=provider,
@@ -2949,4 +3428,15 @@ async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> Non
     assert any(event.kind == "done" for event in events)
     assert provider.calls
     sent_assistant = provider.calls[0]["messages"][1]
-    assert sent_assistant.reasoning_content is None
+    assert sent_assistant.reasoning_content == "I reasoned before answering."
+    adapter = OpenAIProvider(
+        api_key="synthetic-key", model="custom-reasoning-model", provider_kind="openai",
+        base_url="https://api.openai.com/v1",
+    )
+    wire, *_ = adapter._build_payload(
+        provider.calls[0]["messages"], provider.calls[0]["tools"], provider.calls[0]["config"],
+    )
+    assert all("reasoning_content" not in message for message in wire["messages"])
+    assert "I reasoned before answering." not in json.dumps(wire)
+    # Request projection must not erase state kept for a future compatible target.
+    assert sent_assistant.reasoning_content == "I reasoned before answering."

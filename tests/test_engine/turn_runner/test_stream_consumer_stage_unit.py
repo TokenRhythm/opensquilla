@@ -12,6 +12,7 @@ runtime wrapper.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -21,6 +22,11 @@ from typing import Any
 
 import pytest
 
+from opensquilla.contracts.turn_execution import (
+    SurfaceCapabilities,
+    TurnExecutionContext,
+    TurnIdentity,
+)
 from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.turn_runner.stream_consumer_stage import (
     _SUPPRESS,
@@ -37,22 +43,66 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
     _WarningHandler,
 )
 from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
     ArtifactEvent,
     CompactionEvent,
     DoneEvent,
     EnsembleProgressEvent,
     ErrorEvent,
     TextDeltaEvent,
+    ThinkingEvent,
     ToolResultEvent,
+    ToolUseEndEvent,
     ToolUseStartEvent,
     WarningEvent,
 )
 from opensquilla.provider.types import EnsembleProgressEvent as ProviderEnsembleProgressEvent
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes
 # ---------------------------------------------------------------------------
+
+
+def test_tool_presentation_enrichment_is_best_effort() -> None:
+    event = ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file")
+    presentation = {
+        "category": "file_read",
+        "primaryArguments": ["path"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+
+    enriched = StreamConsumerStage._with_tool_presentation(
+        event,
+        SimpleNamespace(tool_presentation_payload=lambda _name: presentation),
+    )
+
+    assert enriched is not event
+    assert enriched.tool_presentation == presentation
+
+
+def test_tool_presentation_enrichment_never_breaks_execution() -> None:
+    event = ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file")
+
+    def fail(_name: str) -> dict[str, Any]:
+        raise ValueError("invalid presentation rule")
+
+    enriched = StreamConsumerStage._with_tool_presentation(
+        event,
+        SimpleNamespace(tool_presentation_payload=fail),
+    )
+
+    assert enriched.tool_presentation == {
+        "category": "generic",
+        "primaryArguments": [],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
 
 
 @dataclass
@@ -95,6 +145,7 @@ class _RecordingAgentRun:
 class _RecordingCompactionPersist:
     calls: list[dict[str, Any]] = field(default_factory=list)
     raises: type[BaseException] | None = None
+    result: bool | None = None
 
     async def persist_and_notify(
         self,
@@ -102,18 +153,51 @@ class _RecordingCompactionPersist:
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
-    ) -> None:
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int = 0,
+        source_entries: tuple[Any, ...] | None = None,
+        source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> bool | None:
         self.calls.append(
             {
                 "session_key": session_key,
                 "summary": summary,
                 "kept_entries": kept_entries,
+                "summary_payload": summary_payload,
+                "summary_format": summary_format,
+                "coverage_status": coverage_status,
+                "missing_obligations": missing_obligations,
+                "critical_carry_forward": critical_carry_forward,
                 "compaction_id": compaction_id,
+                "compaction_deadline_at_monotonic": (
+                    compaction_deadline_at_monotonic
+                ),
+                "compaction_timeout_seconds": compaction_timeout_seconds,
+                "removed_count": removed_count,
+                "source_entries": source_entries,
+                "source_preimage": source_preimage,
+                "source_context_fingerprint": source_context_fingerprint,
+                "source_boundary_message_id": source_boundary_message_id,
+                "source_boundary_entry_id": source_boundary_entry_id,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
             }
         )
         if self.raises is not None:
             raise self.raises("recording persist boom")
+        return self.result
 
 
 @dataclass
@@ -203,12 +287,22 @@ def _make_input(
     *,
     state: _StreamState | None = None,
     turn: Any | None = None,
+    run_kind: str = "default",
+    input_mode: str = "user",
     session_manager_present: bool = True,
     private_memory_allowed: bool = True,
     sync_manager: Any | None = None,
     input_provenance: dict[str, Any] | None = None,
     pending_input_provider: Any | None = None,
     tool_context: Any | None = None,
+    compaction_source_entries: tuple[Any, ...] | None = None,
+    compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+    compaction_source_context_fingerprint: str | None = None,
+    compaction_source_boundary_message_id: str | None = None,
+    compaction_source_boundary_entry_id: int | None = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
+    execution_context: TurnExecutionContext | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
         agent=SimpleNamespace(),
@@ -223,7 +317,7 @@ def _make_input(
         effective_runtime_message="hello there",
         input_provenance=input_provenance,
         session_key="agent:main:s1",
-        run_kind="default",
+        run_kind=run_kind,
         heartbeat_ack_max_chars=300,
         bootstrap_context_mode=None,
         router_cfg=None,
@@ -231,6 +325,17 @@ def _make_input(
         state=state if state is not None else _make_state(),
         pending_input_provider=pending_input_provider,
         tool_context=tool_context,
+        compaction_source_entries=compaction_source_entries,
+        compaction_source_preimage=compaction_source_preimage,
+        compaction_source_context_fingerprint=compaction_source_context_fingerprint,
+        compaction_source_boundary_message_id=(
+            compaction_source_boundary_message_id
+        ),
+        compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
+        input_mode=input_mode,
+        execution_context=execution_context,
     )
 
 
@@ -327,6 +432,214 @@ async def test_stream_consumer_normalizes_provider_ensemble_progress_events() ->
     assert events[0].output_tokens == 4
     assert events[0].cost_usd == 0.005
     assert events[0].error == ""
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_reset_clears_answer_and_keeps_completed_tool_timeline() -> None:
+    state = _make_state()
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="old answer"),
+                ToolUseStartEvent(tool_use_id="done-call", tool_name="record"),
+                ToolResultEvent(
+                    tool_use_id="done-call",
+                    tool_name="record",
+                    result="completed",
+                ),
+                TextDeltaEvent(text="old suffix"),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-reset",
+                    assistant_message_id="assistant-reset",
+                    old_generation_epoch=0,
+                    new_generation_epoch=1,
+                    safe_reason="takeover",
+                    sequence=5,
+                ),
+                TextDeltaEvent(text="new answer", generation_epoch=1),
+                ThinkingEvent(text="new reasoning", generation_epoch=1),
+                DoneEvent(text="new answer", generation_epoch=1),
+            ],
+        )
+    )
+
+    events = await _drain(stage, _make_input(state=state))
+
+    assert any(isinstance(event, AnswerGenerationResetEvent) for event in events)
+    assert state.final_text_parts == ["new answer"]
+    assert state.reasoning == ["new reasoning"]
+    assert [segment["type"] for segment in state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_reset_is_only_public_outcome_and_keeps_accounting_done() -> None:
+    state = _make_state()
+    terminal_text = "The fixed model could not complete this answer."
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="partial fixed answer"),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-terminal-reset",
+                    assistant_message_id="assistant-terminal-reset",
+                    old_generation_epoch=1,
+                    new_generation_epoch=2,
+                    safe_reason="fixed provider final failure",
+                    sequence=7,
+                    terminal=True,
+                    terminal_text_snapshot=terminal_text,
+                    terminal_error_message="The provider rejected the request.",
+                    terminal_error_code="provider_bad_request",
+                    terminal_failure_kind="bad_request",
+                ),
+                DoneEvent(
+                    text="",
+                    text_snapshot="",
+                    input_tokens=9,
+                    output_tokens=3,
+                    generation_epoch=2,
+                ),
+            ]
+        )
+    )
+
+    events = await _drain(stage, _make_input(state=state))
+
+    assert [type(event) for event in events] == [
+        TextDeltaEvent,
+        AnswerGenerationResetEvent,
+    ]
+    assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
+    assert state.final_text_parts == [terminal_text]
+    assert state.current_text_parts == [terminal_text]
+    assert state.turn_segments == []
+    assert state.done_event is not None
+    assert state.done_event.text_snapshot == terminal_text
+    assert state.done_event.input_tokens == 9
+    assert state.done_event.output_tokens == 3
+    assert state.error_message == "The provider rejected the request."
+    assert state.pending_error_event is not None
+    assert state.pending_error_event.code == "provider_bad_request"
+    assert state.pending_error_event.failure_kind == "bad_request"
+    assert state.pending_error_event.generation_epoch == 2
+    public_reset = next(
+        event for event in events if isinstance(event, AnswerGenerationResetEvent)
+    )
+    assert public_reset.terminal_error_message == "The provider rejected the request."
+    assert public_reset.terminal_error_code == "provider_bad_request"
+    assert public_reset.terminal_failure_kind == "bad_request"
+
+
+@pytest.mark.asyncio
+async def test_non_reset_surface_projects_terminal_reset_to_one_legacy_error() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-terminal-legacy",
+            "assistant-terminal-legacy",
+            "agent:main:terminal-legacy",
+        ),
+        surface=SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        ),
+    )
+    state = _make_state()
+    terminal_text = "The model could not complete this answer."
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="superseded partial"),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-terminal-legacy",
+                    assistant_message_id="assistant-terminal-legacy",
+                    old_generation_epoch=1,
+                    new_generation_epoch=2,
+                    safe_reason="fixed provider final failure",
+                    sequence=8,
+                    terminal=True,
+                    terminal_text_snapshot=terminal_text,
+                    terminal_error_message="internal provider detail",
+                    terminal_error_code="provider_bad_request",
+                    terminal_failure_kind="bad_request",
+                ),
+                DoneEvent(input_tokens=7, output_tokens=2, generation_epoch=2),
+            ]
+        )
+    )
+
+    events = await _drain(
+        stage,
+        _make_input(state=state, execution_context=context),
+    )
+
+    assert [type(event) for event in events] == [ErrorEvent]
+    assert events[0].message == terminal_text
+    assert events[0].code == "ensemble_fixed_error"
+    assert events[0].failure_kind == ""
+    assert state.error_message == "internal provider detail"
+    assert state.pending_error_event is not None
+    assert state.pending_error_event.code == "provider_bad_request"
+    assert state.done_event is not None
+    assert state.done_event.input_tokens == 7
+    assert state.done_event.output_tokens == 2
+    assert state.final_text_parts == [terminal_text]
+
+
+@pytest.mark.asyncio
+async def test_non_editable_surface_hides_replaced_text_until_fixed_done() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-non-edit",
+            "assistant-non-edit",
+            "agent:main:non-edit",
+        ),
+        surface=SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        ),
+    )
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="old answer", generation_epoch=0),
+                ThinkingEvent(text="old reasoning", generation_epoch=0),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-non-edit",
+                    assistant_message_id="assistant-non-edit",
+                    old_generation_epoch=0,
+                    new_generation_epoch=1,
+                    safe_reason="fixed takeover",
+                    sequence=3,
+                ),
+                TextDeltaEvent(text="fixed answer", generation_epoch=1),
+                DoneEvent(
+                    text="fixed answer",
+                    text_snapshot="fixed answer",
+                    generation_epoch=1,
+                ),
+            ],
+        )
+    )
+
+    events = await _drain(
+        stage,
+        _make_input(execution_context=context),
+    )
+
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "fixed answer"
+    ]
+    assert not any(
+        isinstance(event, ThinkingEvent) and event.text == "old reasoning"
+        for event in events
+    )
+    assert not any(isinstance(event, AnswerGenerationResetEvent) for event in events)
+    assert sum(isinstance(event, DoneEvent) for event in events) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +805,7 @@ def test_tool_use_start_handler_preserves_canonical_details_text_segment() -> No
     assert state.turn_segments[0] == {
         "type": "text",
         "text": expected,
+        "presentation": "intermediate",
     }
     assert "".join(state.final_text_parts) == expected
 
@@ -510,11 +824,47 @@ def test_tool_use_start_handler_flushes_text_and_appends_segment() -> None:
         state,
     )
     assert state.turn_segments == [
-        {"type": "text", "text": "pre"},
+        {"type": "text", "text": "pre", "presentation": "intermediate"},
         {"type": "tool_use", "tool_use_id": "t1", "name": "echo", "input": ""},
     ]
     assert state.current_text_parts == []
     assert state.final_text_parts == ["pre"]  # unchanged when not synthetic
+
+
+@pytest.mark.asyncio
+async def test_tool_use_end_persists_input_before_execution_result() -> None:
+    state = _make_state()
+    presentation = {
+        "category": "file_read",
+        "primaryArguments": ["path"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                ToolUseStartEvent(tool_use_id="read-1", tool_name="read_file"),
+                ToolUseEndEvent(
+                    tool_use_id="read-1",
+                    tool_name="read_file",
+                    arguments={"path": "src/app.py", "offset": 500},
+                    tool_presentation=presentation,
+                ),
+            ]
+        )
+    )
+
+    await _drain(stage, _make_input(state=state))
+
+    assert state.turn_segments == [
+        {
+            "type": "tool_use",
+            "tool_use_id": "read-1",
+            "name": "read_file",
+            "input": {"path": "src/app.py", "offset": 500},
+            "tool_presentation": presentation,
+        }
+    ]
 
 
 def test_tool_result_handler_projects_large_write_file_arguments() -> None:
@@ -951,6 +1301,68 @@ def test_tool_result_handler_replaces_intermediate_approval_result() -> None:
     assert state.turn_segments[0]["input"]["approval_id"] == "approval-1"
 
 
+def test_tool_result_handler_preserves_initial_user_input_request() -> None:
+    state = _make_state()
+    handler = _ToolResultHandler()
+    request = {
+        "status": "input_required",
+        "kind": "user_input",
+        "paused": True,
+        "request_id": "request-1",
+        "run_id": "run-1",
+        "step": "plan",
+        "clarify_schema": {
+            "mode": "form",
+            "presentation": "plan_questionnaire_v1",
+            "fields": [{"name": "scope", "required": True}],
+        },
+    }
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="call-input",
+            tool_name="request_user_input",
+            result=json.dumps(request),
+        ),
+        state,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="call-input",
+            tool_name="request_user_input",
+            result=json.dumps(
+                {
+                    "status": "answered",
+                    "kind": "user_input",
+                    "paused": False,
+                    "request_id": "request-1",
+                    "answers": {"scope": "focused"},
+                }
+            ),
+        ),
+        state,
+    )
+
+    assert state.turn_segments == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-input",
+            "name": "request_user_input",
+            "result": json.dumps(
+                {
+                    "status": "answered",
+                    "kind": "user_input",
+                    "paused": False,
+                    "request_id": "request-1",
+                    "answers": {"scope": "focused"},
+                }
+            ),
+            "is_error": False,
+            "user_input_request": request,
+        }
+    ]
+
+
 def test_artifact_handler_appends_payload() -> None:
     state = _make_state()
     handler = _ArtifactHandler()
@@ -970,13 +1382,85 @@ def test_artifact_handler_appends_payload() -> None:
     assert len(state.turn_artifacts) == 1
 
 
+@pytest.mark.asyncio
+async def test_generated_artifact_is_adopted_before_public_yield() -> None:
+    order: list[tuple[str, str]] = []
+
+    async def adopt(event: ArtifactEvent) -> None:
+        order.append(("adopt", event.id))
+
+    artifact = ArtifactEvent(
+        id="art-editable",
+        name="page.html",
+        mime="text/html",
+        size=32,
+    )
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[artifact, DoneEvent(text="ready", text_snapshot="ready")]
+        )
+    )
+    inp = _make_input(
+        tool_context=ToolContext(generated_artifact_adopter=adopt),
+    )
+
+    yielded: list[Any] = []
+    async for event in stage.run(inp):
+        if isinstance(event, ArtifactEvent):
+            order.append(("yield", event.id))
+        yielded.append(event)
+
+    assert order == [("adopt", "art-editable"), ("yield", "art-editable")]
+    assert any(isinstance(event, ArtifactEvent) for event in yielded)
+    assert inp.state.turn_artifacts[0]["id"] == "art-editable"
+
+
+@pytest.mark.asyncio
+async def test_generated_artifact_adoption_failure_keeps_delivery() -> None:
+    async def fail_adoption(_event: ArtifactEvent) -> None:
+        raise RuntimeError("synthetic adoption failure")
+
+    artifact = ArtifactEvent(
+        id="art-fallback",
+        name="page.html",
+        mime="text/html",
+        size=32,
+    )
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[artifact, DoneEvent(text="ready", text_snapshot="ready")]
+        )
+    )
+    inp = _make_input(
+        tool_context=ToolContext(generated_artifact_adopter=fail_adoption),
+    )
+
+    yielded = await _drain(stage, inp)
+
+    assert any(isinstance(event, ArtifactEvent) for event in yielded)
+    assert inp.state.turn_artifacts[0]["id"] == "art-fallback"
+
+
 def test_error_handler_rewrites_timeout_envelope() -> None:
     state = _make_state()
     handler = _ErrorHandler()
-    result = handler.handle(ErrorEvent(message="x", code="timeout"), state)
+    event = ErrorEvent(
+        message="x", code="timeout", error_id="abcd1234",
+        failure_kind="transport_transient", generation_epoch=3,
+        retry_after_ms=8000, usage_call_index=2,
+        no_prior_provider_dispatch=False, replay_safe=False,
+    )
+    result = handler.handle(event, state)
     assert result is _SUPPRESS
     assert state.pending_error_event is not None
     assert state.pending_error_event.code == "llm_timeout"
+    assert state.pending_error_event.error_id == event.error_id
+    assert state.pending_error_event.failure_kind == event.failure_kind
+    assert state.pending_error_event.generation_epoch == event.generation_epoch
+    assert state.pending_error_event.retry_after_ms == event.retry_after_ms
+    assert state.pending_error_event.usage_call_index == event.usage_call_index
+    assert state.pending_error_event.no_prior_provider_dispatch is False
+    assert state.pending_error_event.replay_safe is False
 
 
 def test_error_handler_drops_unpaired_tool_use_on_incomplete_stream() -> None:
@@ -1212,17 +1696,64 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
         memory_snapshot=snapshot,
         system_prompt=prompt,
     )
-    inp = _make_input()
+    source_entries = (SimpleNamespace(message_id="source-boundary", id=7),)
+    source_preimage = ((7, "source-boundary"),)
+    inp = _make_input(
+        compaction_source_entries=source_entries,
+        compaction_source_preimage=source_preimage,
+        compaction_source_context_fingerprint="frozen-context",
+        compaction_source_boundary_message_id="source-boundary",
+        compaction_source_boundary_entry_id=7,
+        expected_session_id="session-admitted",
+        expected_session_epoch=7,
+    )
     await handler.handle(
-        CompactionEvent(compaction_id="cmp_inline_1", summary="s", kept_entries=[1, 2]),
+        CompactionEvent(
+            compaction_id="cmp_inline_1",
+            summary="s",
+            kept_entries=[1, 2],
+            removed_count=4,
+        ),
         inp,
     )
     assert len(persist.calls) == 1
     assert persist.calls[0]["summary"] == "s"
     assert persist.calls[0]["kept_entries"] == [1, 2]
     assert persist.calls[0]["compaction_id"] == "cmp_inline_1"
+    assert persist.calls[0]["removed_count"] == 4
+    assert persist.calls[0]["source_entries"] is source_entries
+    assert persist.calls[0]["source_preimage"] is source_preimage
+    assert persist.calls[0]["source_context_fingerprint"] == "frozen-context"
+    assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
+    assert persist.calls[0]["source_boundary_entry_id"] == 7
+    assert persist.calls[0]["expected_session_id"] == "session-admitted"
+    assert persist.calls[0]["expected_session_epoch"] == 7
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_handler_does_not_refresh_after_stale_source() -> None:
+    persist = _RecordingCompactionPersist(result=False)
+    snapshot = _RecordingMemorySnapshotRefresh()
+    prompt = _RecordingSystemPromptRefresh()
+    handler = _CompactionHandler(
+        persist=persist,
+        memory_snapshot=snapshot,
+        system_prompt=prompt,
+    )
+
+    await handler.handle(
+        CompactionEvent(summary="stale", kept_entries=[], removed_count=1),
+        _make_input(
+            compaction_source_entries=(),
+            compaction_source_preimage=(),
+        ),
+    )
+
+    assert len(persist.calls) == 1
+    assert snapshot.calls == []
+    assert prompt.calls == []
 
 
 @pytest.mark.asyncio
@@ -1285,6 +1816,835 @@ async def test_outer_stage_yields_text_then_done_and_notifies_post_stream() -> N
     assert len(recs["memory_sync_notify"].calls) == 1
     assert recs["memory_sync_notify"].calls[0]["runtime_message"] == "hello there"
     assert recs["memory_sync_notify"].calls[0]["sync_manager_present"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sentinel", "chunks"),
+    [
+        ("NO_REPLY", ["NO_REPLY"]),
+        ("NO_REPLY", list("NO_REPLY")),
+        ("HEARTBEAT_OK", ["HEARTBEAT_OK"]),
+        ("HEARTBEAT_OK", list("HEARTBEAT_OK")),
+        ("  NO_REPLY\n", ["  ", "NO_", "REPLY\n"]),
+        ("\tHEARTBEAT_OK  ", ["\tHEART", "BEAT_OK  "]),
+    ],
+)
+async def test_human_sentinel_only_done_becomes_pending_error_without_text_flash(
+    sentinel: str,
+    chunks: list[str],
+) -> None:
+    agent_run = _RecordingAgentRun(
+        events=[
+            *(TextDeltaEvent(text=chunk) for chunk in chunks),
+            DoneEvent(
+                text=sentinel,
+                text_snapshot=sentinel,
+                input_tokens=13,
+                output_tokens=2,
+            ),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert yielded == []
+    assert inp.state.final_text_parts == []
+    assert inp.state.current_text_parts == []
+    assert inp.state.pending_error_event == ErrorEvent(
+        message=SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+        code=SILENT_REPLY_NOT_ALLOWED_CODE,
+    )
+    assert inp.state.error_message == SILENT_REPLY_NOT_ALLOWED_MESSAGE
+    assert inp.state.done_event is not None
+    assert inp.state.done_event.input_tokens == 13
+    assert inp.state.done_event.output_tokens == 2
+    assert inp.state.done_event.delivery == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_human_done_only_sentinel_becomes_pending_error() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                DoneEvent(
+                    text="NO_REPLY",
+                    text_snapshot="NO_REPLY",
+                    input_tokens=5,
+                    output_tokens=1,
+                )
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert yielded == []
+    assert inp.state.pending_error_event is not None
+    assert inp.state.pending_error_event.code == SILENT_REPLY_NOT_ALLOWED_CODE
+    assert inp.state.done_event is not None
+    assert inp.state.done_event.input_tokens == 5
+
+
+@pytest.mark.asyncio
+async def test_human_short_normal_prefix_releases_at_done() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO"),
+                DoneEvent(text="NO", text_snapshot="NO"),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[0].text == "NO"
+    assert yielded[1].text_snapshot == "NO"
+    assert inp.state.pending_error_event is None
+
+
+@pytest.mark.asyncio
+async def test_human_prefix_crossing_tool_boundary_keeps_live_and_history_order() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO"),
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+                ToolResultEvent(
+                    tool_use_id="tool-1",
+                    tool_name="lookup",
+                    result="ok",
+                ),
+                TextDeltaEvent(text=" results"),
+                DoneEvent(text="NO results", text_snapshot="NO results"),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == "NO results"
+    assert [segment["type"] for segment in inp.state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+    assert inp.state.current_text_parts == ["NO results"]
+
+
+@pytest.mark.asyncio
+async def test_human_short_prefix_done_after_tool_moves_text_to_history_tail() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO"),
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+                ToolResultEvent(
+                    tool_use_id="tool-1",
+                    tool_name="lookup",
+                    result="ok",
+                ),
+                DoneEvent(text="NO", text_snapshot="NO"),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == "NO"
+    assert [segment["type"] for segment in inp.state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+    assert inp.state.current_text_parts == ["NO"]
+
+
+@pytest.mark.asyncio
+async def test_human_usage_done_after_provider_error_keeps_original_error() -> None:
+    provider_error = ErrorEvent(message="provider failed", code="provider_error")
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REP"),
+                provider_error,
+                DoneEvent(
+                    text="NO_REPLY",
+                    text_snapshot="NO_REPLY",
+                    input_tokens=8,
+                    output_tokens=1,
+                ),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert yielded == []
+    assert inp.state.pending_error_event is provider_error
+    assert inp.state.error_message == "provider failed"
+    assert inp.state.final_text_parts == []
+    assert inp.state.done_event is not None
+    assert inp.state.done_event.input_tokens == 8
+    assert inp.state.done_event.delivery == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_human_mixed_sentinel_prose_releases_once_and_completes() -> None:
+    body = "This is a normal human-facing reply."
+    source = f"NO_REPLY\n{body}"
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_"),
+                TextDeltaEvent(text="REPLY\n"),
+                TextDeltaEvent(text=body),
+                DoneEvent(text=source, text_snapshot=source),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[0].text == source
+    assert yielded[1].text_snapshot == source
+    assert inp.state.pending_error_event is None
+
+
+@pytest.mark.asyncio
+async def test_human_sentinel_failure_keeps_tool_and_artifact_activity() -> None:
+    artifact = ArtifactEvent(name="report.txt", mime="text/plain", size=4)
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REPLY"),
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+                ToolResultEvent(
+                    tool_use_id="tool-1",
+                    tool_name="lookup",
+                    result="ok",
+                ),
+                artifact,
+                DoneEvent(
+                    text="NO_REPLY",
+                    text_snapshot="NO_REPLY",
+                    input_tokens=7,
+                    output_tokens=1,
+                ),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "ArtifactEvent",
+    ]
+    assert [segment["type"] for segment in inp.state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+    assert len(inp.state.turn_artifacts) == 1
+    assert inp.state.turn_artifacts[0]["name"] == "report.txt"
+    assert inp.state.turn_artifacts[0]["mime"] == "text/plain"
+    assert inp.state.turn_artifacts[0]["size"] == 4
+    assert inp.state.pending_error_event is not None
+    assert inp.state.pending_error_event.code == SILENT_REPLY_NOT_ALLOWED_CODE
+    assert inp.state.done_event is not None
+    assert inp.state.done_event.input_tokens == 7
+
+
+@pytest.mark.asyncio
+async def test_system_event_buffers_split_sentinel_and_suppresses_terminal_text() -> None:
+    agent_run = _RecordingAgentRun(
+        events=[
+            *(TextDeltaEvent(text=char) for char in "NO_REPLY"),
+            DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY"),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+
+    yielded = await _drain(
+        stage,
+        _make_input(run_kind="goal", input_mode="system_event"),
+    )
+
+    assert [type(event).__name__ for event in yielded] == ["DoneEvent"]
+    done = yielded[0]
+    assert isinstance(done, DoneEvent)
+    assert done.text == ""
+    assert done.text_snapshot == ""
+    assert done.delivery == "suppressed"
+    assert done.suppression_reason == "no_reply"
+
+
+@pytest.mark.asyncio
+async def test_system_event_buffers_mixed_sentinel_and_releases_only_body_once() -> None:
+    body = "The synthetic background check is still pending."
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="NO_"),
+            TextDeltaEvent(text="REPLY\r\n"),
+            TextDeltaEvent(text=body),
+            DoneEvent(
+                text=f"NO_REPLY\r\n{body}",
+                text_snapshot=f"NO_REPLY\r\n{body}",
+            ),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+
+    yielded = await _drain(
+        stage,
+        _make_input(run_kind="goal", input_mode="system_event"),
+    )
+
+    assert [type(event).__name__ for event in yielded] == [
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[0].text == body
+    done = yielded[1]
+    assert isinstance(done, DoneEvent)
+    assert done.text == body
+    assert done.text_snapshot == body
+    assert done.delivery == "visible"
+    assert done.suppression_reason is None
+
+
+@pytest.mark.asyncio
+async def test_system_event_keeps_tool_events_live_while_text_is_buffered() -> None:
+    body = "The check completed."
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="HEARTBEAT_OK\n"),
+            ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+            ToolResultEvent(
+                tool_use_id="tool-1",
+                tool_name="lookup",
+                result="ok",
+            ),
+            TextDeltaEvent(text=body),
+            DoneEvent(
+                text=f"HEARTBEAT_OK\n{body}",
+                text_snapshot=f"HEARTBEAT_OK\n{body}",
+            ),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+
+    yielded = await _drain(
+        stage,
+        _make_input(run_kind="goal", input_mode="system_event"),
+    )
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_text",
+    ["NO_REPLY\nPreparing.Finished.", "Preparing.Finished."],
+)
+async def test_system_event_normalization_preserves_text_around_tool_boundary(
+    terminal_text: str,
+) -> None:
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="NO_REPLY\nPreparing."),
+            ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+            ToolResultEvent(
+                tool_use_id="tool-1",
+                tool_name="lookup",
+                result="ok",
+            ),
+            TextDeltaEvent(text="Finished."),
+            DoneEvent(text=terminal_text, text_snapshot=terminal_text),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == "Preparing.Finished."
+    assert [segment["type"] for segment in inp.state.turn_segments] == [
+        "text",
+        "tool_use",
+        "tool_result",
+    ]
+    assert inp.state.turn_segments[0] == {
+        "type": "text",
+        "text": "Preparing.",
+        "presentation": "intermediate",
+    }
+    assert inp.state.current_text_parts == ["Finished."]
+    assert "NO_REPLY" not in str(inp.state.turn_segments)
+
+
+@pytest.mark.asyncio
+async def test_system_event_removes_bare_marker_before_tool_without_newline() -> None:
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="NO_REPLY"),
+            ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+            ToolResultEvent(
+                tool_use_id="tool-1",
+                tool_name="lookup",
+                result="ok",
+            ),
+            TextDeltaEvent(text="Visible body."),
+            DoneEvent(
+                text="NO_REPLYVisible body.",
+                text_snapshot="NO_REPLYVisible body.",
+            ),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == "Visible body."
+    assert yielded[3].text_snapshot == "Visible body."
+    assert [segment["type"] for segment in inp.state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+    assert inp.state.current_text_parts == ["Visible body."]
+    assert inp.state.final_text_parts == ["Visible body."]
+
+
+@pytest.mark.asyncio
+async def test_system_event_removes_bare_marker_after_tool_without_newline() -> None:
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="Visible body."),
+            ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+            ToolResultEvent(
+                tool_use_id="tool-1",
+                tool_name="lookup",
+                result="ok",
+            ),
+            TextDeltaEvent(text="NO_REPLY"),
+            DoneEvent(
+                text="Visible body.NO_REPLY",
+                text_snapshot="Visible body.NO_REPLY",
+            ),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == "Visible body."
+    assert yielded[3].text_snapshot == "Visible body."
+    assert inp.state.turn_segments[0] == {
+        "type": "text",
+        "text": "Visible body.",
+        "presentation": "intermediate",
+    }
+    assert inp.state.current_text_parts == []
+    assert inp.state.final_text_parts == ["Visible body."]
+
+
+@pytest.mark.asyncio
+async def test_system_event_keeps_bare_marker_on_a_middle_tool_boundary() -> None:
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="Before."),
+            ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+            ToolResultEvent(
+                tool_use_id="tool-1",
+                tool_name="lookup",
+                result="one",
+            ),
+            TextDeltaEvent(text="NO_REPLY"),
+            ToolUseStartEvent(tool_use_id="tool-2", tool_name="lookup"),
+            ToolResultEvent(
+                tool_use_id="tool-2",
+                tool_name="lookup",
+                result="two",
+            ),
+            TextDeltaEvent(text="After."),
+            DoneEvent(
+                text="Before.NO_REPLYAfter.",
+                text_snapshot="Before.NO_REPLYAfter.",
+            ),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+
+    yielded = await _drain(stage, inp)
+
+    text_events = [event.text for event in yielded if isinstance(event, TextDeltaEvent)]
+    assert text_events == ["Before.NO_REPLYAfter."]
+    done = next(event for event in yielded if isinstance(event, DoneEvent))
+    assert done.text_snapshot == "Before.NO_REPLYAfter."
+    assert any(
+        segment.get("type") == "text" and segment.get("text") == "NO_REPLY"
+        for segment in inp.state.turn_segments
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_background_process_does_not_emit_stale_notice(returncode: int) -> None:
+    state = _make_state()
+    state.turn_segments.extend([
+        {
+            "type": "tool_result",
+            "name": "background_process",
+            "result": "session_id=process-a\ncommand: synthetic-job\nstatus: running",
+            "execution_status": {"status": "unknown", "reason": "background_running"},
+        },
+        {
+            "type": "tool_result",
+            "name": "process",
+            "result": json.dumps({
+                "status": "ok",
+                "action": "wait",
+                "exited": True,
+                "session": {"session_id": "process-a", "returncode": returncode},
+            }),
+            "execution_status": {"status": "success" if returncode == 0 else "error"},
+        },
+    ])
+    final_text = "Process completed." if returncode == 0 else "Process exited unsuccessfully."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(events=[DoneEvent(text=final_text, text_snapshot=final_text)])
+    )
+
+    yielded = await _drain(stage, _make_input(state=state))
+
+    assert all("could not confirm" not in getattr(event, "text", "") for event in yielded)
+    assert isinstance(yielded[-1], DoneEvent)
+    assert yielded[-1].text == final_text
+    assert yielded[-1].text_snapshot == final_text
+
+
+@pytest.mark.asyncio
+async def test_system_event_runtime_notice_overrides_suppressed_model_delivery() -> None:
+    state = _make_state()
+    state.turn_segments.append(
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "name": "background_process",
+            "result": "status: running",
+            "execution_status": {
+                "status": "unknown",
+                "reason": "background_running",
+            },
+        }
+    )
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REPLY"),
+                DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY"),
+            ]
+        )
+    )
+
+    yielded = await _drain(
+        stage,
+        _make_input(
+            state=state,
+            run_kind="goal",
+            input_mode="system_event",
+        ),
+    )
+
+    assert [type(event).__name__ for event in yielded] == [
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    notice = yielded[0].text
+    assert "could not confirm" in notice
+    done = yielded[1]
+    assert isinstance(done, DoneEvent)
+    assert done.text == notice
+    assert done.text_snapshot == notice
+    assert done.delivery == "visible"
+    assert done.suppression_reason is None
+
+
+@pytest.mark.asyncio
+async def test_system_event_retry_releases_only_authoritative_done_snapshot() -> None:
+    final_body = "Canonical successful status."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REPLY\nDiscarded retry status."),
+                TextDeltaEvent(text=final_body),
+                DoneEvent(text=final_body, text_snapshot=final_body),
+            ]
+        )
+    )
+
+    yielded = await _drain(
+        stage,
+        _make_input(run_kind="goal", input_mode="system_event"),
+    )
+
+    assert [type(event).__name__ for event in yielded] == [
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[0].text == final_body
+    assert yielded[1].text_snapshot == final_body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_marker", ["NO", "NO_REP", "HEARTBEAT_O"])
+async def test_system_event_error_does_not_release_partial_sentinel(
+    partial_marker: str,
+) -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text=partial_marker),
+                ErrorEvent(message="provider failed", code="provider_error"),
+            ]
+        )
+    )
+
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+    yielded = await _drain(stage, inp)
+
+    assert yielded == []
+    assert inp.state.final_text_parts == []
+    assert inp.state.current_text_parts == []
+    assert all(segment.get("type") != "text" for segment in inp.state.turn_segments)
+
+
+@pytest.mark.asyncio
+async def test_partial_sentinel_error_then_complete_usage_done_stays_suppressed() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REP"),
+                ErrorEvent(message="provider failed", code="provider_error"),
+                DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY"),
+            ]
+        )
+    )
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == ["DoneEvent"]
+    done = yielded[0]
+    assert isinstance(done, DoneEvent)
+    assert done.text == ""
+    assert done.text_snapshot == ""
+    assert done.delivery == "suppressed"
+    assert done.suppression_reason == "no_reply"
+    assert inp.state.final_text_parts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_text", ["NO_REPLY", ""])
+async def test_complete_sentinel_error_then_usage_done_stays_suppressed(
+    terminal_text: str,
+) -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REPLY"),
+                ErrorEvent(message="provider failed", code="provider_error"),
+                DoneEvent(text=terminal_text, text_snapshot=terminal_text),
+            ]
+        )
+    )
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == ["DoneEvent"]
+    done = yielded[0]
+    assert isinstance(done, DoneEvent)
+    assert done.text == ""
+    assert done.text_snapshot == ""
+    assert done.delivery == "suppressed"
+    assert done.suppression_reason == "no_reply"
+    assert inp.state.final_text_parts == []
+
+
+@pytest.mark.asyncio
+async def test_system_event_error_releases_normal_partial_text_once() -> None:
+    body = "A useful partial status."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text=body),
+                ErrorEvent(message="provider failed", code="provider_error"),
+            ]
+        )
+    )
+
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == ["TextDeltaEvent"]
+    assert yielded[0].text == body
+    assert inp.state.final_text_parts == [body]
+
+
+@pytest.mark.asyncio
+async def test_system_event_usage_done_does_not_release_error_body_twice() -> None:
+    body = "A useful partial status."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text=body),
+                ErrorEvent(message="provider failed", code="provider_error"),
+                DoneEvent(text=body, text_snapshot=body),
+            ]
+        )
+    )
+
+    yielded = await _drain(
+        stage,
+        _make_input(run_kind="goal", input_mode="system_event"),
+    )
+
+    assert [type(event).__name__ for event in yielded] == [
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[0].text == body
+    assert yielded[1].text_snapshot == body
+
+
+@pytest.mark.asyncio
+async def test_tool_boundary_marker_error_then_usage_done_releases_body_once() -> None:
+    body = "A useful partial status."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REPLY"),
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+                ToolResultEvent(
+                    tool_use_id="tool-1",
+                    tool_name="lookup",
+                    result="ok",
+                ),
+                TextDeltaEvent(text=body),
+                ErrorEvent(message="provider failed", code="provider_error"),
+                DoneEvent(
+                    text=f"NO_REPLY{body}",
+                    text_snapshot=f"NO_REPLY{body}",
+                ),
+            ]
+        )
+    )
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == body
+    assert yielded[3].text_snapshot == body
+    assert inp.state.final_text_parts == [body]
+    assert "NO_REPLY" not in str(inp.state.turn_segments)
+
+
+@pytest.mark.asyncio
+async def test_error_release_does_not_mask_conflicting_authoritative_done() -> None:
+    partial = "A useful partial status."
+    corrected = "Authoritative corrected status."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REPLY"),
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+                ToolResultEvent(
+                    tool_use_id="tool-1",
+                    tool_name="lookup",
+                    result="ok",
+                ),
+                TextDeltaEvent(text=partial),
+                ErrorEvent(message="provider failed", code="provider_error"),
+                DoneEvent(text=corrected, text_snapshot=corrected),
+            ]
+        )
+    )
+    inp = _make_input(run_kind="goal", input_mode="system_event")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == partial
+    assert yielded[3].text_snapshot == corrected
+    assert inp.state.final_text_parts == [corrected]
 
 
 @pytest.mark.asyncio
@@ -1434,6 +2794,40 @@ def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
 
 
 @pytest.mark.asyncio
+async def test_auto_published_artifact_is_adopted_before_public_yield(
+    tmp_path: Path,
+) -> None:
+    order: list[tuple[str, str]] = []
+
+    async def adopt(event: ArtifactEvent) -> None:
+        order.append(("adopt", event.id))
+
+    ctx, _media_root = _make_publish_tool_context(tmp_path)
+    ctx.generated_artifact_adopter = adopt
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="Wrote report.csv"),
+                DoneEvent(text="Wrote report.csv"),
+            ]
+        )
+    )
+
+    yielded: list[Any] = []
+    async for event in stage.run(_make_input(tool_context=ctx)):
+        if isinstance(event, ArtifactEvent):
+            order.append(("yield", event.id))
+        yielded.append(event)
+    artifact_events = [event for event in yielded if isinstance(event, ArtifactEvent)]
+
+    assert len(artifact_events) == 1
+    assert order == [
+        ("adopt", artifact_events[0].id),
+        ("yield", artifact_events[0].id),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
         "run_status",
@@ -1528,18 +2922,16 @@ async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
 
 def _gate_real_publish(
     stage: StreamConsumerStage,
-) -> tuple[threading.Event, threading.Event, threading.Event, list[threading.Thread]]:
+) -> tuple[threading.Event, threading.Event, threading.Event]:
     """Wrap the bound ``run_publish`` with an Event handshake: signal entry,
     block until released, then run the REAL publish (real ArtifactStore
     writes) and signal completion."""
     publish_started = threading.Event()
     release_publish = threading.Event()
     publish_finished = threading.Event()
-    worker_threads: list[threading.Thread] = []
     real_publish = stage._done_handler.run_publish
 
     def gated_publish(inner_inp: Any, accumulated_text: str) -> Any:
-        worker_threads.append(threading.current_thread())
         publish_started.set()
         assert release_publish.wait(timeout=5.0), "publish was never released"
         result = real_publish(inner_inp, accumulated_text)
@@ -1547,7 +2939,7 @@ def _gate_real_publish(
         return result
 
     stage._done_handler.run_publish = gated_publish  # type: ignore[method-assign]
-    return publish_started, release_publish, publish_finished, worker_threads
+    return publish_started, release_publish, publish_finished
 
 
 @pytest.mark.asyncio
@@ -1569,7 +2961,7 @@ async def test_single_cancel_records_completed_publish(tmp_path: Path) -> None:
         ]
     )
     stage, _ = _make_stage(agent_run=agent_run)
-    publish_started, release_publish, publish_finished, _ = _gate_real_publish(stage)
+    publish_started, release_publish, publish_finished = _gate_real_publish(stage)
     state = _make_state()
     inp = _make_input(state=state, tool_context=ctx)
 
@@ -1610,9 +3002,7 @@ async def test_double_cancel_waits_for_worker_before_unwind(tmp_path: Path) -> N
         ]
     )
     stage, _ = _make_stage(agent_run=agent_run)
-    publish_started, release_publish, publish_finished, worker_threads = (
-        _gate_real_publish(stage)
-    )
+    publish_started, release_publish, publish_finished = _gate_real_publish(stage)
     state = _make_state()
     inp = _make_input(state=state, tool_context=ctx)
 
@@ -1644,8 +3034,10 @@ async def test_double_cancel_waits_for_worker_before_unwind(tmp_path: Path) -> N
     # ctx.published_artifacts append happened strictly before the unwind.
     published_snapshot = list(ctx.published_artifacts)
     files_snapshot = sorted(str(p) for p in media_root.rglob("*") if p.is_file())
-    for thread in worker_threads:
-        await asyncio.to_thread(thread.join, 5.0)
+    # ``publish_task`` cannot complete until the worker callable returns. The
+    # callable runs on asyncio's long-lived default executor, so joining that
+    # worker here would either wait for executor shutdown or schedule a
+    # self-join on the same executor thread.
     for _ in range(10):
         await asyncio.sleep(0)
     assert list(ctx.published_artifacts) == published_snapshot
@@ -1681,7 +3073,7 @@ async def test_outer_stage_persists_literal_text_before_native_tool_segment() ->
     await _drain(stage, _make_input(state=state))
 
     assert state.turn_segments[:2] == [
-        {"type": "text", "text": literal},
+        {"type": "text", "text": literal, "presentation": "intermediate"},
         {
             "type": "tool_use",
             "tool_use_id": "native-1",

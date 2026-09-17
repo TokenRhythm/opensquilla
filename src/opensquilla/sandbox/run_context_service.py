@@ -349,13 +349,9 @@ async def auto_add_trusted_domain_grant(
     )
     if grant in existing.domains:
         return existing
-    trusted_context = replace(existing, run_mode=RunMode.TRUSTED)
+    trusted_context = replace(existing, run_mode=RunMode.SAFE)
     decision = decide_network_access(normalized_host, trusted_context)
-    if (
-        decision.status != "allow"
-        or decision.reason != "auto_trusted"
-        or decision.source != "auto_trusted:chat"
-    ):
+    if decision.status != "allow":
         raise ValueError(decision.reason)
     domains = tuple(
         existing_domain

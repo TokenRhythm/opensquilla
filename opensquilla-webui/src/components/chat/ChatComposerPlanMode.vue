@@ -63,16 +63,16 @@ const { t } = useI18n()
   gap: 6px;
   margin-left: auto;
   padding: 2px 3px 2px 9px;
-  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border));
+  border: 1px solid var(--border);
   border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  background: transparent;
   color: var(--text-muted);
 }
 
 .composer-plan-mode__icon {
   display: inline-flex;
   flex: none;
-  color: var(--accent);
+  color: var(--text-muted);
 }
 
 .composer-plan-mode__label {
@@ -86,7 +86,7 @@ const { t } = useI18n()
   flex: none;
   min-width: 0;
   overflow: hidden;
-  color: var(--accent);
+  color: var(--text-dim);
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;

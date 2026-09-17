@@ -1,0 +1,97 @@
+{
+  "format_version": 1,
+  "kind": "response",
+  "cases": [
+    {
+      "id": "response.empty",
+      "coverage": "empty-search-result",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "search-empty",
+        "ok": true,
+        "payload": {
+          "sessions": [],
+          "messages": [],
+          "query": "missing",
+          "ts": 1700000000000
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "response.title-and-transcript-hits",
+      "coverage": "title-and-transcript-hits",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "search-hits",
+        "ok": true,
+        "payload": {
+          "sessions": [
+            {
+              "key": "agent:main:s1",
+              "title": "Deploy planning",
+              "effectiveAgentId": "main",
+              "surface": "webchat",
+              "updatedAt": 1699999999000,
+              "origin": {
+                "kind": "webchat"
+              }
+            }
+          ],
+          "messages": [
+            {
+              "key": "agent:main:s2",
+              "title": "Grocery list",
+              "role": "user",
+              "snippet": "buy >>>milk<<< today",
+              "createdAt": 1700000000000,
+              "future_field": "preserved"
+            }
+          ],
+          "query": "milk",
+          "ts": 1700000000001,
+          "delivery_context": {
+            "source": "search-index"
+          }
+        },
+        "error": null
+      },
+      "compatibility_note": "Unknown additive fields are part of the v4 extension surface and must survive adapter validation."
+    },
+    {
+      "id": "response.nullable-and-string-time",
+      "coverage": "nullable-and-legacy-timestamp",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "search-legacy",
+        "ok": true,
+        "payload": {
+          "sessions": [
+            {
+              "key": "agent:main:legacy",
+              "title": "Legacy",
+              "effectiveAgentId": null,
+              "surface": null,
+              "updatedAt": null
+            }
+          ],
+          "messages": [
+            {
+              "key": "agent:main:legacy",
+              "title": "Legacy",
+              "role": null,
+              "snippet": "legacy result",
+              "createdAt": "1700000000000"
+            }
+          ],
+          "query": "legacy",
+          "ts": 1700000000002
+        },
+        "error": null
+      }
+    }
+  ]
+}

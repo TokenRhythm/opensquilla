@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import io
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -28,6 +32,7 @@ from opensquilla.gateway.app import create_gateway_app
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 from opensquilla.gateway.uploads import (
     AttachmentNotFoundError,
     UploadStore,
@@ -35,20 +40,24 @@ from opensquilla.gateway.uploads import (
 )
 from opensquilla.gateway.websocket import SubscriptionManager, get_registry
 from opensquilla.provider import ChatConfig, DoneEvent, Message, ModelCapabilities
-from opensquilla.provider.types import ContentBlockImage, ModelInfo, TextDeltaEvent
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockText,
+    ModelInfo,
+    TextDeltaEvent,
+)
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
+from opensquilla.token_estimation import estimate_tokens
+from opensquilla.tools.types import ToolContext
+from tests.helpers.image_bytes import image_bytes
 
-_PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-    b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4"
-    b"\x89\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00\x01\x01"
-    b"\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+_PNG_BYTES = image_bytes()
 
-_TEXT_MODEL = "test/text"
-_GATE_MODEL = "test/gate"
-_VISION_MODEL = "test/vision"
+_PROVIDER_ID = "tokenrhythm"
+_TEXT_MODEL = "deepseek-v4-pro-0813"
+_GATE_MODEL = "deepseek-v4-flash-0731"
+_VISION_MODEL = "kimi-k2.6"
 _TURN_TERMINAL_EVENT_TIMEOUT_SECONDS = 30.0
 _TURN_TASK_DRAIN_TIMEOUT_SECONDS = 10.0
 
@@ -75,7 +84,7 @@ class _RecordingProvider:
 
 
 class _RecordingSelector:
-    active_provider_id = "openrouter"
+    active_provider_id = _PROVIDER_ID
 
     def __init__(
         self,
@@ -88,6 +97,13 @@ class _RecordingSelector:
     def clone(self) -> _RecordingSelector:
         return _RecordingSelector(self.providers, self.model)
 
+    @property
+    def current_config(self) -> SimpleNamespace:
+        return SimpleNamespace(provider=_PROVIDER_ID, model=self.model)
+
+    def remaining_chain(self) -> list[SimpleNamespace]:
+        return [self.current_config]
+
     def override_model(self, model: str) -> None:
         self.model = model
 
@@ -95,6 +111,8 @@ class _RecordingSelector:
         self,
         model: str,
         fallback_chain: list[object],  # noqa: ARG002
+        *,
+        preserve_existing_tail: bool = True,  # noqa: ARG002
     ) -> None:
         self.override_model(model)
 
@@ -111,25 +129,39 @@ class _FakeModelCatalog:
         model_id: str,  # noqa: ARG002
         *,
         user_override: int = 0,
-        provider: str = "openrouter",  # noqa: ARG002
+        provider: str = _PROVIDER_ID,  # noqa: ARG002
     ) -> int:
         return user_override if user_override > 0 else 1024
 
     def resolve_context_window(
         self,
-        model_id: str,  # noqa: ARG002
+        model_id: str,
         *,
-        provider: str = "openrouter",  # noqa: ARG002
+        provider: str = _PROVIDER_ID,  # noqa: ARG002
     ) -> int:
-        return 8192
+        # Mirror the live TokenRhythm shape: the stable text/base consumer has
+        # a much larger durable-history window than the one-turn image route.
+        return 1_000_000 if model_id == _TEXT_MODEL else 128_000
 
     def get_capabilities(
         self,
         model_id: str,
-        provider_name: str = "openrouter",  # noqa: ARG002
+        provider_name: str = _PROVIDER_ID,  # noqa: ARG002
         base_url: str = "",  # noqa: ARG002
     ) -> ModelCapabilities:
         return ModelCapabilities(supports_vision=model_id == _VISION_MODEL)
+
+    def resolve_vision_support(
+        self,
+        model_id: str,
+        *,
+        provider_name: str = _PROVIDER_ID,  # noqa: ARG002
+        base_url: str = "",  # noqa: ARG002
+    ) -> str:
+        return "supported" if model_id == _VISION_MODEL else "unsupported"
+
+    def resolve_deployment_vision_support(self, model_id: str, **_kwargs: Any) -> str:
+        return "supported" if model_id == _VISION_MODEL else "unsupported"
 
 
 class _EventSink:
@@ -146,6 +178,22 @@ class _EventSink:
         meta: dict[str, Any] | None = None,  # noqa: ARG002
     ) -> None:
         self.events.append((event, dict(payload or {})))
+
+
+class _UsageSink:
+    def __init__(self) -> None:
+        self.started: list[Any] = []
+        self.finalized: list[tuple[Any, Any]] = []
+        self.unknown: list[tuple[Any, str]] = []
+
+    async def start(self, call: Any) -> None:
+        self.started.append(call)
+
+    async def finalize(self, call: Any, result: Any) -> None:
+        self.finalized.append((call, result))
+
+    async def mark_unknown(self, call: Any, reason: str) -> None:
+        self.unknown.append((call, reason))
 
 
 class _TextTierStrategy:
@@ -183,29 +231,31 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
     config.squilla_router.vision_followup_gate_tier = "c0"
     config.squilla_router.tiers = {
         "c0": {
-            "provider": "openrouter",
+            "provider": _PROVIDER_ID,
             "model": _GATE_MODEL,
             "supports_image": False,
         },
         "c1": {
-            "provider": "openrouter",
+            "provider": _PROVIDER_ID,
             "model": _TEXT_MODEL,
             "supports_image": False,
         },
-        "image_model": {
-            "provider": "openrouter",
+        "c2": {
+            "provider": _PROVIDER_ID,
             "model": _VISION_MODEL,
             "supports_image": True,
-            "image_only": True,
         },
     }
     config.squilla_router.default_tier = "c1"
-    config.llm.provider = "openrouter"
+    config.llm.provider = _PROVIDER_ID
     config.llm.model = _TEXT_MODEL
+    # Synthetic model ids are absent from the production catalog; the fake
+    # catalog above declares their per-deployment windows explicitly.
+    config.llm.context_window_tokens = 0
     return config
 
 
-async def _upload_png(app: Any) -> str:
+async def _upload_png(app: Any, payload: bytes = _PNG_BYTES) -> str:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
         transport=transport,
@@ -213,7 +263,7 @@ async def _upload_png(app: Any) -> str:
     ) as client:
         response = await client.post(
             "/api/v1/files/upload",
-            files={"file": ("first.png", _PNG_BYTES, "image/png")},
+            files={"file": ("first.png", payload, "image/png")},
         )
     assert response.status_code == 200, response.text
     payload = response.json()
@@ -229,6 +279,7 @@ async def _send_session_turn(
     sink: _EventSink,
     message: str,
     attachments: list[dict[str, Any]] | None = None,
+    expected_error_code: str | None = None,
 ) -> None:
     done_before = sum(1 for event, _payload in sink.events if event == "session.event.done")
     event_count_before = len(sink.events)
@@ -266,6 +317,16 @@ async def _send_session_turn(
             if event == "session.event.error"
         ]
         if new_errors:
+            if (
+                expected_error_code
+                and new_errors[-1].get("code") == expected_error_code
+            ):
+                if task is not None:
+                    await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=_TURN_TASK_DRAIN_TIMEOUT_SECONDS,
+                    )
+                return
             raise AssertionError(f"turn emitted error events: {sink.events!r}")
         if task is not None and task.done():
             if task.cancelled():
@@ -300,9 +361,43 @@ def _file_uuid_attachment(file_uuid: str) -> dict[str, str]:
     return {"file_uuid": file_uuid, "mime": "image/png", "name": "first.png"}
 
 
+def _deterministic_png_payload(*, seed: str, size: int = 80_000) -> bytes:
+    """Return stable high-entropy PNG-like bytes for capacity regression fixtures."""
+
+    payload = bytearray(_PNG_BYTES)
+    counter = 0
+    while len(payload) < size:
+        payload.extend(hashlib.sha256(f"{seed}:{counter}".encode()).digest())
+        counter += 1
+    return bytes(payload[:size])
+
+
+def _inline_image_envelope(text: str, *payloads: bytes) -> str:
+    return json.dumps(
+        {
+            "text": text,
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "name": f"legacy-{index}.png",
+                    "size": len(payload),
+                    "data": base64.b64encode(payload).decode("ascii"),
+                }
+                for index, payload in enumerate(payloads, start=1)
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 @pytest.fixture
 async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.ModelCatalog.resolve_deployment_vision_support",
+        _FakeModelCatalog.resolve_deployment_vision_support,
+    )
     config = _configure_gateway(tmp_path)
     store = UploadStore(marker_dir=tmp_path / "upload-markers")
     set_upload_store(store)
@@ -325,11 +420,13 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             _VISION_MODEL: vision_provider,
         }
     )
+    usage_sink = _UsageSink()
     runner = TurnRunner(
         provider_selector=selector,
         session_manager=manager,
         config=config,
         model_catalog=_FakeModelCatalog(),
+        usage_event_sink=usage_sink,
     )
     bootstrap_configs: list[AgentConfig] = []
     original_bootstrap_run = runner._agent_bootstrap_stage.run
@@ -374,11 +471,13 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "gate_provider": gate_provider,
             "manager": manager,
             "runner": runner,
+            "selector": selector,
             "sink": sink,
             "storage": storage,
             "store": store,
             "subscription_manager": subscription_manager,
             "text_provider": text_provider,
+            "usage_sink": usage_sink,
             "vision_provider": vision_provider,
         }
     finally:
@@ -388,7 +487,408 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_gateway_upload_history_image_replays_through_squilla_router_gate_history(
+async def test_gateway_single_text_model_projects_marker_and_continues(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    manager: SessionManager = _e2e_stack["manager"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    usage_sink: _UsageSink = _e2e_stack["usage_sink"]
+    config.squilla_router.enabled = False
+    key = "agent:main:single-text-model-image"
+    session = await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+    for index in range(6):
+        await manager.append_message(key, "user", f"history-{index}:" + "u" * 5_000)
+        await manager.append_message(key, "assistant", "a" * 5_000)
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    gate_calls_before = len(gate_provider.calls)
+    text_calls_before = len(text_provider.calls)
+    vision_calls_before = len(vision_provider.calls)
+    usage_started_before = len(usage_sink.started)
+    usage_finalized_before = len(usage_sink.finalized)
+    usage_unknown_before = len(usage_sink.unknown)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="请分析这张图片。",
+        attachments=[_file_uuid_attachment(file_uuid)],
+    )
+
+    assert len(gate_provider.calls) == gate_calls_before
+    assert len(text_provider.calls) == text_calls_before + 1
+    assert len(vision_provider.calls) == vision_calls_before
+    assert len(usage_sink.started) == usage_started_before + 1
+    assert len(usage_sink.finalized) == usage_finalized_before + 1
+    assert len(usage_sink.unknown) == usage_unknown_before
+    sent_messages = text_provider.calls[-1]["messages"]
+    assert not any(_message_has_image(item) for item in sent_messages)
+    assert "图片未分析" in str(sent_messages)
+    assert _event_payloads(sink, "session.event.text_delta")[-1]["text"] == "text ok"
+    assert _event_payloads(sink, "session.event.error") == []
+    assert _event_payloads(sink, "session.event.done")
+    transcript = await manager.get_transcript(key)
+    assert transcript[-1].role == "assistant"
+    assert transcript[-1].content == "text ok"
+    canonical = await manager.get_canonical_transcript(key)
+    image_envelope = next(
+        json.loads(str(entry.content))
+        for entry in canonical
+        if '"attachments"' in str(entry.content or "")
+    )
+    sha = image_envelope["attachments"][0]["sha256_ref"]
+    material_path = transcript_material_path(
+        Path(config.attachments.media_root or ""),
+        session.session_id,
+        sha,
+    )
+    assert material_path.read_bytes() == _PNG_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_transcripts", [True, False])
+async def test_runner_image_marker_matches_persisted_attachment_retention(
+    _e2e_stack: dict[str, Any],
+    persist_transcripts: bool,
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    config.squilla_router.enabled = False
+    config.attachments.persist_transcripts = persist_transcripts
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    selector: _RecordingSelector = _e2e_stack["selector"]
+    key = "agent:main:image-retention"
+    session = await manager.create(session_key=key, agent_id="main")
+    attachment = {
+        "type": "image/png", "name": "sample.png", "_was_staged": True,
+        "data": base64.b64encode(_PNG_BYTES).decode("ascii"),
+    }
+    envelope, writes = build_transcript_attachment_envelope(
+        text="Inspect this image.", attachments=[attachment],
+        session_id=session.session_id,
+        media_root=Path(config.attachments.media_root or ""),
+        persist_enabled=persist_transcripts,
+    )
+    saved_image = json.loads(envelope)["attachments"][0]
+    if not persist_transcripts:
+        assert saved_image["missing_reason"] == "attachment persistence disabled"
+        assert not {"attachment_id", "sha256_ref", "data"}.intersection(saved_image)
+        assert writes == []
+    current = await manager.append_message(key, "user", envelope)
+    context = ToolContext(is_owner=True, workspace_dir=config.workspace_dir)
+
+    async for _ in runner.run(
+        "Inspect this image.", session_key=key, tool_context=context,
+        attachments=[attachment], bound_user_message_id=current.message_id,
+    ):
+        pass
+
+    sent_messages = text_provider.calls[-1]["messages"]
+    assert not any(_message_has_image(message) for message in sent_messages)
+    assert ("原图已保留" in str(sent_messages)) is persist_transcripts
+    if not persist_transcripts:
+        assert "原图未持久化" in str(sent_messages)
+        assert "重新上传" in str(sent_messages)
+    selector.model = _VISION_MODEL
+    config.llm.model = _VISION_MODEL
+    followup = await manager.append_message(key, "user", "Analyze the previous image again.")
+    async for _ in runner.run(
+        followup.content, session_key=key, tool_context=context,
+        bound_user_message_id=followup.message_id,
+    ):
+        pass
+
+    followup_messages = vision_provider.calls[-1]["messages"]
+    assert any(_message_has_image(message) for message in followup_messages) is persist_transcripts
+    if not persist_transcripts:
+        assert "历史图片不可用" in str(followup_messages)
+        assert "重新上传" in str(followup_messages)
+        assert "原图已保留" not in str(followup_messages)
+
+
+@pytest.mark.asyncio
+async def test_gateway_unpersisted_upload_is_tool_readable_only_during_turn(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    from PIL import Image
+
+    from opensquilla.provider.types import ToolUseEndEvent, ToolUseStartEvent
+    from opensquilla.tools.builtin import media
+    from opensquilla.tools.registry import ToolRegistry, get_default_registry
+    from opensquilla.tools.types import current_tool_context
+
+    config = _e2e_stack["config"]
+    config.squilla_router.enabled = False
+    config.attachments.persist_transcripts = False
+    runner = _e2e_stack["runner"]
+    registry = ToolRegistry()
+    registered = get_default_registry().get("image")
+    assert registered is not None
+    tool_results = []
+    paths: list[Path] = []
+
+    async def inspect_image(**arguments):
+        context = current_tool_context.get()
+        path = Path(arguments["path"])
+        assert context is not None and context.scratch_dir
+        assert path.is_relative_to(Path(context.scratch_dir))
+        assert path.is_file()
+        result = await media.image(**arguments)
+        tool_results.append(json.loads(result))
+        return result
+
+    registry.register(registered.spec, inspect_image)
+    runner._tool_registry = registry
+    provider = _e2e_stack["text_provider"]
+
+    async def chat(messages, tools=None, config=None):
+        provider.calls.append({"messages": messages, "tools": tools, "config": config})
+        if len(provider.calls) == 1:
+            assert any(tool.name == "image" for tool in tools)
+            markers = [
+                block.text for message in messages if isinstance(message.content, list)
+                for block in message.content if isinstance(block, ContentBlockText)
+                and "[attachment available:" in block.text
+            ]
+            match = re.search(r" at ([^\]]+)\]", "\n".join(markers))
+            assert match is not None
+            path = Path(match.group(1))
+            paths.append(path)
+            assert path.read_bytes() == payload
+            yield ToolUseStartEvent(tool_use_id="inspect", tool_name="image")
+            yield ToolUseEndEvent(tool_use_id="inspect", tool_name="image", arguments={
+                "path": str(path), "prompt": "Inspect the uploaded image",
+            })
+            yield DoneEvent(stop_reason="tool_use")
+        else:
+            assert paths[0].is_file()
+            yield TextDeltaEvent(text="Image is not analyzed")
+            yield DoneEvent(stop_reason="end_turn")
+
+    provider.chat = chat
+    manager = _e2e_stack["manager"]
+    key = "agent:main:temporary-upload"
+    session = await manager.create(session_key=key, agent_id="main")
+    sink = _e2e_stack["sink"]
+    _e2e_stack["subscription_manager"].subscribe_messages(sink.conn_id, key)
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), "blue").save(buffer, format="PNG")
+    payload = buffer.getvalue()
+    file_uuid = await _e2e_stack["store"].put(name="first.png", mime="image/png", payload=payload)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"], key=key, sink=sink,
+        message="Inspect this upload", attachments=[_file_uuid_attachment(file_uuid)],
+    )
+    assert tool_results and tool_results[0]["status"] == "loaded"
+    assert paths and all(not path.exists() for path in paths)
+    assert not list(Path(config.workspace_dir).rglob("*.png"))
+    assert not (Path(config.attachments.media_root) / "transcripts" / session.session_id).exists()
+    transcript = await manager.get_canonical_transcript(key)
+    saved = next(json.loads(entry.content) for entry in transcript
+                 if '"attachments"' in str(entry.content or ""))
+    assert saved["attachments"][0]["missing_reason"] == "attachment persistence disabled"
+    assert not {"attachment_id", "data", "sha256_ref", "ref"}.intersection(
+        saved["attachments"][0]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["provider_error", "bootstrap_error", "cancel"])
+async def test_unpersisted_image_cleanup_before_agent_creation(
+    _e2e_stack: dict[str, Any], terminal: str,
+) -> None:
+    config = _e2e_stack["config"]
+    config.squilla_router.enabled = False
+    config.attachments.persist_transcripts = False
+    runner = _e2e_stack["runner"]
+    paths = []
+    await _e2e_stack["manager"].create(
+        session_key="agent:main:temporary-early-exit", agent_id="main",
+    )
+    reached = asyncio.Event()
+    stage = (
+        runner._provider_and_tools_stage if terminal == "provider_error"
+        else runner._prompt_assembler_stage
+    )
+
+    async def fail(inp):
+        context = getattr(inp, "effective_tool_context", None) or inp.tool_context
+        paths.append(Path(context.scratch_dir))
+        assert paths[-1].exists()
+        if terminal != "provider_error":
+            assert list(paths[-1].rglob("*.png"))
+        reached.set()
+        if terminal == "cancel":
+            await asyncio.Event().wait()
+        raise ValueError("test stage failure")
+
+    stage.run = fail
+
+    async def run():
+        return [event async for event in runner.run(
+            "Inspect image", session_key="agent:main:temporary-early-exit",
+            tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
+            attachments=[{
+                "type": "image/png", "name": "sample.png",
+                "data": base64.b64encode(_PNG_BYTES).decode("ascii"),
+            }],
+        )]
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(reached.wait(), 2.0)
+    if terminal == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+    assert paths and all(not path.exists() for path in paths)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_images", [True, False])
+async def test_attachment_worker_uses_accepted_turn_persistence_policy(
+    _e2e_stack: dict[str, Any], persist_images: bool,
+) -> None:
+    from opensquilla.engine.runtime import accepted_turn_config_scope
+
+    config = _e2e_stack["config"]
+    config.squilla_router.enabled = False
+    config.attachments.persist_transcripts = not persist_images
+    accepted = config.model_copy(deep=True)
+    accepted.attachments.persist_transcripts = persist_images
+    runner = _e2e_stack["runner"]
+    key = "agent:main:accepted-image-policy"
+    await _e2e_stack["manager"].create(session_key=key, agent_id="main")
+    paths = []
+    original = runner._prompt_assembler_stage.run
+
+    async def observe(inp):
+        if persist_images:
+            assert inp.effective_tool_context.scratch_dir is None
+        else:
+            root = Path(inp.effective_tool_context.scratch_dir)
+            paths.extend(root.rglob("*.png"))
+            assert paths
+        return await original(inp)
+
+    runner._prompt_assembler_stage.run = observe
+    with accepted_turn_config_scope(accepted):
+        events = [event async for event in runner.run(
+            "Inspect image", session_key=key,
+            tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
+            attachments=[{
+                "type": "image/png", "name": "sample.png",
+                "data": base64.b64encode(_PNG_BYTES).decode("ascii"),
+            }],
+        )]
+    assert not [event for event in events if type(event).__name__ == "ErrorEvent"]
+    assert bool(list(Path(config.workspace_dir).rglob("*.png"))) is persist_images
+    assert all(not path.exists() for path in paths)
+
+
+@pytest.mark.asyncio
+async def test_gateway_direct_model_switch_replays_canonical_history_image(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    manager: SessionManager = _e2e_stack["manager"]
+    selector: _RecordingSelector = _e2e_stack["selector"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    config.squilla_router.enabled = False
+    key = "agent:main:direct-text-to-vision-switch"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="先保存这张图片。",
+        attachments=[_file_uuid_attachment(file_uuid)],
+    )
+    assert "图片未分析" in str(text_provider.calls[-1]["messages"])
+
+    selector.model = _VISION_MODEL
+    config.llm.model = _VISION_MODEL
+    vision_calls_before = len(vision_provider.calls)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="请重新分析上一张图片。",
+    )
+
+    assert len(vision_provider.calls) == vision_calls_before + 1
+    sent_messages = vision_provider.calls[-1]["messages"]
+    historical_images = [
+        block
+        for message in sent_messages[:-1]
+        for block in _message_image_blocks(message)
+    ]
+    assert len(historical_images) == 1
+    assert base64.b64decode(historical_images[0].data, validate=True) == _PNG_BYTES
+    assert _event_payloads(sink, "session.event.error") == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_current_upload_keeps_recent_images_for_primary_model_selection(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    manager: SessionManager = _e2e_stack["manager"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    key = "agent:main:current-and-recent-image"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+
+    first_uuid = await _upload_png(_e2e_stack["app"])
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Describe the first image.",
+        attachments=[_file_uuid_attachment(first_uuid)],
+    )
+
+    second_payload = image_bytes(color="red")
+    second_uuid = await _upload_png(_e2e_stack["app"], second_payload)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Describe only this new image.",
+        attachments=[_file_uuid_attachment(second_uuid)],
+    )
+
+    sent_messages = vision_provider.calls[-1]["messages"]
+    image_blocks = [
+        block
+        for message in sent_messages
+        for block in _message_image_blocks(message)
+    ]
+    assert [base64.b64decode(block.data, validate=True) for block in image_blocks] == [
+        _PNG_BYTES, second_payload,
+    ]
+    assert "Describe only this new image." in str(sent_messages[-1].content)
+    assert _e2e_stack["gate_provider"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_upload_history_image_routes_without_auxiliary_gate(
     _e2e_stack: dict[str, Any],
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
@@ -419,6 +919,29 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
     with pytest.raises(AttachmentNotFoundError):
         await store.get(file_uuid)
 
+    assert vision_provider.calls
+    first_call_messages = vision_provider.calls[-1]["messages"]
+    current_turn = next(message for message in first_call_messages if _message_has_image(message))
+    assert isinstance(current_turn.content, list)
+    current_turn_markers = [
+        block.text
+        for block in current_turn.content
+        if isinstance(block, ContentBlockText)
+        and block.text.startswith("[attachment available:")
+    ]
+    workspace_images = list(
+        (Path(config.workspace_dir) / ".opensquilla" / "attachments").glob("**/*-first.png")
+    )
+    assert len(workspace_images) == 1
+    assert workspace_images[0].read_bytes() == _PNG_BYTES
+    relative_workspace_image = workspace_images[0].relative_to(config.workspace_dir).as_posix()
+    assert current_turn_markers == [
+        (
+            "[attachment available: first.png (image/png) "
+            f"at {relative_workspace_image}]"
+        )
+    ]
+
     transcript = await manager.get_transcript(key)
     first_user = transcript[0]
     persisted = json.loads(first_user.content)
@@ -447,7 +970,7 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
         message="What color is the small corner?",
     )
 
-    assert len(gate_provider.calls) == 1
+    assert len(gate_provider.calls) == 0
     assert len(vision_provider.calls) == vision_calls_before + 1
     final_call = vision_provider.calls[-1]
     sent_messages = final_call["messages"]
@@ -458,6 +981,17 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
     ]
     assert image_blocks
     assert base64.b64decode(image_blocks[0].data, validate=True) == _PNG_BYTES
+    from opensquilla.provider.openai import _build_openai_messages
+
+    replayed_turn = next(message for message in sent_messages if _message_has_image(message))
+    initial_wire = _build_openai_messages(current_turn)[0]
+    replayed_wire = _build_openai_messages(replayed_turn)[0]
+    # The current date/time hint is intentionally scoped to each request.
+    # The complete preceding caption/image/path sequence must replay unchanged.
+    assert initial_wire["content"][-1]["text"].startswith(
+        "\n\n[Runtime context for this turn]"
+    )
+    assert replayed_wire == {**initial_wire, "content": initial_wire["content"][:-1]}
     assert isinstance(sent_messages[-1].content, str)
     assert sent_messages[-1].content.startswith("What color is the small corner?")
 
@@ -465,18 +999,174 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
     assert router_events[-1]["source"] == "image_route"
     assert router_events[-1]["model"] == _VISION_MODEL
     done_events = _event_payloads(sink, "session.event.done")
-    assert done_events[-1]["image_route_reason"] == "gate_history"
-    assert done_events[-1]["vision_followup_needs_image"] is True
-    assert done_events[-1]["vision_followup_gate_decision"] == "needs_image"
+    assert done_events[-1]["image_route_reason"] == "history_context"
     assert bootstrap_configs[-1].preserve_historical_images is True
-    assert (
-        bootstrap_configs[-1].max_history_turns
-        == config.squilla_router.vision_history_lookback_turns
-    )
+    assert bootstrap_configs[-1].max_history_turns == 0
 
 
 @pytest.mark.asyncio
-async def test_historical_image_material_is_not_replayed_without_vision_support(
+async def test_gateway_current_image_capacity_uses_typed_media_history(
+    _e2e_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy inline images must not create a false Router capacity rejection."""
+
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    bootstrap_configs: list[AgentConfig] = _e2e_stack["bootstrap_configs"]
+    key = "agent:main:attachment-capacity-replay"
+    preflight_calls = 0
+    router_capacity_calls: list[dict[str, Any]] = []
+
+    run_preflight = runner._maybe_preflight_compact
+
+    async def _record_preflight(*args: Any, **kwargs: Any) -> None:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        await run_preflight(*args, **kwargs)
+
+    # Exercise the real preflight boundary. The stable text/base deployment has
+    # a 1M window while the image route has 128k, so this synthetic history is
+    # raw-overflowing for Router admission but naturally below durable
+    # compaction pressure, matching the live TokenRhythm topology.
+    monkeypatch.setattr(runner, "_maybe_preflight_compact", _record_preflight)
+    project_router_capacity = runner._router_history_capacity_for_request
+
+    async def _record_router_capacity(
+        session_key: str,
+        request: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        result = await project_router_capacity(session_key, request, **kwargs)
+        router_capacity_calls.append({**kwargs, "result": dict(result)})
+        return result
+
+    monkeypatch.setattr(
+        runner,
+        "_router_history_capacity_for_request",
+        _record_router_capacity,
+    )
+    session = await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+
+    payloads = [
+        _deterministic_png_payload(seed=f"legacy-{index}") for index in range(4)
+    ]
+    envelopes = [
+        _inline_image_envelope("legacy turn one", payloads[0]),
+        _inline_image_envelope("legacy turn two", payloads[1]),
+        _inline_image_envelope("legacy turn three", payloads[2], payloads[3]),
+    ]
+    assert sum(estimate_tokens(envelope) for envelope in envelopes) > 100_000
+    for index, envelope in enumerate(envelopes, start=1):
+        await manager.append_message(key, "user", envelope)
+        await manager.append_message(key, "assistant", f"legacy answer {index}")
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    event_count_before = len(sink.events)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="Describe only the current image.",
+        attachments=[_file_uuid_attachment(file_uuid)],
+    )
+
+    assert len(text_provider.calls) == 0
+    assert len(gate_provider.calls) == 0
+    assert len(vision_provider.calls) == 1
+    assert not any(
+        event == "session.event.error"
+        for event, _payload in sink.events[event_count_before:]
+    )
+
+    sent_messages = vision_provider.calls[0]["messages"]
+    historical_users = [
+        message
+        for message in sent_messages[:-1]
+        if message.role == "user" and _message_has_image(message)
+    ]
+    # New uploads preserve recent typed images; the primary model receives
+    # the user's instruction about which image to discuss.
+    assert len(historical_users) == 3
+    decoded_images = [
+        base64.b64decode(block.data, validate=True)
+        for message in sent_messages
+        for block in _message_image_blocks(message)
+    ]
+    assert decoded_images == [*payloads, _PNG_BYTES]
+
+    # The provider may receive typed image blocks, but legacy envelope/base64
+    # must never survive as text in the projected history.
+    legacy_data = {
+        base64.b64encode(payload).decode("ascii") for payload in payloads
+    }
+    for message in sent_messages:
+        text_parts: list[str] = []
+        if isinstance(message.content, str):
+            text_parts.append(message.content)
+        elif isinstance(message.content, list):
+            text_parts.extend(
+                block.text
+                for block in message.content
+                if isinstance(block, ContentBlockText)
+            )
+        projected_text = "\n".join(text_parts)
+        assert '"attachments":' not in projected_text
+        assert all(data not in projected_text for data in legacy_data)
+
+    projected_history_parts: list[str] = []
+    replayed_legacy_user_turns = 0
+    for message in sent_messages[:-1]:
+        message_parts: list[str] = []
+        if isinstance(message.content, str):
+            message_parts.append(message.content)
+        elif isinstance(message.content, list):
+            message_parts.extend(
+                block.text
+                for block in message.content
+                if isinstance(block, ContentBlockText)
+            )
+        projected_history_parts.extend(message_parts)
+        if message.role == "user" and "legacy turn" in "\n".join(message_parts):
+            replayed_legacy_user_turns += 1
+    projected_history_text = "\n".join(projected_history_parts)
+    assert replayed_legacy_user_turns == 3
+    assert "legacy turn one" in projected_history_text
+    assert "legacy turn two" in projected_history_text
+    assert "legacy answer 1" in projected_history_text
+    assert "legacy answer 2" in projected_history_text
+    assert "legacy turn three" in projected_history_text
+    assert "legacy answer 3" in projected_history_text
+
+    router_events = _event_payloads(sink, "session.event.router_decision")
+    assert router_events[-1]["source"] == "image_route"
+    assert router_events[-1]["model"] == _VISION_MODEL
+    done_events = _event_payloads(sink, "session.event.done")
+    assert done_events[-1]["image_route_reason"] == "current_turn"
+    assert bootstrap_configs[-1].max_history_turns == 0
+    assert len(router_capacity_calls) == 1
+    assert router_capacity_calls[0]["max_history_turns"] == 0
+    assert router_capacity_calls[0]["preserve_image_attachments"] is True
+    assert router_capacity_calls[0]["reachable_provider_kinds"] == frozenset(
+        {_PROVIDER_ID}
+    )
+    assert router_capacity_calls[0]["result"]["history_capacity_message_count"] == 6
+    assert router_capacity_calls[0]["result"]["history_capacity_estimate_complete"] is True
+    assert preflight_calls == 1
+    persisted = await manager.get_session(key)
+    assert persisted is not None
+    assert persisted.session_id == session.session_id
+    assert persisted.compaction_count == 0
+
+
+@pytest.mark.asyncio
+async def test_historical_image_material_is_preserved_before_text_model_projection(
     _e2e_stack: dict[str, Any],
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
@@ -500,18 +1190,21 @@ async def test_historical_image_material_is_not_replayed_without_vision_support(
         provider=provider,
         config=AgentConfig(
             model_capabilities=ModelCapabilities(supports_vision=False),
+            model_vision_support="unsupported",
             preserve_historical_images=True,
         ),
     )
     await runner._load_history(agent, key)
+    assert any(_message_has_image(message) for message in agent._history)
     events = [event async for event in agent.run_turn("Follow up.")]
 
     assert any(getattr(event, "kind", None) == "done" for event in events)
     assert not any(_message_has_image(message) for message in provider.calls[0]["messages"])
+    assert any(_message_has_image(message) for message in agent._history)
 
 
 @pytest.mark.asyncio
-async def test_historical_image_material_outside_lookback_is_not_replayed(
+async def test_active_image_material_outside_legacy_lookback_is_replayed(
     _e2e_stack: dict[str, Any],
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
@@ -546,11 +1239,11 @@ async def test_historical_image_material_outside_lookback_is_not_replayed(
     events = [event async for event in agent.run_turn("Follow up.")]
 
     assert any(getattr(event, "kind", None) == "done" for event in events)
-    assert not any(_message_has_image(message) for message in provider.calls[0]["messages"])
+    assert any(_message_has_image(message) for message in provider.calls[0]["messages"])
 
 
 @pytest.mark.asyncio
-async def test_gate_text_only_followup_stays_text_and_does_not_replay_history_image(
+async def test_new_text_task_keeps_recent_images_and_reaches_primary_model_without_gate(
     _e2e_stack: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -575,9 +1268,6 @@ async def test_gate_text_only_followup_stays_text_and_does_not_replay_history_im
     )
     await manager.append_message(key, "user", "A text-only turn in between.")
     await manager.append_message(key, "assistant", "Text answer in between.")
-    gate_provider.text = (
-        '{"decision":"text_only","confidence":0.91,"reason":"new coding task"}'
-    )
     gate_calls_before = len(gate_provider.calls)
     text_calls_before = len(text_provider.calls)
     vision_calls_before = len(vision_provider.calls)
@@ -589,12 +1279,81 @@ async def test_gate_text_only_followup_stays_text_and_does_not_replay_history_im
         message="Write a small Python script.",
     )
 
-    assert len(gate_provider.calls) == gate_calls_before + 1
-    assert len(text_provider.calls) == text_calls_before + 1
-    assert len(vision_provider.calls) == vision_calls_before
-    sent_messages = text_provider.calls[-1]["messages"]
-    assert not any(_message_has_image(message) for message in sent_messages)
+    assert len(gate_provider.calls) == gate_calls_before == 0
+    assert len(text_provider.calls) == text_calls_before
+    assert len(vision_provider.calls) == vision_calls_before + 1
+    sent_messages = vision_provider.calls[-1]["messages"]
+    assert any(_message_has_image(message) for message in sent_messages)
+    assert "Write a small Python script." in str(sent_messages[-1].content)
     done_events = _event_payloads(sink, "session.event.done")
-    assert done_events[-1]["vision_followup_gate_decision"] == "text_only"
-    assert done_events[-1]["vision_followup_needs_image"] is False
-    assert done_events[-1].get("image_route_reason") is None
+    assert done_events[-1]["image_route_reason"] == "history_context"
+
+
+@pytest.mark.asyncio
+async def test_gateway_free_text_attachment_id_does_not_replay_archived_image(
+    _e2e_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.session.attachment_manifest import build_attachment_manifest
+
+    monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _TextTierStrategy())
+    # Random attachment tokens can contain complaint terms such as "sb" and
+    # upgrade the text route, independently of archived-image replay.
+    monkeypatch.setattr(
+        "opensquilla.gateway.transcripts._new_attachment_id",
+        lambda: "att_abcdefghijklmnopQRstuvwx",
+    )
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    sink: _EventSink = _e2e_stack["sink"]
+    key = "agent:main:archived-image-reference"
+    session = await manager.create(session_key=key, agent_id="main")
+    _e2e_stack["subscription_manager"].subscribe_messages(sink.conn_id, key)
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"], key=key, sink=sink,
+        message="Describe the sample image.", attachments=[_file_uuid_attachment(file_uuid)],
+    )
+    manifest = build_attachment_manifest(
+        await manager.get_transcript(key), session_id=session.session_id, session_key=key,
+    )
+    attachment_id = manifest.occurrences[0].attachment_id
+    tail = await manager.append_message(key, "user", "A later text discussion.")
+    source = await manager.capture_compaction_source(key, boundary_message_id=tail.message_id)
+    assert await manager.persist_compaction_result(
+        key,
+        "The earlier image was discussed.",
+        [{"role": "user", "content": tail.content}],
+        compaction_id="synthetic-image-compaction",
+        removed_count=2,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+    assert [entry.message_id for entry in await manager.get_transcript(key)] == [tail.message_id]
+    assert len(await manager.get_canonical_transcript(key)) == 3
+    canonical_reads: list[str] = []
+    read_canonical = runner._canonical_transcript_for_attachment_replay
+
+    async def record_archive_read(session_key: str, *args: Any, **kwargs: Any) -> Any:
+        canonical_reads.append(session_key)
+        return await read_canonical(session_key, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_canonical_transcript_for_attachment_replay", record_archive_read)
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_calls_before = len(vision_provider.calls)
+    text_calls_before = len(text_provider.calls)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"], key=key, sink=sink,
+        message=f"Discuss attachment_id={attachment_id} again.",
+    )
+
+    assert _e2e_stack["gate_provider"].calls == []
+    assert canonical_reads == []
+    assert len(vision_provider.calls) == vision_calls_before
+    assert len(text_provider.calls) == text_calls_before + 1
+    assert not any(
+        _message_has_image(message) for message in text_provider.calls[-1]["messages"]
+    )

@@ -3,16 +3,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { effectScope } from 'vue'
 
+import i18n, { loadLocaleMessages, type LocaleCode } from '@/i18n'
 import { useUsageData } from './useUsageData'
 import { requestUsageSnapshot } from './useUsageQuery'
 import type { UsageSnapshot } from '@/types/usage'
+import { usageSession } from '@/testing/usage.test-helper'
+import type { SessionDirectory } from '@/modules/sessionDirectory'
+import type { Observability } from '@/modules/observability'
 
 vi.mock('vue-router', () => ({
   useRouter: () => ({ push: vi.fn() }),
-}))
-
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({}),
 }))
 
 vi.mock('./useUsageQuery', () => ({
@@ -82,8 +82,14 @@ function deferred<T>() {
 
 function mountUsageData() {
   const scope = effectScope()
-  const api = scope.run(() => useUsageData())!
-  return { api, scope }
+  const directory: SessionDirectory = {
+    listPage: vi.fn().mockResolvedValue({ items: [], hasMore: false, nextCursor: null }),
+    count: vi.fn().mockResolvedValue({ value: 0, exact: true }),
+    resolve: vi.fn().mockResolvedValue({ key: 'agent:main:webchat:default', id: 'default' }),
+    search: vi.fn().mockResolvedValue({ sessions: [], messages: [] }),
+  }
+  const api = scope.run(() => useUsageData(directory, {} as Observability))!
+  return { api, directory, scope }
 }
 
 async function flushMicrotasks() {
@@ -96,6 +102,7 @@ async function flushMicrotasks() {
 let scopes: Array<ReturnType<typeof effectScope>> = []
 
 beforeEach(() => {
+  i18n.global.locale.value = 'en'
   localStorage.setItem(RANGE_KEY, '7')
   vi.mocked(requestUsageSnapshot).mockReset()
 })
@@ -103,10 +110,21 @@ beforeEach(() => {
 afterEach(() => {
   scopes.forEach(scope => scope.stop())
   scopes = []
+  i18n.global.locale.value = 'en'
   localStorage.clear()
 })
 
 describe('useUsageData range selection under concurrent refreshes', () => {
+  it('delegates task-title connection ownership to SessionDirectory', async () => {
+    vi.mocked(requestUsageSnapshot).mockResolvedValueOnce(snapshotFor('last_7_calendar_days'))
+    const { api, directory, scope } = mountUsageData()
+    scopes.push(scope)
+
+    await api.loadData()
+
+    expect(directory.listPage).toHaveBeenCalledWith({ limit: 200 })
+  })
+
   it('does not describe complete all-time task totals as a date-range approximation', async () => {
     localStorage.setItem(RANGE_KEY, 'all')
     const snapshot = snapshotFor('all')
@@ -169,5 +187,48 @@ describe('useUsageData range selection under concurrent refreshes', () => {
     expect(localStorage.getItem(RANGE_KEY)).toBe('7')
     // The cached 7d snapshot is still rendered, so no page-level error.
     expect(api.usageError.value).toBeNull()
+  })
+})
+
+describe('useUsageData model labels', () => {
+  const localizedModelCounts: ReadonlyArray<{
+    locale: LocaleCode
+    expected: string
+  }> = [
+    { locale: 'en', expected: '2 models' },
+    { locale: 'zh-Hans', expected: '2 个模型' },
+    { locale: 'ja', expected: '2 モデル' },
+    { locale: 'fr', expected: '2 modèles' },
+    { locale: 'de', expected: '2 Modelle' },
+    { locale: 'es', expected: '2 modelos' },
+  ]
+
+  it.each(localizedModelCounts)(
+    'describes multiple models neutrally in $locale',
+    async ({ locale, expected }) => {
+      await loadLocaleMessages(locale)
+      i18n.global.locale.value = locale
+      const { api, scope } = mountUsageData()
+      scopes.push(scope)
+
+      const label = api.modelDisplayLabel(usageSession({
+        modelBreakdown: [
+          { model: 'provider/primary-model' },
+          { model: 'provider/helper-model' },
+        ],
+      }))
+
+      expect(label).toBe(expected)
+      expect(label).not.toMatch(/auto|自动|自動/i)
+    },
+  )
+
+  it('keeps the model name for a single-model breakdown', () => {
+    const { api, scope } = mountUsageData()
+    scopes.push(scope)
+
+    expect(api.modelDisplayLabel(usageSession({
+      modelBreakdown: [{ model: 'provider/only-model' }],
+    }))).toBe('provider/only-model')
   })
 })

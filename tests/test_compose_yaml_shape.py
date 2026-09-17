@@ -88,6 +88,7 @@ def test_dockerignore_prevents_stale_webui_and_nested_secrets_from_entering_cont
 
     assert {
         "src/opensquilla/gateway/static/dist",
+        "dist",
         ".env*",
         "**/.env*",
         ".npmrc",

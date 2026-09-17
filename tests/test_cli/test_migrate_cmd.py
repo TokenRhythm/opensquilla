@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -14,16 +16,45 @@ from opensquilla.cli.main import app
 
 runner = CliRunner()
 
+_EMPTY_MIGRATION_ENV_KEYS = (
+    "OPENSQUILLA_PROFILE",
+    "OPENSQUILLA_HOME",
+    "OPENSQUILLA_GATEWAY_CONFIG_PATH",
+    "OPENSQUILLA_GATEWAY_STATE_DIR",
+    "OPENSQUILLA_GATEWAY_WORKSPACE_DIR",
+    "OPENSQUILLA_WORKSPACE_DIR",
+    "OPENSQUILLA_PROFILE_KIND",
+    "OPENSQUILLA_DESKTOP_PROFILE_KIND",
+    "OPENSQUILLA_DESKTOP",
+)
+
 
 @pytest.fixture(autouse=True)
-def _isolate_profile_operation_locks(
+def _isolate_migration_process_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep CLI migration locks out of the runner's real user-state tree."""
+    """Keep CLI migration discovery, writes, and locks inside this test's tree."""
 
+    for key in _EMPTY_MIGRATION_ENV_KEYS:
+        # Empty values block dotenv rehydration while remaining falsey to path selectors.
+        monkeypatch.setenv(key, "")
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
+    runtime_temp = tmp_path / "runtime-temp"
+    runtime_temp.mkdir()
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-appdata"))
+    monkeypatch.setenv("TEMP", str(runtime_temp))
+    monkeypatch.setenv("TMP", str(runtime_temp))
+    monkeypatch.setenv("TMPDIR", str(runtime_temp))
     monkeypatch.setenv("OPENSQUILLA_TEST", "1")
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "opensquilla-home"))
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    monkeypatch.chdir(tmp_path)
 
 
 def _set_fake_home(monkeypatch, home: Path) -> None:
@@ -42,6 +73,123 @@ def _make_source(root: Path) -> Path:
         encoding="utf-8",
     )
     return source
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes | None]:
+    return {
+        path.relative_to(root).as_posix(): None if path.is_dir() else path.read_bytes()
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def test_migrate_pytest_isolates_inherited_process_paths(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    hostile_root = tmp_path / "hostile-parent-environment"
+    hostile_cwd = hostile_root / "cwd"
+    hostile_workspace = hostile_root / "workspace"
+    hostile_state = hostile_root / "state"
+    hostile_logs = hostile_root / "logs"
+    hostile_user_state = hostile_root / "user-state"
+    hostile_home = hostile_root / "home"
+    runtime_temp = hostile_root / "runtime-temp"
+    for directory in (
+        hostile_cwd,
+        hostile_workspace,
+        hostile_state,
+        hostile_logs,
+        hostile_user_state,
+        hostile_home,
+        runtime_temp,
+    ):
+        directory.mkdir(parents=True)
+
+    config_path = hostile_cwd / "opensquilla.toml"
+    config_bytes = (
+        b"# synthetic operator config must remain byte-for-byte unchanged\n"
+        b"[llm]\n"
+        b'provider = "openai"\n'
+        b'model = "gpt-5"\n'
+        b'api_key_env = "SYNTHETIC_OPENAI_API_KEY"\n'
+    )
+    config_path.write_bytes(config_bytes)
+    protected_roots = (
+        hostile_cwd,
+        hostile_workspace,
+        hostile_state,
+        hostile_logs,
+        hostile_user_state,
+    )
+    for root in protected_roots[1:]:
+        (root / "keep.txt").write_text("keep\n", encoding="utf-8")
+    before = {root: _tree_snapshot(root) for root in protected_roots}
+
+    passthrough_keys = {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+    }
+    child_env = {key: value for key, value in os.environ.items() if key.upper() in passthrough_keys}
+    child_env.update(
+        {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": os.pathsep.join((str(repo_root / "src"), str(repo_root))),
+            "HOME": str(hostile_home),
+            "USERPROFILE": str(hostile_home),
+            "TMPDIR": str(runtime_temp),
+            "TMP": str(runtime_temp),
+            "TEMP": str(runtime_temp),
+            "APPDATA": str(hostile_root / "appdata"),
+            "LOCALAPPDATA": str(hostile_root / "local-appdata"),
+            "OPENSQUILLA_TEST": "1",
+            "OPENSQUILLA_PROFILE": "operator",
+            "OPENSQUILLA_HOME": str(hostile_root / "profiles"),
+            "OPENSQUILLA_STATE_DIR": str(hostile_state),
+            "OPENSQUILLA_LOG_DIR": str(hostile_logs),
+            "OPENSQUILLA_USER_STATE_DIR": str(hostile_user_state),
+            "OPENSQUILLA_GATEWAY_CONFIG_PATH": str(config_path),
+            "OPENSQUILLA_GATEWAY_STATE_DIR": str(hostile_state),
+            "OPENSQUILLA_GATEWAY_WORKSPACE_DIR": str(hostile_workspace),
+            "OPENSQUILLA_WORKSPACE_DIR": str(hostile_workspace),
+            "OPENSQUILLA_PROFILE_KIND": "desktop-primary",
+            "OPENSQUILLA_DESKTOP_PROFILE_KIND": "desktop-primary",
+            "OPENSQUILLA_DESKTOP": "1",
+        }
+    )
+    test_file = Path(__file__).resolve()
+    nodes = (
+        f"{test_file}::test_migrate_auto_detect_single_source_auto_picks",
+        f"{test_file}::test_migrate_openclaw_apply_writes_config_and_workspace",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--rootdir",
+            str(repo_root),
+            *nodes,
+        ],
+        cwd=hostile_cwd,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert config_path.read_bytes() == config_bytes
+    assert not list(hostile_cwd.glob("opensquilla.toml.backup.*"))
+    assert {root: _tree_snapshot(root) for root in protected_roots} == before
 
 
 def test_migrate_openclaw_json_dry_run(tmp_path: Path, monkeypatch) -> None:
@@ -400,7 +548,11 @@ def test_foreign_migration_blocks_unsafe_desktop_before_any_write(
     target.mkdir()
     missing_workspace = tmp_path / "missing-workspace"
     config = target / "config.toml"
-    config_bytes = f"workspace_dir = {json.dumps(str(missing_workspace))}\n".encode()
+    # config_version = 999 is the remaining hard startup gate.
+    config_bytes = (
+        "config_version = 999\n"
+        f"workspace_dir = {json.dumps(str(missing_workspace))}\n"
+    ).encode()
     config.write_bytes(config_bytes)
     _set_fake_home(monkeypatch, fake_home)
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(target))
@@ -421,7 +573,7 @@ def test_foreign_migration_blocks_unsafe_desktop_before_any_write(
 
     assert result.exit_code != 0
     assert isinstance(result.exception, RecoveryRequiredError)
-    assert result.exception.report.stable_code == "effective_state_missing"
+    assert result.exception.report.stable_code == "config_schema_too_new"
     assert config.read_bytes() == config_bytes
     assert not missing_workspace.exists()
     assert not (target / "workspace").exists()

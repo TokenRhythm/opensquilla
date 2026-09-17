@@ -2,26 +2,38 @@
 
 from __future__ import annotations
 
-import os
-import re
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
-from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
-from opensquilla.artifacts import (
-    ArtifactIntegrityError,
-    ArtifactNotFoundError,
-    ArtifactStore,
+from opensquilla.application.artifact_workbench import (
+    ArtifactContentApplication,
+    ArtifactContentQuery,
+    ContentIntegrityError,
+    ContentNotFoundError,
+    DocumentContentQuery,
+    NativeArtifactOpen,
+    NativeArtifactOpenApplication,
+    NativeArtifactOpenError,
+    NativeArtifactUnsupportedError,
+    WorkingFileQuery,
+)
+from opensquilla.gateway.adapters import artifact_native as _artifact_native
+from opensquilla.gateway.adapters.artifact_content import GatewayArtifactContentPort
+from opensquilla.gateway.adapters.artifact_native import (
+    GatewayNativeArtifactOpenPort,
+)
+from opensquilla.gateway.adapters.artifact_native import (
+    _artifact_open_cache_dir as _artifact_open_cache_dir,
+)
+from opensquilla.gateway.adapters.artifact_native import (
+    _materialize_artifact_for_open as _materialize_artifact_for_open,
+)
+from opensquilla.gateway.adapters.artifact_native import (
+    _open_path_with_default_app as _open_path_with_default_app,
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import (
@@ -31,126 +43,11 @@ from opensquilla.gateway.origin_guard import (
 from opensquilla.gateway.origin_guard import (
     request_principal_is_owner as _request_principal_is_owner,
 )
-from opensquilla.paths import media_root_from_config, native_io_path
 
-_OPENABLE_HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
-_OPENABLE_HTML_SUFFIXES = frozenset({".html", ".htm", ".xhtml"})
-_MIME_EXTENSION_FALLBACKS = {
-    "text/html": ".html",
-    "application/xhtml+xml": ".xhtml",
-}
-_OPEN_CACHE_MAX_AGE_SECONDS = 60 * 60
-_UNSAFE_OPEN_FILENAME_RE = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]+')
-
-
-async def _session_id_for_download(session_manager: Any, session_key: str) -> str | None:
-    if not session_key:
-        return None
-    if session_manager is None:
-        return session_key
-    get_session = getattr(session_manager, "get_session", None)
-    if not callable(get_session):
-        return session_key
-    try:
-        session = await get_session(session_key)
-    except Exception:
-        return None
-    session_id = getattr(session, "session_id", None)
-    return session_id if isinstance(session_id, str) and session_id else None
-
-
-def _media_root_from_config(config: GatewayConfig) -> Path:
-    return media_root_from_config(config)
-
-
-def _normalized_mime(value: str) -> str:
-    return value.split(";", 1)[0].strip().lower()
-
-
-def _is_html_artifact(ref: Any) -> bool:
-    mime = _normalized_mime(str(getattr(ref, "mime", "") or ""))
-    if mime in _OPENABLE_HTML_MIMES:
-        return True
-    return Path(str(getattr(ref, "name", "") or "")).suffix.lower() in _OPENABLE_HTML_SUFFIXES
-
-
-def _safe_open_filename(name: str) -> str:
-    base = Path(str(name or "artifact")).name.strip()
-    base = base.replace("\\", "_")
-    cleaned = _UNSAFE_OPEN_FILENAME_RE.sub("_", base).strip()
-    return cleaned or "artifact"
-
-
-def _extension_for_open_name(name: str, mime: str) -> str:
-    if Path(name).suffix:
-        return ""
-    return _MIME_EXTENSION_FALLBACKS.get(_normalized_mime(mime), "")
-
-
-def _artifact_open_cache_dir() -> Path:
-    root = Path(tempfile.gettempdir()) / "opensquilla-artifacts"
-    try:
-        root.mkdir(parents=True, exist_ok=False, mode=0o700)
-    except FileExistsError:
-        pass
-    if root.is_symlink() or not root.is_dir():
-        raise OSError("unsafe artifact open temp directory")
-    if sys.platform != "win32":
-        uid = getattr(os, "getuid", lambda: None)()
-        stat_result = root.stat()
-        if uid is not None and getattr(stat_result, "st_uid", uid) != uid:
-            raise OSError("artifact open temp directory is owned by another user")
-        if stat_result.st_mode & 0o077:
-            root.chmod(0o700)
-            stat_result = root.stat()
-            if stat_result.st_mode & 0o077:
-                raise OSError("artifact open temp directory permissions are too broad")
-    return root
-
-
-def _prune_artifact_open_cache(root: Path) -> None:
-    try:
-        now = time.time()
-        for entry in root.iterdir():
-            try:
-                if now - entry.stat().st_mtime > _OPEN_CACHE_MAX_AGE_SECONDS:
-                    entry.unlink()
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
-def _materialize_artifact_for_open(ref: Any, source: Path) -> Path:
-    root = _artifact_open_cache_dir()
-    _prune_artifact_open_cache(root)
-    name = _safe_open_filename(str(getattr(ref, "name", "") or "artifact"))
-    suffix = _extension_for_open_name(name, str(getattr(ref, "mime", "") or ""))
-    destination = root / f"{uuid4()}-{name}{suffix}"
-    shutil.copyfile(native_io_path(source), destination)
-    try:
-        destination.chmod(0o600)
-    except OSError:
-        pass
-    return destination
-
-
-def _open_path_with_default_app(path: Path) -> str | None:
-    try:
-        if sys.platform == "win32":
-            os.startfile(str(path))  # type: ignore[attr-defined]
-            return None
-        command = ("open", str(path)) if sys.platform == "darwin" else ("xdg-open", str(path))
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if process.poll() not in (None, 0):
-            return "system opener failed"
-        return None
-    except Exception:
-        return "system opener failed"
+# Keep the test-facing module handles stable while the implementation lives in
+# the native Adapter.  The HTTP module no longer owns platform behavior.
+sys = _artifact_native.sys
+tempfile = _artifact_native.tempfile
 
 
 def register_artifact_routes(
@@ -161,6 +58,90 @@ def register_artifact_routes(
 ) -> None:
     """Register GET /api/v1/artifacts/{artifact_id} on the given Starlette app."""
 
+    content_port = GatewayArtifactContentPort(config, session_manager=session_manager)
+    content = ArtifactContentApplication(content_port)
+    native_open = NativeArtifactOpenApplication(
+        GatewayNativeArtifactOpenPort(
+            content_port,
+            materialize=_materialize_artifact_for_open,
+            open_path=_open_path_with_default_app,
+        )
+    )
+
+    async def working_file_handler(request: Request) -> Response:
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        if not request_origin_allowed(request, config):
+            return forbidden_origin_response()
+        # Source paths are host material, unlike an immutable shared delivery.
+        if not _request_principal_is_owner(config, request):
+            return JSONResponse({"code": "OWNER_REQUIRED"}, status_code=403, headers=headers)
+        format_ = request.query_params.get("format", "content")
+        if format_ not in {"content", "metadata"}:
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=headers)
+        try:
+            material = await content.working_file(
+                WorkingFileQuery(
+                    request.headers.get("x-opensquilla-session-key", ""),
+                    request.path_params["document_id"],
+                    request.query_params.get("pagePath"),
+                )
+            )
+        except (ContentNotFoundError, ValueError):
+            return JSONResponse(
+                {"code": "WORKING_FILE_UNAVAILABLE"}, status_code=404, headers=headers
+            )
+        if format_ == "metadata":
+            return JSONResponse(
+                {
+                    "documentId": material.document_id,
+                    "pagePath": material.page_path,
+                    "sourcePath": str(material.path),
+                    "workspace": material.workspace,
+                    "name": material.path.name,
+                    "mime": material.media_type,
+                    "size": len(material.data),
+                },
+                headers=headers,
+            )
+        from urllib.parse import quote
+
+        headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + quote(
+            material.path.name, safe=""
+        )
+        return Response(material.data, media_type=material.media_type, headers=headers)
+
+    async def document_download_handler(request: Request) -> FileResponse | JSONResponse:
+        document_id = request.path_params.get("document_id", "")
+        session_key = (
+            request.query_params.get("sessionKey")
+            or request.query_params.get("session_key")
+            or request.headers.get("x-opensquilla-session-key")
+            or ""
+        )
+        try:
+            material = await content.document(
+                DocumentContentQuery(
+                    session_key,
+                    str(document_id),
+                    request.query_params.get("revisionId"),
+                )
+            )
+        except ContentIntegrityError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": "INTEGRITY_ERROR"},
+                status_code=409,
+            )
+        except (ContentNotFoundError, ValueError):
+            return JSONResponse(
+                {"error": "Artifact document not found", "code": "NOT_FOUND"},
+                status_code=404,
+            )
+        return FileResponse(
+            material.path,
+            media_type=material.media_type,
+            filename=material.filename,
+        )
+
     async def download_handler(request: Request) -> FileResponse | JSONResponse:
         artifact_id = request.path_params.get("artifact_id", "")
         session_key = (
@@ -169,34 +150,27 @@ def register_artifact_routes(
             or request.headers.get("x-opensquilla-session-key")
             or ""
         )
-        session_id = await _session_id_for_download(session_manager, session_key)
-        if not session_id:
-            return JSONResponse(
-                {"error": "Artifact not found", "code": "NOT_FOUND"},
-                status_code=404,
-            )
-
         want_thumbnail = request.query_params.get("variant") == "thumb"
-
-        store = ArtifactStore(_media_root_from_config(config))
         try:
-            ref, path = store.resolve_for_download(str(artifact_id), session_id=session_id)
-            if want_thumbnail:
-                thumbnail = store.resolve_thumbnail_for_download(
-                    str(artifact_id), session_id=session_id
+            material = await content.artifact(
+                ArtifactContentQuery(
+                    session_key,
+                    str(artifact_id),
+                    thumbnail=want_thumbnail,
                 )
-                if thumbnail is not None:
-                    _, thumb_path = thumbnail
-                    return FileResponse(native_io_path(thumb_path), media_type="image/webp")
-        except ArtifactIntegrityError as exc:
+            )
+        except ContentIntegrityError as exc:
             return JSONResponse({"error": str(exc), "code": "INTEGRITY_ERROR"}, status_code=409)
-        except (ArtifactNotFoundError, ValueError):
+        except (ContentNotFoundError, ValueError):
             return JSONResponse(
                 {"error": "Artifact not found", "code": "NOT_FOUND"},
                 status_code=404,
             )
-
-        return FileResponse(native_io_path(path), media_type=ref.mime, filename=ref.name)
+        return FileResponse(
+            material.path,
+            media_type=material.media_type,
+            filename=material.filename,
+        )
 
     async def open_handler(request: Request) -> JSONResponse:
         if not request_origin_allowed(request, config):
@@ -214,25 +188,11 @@ def register_artifact_routes(
             or request.headers.get("x-opensquilla-session-key")
             or ""
         )
-        session_id = await _session_id_for_download(session_manager, session_key)
-        if not session_id:
-            return JSONResponse(
-                {"error": "Artifact not found", "code": "NOT_FOUND"},
-                status_code=404,
-            )
-
-        store = ArtifactStore(_media_root_from_config(config))
         try:
-            ref, path = store.resolve_for_download(str(artifact_id), session_id=session_id)
-        except ArtifactIntegrityError as exc:
+            await native_open.open(NativeArtifactOpen(session_key, str(artifact_id)))
+        except ContentIntegrityError as exc:
             return JSONResponse({"error": str(exc), "code": "INTEGRITY_ERROR"}, status_code=409)
-        except (ArtifactNotFoundError, ValueError):
-            return JSONResponse(
-                {"error": "Artifact not found", "code": "NOT_FOUND"},
-                status_code=404,
-            )
-
-        if not _is_html_artifact(ref):
+        except NativeArtifactUnsupportedError:
             return JSONResponse(
                 {
                     "error": "Artifact type is not supported for native open",
@@ -240,16 +200,12 @@ def register_artifact_routes(
                 },
                 status_code=415,
             )
-
-        try:
-            open_path = _materialize_artifact_for_open(ref, path)
-        except OSError:
+        except (ContentNotFoundError, ValueError):
             return JSONResponse(
-                {"error": "Artifact open failed", "code": "OPEN_FAILED"},
-                status_code=503,
+                {"error": "Artifact not found", "code": "NOT_FOUND"},
+                status_code=404,
             )
-
-        if _open_path_with_default_app(open_path):
+        except NativeArtifactOpenError:
             return JSONResponse(
                 {"error": "Artifact open failed", "code": "OPEN_FAILED"},
                 status_code=503,
@@ -258,7 +214,21 @@ def register_artifact_routes(
         return JSONResponse({"ok": True, "status": "accepted"}, status_code=202)
 
     app.router.routes.append(
+        Route(
+            "/api/v1/artifact-documents/{document_id}/working-file",
+            working_file_handler,
+            methods=["GET"],
+        )
+    )
+    app.router.routes.append(
         Route("/api/v1/artifacts/{artifact_id}/open", open_handler, methods=["POST"])
+    )
+    app.router.routes.append(
+        Route(
+            "/api/v1/artifact-documents/{document_id}",
+            document_download_handler,
+            methods=["GET", "HEAD"],
+        )
     )
     app.router.routes.append(
         Route("/api/v1/artifacts/{artifact_id}", download_handler, methods=["GET", "HEAD"])

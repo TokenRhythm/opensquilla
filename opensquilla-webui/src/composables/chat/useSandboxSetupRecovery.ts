@@ -1,54 +1,44 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type {
+  SandboxChatRuntime,
+  SandboxSetupOutcome,
+} from '@/modules/sandboxRuntime'
+import type {
   SandboxRunMode,
-  SandboxSetupState,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
 
 const SETUP_POLL_MS = 2000
 
-type SandboxSetupRpc = {
-  call: (method: string, params?: Record<string, unknown>) => Promise<unknown>
-}
-
 export interface UseSandboxSetupRecoveryOptions {
-  rpc: SandboxSetupRpc
+  sandbox: Pick<SandboxChatRuntime, 'readiness' | 'ensureReady'>
   connectionState: Ref<string>
   runMode: Ref<SandboxRunMode>
   autoRefresh?: boolean
 }
 
-function normalizeStatus(payload: unknown): SandboxSetupStatusPayload | null {
-  if (!payload || typeof payload !== 'object') return null
-  const raw = payload as Record<string, unknown>
-  const state = String(raw.state || '') as SandboxSetupState
-  if (!['not_setup', 'setting_up', 'ready', 'failed', 'unavailable'].includes(state)) return null
-  return {
-    state,
-    platform: String(raw.platform || ''),
-    message: String(raw.message || ''),
-    requiresAdmin: raw.requiresAdmin === true || raw.requires_admin === true,
-    detail: typeof raw.detail === 'string' ? raw.detail : undefined,
-  }
-}
-
 export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions) {
   const status = ref<SandboxSetupStatusPayload | null>(null)
+  const resolved = ref(false)
   const loading = ref(false)
   const ensuring = ref(false)
   const dismissed = ref(false)
   const error = ref('')
+  const outcome = ref<SandboxSetupOutcome>('idle')
   let requestGeneration = 0
   let pollTimer: ReturnType<typeof setTimeout> | null = null
   let lastState = ''
 
-  const active = computed(() =>
-    options.connectionState.value === 'connected' && options.runMode.value !== 'full')
+  const active = computed(() => options.connectionState.value === 'connected')
   const visible = computed(() =>
-    active.value && !dismissed.value && status.value !== null && status.value.state !== 'ready')
+    active.value
+    && options.runMode.value !== 'full'
+    && !dismissed.value
+    && status.value !== null
+    && status.value.state !== 'ready')
   const isWindows = computed(() => status.value?.platform.toLowerCase().startsWith('win') === true)
   const canSetup = computed(() =>
-    isWindows.value && (status.value?.state === 'not_setup' || status.value?.state === 'failed'))
+    isWindows.value && status.value?.state === 'not_setup')
 
   function clearPoll() {
     if (pollTimer) clearTimeout(pollTimer)
@@ -75,7 +65,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     loading.value = status.value === null
     clearPoll()
     try {
-      const payload = normalizeStatus(await options.rpc.call('sandbox.setup.status'))
+      const payload = (await options.sandbox.readiness()).status
       if (generation !== requestGeneration) return
       if (!payload) {
         // Keep following an already-authoritative setting_up state when a
@@ -96,24 +86,25 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
       error.value = cause instanceof Error ? cause.message : String(cause)
       schedulePoll()
     } finally {
-      if (generation === requestGeneration) loading.value = false
+      if (generation === requestGeneration) {
+        resolved.value = true
+        loading.value = false
+      }
     }
   }
 
-  async function ensureSetup() {
-    if (!canSetup.value || ensuring.value) return
+  async function ensureSetup(): Promise<boolean> {
+    if (!canSetup.value || ensuring.value) return false
     const generation = ++requestGeneration
     ensuring.value = true
     error.value = ''
     clearPoll()
     try {
-      const payload = normalizeStatus(await options.rpc.call('sandbox.setup.ensure'))
-      if (generation !== requestGeneration || !payload) return
-      applyStatus(payload)
-    } catch (cause) {
-      if (generation === requestGeneration) {
-        error.value = cause instanceof Error ? cause.message : String(cause)
-      }
+      const result = await options.sandbox.ensureReady()
+      if (generation !== requestGeneration) return false
+      if (result.status) applyStatus(result.status)
+      outcome.value = result.outcome
+      return result.ready
     } finally {
       if (generation === requestGeneration) ensuring.value = false
     }
@@ -124,27 +115,29 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   }
 
   watch(
-    () => [options.connectionState.value, options.runMode.value] as const,
-    ([connection, mode], previous) => {
-      const changedMode = previous && previous[1] !== mode
-      if (changedMode) dismissed.value = false
+    () => options.connectionState.value,
+    (connection) => {
       requestGeneration++
       clearPoll()
-      if (
-        options.autoRefresh !== false
-        && connection === 'connected'
-        && mode !== 'full'
-      ) {
+      if (options.autoRefresh !== false && connection === 'connected') {
         void refresh()
       }
       else {
         status.value = null
+        resolved.value = false
         lastState = ''
         loading.value = false
         ensuring.value = false
       }
     },
     { immediate: true },
+  )
+
+  watch(
+    () => options.runMode.value,
+    () => {
+      dismissed.value = false
+    },
   )
 
   onScopeDispose(() => {
@@ -154,10 +147,12 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
 
   return {
     status,
+    resolved,
     loading,
     ensuring,
     dismissed,
     error,
+    outcome,
     visible,
     canSetup,
     refresh,

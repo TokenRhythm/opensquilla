@@ -143,6 +143,7 @@ class CronJob:
     creator_session_key: str = ""  # Session key of the caller that created the job
     creator_sender_id: str = ""  # Channel sender id (when created from a channel)
     creator_is_owner: bool = False
+    creator_host_execute: bool = False
     run_mode: str = ""
     elevated: str = ""
     execution_target: str = ""

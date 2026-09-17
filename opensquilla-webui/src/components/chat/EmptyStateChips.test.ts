@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, ref } from 'vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
+import { SETUP_WORKFLOW_KEY, type SetupWorkflow } from '@/modules/setupWorkflow'
 import EmptyStateChips from './EmptyStateChips.vue'
 
 vi.mock('@/composables/useRpc', () => ({
@@ -25,6 +26,9 @@ async function mountChips(props: {
     agentId: 'main',
     ...props,
   })
+  app.provide(SETUP_WORKFLOW_KEY, {
+    status: async () => ({}),
+  } as SetupWorkflow)
   app.use(i18n)
   app.mount(el)
   await nextTick()
@@ -61,7 +65,7 @@ describe('EmptyStateChips', () => {
     app.unmount()
   })
 
-  it('uses the game label while emitting the full voxel-racing prompt', async () => {
+  it('emits only the visible game suggestion label', async () => {
     i18n.global.setLocaleMessage('zh-Hans', zhHans)
     i18n.global.locale.value = 'zh-Hans'
     const onPick = vi.fn()
@@ -73,9 +77,7 @@ describe('EmptyStateChips', () => {
     game?.click()
     await nextTick()
 
-    expect(onPick).toHaveBeenCalledWith(
-      '构建一个可玩的浏览器端体素竞速游戏原型，包含响应式操控、加速/刹车、可读赛道、碰撞检测、检查点、圈速计时和重启流程。用代码生成体素风格的赛车和场景，不使用付费素材。运行游戏、测试控制、修复阻塞性问题后交付。我希望风景更好,开放世界。且地图在有opensquilla和 tokenrhythm这两个标识 是赞助商彩蛋',
-    )
+    expect(onPick).toHaveBeenCalledWith('帮我做个游戏')
     app.unmount()
   })
 

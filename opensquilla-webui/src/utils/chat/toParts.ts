@@ -9,6 +9,7 @@ import type {
   ChatPart,
   InterruptApprovalData,
   InterruptClarifyData,
+  InterruptResolution,
   InterruptViewState,
   ToolPartState,
 } from '@/types/parts'
@@ -20,6 +21,7 @@ export interface ToPartsInterrupt {
   kind: 'approval' | 'clarify'
   approvalId: string
   data: InterruptApprovalData | InterruptClarifyData
+  resolution?: InterruptResolution
 }
 
 function assertNever(x: never): never {
@@ -156,7 +158,9 @@ export function toParts(
       interruptKind: it.kind,
       approval: it.kind === 'approval' ? (it.data as InterruptApprovalData) : undefined,
       clarify: it.kind === 'clarify' ? (it.data as InterruptClarifyData) : undefined,
-      resolution: state?.resolution ?? null,
+      resolution: it.kind === 'clarify' && it.resolution === 'replied'
+        ? 'replied'
+        : state?.resolution ?? it.resolution ?? null,
       busy: state?.busy ?? false,
       error: state?.error ?? '',
       key: `${ownerKey}:interrupt:${it.approvalId}`,

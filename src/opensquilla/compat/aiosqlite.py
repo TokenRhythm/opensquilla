@@ -1,18 +1,20 @@
 """Compatibility wrapper around aiosqlite for Python 3.13 runtime reliability.
 
 On environments where ``aiosqlite.connect`` blocks at startup, this module
-falls back to ``sqlite3`` executed in ``asyncio.to_thread`` while keeping the
+falls back to ``sqlite3`` executed in worker threads while keeping the
 async API shape used by project call sites.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib
 import os
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable
 from contextlib import AbstractAsyncContextManager
+from functools import partial
 from typing import Any, Protocol, cast
 
 _timeout_raw = os.getenv("OPENSQUILLA_AIOSQLITE_CONNECT_TIMEOUT_SEC", "1.0")
@@ -80,6 +82,9 @@ class Connection(AbstractAsyncContextManager["Connection"], Protocol):
     @property
     def in_transaction(self) -> bool: ...
 
+    @property
+    def total_changes(self) -> int: ...
+
     def execute(self, sql: str, params: Iterable[Any] = ()) -> CursorContext: ...
 
     def executemany(
@@ -114,6 +119,51 @@ _native_available = _native_aiosqlite is not None
 _prefer_native: bool | None = None
 
 
+async def _run_sqlite_call[Result](
+    function: Callable[..., Result],
+    /,
+    *args: Any,
+    on_cancelled_result: Callable[[Result], None] | None = None,
+    **kwargs: Any,
+) -> Result:
+    """Finish native work before cancellation can release the connection lock."""
+
+    # Cancelling an executor await does not stop its native thread. Keep the
+    # caller (and its shared SQLite lock) alive until the operation completes,
+    # including when shutdown cancels that caller more than once. Use an
+    # executor Future so cancelling all asyncio Tasks cannot cancel the worker.
+    context = contextvars.copy_context()
+    operation = asyncio.get_running_loop().run_in_executor(
+        None, partial(context.run, function, *args, **kwargs),
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException:
+            # Retrieve the original worker exception below, also when the
+            # caller was cancelled while the worker was still running.
+            break
+
+    try:
+        result = operation.result()
+    except BaseException as exc:
+        if cancellation is not None:
+            raise cancellation from exc
+        raise
+    if cancellation is not None:
+        if on_cancelled_result is not None:
+            try:
+                await _run_sqlite_call(on_cancelled_result, result)
+            except BaseException as exc:
+                raise cancellation from exc
+        raise cancellation
+    return result
+
+
 class _AsyncCursor:
     def __init__(self, cursor: sqlite3.Cursor, lock: asyncio.Lock) -> None:
         self._cursor = cursor
@@ -129,14 +179,14 @@ class _AsyncCursor:
 
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> _AsyncCursor:
         async with self._lock:
-            self._cursor = await asyncio.to_thread(self._cursor.execute, sql, tuple(params))
+            self._cursor = await _run_sqlite_call(self._cursor.execute, sql, tuple(params))
         return self
 
     async def executemany(
         self, sql: str, seq_of_params: Iterable[Iterable[Any]]
     ) -> _AsyncCursor:
         async with self._lock:
-            self._cursor = await asyncio.to_thread(
+            self._cursor = await _run_sqlite_call(
                 self._cursor.executemany,
                 sql,
                 cast(Any, seq_of_params),
@@ -145,21 +195,21 @@ class _AsyncCursor:
 
     async def fetchone(self) -> Any:
         async with self._lock:
-            return await asyncio.to_thread(self._cursor.fetchone)
+            return await _run_sqlite_call(self._cursor.fetchone)
 
     async def fetchall(self) -> list[Any]:
         async with self._lock:
-            return await asyncio.to_thread(self._cursor.fetchall)
+            return await _run_sqlite_call(self._cursor.fetchall)
 
     async def fetchmany(self, size: int | None = None) -> list[Any]:
         async with self._lock:
             if size is None:
-                return await asyncio.to_thread(self._cursor.fetchmany)
-            return await asyncio.to_thread(self._cursor.fetchmany, size)
+                return await _run_sqlite_call(self._cursor.fetchmany)
+            return await _run_sqlite_call(self._cursor.fetchmany, size)
 
     async def close(self) -> None:
         async with self._lock:
-            await asyncio.to_thread(self._cursor.close)
+            await _run_sqlite_call(self._cursor.close)
 
     async def __aenter__(self) -> _AsyncCursor:
         return self
@@ -211,9 +261,16 @@ class _AsyncConnection:
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
 
+    @property
+    def total_changes(self) -> int:
+        return self._conn.total_changes
+
     async def _execute(self, sql: str, params: Iterable[Any] = ()) -> _AsyncCursor:
         async with self._locked:
-            cursor = await asyncio.to_thread(self._conn.execute, sql, tuple(params))
+            cursor = await _run_sqlite_call(
+                self._conn.execute, sql, tuple(params),
+                on_cancelled_result=lambda result: result.close(),
+            )
         return _AsyncCursor(cursor, self._locked)
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> _CursorProxy:
@@ -223,10 +280,11 @@ class _AsyncConnection:
         self, sql: str, seq_of_params: Iterable[Iterable[Any]]
     ) -> _AsyncCursor:
         async with self._locked:
-            cursor = await asyncio.to_thread(
+            cursor = await _run_sqlite_call(
                 self._conn.executemany,
                 sql,
                 cast(Any, seq_of_params),
+                on_cancelled_result=lambda result: result.close(),
             )
         return _AsyncCursor(cursor, self._locked)
 
@@ -235,32 +293,38 @@ class _AsyncConnection:
 
     async def executescript(self, script: str) -> None:
         async with self._locked:
-            await asyncio.to_thread(self._conn.executescript, script)
+            cursor = await _run_sqlite_call(
+                self._conn.executescript, script,
+                on_cancelled_result=lambda result: result.close(),
+            )
+            await _run_sqlite_call(cursor.close)
 
     async def commit(self) -> None:
         async with self._locked:
-            await asyncio.to_thread(self._conn.commit)
+            await _run_sqlite_call(self._conn.commit)
 
     async def rollback(self) -> None:
         async with self._locked:
-            await asyncio.to_thread(self._conn.rollback)
+            await _run_sqlite_call(self._conn.rollback)
 
     async def close(self) -> None:
         async with self._locked:
-            await asyncio.to_thread(self._conn.close)
+            await _run_sqlite_call(self._conn.close)
 
     async def cursor(self) -> _AsyncCursor:
         async with self._locked:
-            cur = await asyncio.to_thread(self._conn.cursor)
+            cur = await _run_sqlite_call(
+                self._conn.cursor, on_cancelled_result=lambda result: result.close(),
+            )
         return _AsyncCursor(cur, self._locked)
 
     async def enable_load_extension(self, enabled: bool) -> None:
         async with self._locked:
-            await asyncio.to_thread(self._conn.enable_load_extension, enabled)
+            await _run_sqlite_call(self._conn.enable_load_extension, enabled)
 
     async def load_extension(self, path: str) -> None:
         async with self._locked:
-            await asyncio.to_thread(self._conn.load_extension, path)
+            await _run_sqlite_call(self._conn.load_extension, path)
 
     async def create_function(
         self,
@@ -271,7 +335,7 @@ class _AsyncConnection:
         deterministic: bool = False,
     ) -> None:
         async with self._locked:
-            await asyncio.to_thread(
+            await _run_sqlite_call(
                 self._conn.create_function,
                 name,
                 num_params,
@@ -284,7 +348,7 @@ class _AsyncConnection:
         handler: Callable[[str], Any] | None,
     ) -> None:
         async with self._locked:
-            await asyncio.to_thread(self._conn.set_trace_callback, handler)
+            await _run_sqlite_call(self._conn.set_trace_callback, handler)
 
     async def __aenter__(self) -> _AsyncConnection:
         return self
@@ -348,7 +412,9 @@ async def _connect_sqlite3(
             cached_statements=cached_statements,
         )
 
-    conn = await asyncio.to_thread(_open_sqlite3_connection)
+    conn = await _run_sqlite_call(
+        _open_sqlite3_connection, on_cancelled_result=lambda result: result.close(),
+    )
     conn.row_factory = sqlite3.Row
     return _AsyncConnection(conn)
 

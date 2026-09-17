@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import ntpath
 import os
@@ -15,6 +16,9 @@ from dataclasses import replace
 from pathlib import Path, PurePath
 from typing import Any
 
+from opensquilla.process_tree import (
+    create_owned_subprocess_exec,
+)
 from opensquilla.sandbox.backend.base import Backend
 from opensquilla.sandbox.backend.filesystem_worker_policy import (
     build_filesystem_worker_policy,
@@ -35,6 +39,7 @@ from opensquilla.sandbox.backend.windows_default_roots import (
     runtime_rx_roots,
     windows_platform_rx_roots,
     windows_sensitive_marker,
+    windows_system_root,
     workspace_cache_root,
 )
 from opensquilla.sandbox.backend.windows_default_setup import (
@@ -57,14 +62,14 @@ from opensquilla.sandbox.permissions import (
     logical_absolute_path,
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest, SandboxResult
 from opensquilla.subprocess_encoding import decode_subprocess_output
 
-_HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
-_FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
 _OUTPUT_BYTE_CAP = 1_048_576
 _HELPER_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
 _HELPER_ERROR_PREFIX = "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
+_HELPER_TIMEOUT_PREFIX = b"\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT "
 _HELPER_TIMEOUT_GRACE_S = 30.0
 _WINDOWS_PROCESS_BASE_ENV_KEYS = (
     "SystemRoot",
@@ -93,7 +98,7 @@ _WINDOWS_DOS_DEVICE_NAMES = frozenset(
 
 
 class WindowsDefaultBackend(Backend):
-    """Windows backend used by Standard-Sandbox and Managed Execution."""
+    """Windows backend used by Safe mode."""
 
     name = "windows_default"
 
@@ -166,12 +171,15 @@ class WindowsDefaultBackend(Backend):
             separators=(",", ":"),
             sort_keys=True,
         )
-        helper_argv = (sys.executable, "-m", _HELPER_MODULE, "--payload-env")
+        helper_argv = internal_child_argv(
+            ChildRole.WINDOWS_DEFAULT_RUNNER,
+            args=("--payload-env",),
+        )
         wall = request.policy.limits.wall_timeout_s
         helper_wall = _helper_supervision_timeout(wall)
         started = time.monotonic()
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_owned_subprocess_exec(
                 *helper_argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -185,12 +193,11 @@ class WindowsDefaultBackend(Backend):
                 proc.communicate(),
                 timeout=helper_wall,
             )
+        except asyncio.CancelledError:
+            await asyncio.shield(_terminate_owned_helper(proc))
+            raise
         except TimeoutError:
-            proc.kill()
-            try:
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            await _terminate_owned_helper(proc)
             elapsed = time.monotonic() - started
             return SandboxResult(
                 returncode=124,
@@ -202,7 +209,14 @@ class WindowsDefaultBackend(Backend):
                 timed_out=True,
             )
 
+        owner = getattr(proc, "_opensquilla_process_tree_owner", None)
+        if owner is not None:
+            await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
         elapsed = time.monotonic() - started
+        stderr_bytes, helper_timed_out = _extract_authenticated_helper_timeout(
+            stderr_bytes,
+            expected_nonce=str(payload["helperNonce"]),
+        )
         stdout, trunc_out = _decode_capped(stdout_bytes)
         stderr, trunc_err = _decode_capped(stderr_bytes)
         helper_error = _authenticated_helper_error(
@@ -222,12 +236,24 @@ class WindowsDefaultBackend(Backend):
             policy_used=request.policy.summary(),
             truncated_stdout=trunc_out,
             truncated_stderr=trunc_err,
-            timed_out=False,
+            timed_out=proc.returncode == 124 and helper_timed_out,
         )
 
 
 def _support_ready() -> bool:
     return probe_windows_default_support().default_backend_available
+
+
+async def _terminate_owned_helper(proc: Any) -> None:
+    owner = getattr(proc, "_opensquilla_process_tree_owner", None)
+    if owner is not None:
+        await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
+        return
+    # Compatibility for injected subprocess-like embedders. Production owned
+    # launchers always attach a Job-backed owner before returning.
+    proc.kill()
+    with contextlib.suppress(ProcessLookupError):
+        await proc.wait()
 
 
 def _helper_supervision_timeout(command_timeout_s: float) -> float:
@@ -256,6 +282,12 @@ def _payload_for_request(
         request,
         private_mounts_are_required=private_mounts_are_required,
     )
+    if _is_capability_probe_request(request):
+        # Capability canaries use their own short-lived capability SIDs. They
+        # must not switch the shared offline account's allow journal away from
+        # the user's real Safe profile, which can trigger expensive inherited
+        # ACL churn on a large home directory.
+        policy["capabilityProbe"] = True
     network_boundary = _windows_network_boundary_payload(request)
     if network_boundary is not None:
         policy["windowsNetworkBoundary"] = network_boundary
@@ -277,6 +309,53 @@ def _payload_for_request(
 
 def _new_helper_nonce() -> str:
     return secrets.token_hex(16)
+
+
+def _is_capability_probe_request(request: SandboxRequest) -> bool:
+    return request.action_kind == "capability.probe" or request.action_kind.startswith(
+        "capability.probe.fs.worker."
+    )
+
+
+def _extract_authenticated_helper_timeout(
+    stderr: bytes,
+    *,
+    expected_nonce: str,
+) -> tuple[bytes, bool]:
+    """Remove trusted timeout frames before output truncation or decoding."""
+    if not expected_nonce:
+        return stderr, False
+    chunks: list[bytes] = []
+    cursor = 0
+    search_from = 0
+    timed_out = False
+    while (start := stderr.find(_HELPER_TIMEOUT_PREFIX, search_from)) >= 0:
+        content_start = start + len(_HELPER_TIMEOUT_PREFIX)
+        end = stderr.find(b"\n", content_start)
+        if end < 0:
+            break
+        search_from = content_start
+        try:
+            payload = json.loads(stderr[content_start:end])
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        nonce = payload.get("nonce")
+        if (
+            isinstance(nonce, str)
+            and nonce.isascii()
+            and secrets.compare_digest(nonce, expected_nonce)
+            and payload.get("timed_out") is True
+        ):
+            # The leading and trailing LF belong to the control frame, so a
+            # user's unterminated stderr line and arbitrary bytes stay intact.
+            chunks.append(stderr[cursor:start])
+            cursor = end + 1
+            search_from = cursor
+            timed_out = True
+    chunks.append(stderr[cursor:])
+    return b"".join(chunks), timed_out
 
 
 def _authenticated_helper_error(
@@ -361,6 +440,8 @@ def _filesystem_operation_request(
     env = {
         "PATH": str(_python_executable().parent),
         "PYTHONPATH": _pythonpath_for_worker(),
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
         "TEMP": str(worker_temp),
         "TMP": str(worker_temp),
         "TMPDIR": str(worker_temp),
@@ -393,16 +474,13 @@ def _filesystem_operation_request(
             "defaultAccess": profile.default_access.value,
         },
     }
+    action_kind = f"fs.worker.{operation.kind}"
+    if operation.operation_id == "capability-probe":
+        action_kind = f"capability.probe.{action_kind}"
     return SandboxRequest(
-        argv=(
-            str(_python_executable()),
-            "-B",
-            "-m",
-            _FILESYSTEM_WORKER_MODULE,
-            "-",
-        ),
+        argv=internal_child_argv(ChildRole.FILESYSTEM_WORKER, args=("-",)),
         cwd=workspace,
-        action_kind=f"fs.worker.{operation.kind}",
+        action_kind=action_kind,
         policy=policy,
         stdin=json.dumps(worker_payload, ensure_ascii=False).encode("utf-8"),
         env=env,
@@ -763,9 +841,17 @@ def _acl_plan_payload(
     process_rx_roots = tuple(
         root for root in process_executable_rx_roots(request.argv, request.env) if root.exists()
     )
+    if request.env.get("OPENSQUILLA_GUEST_SAFE") == "1":
+        system_root = windows_system_root(request.env).resolve(strict=False)
+        process_rx_roots = tuple(
+            root
+            for root in process_rx_roots
+            if _is_relative_to_casefold(root.resolve(strict=False), system_root)
+            or profile.resolve(root) is not FileSystemAccess.DENY
+        )
     tool_rx_roots = (
         ()
-        if _is_filesystem_worker_request(request)
+        if not _request_needs_host_tool_paths(request)
         else tuple(
             root
             for root in _windows_tool_path_roots(
@@ -775,10 +861,10 @@ def _acl_plan_payload(
             if _acl_sensitive_marker(root) is None
         )
     )
-    tool_traversal_roots = _windows_tool_traversal_roots(
-        tool_rx_roots,
-        host_env=_host_tool_env(request),
-    )
+    # Grant discovered tool directories, not their ancestors. The restricted
+    # token enables SeChangeNotifyPrivilege to traverse those ancestors. RX on
+    # a directory inherits to its children, so granting AppData or .cache here
+    # would rewrite unrelated trees before the requested process can start.
     runtime_acl_roots = tuple(
         root
         for root in runtime_rx_roots(_python_executable())
@@ -792,7 +878,6 @@ def _acl_plan_payload(
             AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED)
             for root in _workspace_traversal_roots(request.cwd)
         ),
-        *(AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED) for root in tool_traversal_roots),
         *(AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED) for root in runtime_acl_roots),
         *(AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED) for root in tool_rx_roots),
         *(AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED) for root in process_acl_roots),
@@ -858,7 +943,7 @@ def _acl_plan_payload(
         "denyWritePaths": [str(path) for path in deny_write_paths],
         "denyReadPaths": [str(path) for path in deny_read_paths],
         "denyAclStatePath": str(_deny_acl_state_path()),
-        "revalidateDenyAcl": not request.action_kind.startswith("fs.worker."),
+        "revalidateDenyAcl": not _is_filesystem_worker_request(request),
         "grantCurrentUserAccess": True,
     }
 
@@ -1131,13 +1216,21 @@ def _process_base_env(request: SandboxRequest) -> dict[str, str]:
         value = request.env.get(key) or os.environ.get(key)
         if isinstance(value, str) and value:
             env[key] = value
-    if not _is_filesystem_worker_request(request):
+    if _request_needs_host_tool_paths(request):
         _prepend_windows_tool_paths(env, host_env=_host_tool_env(request))
     return env
 
 
 def _is_filesystem_worker_request(request: SandboxRequest) -> bool:
-    return request.action_kind.startswith("fs.worker.")
+    return request.action_kind.startswith(("fs.worker.", "capability.probe.fs.worker."))
+
+
+def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
+    return (
+        request.env.get("OPENSQUILLA_GUEST_SAFE") != "1"
+        and not _is_filesystem_worker_request(request)
+        and request.action_kind != "capability.probe"
+    )
 
 
 def _host_tool_env(request: SandboxRequest) -> dict[str, str]:
@@ -1257,52 +1350,6 @@ def _common_windows_tool_dirs(env: Mapping[str, str]) -> tuple[Path, ...]:
     return tuple(candidates)
 
 
-def _windows_tool_traversal_roots(
-    tool_roots: tuple[Path, ...],
-    *,
-    host_env: Mapping[str, str],
-) -> tuple[Path, ...]:
-    anchors: list[Path] = []
-    for key in ("LOCALAPPDATA", "APPDATA"):
-        value = _env_path(host_env, key)
-        if value is not None and value.parent != value:
-            anchors.append(value.parent)
-    userprofile = _env_path(host_env, "USERPROFILE")
-    if userprofile is not None:
-        anchors.append(userprofile / ".local")
-        anchors.append(userprofile / ".cache")
-
-    roots: list[Path] = []
-    for tool_root in tool_roots:
-        resolved_tool = tool_root.resolve(strict=False)
-        for anchor in anchors:
-            resolved_anchor = anchor.resolve(strict=False)
-            if not _is_relative_to_casefold(resolved_tool, resolved_anchor):
-                continue
-            roots.extend(_path_chain(resolved_anchor, resolved_tool.parent))
-            break
-    return tuple(_dedupe_paths(path for path in roots if _acl_sensitive_marker(path) is None))
-
-
-def _path_chain(start: Path, stop: Path) -> tuple[Path, ...]:
-    start = start.resolve(strict=False)
-    stop = stop.resolve(strict=False)
-    if not _is_relative_to_casefold(stop, start):
-        return ()
-    roots: list[Path] = []
-    current = stop
-    while True:
-        roots.append(current)
-        if current == start:
-            break
-        parent = current.parent
-        if parent == current:
-            return ()
-        current = parent
-    roots.reverse()
-    return tuple(roots)
-
-
 def _program_files_roots(env: Mapping[str, str]) -> tuple[Path, ...]:
     roots = []
     for key, fallback in (
@@ -1325,9 +1372,14 @@ def _split_windows_path(value: str) -> list[str]:
 
 
 def _directory_has_windows_tool(path: Path) -> bool:
-    if not path.exists() or not path.is_dir():
+    try:
+        if not path.exists() or not path.is_dir():
+            return False
+        return any((path / name).exists() for name in _WINDOWS_TOOL_PATH_EXECUTABLES)
+    except OSError:
+        # Ignore malformed or oversized PATH entries instead of aborting the
+        # entire sandbox request while probing for optional Windows tools.
         return False
-    return any((path / name).exists() for name in _WINDOWS_TOOL_PATH_EXECUTABLES)
 
 
 def _windows_path_is_apps_alias_dir(path: Path) -> bool:

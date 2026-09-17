@@ -16,6 +16,10 @@ async function openControl(page: Page, path = '') {
 }
 
 test.describe('Sidebar', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  })
+
   test('desktop separator resizes, persists, and collapses only on pointer release', async ({ page }) => {
     await page.addInitScript(() => {
       if (sessionStorage.getItem('sidebar-resize-e2e-seeded')) return
@@ -225,7 +229,7 @@ test.describe('Sidebar', () => {
       )
     })).toBeLessThanOrEqual(0.00001)
 
-    await openControl(page, 'settings/appearance')
+    await openControl(page, 'settings/interface')
     const wide = page.getByTestId('settings-sidebar-width-wide')
     await wide.locator('..').click()
     await page.getByRole('dialog').getByRole('button', { name: 'Close' }).focus()
@@ -238,7 +242,7 @@ test.describe('Sidebar', () => {
   test('Appearance provides a click-only alternative for preset, custom width, and collapse', async ({ page }) => {
     await page.addInitScript(() => localStorage.removeItem('opensquilla.sidebar.width.v1'))
     await page.setViewportSize({ width: 1440, height: 900 })
-    await openControl(page, 'settings/appearance')
+    await openControl(page, 'settings/interface')
 
     const sidebar = page.locator('.sidebar')
     const sidebarWidth = async () => Math.round((await sidebar.boundingBox())?.width || 0)

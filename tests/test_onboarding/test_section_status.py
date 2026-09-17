@@ -504,6 +504,121 @@ def test_image_generation_enabled_without_credentials_is_missing(cfg, monkeypatc
     assert image_generation_section_status(cfg) is SectionStatus.MISSING
 
 
+def test_follow_llm_image_generation_is_dormant_for_other_active_provider(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.binding = "follow_llm"
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.providers.openrouter.api_key = "synthetic-image-key"
+    cfg.llm = LlmProviderConfig(
+        provider="openai",
+        model="gpt-test",
+        api_key="synthetic-openai-key",
+    )
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.OPTIONAL
+    assert status.image_generation_state["mode"] == "follow_llm"
+    assert status.image_generation_state["operatorManaged"] is False
+    assert status.image_generation_state["effective"] == {
+        "enabled": False,
+        "available": False,
+        "dormant": True,
+        "providerId": "openrouter",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+        "credentialSource": "none",
+        "credentialOwner": "none",
+        "reason": "active_provider_mismatch",
+    }
+    recommendation = status.image_generation_state["recommendation"]
+    assert recommendation["providerId"] == "openai"
+    assert recommendation["canReuseCredential"] is True
+
+    cfg.llm = LlmProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    restored = get_onboarding_status(cfg)
+    assert image_generation_section_status(cfg) is SectionStatus.OK
+    assert restored.image_generation_state["effective"]["dormant"] is False
+    assert restored.image_generation_state["effective"]["available"] is True
+
+
+def test_follow_llm_image_generation_reuses_resolved_llm_env_reference(
+    cfg,
+    monkeypatch,
+):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("CUSTOM_OPENROUTER_KEY", "synthetic-env-key")
+    cfg.image_generation.enabled = True
+    cfg.image_generation.binding = "follow_llm"
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.llm = LlmProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-test",
+        api_key_env="CUSTOM_OPENROUTER_KEY",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.OK
+    assert status.image_generation_source == "llm_fallback"
+    assert status.image_generation_env_key == "CUSTOM_OPENROUTER_KEY"
+    assert status.image_generation_state["effective"]["available"] is True
+
+
+def test_follow_llm_image_generation_is_dormant_for_custom_same_provider_endpoint(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.binding = "follow_llm"
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.providers.openrouter.api_key = "synthetic-image-key"
+    cfg.llm = LlmProviderConfig(
+        provider="openrouter",
+        model="compatible-model",
+        api_key="synthetic-llm-key",
+        base_url="https://compatible.example.test/v1",
+    )
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.OPTIONAL
+    assert status.image_generation_state["effective"]["dormant"] is True
+    assert status.image_generation_state["effective"]["available"] is False
+    assert status.image_generation_state["recommendation"] == {
+        "providerId": "tokenrhythm",
+        "reason": "recommended_standalone",
+        "canReuseCredential": False,
+        "actionRequired": True,
+    }
+
+
+def test_follow_llm_image_generation_reports_missing_llm_env_reference(
+    cfg,
+    monkeypatch,
+):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("CUSTOM_OPENROUTER_KEY", raising=False)
+    cfg.image_generation.enabled = True
+    cfg.image_generation.binding = "follow_llm"
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.llm = LlmProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-test",
+        api_key_env="CUSTOM_OPENROUTER_KEY",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+    assert status.image_generation_source == "missing_env"
+    assert status.image_generation_env_key == "CUSTOM_OPENROUTER_KEY"
+    assert status.image_generation_state["effective"]["available"] is False
+
+
 def test_image_generation_unknown_provider_reference_is_unknown(cfg, monkeypatch):
     cfg.image_generation.enabled = True
     cfg.image_generation.primary = "no-such-provider/no-such-model"

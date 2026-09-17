@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
+
 
 class Surface(StrEnum):
     """Chat surface that may render a slash command.
@@ -386,6 +390,24 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=90,
     ),
     CommandDef(
+        name="/routing",
+        usage="/routing [direct|router|ensemble]",
+        description="Choose or inspect the current session's model routing.",
+        execution={
+            _T: _local("session.routing"),
+            _S: _local("session.routing"),
+        },
+        argument_choices=(
+            ArgumentChoice("direct", "Use the selected model directly from the next turn."),
+            ArgumentChoice("router", "Use Squilla Router from the next turn."),
+            ArgumentChoice("ensemble", "Use Model Ensemble from the next turn."),
+        ),
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.NEXT_TURN,
+        presentation=CommandPresentation.PICKER,
+        order=19,
+    ),
+    CommandDef(
         name="/strategy",
         usage="/strategy [direct|router|ensemble|status]",
         description="Choose or inspect the shared model strategy.",
@@ -569,6 +591,19 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=180,
     ),
     CommandDef(
+        name="/goal",
+        usage="/goal [status|clear [--confirm]|pause|resume|<description>]",
+        description="Set a long-running goal for the agent to pursue.",
+        execution={
+            _T: _local("goal.set"),
+            _W: _local("goal.set"),
+        },
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.NOTICE,
+        order=185,
+    ),
+    CommandDef(
         name="/permissions",
         usage="/permissions [mode]",
         description="Show or set the session permission override.",
@@ -605,7 +640,7 @@ _COMMANDS: tuple[CommandDef, ...] = (
         name="/sessions",
         usage="/sessions [limit]",
         description="List recent sessions.",
-        execution={_T: _local("sessions.list")},
+        execution={_T: _local(SESSIONS_LIST_METHOD)},
         category=CommandCategory.NAVIGATION,
         busy_policy=CommandBusyPolicy.IMMEDIATE,
         presentation=CommandPresentation.PICKER,
@@ -663,19 +698,18 @@ _COMMANDS: tuple[CommandDef, ...] = (
     ),
     CommandDef(
         name="/sandbox",
-        usage="/sandbox <standard|trusted|full>",
+        usage="/sandbox <safe|full>",
         description="Set the channel session sandbox mode.",
         execution={_C: _rpc("sandbox.run_context.set", _sandbox_session_key)},
         argument_choices=(
-            ArgumentChoice("standard", "Use Standard-Sandbox for this channel session."),
-            ArgumentChoice("trusted", "Use Managed Execution for this channel session."),
+            ArgumentChoice("safe", "Use Safe mode for this channel session."),
             ArgumentChoice("full", "Use Full Host Access; channel admin only."),
         ),
     ),
     CommandDef(
         name="/meta",
-        usage="/meta [skill-name]",
-        description="List meta-skills, or run one with /meta <skill-name>.",
+        usage="/meta [skill-name] [request]",
+        description="List meta-skills, or run one with /meta <skill-name> [request].",
         execution={
             _W: _local("meta.menu"),
             _T: _local("meta.menu"),

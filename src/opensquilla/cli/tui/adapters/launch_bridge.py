@@ -144,6 +144,11 @@ def quiet_logs_for_interactive_chat() -> None:
 
     import structlog  # noqa: PLC0415
 
+    from opensquilla.observability.log_privacy import (  # noqa: PLC0415
+        PrivateLogFormatter,
+        private_log_event,
+    )
+
     global _INTERACTIVE_STDLIB_LOG_HANDLER  # noqa: PLW0603 - process-wide logging sink
     global _INTERACTIVE_STRUCTLOG_FILE  # noqa: PLW0603 - process-wide logging sink
 
@@ -194,12 +199,16 @@ def quiet_logs_for_interactive_chat() -> None:
     _INTERACTIVE_STRUCTLOG_FILE = log_file
     _INTERACTIVE_STDLIB_LOG_HANDLER = logging.StreamHandler(log_file)
     _INTERACTIVE_STDLIB_LOG_HANDLER.setLevel(level)
-    _INTERACTIVE_STDLIB_LOG_HANDLER.setFormatter(
-        logging.Formatter("%(levelname)s:%(name)s:%(message)s")
-    )
+    _INTERACTIVE_STDLIB_LOG_HANDLER.setFormatter(PrivateLogFormatter())
     setattr(_INTERACTIVE_STDLIB_LOG_HANDLER, _INTERACTIVE_LOG_HANDLER_ATTR, True)
     root_logger.addHandler(_INTERACTIVE_STDLIB_LOG_HANDLER)
     structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            private_log_event,
+            structlog.processors.JSONRenderer(),
+        ],
         logger_factory=structlog.PrintLoggerFactory(file=log_file),
         wrapper_class=structlog.make_filtering_bound_logger(level),
     )

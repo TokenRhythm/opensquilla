@@ -4,6 +4,8 @@
   "description": "Compact git log --oneline output while preserving commits.",
   "match": {
     "argv0": ["git"],
+    "gitSubcommands": ["log"],
+    "argvIncludesBeforeDoubleDash": [["--oneline"]],
     "argvIncludes": [["log"], ["--oneline"]]
   },
   "transforms": {

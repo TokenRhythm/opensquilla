@@ -9,7 +9,8 @@ test.describe('Chat parity controls', () => {
 
     await page.getByRole('button', { name: 'More' }).click()
     await expect(page.getByRole('menuitem', { name: 'Composer settings' })).toHaveCount(0)
-    await expect(page.locator('.chat-more-actions-menu [role="menuitem"]')).toHaveCount(2)
+    await expect(page.locator('.chat-more-actions-menu [role="menuitem"]')).toHaveCount(3)
     await expect(page.getByRole('menuitem', { name: 'Export as Markdown' })).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: 'Prompt cache keepalive' })).toBeDisabled()
   })
 })

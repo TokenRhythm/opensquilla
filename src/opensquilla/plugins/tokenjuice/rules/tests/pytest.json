@@ -5,6 +5,7 @@
   "counterSource": "preKeep",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["pytest"],
     "commandIncludes": ["pytest"]
   },
   "transforms": {

@@ -54,6 +54,7 @@ describe('UserMessage steer status', () => {
     const { app, host } = await renderDisposition(disposition)
 
     const status = host.querySelector('.msg-user-steer-status')
+    expect(host.querySelector('.msg-user')?.classList.contains('msg-user--steer')).toBe(true)
     expect(status?.textContent).toContain(label)
     expect(status?.classList.contains(`msg-user-steer-status--${disposition}`)).toBe(true)
     app.unmount()

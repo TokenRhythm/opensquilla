@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import tomllib
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from functools import cache
 from importlib import resources
 from typing import Any, Literal
@@ -21,13 +22,46 @@ from .models_dev import lookup_limits as _models_dev_limits
 from .models_dev import lookup_model as _models_dev_model
 from .ollama import _OLLAMA_DEFAULT_NUM_CTX
 from .registry import LOCAL_RUNTIME_PROVIDERS
-from .types import ModelCapabilities, ModelInfo
+from .tokenrhythm_catalog import (
+    TOKENRHYTHM_API_BASE_URL,
+    TokenRhythmCatalogEntries,
+    TokenRhythmDeclaredModel,
+    TokenRhythmModelMetadata,
+    TokenRhythmPublishedModel,
+    canonical_tokenrhythm_base_url,
+    is_official_tokenrhythm_endpoint,
+    tokenrhythm_authority_identity,
+)
+from .types import ModelCapabilities, ModelInfo, VisionSupport
 
 log = structlog.get_logger(__name__)
 
 DEFAULT_MAX_TOKENS = 16384
 SAFE_OPENROUTER_DEFAULT_MAX_TOKENS = 8192
 DEFAULT_CONTEXT_WINDOW = 200_000
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentModelLimits:
+    """Automatic limits for one physical provider deployment.
+
+    ``max_output_tokens_known`` distinguishes a provider/model fact from the
+    generic 16K compatibility default.  Physical fallback may clamp only when
+    this flag is true.
+    """
+
+    context_window: int
+    max_output_tokens: int
+    max_output_tokens_known: bool
+    context_window_known: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _TokenRhythmSnapshotSidecars:
+    """One atomically replaceable, authority-scoped normalized snapshot."""
+
+    published: dict[str, TokenRhythmPublishedModel]
+    declared_by_authority: dict[str, dict[str, TokenRhythmDeclaredModel]]
 
 # Layer attribution for the ``*_with_source`` resolver variants. "override"
 # is an explicit operator value (caller-supplied for max_tokens, the
@@ -91,6 +125,13 @@ _SYNTHESIZED_DEFAULTS: dict[str, Any] = {
     "supports_tools": True,
     "supports_reasoning": False,
 }
+
+_USER_PRICE_FIELDS = (
+    "input_cost_per_mtok",
+    "output_cost_per_mtok",
+    "cache_read_cost_per_mtok",
+    "cache_write_cost_per_mtok",
+)
 
 # Protocol variants that share one service-side model catalog. User and live
 # overrides remain keyed to the exact configured provider; only packaged
@@ -191,9 +232,10 @@ def _corrections_budget_fallback(model_id: str) -> tuple[int, int] | None:
     basename — the requested id and every exact (non-glob) corrections row
     key are normalized to the basename after the final ``/``, so a model
     resolves identically whether referenced bare (``moonshot-v1-8k``) or
-    provider-qualified (``moonshot/moonshot-v1-8k``), and regardless of which
-    provider table carries the row. Glob rows belong to the capability
-    ladder and are never consulted for budgets.
+    provider-qualified (``moonshot/moonshot-v1-8k``). Glob rows belong to the
+    capability ladder and are never consulted for budgets. Provider tables
+    that intentionally preserve platform-published raw policy inputs (currently
+    TokenRhythm) remain scoped and are excluded from this compatibility layer.
 
     When several rows share a basename, the per-dimension minimum wins —
     over-estimating a context window causes silent server-side truncation,
@@ -206,7 +248,15 @@ def _corrections_budget_fallback(model_id: str) -> tuple[int, int] | None:
     max_outputs: list[int] = []
     windows: list[int] = []
     matched = False
-    for table in _corrections_tables().values():
+    for corrections_provider, table in _corrections_tables().items():
+        if corrections_provider == "tokenrhythm":
+            # These rows deliberately preserve the website's raw published
+            # limits, including output ceilings that nearly equal the shared
+            # context window. They are provider-scoped policy inputs and must
+            # never become a bare-id budget for an unrelated provider. The
+            # TokenRhythm resolver applies its half-window execution policy
+            # after selecting the exact provider row above.
+            continue
         for key, entry in table.items():
             if any(marker in key for marker in "*?["):
                 continue
@@ -232,9 +282,9 @@ def _corrections_budget_fallback(model_id: str) -> tuple[int, int] | None:
 def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
     """Fields the live provider catalog knows, adapted per-1k → per-Mtok.
 
-    Capability booleans are computed deterministically from the provider
-    response at populate time, so they are emitted as known whenever the
-    model is in the cache. A 0.0 per-1k price is the live cache's "free or
+    Vision is known only when the provider actually supplied input modalities;
+    the compatibility boolean default is not evidence of a text-only model.
+    A 0.0 per-1k price is the live cache's "free or
     unknown" sentinel, so costs are emitted only when positive — this layer
     never claims a known $0 price.
     """
@@ -243,8 +293,9 @@ def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "supports_reasoning": info.supports_reasoning,
         "supports_tools": info.supports_tools,
-        "supports_vision": info.supports_vision,
     }
+    if "supports_vision" in info.model_fields_set:
+        fields["supports_vision"] = info.supports_vision
     if info.display_name:
         fields["display_name"] = info.display_name
     if info.context_window > 0:
@@ -289,6 +340,24 @@ def _corrections_layer_fields(provider_id: str, model_id: str) -> dict[str, Any]
             for name, value in entry.items():
                 fields.setdefault(name, value)
     return fields
+
+
+def _exact_corrections_layer_fields(
+    provider_id: str,
+    model_id: str,
+) -> dict[str, Any]:
+    """Return only the exact packaged row for capability provenance checks."""
+
+    if not provider_id:
+        return {}
+    provider_l = _CORRECTIONS_PROVIDER_ALIASES.get(
+        provider_id.strip().lower(),
+        provider_id.strip().lower(),
+    )
+    model_l = model_id.strip().lower()
+    if not model_l:
+        return {}
+    return dict(_corrections_tables().get(provider_l, {}).get(model_l) or {})
 
 
 def _snapshot_layer_fields(provider_id: str, model_id: str) -> dict[str, Any]:
@@ -371,6 +440,7 @@ class ModelCatalog:
         # User-override layer for resolve_entry; keys are lowercased
         # "provider/model" or bare model ids (see set_user_overrides).
         self._user_overrides: dict[str, dict[str, Any]] = {}
+        self._capacity_endpoint_identities: dict[str, str] = {}
         # Provider-scoped live layer: boot-time ingest of a provider's own
         # public model listing (see provider/live_catalog.py). Keyed
         # provider -> lowercased model id -> validated entry fields.
@@ -379,6 +449,20 @@ class ModelCatalog:
         # so aggregator rows placed there would leak windows into other
         # providers' resolutions of the same bare ids.
         self._live_provider_entries: dict[str, dict[str, dict[str, Any]]] = {}
+        # Typed provider facts kept outside the compatibility entry projection.
+        # TokenRhythm needs both the public website record and the authenticated
+        # declaration; neither should be flattened into a single lossy row.
+        self._provider_model_metadata: dict[str, dict[str, Any]] = {}
+        # Runtime fallback must resolve an authenticated declaration against
+        # the exact credential authority that will serve the physical leg.
+        # Keep the key-independent public facts and every persisted authority's
+        # normalized declaration in one replace-only object; the active RPC
+        # compatibility projection above remains intentionally separate.
+        self._tokenrhythm_snapshot_sidecars = _TokenRhythmSnapshotSidecars(
+            published={},
+            declared_by_authority={},
+        )
+        self._warned_max_token_overrides: set[tuple[str, str, int, int]] = set()
 
     def __len__(self) -> int:
         return len(self._models)
@@ -391,21 +475,32 @@ class ModelCatalog:
                 continue
             top_provider = m.get("top_provider") or {}
             max_completion = top_provider.get("max_completion_tokens") or 0
+            context_windows = [
+                value for value in (m.get("context_length"), top_provider.get("context_length"))
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            ]
             supported = set(m.get("supported_parameters", []))
             architecture = m.get("architecture") or {}
-            input_modalities = {
-                str(item).lower() for item in architecture.get("input_modalities", [])
-            }
+            modalities = architecture.get("input_modalities")
+            vision_fields: dict[str, Any] = {}
+            if (
+                isinstance(modalities, list)
+                and modalities
+                and all(isinstance(item, str) and item.strip() for item in modalities)
+            ):
+                vision_fields["supports_vision"] = "image" in {
+                    item.strip().lower() for item in modalities
+                }
             pricing = m.get("pricing") or {}
             self._models[model_id] = ModelInfo(
                 provider="openrouter",
                 model_id=model_id,
                 display_name=m.get("name", model_id),
-                context_window=m.get("context_length", 0),
+                context_window=min(context_windows) if context_windows else 0,
                 max_output_tokens=max_completion,
                 supports_reasoning="reasoning" in supported or "reasoning_effort" in supported,
                 supports_tools="tools" in supported or "tool_choice" in supported,
-                supports_vision="image" in input_modalities,
+                **vision_fields,
                 input_cost_per_1k=_price_per_1k(pricing.get("prompt")),
                 output_cost_per_1k=_price_per_1k(pricing.get("completion")),
             )
@@ -501,6 +596,120 @@ class ModelCatalog:
         # (the transcribed capability ladder) > snapshot > synthesized.
         return _capabilities_from_entry(self.resolve_entry(model_id, provider=provider_name))
 
+    def tool_capability_is_verified(
+        self,
+        model_id: str,
+        *,
+        provider_name: str = "openrouter",
+        base_url: str = "",
+    ) -> bool:
+        """Return whether ``supports_tools`` came from an authoritative layer.
+
+        ``resolve_entry`` deliberately synthesizes ``supports_tools=True`` for
+        unknown models so agent turns keep their authorized tool surface. This
+        helper answers provenance, not authorization or capability admission,
+        and stays false unless a user override, live catalog, packaged
+        correction, snapshot, or a trusted host rule explicitly supplied the
+        tools flag. Callers must not turn an unverified value into a tools
+        denial; only an explicit ``supports_tools=False`` does that.
+        """
+
+        provider_id = str(provider_name or "").strip().lower()
+        model_l = str(model_id or "").strip().lower()
+        base_l = str(base_url or "").strip().lower()
+        if (
+            provider_id in {"anthropic", "ollama"}
+            and not CATALOG_CAPABILITIES_FOR_ANTHROPIC_OLLAMA
+        ):
+            return False
+        if provider_id == "openai" and "deepseek" in base_l:
+            return True
+        if (
+            provider_id == "openai"
+            and "api.openai.com" in base_l
+            and model_l.startswith(("gpt-5", "o1", "o3", "o4"))
+        ):
+            return True
+        layers = (
+            self._user_override_fields(model_id, provider_id),
+            self._live_provider_fields(model_id, provider_id),
+            _live_layer_fields(self._models.get(model_id)),
+            _exact_corrections_layer_fields(provider_id, model_id),
+            _snapshot_layer_fields(provider_id, model_id),
+        )
+        return any(
+            isinstance(fields.get("supports_tools"), bool) for fields in layers
+        )
+
+    def deployment_tool_capability_is_verified(
+        self,
+        model_id: str,
+        *,
+        provider: str,
+        api_key: str = "",
+        base_url: str = "",
+    ) -> bool:
+        """Resolve tool-capability provenance for one physical deployment."""
+
+        provider_id = str(provider or "").strip().lower()
+        if provider_id != "tokenrhythm":
+            return self.tool_capability_is_verified(
+                model_id,
+                provider_name=provider_id,
+                base_url=base_url,
+            )
+
+        effective_base = str(base_url or "").strip() or TOKENRHYTHM_API_BASE_URL
+        canonical_base = canonical_tokenrhythm_base_url(effective_base)
+        official_endpoint = bool(
+            canonical_base and is_official_tokenrhythm_endpoint(canonical_base)
+        )
+        authority = tokenrhythm_authority_identity(
+            provider=provider_id,
+            base_url=canonical_base,
+            api_key=api_key,
+        )
+        model_l = str(model_id or "").strip().lower()
+        snapshot = self._tokenrhythm_snapshot_sidecars
+        published = snapshot.published.get(model_l) if official_endpoint else None
+        declared = (
+            snapshot.declared_by_authority.get(authority, {}).get(model_l)
+            if authority is not None
+            else None
+        )
+        deployment_fields: dict[str, Any] = {}
+        declared_tools = (
+            getattr(declared.capabilities, "tools", None)
+            if declared is not None
+            else None
+        )
+        published_tools = (
+            getattr(published.capabilities, "tools", None)
+            if published is not None
+            else None
+        )
+        if isinstance(declared_tools, bool):
+            deployment_fields["supports_tools"] = declared_tools
+        elif isinstance(published_tools, bool):
+            deployment_fields["supports_tools"] = published_tools
+        layers = (
+            self._user_override_fields(model_id, provider_id),
+            deployment_fields,
+            (
+                _exact_corrections_layer_fields(provider_id, model_id)
+                if official_endpoint
+                else {}
+            ),
+            (
+                _snapshot_layer_fields(provider_id, model_id)
+                if official_endpoint
+                else {}
+            ),
+        )
+        return any(
+            isinstance(fields.get("supports_tools"), bool) for fields in layers
+        )
+
     async def fetch_openrouter(self, api_key: str, base_url: str, proxy: str = "") -> None:
         """Fetch model list from OpenRouter /api/v1/models endpoint.
 
@@ -565,6 +774,23 @@ class ModelCatalog:
                     fields.setdefault(name, value)
         return fields
 
+    def user_override_price_fields(self, model: str, *, provider: str = "") -> dict[str, float]:
+        """Return only explicit user price fields for one provider/model pair.
+
+        The provider-qualified override takes precedence over a bare model-id
+        override, matching :meth:`resolve_entry`. Lower catalog layers are
+        deliberately excluded so callers can distinguish operator-authored
+        pricing from a same-named marketplace model.
+        """
+        fields = self._user_override_fields(
+            str(model or ""), (provider or "").strip().lower()
+        )
+        return {
+            name: float(value)
+            for name in _USER_PRICE_FIELDS
+            if (value := fields.get(name)) is not None
+        }
+
     def set_live_provider_entries(
         self, provider_id: str, entries: Mapping[str, Mapping[str, Any]]
     ) -> None:
@@ -581,6 +807,43 @@ class ModelCatalog:
         provider_l = (provider_id or "").strip().lower()
         if not provider_l:
             return
+        if provider_l == "tokenrhythm" and isinstance(entries, TokenRhythmCatalogEntries):
+            current_sidecars = self._tokenrhythm_snapshot_sidecars
+            self._tokenrhythm_snapshot_sidecars = _TokenRhythmSnapshotSidecars(
+                published={
+                    str(model_id).strip().lower(): model
+                    for model_id, model in entries.published.items()
+                    if str(model_id).strip()
+                },
+                declared_by_authority=current_sidecars.declared_by_authority,
+            )
+            existing = self._provider_model_metadata.get(provider_l, {})
+            metadata: dict[str, TokenRhythmModelMetadata] = {}
+            for model_id, published in entries.published.items():
+                previous = existing.get(model_id.strip().lower())
+                declared = (
+                    previous.declared
+                    if isinstance(previous, TokenRhythmModelMetadata)
+                    else None
+                )
+                metadata[model_id] = TokenRhythmModelMetadata(
+                    published=published,
+                    declared=declared,
+                )
+            published_ids = {key.lower() for key in metadata}
+            # Auth-only declarations remain useful when the public listing is
+            # temporarily incomplete; public-only rows never grant entitlement.
+            for model_id, previous in existing.items():
+                if (
+                    model_id not in published_ids
+                    and isinstance(previous, TokenRhythmModelMetadata)
+                    and previous.declared is not None
+                ):
+                    metadata[model_id] = TokenRhythmModelMetadata(
+                        published=None,
+                        declared=previous.declared,
+                    )
+            self.set_provider_model_metadata(provider_l, metadata)
         table: dict[str, dict[str, Any]] = {}
         for model_key, fields in entries.items():
             entry: dict[str, Any] = {}
@@ -598,6 +861,527 @@ class ModelCatalog:
                 table[str(model_key).strip().lower()] = entry
         self._live_provider_entries[provider_l] = table
 
+    def set_provider_model_metadata(
+        self, provider_id: str, entries: Mapping[str, Any]
+    ) -> None:
+        """Atomically replace one provider's typed metadata sidecar.
+
+        The values are provider-owned normalized objects, never upstream raw
+        JSON.  TokenRhythm callers pass :class:`TokenRhythmModelMetadata`.
+        Keeping this sidecar independent from ``ModelCatalogEntry`` preserves
+        tri-state booleans and public/auth provenance while old callers keep
+        consuming the flat compatibility record.
+        """
+        provider_l = (provider_id or "").strip().lower()
+        if not provider_l:
+            return
+        table: dict[str, Any] = {}
+        for model_id, metadata in entries.items():
+            model_l = str(model_id).strip().lower()
+            if not model_l:
+                continue
+            if provider_l == "tokenrhythm" and not isinstance(
+                metadata, TokenRhythmModelMetadata
+            ):
+                log.warning(
+                    "model_catalog.provider_metadata_bad_entry",
+                    provider=provider_l,
+                    model=str(model_id),
+                )
+                continue
+            table[model_l] = metadata
+        self._provider_model_metadata[provider_l] = table
+
+    def get_provider_model_metadata(
+        self, model_id: str, provider: str = ""
+    ) -> Any | None:
+        provider_l = (provider or "").strip().lower()
+        model_l = (model_id or "").strip().lower()
+        return self._provider_model_metadata.get(provider_l, {}).get(model_l)
+
+    def provider_model_metadata(self, provider: str) -> dict[str, Any]:
+        """Return a shallow copy of one provider's normalized metadata map."""
+        provider_l = (provider or "").strip().lower()
+        return dict(self._provider_model_metadata.get(provider_l, {}))
+
+    def set_tokenrhythm_snapshot_sidecars(
+        self,
+        *,
+        published: Mapping[str, TokenRhythmPublishedModel],
+        declared_by_authority: Mapping[
+            str, Mapping[str, TokenRhythmDeclaredModel]
+        ],
+    ) -> None:
+        """Atomically replace normalized TokenRhythm snapshot sidecars.
+
+        Authorities are opaque, secret-free SHA-256 identities.  Invalid
+        identities and mistyped records are ignored without logging their
+        values, keeping snapshot corruption from becoming an identity oracle.
+        The returned runtime lookup never exposes an authority outside this
+        object and never falls back to a different authority's declaration.
+        """
+
+        normalized_published = {
+            str(model_id).strip().lower(): model
+            for model_id, model in published.items()
+            if str(model_id).strip()
+            and isinstance(model, TokenRhythmPublishedModel)
+        }
+        normalized_declared: dict[
+            str, dict[str, TokenRhythmDeclaredModel]
+        ] = {}
+        for raw_authority, models in declared_by_authority.items():
+            authority = str(raw_authority or "").strip().lower()
+            if len(authority) != 64 or any(
+                char not in "0123456789abcdef" for char in authority
+            ):
+                continue
+            normalized_models = {
+                str(model_id).strip().lower(): model
+                for model_id, model in models.items()
+                if str(model_id).strip()
+                and isinstance(model, TokenRhythmDeclaredModel)
+            }
+            normalized_declared[authority] = normalized_models
+        self._tokenrhythm_snapshot_sidecars = _TokenRhythmSnapshotSidecars(
+            published=normalized_published,
+            declared_by_authority=normalized_declared,
+        )
+
+    def tokenrhythm_declared_for_authority(
+        self,
+        model_id: str,
+        authority_identity: str,
+    ) -> TokenRhythmDeclaredModel | None:
+        """Return one exact authority's declaration without cross-key fallback."""
+
+        snapshot = self._tokenrhythm_snapshot_sidecars
+        return snapshot.declared_by_authority.get(
+            str(authority_identity or "").strip().lower(), {}
+        ).get(str(model_id or "").strip().lower())
+
+    def tokenrhythm_published_snapshot(
+        self,
+    ) -> dict[str, TokenRhythmPublishedModel]:
+        """Return key-independent normalized public facts, detached from active RPC state."""
+
+        return dict(self._tokenrhythm_snapshot_sidecars.published)
+
+    def resolve_deployment_limits(
+        self,
+        model_id: str,
+        *,
+        provider: str,
+        api_key: str = "",
+        base_url: str = "",
+        proxy: str = "",
+        logical_max_tokens_override: int = 0,
+    ) -> DeploymentModelLimits:
+        """Resolve automatic limits for one physical provider deployment.
+
+        TokenRhythm is authority-sensitive: an exact authenticated sidecar is
+        used only when the provider/base/key identity matches.  Missing exact
+        LKG data falls back to key-independent public/correction facts, never
+        another key's declaration.  Custom endpoints skip the official public
+        snapshot entirely. ``proxy`` is accepted as part of the deployment
+        lookup contract even though it does not change provider declarations.
+        """
+
+        del proxy
+        provider_id = str(provider or "").strip().lower()
+        if provider_id != "tokenrhythm":
+            max_tokens, source = self.resolve_max_tokens_with_source(
+                model_id,
+                user_override=0,
+                provider=provider_id,
+            )
+            context_window, context_source = self.resolve_context_window_with_source(
+                model_id, provider_id,
+            )
+            return DeploymentModelLimits(
+                context_window=context_window,
+                max_output_tokens=max_tokens,
+                max_output_tokens_known=source in {"catalog", "override"},
+                context_window_known=(
+                    context_source in {"catalog", "override"}
+                    or provider_id in LOCAL_RUNTIME_PROVIDERS
+                ),
+            )
+
+        model_l = str(model_id or "").strip().lower()
+        effective_base = str(base_url or "").strip() or TOKENRHYTHM_API_BASE_URL
+        canonical_base = canonical_tokenrhythm_base_url(effective_base)
+        official_endpoint = bool(
+            canonical_base
+            and is_official_tokenrhythm_endpoint(canonical_base)
+        )
+        authority = tokenrhythm_authority_identity(
+            provider=provider_id,
+            base_url=canonical_base,
+            api_key=api_key,
+        )
+        snapshot = self._tokenrhythm_snapshot_sidecars
+        published = snapshot.published.get(model_l) if official_endpoint else None
+        declared = (
+            snapshot.declared_by_authority.get(authority, {}).get(model_l)
+            if authority is not None
+            else None
+        )
+
+        def positive(value: object) -> int | None:
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+            return None
+
+        declared_context = positive(
+            declared.context_window if declared is not None else None
+        )
+        published_context = positive(
+            published.context_window if published is not None else None
+        )
+        declared_max = positive(
+            declared.max_output_tokens if declared is not None else None
+        )
+        published_max = positive(
+            published.max_output_tokens if published is not None else None
+        )
+        provider_budget = (
+            _provider_corrections_budget(provider_id, model_id)
+            if official_endpoint
+            else None
+        )
+        snapshot_limits = (
+            _models_dev_limits(provider_id, model_id)
+            if official_endpoint
+            else None
+        )
+        generic_budget = (
+            _corrections_budget_fallback(model_id)
+            if official_endpoint
+            else None
+        )
+
+        context_override = self.user_context_window_override(model_id, provider_id)
+        context_known = True
+        if context_override is not None:
+            context_window = context_override
+        elif official_contexts := [
+            value
+            for value in (declared_context, published_context)
+            if value is not None
+        ]:
+            context_window = min(official_contexts)
+        elif provider_budget is not None and provider_budget[1] > 0:
+            context_window = provider_budget[1]
+        elif snapshot_limits is not None and snapshot_limits[1] > 0:
+            context_window = snapshot_limits[1]
+        elif generic_budget is not None and generic_budget[1] > 0:
+            context_window = generic_budget[1]
+        else:
+            context_window = DEFAULT_CONTEXT_WINDOW
+            context_known = False
+
+        override_fields = self._user_override_fields(model_id, provider_id)
+        override_max = override_fields.get("max_output_tokens")
+        override_max_value = positive(override_max)
+        using_override = override_max_value is not None
+        official_maxima = [
+            value
+            for value in (declared_max, published_max)
+            if value is not None
+        ]
+        logical_override = (
+            logical_max_tokens_override
+            if isinstance(logical_max_tokens_override, int)
+            and not isinstance(logical_max_tokens_override, bool)
+            and logical_max_tokens_override > 0
+            else 0
+        )
+        if official_maxima and logical_override > min(official_maxima):
+            provider_cap = min(official_maxima)
+            warning_key = (
+                provider_id,
+                model_id,
+                logical_override,
+                provider_cap,
+            )
+            if warning_key not in self._warned_max_token_overrides:
+                self._warned_max_token_overrides.add(warning_key)
+                log.warning(
+                    "model_catalog.max_tokens_override_exceeds_provider_cap",
+                    provider=provider_id,
+                    model=model_id,
+                    configured_max_tokens=logical_override,
+                    provider_cap=provider_cap,
+                    declared_max_tokens=declared_max,
+                    published_max_tokens=published_max,
+                )
+        if using_override:
+            assert override_max_value is not None
+            effective_max = override_max_value
+            max_known = True
+            if official_maxima and effective_max > min(official_maxima):
+                provider_cap = min(official_maxima)
+                warning_key = (
+                    provider_id,
+                    model_id,
+                    effective_max,
+                    provider_cap,
+                )
+                if warning_key not in self._warned_max_token_overrides:
+                    self._warned_max_token_overrides.add(warning_key)
+                    log.warning(
+                        "model_catalog.max_tokens_override_exceeds_provider_cap",
+                        provider=provider_id,
+                        model=model_id,
+                        configured_max_tokens=effective_max,
+                        provider_cap=provider_cap,
+                        declared_max_tokens=declared_max,
+                        published_max_tokens=published_max,
+                    )
+        elif official_maxima:
+            effective_max = min(official_maxima)
+            max_known = True
+        elif provider_budget is not None and provider_budget[0] > 0:
+            effective_max = provider_budget[0]
+            max_known = True
+        elif snapshot_limits is not None and snapshot_limits[0] > 0:
+            effective_max = snapshot_limits[0]
+            max_known = True
+        elif generic_budget is not None and generic_budget[0] > 0:
+            effective_max = generic_budget[0]
+            max_known = True
+        else:
+            effective_max = DEFAULT_MAX_TOKENS
+            max_known = False
+
+        if context_window > 0:
+            effective_max = min(effective_max, context_window)
+            if (
+                not using_override
+                and effective_max >= context_window - DEFAULT_MAX_TOKENS
+            ):
+                effective_max = min(
+                    effective_max,
+                    max(1, context_window // 2),
+                )
+        return DeploymentModelLimits(
+            context_window=context_window,
+            max_output_tokens=effective_max,
+            max_output_tokens_known=max_known,
+            context_window_known=context_known,
+        )
+
+    def resolve_vision_support(
+        self,
+        model_id: str,
+        *,
+        provider_name: str = "",
+        base_url: str = "",
+    ) -> VisionSupport:
+        """Resolve per-field vision evidence without treating defaults as facts."""
+
+        provider_id = str(provider_name or "").strip().lower()
+        model_id = str(model_id or "").strip()
+        openrouter_live_fields = (
+            _live_layer_fields(self._models.get(model_id))
+            if provider_id in {"", "openrouter"}
+            else {}
+        )
+        layers = (
+            self._user_override_fields(model_id, provider_id),
+            self._live_provider_fields(model_id, provider_id),
+            openrouter_live_fields,
+            _corrections_layer_fields(provider_id, model_id),
+            _snapshot_layer_fields(provider_id, model_id),
+        )
+        for fields in layers:
+            value = fields.get("supports_vision")
+            if isinstance(value, bool):
+                return "supported" if value else "unsupported"
+        return "unknown"
+
+    def resolve_deployment_vision_support(
+        self,
+        model_id: str,
+        *,
+        provider: str,
+        api_key: str = "",
+        base_url: str = "",
+        proxy: str = "",
+    ) -> VisionSupport:
+        """Resolve exact deployment vision evidence for selector legs."""
+
+        del proxy  # Identity is represented by the provider's catalog authority.
+        provider_id = str(provider or "").strip().lower()
+        if provider_id != "tokenrhythm":
+            return self.resolve_vision_support(
+                model_id,
+                provider_name=provider_id,
+                base_url=base_url,
+            )
+
+        effective_base = str(base_url or "").strip() or TOKENRHYTHM_API_BASE_URL
+        canonical_base = canonical_tokenrhythm_base_url(effective_base)
+        official_endpoint = bool(
+            canonical_base and is_official_tokenrhythm_endpoint(canonical_base)
+        )
+        authority = tokenrhythm_authority_identity(
+            provider=provider_id,
+            base_url=canonical_base,
+            api_key=api_key,
+        )
+        model_l = str(model_id or "").strip().lower()
+        snapshot = self._tokenrhythm_snapshot_sidecars
+        declared = (
+            snapshot.declared_by_authority.get(authority, {}).get(model_l)
+            if authority is not None
+            else None
+        )
+        published = snapshot.published.get(model_l) if official_endpoint else None
+        deployment_value = None
+        if declared is not None:
+            deployment_value = declared.capabilities.vision
+        if deployment_value is None and published is not None:
+            deployment_value = published.capabilities.vision
+
+        layers = (
+            self._user_override_fields(str(model_id or "").strip(), provider_id),
+            {"supports_vision": deployment_value}
+            if isinstance(deployment_value, bool)
+            else {},
+            _corrections_layer_fields(provider_id, model_id)
+            if official_endpoint
+            else {},
+            _snapshot_layer_fields(provider_id, model_id)
+            if official_endpoint
+            else {},
+        )
+        for fields in layers:
+            value = fields.get("supports_vision")
+            if isinstance(value, bool):
+                return "supported" if value else "unsupported"
+        return "unknown"
+
+    def resolve_deployment_capabilities(
+        self,
+        model_id: str,
+        *,
+        provider: str,
+        api_key: str = "",
+        base_url: str = "",
+    ) -> ModelCapabilities:
+        """Resolve capabilities without crossing TokenRhythm authorities."""
+
+        provider_id = str(provider or "").strip().lower()
+        if provider_id != "tokenrhythm":
+            return self.get_capabilities(
+                model_id,
+                provider_name=provider_id,
+                base_url=base_url,
+            )
+
+        effective_base = str(base_url or "").strip() or TOKENRHYTHM_API_BASE_URL
+        canonical_base = canonical_tokenrhythm_base_url(effective_base)
+        official_endpoint = bool(
+            canonical_base
+            and is_official_tokenrhythm_endpoint(canonical_base)
+        )
+        authority = tokenrhythm_authority_identity(
+            provider=provider_id,
+            base_url=canonical_base,
+            api_key=api_key,
+        )
+        model_l = str(model_id or "").strip().lower()
+        snapshot = self._tokenrhythm_snapshot_sidecars
+        published = snapshot.published.get(model_l) if official_endpoint else None
+        declared = (
+            snapshot.declared_by_authority.get(authority, {}).get(model_l)
+            if authority is not None
+            else None
+        )
+        deployment_fields: dict[str, Any] = {}
+        for capability_name, entry_name in (
+            ("reasoning", "supports_reasoning"),
+            ("tools", "supports_tools"),
+            ("vision", "supports_vision"),
+        ):
+            value = None
+            if declared is not None:
+                value = getattr(declared.capabilities, capability_name)
+            if value is None and published is not None:
+                value = getattr(published.capabilities, capability_name)
+            if isinstance(value, bool):
+                deployment_fields[entry_name] = value
+        streaming = None
+        if declared is not None:
+            streaming = declared.capabilities.streaming
+        if streaming is None and published is not None:
+            streaming = published.capabilities.streaming
+
+        packaged_capabilities = (
+            _corrections_layer_fields(provider_id, model_id)
+            if official_endpoint
+            else {}
+        )
+        snapshot_capabilities = (
+            _snapshot_layer_fields(provider_id, model_id)
+            if official_endpoint
+            else {}
+        )
+        layers: tuple[tuple[CatalogSource, dict[str, Any]], ...] = (
+            ("user", self._user_override_fields(model_id, provider_id)),
+            ("live", deployment_fields),
+            ("corrections", packaged_capabilities),
+            ("snapshot", snapshot_capabilities),
+        )
+        merged: dict[str, Any] = {}
+        source: CatalogSource = "synthesized"
+        for layer_source, fields in layers:
+            for name, value in fields.items():
+                if name not in merged:
+                    merged[name] = value
+                    if source == "synthesized":
+                        source = layer_source
+        for name, value in _SYNTHESIZED_DEFAULTS.items():
+            merged.setdefault(name, value)
+        capabilities = _capabilities_from_entry(
+            ModelCatalogEntry(
+                provider_id=provider_id,
+                model_id=model_id,
+                source=source,
+                **merged,
+            )
+        )
+        if isinstance(streaming, bool):
+            capabilities = replace(
+                capabilities,
+                supports_streaming=streaming,
+            )
+        return capabilities
+
+    def _tokenrhythm_declared_published_limits(
+        self, model_id: str
+    ) -> tuple[int | None, int | None, int | None, int | None]:
+        """Return declared/published output and context facts, preserving absence."""
+        metadata = self.get_provider_model_metadata(model_id, "tokenrhythm")
+        if not isinstance(metadata, TokenRhythmModelMetadata):
+            return None, None, None, None
+        declared = metadata.declared
+        published = metadata.published
+
+        def positive(value: object) -> int | None:
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+            return None
+
+        return (
+            positive(declared.max_output_tokens) if declared is not None else None,
+            positive(published.max_output_tokens) if published is not None else None,
+            positive(declared.context_window) if declared is not None else None,
+            positive(published.context_window) if published is not None else None,
+        )
+
     def _live_provider_fields(self, model_id: str, provider_id: str) -> dict[str, Any]:
         """Scoped live-layer fields for ``(provider, model)``, exact key only.
 
@@ -606,12 +1390,24 @@ class ModelCatalog:
         resolutions and other providers' scoped lookups can never see a
         foreign platform's rows.
         """
-        if not provider_id or not self._live_provider_entries:
+        if not provider_id:
             return {}
-        table = self._live_provider_entries.get(provider_id.strip().lower())
-        if not table:
-            return {}
-        return dict(table.get(model_id.strip().lower()) or {})
+        provider_l = provider_id.strip().lower()
+        model_l = model_id.strip().lower()
+        table = self._live_provider_entries.get(provider_l, {})
+        fields = dict(table.get(model_l) or {})
+        if provider_l == "tokenrhythm":
+            metadata = self.get_provider_model_metadata(model_l, provider_l)
+            if isinstance(metadata, TokenRhythmModelMetadata):
+                declared = metadata.declared
+                if declared is not None:
+                    for value, field_name in (
+                        (declared.capabilities.tools, "supports_tools"),
+                        (declared.capabilities.vision, "supports_vision"),
+                    ):
+                        if value is not None:
+                            fields[field_name] = value
+        return fields
 
     def resolve_entry(self, model: str, *, provider: str = "") -> ModelCatalogEntry:
         """Resolve one typed catalog entry through the layered sources.
@@ -668,7 +1464,8 @@ class ModelCatalog:
         return self.resolve_max_tokens_with_source(model_id, user_override, provider)[0]
 
     def resolve_max_tokens_with_source(
-        self, model_id: str, user_override: int = 0, provider: str = ""
+        self, model_id: str, user_override: int = 0, provider: str = "",
+        *, capacity_only: bool = False,
     ) -> tuple[int, MaxTokensSource]:
         """Resolve max_tokens and name the layer that decided the value.
 
@@ -683,7 +1480,8 @@ class ModelCatalog:
         the attribution: the source names the layer that supplied the
         pre-clamp candidate.
         """
-        context_window = self.resolve_context_window(model_id, provider)
+        provider_id = (provider or "").strip().lower()
+        context_window = self.resolve_context_window(model_id, provider_id)
         info = self._models.get(model_id)
         scoped_live = self._live_provider_fields(model_id, provider)
         scoped_max_output = int(scoped_live.get("max_output_tokens") or 0)
@@ -699,6 +1497,10 @@ class ModelCatalog:
         source: MaxTokensSource
         if using_user_override:
             effective = user_override
+            if isinstance(override_max, int) and override_max > 0:
+                # A request/member output budget cannot enlarge an explicitly
+                # configured model capability. Smaller request limits survive.
+                effective = min(effective, override_max)
             source = "override"
         elif isinstance(override_max, int) and override_max > 0:
             # A [models.*] operator override is authoritative for budgeting;
@@ -726,6 +1528,42 @@ class ModelCatalog:
             effective = DEFAULT_MAX_TOKENS
             source = "default"
 
+        declared_max: int | None = None
+        published_max: int | None = None
+        if provider_id == "tokenrhythm":
+            declared_max, published_max, _, _ = (
+                self._tokenrhythm_declared_published_limits(model_id)
+            )
+            official_caps = [
+                value for value in (declared_max, published_max) if value is not None
+            ]
+            if official_caps and not using_user_override:
+                # Public and authenticated documents are independent upstream
+                # facts. A conflict resolves conservatively for execution while
+                # both exact values remain available in typed metadata.
+                effective = min(official_caps)
+                source = "catalog"
+            elif official_caps and using_user_override:
+                provider_cap = min(official_caps)
+                if effective > provider_cap:
+                    warning_key = (provider_id, model_id, effective, provider_cap)
+                    if warning_key not in self._warned_max_token_overrides:
+                        self._warned_max_token_overrides.add(warning_key)
+                        log.warning(
+                            "model_catalog.max_tokens_override_exceeds_provider_cap",
+                            provider=provider_id,
+                            model=model_id,
+                            configured_max_tokens=effective,
+                            provider_cap=provider_cap,
+                            declared_max_tokens=declared_max,
+                            published_max_tokens=published_max,
+                        )
+
+        if capacity_only:
+            # Model configuration displays a capability, not the request's
+            # output reservation. Keep the same selection and source chain.
+            return effective, source
+
         # Clamp to context window. Some provider catalogs report a model's
         # max_completion_tokens as almost the entire context window; using that
         # value as max_tokens leaves no room for ordinary prompt/tool/image input
@@ -733,6 +1571,15 @@ class ModelCatalog:
         if context_window > 0:
             effective = min(effective, context_window)
             if (
+                provider_id == "tokenrhythm"
+                and not using_user_override
+                and effective >= context_window - DEFAULT_MAX_TOKENS
+            ):
+                # TokenRhythm publishes total-window-like output ceilings for
+                # several models. Preserve that published fact, but reserve
+                # half the shared window for input at execution time.
+                effective = min(effective, max(1, context_window // 2))
+            elif (
                 not using_user_override
                 and context_window > DEFAULT_MAX_TOKENS
                 and effective >= context_window - DEFAULT_MAX_TOKENS
@@ -779,6 +1626,18 @@ class ModelCatalog:
         override = self.user_context_window_override(model_id, provider)
         if override is not None:
             return override, "override"
+        provider_id = (provider or "").strip().lower()
+        if provider_id == "tokenrhythm":
+            _, _, declared_context, published_context = (
+                self._tokenrhythm_declared_published_limits(model_id)
+            )
+            official_windows = [
+                value
+                for value in (declared_context, published_context)
+                if value is not None
+            ]
+            if official_windows:
+                return min(official_windows), "catalog"
         scoped_live = self._live_provider_fields(model_id, provider)
         scoped_window = int(scoped_live.get("context_window") or 0)
         if scoped_window > 0:

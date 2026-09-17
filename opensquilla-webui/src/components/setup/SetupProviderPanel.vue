@@ -1,21 +1,24 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ControlSwitch from '@/components/ControlSwitch.vue'
 import SetupField from '@/components/SetupField.vue'
 import SetupNeedList from '@/components/SetupNeedList.vue'
 import SetupCommandBlock from '@/components/setup/SetupCommandBlock.vue'
 import SetupProviderCredentialCard from '@/components/setup/SetupProviderCredentialCard.vue'
 import SetupProviderRecommendation from '@/components/setup/SetupProviderRecommendation.vue'
+import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import SetupProviderCatalogDialog from '@/components/setup/SetupProviderCatalogDialog.vue'
+import SetupProviderMenu, { type ProviderMenuItem } from '@/components/setup/SetupProviderMenu.vue'
 import type {
   ConnectionState,
   DiscoveredModel,
   ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
+import type { ProviderProbeMode } from '@/modules/setupWorkflow'
 import { parseContextWindowInput } from '@/composables/setup/useSettingsPromotedForm'
-import type { SetupTierRow } from '@/composables/setup/useSetupRouterForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
 
 const { t, locale } = useI18n()
@@ -55,6 +58,7 @@ interface ProviderPanelContract {
     value: number
     source: 'config' | 'catalog' | 'default'
   } | null
+  effectiveMaxTokensPending?: boolean
   providerIsLocal: boolean
   configuredProviders: Array<{
     providerId: string
@@ -75,7 +79,13 @@ interface ProviderPanelContract {
   selectedStoredProfile: boolean
   editingNew: boolean
   profileSaveSupported: boolean
+  profileUpsertAndActivateSupported?: boolean
+  hasConfiguredPrimaryProvider?: boolean
+  primaryReady?: boolean
+  busy?: boolean
   primaryProviderRemovalSupported: boolean
+  imageGenerationOffer?: boolean
+  imageGenerationOptIn?: boolean
   routingEnabled: boolean
   routerEnabled: boolean
   routerBinding: 'follow_primary' | 'custom' | 'legacy'
@@ -94,22 +104,8 @@ interface ProviderPanelContract {
   providerFieldValue: (field: FieldSpec) => string
 }
 
-interface PresetCardContract {
-  hasPreset: boolean
-  presetLabel: string
-  presetDescription: string
-  synthesized: boolean
-  tierRows: SetupTierRow[]
-  tierLabel: (tier: string) => string
-  routerMode: string
-  routerCustomized: boolean
-}
-
 const props = defineProps<{
   panel: ProviderPanelContract
-  // Optional routing-preset card contract (absent on older gateways whose
-  // catalog carries no presets — the card simply doesn't render).
-  preset?: PresetCardContract | null
   dirty?: boolean
   saving?: boolean
 }>()
@@ -120,27 +116,34 @@ const emit = defineEmits<{
   updateProviderField: [name: string, value: unknown]
   updateLlmTimeout: [value: number]
   updateContextWindow: [value: string]
-  probeConnection: []
+  probeConnection: [mode: ProviderProbeMode]
+  cancelProviderProbe: []
+  refreshModels: []
   saveProvider: []
+  saveProviderAndActivate: []
   cancelProviderEdit: []
-  applyPreset: []
   copy: [command: string]
   goToSection: [value: string]
   selectConfiguredProvider: [value: string]
   removeProviderProfile: [value: string]
   addProvider: [value: string]
   probeConfiguredProvider: [value: string]
+  cancelConfiguredProviderProbe: [value: string]
   activateProvider: [providerId: string]
+  updateImageGenerationOptIn: [enabled: boolean]
 }>()
 
 const addOpen = ref(false)
 const editorOpen = ref(false)
 const listExpanded = ref(false)
+const openProviderMenuId = ref('')
 const addButtonRef = ref<HTMLButtonElement | null>(null)
 const editorHeadingRef = ref<HTMLElement | null>(null)
 const editorDialogRef = ref<HTMLElement | null>(null)
 const sectionRef = ref<HTMLElement | null>(null)
 const pendingRemoval = ref<{ providerId: string; index: number } | null>(null)
+const recentlyActivatedProviderId = ref('')
+let recentlyActivatedTimer: ReturnType<typeof setTimeout> | null = null
 const dialogInvoker = ref<HTMLElement | null>(null)
 
 const selectedProviderLabel = computed(() => (
@@ -214,6 +217,7 @@ function closeAddPicker(restoreFocus = true) {
 }
 
 function cancelAndClose(restoreFocus = true) {
+  if (providerBusy.value || props.saving) return
   if (!addOpen.value) {
     emit('cancelProviderEdit')
   }
@@ -221,6 +225,7 @@ function cancelAndClose(restoreFocus = true) {
 }
 
 function toggleAddPicker() {
+  if (providerBusy.value || props.saving) return
   if (editorOpen.value) {
     closeAddPicker()
     return
@@ -231,6 +236,7 @@ function toggleAddPicker() {
 }
 
 function selectConfigured(providerId: string) {
+  if (providerBusy.value || props.saving) return
   dialogInvoker.value = document.activeElement instanceof HTMLElement
     ? document.activeElement
     : null
@@ -263,14 +269,21 @@ function onEditorDialogKeydown(event: KeyboardEvent) {
 }
 
 function testConfigured(providerId: string) {
+  if (probeFor(providerId).phase === 'probing') {
+    emit('cancelConfiguredProviderProbe', providerId)
+    return
+  }
+  if (providerBusy.value) return
   emit('probeConfiguredProvider', providerId)
 }
 
 function activateConfigured(providerId: string) {
+  if (providerBusy.value) return
   emit('activateProvider', providerId)
 }
 
 function removeConfigured(providerId: string) {
+  if (providerBusy.value) return
   pendingRemoval.value = {
     providerId,
     index: props.panel.configuredProviders.findIndex(row => row.providerId === providerId),
@@ -347,13 +360,19 @@ watch(() => props.panel.providerSelected, (value, previous) => {
   })
 })
 
+const hasSavableProviderChange = computed(() => (
+  Boolean(props.dirty)
+  || Boolean(props.panel.imageGenerationOffer && props.panel.imageGenerationOptIn)
+))
+
 watch(() => props.saving, (saving, wasSaving) => {
-  if (!wasSaving || saving || props.dirty) return
+  if (!wasSaving || saving || hasSavableProviderChange.value) return
   closeAddPicker()
 })
 
 watch(() => props.panel.configuredProviders, rows => {
   if (rows.length < 5) listExpanded.value = false
+  if (!rows.some(row => row.providerId === openProviderMenuId.value)) openProviderMenuId.value = ''
   const pending = pendingRemoval.value
   if (pending && !rows.some(row => row.providerId === pending.providerId)) {
     pendingRemoval.value = null
@@ -371,6 +390,24 @@ watch(() => props.panel.configuredProviders, rows => {
   }
 }, { deep: true })
 
+const activeConfiguredProviderId = computed(() => (
+  props.panel.configuredProviders.find(row => row.active)?.providerId || ''
+))
+
+watch(activeConfiguredProviderId, (providerId, previousProviderId) => {
+  if (!previousProviderId || !providerId || providerId === previousProviderId) return
+  recentlyActivatedProviderId.value = providerId
+  if (recentlyActivatedTimer) clearTimeout(recentlyActivatedTimer)
+  recentlyActivatedTimer = setTimeout(() => {
+    recentlyActivatedProviderId.value = ''
+    recentlyActivatedTimer = null
+  }, 700)
+})
+
+onBeforeUnmount(() => {
+  if (recentlyActivatedTimer) clearTimeout(recentlyActivatedTimer)
+})
+
 function probeFor(providerId: string): ConnectionState {
   return (props.panel.configuredProviderProbes || {})[providerId.toLowerCase()] || {
     phase: 'unverified', failureKind: '', detail: '',
@@ -384,12 +421,17 @@ const activationState = computed(() => props.panel.activation || {
 })
 
 function activationDisabledReason(provider: ProviderPanelContract['configuredProviders'][number]): string {
+  if (!props.panel.profileSaveSupported) return t('setup.provider.upgradeGatewayHint')
   if (provider.primaryEligible) return ''
   if (provider.primaryBlockReason === 'missing_model') {
     return t('setup.provider.activationModelRequiredHint')
   }
   if (provider.primaryBlockReason === 'primary_pool_unsupported') {
     return t('setup.provider.activationPoolUnsupported')
+  }
+  if (['missing_api_key', 'missing_credential', 'missing_credentials', 'missing_env'].includes(provider.primaryBlockReason)
+    || ['missing_api_key', 'missing_credentials'].includes(provider.reason)) {
+    return t('setup.provider.activationCredentialRequired')
   }
   if (['profile_status_unavailable', 'runtime_unsupported', 'unknown_provider'].includes(
     provider.primaryBlockReason,
@@ -406,8 +448,9 @@ function activationInProgress(providerId: string): boolean {
 
 const activationBusy = computed(() => activationState.value.phase === 'activating')
 const providerBusy = computed(() => (
-  activationBusy.value || props.panel.credentialRemovalPending
+  props.panel.busy || activationBusy.value || props.panel.credentialRemovalPending || props.saving
 ))
+watch(providerBusy, busy => { if (busy) openProviderMenuId.value = '' }, { flush: 'sync' })
 
 watch(() => props.panel.credentialRemovalPending, (pending, wasPending) => {
   if (pending || !wasPending) return
@@ -455,6 +498,7 @@ function probeFailureSentence(state: ConnectionState): string {
 
 function configuredStatus(provider: ProviderPanelContract['configuredProviders'][number]): string {
   if (providerStatusUnavailable(provider)) return t('setup.provider.profileStatusUnavailable')
+  if (provider.reason === 'missing_model') return t('setup.provider.activationModelRequiredHint')
   return provider.ready ? t('setup.provider.profileReady') : t('setup.provider.profileNeedsCredentials')
 }
 
@@ -467,11 +511,46 @@ function providerStatusUnavailable(provider: ProviderPanelContract['configuredPr
 }
 
 function configuredTestLabel(provider: ProviderPanelContract['configuredProviders'][number]): string {
-  if (probeFor(provider.providerId).phase === 'probing') return t('setup.provider.testing')
+  if (probeFor(provider.providerId).phase === 'probing') return t('setup.provider.cancelTest')
   if (providerStatusUnavailable(provider)) return t('setup.provider.profileStatusUnavailable')
   if (!provider.ready) return t('setup.provider.addKeyToTest')
   if (!provider.probeModelAvailable) return t('setup.provider.addModelToTest')
-  return t('setup.provider.testSavedConnection')
+  return t('setup.provider.testSavedModel')
+}
+
+function configuredMenuItems(provider: ProviderPanelContract['configuredProviders'][number]): ProviderMenuItem[] {
+  const items: ProviderMenuItem[] = []
+  if (!provider.active) items.push({
+    id: 'edit', label: t('common.edit'), icon: 'edit',
+    ariaLabel: t('setup.provider.editProvider', { provider: provider.label }),
+  })
+  items.push({
+    id: 'verify', label: configuredTestLabel(provider), icon: 'check',
+    ariaLabel: `${configuredTestLabel(provider)} — ${provider.label}`,
+    describedBy: 'setup-provider-configured-desc',
+    className: 'setup-provider-card__test',
+    busy: probeFor(provider.providerId).phase === 'probing',
+    disabled: probeFor(provider.providerId).phase !== 'probing'
+      && (!provider.ready || !provider.probeModelAvailable),
+    hint: providerStatusUnavailable(provider) ? t('setup.provider.statusUnavailableTestHint')
+      : !provider.ready ? t('setup.provider.addKeyToTestHint')
+        : !provider.probeModelAvailable ? t('setup.provider.addModelToTestHint') : undefined,
+  })
+  if (props.panel.profileSaveSupported && (!provider.active || props.panel.primaryProviderRemovalSupported)) {
+    items.push({
+      id: 'delete', label: t('common.delete'), icon: 'trash',
+      ariaLabel: `${t('setup.provider.removeConfirmPrimary')} — ${provider.label}`,
+      className: 'setup-provider-card__delete', danger: true, separatorBefore: true,
+    })
+  }
+  return items
+}
+
+function onProviderMenuAction(providerId: string, action: string) {
+  if (providerBusy.value) return
+  if (action === 'edit') selectConfigured(providerId)
+  else if (action === 'verify') testConfigured(providerId)
+  else if (action === 'delete') removeConfigured(providerId)
 }
 
 function configuredRowFor(
@@ -484,7 +563,7 @@ function configuredRowFor(
 
 function probeStatus(providerId: string): string {
   const state = probeFor(providerId)
-  if (state.phase === 'probing') return t('setup.provider.testing')
+  if (state.phase === 'probing') return t('setup.provider.testingModel')
   if (state.phase === 'unverified') {
     const provider = configuredRowFor(providerId)
     if (!provider?.ready) return ''
@@ -503,11 +582,22 @@ function probeStatus(providerId: string): string {
     }
     return t('setup.provider.connectionNotTested')
   }
-  if (state.phase === 'verified') {
-    return t('setup.provider.connected')
+  if (state.phase === 'reachable') {
+    return t('setup.provider.reachableNotModelTested')
+  }
+  if (state.phase === 'model_verified' || state.phase === 'verified') {
+    return t('setup.provider.modelVerified')
+  }
+  if (state.phase === 'timed_out') {
+    return state.failureStage === 'reachability'
+      ? t('setup.provider.reachabilityTimedOut')
+      : t('setup.provider.modelTimedOut')
   }
   if (PROTOCOL_FAILURE_KINDS.has(state.failureKind)) {
     return t('setup.provider.streamIncompatible')
+  }
+  if (state.phase === 'reachable_error') {
+    return t('setup.provider.endpointResponded', { reason: probeFailureSentence(state) })
   }
   if (state.phase === 'key_invalid') {
     return t('setup.provider.keyRejected', { reason: probeFailureSentence(state) })
@@ -521,7 +611,7 @@ function probeStatus(providerId: string): string {
 function probeToneClass(providerId: string): string {
   const state = probeFor(providerId)
   if (state.phase === 'probing') return ''
-  if (state.phase === 'verified') return 'is-ready'
+  if (state.phase === 'reachable' || state.phase === 'model_verified' || state.phase === 'verified') return 'is-ready'
   if (state.phase !== 'unverified') return 'is-warn'
   const lastProbe = configuredRowFor(providerId)?.lastProbe
   if (lastProbe?.ok) return lastProbe.configChanged ? '' : 'is-ready'
@@ -616,6 +706,9 @@ const contextWindowReadout = computed(() => t('setup.provider.contextWindowReado
 }))
 
 const effectiveMaxTokensReadout = computed(() => {
+  if (props.panel.effectiveMaxTokensPending) {
+    return t('setup.provider.effectiveMaxTokensAfterSave')
+  }
   const record = props.panel.effectiveMaxTokens
   if (!record) return ''
   const sourceKey = {
@@ -627,6 +720,25 @@ const effectiveMaxTokensReadout = computed(() => {
     tokens: new Intl.NumberFormat(locale.value).format(record.value),
     source: t(sourceKey),
   })
+})
+
+const catalogSyncReadout = computed(() => {
+  if (props.panel.connection.discovering) return t('setup.provider.discoveringModels')
+  if (props.panel.connection.discoverError) {
+    return `${t('setup.provider.discoverFailed')} ${props.panel.connection.discoverError}`
+  }
+  if (props.panel.connection.modelSource === 'live' && !props.panel.connection.models.length) {
+    return t('setup.provider.modelListReadout', { count: 0 })
+  }
+  const catalog = props.panel.connection.catalog
+  if (!catalog) return ''
+  const ago = localizedRelativeTime(catalog.lastSyncedAt, locale.value)
+  if (catalog.stale) {
+    return ago
+      ? t('setup.provider.modelCatalogStaleSince', { ago })
+      : t('setup.provider.modelCatalogStale')
+  }
+  return ago ? t('setup.provider.modelCatalogSynced', { ago }) : ''
 })
 
 const showContextWindowWarning = computed(() => (
@@ -668,6 +780,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         type="button"
         class="btn btn--primary setup-provider-page__add"
         data-provider-picker-trigger
+        :disabled="providerBusy"
         aria-controls="setup-provider-editor-dialog"
         :aria-expanded="editorOpen ? 'true' : 'false'"
         @click="toggleAddPicker"
@@ -696,6 +809,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           count: panel.configuredProviders.length,
           ready: readyProviderCount,
         }) }}</p>
+        <p>{{ t('setup.provider.primaryRoleHint') }}</p>
       </div>
     </div>
 
@@ -714,16 +828,24 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
       </div>
     </div>
 
-    <ul
+    <TransitionGroup
       v-if="panel.configuredProviders.length > 0"
+      name="provider-list"
+      tag="ul"
       class="setup-provider-list"
+      :class="{ 'is-expanded': listExpanded }"
       data-testid="configured-provider-list"
     >
       <li
         v-for="provider in visibleConfiguredProviders"
         :key="provider.providerId"
         class="setup-provider-card"
-        :class="{ 'is-selected': editorOpen && isEditingProvider(provider.providerId) }"
+        :class="{
+          'is-primary': provider.active,
+          'is-selected': editorOpen && isEditingProvider(provider.providerId),
+          'is-activating': activationInProgress(provider.providerId),
+          'is-settling': recentlyActivatedProviderId === provider.providerId,
+        }"
         :data-provider-id="provider.providerId"
       >
         <button
@@ -731,10 +853,24 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           class="setup-provider-card__identity setup-provider-card__select"
           :aria-label="providerIdentityLabel(provider)"
           :aria-current="editorOpen && isEditingProvider(provider.providerId) ? 'true' : undefined"
+          :disabled="providerBusy"
           @click="selectConfigured(provider.providerId)"
         >
           <span class="setup-provider-card__name-row">
             <span class="setup-provider-card__name">{{ provider.label }}</span>
+            <span
+              v-if="provider.active"
+              class="setup-provider-card__primary-status"
+              data-testid="provider-primary-badge"
+              role="status"
+              :aria-label="`${t('setup.provider.currentPrimary')} — ${provider.label}`"
+            >
+              <Icon name="check" :size="14" aria-hidden="true" />
+              {{ t('setup.provider.currentPrimary') }}
+            </span>
+          </span>
+          <span v-if="!showConfiguredProbeStatus(provider.providerId)" class="setup-provider-card__readiness">
+            {{ configuredStatus(provider) }}
           </span>
           <span
             v-if="showConfiguredProbeStatus(provider.providerId)"
@@ -754,40 +890,44 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           </span>
         </button>
         <div class="setup-provider-card__actions">
+          <div v-if="!provider.active" class="setup-provider-card__activation">
+            <button
+              type="button"
+              class="btn setup-provider-card__activate"
+              :class="{ 'is-pending': activationInProgress(provider.providerId) }"
+              :disabled="providerBusy || Boolean(activationDisabledReason(provider))"
+              :title="activationDisabledReason(provider) || undefined"
+              :aria-label="activationActionLabel(provider)"
+              :aria-busy="activationInProgress(provider.providerId) ? 'true' : undefined"
+              @click="activateConfigured(provider.providerId)"
+            >
+              <span v-if="activationInProgress(provider.providerId)" class="setup-connection__spinner" aria-hidden="true"></span>
+              {{ activationInProgress(provider.providerId) ? t('setup.provider.activating') : t('setup.provider.makeActive') }}
+            </button>
+            <small v-if="activationDisabledReason(provider)" class="setup-provider-card__activation-reason">{{ activationDisabledReason(provider) }}</small>
+          </div>
           <button
-            type="button"
-            class="btn setup-provider-card__test"
-            :disabled="!provider.ready || !provider.probeModelAvailable || probeFor(provider.providerId).phase === 'probing'"
-            :title="providerStatusUnavailable(provider) ? t('setup.provider.statusUnavailableTestHint') : (!provider.ready ? t('setup.provider.addKeyToTestHint') : (!provider.probeModelAvailable ? t('setup.provider.addModelToTestHint') : undefined))"
-            :aria-label="`${configuredTestLabel(provider)} — ${provider.label}`"
-            :aria-describedby="provider.ready && provider.probeModelAvailable ? 'setup-provider-configured-desc' : undefined"
-            @click="testConfigured(provider.providerId)"
-          >{{ configuredTestLabel(provider) }}</button>
-          <button
+            v-else
             type="button"
             class="btn btn--ghost setup-provider-card__action"
+            :disabled="providerBusy"
             :aria-label="t('setup.provider.editProvider', { provider: provider.label })"
             @click="selectConfigured(provider.providerId)"
           >
             <Icon name="edit" :size="14" aria-hidden="true" />
             {{ t('common.edit') }}
           </button>
-          <button
-            v-if="
-              panel.profileSaveSupported
-              && (!provider.active || panel.primaryProviderRemovalSupported)
-            "
-            type="button"
-            class="btn btn--ghost setup-provider-card__action setup-provider-card__delete"
-            :aria-label="`${t('setup.provider.removeConfirmPrimary')} — ${provider.label}`"
-            @click="removeConfigured(provider.providerId)"
-          >
-            <Icon name="trash" :size="14" aria-hidden="true" />
-            {{ t('common.delete') }}
-          </button>
+          <SetupProviderMenu
+            :label="t('setup.provider.moreActions', { provider: provider.label })"
+            :open="openProviderMenuId === provider.providerId"
+            :disabled="providerBusy"
+            :items="configuredMenuItems(provider)"
+            @update:open="openProviderMenuId = $event ? provider.providerId : ''"
+            @action="onProviderMenuAction(provider.providerId, $event)"
+          />
         </div>
       </li>
-    </ul>
+    </TransitionGroup>
     <button
       v-if="panel.configuredProviders.length >= 5"
       type="button"
@@ -845,7 +985,9 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
       @replace="panel.credentialPanel.onReplace?.()"
       @cancel-replace="panel.credentialPanel.onCancelReplace?.()"
       @remove-credential="panel.credentialPanel.onRemoveCredential?.()"
-      @test-connection="emit('probeConnection')"
+      @check-reachability="emit('probeConnection', 'reachability')"
+      @test-model="emit('probeConnection', 'model')"
+      @cancel-probe="emit('cancelProviderProbe')"
       @update-field="(name, value) => emit('updateProviderField', name, value)"
     />
 
@@ -903,6 +1045,25 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         data-testid="setup-effective-max-tokens"
         aria-live="polite"
       >{{ effectiveMaxTokensReadout }}</p>
+      <div v-if="panel.providerSelected" class="setup-model-catalog-sync">
+        <span
+          v-if="catalogSyncReadout"
+          class="setup-model-catalog-sync__status"
+          :class="{ 'is-stale': panel.connection.catalog?.stale }"
+          data-testid="setup-model-catalog-sync"
+          aria-live="polite"
+        >{{ catalogSyncReadout }}</span>
+        <button
+          type="button"
+          class="btn btn--ghost setup-model-catalog-sync__refresh"
+          data-testid="setup-refresh-models"
+          :disabled="providerBusy || saving || panel.connection.discovering"
+          @click="emit('refreshModels')"
+        >
+          <Icon name="refresh" :size="14" aria-hidden="true" />
+          {{ t('setup.provider.refreshModels') }}
+        </button>
+      </div>
     </section>
 
     <details class="setup-provider-options" :open="panel.providerAdvancedOpen">
@@ -1099,6 +1260,29 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   <strong>{{ selectedProviderLabel }}</strong>
                 </label>
 
+                <label
+                  v-if="panel.imageGenerationOffer"
+                  class="control-row setup-provider-image-offer"
+                  data-testid="openrouter-image-generation-offer"
+                >
+                  <div class="control-row__label-block">
+                    <span class="control-row__label">
+                      {{ t('setup.provider.imageGenerationOptInLabel') }}
+                    </span>
+                    <span class="control-row__desc">
+                      {{ t('setup.provider.imageGenerationOptInDesc') }}
+                    </span>
+                  </div>
+                  <div class="control-row__control">
+                    <ControlSwitch
+                      :checked="panel.imageGenerationOptIn !== false"
+                      name="setup_provider_image_generation_opt_in"
+                      :aria-label="t('setup.provider.imageGenerationOptInLabel')"
+                      @change="emit('updateImageGenerationOptIn', $event)"
+                    />
+                  </div>
+                </label>
+
                 <SetupProviderRecommendation
                   v-if="tokenRhythmSelected"
                   compact
@@ -1136,7 +1320,9 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   @replace="panel.credentialPanel.onReplace?.()"
                   @cancel-replace="panel.credentialPanel.onCancelReplace?.()"
                   @remove-credential="panel.credentialPanel.onRemoveCredential?.()"
-                  @test-connection="emit('probeConnection')"
+                  @check-reachability="emit('probeConnection', 'reachability')"
+                  @test-model="emit('probeConnection', 'model')"
+                  @cancel-probe="emit('cancelProviderProbe')"
                   @update-field="(name, value) => emit('updateProviderField', name, value)"
                 />
 
@@ -1158,6 +1344,31 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                       @update="(name, val) => emit('updateProviderField', name, val)"
                     />
                   </template>
+                  <div class="setup-model-catalog-sync">
+                    <span
+                      v-if="catalogSyncReadout"
+                      class="setup-model-catalog-sync__status"
+                      :class="{ 'is-stale': panel.connection.catalog?.stale }"
+                      data-testid="setup-model-catalog-sync"
+                      role="status"
+                    >{{ catalogSyncReadout }}</span>
+                    <button
+                      type="button"
+                      class="btn btn--ghost setup-model-catalog-sync__refresh"
+                      data-testid="setup-refresh-models"
+                      :disabled="providerBusy || saving || panel.connection.discovering"
+                      @click="emit('refreshModels')"
+                    >
+                      <Icon name="refresh" :size="14" aria-hidden="true" />
+                      {{ t('setup.provider.refreshModels') }}
+                    </button>
+                  </div>
+                  <SetupModelCapacity
+                    inline :provider="panel.providerSelected"
+                    :model="String(panel.providerFieldValue({ name: 'model', label: '' }) || '')"
+                    :scope="`provider:${panel.providerSelected.trim().toLowerCase()}`"
+                    :disabled="providerBusy || saving"
+                  />
                 </section>
               </fieldset>
             </div>
@@ -1181,18 +1392,25 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                 @click="cancelAndClose()"
               >{{ t('common.cancel') }}</button>
               <button
+                v-if="!panel.editingPrimary && (panel.primaryReady ?? panel.hasConfiguredPrimaryProvider) !== false"
+                type="button"
+                class="btn"
+                data-testid="provider-save-and-activate"
+                :disabled="providerBusy || !panel.profileUpsertAndActivateSupported || !hasSavableProviderChange"
+                :title="!panel.profileUpsertAndActivateSupported ? t('setup.provider.saveActivateUpgradeHint') : undefined"
+                @click="emit('saveProviderAndActivate')"
+              >{{ t('setup.provider.saveAndMakeActive') }}</button>
+              <button
                 type="button"
                 class="btn btn--primary"
-                :disabled="providerBusy || saving || !dirty || (replacesCurrentProvider && panel.connection.phase !== 'verified')"
-                :title="replacesCurrentProvider && panel.connection.phase !== 'verified'
-                  ? t('setup.provider.currentSettingsNotTested')
-                  : undefined"
+                :disabled="providerBusy || saving || !hasSavableProviderChange"
                 :aria-busy="saving ? 'true' : undefined"
                 @click="emit('saveProvider')"
               >
                 <span v-if="saving" class="setup-connection__spinner" aria-hidden="true"></span>
-                {{ t('setup.provider.saveChanges') }}
+                {{ t((panel.primaryReady ?? panel.hasConfiguredPrimaryProvider) === false ? 'setup.provider.saveAndStart' : 'setup.provider.saveChanges') }}
               </button>
+              <small v-if="!panel.editingPrimary && !panel.profileUpsertAndActivateSupported" class="setup-provider-card__activation-reason">{{ t('setup.provider.saveActivateUpgradeHint') }}</small>
             </footer>
 
           </section>
@@ -1251,11 +1469,49 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-list {
+  background: color-mix(in srgb, var(--bg-surface-2) 76%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
+  border-radius: var(--radius-card);
   display: grid;
   gap: 0;
   list-style: none;
   margin: var(--sp-3) 0 0;
+  overflow: hidden;
   padding: 0;
+  position: relative;
+}
+
+/* Primary changes reorder the saved list. Keep the transition quiet and
+   directional so the new primary feels like it moved into place instead of
+   the whole list flashing or jumping. */
+.provider-list-move {
+  transition: transform var(--dur-base) var(--ease-out);
+}
+
+.provider-list-enter-active,
+.provider-list-leave-active {
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+
+.provider-list-enter-from,
+.provider-list-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.provider-list-leave-active {
+  position: absolute;
+  inset-inline: 0;
+}
+
+.setup-provider-list.is-expanded {
+  max-height: min(28rem, 52vh);
+  overscroll-behavior: contain;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .setup-provider-overview {
@@ -1293,7 +1549,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   gap: var(--sp-3);
   margin: var(--sp-3) 0 0;
   justify-items: center;
-  padding: var(--sp-7) var(--sp-4);
+  padding: var(--sp-5) var(--sp-4);
   text-align: center;
 }
 
@@ -1331,9 +1587,13 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
-  min-height: 60px;
-  padding: var(--sp-3) var(--sp-2);
+  min-height: 58px;
+  padding: var(--sp-2) var(--sp-3);
   transition: background var(--dur-base) var(--ease-out);
+}
+
+.setup-provider-card:first-child {
+  border-top: 0;
 }
 
 .setup-provider-card:hover {
@@ -1344,6 +1604,46 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 .setup-provider-card.is-selected {
   background: color-mix(in srgb, var(--accent) 7%, transparent);
   box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.setup-provider-card.is-primary {
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Keep the saved-primary marker and the editor selection legible together. */
+.setup-provider-card.is-primary.is-selected {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+.setup-provider-card.is-activating {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.setup-provider-card.is-settling {
+  animation: provider-primary-settle var(--dur-enter) var(--ease-out) both;
+}
+
+.setup-provider-card.is-settling .setup-provider-card__primary-status {
+  animation: provider-primary-badge-settle var(--dur-base) var(--ease-spring) both;
+}
+
+@keyframes provider-primary-settle {
+  from {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    box-shadow: inset 4px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, transparent);
+  }
+  to {
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+}
+
+@keyframes provider-primary-badge-settle {
+  from { opacity: 0; transform: translateX(-4px) scale(.96); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
 }
 
 .setup-provider-card__identity {
@@ -1372,7 +1672,24 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
 .setup-provider-card__actions {
   flex: 0 0 auto;
+  flex-wrap: nowrap;
+  gap: var(--sp-2);
   justify-content: flex-end;
+}
+
+.setup-provider-card__test {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  border-color: transparent;
+  color: var(--text-secondary);
+  min-height: 32px;
+  padding: var(--sp-1) var(--sp-2);
+  white-space: nowrap;
+}
+
+.setup-provider-card__test:hover:not(:disabled),
+.setup-provider-card__test:focus-visible {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text);
 }
 
 .setup-provider-card__action {
@@ -1381,7 +1698,38 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-card__activate {
+  align-items: center;
   color: var(--accent);
+  display: inline-flex;
+  gap: var(--sp-2);
+}
+
+.setup-provider-card__activate.is-pending {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius-sm);
+  cursor: progress;
+  min-height: 32px;
+  padding: var(--sp-1) var(--sp-2);
+}
+
+.setup-provider-card__primary-status {
+  align-items: center;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  display: inline-flex;
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  white-space: nowrap;
+}
+
+.setup-provider-card__readiness {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
 }
 
 .setup-provider-card__delete {
@@ -1426,7 +1774,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-list__toggle {
-  margin-top: calc(var(--sp-2) * -1);
+  margin-top: var(--sp-2);
 }
 
 .setup-provider-list__empty {
@@ -1628,6 +1976,31 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   margin-top: var(--sp-2);
 }
 
+.setup-model-catalog-sync {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: space-between;
+  margin: var(--sp-1) 0 var(--sp-2);
+}
+
+.setup-model-catalog-sync__status {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  overflow-wrap: anywhere;
+}
+
+.setup-model-catalog-sync__status.is-stale {
+  color: var(--warning-text, var(--text-muted));
+}
+
+.setup-model-catalog-sync__refresh {
+  align-items: center;
+  display: inline-flex;
+  gap: var(--sp-1);
+}
+
 .setup-provider-profile-model-hint {
   color: var(--text-muted);
   font-size: var(--fs-xs);
@@ -1774,8 +2147,26 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   align-items: center;
   border-top: 1px solid var(--border);
   display: flex;
+  flex-wrap: wrap;
   gap: var(--sp-2);
   padding: var(--sp-4) var(--sp-5);
+}
+
+.setup-provider-modal__footer .btn {
+  white-space: normal;
+}
+
+.setup-provider-card__activation {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-1);
+}
+
+.setup-provider-card__activation-reason {
+  color: var(--text-muted);
+  max-width: 30ch;
+  white-space: normal;
 }
 
 .setup-provider-modal__footer-spacer {
@@ -1818,6 +2209,14 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   font-size: var(--fs-md);
 }
 
+.setup-provider-image-offer {
+  margin: 0;
+  padding: var(--sp-3);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-elevated));
+}
+
 .setup-provider-modal__endpoint,
 .setup-provider-modal__model {
   border-top: 1px solid var(--border);
@@ -1851,11 +2250,24 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .setup-connection__spinner {
+    animation: none;
+  }
+
   .provider-dialog-enter-active,
   .provider-dialog-leave-active,
   .provider-dialog-enter-active .setup-provider-modal,
   .provider-dialog-leave-active .setup-provider-modal {
     transition: none;
+  }
+
+  .provider-list-move,
+  .provider-list-enter-active,
+  .provider-list-leave-active,
+  .setup-provider-card.is-settling,
+  .setup-provider-card.is-settling .setup-provider-card__primary-status {
+    transition: none;
+    animation: none;
   }
 }
 
@@ -1902,7 +2314,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   }
 }
 
-@container provider-panel (max-width: 560px) {
+@container provider-panel (max-width: 640px) {
   .setup-provider-card {
     align-items: stretch;
     display: grid;
@@ -1911,6 +2323,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
   .setup-provider-card__actions {
     align-self: start;
+    flex-wrap: wrap;
     justify-content: flex-start;
   }
 

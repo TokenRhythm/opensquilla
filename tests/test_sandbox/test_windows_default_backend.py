@@ -4,8 +4,10 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -74,8 +76,36 @@ def _request(tmp_path: Path) -> SandboxRequest:
         action_kind="shell.exec",
         policy=replace(_policy(), file_system=profile),
         env={"PATH": r"C:\Windows\System32"},
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
+
+
+@pytest.mark.asyncio
+async def test_windows_guest_process_is_rejected_before_support_or_acl_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.integration import run_under_backend
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    request = replace(_request(tmp_path), env={"OPENSQUILLA_GUEST_SAFE": "0"})
+    runtime = SimpleNamespace(backend=mod.WindowsDefaultBackend())
+
+    def unexpected_support_probe() -> bool:
+        raise AssertionError("guest process rejection must precede native setup checks")
+
+    monkeypatch.setattr(mod, "_support_ready", unexpected_support_probe)
+
+    token = current_tool_context.set(ToolContext(guest_safe=True))
+    try:
+        with pytest.raises(
+            SandboxBackendError,
+            match="GUEST_WINDOWS_PROCESS_UNAVAILABLE",
+        ):
+            await run_under_backend(request, runtime=runtime)
+    finally:
+        current_tool_context.reset(token)
 
 
 def test_windows_acl_plan_compiles_profile_reads_writes_and_denies(
@@ -241,6 +271,40 @@ def test_windows_filesystem_worker_uses_cached_deny_acl_validation(
 
     assert plan["revalidateDenyAcl"] is False
     assert mod._acl_plan_payload(_request(workspace))["revalidateDenyAcl"] is True
+
+
+def test_capability_filesystem_worker_uses_worker_acl_and_path_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    request = replace(
+        _request(workspace),
+        action_kind="capability.probe.fs.worker.write_text",
+    )
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
+    monkeypatch.setattr(
+        mod,
+        "_windows_tool_path_roots",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("filesystem workers must not project host tool paths")
+        ),
+    )
+
+    payload = mod._payload_for_request(request)
+
+    assert payload["policy"]["capabilityProbe"] is True
+    assert payload["policy"]["windowsAclPlan"]["revalidateDenyAcl"] is False
 
 
 def test_windows_acl_filter_resolves_parent_segments_before_root_check(
@@ -863,7 +927,7 @@ def test_payload_contains_cache_env_and_run_mode(
     payload = mod._payload_for_request(_request(tmp_path))
 
     assert payload["backend"] == "windows_default"
-    assert payload["runMode"] == "trusted"
+    assert payload["runMode"] == "safe"
     assert payload["cwd"] == str(tmp_path)
     assert payload["env"]["TEMP"] == str(tmp_path / ".opensquilla-cache" / "temp")
     assert payload["env"]["PIP_CACHE_DIR"] == str(tmp_path / ".opensquilla-cache" / "pip")
@@ -960,7 +1024,7 @@ def test_payload_rehomes_user_state_for_regular_windows_commands(
             "HOMEDRIVE": "C:",
             "HOMEPATH": r"\SandboxUser\me",
         },
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
@@ -1062,9 +1126,9 @@ def test_payload_prepends_real_windows_tool_paths_and_grants_user_tool_acl(
         grant["path"]: grant["access"]
         for grant in payload["policy"]["windowsAclPlan"]["autoGrants"]
     }
-    assert grants[str(userprofile / "AppData")] == "RX"
-    assert grants[str(local_appdata)] == "RX"
-    assert grants[str(local_appdata / "OpenAI")] == "RX"
+    assert str(userprofile / "AppData") not in grants
+    assert str(local_appdata) not in grants
+    assert str(local_appdata / "OpenAI") not in grants
     assert grants[str(node_bin)] == "RX"
     assert str(git_cmd) not in grants
 
@@ -1127,10 +1191,65 @@ def test_payload_discovers_codex_bundled_git_and_node_tools(
         grant["path"]: grant["access"]
         for grant in payload["policy"]["windowsAclPlan"]["autoGrants"]
     }
-    assert grants[str(userprofile / ".cache")] == "RX"
-    assert grants[str(userprofile / ".cache" / "codex-runtimes")] == "RX"
+    assert str(userprofile / ".cache") not in grants
+    assert str(userprofile / ".cache" / "codex-runtimes") not in grants
     assert grants[str(git_cmd)] == "RX"
     assert grants[str(node_bin)] == "RX"
+
+
+@pytest.mark.parametrize("parent_parts", [("AppData", "Local"), (".cache",)])
+@pytest.mark.parametrize("explicit_parent_read", [False, True])
+def test_tool_discovery_keeps_ancestor_reads_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_parts: tuple[str, ...],
+    explicit_parent_read: bool,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    userprofile = tmp_path / "user"
+    ancestor = userprofile.joinpath(*parent_parts)
+    tool_root = ancestor / "tools" / "node" / "bin"
+    tool_root.mkdir(parents=True)
+    (tool_root / "node.exe").write_bytes(b"synthetic tool discovery fixture")
+    unrelated = ancestor / "unrelated"
+    unrelated.mkdir()
+    entries = [FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE)]
+    if explicit_parent_read:
+        entries.append(FileSystemPermissionEntry(ancestor, FileSystemAccess.READ))
+    request = replace(
+        _request(workspace),
+        env={
+            "PATH": str(tool_root),
+            "USERPROFILE": str(userprofile),
+            "LOCALAPPDATA": str(userprofile / "AppData" / "Local"),
+            "APPDATA": str(userprofile / "AppData" / "Roaming"),
+        },
+        policy=replace(_policy(), file_system=FileSystemPermissionProfile(entries=tuple(entries))),
+    )
+    monkeypatch.setattr(mod, "_common_windows_tool_dirs", lambda _env: ())
+    monkeypatch.setattr(mod, "_host_tool_env", lambda _request: request.env)
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda _executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda _argv, _env: ())
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(mod, "_deny_acl_state_path", lambda: tmp_path / "deny_acl.json")
+
+    plan = mod._acl_plan_payload(request)
+    grants = {grant["path"]: grant for grant in plan["autoGrants"]}
+
+    assert grants[str(tool_root)]["access"] == "RX"
+    assert grants[str(workspace)]["access"] == "RWX"
+    assert str(tool_root.parent) not in grants
+    assert str(userprofile / "AppData") not in grants
+    assert str(unrelated) not in grants
+    if explicit_parent_read:
+        assert grants[str(ancestor)]["access"] == "RX"
+        assert grants[str(ancestor)]["kind"] == "policy"
+    else:
+        assert str(ancestor) not in grants
 
 
 def test_payload_encodes_stdin_as_base64(
@@ -1224,7 +1343,7 @@ async def test_backend_readonly_cwd_does_not_prepare_or_rehome_cache(
     monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
     monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
     monkeypatch.setattr(mod, "_windows_tool_path_roots", lambda *args, **kwargs: ())
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     await WindowsDefaultBackend().run(request)
 
@@ -1236,15 +1355,18 @@ async def test_backend_readonly_cwd_does_not_prepare_or_rehome_cache(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [7, 124])
 async def test_backend_returns_helper_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
 ) -> None:
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
     class _Proc:
-        returncode = 7
+        def __init__(self):
+            self.returncode = returncode
 
         async def communicate(self):
             return b"out", b"err"
@@ -1258,11 +1380,12 @@ async def test_backend_returns_helper_result(
 
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     result = await WindowsDefaultBackend().run(_request(tmp_path))
 
-    assert result.returncode == 7
+    assert result.returncode == returncode
+    assert result.timed_out is False
     assert result.stdout == "out"
     assert result.stderr == "err"
     assert result.backend_used == "windows_default"
@@ -1270,6 +1393,167 @@ async def test_backend_returns_helper_result(
     assert "--payload-env" in captured["argv"]
     payload_env = captured["env"]["OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"]
     assert '"argv":["python","-c","print(\'ok\')"]' in payload_env
+
+
+@pytest.mark.parametrize("user_stderr", [b"", b"no newline", "中文错误\r\n".encode(), b"\xff\xfe"])
+def test_authenticated_timeout_frames_preserve_user_stderr_bytes(user_stderr: bytes) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    marker = (
+        b'\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT {"nonce":"timeout-test","timed_out":true}\n'
+    )
+    # Both the restricted runner and its offline parent can observe a timeout.
+    stderr, timed_out = mod._extract_authenticated_helper_timeout(
+        user_stderr + marker + marker, expected_nonce="timeout-test"
+    )
+
+    assert stderr == user_stderr
+    assert timed_out is True
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        b'{"nonce":"wrong","timed_out":true}',
+        b'{"nonce":"timeout-test","timed_out":false}',
+        b'{"nonce":"timeout-test","timed_out":1}',
+        b'{"nonce":null,"timed_out":true}',
+        '{"nonce":"伪造","timed_out":true}'.encode(),
+        b"[]",
+        b"{broken",
+        b"\xff",
+        b'{"nonce":' + b"9" * 5000 + b',"timed_out":true}',
+        b"[" * 2000 + b"]" * 2000,
+    ],
+)
+def test_untrusted_timeout_frames_remain_user_output(status: bytes) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    raw = b"user stderr\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT " + status + b"\n"
+    assert mod._extract_authenticated_helper_timeout(raw, expected_nonce="timeout-test") == (
+        raw,
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_backend_authenticates_timeout_before_stderr_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    user_stderr = "中文错误 without newline".encode()
+    marker = (
+        b'\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT {"nonce":"timeout-test","timed_out":true}\n'
+    )
+
+    class Proc:
+        returncode = 124
+
+        async def communicate(self):
+            return "已就绪".encode(), user_stderr + marker
+
+    async def fake_exec(*args, **kwargs):
+        return Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "timeout-test")
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "_OUTPUT_BYTE_CAP", 12)
+
+    result = await mod.WindowsDefaultBackend().run(_request(tmp_path))
+
+    assert result.returncode == 124
+    assert result.timed_out is True
+    assert result.stdout == "已就绪"
+    assert result.stderr == "中文错误"
+    assert result.truncated_stderr is True
+
+
+@pytest.mark.asyncio
+async def test_backend_cancellation_kills_and_reaps_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    communicating = asyncio.Event()
+    never_finishes = asyncio.Event()
+
+    class _Proc:
+        returncode = None
+        killed = False
+        waited = False
+
+        async def communicate(self):
+            communicating.set()
+            await never_finishes.wait()
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.waited = True
+            return self.returncode
+
+    proc = _Proc()
+
+    async def fake_exec(*argv, stdout=None, stderr=None, env=None):
+        return proc
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
+
+    task = asyncio.create_task(WindowsDefaultBackend().run(_request(tmp_path)))
+    await communicating.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed is True
+    assert proc.waited is True
+
+
+@pytest.mark.asyncio
+async def test_frozen_backend_uses_internal_child_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    captured: dict[str, object] = {}
+
+    async def fake_exec(*argv, stdout=None, stderr=None, env=None):
+        captured["argv"] = argv
+        return _Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
+
+    await WindowsDefaultBackend().run(_request(tmp_path))
+
+    assert captured["argv"] == (
+        sys.executable,
+        "--internal-child",
+        "windows-default-runner",
+        "--payload-env",
+    )
 
 
 @pytest.mark.asyncio
@@ -1296,7 +1580,7 @@ async def test_backend_raises_terminal_error_for_authenticated_helper_failure(
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
     monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "nonce-123", raising=False)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     with pytest.raises(SandboxBackendError, match="execution lease is busy"):
         await WindowsDefaultBackend().run(_request(tmp_path))
@@ -1329,7 +1613,7 @@ async def test_backend_waits_for_helper_grace_beyond_command_timeout(
     request = _request(tmp_path)
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
 
     result = await WindowsDefaultBackend().run(request)
@@ -1364,6 +1648,70 @@ def test_payload_contains_profile_workspace_and_required_runtime_acl_plan(
     assert grant_paths[str(tmp_path / "runtime" / "Scripts")] == "RX"
     assert plan["capabilitySids"]
     assert plan["grantCurrentUserAccess"] is True
+
+
+def test_capability_probe_does_not_project_host_tool_path_acl_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
+    monkeypatch.setattr(
+        mod,
+        "_windows_tool_path_roots",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("capability canary must not project host tool paths")
+        ),
+    )
+    request = replace(_request(tmp_path), action_kind="capability.probe")
+
+    payload = mod._payload_for_request(request)
+
+    assert payload["argv"]
+    assert payload["policy"]["capabilityProbe"] is True
+
+
+def test_capability_filesystem_worker_keeps_probe_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.operation_runtime import SandboxOperation
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "notes.txt"
+    runtime_scripts = tmp_path / "runtime" / "Scripts"
+    runtime_scripts.mkdir(parents=True)
+    python_exe = runtime_scripts / "python.exe"
+    python_exe.write_text("", encoding="utf-8")
+    source_root = tmp_path / "src" / "opensquilla"
+    source_root.mkdir(parents=True)
+    monkeypatch.setattr(mod, "_python_executable", lambda: python_exe)
+    monkeypatch.setattr(mod, "_opensquilla_import_roots", lambda: (source_root,))
+
+    operation = replace(
+        SandboxOperation.filesystem(
+            kind="write_text",
+            workspace=workspace,
+            run_mode=RunMode.SAFE.value,
+            path=target,
+            paths=(target,),
+            content="hello",
+            file_system_profile=FileSystemPermissionProfile(
+                entries=(FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),)
+            ),
+        ),
+        operation_id="capability-probe",
+    )
+
+    request = mod._filesystem_operation_request(operation)
+
+    assert request.action_kind == "capability.probe.fs.worker.write_text"
 
 
 def test_payload_skips_windows_reserved_device_expansion_roots(
@@ -1503,7 +1851,7 @@ def test_payload_adds_readonly_private_mounts_as_deny_write_paths(
         action_kind="shell.exec",
         policy=policy,
         env={"PATH": r"C:\Windows\System32"},
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
 
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
@@ -1586,6 +1934,82 @@ def test_payload_grants_process_runtime_roots_rx(
     assert grants[str(tmp_path)] == "RWX"
 
 
+def test_guest_request_never_discovers_host_tool_paths(tmp_path: Path) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    request = _request(tmp_path)
+    request = SandboxRequest(
+        argv=request.argv,
+        cwd=request.cwd,
+        action_kind=request.action_kind,
+        policy=request.policy,
+        env={
+            **request.env,
+            "OPENSQUILLA_GUEST_SAFE": "1",
+            "PATH": str(tmp_path / "bundled-runtime"),
+        },
+        run_mode=request.run_mode,
+    )
+
+    assert mod._request_needs_host_tool_paths(request) is False
+
+
+def test_guest_acl_plan_keeps_only_system_and_explicit_runtime_rx_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    workspace = tmp_path / "guest-workspace"
+    bundled_runtime = tmp_path / "bundled-runtime"
+    windows_root = tmp_path / "Windows"
+    program_files = tmp_path / "Program Files"
+    program_data = tmp_path / "ProgramData"
+    for root in (workspace, bundled_runtime, windows_root, program_files, program_data):
+        root.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        readable_roots=(bundled_runtime,),
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+        protect_metadata=False,
+    )
+    request = _request(workspace).with_policy(replace(_policy(), file_system=profile))
+    request = SandboxRequest(
+        argv=(str(bundled_runtime / "python.exe"), "-c", "print('ok')"),
+        cwd=request.cwd,
+        action_kind=request.action_kind,
+        policy=request.policy,
+        env={
+            **request.env,
+            "OPENSQUILLA_GUEST_SAFE": "1",
+            "SystemRoot": str(windows_root),
+        },
+        run_mode=request.run_mode,
+    )
+    monkeypatch.setattr(
+        mod,
+        "process_executable_rx_roots",
+        lambda argv, env: (bundled_runtime, windows_root, program_files, program_data),
+    )
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+
+    plan = mod._acl_plan_payload(request)
+    grants = {item["path"]: item["access"] for item in plan["autoGrants"]}
+
+    assert grants[str(workspace)] == "RWX"
+    assert grants[str(bundled_runtime)] == "RX"
+    assert str(program_files) not in grants
+    assert str(program_data) not in grants
+
+
 def test_payload_does_not_acl_grant_windows_platform_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1645,7 +2069,7 @@ def test_trusted_non_sensitive_expansion_auto_grants(
         action_kind=request.action_kind,
         policy=request.policy,
         env={"OPENSQUILLA_WINDOWS_SANDBOX_EXPANSION_ROOTS": str(external)},
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
@@ -1670,7 +2094,7 @@ def test_missing_expansion_roots_are_ignored(
         action_kind=request.action_kind,
         policy=request.policy,
         env={"OPENSQUILLA_WINDOWS_SANDBOX_EXPANSION_ROOTS": str(missing)},
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
@@ -1681,7 +2105,7 @@ def test_missing_expansion_roots_are_ignored(
     assert str(missing) not in paths
 
 
-def test_standard_non_sensitive_expansion_requires_approval(
+def test_safe_non_sensitive_expansion_is_automatically_granted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1696,13 +2120,15 @@ def test_standard_non_sensitive_expansion_requires_approval(
         action_kind=request.action_kind,
         policy=request.policy,
         env={"OPENSQUILLA_WINDOWS_SANDBOX_EXPANSION_ROOTS": str(external)},
-        run_mode=RunMode.STANDARD.value,
+        run_mode=RunMode.SAFE.value,
     )
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
 
-    with pytest.raises(SandboxBackendError, match="ACL approval is required"):
-        mod._payload_for_request(request)
+    payload = mod._payload_for_request(request)
+
+    auto_grants = payload["policy"]["windowsAclPlan"]["autoGrants"]
+    assert str(external) in {grant["path"] for grant in auto_grants}
 
 
 def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
@@ -1724,11 +2150,12 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
 
     monkeypatch.setattr(mod, "_python_executable", lambda: python_exe)
     monkeypatch.setattr(mod, "_opensquilla_import_roots", lambda: (source_root,))
+    monkeypatch.setattr(sys, "executable", str(python_exe))
 
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         content="hello",
@@ -1740,7 +2167,7 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
     request = mod._filesystem_operation_request(operation)
 
     assert request.cwd == workspace
-    assert request.run_mode == "trusted"
+    assert request.run_mode == "safe"
     mounts = {str(mount.host_path): mount.mode for mount in request.policy.mounts}
     assert mounts[str(runtime_scripts)] == "ro"
     assert mounts[str(runtime_scripts.parent)] == "ro"
@@ -1749,11 +2176,12 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
     assert mounts[str(worker_temp)] == "rw"
     assert request.env["TEMP"] == str(worker_temp)
     assert request.env["TMP"] == str(worker_temp)
+    assert request.env["PYTHONUTF8"] == "1"
+    assert request.env["PYTHONIOENCODING"] == "utf-8"
     assert request.policy.file_system is operation.file_system_profile
     assert request.policy.tmp_writable is False
     assert request.argv == (
         str(python_exe),
-        "-B",
         "-m",
         "opensquilla.sandbox.filesystem_worker",
         "-",
@@ -1793,7 +2221,7 @@ def test_windows_filesystem_operation_request_serializes_logical_profile_path(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         content="hello",
@@ -1841,7 +2269,7 @@ def test_windows_filesystem_target_checks_logical_path_before_canonicalizing(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=logical_target,
         paths=(canonical_target,),
         content="hello",
@@ -1876,7 +2304,7 @@ def test_windows_relative_filesystem_target_is_based_on_workspace(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=relative_target,
         paths=(relative_target,),
         content="hello",
@@ -1909,7 +2337,7 @@ def test_windows_source_target_maps_execution_workspace_alias(
     operation = SandboxOperation.filesystem(
         kind="create_source",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         logical_path=Path("/workspace/new.py"),
         paths=(target,),
@@ -1949,7 +2377,7 @@ def test_windows_apply_patch_checks_each_logical_path_relative_to_root(
     operation = SandboxOperation.filesystem(
         kind="apply_patch",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         paths=(canonical_target,),
         patch=patch,
         root=workspace,
@@ -1994,7 +2422,7 @@ def test_windows_filesystem_operation_request_preserves_minimal_home_environment
     operation = SandboxOperation.filesystem(
         kind="read_file",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         file_system_profile=FileSystemPermissionProfile(
@@ -2047,7 +2475,7 @@ def test_windows_filesystem_worker_does_not_expand_general_tool_paths(
     operation = SandboxOperation.filesystem(
         kind="read_file",
         workspace=workspace,
-        run_mode=RunMode.STANDARD.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         file_system_profile=FileSystemPermissionProfile(
@@ -2087,7 +2515,7 @@ def test_windows_filesystem_operation_missing_read_target_fails_before_acl(
     operation = SandboxOperation.filesystem(
         kind="read_file",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         display_path=str(target),
@@ -2137,7 +2565,7 @@ def test_windows_filesystem_operation_denies_runtime_readonly_target(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         content="blocked",
@@ -2169,7 +2597,7 @@ async def test_windows_filesystem_operation_rejects_mismatched_paths_without_cac
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=actual,
         paths=(declared,),
         content="blocked",

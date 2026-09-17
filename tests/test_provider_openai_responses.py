@@ -19,6 +19,7 @@ from opensquilla.provider import (
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.openai_responses import OpenAIResponsesProvider
 from opensquilla.provider.registry import get_provider_spec
+from opensquilla.provider.request_proof import ProviderRequestBudgetExceededError
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.types import (
     ContentBlockImage,
@@ -33,8 +34,12 @@ def _patch_transport(
     monkeypatch: Any,
     captured: dict[str, Any],
     response: httpx.Response,
+    *,
+    calls: list[httpx.Request] | None = None,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if calls is not None:
+            calls.append(request)
         captured["url"] = str(request.url)
         captured["headers"] = request.headers
         captured["payload"] = (
@@ -70,6 +75,55 @@ def _collect_events(
         ]
 
     return asyncio.run(_run())
+
+
+def test_openai_responses_final_request_proof_blocks_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    async def _run() -> list[Any]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="x" * 5000)],
+                config=ChatConfig(provider_request_max_chars=1000),
+            )
+        ]
+
+    events = asyncio.run(_run())
+
+    assert captured == {}
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_request_budget_exhausted"
+    proof = json.loads(events[0].message)
+    assert proof["projection_adapter"] == "openai_responses"
+    assert proof["request_sequence_key"] == "input"
+    assert proof["request_system_key"] == "instructions"
+    assert proof["request_compaction_supported"] is False
+    assert proof["conversation_chars"] > 0
+    assert proof["retry_count"] == 0
+
+
+def test_openai_responses_non_finite_json_is_controlled_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(
+        provider,
+        config=ChatConfig(temperature=float("nan")),
+    )
+
+    assert captured == {}
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_internal"
+    assert events[0].message == "Provider request could not be serialized."
 
 
 def test_openai_responses_provider_is_separate_from_chat_completions_provider() -> None:
@@ -140,7 +194,11 @@ def test_openai_responses_provider_posts_responses_payload_and_usage(
             event
             async for event in provider.chat(
                 [Message(role="user", content="hi")],
-                config=ChatConfig(system="stable system", max_tokens=12),
+                config=ChatConfig(
+                    system="stable system",
+                    max_tokens=12,
+                    provider_request_max_chars=100_000,
+                ),
             )
         ]
 
@@ -162,6 +220,29 @@ def test_openai_responses_provider_posts_responses_payload_and_usage(
     assert done.output_tokens == 2
     assert done.reasoning_tokens == 0
     assert done.model == "gpt-5.4"
+
+
+def test_openai_responses_auth_failure_uses_one_physical_request(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    calls: list[httpx.Request] = []
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(401, json={"error": {"message": "expired"}}),
+        calls=calls,
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(
+        provider,
+        config=ChatConfig(physical_attempt_limit=1),
+    )
+
+    assert len(calls) == 1
+    assert any(isinstance(event, ErrorEvent) and event.code == "401" for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_openai_responses_candidate_mode_demotes_oversized_function_call(
@@ -271,7 +352,87 @@ def test_openai_responses_normal_mode_keeps_tool_name_limit(
         isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
         for event in events
     )
+    assert not any(isinstance(event, ToolUseStartEvent) for event in events)
     assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_openai_responses_malformed_arguments_emit_start_before_terminal_error(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            json={
+                "id": "resp_incomplete_edit",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_edit",
+                        "name": "write_file",
+                        "arguments": '{"operations":',
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        ),
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(provider)
+
+    lifecycle = [
+        event
+        for event in events
+        if isinstance(event, ToolUseStartEvent | ToolUseEndEvent | ErrorEvent)
+    ]
+    assert isinstance(lifecycle[0], ToolUseStartEvent)
+    assert lifecycle[0].tool_use_id == "call_edit"
+    assert lifecycle[0].tool_name == "write_file"
+    assert isinstance(lifecycle[1], ErrorEvent)
+    assert lifecycle[1].code == "incomplete_tool_call"
+    assert not any(isinstance(event, ToolUseDeltaEvent | ToolUseEndEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_openai_responses_malformed_call_without_name_does_not_emit_start(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            json={
+                "id": "resp_missing_name",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_missing_name",
+                        "arguments": '{"operations":',
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        ),
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(provider)
+
+    assert not any(isinstance(event, ToolUseStartEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+    assert not any(isinstance(event, ToolUseEndEvent | DoneEvent) for event in events)
 
 
 def test_openai_responses_candidate_mode_retains_semantically_invalid_call(
@@ -649,11 +810,75 @@ def test_openai_responses_compact_window_returns_opaque_output(
         {"type": "message", "role": "assistant", "content": "second"},
     ]
 
-    compacted = asyncio.run(provider.compact_window(input_items))
+    compacted = asyncio.run(
+        provider.compact_window(
+            input_items,
+            config=ChatConfig(provider_request_max_chars=100_000),
+        )
+    )
 
     assert captured["url"] == "https://api.openai.com/v1/responses/compact"
     assert captured["payload"] == {"model": "gpt-5.5", "input": input_items}
     assert compacted["output"] == compact_output
+
+
+def test_openai_responses_compact_window_budget_blocks_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.5")
+    input_items = [
+        {"type": "message", "role": "user", "content": "x" * 5000},
+    ]
+
+    with pytest.raises(ProviderRequestBudgetExceededError) as exc_info:
+        asyncio.run(
+            provider.compact_window(
+                input_items,
+                config=ChatConfig(provider_request_max_chars=1000),
+            )
+        )
+
+    assert captured == {}
+    assert exc_info.value.proof["projection_adapter"] == "openai_responses_compact"
+    assert exc_info.value.proof["request_sequence_key"] == "input"
+    assert exc_info.value.proof["request_system_key"] == "instructions"
+    assert exc_info.value.proof["request_compaction_supported"] is False
+
+
+def test_openai_responses_compact_window_requires_bound_request_budget(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.5")
+
+    with pytest.raises(ValueError, match="provider_request_budget_unbound"):
+        asyncio.run(
+            provider.compact_window(
+                [{"type": "message", "role": "user", "content": "hello"}],
+            )
+        )
+
+    assert captured == {}
+
+
+def test_openai_responses_compact_window_invalid_json_blocks_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.5")
+
+    with pytest.raises(ValueError, match="provider_request_serialization_failed"):
+        asyncio.run(
+            provider.compact_window(
+                [{"type": "message", "role": "user", "weight": float("nan")}],
+            )
+        )
+
+    assert captured == {}
 
 
 def test_openai_responses_chat_items_sends_canonical_window_as_input(
@@ -906,3 +1131,26 @@ def test_openai_responses_incomplete_max_output_tokens_reports_length(
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.stop_reason == "length"
+
+
+def test_responses_send_enforces_same_physical_token_budget_as_projection(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+    config = ChatConfig(
+        max_tokens=8_192,
+        provider_context_window_tokens=8_192,
+        provider_request_max_chars=1_000_000,
+    )
+    projection = provider.project_final_request(
+        [Message(role="user", content="hi")], config=config,
+    )
+    assert not projection.fits
+    events = _collect_events(provider, config=config)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "provider_request_budget_exhausted"
+        for event in events
+    )
+    assert captured == {}

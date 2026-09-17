@@ -54,6 +54,58 @@ describe('useSetupModelStrategyForm', () => {
     expect(ensembleDirtyForm.strategy.isDirty.value).toBe(true)
   })
 
+  it('marks saved tier-fusion runtime status stale after a local model-strategy edit', () => {
+    const router = useSetupRouterForm()
+    const ensemble = useSetupEnsembleForm()
+    router.initFromConfig({
+      enabled: true,
+      tiers: {
+        c3: { provider: 'openrouter', model: 'quality-model', ensemble_enabled: true },
+      },
+    }, {}, 'openrouter', 'custom', { c3: 'dormant_draft' }, 'custom_b5', false, {
+      selectionMode: 'custom_b5',
+      activationTiers: ['c3'],
+      runtimeStatus: 'ready',
+      configurationReady: true,
+      fixedFallbackReady: true,
+    })
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'custom_b5' })
+    const strategy = useSetupModelStrategyForm(
+      router,
+      ensemble,
+      computed(() => 'openrouter'),
+      undefined,
+      computed(() => 'fallback-model'),
+    )
+    strategy.initFixedModel()
+    const routerPanel = router.createPanel({
+      routerSummary: computed(() => ''),
+      ensembleProfileActive: computed(() => false),
+      hasSavedProvider: computed(() => true),
+      isOpenrouter: computed(() => true),
+      textTiers: ['c3'],
+      tierLabel: tier => tier,
+    })
+    const ensemblePanel = ensemble.createPanel({
+      statusText: computed(() => ''),
+      activeProvider: computed(() => 'openrouter'),
+      activeModel: computed(() => 'fallback-model'),
+    })
+    const strategyPanel = strategy.createPanel({
+      hasSavedProvider: computed(() => true),
+      profileSaveSupported: computed(() => true),
+      providerLabel: computed(() => 'OpenRouter'),
+      routerPanel,
+      ensemblePanel,
+      routerTemplateState: computed(() => 'custom'),
+      fixedModelCatalog: computed(() => ({ models: [], source: 'none' as const })),
+    })
+
+    expect(strategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+    router.updateTierField('c3', 'model', 'new-quality-model')
+    expect(strategyPanel.value.router.tierEnsembleStatusFresh).toBe(false)
+  })
+
   it('tracks the fixed model as part of Model Routing and emits only its config patch', () => {
     const { strategy } = makeForm()
 
@@ -113,6 +165,35 @@ describe('useSetupModelStrategyForm', () => {
     expect(strategy.activeStrategy.value).toBe('router')
   })
 
+  it('refreshes provider roles across local ensemble and router strategy transitions', () => {
+    const router = useSetupRouterForm()
+    const ensemble = useSetupEnsembleForm()
+    router.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model' },
+        c3: { provider: 'tokenrhythm', model: 'quality-model' },
+      },
+    }, {}, 'openrouter', 'custom', {
+      c0: 'direct',
+      c3: 'direct',
+    }, 'static_openrouter_b5', false)
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'static_openrouter_b5' })
+    const strategy = useSetupModelStrategyForm(router, ensemble)
+
+    strategy.setStrategy('ensemble')
+    expect(router.routerProviderRoles.value).toEqual({
+      c0: 'dormant_draft',
+      c3: 'dormant_draft',
+    })
+
+    strategy.setStrategy('router')
+    expect(router.routerProviderRoles.value).toEqual({
+      c0: 'direct',
+      c3: 'direct',
+    })
+  })
+
   it('re-enables a follow-primary router as the managed provider preset', () => {
     const router = useSetupRouterForm()
     const ensemble = useSetupEnsembleForm()
@@ -150,8 +231,9 @@ describe('useSetupModelStrategyForm', () => {
     expect(strategy.activeStrategy.value).toBe('router')
   })
 
-  it('selecting model ensemble gives non-preset providers an explicit custom lineup', () => {
+  it('selecting model ensemble migrates a hidden legacy plan to an explicit custom lineup', () => {
     const { router, ensemble, strategy } = makeForm()
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'router_dynamic' })
 
     strategy.setStrategy('ensemble')
 
@@ -163,11 +245,11 @@ describe('useSetupModelStrategyForm', () => {
     expect(strategy.activeStrategy.value).toBe('ensemble')
   })
 
-  it('selecting model ensemble seeds the custom lineup from the router tiers', () => {
+  it('selecting model ensemble seeds a legacy custom lineup from the router tiers', () => {
     const router = useSetupRouterForm()
     const ensemble = useSetupEnsembleForm()
     router.initFromConfig({ enabled: true, tier_profile: 'openai' }, {}, 'openai')
-    ensemble.initFromConfig({ enabled: false })
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'router_dynamic' })
     const strategy = useSetupModelStrategyForm(
       router,
       ensemble,
@@ -184,26 +266,27 @@ describe('useSetupModelStrategyForm', () => {
     expect(ensemble.candidates.value.map(c => c.model)).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
   })
 
-  it('selecting model ensemble seeds the OpenRouter profile as a custom lineup', () => {
+  it('selecting model ensemble preserves the current OpenRouter preset plan', () => {
     const { router, ensemble, strategy } = makeForm('openrouter')
 
     strategy.setStrategy('ensemble')
 
     expect(router.mode.value).toBe('disabled')
     expect(ensemble.enabled.value).toBe(true)
-    expect(ensemble.selectionMode.value).toBe('custom_b5')
-    expect(ensemble.candidates.value.length).toBe(5)
+    expect(ensemble.selectionMode.value).toBe('static_openrouter_b5')
+    expect(ensemble.candidates.value.length).toBe(0)
   })
 
-  it('selecting model ensemble seeds the TokenRhythm profile as a custom lineup', () => {
+  it('selecting model ensemble preserves the current TokenRhythm preset plan', () => {
     const { router, ensemble, strategy } = makeForm('tokenrhythm')
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'static_tokenrhythm_b5' })
 
     strategy.setStrategy('ensemble')
 
     expect(router.mode.value).toBe('disabled')
     expect(ensemble.enabled.value).toBe(true)
-    expect(ensemble.selectionMode.value).toBe('custom_b5')
-    expect(ensemble.candidates.value.length).toBe(5)
+    expect(ensemble.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(ensemble.candidates.value.length).toBe(0)
   })
 
   it('builds the routing choices in progressive order with guidance badges', () => {
@@ -222,6 +305,7 @@ describe('useSetupModelStrategyForm', () => {
     })
     const panel = strategy.createPanel({
       hasSavedProvider: computed(() => true),
+      profileSaveSupported: computed(() => true),
       providerLabel: computed(() => 'OpenAI'),
       routerPanel,
       ensemblePanel,

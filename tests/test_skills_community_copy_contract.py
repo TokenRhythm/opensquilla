@@ -11,7 +11,7 @@ SURFACES = [
     / "src"
     / "components"
     / "skills"
-    / "SkillsRegistryPanel.vue",
+    / "SkillsAddDrawer.vue",
     ROOT / "src" / "opensquilla" / "skills" / "hub" / "__init__.py",
     ROOT / "src" / "opensquilla" / "skills" / "hub" / "clawhub.py",
     ROOT / "src" / "opensquilla" / "skills" / "hub" / "source.py",

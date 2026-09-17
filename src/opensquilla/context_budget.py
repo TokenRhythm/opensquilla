@@ -9,8 +9,6 @@ from typing import Any
 CHARS_PER_TOKEN = 4
 LARGE_CONTEXT_MIN_TOKENS = 64_000
 CONTEXT_RESERVE_FLOOR_TOKENS = 20_000
-SMALL_CONTEXT_MIN_PROOF_CHARS = 4_000
-SMALL_CONTEXT_MAX_PROOF_CHARS = 32_000
 LARGE_CONTEXT_MIN_ARGUMENT_CHARS = 64_000
 LARGE_CONTEXT_MAX_ARGUMENT_CHARS = 512_000
 LARGE_CONTEXT_MIN_RESULT_CHARS = 128_000
@@ -135,26 +133,23 @@ class ContextBudgetGovernor:
         thinking_budget = max(0, int(thinking_budget_tokens or 0))
         threshold = _threshold(context_overflow_threshold)
 
-        max_reserve = max(1, context_tokens // 2)
-        output_reserve = min(max_output + thinking_budget, max_reserve)
+        # Callers without an adapter projection conservatively reserve both
+        # configured budgets. Final request admission passes the adapter's
+        # complete generation cap as max_output_tokens and zero thinking.
+        output_reserve = max_output + thinking_budget
         context_reserve = (
             CONTEXT_RESERVE_FLOOR_TOKENS
             if context_tokens >= LARGE_CONTEXT_MIN_TOKENS
             else max(512, context_tokens // 8)
         )
-        reserved_tokens = min(
-            max(context_tokens - 1, 1),
-            output_reserve + context_reserve,
-        )
-        usable_tokens = max(1, context_tokens - reserved_tokens)
+        reserved_tokens = min(context_tokens, output_reserve + context_reserve)
+        usable_tokens = max(0, context_tokens - reserved_tokens)
 
         explicit_proof = _positive_int(provider_request_proof_max_chars)
-        derived_provider_chars = int(usable_tokens * threshold * CHARS_PER_TOKEN)
-        if context_tokens < LARGE_CONTEXT_MIN_TOKENS:
-            derived_provider_chars = min(
-                SMALL_CONTEXT_MAX_PROOF_CHARS,
-                max(SMALL_CONTEXT_MIN_PROOF_CHARS, derived_provider_chars),
-            )
+        # The threshold is a soft compaction trigger, not another reduction
+        # of the provider's hard input budget. Character limits remain an
+        # independent guard, including when an operator supplies one.
+        derived_provider_chars = usable_tokens * CHARS_PER_TOKEN
         provider_chars = explicit_proof or max(1, derived_provider_chars)
 
         explicit_argument = _positive_int(tool_use_argument_provider_request_max_chars)

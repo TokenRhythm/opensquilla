@@ -1,4 +1,7 @@
 dist/
 node_modules/
 .pyinstaller/
-runtime/
+.runtime-cache/
+runtime/*
+!runtime/runtime-manifest.json
+!runtime/runtime-pack-catalog.json

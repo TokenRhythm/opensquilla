@@ -16,10 +16,12 @@ const BASE_PROPS = {
   isNewLanding: false,
   placeholder: 'Send a message',
   sendButtonTitle: 'Send',
-  runMode: 'trusted',
-  allowedRunModes: ['standard', 'trusted', 'full'],
-  modelRoutingMode: 'llm_ensemble',
-  modelRoutingSettingsBusy: false,
+  runMode: 'safe',
+  allowedRunModes: ['safe', 'full'],
+  runModeLocked: false,
+  runModeLockMessage: '',
+  sessionRoutingMode: 'llm_ensemble',
+  sessionRoutingBusy: false,
   routerVisualEffectsEnabled: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
@@ -34,6 +36,40 @@ afterEach(() => {
 })
 
 describe('ChatComposer image-send guard', () => {
+  it('announces Sending and disables duplicate submission while receipt is pending', async () => {
+    const onSend = vi.fn()
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp(ChatComposer, { ...BASE_PROPS, sendPending: true, onSend })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+    const send = el.querySelector<HTMLButtonElement>('.chat-send-btn')!
+    expect(send.disabled).toBe(true)
+    expect(send.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.chat-composer-send-pending')?.textContent).toContain('Sending')
+    expect(el.querySelector('.chat-composer-send-pending [role="status"]')).toBeTruthy()
+    send.click()
+    expect(onSend).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('keeps Stop available while a pending send waits for its receipt', async () => {
+    const onStop = vi.fn()
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp(ChatComposer, { ...BASE_PROPS, sendPending: true, canStop: true, onStop })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+    const stop = el.querySelector<HTMLButtonElement>('.chat-send-btn')!
+    expect(stop.disabled).toBe(false)
+    expect(el.querySelector('.chat-composer-send-pending')?.textContent).toContain('Sending')
+    stop.click()
+    expect(onStop).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
   it('announces the block accessibly and prevents the send control from firing', async () => {
     const onSend = vi.fn()
     const message = 'Ensemble image input is unavailable.'
@@ -80,6 +116,32 @@ describe('ChatComposer image-send guard', () => {
     expect(send?.disabled).toBe(false)
     send?.click()
     expect(onSend).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
+  it('disables sending during a routing mutation without mounting a status row', async () => {
+    const onSend = vi.fn()
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp(ChatComposer, {
+      ...BASE_PROPS,
+      sessionRoutingBusy: true,
+      onSend,
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')
+    const send = el.querySelector<HTMLButtonElement>('.chat-send-btn')
+    expect(el.querySelector('#chat-composer-send-status')).toBeNull()
+    expect(textarea?.getAttribute('aria-describedby')).toBeNull()
+    expect(send?.disabled).toBe(true)
+    expect(send?.getAttribute('aria-busy')).toBe('true')
+    expect(send?.title).toBe('Model routing is being updated. Wait before sending.')
+    send?.click()
+    expect(onSend).not.toHaveBeenCalled()
 
     app.unmount()
   })

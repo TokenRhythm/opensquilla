@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/opensquilla/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/TokenRhythm/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
   <a href="https://opensquilla.ai/"><img src="https://img.shields.io/badge/website-opensquilla.ai-blue?style=for-the-badge" alt="Website"></a>
-  <a href="https://github.com/opensquilla/opensquilla/releases"><img src="https://img.shields.io/github/v/release/opensquilla/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/releases"><img src="https://img.shields.io/github/v/release/TokenRhythm/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=for-the-badge" alt="Python 3.12+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge" alt="Apache 2.0 License"></a>
 </p>
@@ -30,7 +30,9 @@
 
 ## 最新动态
 
-- 📢 **2026-07-03** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](docs/releases/agentic_routing_v0.pdf)**（预览版）已发布，随 OpenSquilla **0.5.0 Preview 1** 一同放出。报告详细介绍了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮。
+- 📢 **2026-08-22** —— 技术报告英文版已登陆 aiXiv：[aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)，中文版已登陆 ChinaXiv：[202608.00176](https://chinaxiv.org/abs/202608.00176)。如何引用 OpenSquilla 请见[引用](#引用)。
+
+- 📢 **2026-07-14** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** 已登陆 arXiv。报告展示了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮，以及**多模型集成路由如何超越 Fable 5**。
 
 ---
 
@@ -43,7 +45,7 @@ OpenSquilla 是一个高效利用 Token 的微内核 AI Agent。本地模型路�
 Ollama、DeepSeek、Gemini、Qwen/DashScope 等 20 多个 LLM 提供商，无需改动你的代码或
 配置结构。
 
-OpenSquilla 0.5.2 是当前正式发布版本。
+OpenSquilla 0.5.4 是当前正式发布版本。
 
 如需面向任务的产品文档，请从
 [OpenSquilla 产品指南](README.product.md)或[文档索引](docs/README.md)开始。
@@ -59,8 +61,8 @@ OpenSquilla 可运行于 Windows、macOS 和 Linux。请选择与你的使用场
 发布版安装命令使用 GitHub 上已发布的 release 资源。Python wheel 安装使用带版本号的 wheel
 文件名，因为安装器会校验嵌入在 wheel 文件名中的版本号。
 
-对于 0.5.2 的桌面使用，建议从 GitHub Release 下载打包桌面安装包:macOS 上为
-`OpenSquilla-0.5.2-mac-arm64.dmg`，Windows 上为 `OpenSquilla-0.5.2-win-x64.exe`。
+对于 0.5.4 的桌面使用，建议从 GitHub Release 下载打包桌面安装包:macOS 上为
+`OpenSquilla-0.5.4-mac-arm64.dmg`，Windows 上为 `OpenSquilla-0.5.4-win-x64.exe`。
 
 | 安装方式 | 适合人群 | 何时使用 |
 | --- | --- | --- |
@@ -100,10 +102,10 @@ PowerShell 安装器会通过 `winget` 自动装好它；而**终端快速安装
 
 ### 桌面安装包
 
-0.5.2 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
+0.5.4 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
 
-- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-mac-arm64.dmg>
-- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-win-x64.exe>
+- macOS Apple Silicon:<https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64:<https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 中国大陆下载可直接使用 OSS 的固定安装包链接：
 
@@ -146,7 +148,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. 安装 OpenSquilla**——所有平台命令相同。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 这会从 release URL 安装 OpenSquilla wheel，再由 `uv` 下载所选 extra 所声明的依赖。
@@ -167,7 +169,7 @@ opensquilla gateway run
 > PATH 设置命令。
 
 如需完全锁定版本的安装，请使用带版本号的 wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl`。
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 
@@ -181,7 +183,7 @@ opensquilla gateway run
 
    ```sh
    git lfs install
-   git clone https://github.com/opensquilla/opensquilla.git
+   git clone https://github.com/TokenRhythm/opensquilla.git
    cd opensquilla
    git lfs pull --include="src/opensquilla/squilla_router/models/**"
    ```
@@ -333,10 +335,13 @@ opensquilla uninstall --purge-all      # 全部（会要求你输入确认）
 
 ## 安装隐私
 
-OpenSquilla 使用匿名安装遥测来估算安装数量、版本采纳情况和运行时兼容性。数据只在网关
-首次启动时上报，并且每个 OpenSquilla 版本只上报一次。它还会在本地按 UTC 日期汇总已完成
-的顶层对话次数和 token 用量，并在启动时及此后每小时尝试向遥测服务上报待发送的 UTC
-当日累计快照。OpenSquilla 也可能执行被动更新检查，包括桌面启动时以及应用持续运行期间
+OpenSquilla 保留 V1 安装／版本和每日用量统计，并与 V2 的可靠性、客户端活跃和功能使用
+统计并行运行。V1 在网关监听和运行时就绪后后台上报首次安装，每个新版本只上报一次。
+它还会在本地按 UTC 日期汇总已完成的顶层对话次数和 token 用量，并在就绪后及此后每小时
+尝试上传已结束日期的待发送汇总；当日数据等到 UTC 日期结束后再上传，以保证每日总量完整。
+安装状态继续保留；每日事件使用各汇总数据库持久保存的随机标识生成去重键，避免同一机器
+不同 profile 相互覆盖，重启、移动数据库和重试时保持稳定。旧待上传记录的升级边界见隐私政策。
+OpenSquilla 也可能执行被动更新检查，包括桌面启动时以及应用持续运行期间
 最多每日一次的自动更新检查。上传设了很短的超时，绝不会阻塞启动。
 
 发送的内容:
@@ -354,6 +359,9 @@ OpenSquilla 使用匿名安装遥测来估算安装数量、版本采纳情况�
 `install_id` 是一个本地单向 SHA-256 摘要，由可用的 MAC 地址派生；无 MAC 时使用本地 IP
 地址，并以一个随机持久化值兜底。原始 MAC/IP 值不会被上传。
 
+上述安装标识仅用于 V1 统计，与 V2 的独立随机标识分开。
+`X-OpenSquilla-Install-Id` 提供商请求头仍处于停用状态，不向模型提供商附加此安装标识。
+
 不发送的内容:用户名、主机名、路径、API key、提供商配置、聊天/会话/记忆/Agent 内容、
 文件名或文件内容。源 IP 在传输层可能会被 HTTP 服务器看到，但它不在上传的数据内。
 
@@ -370,7 +378,12 @@ OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
 disable_network_observability = true
 ```
 
-这个统一开关覆盖自动安装遥测、每日汇总用量遥测、被动更新检查，以及桌面启动时和应用持续运行期间的自动更新检查。只要统一或兼容退出开关仍启用，用户显式触发的更新可用性检查也不会绕过它。其他用户主动操作仍可能在明确意图后访问网络服务，例如打开发布页、下载发布资产，以及使用已配置的提供商、搜索或渠道。
+这个统一开关覆盖 V1、V2 统计、被动更新检查，以及桌面启动时和应用持续运行期间的自动
+更新检查。关闭统计会停止采集并暂停上传，保留已有状态；重新开启后可继续上传待发送数据。
+此前保存的任一分项拒绝设置也会迁移为统一关闭。只要统一或兼容更新退出开关仍启用，
+用户显式触发的更新可用性检查也不会绕过它。CI、测试和 `DO_NOT_TRACK` 环境会自动抑制
+统计。其他用户主动操作仍可能在明确意图后访问网络服务，例如打开发布页、下载发布
+资产，以及使用已配置的提供商、搜索或渠道。
 
 旧环境变量仍兼容:
 
@@ -378,6 +391,9 @@ disable_network_observability = true
 OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
+
+旧遥测退出开关同时关闭 V1 和 V2。旧更新检查退出开关继续按 V1 兼容规则关闭安装／每日
+用量上传，但不关闭 V2。完整的数据处理规则见 [`PRIVACY.md`](PRIVACY.md)。
 
 进阶部署可以使用自己的安装遥测端点:
 
@@ -513,11 +529,11 @@ opensquilla gateway run --listen 0.0.0.0 --port 18791
 **Docker**
 
 预构建的多架构镜像(`amd64`/`arm64`)会随每个发布标签发布到
-`ghcr.io/opensquilla/opensquilla`——完整的容器部署指南见
+`ghcr.io/tokenrhythm/opensquilla`——完整的容器部署指南见
 [`docs/docker.md`](docs/docker.md)(家庭服务器与 NAS、带 token 认证的局域网访问、升级):
 
 ```sh
-OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/opensquilla/opensquilla:latest docker compose up -d
+OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/tokenrhythm/opensquilla:latest docker compose up -d
 ```
 
 不设置 `OPENSQUILLA_GATEWAY_IMAGE` 时,compose 路径运行一个你自己构建的
@@ -537,56 +553,9 @@ docker build -t opensquilla:local .
 
 ---
 
-## 0.4.1 更新内容
+## 版本发布说明
 
-OpenSquilla 0.4.1 是面向桌面端与 Control UI 方向的维护版本:
-
-- **桌面可靠性** —— 打包后的网关检查现在覆盖 Coding 模式、`code-task` 和 SquillaRouter
-  启动，桌面窗口/产物处理更加稳定。
-- **六种语言客户端支持** —— Control UI 和桌面客户端在首屏和设置界面支持英语、简体中文、
-  日语、法语、德语和西班牙语。
-- **Coding 模式与路由打包** —— 如果路由资源缺失或仍是 Git LFS 指针，桌面构建会快速失败，
-  防止生成功能受损的发布包。
-- **遥测与 Windows 打磨** —— 安装遥测会跳过 CI 和测试环境，Windows 桌面资源使用
-  OpenSquilla 徽标。
-- **主线治理** —— 普通 pull request 和发布集成统一围绕 `main`，维护者分支则保留用于发布、
-  热修复、预发布、集成和沙箱工作。
-
-完整说明:[`CHANGELOG.md`](CHANGELOG.md) ·
-[`docs/releases/0.4.1.md`](docs/releases/0.4.1.md)。
-
-## 0.2.1 更新内容
-
-OpenSquilla 0.2.1 是一个专注于发布包启动和长时运行 Agent 可靠性的维护版本:
-
-- **Windows 便携版启动** —— 便携版启动器能更好地检测并引导安装内置 ONNX 路由所需的
-  Visual C++ 运行库。
-- **长时运行的 Agent 轮次** —— 工具密集的 WebUI 会话现在能更利落地从各种状况中恢复:超大工具结果、格式错误的工具调用、产物交付环节，以及降级的最终响应。
-- **更干净的 WebUI 输出** —— 生成的产物标记不会出现在普通聊天回放中，而已交付的文件仍然
-  可见。
-- **记忆召回评分** —— 本地以及 OpenAI 兼容的嵌入向量，会在语义搜索前先做归一化；当向量得分偏低时，强关键词匹配依然能派上用场。
-
-完整说明:[`CHANGELOG.md`](CHANGELOG.md) ·
-[发布说明](https://opensquilla.ai/news/)。
-
-## 0.2.0 更新内容
-
-此版本在迁移、CLI 聊天、渠道、调度和长时运行的工具工作等方面扩展了 OpenSquilla:
-
-- **从现有 Agent 主目录迁移** —— `opensquilla migrate` 可以预览并执行从现有 OpenClaw/Hermes 主目录的导入，包括记忆、persona 文件、技能、MCP/渠道配置、冲突处理
-  和迁移报告。
-- **可用的聊天 CLI** —— `opensquilla chat` 拥有稳定的终端 UI、流式输出、排队输入、
-  斜杠模式发现、工具/状态条，以及更具确定性的实时提示行为。
-- **跨界面的 cron 自动化** —— cron 作业现在涵盖结构化排程、时区感知的精确/周期性/cron 运行、
-  渠道或 webhook 投递、失败目标、手动运行，以及 WebUI/CLI/RPC 的一致性。
-- **更好的 Feishu 和 Discord 渠道** —— 渠道适配器暴露更清晰的能力元数据、更安全的
-  私信/群组处理、原生的文件与产物路径，以及改进的附件/线程行为，同时特权操作保持受限作用域。
-- **更稳健的长时运行轮次** —— 失败的轮次不会进入提供商回放，格式错误的工具调用也会得到更稳妥的处理；需要审批的重试则会等操作者拍板。
-- **更智能的上下文与工具预算** —— 提供商预算压缩、提示缓存保留、对工具结果做大小限制，以及能感知副作用的并发，让大型、工具密集的会话更可预测。
-- **Web UI 与发布打磨** —— 在 0.2.0 中对按时间排序、表格布局、移动端控件、重复通知、配置表单、release URL 和安装路径都做了打磨收紧。
-
-完整说明:[`CHANGELOG.md`](CHANGELOG.md) ·
-[发布说明](https://opensquilla.ai/news/)。
+各版本的详细更新内容请见 [`CHANGELOG.md`](CHANGELOG.md) 与 [`docs/releases/`](docs/releases/)。
 
 ---
 
@@ -679,8 +648,8 @@ OpenSquilla 的灵感来自
 感谢所有为 OpenSquilla 做出贡献的人。
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  <a href="https://github.com/TokenRhythm/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TokenRhythm/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
   </a>
 </p>
 
@@ -690,7 +659,27 @@ OpenSquilla 的灵感来自
 
 我们欢迎各种形式的贡献——bug 报告、功能想法、文档、新的提供商或渠道适配器、技能，以及
 核心运行时方面的开发。请参阅 [`CONTRIBUTING.md`](CONTRIBUTING.md)，然后到
-[GitHub](https://github.com/opensquilla/opensquilla) 上提 issue 或 pull request。
+[GitHub](https://github.com/TokenRhythm/opensquilla) 上提 issue 或 pull request。
 
 [行为准则](CODE_OF_CONDUCT.md) · [安全](SECURITY.md) ·
 [支持](SUPPORT.md) · [许可证](LICENSE)（Apache-2.0）
+
+---
+
+## 引用
+
+如果你在研究中使用了 OpenSquilla，请引用我们的技术报告：
+
+```bibtex
+@misc{opensquilla2026,
+  title         = {OpenSquilla: Token-Efficient Agent = Models + Routing Harness},
+  author        = {{TokenRhythm Technologies}},
+  year          = {2026},
+  month         = aug,
+  eprint        = {aixiv.260822.000001},
+  archivePrefix = {aiXiv},
+  howpublished  = {aiXiv preprint},
+  url           = {https://aixiv.science/abs/aixiv.260822.000001},
+  note          = {Version 1.0, under review}
+}
+```

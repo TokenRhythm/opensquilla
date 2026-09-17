@@ -1,21 +1,22 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { copyTextWithFallback } from '@/utils/browser'
-import { useRpcStore } from '@/stores/rpc'
+import {
+  MEMORY_PROFILE_IMPORT_KEY,
+  MemoryProfileImportError,
+  type MemoryImportAnalysisPhase as AnalysisPhase,
+  type MemoryImportInfo as ImportInfo,
+  type MemoryImportJob as ImportJob,
+  type MemoryImportPreview as ImportPreview,
+  type MemoryImportRecent as RecentImport,
+  type MemoryImportDiffFile as ImportDiffFile,
+  type MemoryImportTarget as ImportTarget,
+} from '@/modules/memoryProfileImport'
 
-const INFO_METHOD = 'memory.import.info'
-const START_METHOD = 'memory.import.start'
-const STATUS_METHOD = 'memory.import.status'
-const CANCEL_METHOD = 'memory.import.cancel'
-const RETRY_METHOD = 'memory.import.retry'
-const APPLY_METHOD = 'memory.import.apply'
-const UNDO_METHOD = 'memory.import.undo'
-const DISCARD_METHOD = 'memory.import.discard'
 const EXPORT_PROMPT_VERSION = 'profile-export-v1'
-const CLIENT_SCHEMA_VERSION = 1
 const CLIENT_INPUT_LIMIT_BYTES = 256 * 1024
 
 type PanelState =
@@ -29,92 +30,22 @@ type PanelState =
   | 'success'
   | 'stale-undo'
   | 'error'
-type AnalysisPhase = 'reading' | 'model' | 'diff'
-type ImportTarget = 'USER' | 'MEMORY' | 'IMPORT'
 type Operation = 'info' | 'copy' | 'preview' | 'apply' | 'undo'
-type JobStatus = 'queued' | 'analyzing' | 'cancelling' | 'cancelled'
-  | 'interrupted' | 'ready' | 'failed' | 'applied' | 'discarded'
-
-interface ImportInfo {
-  schemaVersion: number
-  available: boolean
-  provider: string
-  model: string
-  isLocal: boolean
-  maxInputBytes: number
-  promptVersion: string
-  recentImport: RecentImport | null
-  draftJob: ImportJob | null
-}
-
-interface RecentImport {
-  receiptId: string
-  batchId: string
-  appliedAt: string
-  summary: string[]
-  provider: string
-  model: string
-  status: string
-  indexStatus: string
-  fileCount: number
-  targets: ImportTarget[]
-}
-
-interface ImportDiffFile {
-  target: ImportTarget
-  displayName: string
-  relativePath: string
-  status: 'created' | 'modified' | 'deleted'
-  additions: number
-  deletions: number
-  diff: string
-}
-
-interface ImportPreview {
-  schemaVersion: number
-  previewId: string
-  batchId: string
-  candidateHash: string
-  provider: string
-  model: string
-  summary: string[]
-  decisionCounts: {
-    applied: number
-    duplicate: number
-    unresolved: number
-  }
-  files: ImportDiffFile[]
-}
-
-interface ImportJob {
-  schemaVersion: number
-  jobId: string
-  batchId: string
-  status: JobStatus
-  stage: AnalysisPhase
-  provider: string
-  model: string
-  startedAt: string
-  canRetry: boolean
-  errorCode: string
-  preview: ImportPreview | null
-}
-
-interface RpcError extends Error {
-  code?: string
-}
 
 const { t, tm, locale } = useI18n()
-const rpc = useRpcStore()
+const injectedMemoryImport = inject(MEMORY_PROFILE_IMPORT_KEY)
+if (!injectedMemoryImport) throw new Error('MemoryProfileImport was not provided')
+const memoryImport = injectedMemoryImport
 const state = ref<PanelState>('loading')
 const phase = ref<AnalysisPhase>('reading')
 const rawText = ref('')
-const promptOpen = ref(false)
+const promptOpen = ref(true)
 const promptCopied = ref(false)
 const submitAttempted = ref(false)
 const busy = ref(false)
 const errorCode = ref('')
 const previewErrorVisible = ref(false)
+const retryErrorVisible = ref(false)
 const lastOperation = ref<Operation>('info')
 const previewMode = ref<'import' | 'undo'>('import')
 const successKind = ref<'import' | 'undo'>('import')
@@ -158,10 +89,12 @@ const inputError = computed(() => {
 })
 const providerLabel = computed(() => info.value?.provider || preview.value?.provider || '')
 const modelLabel = computed(() => info.value?.model || preview.value?.model || '')
-const hasCanonicalDeletion = computed(() => Boolean(
-  preview.value?.files.some(file => (
-    (file.target === 'USER' || file.target === 'MEMORY') && file.deletions > 0
-  )),
+const hasCanonicalRemovalOnly = computed(() => Boolean(
+  preview.value?.files.some(file => {
+    if (file.target !== 'USER' && file.target !== 'MEMORY') return false
+    return file.status === 'deleted'
+      || (file.status === 'modified' && file.deletions > 0 && file.additions === 0)
+  }),
 ))
 const totalAdditions = computed(() => (
   preview.value?.files.reduce((total, file) => total + file.additions, 0) || 0
@@ -196,136 +129,35 @@ const recentTargets = computed(() => {
   const targets = new Set(recentImport.value?.targets || [])
   return (['USER', 'MEMORY', 'IMPORT'] as ImportTarget[]).filter(target => targets.has(target))
 })
-const recentSummaryItems = computed(() => recentImport.value?.summary.slice(0, 3) || [])
-const noChangeReason = computed(() => (
-  recentImport.value?.summary[0] || t('settings.memoryImport.noChangesDescription')
-))
-
-function objectValue(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
-}
-
-function textValue(value: unknown): string {
-  return typeof value === 'string' ? value : ''
-}
-
-function numberValue(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
-function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
-}
-
-function normalizeRecent(value: unknown): RecentImport | null {
-  const data = objectValue(value)
-  const receiptId = textValue(data.receiptId)
-  if (!receiptId) return null
-  return {
-    receiptId,
-    batchId: textValue(data.batchId),
-    appliedAt: textValue(data.appliedAt),
-    summary: stringList(data.summary),
-    provider: textValue(data.provider),
-    model: textValue(data.model),
-    status: textValue(data.status) || 'applied',
-    indexStatus: textValue(data.indexStatus),
-    fileCount: numberValue(data.fileCount),
-    targets: Array.isArray(data.targets)
-      ? data.targets.map(normalizeTarget).filter((target): target is ImportTarget => target !== null)
-      : [],
+const pausedMessage = computed(() => {
+  const current = importJob.value
+  if (
+    current?.status === 'failed'
+    && (
+      current.errorCode === 'MEMORY_IMPORT_MODEL_FAILED'
+      || current.errorCode === 'MEMORY_IMPORT_INVALID_OUTPUT'
+    )
+  ) {
+    const key = current.errorCode === 'MEMORY_IMPORT_MODEL_FAILED' ? 'modelFailed' : 'invalidOutput'
+    return t(`settings.memoryImport.errors.${key}`)
   }
-}
+  return t(`settings.memoryImport.jobStates.${current?.status || 'failed'}.description`)
+})
 
-function normalizeInfo(value: unknown): ImportInfo {
-  const data = objectValue(value)
-  return {
-    schemaVersion: numberValue(data.schemaVersion),
-    available: data.available === true,
-    provider: textValue(data.provider),
-    model: textValue(data.model),
-    isLocal: data.isLocal === true || data.isLoopback === true || data.isLocalEndpoint === true,
-    maxInputBytes: numberValue(data.maxInputBytes ?? data.maxRawBytes) || CLIENT_INPUT_LIMIT_BYTES,
-    promptVersion: textValue(data.promptVersion),
-    recentImport: normalizeRecent(data.recentImport),
-    draftJob: normalizeJob(data.draftJob),
-  }
-}
-
-function normalizeTarget(value: unknown): ImportTarget | null {
-  if (value === 'USER' || value === 'MEMORY' || value === 'IMPORT') return value
-  return null
-}
-
-function normalizePreview(value: unknown): ImportPreview | null {
-  const data = objectValue(value)
-  const counts = objectValue(data.decisionCounts)
-  const files: ImportDiffFile[] = []
-  if (Array.isArray(data.files)) {
-    for (const entry of data.files) {
-      const file = objectValue(entry)
-      const target = normalizeTarget(file.target ?? file.logicalTarget)
-      const diff = textValue(file.diff)
-      if (!target || !diff) continue
-      files.push({
-        target,
-        displayName: textValue(file.displayName),
-        relativePath: textValue(file.relativePath),
-        status: file.status === 'created' || file.status === 'deleted' ? file.status : 'modified',
-        additions: numberValue(file.additions),
-        deletions: numberValue(file.deletions),
-        diff,
-      })
-    }
-  }
-  const normalized: ImportPreview = {
-    schemaVersion: numberValue(data.schemaVersion),
-    previewId: textValue(data.previewId),
-    batchId: textValue(data.batchId),
-    candidateHash: textValue(data.candidateHash),
-    provider: textValue(data.provider),
-    model: textValue(data.model),
-    summary: stringList(data.summary),
-    decisionCounts: {
-      applied: numberValue(counts.applied),
-      duplicate: numberValue(counts.duplicate),
-      unresolved: numberValue(counts.unresolved),
-    },
-    files,
-  }
-  return normalized.previewId && normalized.candidateHash ? normalized : null
-}
-
-function normalizeJob(value: unknown): ImportJob | null {
-  const data = objectValue(value)
-  const jobId = textValue(data.jobId)
-  if (!jobId) return null
-  const status = textValue(data.status) as JobStatus
-  const stageValue = textValue(data.stage)
-  return {
-    schemaVersion: numberValue(data.schemaVersion),
-    jobId,
-    batchId: textValue(data.batchId),
-    status,
-    stage: stageValue === 'model' || stageValue === 'diff' ? stageValue : 'reading',
-    provider: textValue(data.provider),
-    model: textValue(data.model),
-    startedAt: textValue(data.startedAt),
-    canRetry: data.canRetry === true,
-    errorCode: textValue(data.errorCode),
-    preview: normalizePreview(data.preview),
-  }
-}
-
-function rpcErrorCode(error: unknown): string {
-  return textValue((error as RpcError | undefined)?.code)
+function memoryImportErrorCode(error: unknown): string {
+  return error instanceof MemoryProfileImportError ? error.code : ''
 }
 
 function isMethodMissing(error: unknown): boolean {
-  return rpcErrorCode(error) === 'METHOD_NOT_FOUND'
-    || /method not found|unknown method|not registered/i.test(
-      error instanceof Error ? error.message : String(error),
-    )
+  return error instanceof MemoryProfileImportError && error.kind === 'unsupported'
+}
+
+function providerExpectation() {
+  return {
+    provider: info.value?.provider || '',
+    model: info.value?.model || '',
+    isLocal: info.value?.isLocal === true,
+  }
 }
 
 function createRequestId(): string {
@@ -402,20 +234,9 @@ async function loadInfo() {
   lastOperation.value = 'info'
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
   try {
-    await rpc.waitForConnection(8000)
-    if (!rpc.supportsMethod(INFO_METHOD)) {
-      state.value = 'unsupported'
-      return
-    }
-    const result = normalizeInfo(await rpc.call(INFO_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-    }))
-    if (result.schemaVersion !== CLIENT_SCHEMA_VERSION) {
-      state.value = 'unsupported'
-      return
-    }
+    const result = await memoryImport.info()
     info.value = result
     recentImport.value = result.recentImport
     if (result.draftJob) {
@@ -425,11 +246,10 @@ async function loadInfo() {
     }
   } catch (error) {
     if (isMethodMissing(error)) {
-      rpc.markMethodUnavailable(INFO_METHOD)
       state.value = 'unsupported'
       return
     }
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     state.value = 'error'
   }
 }
@@ -453,10 +273,6 @@ async function copyPrompt() {
 async function requestPreview() {
   submitAttempted.value = true
   if (inputError.value || !info.value?.available) return
-  if (!rpc.supportsMethod(START_METHOD) || !rpc.supportsMethod(STATUS_METHOD)) {
-    state.value = 'unsupported'
-    return
-  }
 
   const analyzingEntered = waitForNextStateEnter()
   phase.value = 'reading'
@@ -464,35 +280,26 @@ async function requestPreview() {
   lastOperation.value = 'preview'
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
   if (!previewRequestId.value) previewRequestId.value = createRequestId()
   state.value = 'analyzing'
   await analyzingEntered
 
   try {
-    const result = normalizeJob(await rpc.call(START_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
+    const result = await memoryImport.start({
       rawText: rawText.value,
-      uiLocale: locale.value,
+      locale: locale.value,
       exportPromptVersion: EXPORT_PROMPT_VERSION,
-      expectedProvider: info.value.provider,
-      expectedModel: info.value.model,
-      expectedIsLocal: info.value.isLocal,
       clientRequestId: previewRequestId.value,
-    }))
-    if (!result || result.schemaVersion !== CLIENT_SCHEMA_VERSION) {
-      throw Object.assign(new Error('Invalid profile import job'), {
-        code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-      })
-    }
+      expected: providerExpectation(),
+    })
     await handleJob(result)
   } catch (error) {
     if (isMethodMissing(error)) {
-      rpc.markMethodUnavailable(START_METHOD)
       state.value = 'unsupported'
       return
     }
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     previewErrorVisible.value = true
     state.value = 'input'
   }
@@ -526,21 +333,17 @@ async function pollJob() {
   const current = importJob.value
   if (!current || document.hidden) return
   try {
-    const result = normalizeJob(await rpc.call(STATUS_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      jobId: current.jobId,
-    }))
-    if (!result) throw new Error('Invalid profile import job status')
+    const result = await memoryImport.status(current.jobId)
     await handleJob(result)
   } catch (error) {
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     state.value = 'error'
   }
 }
 
 async function handleJob(current: ImportJob) {
   clearJobTimers()
+  retryErrorVisible.value = false
   importJob.value = current
   phase.value = current.stage
   if (current.status === 'ready' && current.preview) {
@@ -573,13 +376,8 @@ async function cancelImport() {
   if (!current || busy.value) return
   busy.value = true
   try {
-    const result = normalizeJob(await rpc.call(CANCEL_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      jobId: current.jobId,
-      clientRequestId: createRequestId(),
-    }))
-    if (result) await handleJob(result)
+    const result = await memoryImport.cancel(current.jobId, createRequestId())
+    await handleJob(result)
   } finally {
     busy.value = false
   }
@@ -589,20 +387,16 @@ async function retryImport() {
   const current = importJob.value
   if (!current || !info.value || busy.value) return
   busy.value = true
+  retryErrorVisible.value = false
   try {
-    const result = normalizeJob(await rpc.call(RETRY_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      jobId: current.jobId,
-      clientRequestId: createRequestId(),
-      expectedProvider: info.value.provider,
-      expectedModel: info.value.model,
-      expectedIsLocal: info.value.isLocal,
-    }))
-    if (result) await handleJob(result)
-  } catch (error) {
-    errorCode.value = rpcErrorCode(error)
-    state.value = 'paused'
+    const result = await memoryImport.retry(
+      current.jobId,
+      createRequestId(),
+      providerExpectation(),
+    )
+    await handleJob(result)
+  } catch {
+    retryErrorVisible.value = true
   } finally {
     busy.value = false
   }
@@ -613,15 +407,12 @@ async function discardJob() {
   if (!current || busy.value) return
   busy.value = true
   try {
-    await rpc.call(DISCARD_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      jobId: current.jobId,
-    })
+    await memoryImport.discard({ jobId: current.jobId })
     clearJobTimers()
     importJob.value = null
     preview.value = null
     previewRequestId.value = ''
+    retryErrorVisible.value = false
     state.value = 'input'
   } finally {
     busy.value = false
@@ -630,16 +421,10 @@ async function discardJob() {
 
 async function discardPreview() {
   const previewId = preview.value?.previewId
-  if (!previewId || !rpc.supportsMethod(DISCARD_METHOD)) return
+  if (!previewId) return
   try {
-    await rpc.call(DISCARD_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      previewId,
-    })
-  } catch (error) {
-    if (isMethodMissing(error)) rpc.markMethodUnavailable(DISCARD_METHOD)
-  }
+    await memoryImport.discard({ previewId })
+  } catch {}
 }
 
 async function backFromPreview() {
@@ -651,47 +436,24 @@ async function backFromPreview() {
   submitAttempted.value = false
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
   state.value = 'input'
 }
 
 async function applyPreview() {
   const current = preview.value
   if (!current || busy.value) return
-  if (!rpc.supportsMethod(APPLY_METHOD)) {
-    state.value = 'unsupported'
-    return
-  }
   busy.value = true
   lastOperation.value = 'apply'
   errorCode.value = ''
   if (!applyIdempotencyKey.value) applyIdempotencyKey.value = createRequestId()
   const isNoChangeImport = previewMode.value === 'import' && current.files.length === 0
   try {
-    const data = objectValue(await rpc.call(APPLY_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      previewId: current.previewId,
-      candidateHash: current.candidateHash,
+    recentImport.value = await memoryImport.apply({
+      preview: current,
       idempotencyKey: applyIdempotencyKey.value,
-    }))
-    if (Number(data.schemaVersion) !== CLIENT_SCHEMA_VERSION) {
-      throw Object.assign(new Error('Invalid profile import apply result'), {
-        code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-      })
-    }
-    const returnedRecent = normalizeRecent(data.recentImport)
-    recentImport.value = returnedRecent || {
-      receiptId: textValue(data.receiptId),
-      batchId: textValue(data.batchId) || current.batchId,
-      appliedAt: textValue(data.appliedAt) || new Date().toISOString(),
-      summary: current.summary,
-      provider: current.provider,
-      model: current.model,
-      status: previewMode.value === 'undo' ? 'undone' : 'applied',
-      indexStatus: textValue(data.indexStatus),
-      fileCount: current.files.length,
-      targets: Array.from(new Set(current.files.map(file => file.target))),
-    }
+      kind: previewMode.value,
+    })
     successKind.value = previewMode.value
     state.value = isNoChangeImport ? 'no-change' : 'success'
     rawText.value = ''
@@ -702,7 +464,7 @@ async function applyPreview() {
     applyIdempotencyKey.value = ''
     if (isNoChangeImport) focusPreviewHeadingAfterTransition()
   } catch (error) {
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     if (
       errorCode.value === 'MEMORY_IMPORT_PREVIEW_EXPIRED'
       || errorCode.value === 'MEMORY_IMPORT_STALE_PREVIEW'
@@ -727,57 +489,25 @@ async function applyPreview() {
 async function undoRecent() {
   const recent = recentImport.value
   if (!recent?.receiptId || busy.value) return
-  if (!rpc.supportsMethod(UNDO_METHOD)) {
-    state.value = 'unsupported'
-    return
-  }
   busy.value = true
   lastOperation.value = 'undo'
   errorCode.value = ''
   if (!undoRequestId.value) undoRequestId.value = createRequestId()
   try {
-    const data = objectValue(await rpc.call(UNDO_METHOD, {
-      schemaVersion: CLIENT_SCHEMA_VERSION,
-      agentId: 'main',
-      receiptId: recent.receiptId,
+    const result = await memoryImport.undo({
+      recent,
       clientRequestId: undoRequestId.value,
-      expectedProvider: info.value?.provider,
-      expectedModel: info.value?.model,
-      expectedIsLocal: info.value?.isLocal,
-    }))
-    if (Number(data.schemaVersion) !== CLIENT_SCHEMA_VERSION) {
-      throw Object.assign(new Error('Invalid profile import undo result'), {
-        code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-      })
-    }
-    const status = textValue(data.status)
-    if (status === 'undone' || status === 'alreadyUndone') {
-      recentImport.value = {
-        ...recent,
-        status: 'undone',
-        indexStatus: textValue(data.indexStatus),
-      }
+      expected: providerExpectation(),
+    })
+    if (result.kind === 'completed') {
+      recentImport.value = result.recentImport
       successKind.value = 'undo'
       state.value = 'success'
       undoRequestId.value = ''
       return
     }
-    if (status === 'reviewRequired') {
-      const result = normalizePreview(data.preview)
-      if (!result) {
-        throw Object.assign(new Error('Invalid undo preview'), {
-          code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-        })
-      }
-      if (
-        result.provider !== info.value?.provider
-        || result.model !== info.value?.model
-      ) {
-        throw Object.assign(new Error('Undo preview model changed'), {
-          code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-        })
-      }
-      preview.value = result
+    if (result.kind === 'review-required') {
+      preview.value = result.preview
       previewMode.value = 'undo'
       applyIdempotencyKey.value = createRequestId()
       undoRequestId.value = ''
@@ -787,16 +517,12 @@ async function undoRecent() {
       focusPreviewHeadingAfterTransition()
       return
     }
-    throw Object.assign(new Error('Invalid undo result'), {
-      code: 'MEMORY_IMPORT_INVALID_OUTPUT',
-    })
   } catch (error) {
     if (isMethodMissing(error)) {
-      rpc.markMethodUnavailable(UNDO_METHOD)
       state.value = 'unsupported'
       return
     }
-    errorCode.value = rpcErrorCode(error)
+    errorCode.value = memoryImportErrorCode(error)
     state.value = 'error'
   } finally {
     busy.value = false
@@ -813,6 +539,7 @@ function resetForAnother() {
   submitAttempted.value = false
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
   previewMode.value = 'import'
   state.value = 'input'
 }
@@ -840,6 +567,7 @@ function handleRawInput() {
   previewRequestId.value = ''
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
 }
 
 onMounted(() => {
@@ -857,7 +585,11 @@ onUnmounted(() => {
 <template>
   <section class="memory-import" data-testid="settings-memory-panel">
     <header class="memory-import__head">
-      <h3 class="memory-import__title">{{ t('settings.memoryImport.title') }}</h3>
+      <h3
+        class="memory-import__title"
+        data-testid="memory-import-heading"
+        tabindex="-1"
+      >{{ t('settings.memoryImport.title') }}</h3>
       <p class="memory-import__description">{{ t('settings.memoryImport.description') }}</p>
     </header>
 
@@ -901,9 +633,6 @@ onUnmounted(() => {
                 <dd>{{ recentImport.provider }} / {{ recentImport.model }}</dd>
               </div>
             </dl>
-            <ul v-if="recentSummaryItems.length" class="memory-import__summary-list">
-              <li v-for="item in recentSummaryItems" :key="item">{{ item }}</li>
-            </ul>
             <p v-if="recentImport.indexStatus === 'pending'" class="memory-import__index-note">
               {{ t('settings.memoryImport.indexPending') }}
             </p>
@@ -930,60 +659,92 @@ onUnmounted(() => {
         key="input"
         class="memory-import__state memory-import__input-state"
       >
-        <div class="memory-import__prompt-row">
-          <div>
-            <strong>{{ t('settings.memoryImport.helper') }}</strong>
-            <button
-              type="button"
-              class="memory-import__prompt-toggle"
-              :aria-expanded="promptOpen ? 'true' : 'false'"
-              aria-controls="memory-import-export-prompt"
-              @click="promptOpen = !promptOpen"
-            >
-              {{ promptOpen ? t('settings.memoryImport.hidePrompt') : t('settings.memoryImport.showPrompt') }}
-              <Icon :name="promptOpen ? 'chevronDown' : 'chevronRight'" :size="14" aria-hidden="true" />
-            </button>
-          </div>
-          <button
-            type="button"
-            class="btn btn--ghost memory-import__copy"
-            data-testid="memory-import-copy-prompt"
-            @click="copyPrompt"
+        <ol
+          class="memory-import__steps"
+          :aria-label="t('settings.memoryImport.stepsLabel')"
+        >
+          <li
+            class="memory-import__step"
+            data-testid="memory-import-source-step"
           >
-            <Icon :name="promptCopied ? 'check' : 'copy'" :size="15" aria-hidden="true" />
-            <span>{{ promptCopied ? t('settings.memoryImport.copiedPrompt') : t('settings.memoryImport.copyPrompt') }}</span>
-          </button>
-        </div>
+            <div class="memory-import__step-head">
+              <span class="memory-import__step-number" aria-hidden="true">1</span>
+              <div>
+                <h4>{{ t('settings.memoryImport.sourceStepTitle') }}</h4>
+                <p>{{ t('settings.memoryImport.sourceStepDescription') }}</p>
+              </div>
+            </div>
 
-        <pre
-          v-show="promptOpen"
-          id="memory-import-export-prompt"
-          class="memory-import__prompt"
-          data-testid="memory-import-export-prompt"
-        >{{ exportPrompt }}</pre>
+            <div class="memory-import__step-body">
+              <div class="memory-import__prompt-actions">
+                <button
+                  type="button"
+                  class="memory-import__prompt-toggle"
+                  :aria-expanded="promptOpen ? 'true' : 'false'"
+                  aria-controls="memory-import-export-prompt"
+                  @click="promptOpen = !promptOpen"
+                >
+                  {{ promptOpen ? t('settings.memoryImport.hidePrompt') : t('settings.memoryImport.showPrompt') }}
+                  <Icon :name="promptOpen ? 'chevronDown' : 'chevronRight'" :size="14" aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  class="btn btn--ghost memory-import__copy"
+                  data-testid="memory-import-copy-prompt"
+                  @click="copyPrompt"
+                >
+                  <Icon :name="promptCopied ? 'check' : 'copy'" :size="15" aria-hidden="true" />
+                  <span>{{ promptCopied ? t('settings.memoryImport.copiedPrompt') : t('settings.memoryImport.copyPrompt') }}</span>
+                </button>
+              </div>
 
-        <label class="memory-import__input-label" for="memory-import-raw-text">
-          {{ t('settings.memoryImport.textareaLabel') }}
-        </label>
-        <textarea
-          id="memory-import-raw-text"
-          v-model="rawText"
-          class="memory-import__textarea"
-          data-testid="memory-import-textarea"
-          :placeholder="t('settings.memoryImport.textareaPlaceholder')"
-          :aria-invalid="inputError ? 'true' : 'false'"
-          aria-describedby="memory-import-input-meta memory-import-input-error memory-import-privacy"
-          @input="handleRawInput"
-        ></textarea>
-        <div id="memory-import-input-meta" class="memory-import__input-meta">
-          <span>{{ t('settings.memoryImport.inputSize', {
-            size: formatBytes(inputBytes),
-            limit: formatBytes(maxInputBytes),
-          }) }}</span>
-          <span v-if="inputError" id="memory-import-input-error" class="memory-import__input-error" role="alert">
-            {{ inputError }}
-          </span>
-        </div>
+              <pre
+                v-show="promptOpen"
+                id="memory-import-export-prompt"
+                class="memory-import__prompt"
+                data-testid="memory-import-export-prompt"
+              >{{ exportPrompt }}</pre>
+            </div>
+          </li>
+
+          <li
+            class="memory-import__step"
+            data-testid="memory-import-paste-step"
+          >
+            <div class="memory-import__step-head">
+              <span class="memory-import__step-number" aria-hidden="true">2</span>
+              <div>
+                <h4>{{ t('settings.memoryImport.pasteStepTitle') }}</h4>
+                <p>{{ t('settings.memoryImport.pasteStepDescription') }}</p>
+              </div>
+            </div>
+
+            <div class="memory-import__step-body">
+              <label class="memory-import__input-label" for="memory-import-raw-text">
+                {{ t('settings.memoryImport.textareaLabel') }}
+              </label>
+              <textarea
+                id="memory-import-raw-text"
+                v-model="rawText"
+                class="memory-import__textarea"
+                data-testid="memory-import-textarea"
+                :placeholder="t('settings.memoryImport.textareaPlaceholder')"
+                :aria-invalid="inputError ? 'true' : 'false'"
+                aria-describedby="memory-import-input-meta memory-import-input-error memory-import-privacy"
+                @input="handleRawInput"
+              ></textarea>
+              <div id="memory-import-input-meta" class="memory-import__input-meta">
+                <span>{{ t('settings.memoryImport.inputSize', {
+                  size: formatBytes(inputBytes),
+                  limit: formatBytes(maxInputBytes),
+                }) }}</span>
+                <span v-if="inputError" id="memory-import-input-error" class="memory-import__input-error" role="alert">
+                  {{ inputError }}
+                </span>
+              </div>
+            </div>
+          </li>
+        </ol>
 
         <div
           v-if="previewErrorVisible"
@@ -995,7 +756,11 @@ onUnmounted(() => {
           <div>
             <h4>{{ t('settings.memoryImport.errorTitle') }}</h4>
             <p>{{ errorMessage }}</p>
-            <button type="button" class="btn btn--primary" @click="requestPreview">
+            <button
+              type="button"
+              class="btn btn--primary"
+              @click="requestPreview"
+            >
               {{ t('settings.memoryImport.retry') }}
             </button>
           </div>
@@ -1052,9 +817,6 @@ onUnmounted(() => {
                   <dd>{{ recentImport.provider }} / {{ recentImport.model }}</dd>
                 </div>
               </dl>
-              <ul v-if="recentSummaryItems.length" class="memory-import__summary-list">
-                <li v-for="item in recentSummaryItems" :key="item">{{ item }}</li>
-              </ul>
               <p v-if="recentImport.indexStatus === 'pending'" class="memory-import__index-note">
                 {{ t('settings.memoryImport.indexPending') }}
               </p>
@@ -1122,7 +884,19 @@ onUnmounted(() => {
       >
         <Icon name="info" :size="24" aria-hidden="true" />
         <h4>{{ t(`settings.memoryImport.jobStates.${importJob?.status || 'failed'}.title`) }}</h4>
-        <p>{{ t(`settings.memoryImport.jobStates.${importJob?.status || 'failed'}.description`) }}</p>
+        <p>{{ pausedMessage }}</p>
+        <div
+          v-if="retryErrorVisible"
+          class="memory-import__notice memory-import__notice--error"
+          role="alert"
+          data-testid="memory-import-retry-error"
+        >
+          <Icon name="info" :size="18" aria-hidden="true" />
+          <div>
+            <h4>{{ t('settings.memoryImport.retryFailedTitle') }}</h4>
+            <p>{{ t('settings.memoryImport.retryFailedDescription') }}</p>
+          </div>
+        </div>
         <div class="memory-import__actions">
           <button
             type="button"
@@ -1131,7 +905,7 @@ onUnmounted(() => {
             data-testid="memory-import-retry-job"
             @click="retryImport"
           >
-            {{ t('settings.memoryImport.continueImport') }}
+            {{ t('settings.memoryImport.regeneratePreview') }}
           </button>
           <button
             type="button"
@@ -1171,9 +945,12 @@ onUnmounted(() => {
           </p>
         </div>
 
-        <ul v-if="preview?.summary.length" class="memory-import__summary-list">
-          <li v-for="item in preview.summary" :key="item">{{ item }}</li>
-        </ul>
+        <div v-if="preview?.summary.length" class="memory-import__model-analysis">
+          <h5>{{ t('settings.memoryImport.modelAnalysisTitle') }}</h5>
+          <ul class="memory-import__summary-list">
+            <li v-for="item in preview.summary" :key="item">{{ item }}</li>
+          </ul>
+        </div>
 
         <div class="memory-import__decision-counts">
           <span v-if="preview?.decisionCounts.duplicate">
@@ -1184,11 +961,14 @@ onUnmounted(() => {
           </span>
         </div>
 
-        <div v-if="hasCanonicalDeletion" class="memory-import__notice memory-import__notice--warn">
+        <div
+          v-if="hasCanonicalRemovalOnly"
+          class="memory-import__notice memory-import__notice--warn"
+        >
           <Icon name="info" :size="18" aria-hidden="true" />
           <div>
-            <h4>{{ t('settings.memoryImport.deletionWarningTitle') }}</h4>
-            <p>{{ t('settings.memoryImport.deletionWarning') }}</p>
+            <h4>{{ t('settings.memoryImport.removalWarningTitle') }}</h4>
+            <p>{{ t('settings.memoryImport.removalWarning') }}</p>
           </div>
         </div>
 
@@ -1266,7 +1046,7 @@ onUnmounted(() => {
       >
         <Icon name="check" :size="24" aria-hidden="true" />
         <h4 ref="previewHeading" tabindex="-1">{{ t('settings.memoryImport.noChangesTitle') }}</h4>
-        <p>{{ noChangeReason }}</p>
+        <p>{{ t('settings.memoryImport.noChangesDescription') }}</p>
         <button type="button" class="btn btn--primary" @click="backFromPreview">
           {{ previewMode === 'undo' ? t('settings.memoryImport.done') : t('settings.memoryImport.pasteAnother') }}
         </button>
@@ -1319,9 +1099,6 @@ onUnmounted(() => {
                   <dd>{{ recentImport.provider }} / {{ recentImport.model }}</dd>
                 </div>
               </dl>
-              <ul v-if="recentSummaryItems.length" class="memory-import__summary-list">
-                <li v-for="item in recentSummaryItems" :key="item">{{ item }}</li>
-              </ul>
               <p v-if="recentImport.indexStatus === 'pending'" class="memory-import__index-note">
                 {{ t('settings.memoryImport.indexPending') }}
               </p>
@@ -1444,26 +1221,70 @@ onUnmounted(() => {
   min-height: 220px;
 }
 
-.memory-import__prompt-row {
-  align-items: center;
+.memory-import__steps {
+  display: grid;
+  gap: var(--sp-3);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.memory-import__step {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   display: flex;
-  gap: var(--sp-4);
-  justify-content: space-between;
-  padding: var(--sp-3) var(--sp-4);
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: var(--sp-4);
 }
 
-.memory-import__prompt-row > div {
+.memory-import__step-head {
+  align-items: flex-start;
+  display: flex;
+  gap: var(--sp-3);
+}
+
+.memory-import__step-head > div {
   display: flex;
   flex-direction: column;
   gap: var(--sp-1);
+  min-width: 0;
 }
 
-.memory-import__prompt-row strong {
-  color: var(--text);
+.memory-import__step-head h4 {
   font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+
+.memory-import__step-number {
+  align-items: center;
+  background: var(--accent);
+  border-radius: var(--radius-full);
+  color: var(--accent-foreground);
+  display: inline-flex;
+  flex: 0 0 24px;
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  height: 24px;
+  justify-content: center;
+  line-height: 1;
+  width: 24px;
+}
+
+.memory-import__step-body {
+  display: grid;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.memory-import__prompt-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: space-between;
 }
 
 .memory-import__prompt-toggle {
@@ -1489,7 +1310,7 @@ onUnmounted(() => {
 }
 
 .memory-import__prompt {
-  background: var(--bg-elevated);
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   color: var(--text-muted);
@@ -1497,7 +1318,7 @@ onUnmounted(() => {
   font-size: var(--fs-xs);
   line-height: 1.55;
   margin: 0;
-  max-height: 260px;
+  max-height: 180px;
   overflow: auto;
   padding: var(--sp-4);
   white-space: pre-wrap;
@@ -1507,7 +1328,6 @@ onUnmounted(() => {
   color: var(--text);
   font-size: var(--fs-sm);
   font-weight: 600;
-  margin-bottom: calc(-1 * var(--sp-2));
 }
 
 .memory-import__textarea {
@@ -1518,7 +1338,7 @@ onUnmounted(() => {
   font: inherit;
   font-size: var(--fs-sm);
   line-height: 1.55;
-  min-height: 220px;
+  min-height: 190px;
   padding: var(--sp-4);
   resize: vertical;
   transition:
@@ -1546,7 +1366,6 @@ onUnmounted(() => {
   display: flex;
   font-size: var(--fs-xs);
   justify-content: space-between;
-  margin-top: calc(-1 * var(--sp-3));
 }
 
 .memory-import__input-error,
@@ -1687,6 +1506,12 @@ onUnmounted(() => {
 
 .memory-import__preview-title:focus-visible {
   box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.memory-import__model-analysis h5 {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  margin: 0 0 var(--sp-1);
 }
 
 .memory-import__summary-list {
@@ -1989,10 +1814,17 @@ onUnmounted(() => {
     gap: var(--sp-4);
   }
 
-  .memory-import__prompt-row,
   .memory-import__recent-head {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .memory-import__step {
+    padding: var(--sp-3);
+  }
+
+  .memory-import__prompt {
+    max-height: 150px;
   }
 
   .memory-import__copy {
@@ -2000,7 +1832,7 @@ onUnmounted(() => {
   }
 
   .memory-import__textarea {
-    min-height: 180px;
+    min-height: 160px;
   }
 
   .memory-import__input-meta,

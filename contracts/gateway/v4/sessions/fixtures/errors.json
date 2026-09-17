@@ -1,0 +1,179 @@
+{
+  "format_version": 1,
+  "kind": "error",
+  "cases": [
+    {
+      "id": "error.malformed-cursor",
+      "coverage": "INVALID_PARAMS",
+      "expectation": "exact",
+      "request_params": {
+        "view": "session-list-v1",
+        "cursor": "not-a-cursor"
+      },
+      "wire": {
+        "type": "res",
+        "id": "error.malformed-cursor",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INVALID_PARAMS",
+          "message": "params.cursor must be a valid sessions.list cursor",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.cursor-without-page-view",
+      "coverage": "INVALID_PARAMS",
+      "expectation": "exact",
+      "request_params": {
+        "cursor": "opaque"
+      },
+      "wire": {
+        "type": "res",
+        "id": "error.cursor-without-page-view",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INVALID_PARAMS",
+          "message": "params.cursor requires view=session-list-v1",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.insufficient-scope",
+      "coverage": "UNAUTHORIZED",
+      "expectation": "exact",
+      "principal": {
+        "role": "operator",
+        "scopes": []
+      },
+      "wire": {
+        "type": "res",
+        "id": "error.insufficient-scope",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "UNAUTHORIZED",
+          "message": "Insufficient scope for method: sessions.list: missing operator.read",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.guest-owner-missing",
+      "coverage": "UNAUTHORIZED",
+      "expectation": "exact",
+      "principal": {
+        "role": "operator",
+        "scopes": [
+          "operator.read"
+        ],
+        "auth_state": "guest",
+        "guest_owner_id": null
+      },
+      "request_params": {
+        "view": "session-count-v1"
+      },
+      "wire": {
+        "type": "res",
+        "id": "error.guest-owner-missing",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "UNAUTHORIZED",
+          "message": "Anonymous guest is not authorized for this RPC method or session",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.storage-busy",
+      "coverage": "STORAGE_BUSY",
+      "expectation": "exact",
+      "setup": {
+        "exception": "StorageBusyError",
+        "operation": "sessions.list",
+        "waited_ms": 125,
+        "retry_after_ms": 250,
+        "stage": "read_gate",
+        "resource": "session_storage_operation_lock"
+      },
+      "wire": {
+        "type": "res",
+        "id": "error.storage-busy",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "STORAGE_BUSY",
+          "message": "Session storage is temporarily busy. Retry this operation.",
+          "details": {
+            "operation": "sessions.list",
+            "waited_ms": 125,
+            "stage": "read_gate",
+            "resource": "session_storage_operation_lock"
+          },
+          "retryable": true,
+          "retry_after_ms": 250,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.legacy-value-error",
+      "coverage": "INVALID_REQUEST",
+      "expectation": "exact",
+      "setup": {
+        "storage_exception": "ValueError: invalid legacy limit"
+      },
+      "wire": {
+        "type": "res",
+        "id": "error.legacy-value-error",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "invalid legacy limit",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      }
+    },
+    {
+      "id": "error.truthy-non-object-internal",
+      "coverage": "INTERNAL_ERROR",
+      "expectation": "exact",
+      "request_case": "request.truthy-non-object",
+      "wire": {
+        "type": "res",
+        "id": "error.truthy-non-object-internal",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INTERNAL_ERROR",
+          "message": "'list' object has no attribute 'get'",
+          "details": null,
+          "retryable": false,
+          "retry_after_ms": null,
+          "accepted": null
+        }
+      },
+      "compatibility_note": "This is current behavior, not a desirable target. A candidate must not silently convert it to a different v4 error during the spike."
+    }
+  ]
+}

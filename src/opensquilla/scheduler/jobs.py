@@ -46,6 +46,26 @@ def set_failure_dispatcher(fn: FailureDispatcher | None) -> None:
     _failure_dispatcher = fn
 
 
+TerminalNotifier = Callable[[CronJob, JobExecution], Awaitable[None | str]]
+_terminal_notifier: TerminalNotifier | None = None
+
+
+def set_terminal_notifier(fn: TerminalNotifier | None) -> None:
+    """Register the notifier for the single persisted terminal run result."""
+    global _terminal_notifier
+    _terminal_notifier = fn
+
+
+async def notify_terminal_result(job: CronJob, execution: JobExecution) -> None:
+    """Best-effort terminal notification after persistence/state finalization."""
+    if _terminal_notifier is None:
+        return
+    try:
+        await _terminal_notifier(job, execution)
+    except Exception:  # noqa: BLE001 - notifications must not alter job state
+        logger.warning("terminal_notifier_raised id=%s", job.id, exc_info=True)
+
+
 # Error patterns indicating a transient failure (retry-eligible).
 # Permanent errors disable the job immediately; transient errors retry with backoff.
 _TRANSIENT_ERROR_PATTERNS = (

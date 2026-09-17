@@ -1,19 +1,25 @@
 <template>
   <section
-    v-if="isLive"
-    class="assistant-activity assistant-activity--live"
+    class="assistant-activity"
+    :class="{
+      'assistant-activity--live': isLive,
+      'assistant-activity--settled': !isLive,
+      'assistant-activity--failed': lifecycle === 'failed',
+      'assistant-activity--interrupted': lifecycle === 'interrupted',
+    }"
     data-testid="assistant-activity"
     data-share-activity="true"
     :data-share-expanded="open ? 'true' : 'false'"
   >
     <button
+      v-if="isLive"
       type="button"
       class="assistant-activity__live-head"
       data-share-activity-label
       data-share-control
       :aria-expanded="open"
       :aria-controls="bodyId"
-      @click.stop="open = !open"
+      @click.stop="toggleOpen"
     >
       <span
         class="assistant-activity__live-dot"
@@ -46,42 +52,15 @@
         aria-hidden="true"
       />
     </button>
-    <div
-      :id="bodyId"
-      class="assistant-activity__body"
-      :class="{ 'is-open': open }"
-      :aria-hidden="!open"
-      :inert="open ? undefined : true"
-      data-share-activity-body
-    >
-      <div class="assistant-activity__body-inner">
-        <div v-if="detailLabel" class="assistant-activity__detail">
-          {{ detailLabel }}
-        </div>
-        <slot />
-      </div>
-    </div>
-  </section>
-
-  <section
-    v-else
-    class="assistant-activity assistant-activity--settled"
-    :class="{
-      'assistant-activity--failed': lifecycle === 'failed',
-      'assistant-activity--interrupted': lifecycle === 'interrupted',
-    }"
-    data-testid="assistant-activity"
-    data-share-activity="true"
-    :data-share-expanded="open ? 'true' : 'false'"
-  >
     <button
+      v-else
       type="button"
       class="assistant-activity__summary"
       data-share-activity-label
       data-share-control
       :aria-expanded="open"
       :aria-controls="bodyId"
-      @click.stop="open = !open"
+      @click.stop="toggleOpen"
     >
       <span class="assistant-activity__label">{{ resolvedSummaryLabel }}</span>
       <Icon
@@ -94,7 +73,6 @@
     <div
       :id="bodyId"
       class="assistant-activity__body"
-      :class="{ 'is-open': open }"
       :aria-hidden="!open"
       :inert="open ? undefined : true"
       data-share-activity-body
@@ -154,19 +132,34 @@ const open = ref(readAssistantActivityExpansion(
   initialOpen(),
   props.continuityKey,
 ))
+const manuallyToggled = ref(false)
+
+function toggleOpen() {
+  manuallyToggled.value = true
+  open.value = !open.value
+}
 
 watch(open, expanded => {
   writeAssistantActivityExpansion(props.stateKey, expanded, props.continuityKey)
 })
 
 watch(() => [props.stateKey, props.continuityKey] as const, ([key, continuityKey]) => {
+  manuallyToggled.value = false
   open.value = readAssistantActivityExpansion(key, initialOpen(), continuityKey)
 })
 
 watch(
   () => props.defaultOpen,
   (defaultOpen, previousDefaultOpen) => {
-    if (defaultOpen !== previousDefaultOpen) open.value = defaultOpen
+    if (defaultOpen === previousDefaultOpen) return
+    if (!defaultOpen) {
+      // A terminal transition is an explicit visual handoff: always collapse
+      // live work so the canonical answer becomes the stable reading endpoint.
+      manuallyToggled.value = false
+      open.value = false
+      return
+    }
+    if (!manuallyToggled.value) open.value = true
   },
 )
 
@@ -270,7 +263,7 @@ const resolvedSummaryLabel = computed(() => {
 .assistant-activity__live-elapsed {
   flex: 0 0 auto;
   color: var(--text-muted);
-  font-size: 0.75rem;
+  font-size: inherit;
   font-variant-numeric: tabular-nums;
 }
 
@@ -311,9 +304,30 @@ const resolvedSummaryLabel = computed(() => {
   background: transparent;
 }
 
+/* Completed turns use the outer outcome as the visual anchor. The phase rows
+   underneath are supporting detail, so their previous size relationship is
+   deliberately inverted. */
+.assistant-activity--settled > .assistant-activity__summary {
+  color: color-mix(in srgb, var(--text) 76%, transparent);
+  font-size: 0.875rem;
+}
+
+.assistant-activity--settled > .assistant-activity__summary:hover {
+  color: var(--text);
+}
+
+.assistant-activity--settled :deep(.assistant-activity-status__row),
+.assistant-activity--settled :deep(.tool-row) {
+  font-size: 0.75rem;
+}
+
 .assistant-activity__summary:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
+  color: var(--text);
+}
+
+.assistant-activity--settled > .assistant-activity__summary:focus-visible {
   color: var(--text);
 }
 
@@ -369,7 +383,7 @@ const resolvedSummaryLabel = computed(() => {
     transform var(--dur-base) var(--ease-standard);
 }
 
-.assistant-activity__body.is-open {
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body {
   grid-template-rows: 1fr;
   opacity: 1;
   pointer-events: auto;
@@ -395,29 +409,29 @@ const resolvedSummaryLabel = computed(() => {
   line-height: 1.5;
 }
 
-.assistant-activity__body.is-open .assistant-activity__detail,
-.assistant-activity__body.is-open :deep(.thinking-block),
-.assistant-activity__body.is-open :deep(.assistant-activity-status__row),
-.assistant-activity__body.is-open :deep(.tool-row) {
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body .assistant-activity__detail,
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block),
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row),
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row) {
   animation: assistant-activity-item-enter var(--dur-base) var(--ease-standard) backwards;
 }
 
-.assistant-activity__body.is-open :deep(.thinking-block) {
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block) {
   animation-delay: 35ms;
 }
 
-.assistant-activity__body.is-open :deep(.assistant-activity-status__row:nth-child(1)),
-.assistant-activity__body.is-open :deep(.tool-row:nth-child(1)) {
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(1)),
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(1)) {
   animation-delay: 60ms;
 }
 
-.assistant-activity__body.is-open :deep(.assistant-activity-status__row:nth-child(2)),
-.assistant-activity__body.is-open :deep(.tool-row:nth-child(2)) {
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(2)),
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(2)) {
   animation-delay: 90ms;
 }
 
-.assistant-activity__body.is-open :deep(.assistant-activity-status__row:nth-child(n + 3)),
-.assistant-activity__body.is-open :deep(.tool-row:nth-child(n + 3)) {
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(n + 3)),
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(n + 3)) {
   animation-delay: 120ms;
 }
 
@@ -461,10 +475,10 @@ const resolvedSummaryLabel = computed(() => {
     animation: none;
   }
 
-  .assistant-activity__body.is-open .assistant-activity__detail,
-  .assistant-activity__body.is-open :deep(.thinking-block),
-  .assistant-activity__body.is-open :deep(.assistant-activity-status__row),
-  .assistant-activity__body.is-open :deep(.tool-row) {
+  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body .assistant-activity__detail,
+  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block),
+  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row),
+  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row) {
     animation: none;
   }
 }

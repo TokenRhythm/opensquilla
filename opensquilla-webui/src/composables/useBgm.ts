@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue'
+import { readStaticJson } from '@/platform/staticAssets'
 
 /**
  * One entry from `public/music/playlist.json`. `src` is either a filename
@@ -165,9 +166,8 @@ function sourceForId(id: string): string {
 }
 
 async function fetchManifest(name: string): Promise<BgmTrack[] | null> {
-  const res = await fetch(musicAssetUrl(name), { cache: 'no-cache' })
-  if (!res.ok) return null
-  const data = (await res.json()) as { tracks?: Array<Partial<BgmTrack>> }
+  const data = await readStaticJson<{ tracks?: Array<Partial<BgmTrack>> }>(musicAssetUrl(name))
+  if (!data) return null
   if (!Array.isArray(data.tracks)) return null
   return data.tracks
     .map(t => ({

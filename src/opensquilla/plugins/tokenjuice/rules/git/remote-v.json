@@ -4,6 +4,8 @@
   "description": "Compact git remote -v output while preserving fetch/push remotes.",
   "match": {
     "argv0": ["git"],
+    "gitSubcommands": ["remote"],
+    "gitSubcommandArgsStartsWithAny": [["-v"], ["--verbose"]],
     "argvIncludes": [["remote"], ["-v"]]
   },
   "transforms": {

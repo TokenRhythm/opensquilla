@@ -67,6 +67,27 @@ def test_cold_instance_synthesizes_unknown_model() -> None:
     assert entry.quality_prior is None
 
 
+def test_artifact_tool_capability_requires_an_explicit_catalog_fact() -> None:
+    catalog = ModelCatalog()
+    assert not catalog.tool_capability_is_verified(
+        "unknown-writer-model",
+        provider_name="custom",
+    )
+
+    catalog.set_user_overrides(
+        {
+            "custom/unknown-writer-model": {
+                "supports_tools": True,
+            }
+        }
+    )
+
+    assert catalog.tool_capability_is_verified(
+        "unknown-writer-model",
+        provider_name="custom",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-field authority merging
 # ---------------------------------------------------------------------------
@@ -300,8 +321,17 @@ def test_packaged_corrections_file_parses_with_expected_tables() -> None:
     assert set(payload["openrouter"]) == {
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-4.6",
+        "deepseek/deepseek-v4.1-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
+        "z-ai/glm-5.3-flash",
         "x-ai/grok-4.3",
         "stepfun/step-3.5-flash",
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro",
+        "z-ai/glm-5.2",
+        "z-ai/glm-5.1",
+        "moonshotai/kimi-k2.6",
     }
     # Every packaged row survives normalization — no unknown field names,
     # no mistyped values (a dropped field would silently weaken a layer).
@@ -345,8 +375,8 @@ def test_ladder_glob_rows_keep_specific_before_general_file_order() -> None:
     assert volcengine.index("doubao-seed-1-6*") < volcengine.index("*thinking*")
     byteplus = list(payload["byteplus"])
     assert byteplus.index("kimi-k2-*") < byteplus.index("*thinking*")
-    # deepseek is a single catch-all (reasoning_shape transcription).
-    assert list(payload["deepseek"]) == ["*"]
+    # Exact Flash metadata corrections precede the reasoning-shape catch-all.
+    assert list(payload["deepseek"]) == ["deepseek-flash", "deepseek-v4-flash", "*"]
 
 
 # ---------------------------------------------------------------------------

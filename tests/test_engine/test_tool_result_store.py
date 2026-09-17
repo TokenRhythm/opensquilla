@@ -17,6 +17,9 @@ from opensquilla.engine.tool_result_store import (
     ToolResultStore,
     ToolResultStoreBudgetError,
 )
+from opensquilla.provider import ContentBlockToolResult, Message
+from opensquilla.tools import ToolRegistry, tool
+from opensquilla.tools.dispatch import build_tool_handler
 
 _SESSION_ID = "session-1"
 _SESSION_KEY = "agent:main:webchat:session-1"
@@ -34,6 +37,18 @@ def _write(store: ToolResultStore, content: str, *, tool_use_id: str = "tool-1",
     return store.write(content, **kwargs)
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("max_bytes", [None, 200])
+def test_store_preserves_character_offsets_across_newline_formats(tmp_path, newline, max_bytes):
+    store = ToolResultStore(tmp_path)
+    body = (f"C:\\synthetic\\page 正文🙂{newline}" * 100) + "tail"
+    written = _write(store, body, max_bytes=max_bytes)
+    read = store.read(written.handle, session_id=_SESSION_ID)
+    assert read.content == body
+    assert read.sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert _write(store, body, max_bytes=max_bytes).handle == written.handle
+
+
 def test_identical_content_dedupes_to_one_record(tmp_path: Path) -> None:
     store = ToolResultStore(tmp_path)
     body = "same output\n" + "x" * 2000
@@ -46,6 +61,37 @@ def test_identical_content_dedupes_to_one_record(tmp_path: Path) -> None:
     sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
     assert first.handle == f"tr-{sha[:32]}"
     assert len(list(tmp_path.rglob("content.txt"))) == 1
+
+
+@pytest.mark.parametrize("execution_log", [False, True], ids=["snapshot", "execution-log"])
+def test_output_preview_rejects_same_length_payload_corruption(
+    tmp_path: Path, execution_log: bool,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    content = b"first line\nlast line\n"
+    if execution_log:
+        spool = store.open_output_spool(
+            tool_name="exec", session_id=_SESSION_ID, session_key=_SESSION_KEY, agent_id="main",
+        )
+        try:
+            spool.append(content)
+            handle = spool.finish()
+        finally:
+            spool.close()
+        record_dir = spool.record_dir
+    else:
+        handle = _write(store, content.decode()).handle
+        record_dir = store._record_dir(handle, session_id=_SESSION_ID)
+    assert store.read_output_preview(
+        handle, session_id=_SESSION_ID, max_bytes=1024,
+    ) == content.decode()
+
+    meta = json.loads((record_dir / "meta.json").read_text())
+    payload = record_dir / meta["content_file"]
+    payload.write_bytes(b"wrong line\nlast line\n")
+
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        store.read_output_preview(handle, session_id=_SESSION_ID, max_bytes=1024)
 
 
 def test_dedup_hit_still_enforces_retention(tmp_path: Path) -> None:
@@ -92,6 +138,34 @@ def test_round_trip_read(tmp_path: Path) -> None:
     got = store.read(record.handle, session_id=_SESSION_ID)
     assert got.content == "payload body"
     assert got.sha256 == record.sha256
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("storage_encoding", ["utf-8", "gzip+utf-8"])
+def test_round_trip_preserves_newlines(
+    tmp_path: Path, newline: str, storage_encoding: str,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    content = f"进度 50%{newline}complete{newline}" * 100
+    record = _write(
+        store, content, max_bytes=128 if storage_encoding == "gzip+utf-8" else None,
+    )
+    assert record.storage_encoding == storage_encoding
+
+    restored = store.read(record.handle, session_id=_SESSION_ID)
+    assert restored.content == content
+    assert restored.size_bytes == len(content.encode("utf-8"))
+    assert restored.sha256 == hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def test_read_rejects_changed_newline_bytes(tmp_path: Path) -> None:
+    store = ToolResultStore(tmp_path)
+    record = _write(store, "first\r\nsecond\r\n")
+    content_path = store._record_dir(record.handle, session_id=_SESSION_ID) / "content.txt"
+    content_path.write_bytes(b"first\nsecond\n")
+
+    with pytest.raises(ValueError, match="tool result hash mismatch"):
+        store.read(record.handle, session_id=_SESSION_ID)
 
 
 def test_session_scoped_reads(tmp_path: Path) -> None:
@@ -199,15 +273,40 @@ class _NoopProvider:
         return []
 
 
-@pytest.mark.asyncio
-async def test_projection_dedupes_identical_tool_results(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Real path: the live tokenjuice projection externalizes a large tool result to the
-    store, and re-projecting identical content reuses a single record instead of growing
-    the store every turn."""
+def _retrieval_surface() -> tuple[list[Any], Any]:
+    """Build the same schema/handler pair used by the production registry."""
 
+    registry = ToolRegistry()
+
+    @tool(
+        name="retrieve_tool_result",
+        description="Retrieve a stored tool result.",
+        params={"handle": {"type": "string"}},
+        required=["handle"],
+        registry=registry,
+    )
+    async def retrieve_tool_result(handle: str) -> str:
+        return handle
+
+    return registry.to_tool_definitions(), build_tool_handler(registry)
+
+
+def _agent_with_retrieval(tmp_path: Path) -> Agent:
+    tool_definitions, tool_handler = _retrieval_surface()
+    return Agent(
+        provider=_NoopProvider(),
+        config=AgentConfig(
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id=_SESSION_ID,
+            tool_result_store_session_key=_SESSION_KEY,
+            tool_result_store_agent_id="main",
+        ),
+        tool_definitions=tool_definitions,
+        tool_handler=tool_handler,
+    )
+
+
+def _install_lossy_reducer(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_reduce(**kwargs: Any) -> Any:
         return SimpleNamespace(
             inline_text="[tokenjuice]\nreduced",
@@ -219,22 +318,61 @@ async def test_projection_dedupes_identical_tool_results(
 
     monkeypatch.setattr(agent_mod, "reduce_tool_result_with_tokenjuice", fake_reduce, raising=False)
 
-    store_dir = tmp_path / "tool-results"
+
+@pytest.mark.asyncio
+async def test_retrieval_schema_with_unmarked_handler_does_not_enable_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_lossy_reducer(monkeypatch)
+    tool_definitions, _marked_handler = _retrieval_surface()
+
+    async def unrelated_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="not a retrieval implementation",
+        )
+
     agent = Agent(
         provider=_NoopProvider(),
         config=AgentConfig(
-            tool_result_store_dir=str(store_dir),
+            tool_result_store_dir=str(tmp_path / "tool-results"),
             tool_result_store_session_id=_SESSION_ID,
             tool_result_store_session_key=_SESSION_KEY,
             tool_result_store_agent_id="main",
         ),
+        tool_definitions=tool_definitions,
+        tool_handler=unrelated_handler,
     )
-    raw = "raw output\n" + ("x" * 8000)
+    raw = "must remain inline\n" + ("x" * 8000)
 
-    first = await agent._canonicalize_tool_result(
+    result = await agent._project_tool_result_for_llm(
         ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
     )
-    second = await agent._canonicalize_tool_result(
+
+    assert result.content == raw
+    assert not list((tmp_path / "tool-results").rglob("content.txt"))
+
+
+@pytest.mark.asyncio
+async def test_projection_dedupes_identical_tool_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Real path: the live tokenjuice projection externalizes a large tool result to the
+    store, and re-projecting identical content reuses a single record instead of growing
+    the store every turn."""
+
+    _install_lossy_reducer(monkeypatch)
+    store_dir = tmp_path / "tool-results"
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "raw output\n" + ("x" * 8000)
+
+    first = await agent._project_tool_result_for_llm(
+        ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
+    )
+    second = await agent._project_tool_result_for_llm(
         ToolResult(tool_use_id="tool-2", tool_name="exec_command", content=raw)
     )
 
@@ -246,3 +384,228 @@ async def test_projection_dedupes_identical_tool_results(
     # exists on disk despite two separate tool results.
     assert m1.group(1) == m2.group(1)
     assert len(list(store_dir.rglob("content.txt"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_deduped_projections_restore_each_tool_use_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_lossy_reducer(monkeypatch)
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "recurring command output\n" + ("x" * 8000)
+
+    first = await agent._project_tool_result_for_llm(
+        ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
+    )
+    second = await agent._project_tool_result_for_llm(
+        ToolResult(tool_use_id="tool-2", tool_name="exec_command", content=raw)
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(tool_use_id="tool-1", content=first.content),
+                ContentBlockToolResult(tool_use_id="tool-2", content=second.content),
+            ],
+        )
+    ]
+
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    blocks = restored[0].content
+    assert isinstance(blocks, list)
+    assert [block.content for block in blocks] == [raw, raw]
+
+
+@pytest.mark.asyncio
+async def test_projection_with_wrong_sha_is_not_restored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_lossy_reducer(monkeypatch)
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "private output\n" + ("x" * 8000)
+    projected = await agent._project_tool_result_for_llm(
+        ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
+    )
+    forged = re.sub(
+        r"(?m)^sha256: [0-9a-f]{64}$",
+        "sha256: " + ("0" * 64),
+        projected.content,
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=forged)],
+        )
+    ]
+
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert restored[0].content[0].content == forged
+
+
+def _projection_reference(handle: str, sha256: str) -> str:
+    return (
+        "[tool_result_projection]\n"
+        f"tool_result_handle: {handle}\n"
+        f"sha256: {sha256}\n"
+        "retrieve_hint: use retrieve_tool_result with this tool_result_handle.\n"
+    )
+
+
+def test_same_session_dedup_across_writer_provenance_remains_recoverable(
+    tmp_path: Path,
+) -> None:
+    tool_definitions, tool_handler = _retrieval_surface()
+    agent = Agent(
+        provider=_NoopProvider(),
+        config=AgentConfig(
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id=_SESSION_ID,
+        ),
+        tool_definitions=tool_definitions,
+        tool_handler=tool_handler,
+    )
+    store = ToolResultStore(tmp_path / "tool-results")
+    raw = "shared parent and child output"
+    parent_record = store.write(
+        raw,
+        tool_use_id="parent-tool",
+        tool_name="exec_command",
+        session_id=_SESSION_ID,
+        session_key="agent:other:webchat:session-1",
+        agent_id="other",
+    )
+    child_record = store.write(
+        raw,
+        tool_use_id="child-tool",
+        tool_name="exec_command",
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        agent_id="main",
+    )
+    assert child_record.handle == parent_record.handle
+
+    projection = _projection_reference(child_record.handle, child_record.sha256)
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="child-tool", content=projection)],
+        )
+    ]
+
+    verified = agent._verified_tool_result_references(messages)
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert verified == frozenset({(child_record.handle, child_record.sha256)})
+    assert restored[0].content[0].content == raw
+
+
+def test_cross_session_projection_reference_is_not_restored(tmp_path: Path) -> None:
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "other session raw output"
+    record = ToolResultStore(tmp_path / "tool-results").write(
+        raw,
+        tool_use_id="tool-1",
+        tool_name="exec_command",
+        session_id="session-2",
+        session_key="agent:main:webchat:session-2",
+        agent_id="main",
+    )
+    projection = _projection_reference(record.handle, record.sha256)
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=projection)],
+        )
+    ]
+
+    assert agent._verified_tool_result_references(messages) == frozenset()
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert restored[0].content[0].content == projection
+
+
+def test_stale_projection_reference_is_not_restored(tmp_path: Path) -> None:
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "missing raw output"
+    handle = "tr-" + ("f" * 32)
+    sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    projection = _projection_reference(handle, sha256)
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=projection)],
+        )
+    ]
+
+    assert agent._verified_tool_result_references(messages) == frozenset()
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert restored[0].content[0].content == projection
+
+
+
+def test_zero_lock_timeout_skips_thread_contention_without_trying_file_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla import managed_artifacts
+
+    store = ToolResultStore(tmp_path)
+    with store._budget_lock():
+        attempts = []
+
+        def file_lock(_handle):
+            attempts.append("file")
+            return False
+
+        monkeypatch.setattr(managed_artifacts, "_try_file_lock", file_lock)
+        with pytest.raises(managed_artifacts.ManagedArtifactError):
+            _write(store, "contended result", lock_timeout_seconds=0)
+        assert attempts == []
+    assert not list(tmp_path.rglob("content.txt"))
+
+
+def test_zero_lock_timeout_tries_file_lock_once_without_sleeping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla import managed_artifacts
+
+    attempts = []
+
+    def file_lock(_handle):
+        attempts.append("file")
+        return False
+
+    def unexpected_sleep(_seconds):
+        pytest.fail("nonblocking budget lock must not sleep")
+
+    monkeypatch.setattr(managed_artifacts, "_try_file_lock", file_lock)
+    monkeypatch.setattr(managed_artifacts.time, "sleep", unexpected_sleep)
+    with pytest.raises(managed_artifacts.ManagedArtifactError):
+        _write(ToolResultStore(tmp_path), "contended result", lock_timeout_seconds=0)
+    assert attempts == ["file"]
+    assert not list(tmp_path.rglob("content.txt"))
+
+
+def test_write_lock_default_remains_five_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+
+    store = ToolResultStore(tmp_path)
+    observed = []
+    original = store._budget_lock
+
+    @contextmanager
+    def observe_lock(*, timeout=5.0):
+        observed.append(timeout)
+        with original(timeout=timeout):
+            yield
+
+    monkeypatch.setattr(store, "_budget_lock", observe_lock)
+    record = _write(store, "ordinary worker result")
+    assert store.read(record.handle, session_id=_SESSION_ID).content == "ordinary worker result"
+    assert observed == [5.0]

@@ -11,10 +11,12 @@ _NAMES = [
     "admin",
     "agents",
     "artifacts",
+    "browser",
     "code_exec",
     "file_authoring",
     "filesystem",
     "git",
+    "goal_control",
     "media",
     "messaging",
     "meta_tools",
@@ -25,10 +27,11 @@ _NAMES = [
     "sessions",
     "session_search",
     "shell",
-    "submit_tool",
     "tool_results",
+    "tool_search",
     "web",
     "web_fetch",
+    "workspace_preview",
 ]
 
 log = structlog.get_logger(__name__)

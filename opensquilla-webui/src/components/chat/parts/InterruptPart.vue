@@ -8,13 +8,14 @@
     :timeline="timeline"
     @allow-once="emit('resolve', part.approval.approvalId, 'allow-once')"
     @allow-always="emit('resolve', part.approval.approvalId, 'allow-always')"
-    @deny="note => emit('resolve', part.approval!.approvalId, 'deny', note)"
+    @deny="emit('resolve', part.approval.approvalId, 'deny')"
     @extend="emit('extend', part.approval.approvalId)"
   />
   <ClarifyCard
     v-else-if="part.interruptKind === 'clarify' && part.clarify"
     :request="part.clarify"
     :submitted="part.resolution === 'replied'"
+    :expired="part.resolution === 'expired' || part.resolution === 'unavailable'"
     :busy="part.busy"
     :error="part.error"
     @submit="fields => emit('clarify-submit', fields, part.clarify!)"
@@ -35,7 +36,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  resolve: [id: string, decision: 'allow-once' | 'allow-always' | 'deny', note?: string]
+  resolve: [id: string, decision: 'allow-once' | 'allow-always' | 'deny']
   extend: [id: string]
   'clarify-submit': [fields: Record<string, string>, request: NonNullable<Extract<ChatPart, { type: 'interrupt' }>['clarify']>]
   'clarify-dismiss': []
@@ -46,12 +47,17 @@ const emit = defineEmits<{
 function toApprovalItem(data: InterruptApprovalData): ChatApprovalItem {
   return {
     id: data.approvalId,
-    namespace: data.namespace,
+    namespace: data.namespace === 'plugin' ? 'plugin' : 'exec',
     toolName: data.toolName,
     command: data.command,
     approvalKind: data.approvalKind,
     args: data.args,
     warning: data.warning,
+    displayKind: data.displayKind,
+    displayTarget: data.displayTarget,
+    destructive: data.destructive,
+    irreversible: data.irreversible,
+    backupState: data.backupState,
     agent: data.agent,
     sessionKey: data.sessionKey,
     deadline: data.deadline,

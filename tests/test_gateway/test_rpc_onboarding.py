@@ -107,6 +107,77 @@ async def test_provider_configure_redacts_api_key(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_provider_configure_can_atomically_enable_openrouter_image_default(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_path))
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.provider.configure",
+        {
+            "providerId": "openrouter",
+            "model": "openai/gpt-test",
+            "apiKey": "synthetic-openrouter-key",
+            "imageGenerationIntent": "enable_provider_default",
+        },
+        _admin_ctx(),
+    )
+
+    assert res.error is None, res.error
+    change = res.payload["entry"]["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is True
+    persisted = tomllib.loads(config_path.read_text())
+    assert persisted["image_generation"] == {
+        "enabled": True,
+        "binding": "follow_llm",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+    }
+
+    status = await get_dispatcher().dispatch(
+        "r2",
+        "onboarding.status",
+        {},
+        _read_ctx(),
+    )
+    assert status.error is None, status.error
+    image_state = status.payload["imageGenerationState"]
+    assert image_state["mode"] == "follow_llm"
+    assert image_state["effective"]["providerId"] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_provider_configure_image_default_intent_preserves_explicit_off(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "c.toml"
+    config_path.write_text("[image_generation]\nenabled = false\n")
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_path))
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.provider.configure",
+        {
+            "providerId": "openrouter",
+            "model": "openai/gpt-test",
+            "apiKey": "synthetic-openrouter-key",
+            "imageGenerationIntent": "enable_provider_default",
+        },
+        _admin_ctx(),
+    )
+
+    assert res.error is None, res.error
+    change = res.payload["entry"]["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is False
+    assert change["reason"] == "operator_configuration_preserved"
+    persisted = tomllib.loads(config_path.read_text())
+    assert persisted["image_generation"] == {"enabled": False}
+
+
+@pytest.mark.asyncio
 async def test_provider_configure_can_omit_model_for_router_profile(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
     res = await get_dispatcher().dispatch(
@@ -116,9 +187,9 @@ async def test_provider_configure_can_omit_model_for_router_profile(tmp_path, mo
         _admin_ctx(),
     )
     assert res.error is None, res.error
-    assert res.payload["entry"]["model"] == "deepseek-v4-flash"
+    assert res.payload["entry"]["model"] == "deepseek-flash"
     data = tomllib.loads((tmp_path / "c.toml").read_text())
-    assert data["llm"]["model"] == "deepseek-v4-flash"
+    assert data["llm"]["model"] == "deepseek-flash"
     assert data["squilla_router"]["tier_profile"] == "deepseek"
 
 
@@ -182,6 +253,8 @@ async def test_router_configure_accepts_tier_overrides_without_rebinding_direct_
     persisted = tomllib.loads((tmp_path / "c.toml").read_text())
     assert persisted["llm"]["model"] == "gpt-5.4-mini"
     assert persisted["squilla_router"]["tiers"]["c2"]["model"] == "gpt-5.5-custom"
+    assert "supports_image" not in persisted["squilla_router"]["tiers"]["c2"]
+    assert "supports_image" not in ctx.config.squilla_router.tiers["c2"]
     assert persisted["squilla_router"]["tiers"]["image_model"]["supports_image"] is True
 
 
@@ -481,6 +554,7 @@ async def test_ensemble_configure_accepts_full_camel_case_payload(
             "selectionMode": "router_dynamic",
             "modelOptions": ["custom/model-a", "custom/model-b"],
             "minSuccessfulProposers": 2,
+            "proposerMaxRetries": 2,
             "allFailedPolicy": "error",
         },
         _admin_ctx(),
@@ -492,12 +566,31 @@ async def test_ensemble_configure_accepts_full_camel_case_payload(
         "selection_mode": "router_dynamic",
         "model_options": ["custom/model-a", "custom/model-b"],
         "min_successful_proposers": 2,
+        "proposer_max_retries": 2,
         "all_failed_policy": "error",
     }
     persisted = tomllib.loads((tmp_path / "c.toml").read_text())
     assert persisted["llm_ensemble"]["selection_mode"] == "router_dynamic"
     assert persisted["llm_ensemble"]["min_successful_proposers"] == 2
+    assert persisted["llm_ensemble"]["proposer_max_retries"] == 2
     assert persisted["llm_ensemble"]["all_failed_policy"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_ensemble_configure_rejects_out_of_range_proposer_retries(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.ensemble.configure",
+        {"proposerMaxRetries": 11},
+        _admin_ctx(),
+    )
+
+    assert res.error is not None
+    assert res.error.code == "onboarding.ensemble.invalid"
+    assert "proposer_max_retries must be between 0 and 10" in res.error.message
 
 
 @pytest.mark.asyncio
@@ -1575,24 +1668,55 @@ async def test_provider_configure_refreshes_shared_live_catalog_before_return(
 
     fetches: list[str] = []
 
-    async def fake_fetch(url: str, shape: str, **kwargs) -> dict:
-        fetches.append(url)
-        return {
-            "qwen3.7-max": {
-                "context_window": 1_000_000,
-                "max_output_tokens": 131_072,
+    from opensquilla.provider.tokenrhythm_catalog import (
+        parse_tokenrhythm_declared,
+        parse_tokenrhythm_published,
+    )
+
+    async def fake_public_fetch(**kwargs) -> dict:
+        fetches.append("published")
+        return parse_tokenrhythm_published(
+            {
+                "data": [
+                    {
+                        "id": "qwen3.7-max",
+                        "type": "chat",
+                        "status": "online",
+                        "contextWindow": 1_000_000,
+                        "maxOutputTokens": 131_072,
+                    }
+                ]
             }
-        }
+        )
+
+    async def fake_auth_fetch(*args, **kwargs) -> dict:
+        fetches.append("declared")
+        return parse_tokenrhythm_declared(
+            {
+                "data": [
+                    {
+                        "id": "qwen3.7-max",
+                        "context_length": 1_000_000,
+                        "max_completion_tokens": 131_072,
+                    }
+                ]
+            }
+        )
 
     monkeypatch.setattr(
-        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
-        fake_fetch,
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_published",
+        fake_public_fetch,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_declared",
+        fake_auth_fetch,
     )
     catalog = ModelCatalog()
     set_shared_catalog(catalog)
     ctx = _admin_ctx()
     ctx.config = GatewayConfig()
     ctx.config.config_path = str(tmp_path / "c.toml")
+    ctx.config.state_dir = str(tmp_path / "state")
 
     try:
         res = await get_dispatcher().dispatch(
@@ -1607,12 +1731,17 @@ async def test_provider_configure_refreshes_shared_live_catalog_before_return(
         )
 
         assert res.error is None, res.error
-        assert fetches == ["https://tokenrhythm.studio/api/models"]
+        assert fetches == ["published", "declared"]
         persisted = tomllib.loads((tmp_path / "c.toml").read_text())
         assert persisted["llm"]["provider"] == "tokenrhythm"
         assert catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm").source == "live"
         assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
     finally:
+        from opensquilla.gateway.model_catalog_refresh import (
+            install_tokenrhythm_catalog_coordinator,
+        )
+
+        install_tokenrhythm_catalog_coordinator(None)
         set_shared_catalog(None)
 
 
@@ -1628,7 +1757,11 @@ async def test_provider_configure_survives_live_catalog_failure(
         raise OSError("synthetic catalog outage")
 
     monkeypatch.setattr(
-        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_published",
+        failing_fetch,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_declared",
         failing_fetch,
     )
     catalog = ModelCatalog()
@@ -1636,6 +1769,7 @@ async def test_provider_configure_survives_live_catalog_failure(
     ctx = _admin_ctx()
     ctx.config = GatewayConfig()
     ctx.config.config_path = str(tmp_path / "c.toml")
+    ctx.config.state_dir = str(tmp_path / "state")
 
     try:
         res = await get_dispatcher().dispatch(
@@ -1654,6 +1788,11 @@ async def test_provider_configure_survives_live_catalog_failure(
         assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
         assert catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm").source == "corrections"
     finally:
+        from opensquilla.gateway.model_catalog_refresh import (
+            install_tokenrhythm_catalog_coordinator,
+        )
+
+        install_tokenrhythm_catalog_coordinator(None)
         set_shared_catalog(None)
 
 
@@ -1723,6 +1862,67 @@ async def test_models_discover_lists_live_models(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("active_url", "candidate_url"),
+    [
+        (
+            "https://tokenrhythm.studio/v1",
+            "HTTPS://TOKENRHYTHM.STUDIO:443/v1/",
+        ),
+        ("https://tokenrhythm.studio", "https://tokenrhythm.studio/v1"),
+        ("https://tokenrhythm.studio/v1", "https://tokenrhythm.studio"),
+    ],
+)
+async def test_models_discover_equivalent_active_url_can_persist_forced_refresh(
+    tmp_path, monkeypatch, active_url: str, candidate_url: str
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.onboarding.probe import ProviderModelsDiscoverResult
+
+    captured: dict[str, object] = {}
+
+    async def fake_discover(**kwargs):
+        captured.update(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True,
+            provider_id="tokenrhythm",
+            source="live",
+            models=[],
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.discover_selectable_provider_models",
+        fake_discover,
+    )
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(
+        config_path=str(tmp_path / "config.toml"),
+        llm={
+            "provider": "tokenrhythm",
+            "api_key": "synthetic-tokenrhythm-key",
+            "base_url": active_url,
+        },
+    )
+
+    result = await get_dispatcher().dispatch(
+        "equivalent-active-url",
+        "onboarding.models.discover",
+        {
+            "providerId": "tokenrhythm",
+            "baseUrl": candidate_url,
+            "forceRefresh": True,
+        },
+        ctx,
+    )
+
+    assert result.error is None, result.error
+    assert captured["force_refresh"] is True
+    assert captured["persist_catalog"] is True
+    assert captured["catalog_config"] is ctx.config
+    assert captured["api_key"] == "synthetic-tokenrhythm-key"
+
+
+@pytest.mark.asyncio
 async def test_models_discover_unverified_provider_stays_empty_without_build(
     tmp_path, monkeypatch
 ):
@@ -1747,6 +1947,7 @@ async def test_models_discover_unverified_provider_stays_empty_without_build(
         "detail": "",
         "source": "none",
         "models": [],
+        "catalog": None,
     }
 
 

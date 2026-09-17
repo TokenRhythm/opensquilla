@@ -121,8 +121,9 @@ def test_cli_gateway_command_metadata_has_curated_order_and_compatibility() -> N
         key=lambda cmd: cmd.order,
     )
 
-    assert [cmd.name for cmd in palette[:12]] == [
+    assert [cmd.name for cmd in palette[:13]] == [
         "/model",
+        "/routing",
         "/strategy",
         "/sessions",
         "/new",
@@ -161,6 +162,17 @@ def test_cli_gateway_command_metadata_has_curated_order_and_compatibility() -> N
         "model.routing.strategy",
     )
     assert DEFAULT_REGISTRY.find("/strategy", Surface.CLI_STANDALONE) is None
+
+    routing = DEFAULT_REGISTRY.find("/routing", Surface.CLI_GATEWAY)
+    assert routing is not None
+    assert routing.execution_for(Surface.CLI_GATEWAY) == CommandExecution(
+        ExecutionKind.LOCAL,
+        "session.routing",
+    )
+    assert routing.execution_for(Surface.CLI_STANDALONE) == CommandExecution(
+        ExecutionKind.LOCAL,
+        "session.routing",
+    )
 
     router = DEFAULT_REGISTRY.find("/router", Surface.CLI_GATEWAY)
     ensemble = DEFAULT_REGISTRY.find("/ensemble", Surface.CLI_GATEWAY)

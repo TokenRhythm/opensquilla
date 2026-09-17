@@ -3,7 +3,6 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore, type ThemeMode } from '@/stores/app'
 import { themePickerOptions } from '@/themes/registry'
-import { SUPPORTED_LOCALES, type LocaleCode } from '@/i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import { useBgm } from '@/composables/useBgm'
@@ -14,6 +13,7 @@ import {
   useToolDetailPreference,
 } from '@/composables/useToolDetailPreference'
 import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
+import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
@@ -24,9 +24,8 @@ import {
 
 // Client-only preferences: applied instantly to this browser and persisted via
 // the app store. No readiness state; never part of the settings dirty bar.
-// This is the canonical home for theme AND language — the sidebar theme button
-// and the topbar LanguageSwitcher are reactive shortcuts over the SAME store, so
-// the surfaces can never drift.
+// These client-only preferences apply instantly and never enter the settings
+// dirty bar. Language now lives in General with other app-wide defaults.
 const appStore = useAppStore()
 const { t } = useI18n()
 
@@ -35,16 +34,6 @@ const { t } = useI18n()
 // and links here via "More themes…"; this panel is the home for the full set.
 const themeOptions = themePickerOptions({ scope: 'all' })
 
-// Native language names — deliberately NOT translated.
-const LOCALE_LABELS: Record<LocaleCode, string> = {
-  en: 'English',
-  'zh-Hans': '中文',
-  ja: '日本語',
-  fr: 'Français',
-  de: 'Deutsch',
-  es: 'Español',
-}
-const localeOptions = SUPPORTED_LOCALES.map((code) => ({ code, label: LOCALE_LABELS[code] }))
 const toolDetailOptions = TOOL_DETAIL_DISPLAY_MODES.map(mode => ({
   mode,
   labelKey: `settings.appearance.toolDetails${mode[0].toUpperCase()}${mode.slice(1)}`,
@@ -52,10 +41,6 @@ const toolDetailOptions = TOOL_DETAIL_DISPLAY_MODES.map(mode => ({
 
 function pickTheme(mode: ThemeMode) {
   appStore.setTheme(mode)
-}
-
-function pickLocale(code: LocaleCode) {
-  void appStore.setLocale(code)
 }
 
 const {
@@ -66,6 +51,10 @@ const {
   enabled: routerVisualEffectsEnabled,
   setEnabled: setRouterVisualEffectsEnabled,
 } = useRouterVisualEffectsPreference()
+const {
+  enabled: composerFxEnabled,
+  setEnabled: setComposerFxEnabled,
+} = useComposerFloatingPreference()
 
 function pickToolDetailDisplay(mode: ToolDetailDisplayMode) {
   setToolDetailDisplayMode(mode)
@@ -268,39 +257,6 @@ onBeforeUnmount(stopCustomStepRepeat)
 
     <div class="control-row control-row--stack">
       <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('settings.appearance.languageLabel') }}</span>
-        <span class="control-row__desc">{{ t('settings.appearance.languageDesc') }}</span>
-      </div>
-      <div class="control-row__control">
-        <div
-          class="appearance-theme"
-          role="radiogroup"
-          :aria-label="t('settings.appearance.languageLabel')"
-          data-testid="settings-language-group"
-        >
-          <label
-            v-for="opt in localeOptions"
-            :key="opt.code"
-            class="appearance-theme__opt"
-            :class="{ 'is-active': appStore.locale === opt.code }"
-          >
-            <input
-              class="appearance-theme__radio"
-              type="radio"
-              name="appearance-locale"
-              :value="opt.code"
-              :checked="appStore.locale === opt.code"
-              :data-testid="`settings-language-${opt.code}`"
-              @change="pickLocale(opt.code)"
-            >
-            <span>{{ opt.label }}</span>
-          </label>
-        </div>
-      </div>
-    </div>
-
-    <div class="control-row control-row--stack">
-      <div class="control-row__label-block">
         <span class="control-row__label">{{ t('settings.appearance.toolDetailsLabel') }}</span>
         <span class="control-row__desc">{{ t('settings.appearance.toolDetailsDesc') }}</span>
       </div>
@@ -344,6 +300,22 @@ onBeforeUnmount(stopCustomStepRepeat)
           name="appearance_visual_effects"
           data-testid="settings-visual-effects-toggle"
           @change="setRouterVisualEffectsEnabled"
+        />
+      </div>
+    </div>
+
+    <div class="control-row control-row--stack">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('settings.appearance.composerFxLabel') }}</span>
+        <span class="control-row__desc">{{ t('settings.appearance.composerFxDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <ControlSwitch
+          :checked="composerFxEnabled"
+          :aria-label="t('settings.appearance.composerFxLabel')"
+          name="appearance_composer_fx"
+          data-testid="settings-composer-fx-toggle"
+          @change="setComposerFxEnabled"
         />
       </div>
     </div>
@@ -479,8 +451,7 @@ onBeforeUnmount(stopCustomStepRepeat)
 
 <style scoped>
 .appearance-theme {
-  /* Wraps to multiple rows so many themes / locales never overflow or crush the
-     row (the parent row is .control-row--stack, so this fills the width). */
+  /* Wraps so the complete theme list never overflows or crushes the row. */
   display: flex;
   flex-wrap: wrap;
   gap: 2px;

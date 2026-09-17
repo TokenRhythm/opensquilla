@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from opensquilla.engine.types import AgentConfig, DoneEvent
+from opensquilla.git_runtime import (
+    GitCapability,
+    GitCapabilityState,
+    GitRunResult,
+    GitRunState,
+)
+from opensquilla.skills.creator import runtime_e2e as runtime_e2e_module
 from opensquilla.skills.creator.runtime_e2e import (
     make_runtime_e2e_context,
     run_runtime_e2e_gate,
@@ -26,6 +36,108 @@ composition:
         task: "{{ inputs.user_message | xml_escape | truncate(512) }}"
 ---
 """
+
+
+def _git_result(state: GitRunState) -> GitRunResult:
+    available = state is not GitRunState.UNAVAILABLE
+    capability = GitCapability(
+        state=(
+            GitCapabilityState.AVAILABLE
+            if available
+            else GitCapabilityState.UNAVAILABLE
+        ),
+        executable=Path("/test/bin/git") if available else None,
+        source="test" if available else None,
+        reason=None if available else "git_not_found",
+    )
+    return GitRunResult(
+        state=state,
+        returncode=0 if state is GitRunState.OK else None,
+        stdout=b"",
+        stderr=b"" if available else b"git_not_found",
+        capability=capability,
+    )
+
+
+def test_runtime_e2e_workspace_uses_safe_git_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run_git(
+        args: tuple[str, ...],
+        *,
+        cwd: Path,
+        timeout: float,
+    ) -> GitRunResult:
+        assert cwd == tmp_path / "runtime-workspace"
+        assert timeout == 10.0
+        calls.append(args)
+        return _git_result(GitRunState.OK)
+
+    monkeypatch.setattr(runtime_e2e_module, "run_git", fake_run_git)
+
+    workspace = runtime_e2e_module._prepare_runtime_workspace(tmp_path, None)
+
+    assert workspace == tmp_path / "runtime-workspace"
+    assert calls == [
+        ("init",),
+        ("config", "user.email", "runtime-e2e@example.test"),
+        ("config", "user.name", "Runtime E2E"),
+        ("add", "README.md"),
+        ("commit", "-m", "baseline"),
+    ]
+    assert all(call[0] != "git" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_runtime_e2e_context_returns_meta_error_when_git_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = GitCapability(
+        state=GitCapabilityState.UNAVAILABLE,
+        reason="git_not_found",
+    )
+
+    def unavailable_capability(*args: object, **kwargs: object) -> GitCapability:
+        return capability
+
+    def forbidden_subprocess(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise AssertionError("unavailable Git must not launch a subprocess")
+
+    monkeypatch.setattr(
+        "opensquilla.git_runtime.resolve_git_capability",
+        unavailable_capability,
+    )
+    monkeypatch.setattr(
+        "opensquilla.git_runtime.subprocess.run",
+        forbidden_subprocess,
+    )
+    ctx = make_runtime_e2e_context(
+        provider=object(),
+        base_config=AgentConfig(model_id="frontier/highest"),
+        skill_loader=object(),
+        tool_definitions=[],
+        tool_handler=None,
+        agent_factory=None,
+        llm_chat=None,
+        tool_invoker=None,
+    )
+
+    result = await ctx["runner"](
+        route="meta",
+        prompt="please use synth test trigger",
+        skill_md=SKILL_MD,
+        baseline_model="frontier/highest",
+    )
+
+    assert result == {
+        "route": "meta",
+        "text": "",
+        "ok": False,
+        "error": "runtime E2E workspace requires Git, but it is unavailable (git_not_found)",
+    }
 
 
 @pytest.mark.asyncio

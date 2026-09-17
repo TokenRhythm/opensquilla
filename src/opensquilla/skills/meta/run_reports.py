@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Any
 
 from opensquilla.persistence.meta_run_writer import (
@@ -17,9 +18,22 @@ from opensquilla.persistence.meta_run_writer import (
     summarize_run_record,
 )
 from opensquilla.skills.meta.plan_serde import from_jsonable
+from opensquilla.skills.meta.replay_safety import (
+    is_external_paid_step,
+    paid_replay_is_safe,
+)
+from opensquilla.skills.meta.templating import evaluate_when
 from opensquilla.skills.meta.types import MetaPlan
 
 REPLAY_CONTEXT_MAX_CHARS = 4000
+
+_WHEN_OUTPUT_DOT_RE = re.compile(r"\boutputs\.([A-Za-z_][A-Za-z0-9_-]*)")
+_WHEN_OUTPUT_GET_RE = re.compile(
+    r"\boutputs\.get\(\s*['\"]([^'\"]+)['\"]",
+)
+_WHEN_OUTPUT_ITEM_RE = re.compile(
+    r"\boutputs\[\s*['\"]([^'\"]+)['\"]\s*\]",
+)
 
 
 def json_object(raw: str | None) -> dict[str, Any]:
@@ -212,21 +226,323 @@ def build_replay_request(record: RunRecord, *, mode: str = "run") -> dict[str, A
             context_lines.append(
                 f"- {step.step_id}: {_bounded_text(step.output_text or '', 800)}"
             )
+    # Older surfaces send ``replay.message`` through their normal composer.
+    # Keep that path deterministic and machine-routable: a canonical /meta
+    # command starts a fresh orchestrated run instead of asking the outer model
+    # to interpret replay prose.  New surfaces use the live two-phase replay
+    # ticket and preserve successful step outputs; ``context_message`` remains
+    # available for inspection/history without ever being sent as a command.
+    fallback_message = f"/meta {record.meta_skill_name}"
+    if user_message:
+        fallback_message += f" -- {user_message}"
     return {
         "run_id": record.run_id,
         "meta_skill_name": record.meta_skill_name,
         "mode": mode,
         "failed_step_id": failed_step_id or None,
         "request": inputs,
-        "message": _bounded_text("\n".join(context_lines)),
+        "message": _bounded_text(fallback_message),
+        "context_message": _bounded_text("\n".join(context_lines)),
         "replay_kind": "draft",
         "live_replay": {
             "available": False,
             "reason": (
-                "gateway RPC returns a replay draft; execution is started "
-                "by the chat surface"
+                "live replay requires a session-bound prepare/commit request; "
+                "the message fallback starts a fresh orchestrated run"
             ),
         },
+    }
+
+
+def _recovery_step_label(step: Any, language: str) -> str:
+    """Resolve the same zh/en label bucket used by the live scheduler."""
+
+    if language:
+        suffix = "zh" if language.lower().startswith("zh") else "en"
+        localized = getattr(step, "label_by_language", {}).get(suffix)
+        if localized:
+            return str(localized)
+    return str(getattr(step, "label", "") or "")
+
+
+def _recovery_actions(
+    step: Any,
+    error: object,
+    *,
+    plan_has_external_paid_steps: bool,
+) -> list[dict[str, str]]:
+    """Return replay controls that remain valid after the live stream is gone."""
+
+    if is_external_paid_step(step) and not paid_replay_is_safe(error):
+        return [
+            {
+                "id": "review-paid-submit",
+                "label": "Review paid submission",
+                "description": (
+                    "The provider may already have accepted or billed this request. "
+                    "Check provider history before starting another generation."
+                ),
+            },
+            {
+                "id": "switch-meta-skill",
+                "label": "Switch meta-skill",
+                "description": "Use a different workflow without repeating this paid submit.",
+            },
+        ]
+
+    actions = [
+        {
+            "id": "retry-run",
+            "label": "Retry this run",
+            "description": "Run the same meta-skill again with the original request.",
+        },
+        {
+            "id": "retry-step",
+            "label": "Retry failed step",
+            "description": "Retry only the failed step and reuse successful prior outputs.",
+        },
+        {
+            "id": "retry-with-partial-context",
+            "label": "Retry with partial context",
+            "description": "Reuse successful prior step outputs as context for the retry.",
+        },
+        {
+            "id": "switch-meta-skill",
+            "label": "Switch meta-skill",
+            "description": "Use a different meta-skill if this was the wrong workflow.",
+        },
+    ]
+    if plan_has_external_paid_steps:
+        actions = [action for action in actions if action["id"] != "retry-run"]
+    return actions
+
+
+def _when_output_references(expression: str) -> set[str] | None:
+    """Return statically named output keys, or ``None`` for dynamic access.
+
+    Recovery may only re-evaluate a historical condition from dependency
+    outputs that are both durable and complete. Dynamic mapping access cannot
+    prove that boundary, so it deliberately stays pending.
+    """
+
+    references = {
+        *(match for match in _WHEN_OUTPUT_DOT_RE.findall(expression) if match != "get"),
+        *_WHEN_OUTPUT_GET_RE.findall(expression),
+        *_WHEN_OUTPUT_ITEM_RE.findall(expression),
+    }
+    if re.search(r"\boutputs\b", expression) and not references:
+        return None
+    return references
+
+
+def build_recovery_events(record: RunRecord) -> dict[str, Any] | None:
+    """Rebuild terminal ribbon events from one persisted failed run.
+
+    Meta progress events are deliberately transient and do not belong in the
+    assistant transcript.  This read model gives reconnecting clients the same
+    UI state without replaying model-visible content or inventing a new run.
+    """
+
+    if record.status != "failed" or not record.failed_step_id:
+        return None
+    try:
+        plan = deserialize_plan(record)
+    except Exception:  # noqa: BLE001 - corrupt historical rows stay inspectable elsewhere
+        return None
+
+    inputs = json_object(record.inputs_json)
+    language = str(inputs.get("user_language") or "").strip()
+    records_by_id = {step.step_id: step for step in record.steps}
+    plan_steps_by_id = {step.id: step for step in plan.steps}
+    # A step with no persistence row may still have emitted a live `skipped`
+    # event: scheduler conditions are evaluated before on_step_begin writes a
+    # row. First walk backwards from durable execution evidence to find missing
+    # dependencies that cannot still be pending. Do not label every such gap as
+    # skipped: persistence is fail-open, so a row can also be absent after real
+    # execution. We prove conditional skips below by re-evaluating `when` using
+    # persisted inputs/outputs locally; none of that content enters the payload.
+    resolved_dependency_ids: set[str] = set()
+    dependency_stack = [
+        step_id
+        for step_id in set(records_by_id) | {record.failed_step_id}
+        if step_id in plan_steps_by_id
+    ]
+    while dependency_stack:
+        step_id = dependency_stack.pop()
+        for dependency_id in plan_steps_by_id[step_id].depends_on:
+            if (
+                dependency_id not in plan_steps_by_id
+                or dependency_id in resolved_dependency_ids
+            ):
+                continue
+            resolved_dependency_ids.add(dependency_id)
+            dependency_stack.append(dependency_id)
+    dependency_closures: dict[str, set[str]] = {}
+
+    def dependency_closure(step_id: str) -> set[str]:
+        cached = dependency_closures.get(step_id)
+        if cached is not None:
+            return cached
+        closure: set[str] = set()
+        stack = list(plan_steps_by_id[step_id].depends_on)
+        while stack:
+            dependency_id = stack.pop()
+            if dependency_id in closure or dependency_id not in plan_steps_by_id:
+                continue
+            closure.add(dependency_id)
+            stack.extend(plan_steps_by_id[dependency_id].depends_on)
+        dependency_closures[step_id] = closure
+        return closure
+
+    inferred_skipped_ids: set[str] = set()
+
+    def trusted_output(step_id: str) -> str | None:
+        if step_id in inferred_skipped_ids:
+            return ""
+        persisted = records_by_id.get(step_id)
+        if persisted is None:
+            return None
+        source: StepRecord | None = persisted
+        if persisted.status == "substituted":
+            if not persisted.substitute_step_id:
+                return None
+            source = records_by_id.get(persisted.substitute_step_id)
+            if source is None or source.status != "ok":
+                return None
+        elif persisted.status != "ok":
+            return None
+        if source is None:
+            return None
+        if "output_text" in source.truncated_fields:
+            return None
+        return source.output_text or ""
+
+    changed = True
+    while changed:
+        changed = False
+        for step in plan.steps:
+            if (
+                step.id in records_by_id
+                or step.id in inferred_skipped_ids
+                or step.id not in resolved_dependency_ids
+                or not step.when.strip()
+            ):
+                continue
+            # Persisted inputs are intentionally redacted/bounded, and a
+            # recovery read must never guess how that altered an old branch.
+            if re.search(r"\binputs\b", step.when):
+                continue
+            references = _when_output_references(step.when)
+            closure = dependency_closure(step.id)
+            if references is None or not references.issubset(closure):
+                continue
+            candidate_outputs: dict[str, str] = {}
+            for dependency_id in closure:
+                value = trusted_output(dependency_id)
+                if value is not None:
+                    candidate_outputs[dependency_id] = value
+            # The original scheduler could only have evaluated the condition
+            # after every direct dependency resolved. Missing or truncated
+            # evidence therefore leaves the historical state pending.
+            if any(
+                dependency_id not in candidate_outputs
+                for dependency_id in step.depends_on
+            ) or any(reference not in candidate_outputs for reference in references):
+                continue
+            try:
+                should_run = evaluate_when(
+                    step.when,
+                    inputs={},
+                    outputs=candidate_outputs,
+                )
+            except Exception:  # noqa: BLE001 - ambiguous history remains pending
+                continue
+            if should_run:
+                continue
+            inferred_skipped_ids.add(step.id)
+            changed = True
+    completed_steps: list[str] = []
+    recovered_steps: list[str] = []
+    skipped_steps: list[str] = []
+    step_states: list[dict[str, Any]] = []
+    plan_has_external_paid_steps = any(
+        is_external_paid_step(candidate) for candidate in plan.steps
+    )
+
+    for step in plan.steps:
+        persisted = records_by_id.get(step.id)
+        if step.id == record.failed_step_id:
+            state = "failed"
+        elif persisted is not None and persisted.status == "ok":
+            state = "succeeded"
+            completed_steps.append(step.id)
+        elif persisted is not None and persisted.status == "substituted":
+            state = "substituted"
+            recovered_steps.append(step.id)
+        elif persisted is None and step.id in inferred_skipped_ids:
+            state = "skipped"
+            skipped_steps.append(step.id)
+        else:
+            # Unstarted and cancellation-swept siblings remained pending in
+            # the original live ribbon. Preserve that distinction here.
+            state = "pending"
+
+        step_states.append({
+            "run_id": record.run_id,
+            "step_id": step.id,
+            "state": state,
+            "status_text": "Restored from run history" if state == "succeeded" else None,
+            # Unlike explicit admin inspection, this projection is fetched
+            # automatically when a chat opens. Persisted executor errors are
+            # not redacted by MetaRunWriter and may contain credentials, so
+            # never copy them into the reconnect UI payload.
+            "error": (
+                "This step failed in a previous run. Review its tool result before retrying."
+                if state == "failed"
+                else None
+            ),
+            "substitute_for": None,
+            "rescue": {
+                "actions": _recovery_actions(
+                    step,
+                    getattr(persisted, "error", None),
+                    plan_has_external_paid_steps=plan_has_external_paid_steps,
+                )
+            } if state == "failed" else {},
+        })
+
+    announced = {
+        "run_id": record.run_id,
+        "meta_skill_name": record.meta_skill_name,
+        "language": language,
+        "steps": [
+            {
+                "id": step.id,
+                "label": _recovery_step_label(step, language),
+                "kind": step.kind,
+                "depends_on": list(step.depends_on),
+            }
+            for step in plan.steps
+        ],
+        "total": len(plan.steps),
+        "parent_run_id": None,
+    }
+    completed = {
+        "run_id": record.run_id,
+        "outcome": "failed",
+        "completed_steps": completed_steps,
+        "failed_steps": [record.failed_step_id],
+        "recovered_steps": recovered_steps,
+        "skipped_steps": skipped_steps,
+    }
+    return {
+        "run_id": record.run_id,
+        "session_key": record.session_key,
+        "started_at_ms": record.started_at_ms,
+        "ended_at_ms": record.ended_at_ms,
+        "announced": announced,
+        "step_states": step_states,
+        "completed": completed,
     }
 
 

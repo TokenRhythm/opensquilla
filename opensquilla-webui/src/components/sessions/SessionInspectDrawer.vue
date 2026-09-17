@@ -42,7 +42,7 @@
         <span v-if="badge" class="inspect-meta__status" :class="badge.cls">{{ badge.label }}</span>
         <span class="inspect-meta__stats">
           {{ t('sessions.msgCount', { count: item.messageCount != null ? item.messageCount.toLocaleString() : '—' }) }}
-          · {{ t('sessions.inspect.updated', { time: sessionRelTime(item.updatedAt) }) }}<template v-if="costText"> · {{ costText }}</template>
+          · {{ t('sessions.inspect.updated', { time: sessionRelTime(item.updatedAt) }) }}
         </span>
       </div>
 
@@ -138,14 +138,19 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
 import RunTrace from '@/components/run/RunTrace.vue'
-import { useSessionInspect } from '@/composables/sessions/useSessionInspect'
+import {
+  abortInspectedSession,
+  useSessionInspect,
+} from '@/composables/sessions/useSessionInspect'
+import { SESSION_INSPECTION_KEY } from '@/modules/sessionInspection'
+import { TURN_COMMANDS_KEY } from '@/modules/turnCommands'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useRunTrace } from '@/composables/run/useRunTrace'
 import { useToasts } from '@/composables/useToasts'
@@ -156,7 +161,7 @@ import {
   restoreMessageAnchor,
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
-import { nodeStepsFromHistoryMessage } from '@/components/run/runTrace'
+import { nodeStepsFromSessionReadMessage } from '@/components/run/runTrace'
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import type { SessionItem } from '@/composables/useSessions'
 import { sessionRelTime, sessionStatusBadge, sessionSurfaceIcon } from './sessionDisplay'
@@ -183,6 +188,13 @@ const emit = defineEmits<{
   aborted: [item: SessionItem]
 }>()
 
+const injectedSessionInspection = inject(SESSION_INSPECTION_KEY)
+if (!injectedSessionInspection) throw new Error('SessionInspection was not provided')
+const sessionInspection = injectedSessionInspection
+const injectedTurnCommands = inject(TURN_COMMANDS_KEY)
+if (!injectedTurnCommands) throw new Error('TurnCommands was not provided')
+const turnCommands = injectedTurnCommands
+
 const {
   preview,
   messages,
@@ -197,9 +209,8 @@ const {
   load,
   loadEarlier,
   retryHistory,
-  abortSession,
   reset,
-} = useSessionInspect()
+} = useSessionInspect(sessionInspection)
 
 const { t } = useI18n()
 const { renderMarkdown, stripDirectiveTags, stripTimePrefix } = useChatTextRendering()
@@ -240,14 +251,6 @@ const snippetText = computed(() => {
   return text
 })
 
-const costText = computed(() => {
-  const raw = props.item?.raw as Record<string, unknown> | undefined
-  if (!raw) return ''
-  const value = Number(raw['costUsd'] ?? raw['cost_usd'] ?? raw['totalCostUsd'] ?? raw['total_cost_usd'] ?? NaN)
-  if (!Number.isFinite(value)) return ''
-  return `$${value >= 1 ? value.toFixed(2) : value.toFixed(4)}`
-})
-
 function roleTone(role: string): string {
   if (role === 'user') return 'user'
   if (role === 'assistant') return 'agent'
@@ -266,10 +269,10 @@ const transcriptRows = computed((): TranscriptRow[] => {
     const role = String(msg.role || 'assistant')
     const text = role === 'user' ? stripTimePrefix(msg.text || '') : msg.text || ''
     const html = text.trim() ? renderMarkdown(text) : ''
-    const steps = nodeStepsFromHistoryMessage(msg)
+    const steps = nodeStepsFromSessionReadMessage(msg)
     if (!html && steps.length === 0) return
     rows.push({
-      id: String(msg.message_id || msg.id || `${index}:${msg.timestamp ?? msg.ts ?? ''}`),
+      id: String(msg.messageId || msg.id || `${index}:${msg.createdAt ?? ''}`),
       tone: roleTone(role),
       roleLabel: roleLabel(role),
       html,
@@ -384,7 +387,7 @@ async function onAbort() {
   if (!ok) return
   aborting.value = true
   try {
-    const aborted = await abortSession(item.key)
+    const aborted = await abortInspectedSession(turnCommands, item.key)
     pushToast(aborted ? t('sessions.inspect.abortDone') : t('sessions.inspect.abortNone'))
     emit('aborted', item)
   } catch {

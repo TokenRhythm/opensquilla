@@ -13,8 +13,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from opensquilla.gateway.config import (
-    LEGACY_OPENROUTER_MODEL_OPTIONS,
-    STATIC_B5_SELECTION_MODE_PROVIDERS,
     GatewayConfig,
     LlmProviderProfile,
 )
@@ -24,13 +22,16 @@ from opensquilla.onboarding.config_store import default_config_path
 from opensquilla.onboarding.image_generation_specs import (
     get_image_generation_provider_setup_spec,
 )
+from opensquilla.onboarding.image_generation_state import (
+    resolve_image_generation_state,
+)
 from opensquilla.onboarding.provider_specs import get_provider_setup_spec
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
 from opensquilla.onboarding.section_status import (
     FIRST_RUN_REQUIRED_SECTIONS,
     SectionStatus,
     _configured_image_generation_provider_ids,
-    _image_generation_effective_env_key,
+    _image_generation_effective_endpoint,
     _image_generation_endpoint_conflict_provider,
     _image_generation_endpoint_is_valid,
     _image_generation_has_invalid_model_reference,
@@ -49,7 +50,20 @@ from opensquilla.onboarding.section_status import (
     needs_onboarding as _needs_onboarding,
 )
 from opensquilla.provider.environment import environment_value
+from opensquilla.provider.image_generation_credentials import (
+    resolve_image_generation_credential,
+)
 from opensquilla.provider.preset_registry import get_preset
+from opensquilla.router_tiers import (
+    LEGACY_OPENROUTER_MODEL_OPTIONS,
+    ROUTER_DYNAMIC_SELECTION_MODE,
+    STATIC_B5_SELECTION_MODE_PROVIDERS,
+    TierConfig,
+    effective_ensemble_selection_mode,
+    router_dynamic_tier_members_active,
+    router_tier_provider_roles,
+    tier_provider_role,
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +101,9 @@ class OnboardingStatus:
     sections: dict[str, SectionStatus] = field(default_factory=dict)
     section_details: dict[str, dict[str, object]] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    # Additive read-side metadata stays optional so integrations that construct
+    # this public dataclass with the pre-feature positional shape keep working.
+    image_generation_state: dict[str, object] = field(default_factory=dict)
 
 
 _SECTION_LABELS: dict[str, str] = {
@@ -160,16 +177,174 @@ def _router_detail(cfg: GatewayConfig, llm_source: str) -> str:
     return f"SquillaRouter default tier: {default_tier}"
 
 
-def _ensemble_detail(cfg: GatewayConfig) -> str:
-    from opensquilla.provider.ensemble import ensemble_runtime_status
+_ENSEMBLE_ONBOARDING_STATUS_KEYS = (
+    "enabled",
+    "selectionMode",
+    "runtimeStatus",
+    "configurationReady",
+    "blockedReason",
+    "proposerCount",
+    "proposerCountRange",
+    "aggregatorCount",
+    "perTurnCallCount",
+    "perTurnCallCountRange",
+    "memberProviders",
+    "configuredAllFailedPolicy",
+    "effectiveAllFailedPolicy",
+    "policyDeprecated",
+    "configuredMinSuccessfulProposers",
+    "effectiveMinSuccessfulProposers",
+    "configuredProposerMaxRetries",
+    "effectiveProposerMaxRetries",
+    "proposerMaxRetriesSource",
+    "fixedFallbackReady",
+    "fixedFallbackBlockedReason",
+    "fixedFallbackProvider",
+    "fixedFallbackModel",
+    "blockedTierCandidates",
+)
 
-    runtime = ensemble_runtime_status(cfg)
+
+def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
+    """Project global Ensemble state onto the frozen onboarding wire shape.
+
+    Tier-managed fusion is part of the router ladder and is diagnosed by the
+    doctor/router surfaces.  It must not make the global Ensemble toggle look
+    enabled or disable the router editor in older WebUI clients.
+    """
+    globally_enabled = bool(getattr(getattr(cfg, "llm_ensemble", None), "enabled", False))
+    configured_policy = str(
+        getattr(getattr(cfg, "llm_ensemble", None), "all_failed_policy", "fallback_single")
+        or "fallback_single"
+    ).strip()
+    configured_min = max(
+        1,
+        int(getattr(getattr(cfg, "llm_ensemble", None), "min_successful_proposers", 1) or 1),
+    )
+    configured_retries = max(
+        0,
+        int(getattr(getattr(cfg, "llm_ensemble", None), "proposer_max_retries", 0) or 0),
+    )
+    ensemble_fields_set = set(
+        getattr(getattr(cfg, "llm_ensemble", None), "model_fields_set", set())
+    )
+    c3_config = TierConfig.from_value(
+        (getattr(getattr(cfg, "squilla_router", None), "tiers", {}) or {}).get("c3")
+    )
+    c3_default_retries = bool(
+        not globally_enabled
+        and bool(getattr(getattr(cfg, "squilla_router", None), "enabled", False))
+        and c3_config.ensemble_enabled is True
+        and "proposer_max_retries" not in ensemble_fields_set
+    )
+    if not globally_enabled:
+        llm = getattr(cfg, "llm", None)
+        selection_mode = str(
+            getattr(getattr(cfg, "llm_ensemble", None), "selection_mode", "") or ""
+        )
+        runtime = {
+            "enabled": False,
+            "selectionMode": selection_mode,
+            "runtimeStatus": "disabled",
+            "configurationReady": None,
+            "blockedReason": None,
+            "proposerCount": 0,
+            "proposerCountRange": None,
+            "aggregatorCount": 0,
+            "perTurnCallCount": 0,
+            "perTurnCallCountRange": None,
+            "memberProviders": [],
+            "configuredAllFailedPolicy": configured_policy,
+            "effectiveAllFailedPolicy": configured_policy,
+            "policyDeprecated": False,
+            "configuredMinSuccessfulProposers": configured_min,
+            "effectiveMinSuccessfulProposers": configured_min,
+            "configuredProposerMaxRetries": configured_retries,
+            "effectiveProposerMaxRetries": 1 if c3_default_retries else configured_retries,
+            "proposerMaxRetriesSource": (
+                "c3_default" if c3_default_retries else "configured"
+            ),
+            # The global card is intentionally a top-level-toggle projection.
+            # When it is disabled, readiness is not evaluated here; active
+            # tier-local plans expose their truthful fallback status on the
+            # Router card instead.
+            "fixedFallbackReady": None,
+            "fixedFallbackBlockedReason": None,
+            "fixedFallbackProvider": str(getattr(llm, "provider", "") or ""),
+            "fixedFallbackModel": str(getattr(llm, "model", "") or ""),
+            "blockedTierCandidates": [],
+        }
+    else:
+        # Runtime readiness may resolve several provider credentials. Avoid
+        # that work (and its diagnostic noise) when this global surface is
+        # disabled; tier-managed fusion is projected by router/doctor status.
+        from opensquilla.provider.ensemble import ensemble_runtime_status
+
+        runtime = ensemble_runtime_status(cfg)
+        runtime.setdefault("configuredAllFailedPolicy", configured_policy)
+        runtime.setdefault("effectiveAllFailedPolicy", configured_policy)
+        runtime.setdefault("policyDeprecated", False)
+    return {key: runtime.get(key) for key in _ENSEMBLE_ONBOARDING_STATUS_KEYS}
+
+
+_TIER_ENSEMBLE_STATUS_KEYS = (
+    "selectionMode",
+    "activationTiers",
+    "tierSelectionModes",
+    "runtimeStatus",
+    "configurationReady",
+    "blockedReason",
+    "blockedTierCandidates",
+    "proposerCount",
+    "proposerCountRange",
+    "fixedFallbackReady",
+    "fixedFallbackBlockedReason",
+    "configuredAllFailedPolicy",
+    "effectiveAllFailedPolicy",
+    "configuredMinSuccessfulProposers",
+    "effectiveMinSuccessfulProposers",
+    "configuredProposerMaxRetries",
+    "effectiveProposerMaxRetries",
+    "proposerMaxRetriesSource",
+)
+
+
+def _tier_ensemble_onboarding_statuses(
+    cfg: GatewayConfig,
+) -> dict[str, dict[str, object]]:
+    """Project each active tier-local fusion plan onto the Router card.
+
+    The global Ensemble card intentionally mirrors only the top-level toggle
+    for older clients.  Per-tier rows prevent mixed legacy profiles from
+    borrowing whichever selection mode happens to appear first in a mapping.
+    A globally enabled plan is not tier-local, but retained legacy overrides
+    remain visible because runtime still honors them for upgrade compatibility.
+    """
+
+    from opensquilla.provider.ensemble import tier_ensemble_runtime_statuses
+
+    statuses: dict[str, dict[str, object]] = {}
+    for tier, runtime in tier_ensemble_runtime_statuses(cfg).items():
+        statuses[tier] = {
+            key: runtime.get(key)
+            for key in _TIER_ENSEMBLE_STATUS_KEYS
+        }
+    return statuses
+
+
+def _ensemble_detail(cfg: GatewayConfig) -> str:
+    runtime = _ensemble_onboarding_status(cfg)
     if not runtime["enabled"]:
         return "disabled"
     mode = str(runtime["selectionMode"])
     proposer_count = runtime.get("proposerCount")
     if proposer_count is None:
-        proposer_range = runtime.get("proposerCountRange") or []
+        raw_proposer_range = runtime.get("proposerCountRange")
+        proposer_range = (
+            raw_proposer_range
+            if isinstance(raw_proposer_range, list | tuple)
+            else []
+        )
         count_text = (
             f"{proposer_range[0]}-{proposer_range[1]} proposers"
             if len(proposer_range) == 2
@@ -208,7 +383,7 @@ def _ensemble_candidate_provider_ids(cfg: GatewayConfig) -> list[str]:
 
     router = getattr(cfg, "squilla_router", None)
     tiers = getattr(router, "tiers", {}) or {}
-    if selection_mode == "router_dynamic" and isinstance(tiers, dict):
+    if selection_mode == ROUTER_DYNAMIC_SELECTION_MODE and isinstance(tiers, dict):
         for tier_cfg in tiers.values():
             if isinstance(tier_cfg, dict):
                 add(tier_cfg.get("provider") or getattr(llm, "provider", ""))
@@ -740,9 +915,27 @@ def _router_provider_conflicts(cfg: GatewayConfig) -> tuple[str, ...]:
     active = str(getattr(getattr(cfg, "llm", None), "provider", "") or "").strip().lower()
     conflicts: set[str] = set()
     tiers = getattr(router, "tiers", {}) or {}
+    shared_selection_mode = effective_ensemble_selection_mode(cfg)
+    ensemble_globally_enabled = bool(
+        getattr(getattr(cfg, "llm_ensemble", None), "enabled", False)
+    )
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers if isinstance(tiers, dict) else {},
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=ensemble_globally_enabled,
+    )
     if isinstance(tiers, dict):
-        for tier in tiers.values():
+        for tier_name, tier in tiers.items():
             if not isinstance(tier, dict):
+                continue
+            provider_role = tier_provider_role(
+                tier_name,
+                tier,
+                shared_selection_mode=shared_selection_mode,
+                router_dynamic_members_active=dynamic_members_active,
+                ensemble_globally_enabled=ensemble_globally_enabled,
+            )
+            if provider_role not in {"direct", "dynamic_member"}:
                 continue
             provider = str(tier.get("provider") or "").strip().lower()
             if provider and provider != active:
@@ -826,26 +1019,31 @@ def _image_generation_provider_source(
         return "", ""
 
     provider_cfg = _image_generation_provider_config(cfg, provider_id)
-    explicit_key = getattr(provider_cfg, "api_key", "") if provider_cfg else ""
-    if explicit_key:
-        return "explicit", spec.env_key
-
-    env_key, env_is_explicit = _image_generation_effective_env_key(
-        cfg,
-        provider_id,
-        spec,
+    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
+    if endpoint is None:
+        return "", ""
+    resolution = resolve_image_generation_credential(
+        provider_id=provider_id,
+        provider_config=provider_cfg,
+        default_env_key=spec.env_key,
+        default_base_url=endpoint[0],
+        effective_base_url=(
+            spec.default_base_url
+            if str(getattr(cfg.image_generation, "binding", "custom") or "custom")
+            == "follow_llm"
+            else endpoint[1]
+        ),
+        gateway_config=cfg,
+        model=str(getattr(cfg.image_generation, "primary", "") or "image-generation"),
+        include_image_credentials=(
+            str(getattr(cfg.image_generation, "binding", "custom") or "custom")
+            != "follow_llm"
+        ),
     )
-    if env_key and os.environ.get(env_key):
-        return "env", env_key
-    if env_key and env_is_explicit:
-        return (
-            "missing_env",
-            env_key,
-        )
-
-    if _image_generation_llm_key_reusable(cfg, provider_id) is True:
-        return "llm_fallback", spec.env_key
-    return "", env_key or str(getattr(spec, "env_key", "") or "").strip()
+    return (
+        resolution.source if resolution.source != "none" else "",
+        resolution.env_key or spec.env_key,
+    )
 
 
 def _image_generation_annotations(
@@ -1052,10 +1250,22 @@ def get_onboarding_status(
         section_details["router"]["routerProviderConflicts"] = list(
             _router_provider_conflicts(config)
         )
+        section_details["router"]["routerProviderRoles"] = router_tier_provider_roles(
+            getattr(config.squilla_router, "tiers", {}) or {},
+            shared_selection_mode=effective_ensemble_selection_mode(config),
+            ensemble_globally_enabled=bool(
+                getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+            ),
+        )
+        tier_ensemble_statuses = _tier_ensemble_onboarding_statuses(config)
+        section_details["router"]["tierEnsembleStatuses"] = tier_ensemble_statuses
+        # Compatibility field for the current C3 editor.  Its meaning is now
+        # explicit: never infer C3 readiness from another tier's legacy mode.
+        section_details["router"]["tierEnsembleStatus"] = (
+            tier_ensemble_statuses.get("c3")
+        )
     if "ensemble" in section_details:
-        from opensquilla.provider.ensemble import ensemble_runtime_status
-
-        section_details["ensemble"].update(ensemble_runtime_status(config))
+        section_details["ensemble"].update(_ensemble_onboarding_status(config))
     resolution_getter = getattr(config, "provider_resolution", None)
     provider_resolution = (
         resolution_getter() if callable(resolution_getter) else {}
@@ -1094,6 +1304,13 @@ def get_onboarding_status(
         )
 
     llm_profile_status = _llm_profile_status(config, probe_history=probe_history)
+    image_generation_state = resolve_image_generation_state(
+        config,
+        configured=image_status is SectionStatus.OK,
+        resolved_provider_id=image_provider,
+        credential_source=image_source,
+        section_status=image_status.value,
+    )
     return OnboardingStatus(
         config_path=str(path),
         has_config=has_config,
@@ -1110,6 +1327,7 @@ def get_onboarding_status(
         image_generation_provider=image_provider,
         image_generation_primary=image_primary,
         image_generation_env_key=image_env_key,
+        image_generation_state=image_generation_state,
         audio_configured=audio_status is SectionStatus.OK,
         audio_enabled=bool(getattr(config.audio, "enabled", False)),
         audio_source=audio_source,

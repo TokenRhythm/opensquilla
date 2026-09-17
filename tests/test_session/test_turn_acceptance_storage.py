@@ -9,6 +9,13 @@ from typing import Any
 
 import pytest
 
+from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
+    ArtifactSessionService,
+)
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
@@ -17,10 +24,13 @@ from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
     SessionNode,
+    SessionStatus,
     TranscriptEntry,
 )
 from opensquilla.session.storage import (
+    MetaLaunchDraftDiscardedError,
     SessionStorage,
+    StaleEpochError,
     StorageBusyError,
     TurnIngressConflictError,
 )
@@ -113,6 +123,510 @@ async def _receipt_rows(storage: SessionStorage) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+
+
+
+
+
+
+@pytest.mark.asyncio
+async def test_meta_control_staging_prunes_only_abandoned_rows_after_30_days(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        old, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:old-staged",
+            meta_skill_name="meta-paper-write",
+        )
+        accepted, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:old-accepted",
+            meta_skill_name="meta-paper-write",
+        )
+        await storage.conn.execute(
+            "UPDATE meta_control_intents SET created_at = 1 WHERE intent_id IN (?, ?)",
+            (old.intent_id, accepted.intent_id),
+        )
+        await storage.conn.execute(
+            "UPDATE meta_control_intents SET status = 'accepted' WHERE intent_id = ?",
+            (accepted.intent_id,),
+        )
+        await storage.conn.commit()
+
+        recent, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:recent-staged",
+            meta_skill_name="meta-paper-write",
+        )
+
+        assert await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:old-staged",
+        ) is None
+        assert await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:old-accepted",
+        ) is not None
+        assert await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:recent-staged",
+        ) == recent
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_epoch_invalidates_staged_and_fences_recent_accepted_controls(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        staged, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:staged-before-reset",
+            meta_skill_name="meta-paper-write",
+        )
+        accepted, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:accepted-before-reset",
+            meta_skill_name="meta-paper-write",
+        )
+        await storage.conn.execute(
+            "UPDATE meta_control_intents SET status = 'accepted' WHERE intent_id = ?",
+            (accepted.intent_id,),
+        )
+        await storage.conn.commit()
+
+        assert await storage.advance_reset_epoch(SESSION_KEY) == 1
+
+        assert await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id=staged.correlation_id,
+        ) is None
+        preserved = await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id=accepted.correlation_id,
+        )
+        assert preserved is not None
+        assert preserved.intent_id == accepted.intent_id
+        assert preserved.status == "accepted"
+        assert await storage.is_meta_launch_discarded(
+            session_key=SESSION_KEY,
+            client_request_id="staged-before-reset",
+        )
+        assert await storage.is_meta_launch_discarded(
+            session_key=SESSION_KEY,
+            client_request_id="accepted-before-reset",
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_turn_reset_invalidates_staged_meta_controls(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    artifact_service: ArtifactSessionService | None = None
+    try:
+        await storage.upsert_session(_session())
+        artifact_service = await ArtifactSessionService.from_session_storage(storage)
+        await artifact_service.create_document(
+            session_key=SESSION_KEY,
+            session_id=SESSION_ID,
+            name="old working draft",
+            kind=ArtifactKind.HTML,
+            initial_artifact=ArtifactBlobRef(
+                artifact_id="art-old-working-draft",
+                sha256="a" * 64,
+                filename="draft.html",
+                media_type="text/html",
+                byte_size=10,
+            ),
+            actor=Actor(ActorKind.USER, "user-1"),
+        )
+        staged, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:before-atomic-reset",
+            meta_skill_name="meta-paper-write",
+        )
+        await storage.stage_meta_launch_draft(
+            session_key=SESSION_KEY,
+            client_request_id="atomic-reset-turn",
+            meta_skill_name="meta-paper-write",
+            launch_text="/meta meta-paper-write -- stale collision with reset ingress",
+        )
+        reset_node = _session(updated_at=300)
+        reset_node.session_id = "session-after-atomic-reset"
+        reset_node.epoch = 1
+
+        await storage.accept_turn(
+            TranscriptEntry(
+                session_id=reset_node.session_id,
+                session_key=SESSION_KEY,
+                message_id="message-after-atomic-reset",
+                role="user",
+                content="start over with this message",
+                created_at=300,
+            ),
+            expected_epoch=1,
+            updated_at=300,
+            task_record=AgentTaskRecord(
+                task_id="task-after-atomic-reset",
+                session_key=SESSION_KEY,
+                agent_id="main",
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="web_turn",
+                status=AgentTaskStatus.QUEUED,
+                created_at=300,
+                updated_at=300,
+            ),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="atomic-reset-turn",
+            request_fingerprint="sha256:atomic-reset-turn",
+            session_node=reset_node,
+            reset_from_session_id=SESSION_ID,
+        )
+
+        assert await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id=staged.correlation_id,
+        ) is None
+        rotated = await storage.get_session(SESSION_KEY)
+        assert rotated is not None
+        assert rotated.session_id == reset_node.session_id
+        assert rotated.epoch == 1
+        assert (
+            await artifact_service.list_documents(
+                session_key=SESSION_KEY,
+                session_id=SESSION_ID,
+            )
+            == ()
+        )
+        with pytest.raises(MetaLaunchDraftDiscardedError):
+            await storage.stage_meta_launch_draft(
+                session_key=SESSION_KEY,
+                client_request_id="atomic-reset-turn",
+                meta_skill_name="meta-paper-write",
+                launch_text="/meta meta-paper-write -- stale collision with reset ingress",
+            )
+    finally:
+        if artifact_service is not None:
+            await artifact_service.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_turn_reset_preserves_only_control_accepted_by_new_turn(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        stale, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:stale-before-reset",
+            meta_skill_name="meta-paper-write",
+        )
+        accepted_old, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:accepted-before-atomic-reset",
+            meta_skill_name="meta-paper-write",
+        )
+        await storage.conn.execute(
+            "UPDATE meta_control_intents SET status = 'accepted' WHERE intent_id = ?",
+            (accepted_old.intent_id,),
+        )
+        await storage.conn.commit()
+        current, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:current-reset-turn",
+            meta_skill_name="meta-paper-write",
+        )
+        control = {
+            "version": 1,
+            "intent_id": current.intent_id,
+            "kind": "manual",
+            "name": "meta-paper-write",
+            "correlation_id": current.correlation_id,
+        }
+        reset_node = _session(updated_at=300)
+        reset_node.session_id = "session-after-meta-control-reset"
+        reset_node.epoch = 1
+        entry = TranscriptEntry(
+            session_id=reset_node.session_id,
+            session_key=SESSION_KEY,
+            message_id="message-current-reset-turn",
+            role="user",
+            content="/meta meta-paper-write -- start in the reset session",
+            created_at=300,
+            turn_context={"meta_control": control},
+        )
+        task = AgentTaskRecord(
+            task_id="task-current-reset-turn",
+            session_key=SESSION_KEY,
+            agent_id="main",
+            source_kind="webui",
+            queue_mode="followup",
+            run_kind="web_turn",
+            status=AgentTaskStatus.QUEUED,
+            created_at=300,
+            updated_at=300,
+            details={"metadata": {"meta_control": control}},
+        )
+
+        accepted = await storage.accept_turn(
+            entry,
+            expected_epoch=1,
+            updated_at=300,
+            task_record=task,
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="current-reset-turn",
+            request_fingerprint="sha256:current-reset-turn",
+            session_node=reset_node,
+            reset_from_session_id=SESSION_ID,
+            meta_control_intent_id=current.intent_id,
+        )
+
+        assert accepted.replayed is False
+        assert await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id=stale.correlation_id,
+        ) is None
+        preserved = await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id=current.correlation_id,
+        )
+        assert preserved is not None
+        assert preserved.status == "accepted"
+        assert preserved.accepted_task_id == task.task_id
+        accepted_history = await storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id=accepted_old.correlation_id,
+        )
+        assert accepted_history is not None
+        assert accepted_history.status == "accepted"
+        assert await storage.is_meta_launch_discarded(
+            session_key=SESSION_KEY,
+            client_request_id="stale-before-reset",
+        )
+        assert await storage.is_meta_launch_discarded(
+            session_key=SESSION_KEY,
+            client_request_id="accepted-before-atomic-reset",
+        )
+        assert not await storage.is_meta_launch_discarded(
+            session_key=SESSION_KEY,
+            client_request_id="current-reset-turn",
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_meta_control_recovery_quarantines_invalid_head_before_claiming_valid(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+
+        async def accept_control(index: int) -> AgentTaskRecord:
+            request_id = f"recovery-{index}"
+            message_id = f"recovery-message-{index}"
+            task_id = f"recovery-task-{index}"
+            created_at = 200 + index
+            intent, _ = await storage.stage_meta_control_intent(
+                session_key=SESSION_KEY,
+                control_kind="manual",
+                correlation_id=f"request:{request_id}",
+                meta_skill_name="meta-paper-write",
+            )
+            control = {
+                "version": 1,
+                "intent_id": intent.intent_id,
+                "kind": "manual",
+                "name": "meta-paper-write",
+                "correlation_id": f"request:{request_id}",
+            }
+            entry = TranscriptEntry(
+                session_id=SESSION_ID,
+                session_key=SESSION_KEY,
+                message_id=message_id,
+                role="user",
+                content=f"/meta meta-paper-write -- recovery {index}",
+                created_at=created_at,
+                turn_context={"meta_control": control},
+            )
+            task = AgentTaskRecord(
+                task_id=task_id,
+                session_key=SESSION_KEY,
+                agent_id="main",
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="web_turn",
+                status=AgentTaskStatus.QUEUED,
+                created_at=created_at,
+                updated_at=created_at,
+                details={
+                    "metadata": {"meta_control": control},
+                    "persisted_user_message_id": message_id,
+                },
+            )
+            await storage.accept_turn(
+                entry,
+                expected_epoch=0,
+                updated_at=created_at,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id=request_id,
+                request_fingerprint=f"sha256:{request_id}",
+                meta_control_intent_id=intent.intent_id,
+            )
+            return task
+
+        invalid = await accept_control(0)
+        valid = await accept_control(1)
+        assert await storage.mark_abandoned_agent_tasks(now_ms=300) == 2
+        await storage.conn.execute(
+            "UPDATE agent_tasks SET details = '{}' WHERE task_id = ?",
+            (invalid.task_id,),
+        )
+        await storage.conn.commit()
+
+        claimed = await storage.claim_recoverable_meta_control_tasks(limit=1)
+
+        assert [item.task.task_id for item in claimed] == [valid.task_id]
+        quarantined = await storage.get_agent_task(invalid.task_id)
+        assert quarantined is not None
+        assert quarantined.status == AgentTaskStatus.ABANDONED
+        assert quarantined.terminal_reason == "meta_control_recovery_invalid"
+        assert quarantined.error_class == "MetaControlRecoveryInvalid"
+        assert await storage.claim_recoverable_meta_control_tasks(limit=1) == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        SessionStatus.DONE,
+        SessionStatus.FAILED,
+        SessionStatus.KILLED,
+        SessionStatus.TIMEOUT,
+    ],
+)
+@pytest.mark.asyncio
+async def test_meta_control_recovery_never_reopens_terminal_session(
+    tmp_path,
+    terminal_status: SessionStatus,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        request_id = f"terminal-{terminal_status.value}"
+        intent, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id=f"request:{request_id}",
+            meta_skill_name="meta-paper-write",
+        )
+        control = {
+            "version": 1,
+            "intent_id": intent.intent_id,
+            "kind": "manual",
+            "name": "meta-paper-write",
+            "correlation_id": f"request:{request_id}",
+        }
+        message_id = f"message-{terminal_status.value}"
+        task_id = f"task-{terminal_status.value}"
+        await storage.accept_turn(
+            TranscriptEntry(
+                session_id=SESSION_ID,
+                session_key=SESSION_KEY,
+                message_id=message_id,
+                role="user",
+                content="/meta meta-paper-write -- terminal recovery",
+                created_at=200,
+                turn_context={"meta_control": control},
+            ),
+            expected_epoch=0,
+            updated_at=200,
+            task_record=AgentTaskRecord(
+                task_id=task_id,
+                session_key=SESSION_KEY,
+                agent_id="main",
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="web_turn",
+                status=AgentTaskStatus.QUEUED,
+                created_at=200,
+                updated_at=200,
+                details={
+                    "metadata": {"meta_control": control},
+                    "persisted_user_message_id": message_id,
+                },
+            ),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id=request_id,
+            request_fingerprint=f"sha256:{request_id}",
+            meta_control_intent_id=intent.intent_id,
+        )
+        terminal = await storage.get_session(SESSION_KEY)
+        assert terminal is not None
+        terminal.status = terminal_status
+        terminal.ended_at = 250
+        terminal.runtime_ms = 150
+        await storage.upsert_session(terminal)
+
+        assert await storage.mark_abandoned_agent_tasks(now_ms=300) == 1
+        abandoned = await storage.get_agent_task(task_id)
+        assert abandoned is not None
+        assert abandoned.status == AgentTaskStatus.ABANDONED
+        assert abandoned.terminal_reason == "process_restart"
+
+        # Databases opened once by the buggy build may already carry the
+        # recovery marker. The claim path must reject those rows independently
+        # rather than trusting only the current restart-marking pass.
+        await storage.conn.execute(
+            "UPDATE agent_tasks SET terminal_reason = ? WHERE task_id = ?",
+            ("meta_control_restart_before_start", task_id),
+        )
+        await storage.conn.commit()
+
+        assert await storage.claim_recoverable_meta_control_tasks() == []
+        preserved = await storage.get_session(SESSION_KEY)
+        assert preserved is not None
+        assert preserved.status == terminal_status
+        assert preserved.ended_at == 250
+        assert preserved.runtime_ms == 150
+    finally:
+        await storage.close()
+
+
 @pytest.mark.asyncio
 async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp_path) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
@@ -139,6 +653,8 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
         assert task.details["persisted_user_message_id"] == "message-one"
         assert task.details["persisted_user_message_ids"] == ["message-one"]
         assert task.details["message_count"] == 1
+        assert task.details["session_id"] == SESSION_ID
+        assert task.details["session_epoch"] == 0
         assert len(receipts) == 1
         receipt = receipts[0]
         assert receipt["receipt_id"]
@@ -170,6 +686,75 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
         assert _result_value(result, "message_id") == "message-one"
         assert _result_value(result, "task_id") == "task-one"
         assert _result_value(result, "session_id") == SESSION_ID
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_details",
+    [
+        {"session_id": None},
+        {"session_id": ""},
+        {"session_id": 17},
+        {"session_epoch": None},
+        {"session_epoch": True},
+        {"session_epoch": -1},
+    ],
+)
+async def test_accept_turn_rejects_present_invalid_task_owner_fields(
+    tmp_path: Path,
+    invalid_details: dict[str, Any],
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        task = _task("task-invalid-owner")
+        task.details = invalid_details
+
+        with pytest.raises(ValueError, match="session owner"):
+            await storage.accept_turn(
+                _entry("message-invalid-owner"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-invalid-owner",
+                request_fingerprint="sha256:request-invalid-owner",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("task-invalid-owner") is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rejects_mismatched_task_owner(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        task = _task("task-stale-owner")
+        task.details = {
+            "session_id": "retired-session",
+            "session_epoch": 0,
+        }
+
+        with pytest.raises(StaleEpochError, match="owner"):
+            await storage.accept_turn(
+                _entry("message-stale-owner"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-stale-owner",
+                request_fingerprint="sha256:request-stale-owner",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("task-stale-owner") is None
     finally:
         await storage.close()
 
@@ -389,6 +974,196 @@ async def test_accept_turn_replays_same_request_without_duplicate_side_effects(t
 
 
 @pytest.mark.asyncio
+async def test_fresh_webui_accept_turn_seeds_immutable_usage_baseline(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.initialize_usage_ledger(1)
+        first = await storage.accept_turn(
+            _entry("message-create"),
+            expected_epoch=0,
+            updated_at=200,
+            task_record=_task("task-create"),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-create",
+            request_fingerprint="sha256:request-create",
+            session_node=_session(),
+        )
+        baseline = (await storage.list_usage_legacy_baselines())[0]
+        assert first.replayed is False
+        assert (baseline.session_id, baseline.session_epoch) == (SESSION_ID, 0)
+        assert baseline.captured_at_ms > 1
+        assert (baseline.input_tokens, baseline.output_tokens, baseline.total_tokens) == (0, 0, 0)
+
+        replay = await storage.accept_turn(
+            _entry("message-create-prospective-retry", created_at=300),
+            expected_epoch=0,
+            updated_at=300,
+            task_record=_task("task-create-prospective-retry", updated_at=300),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-create",
+            request_fingerprint="sha256:request-create",
+            session_node=_session(updated_at=300),
+        )
+        assert replay.replayed is True
+        assert await storage.list_usage_legacy_baselines() == [baseline]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_accept_turn_reset_seeds_new_generation_usage_baseline(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        old = _session()
+        old.input_tokens = 12
+        old.output_tokens = 4
+        old.total_tokens = 16
+        await storage.upsert_session(old)
+        await storage.initialize_usage_ledger(150)
+        old_baseline = (await storage.list_usage_legacy_baselines())[0]
+
+        reset = old.model_copy(deep=True)
+        reset.session_id = "session-after-reset"
+        reset.epoch = 1
+        reset.updated_at = 300
+        reset.input_tokens = 0
+        reset.output_tokens = 0
+        reset.total_tokens = 0
+        await storage.accept_turn(
+            TranscriptEntry(
+                session_id=reset.session_id,
+                session_key=SESSION_KEY,
+                message_id="message-after-reset",
+                role="user",
+                content="start over",
+                created_at=300,
+            ),
+            expected_epoch=1,
+            updated_at=300,
+            task_record=_task("task-after-reset", updated_at=300),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-after-reset",
+            request_fingerprint="sha256:request-after-reset",
+            session_node=reset,
+            reset_from_session_id=SESSION_ID,
+        )
+
+        baselines = await storage.list_usage_legacy_baselines()
+        assert baselines[0] == old_baseline
+        assert {(row.session_id, row.session_epoch) for row in baselines} == {
+            (SESSION_ID, 0),
+            (reset.session_id, 1),
+        }
+        reset_baseline = next(row for row in baselines if row.session_id == reset.session_id)
+        assert (
+            reset_baseline.input_tokens,
+            reset_baseline.output_tokens,
+            reset_baseline.total_tokens,
+        ) == (0, 0, 0)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_fork_accept_turn_seeds_zero_usage_baseline(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    child_key = "agent:main:webchat:fork-child"
+    child_id = "session-fork-child"
+    try:
+        await storage.initialize_usage_ledger(1)
+        child = SessionNode(
+            session_key=child_key,
+            session_id=child_id,
+            created_at=100,
+            updated_at=100,
+            forked_from_parent=True,
+        )
+        inherited = TranscriptEntry(
+            session_id=child_id,
+            session_key=child_key,
+            message_id="inherited-parent-message",
+            role="assistant",
+            content="parent answer",
+            created_at=50,
+        )
+        await storage.accept_turn(
+            TranscriptEntry(
+                session_id=child_id,
+                session_key=child_key,
+                message_id="fork-user-message",
+                role="user",
+                content="edit from here",
+                created_at=100,
+            ),
+            expected_epoch=0,
+            updated_at=100,
+            task_record=None,
+            source_scope="webui",
+            request_session_key=child_key,
+            client_request_id="request-fork-child",
+            request_fingerprint="sha256:request-fork-child",
+            session_node=child,
+            initial_transcript_entries=(inherited,),
+        )
+
+        baseline = (await storage.list_usage_legacy_baselines())[0]
+        assert (baseline.session_id, baseline.session_epoch) == (child_id, 0)
+        assert (baseline.input_tokens, baseline.output_tokens, baseline.total_tokens) == (0, 0, 0)
+        assert [
+            entry.message_id for entry in await storage.get_transcript(child_id)
+        ] == ["inherited-parent-message", "fork-user-message"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_accept_turn_rolls_back_usage_baseline_with_later_failure(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.initialize_usage_ledger(1)
+        await storage.conn.execute(
+            """
+            CREATE TRIGGER fail_fresh_acceptance_receipt
+            BEFORE INSERT ON turn_ingress_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'injected fresh acceptance failure');
+            END
+            """
+        )
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="injected fresh acceptance failure",
+        ):
+            await storage.accept_turn(
+                _entry("message-failed-create"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=_task("task-failed-create"),
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-failed-create",
+                request_fingerprint="sha256:request-failed-create",
+                session_node=_session(),
+            )
+
+        assert await storage.get_session(SESSION_KEY) is None
+        assert await storage.list_usage_legacy_baselines() == []
+        assert await storage.count_transcript_entries(SESSION_ID) == 0
+        assert await storage.get_agent_task("task-failed-create") is None
+        assert await _row_count(storage, "turn_ingress_receipts") == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_accept_turn_collects_into_existing_task_in_the_same_transaction(
     tmp_path,
 ) -> None:
@@ -441,6 +1216,8 @@ async def test_accept_turn_collects_into_existing_task_in_the_same_transaction(
         ]
         assert task.details["fresh_user_session"] is True
         assert task.details["existing_only"] == "preserved"
+        assert task.details["session_id"] == SESSION_ID
+        assert task.details["session_epoch"] == 0
         assert [
             entry.message_id for entry in await storage.get_transcript(SESSION_ID)
         ] == ["message-collected"]

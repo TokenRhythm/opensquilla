@@ -11,7 +11,12 @@ from opensquilla.cli.chat.turn_stream import (
     stream_response_gateway,
     stream_response_turnrunner,
 )
-from opensquilla.engine.types import DoneEvent, EnsembleProgressEvent
+from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
+    DoneEvent,
+    EnsembleProgressEvent,
+    TextDeltaEvent,
+)
 from opensquilla.tools.types import CallerKind, ToolContext
 
 PROGRESS_PAYLOAD: dict[str, Any] = {
@@ -58,10 +63,12 @@ ENSEMBLE_TRACE: dict[str, Any] = {
 class _GatewayClient:
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self._events = events
+        self.drained = False
 
     async def send_message(self, *_args: Any, **_kwargs: Any) -> AsyncIterator[dict[str, Any]]:
         for event in self._events:
             yield event
+        self.drained = True
 
     async def resolve_approval(self, *_args: Any, **_kwargs: Any) -> None:
         return None
@@ -73,10 +80,12 @@ class _GatewayClient:
 class _TurnRunner:
     def __init__(self, events: list[object]) -> None:
         self._events = events
+        self.drained = False
 
     async def run(self, *_args: Any, **_kwargs: Any) -> AsyncIterator[object]:
         for event in self._events:
             yield event
+        self.drained = True
 
 
 class _RecordingRenderer:
@@ -277,3 +286,68 @@ def test_gateway_session_snapshot_drives_cli_usage_counter() -> None:
     assert counter.output_tokens == 207
     assert counter.cached_tokens == 50
     assert counter.cost_usd == pytest.approx(0.57)
+
+
+@pytest.mark.asyncio
+async def test_turnrunner_terminal_reset_replaces_partial_and_returns_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal_text = "The fixed model could not complete this answer."
+    renderer = _RecordingRenderer()
+    turn_runner = _TurnRunner(
+        [
+            TextDeltaEvent(text="superseded partial"),
+            AnswerGenerationResetEvent(
+                old_generation_epoch=1,
+                new_generation_epoch=2,
+                safe_reason="fixed provider final failure",
+                terminal=True,
+                terminal_text_snapshot=terminal_text,
+            ),
+        ]
+    )
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", _TurnRunner)
+
+    result = await stream_response_turnrunner(
+        turn_runner,
+        "agent:main:test",
+        _tool_context(),
+        "question",
+        deps=_deps(renderer),
+    )
+
+    assert result.text == terminal_text
+    assert result.error == terminal_text
+    assert "superseded partial" not in result.text
+    assert turn_runner.drained is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_terminal_reset_replaces_partial_and_returns_failure() -> None:
+    terminal_text = "The fixed model could not complete this answer."
+    renderer = _RecordingRenderer()
+
+    client = _GatewayClient(
+        [
+            {"event": "session.event.text_delta", "text": "superseded partial"},
+            {
+                "event": "session.event.answer_generation_reset",
+                "old_generation_epoch": 1,
+                "new_generation_epoch": 2,
+                "safe_reason": "fixed provider final failure",
+                "terminal": True,
+                "terminal_text_snapshot": terminal_text,
+            },
+        ]
+    )
+    result = await stream_response_gateway(
+        client,
+        "agent:main:test",
+        "question",
+        deps=_deps(renderer),
+    )
+
+    assert result.text == terminal_text
+    assert result.error == terminal_text
+    assert "superseded partial" not in result.text
+    assert client.drained is True

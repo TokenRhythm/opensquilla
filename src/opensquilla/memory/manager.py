@@ -594,7 +594,9 @@ async def build_memory_managers(
             turn_capture = TurnCaptureService(
                 workspace_dir=native_agent_workspace,
                 turns_dir=native_turns_dir,
-                memory_config=config.memory,
+                # Keep the stable root identity so live config patches that
+                # replace ``config.memory`` reach the next captured turn.
+                memory_config=config,
             )
 
             managers[agent_id] = MemoryManager(

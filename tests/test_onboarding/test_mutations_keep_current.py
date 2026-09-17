@@ -124,6 +124,29 @@ def test_upsert_llm_provider_provider_switch_does_not_carry_unrelated_fields():
     assert llm.thinking is None
 
 
+def test_upsert_custom_provider_preserves_extra_body_until_provider_switch():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "local-model",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "extra_body": {"top_k": 40},
+        }
+    )
+
+    kept = upsert_llm_provider(cfg, provider_id="custom", model="local-model")
+    switched = upsert_llm_provider(
+        kept.config,
+        provider_id="ollama",
+        model="local-model",
+        base_url="http://127.0.0.1:11434",
+        router_action="disable",
+    )
+
+    assert kept.config.llm.extra_body == {"top_k": 40}
+    assert switched.config.llm.extra_body == {}
+
+
 def test_upsert_llm_provider_same_provider_resave_keeps_custom_router_tiers():
     cfg = _config_with_hand_tiers()
 

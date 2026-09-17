@@ -32,6 +32,7 @@ _ARTIFACT_PREVIEW_CONTROL_PATH_RE = re.compile(
 )
 
 
+
 def _is_artifact_preview_capability_path(path: str) -> bool:
     """Identify bearer resource URLs without matching lease control routes."""
     return _ARTIFACT_PREVIEW_CAPABILITY_PATH_RE.match(path) is not None
@@ -40,6 +41,10 @@ def _is_artifact_preview_capability_path(path: str) -> bool:
 def _is_artifact_preview_control_path(path: str) -> bool:
     """Identify preview lease controls whose high-entropy ids must stay out of logs."""
     return _ARTIFACT_PREVIEW_CONTROL_PATH_RE.fullmatch(path) is not None
+
+
+
+
 
 
 _CONTROL_PLANE_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz"})
@@ -151,10 +156,36 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if auth_mode == "token":
             token = self._extract_token(request)
-            if token != self._config.auth.token:
+            from opensquilla.gateway.auth import resolve_auth
+
+            peer_ip = request.client.host if request.client is not None else None
+            principal = resolve_auth(
+                self._config,
+                auth_params={"token": token} if token else {},
+                role_claim="operator",
+                peer_ip=peer_ip,
+            )
+            if principal is None:
                 return JSONResponse(
                     {"error": "Unauthorized", "code": "UNAUTHORIZED"}, status_code=401
                 )
+            if principal.auth_state == "invalid":
+                from opensquilla.gateway.token_store import default_auth_failure_limiter
+
+                await default_auth_failure_limiter().wait_after_failure(
+                    peer_ip,
+                    principal.token_public_id,
+                )
+                log.warning(
+                    "http.auth_invalid_guest_only",
+                    peer_ip=peer_ip,
+                    token_public_id=principal.token_public_id,
+                )
+            if not principal.authenticated:
+                return JSONResponse(
+                    {"error": "Unauthorized", "code": "UNAUTHORIZED"}, status_code=401
+                )
+            request.state.principal = principal
 
         elif auth_mode == "trusted-proxy":
             proxy = self._config.auth.trusted_proxy
@@ -253,7 +284,9 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
                     {"error": "Internal Server Error", "code": "INTERNAL_ERROR"},
                     status_code=500,
                 )
-            if _is_artifact_preview_control_path(request.url.path):
+            if (
+                _is_artifact_preview_control_path(request.url.path)
+            ):
                 log.error(
                     "http.request_failed",
                     path_class="artifact_preview_control",

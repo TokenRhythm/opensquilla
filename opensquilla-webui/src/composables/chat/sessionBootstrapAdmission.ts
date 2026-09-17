@@ -1,5 +1,4 @@
 import { computed, ref } from 'vue'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 const activeHolds = ref(0)
 let primedRelease: (() => void) | null = null
@@ -12,36 +11,15 @@ let primedRelease: (() => void) | null = null
  */
 export const optionalSessionRpcAllowed = computed(() => activeHolds.value === 0)
 
-export const optionalSessionRpcCallOptions: RpcCallOptions = {
-  timeoutMs: 2_000,
-  // These methods still use the Gateway's serial dispatcher. Retire the
-  // connection when one is abandoned so a stuck handler cannot keep later
-  // navigation and control requests trapped behind it.
-  timeoutAction: 'reconnect',
-  abortAction: 'reconnect',
+export const OPTIONAL_SESSION_READ_TIMEOUT_MS = 10_000
+
+export interface OptionalSessionReadOptions {
+  readonly timeoutMs: number
+  readonly signal?: AbortSignal
 }
 
-type OptionalSessionRpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<unknown>
-}
-
-export function waitForSessionRpcConnection(
-  rpc: OptionalSessionRpcClient,
-  callOptions?: RpcCallOptions,
-): Promise<unknown> {
-  if (!callOptions) return rpc.waitForConnection()
-  return rpc.waitForConnection(
-    callOptions.timeoutMs,
-    callOptions.signal,
-    {
-      timeoutAction: callOptions.timeoutAction,
-      abortAction: callOptions.abortAction,
-    },
-  )
+export const optionalSessionReadOptions: OptionalSessionReadOptions = {
+  timeoutMs: OPTIONAL_SESSION_READ_TIMEOUT_MS,
 }
 
 function createSessionBootstrapAdmission(): () => void {

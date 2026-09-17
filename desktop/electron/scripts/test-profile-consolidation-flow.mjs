@@ -18,6 +18,13 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -33,6 +40,9 @@ const credentialOnlyRecoveryId = '51234567-89ab-4cde-8fab-0123456789ab'
 const newerCredentialMarker = 'synthetic-newest-recovery-credential'
 const observedRendererPages = new WeakSet()
 const rendererDiagnostics = []
+const PROFILE_CLI_TIMEOUT_MS = 120_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
+const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000
 
 async function waitFor(check, label, timeoutMs = 120_000) {
   const startedAt = Date.now()
@@ -81,7 +91,6 @@ function launchEnvironment(isolatedHome, sourceEnvironment = process.env) {
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
     OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
     OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
-    OPENSQUILLA_DESKTOP_GATEWAY_PORT: '18898',
     OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
     OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
     OPENSQUILLA_GATEWAY_WORKSPACE_DIR: '',
@@ -121,11 +130,16 @@ function runProfileConsolidationCli(userData, primaryHome, isolatedHome) {
         UV_CACHE_DIR: join(tmpdir(), 'opensquilla-consolidation-e2e-uv-cache'),
       },
       maxBuffer: 4 * 1024 * 1024,
+      timeout: PROFILE_CLI_TIMEOUT_MS,
+      killSignal: 'SIGTERM',
     },
   )
-  if (result.status !== 0) {
+  if (result.error || result.signal || result.status !== 0) {
+    const outcome = result.error?.code === 'ETIMEDOUT'
+      ? `timed out after ${PROFILE_CLI_TIMEOUT_MS}ms`
+      : `status=${result.status ?? 'null'} signal=${result.signal ?? 'null'}`
     throw new Error(
-      `Profile consolidation fixture command failed (${result.status}): `
+      `Profile consolidation fixture command failed (${outcome}): `
       + `${result.stderr || result.stdout}`,
     )
   }
@@ -148,6 +162,7 @@ async function startFakeProvider() {
     response.writeHead(404, { 'content-type': 'application/json' })
     response.end(JSON.stringify({ error: { message: 'synthetic endpoint not found' } }))
   })
+  const connections = trackHttpServerConnections(server)
   await new Promise((resolveListen, rejectListen) => {
     server.once('error', rejectListen)
     server.listen(0, '127.0.0.1', resolveListen)
@@ -156,8 +171,9 @@ async function startFakeProvider() {
   assert(address && typeof address === 'object')
   return {
     port: address.port,
-    close: () => new Promise((resolveClose, rejectClose) => {
-      server.close((error) => error ? rejectClose(error) : resolveClose())
+    close: () => closeHttpServerWithDeadline(server, connections, {
+      label: 'Profile consolidation provider shutdown',
+      timeoutMs: PROVIDER_SHUTDOWN_TIMEOUT_MS,
     }),
   }
 }
@@ -192,11 +208,16 @@ async function controlPage(app) {
         } catch {
           pathname = ''
         }
-        if (pathname !== '/control/chat' && pathname !== '/control/chat/new') continue
+        if (!candidate.url().startsWith('opensquilla-app://desktop/')) continue
+        if (pathname !== '/chat' && pathname !== '/chat/new') continue
+        const connection = await candidate.evaluate(
+          () => window.opensquillaDesktop?.getGatewayConnection?.(),
+        ).catch(() => null)
+        if (connection?.status !== 'ready') continue
         if (await candidate.locator('.chat-textarea').count().catch(() => 0)) return candidate
       }
       return null
-    }, 'consolidated primary Control UI')
+    }, 'consolidated primary Desktop renderer')
   } catch (error) {
     const windows = await Promise.all(app.windows().map(async (page) => ({
       url: page.url(),
@@ -288,6 +309,61 @@ const recoveryProfiles = join(userData, 'recovery-profiles')
 const contextPath = join(userData, 'desktop-profile-context.json')
 const fakeProvider = await startFakeProvider()
 let app
+let activeAppUserData = userData
+
+async function profileShutdownDiagnostics(targetApp, profileUserData, phase) {
+  const windows = await Promise.all(targetApp.windows().map(async page => ({
+    url: page.url(),
+    title: await page.title().catch(() => ''),
+    body: await page.locator('body').innerText({ timeout: 1_000 }).catch(() => '').then(
+      value => value.slice(0, 1_500),
+    ),
+  }))).catch(error => [{ diagnosticError: error?.message || String(error) }])
+  const desktopLog = await readFile(
+    join(profileUserData, 'logs', 'desktop.log'),
+    'utf8',
+  ).catch(() => '')
+  const gatewayLog = await readFile(
+    join(profileUserData, 'logs', 'gateway.log'),
+    'utf8',
+  ).catch(() => '')
+  return {
+    phase,
+    windows,
+    desktopLogTail: desktopLog.slice(-8_000),
+    gatewayLogTail: gatewayLog.slice(-8_000),
+    rendererDiagnostics: rendererDiagnostics.slice(-30),
+  }
+}
+
+async function closeActiveApp(phase, { failOnError = true } = {}) {
+  if (!app) return
+  const targetApp = app
+  const profileUserData = activeAppUserData
+  app = undefined
+  const desktopLogPath = join(profileUserData, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const result = await closeElectronWithDeadline({
+    app: targetApp,
+    phase,
+    timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    diagnostics: () => profileShutdownDiagnostics(targetApp, profileUserData, phase),
+  })
+  if (!result.error) return
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+  if (canAcceptWindowsElectronShutdownFallback({
+    shutdown: result,
+    ...shutdownEvidence,
+  })) {
+    console.warn(JSON.stringify({
+      event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+      phase,
+    }))
+    return
+  }
+  if (failOnError) throw result.error
+}
 
 try {
   await mkdir(userData, { recursive: true })
@@ -358,6 +434,7 @@ try {
     'pending',
   )
 
+  activeAppUserData = userData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
     env: launchEnvironment(isolatedHome),
@@ -501,13 +578,13 @@ try {
     await page.screenshot({ path: screenshotPath })
   }
 
-  await app.close()
-  app = undefined
+  await closeActiveApp('consolidated-primary-electron-shutdown')
 
   // A completed receipt is never replayed. If the user later removes the
   // primary credential, startup must offer normal onboarding instead of
   // resurrecting the archived historical secret.
   await rm(primaryCredential)
+  activeAppUserData = userData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
     env: launchEnvironment(isolatedHome),
@@ -529,8 +606,7 @@ try {
     1,
   )
 
-  await app.close()
-  app = undefined
+  await closeActiveApp('completed-receipt-electron-shutdown')
 
   // A recovery may be the newest valid configuration source without carrying
   // a Desktop credential. Consolidation still succeeds, consumes the legacy
@@ -548,6 +624,7 @@ try {
     omitCredential: true,
     modifiedAt: new Date('2026-07-22T00:00:00.000Z'),
   })
+  activeAppUserData = configOnlyUserData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${configOnlyUserData}`, packageRoot],
     env: launchEnvironment(configOnlyHome),
@@ -578,8 +655,7 @@ try {
     'not_required',
   )
 
-  await app.close()
-  app = undefined
+  await closeActiveApp('config-only-electron-shutdown')
 
   // A credential-only recovery still contains enough provider authority for
   // Electron to generate a canonical primary config. The config and
@@ -603,6 +679,7 @@ try {
     omitConfig: true,
     modifiedAt: new Date('2026-07-22T12:00:00.000Z'),
   })
+  activeAppUserData = credentialOnlyUserData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${credentialOnlyUserData}`, packageRoot],
     env: launchEnvironment(credentialOnlyHome),
@@ -628,6 +705,8 @@ try {
   assert.equal(generatedCredential.encryptedApiKey, 'synthetic-credential-only-secret')
   assert.equal(generatedCredential.configAuthority, 'generated')
   assert.equal(generatedCredential.importTransactionId, '')
+  assert.equal(Object.hasOwn(generatedCredential, 'routerPresetBinding'), false)
+  assert.doesNotMatch(generatedConfig, /preset_binding\s*=/)
   const credentialOnlyTransactions = await readdir(
     join(credentialOnlyUserData, 'backups', 'profile-consolidation'),
   )
@@ -646,8 +725,7 @@ try {
     'complete',
   )
 
-  await app.close()
-  app = undefined
+  await closeActiveApp('credential-only-electron-shutdown')
 
   // Corrupt historical credential bytes are archived and reported, but they
   // must not make startup permanently fail. The copied primary configuration
@@ -665,6 +743,7 @@ try {
     credentialBytes: '{ definitely-not-valid-json',
     modifiedAt: new Date('2026-07-23T00:00:00.000Z'),
   })
+  activeAppUserData = invalidUserData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${invalidUserData}`, packageRoot],
     env: launchEnvironment(invalidHome),
@@ -702,6 +781,8 @@ try {
     'complete',
   )
 
+  await closeActiveApp('invalid-credential-electron-shutdown')
+
   console.log(JSON.stringify({
     ok: true,
     activeProfile: 'primary',
@@ -716,14 +797,18 @@ try {
     invalidCredentialStableCode: skippedCredentialEvent.stableCode,
   }, null, 2))
 } catch (error) {
-  const desktopLog = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
+  const desktopLog = await readFile(join(activeAppUserData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
+  const gatewayLog = await readFile(join(activeAppUserData, 'logs', 'gateway.log'), 'utf8').catch(() => '')
   console.error(JSON.stringify({
+    phase: 'run-error-before-cleanup',
+    error: String(error?.stack || error),
     desktopLogTail: desktopLog.slice(-8_000),
+    gatewayLogTail: gatewayLog.slice(-8_000),
     rendererDiagnostics: rendererDiagnostics.slice(-30),
   }, null, 2))
   throw error
 } finally {
-  await app?.close().catch(() => {})
+  await closeActiveApp('finally-profile-electron-shutdown', { failOnError: false })
   await fakeProvider.close().catch(() => {})
   await rm(root, { recursive: true, force: true }).catch(() => {})
 }

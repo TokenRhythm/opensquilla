@@ -11,6 +11,10 @@ from typing import Any
 
 import structlog
 
+from opensquilla.contracts.adapters.sessions_changed_contract import (
+    SESSIONS_CHANGED_EVENT,
+    observe_sessions_changed_payload,
+)
 from opensquilla.engine.types import AgentEvent
 from opensquilla.gateway.scopes import operator_scope_satisfies
 from opensquilla.gateway.session_streams import get_session_streams
@@ -50,6 +54,8 @@ class EventBridge:
         session_key: str,
         event_name: str,
         payload: dict[str, Any] | None = None,
+        *,
+        replay_recorded: bool = False,
     ) -> None:
         """Broadcast an event to all WS connections subscribed to ``session_key``.
 
@@ -63,8 +69,14 @@ class EventBridge:
             return
 
         try:
-            send_payload = payload or {}
-            if event_name.startswith("session.event."):
+            send_payload = payload if payload is not None else {}
+            if event_name == SESSIONS_CHANGED_EVENT:
+                send_payload = observe_sessions_changed_payload(
+                    send_payload,
+                    source="gateway.event_bridge",
+                    allow_legacy=False,
+                )
+            if event_name.startswith("session.event.") and not replay_recorded:
                 send_payload = get_session_streams().record(session_key, event_name, send_payload)
 
             subscriber_ids = self._subs.get_message_subscribers(session_key)
@@ -109,7 +121,13 @@ class EventBridge:
         if self._registry is None:
             return
         try:
-            send_payload = payload or {}
+            send_payload = payload if payload is not None else {}
+            if event_name == SESSIONS_CHANGED_EVENT:
+                send_payload = observe_sessions_changed_payload(
+                    send_payload,
+                    source="gateway.event_bridge.broadcast_scoped",
+                    allow_legacy=False,
+                )
             for conn in self._registry.all():
                 principal = getattr(conn, "principal", None)
                 scopes = getattr(principal, "scopes", None)

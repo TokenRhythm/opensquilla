@@ -102,6 +102,24 @@ REMINDER_KIND = "reminder"
 SYSTEM_EVENT_KIND = "system_event"
 _VALID_PAYLOAD_KINDS = frozenset({AGENT_TURN_KIND, REMINDER_KIND, SYSTEM_EVENT_KIND})
 _KNOWN_HANDLER_KEYS = frozenset({"agent_run", "static_message", "system_event"})
+_PERSISTED_EXTENSION_KEYS = (
+    "_workspace_id",
+    "_workspace_name",
+    "_workspace_unavailable",
+    "_template_id",
+)
+
+
+def _preserve_extensions(
+    canonical: dict[str, str],
+    source: dict[str, Any],
+) -> dict[str, str]:
+    """Keep validated scheduler metadata while dropping arbitrary payload fields."""
+    for key in _PERSISTED_EXTENSION_KEYS:
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            canonical[key] = value
+    return canonical
 
 
 def payload_kind(payload: dict[str, Any] | None, session_target: SessionTarget | str) -> str:
@@ -217,12 +235,22 @@ def normalize_contract(
             and not bound_session_key
         ):
             raise ValueError(f"{target.value} sessionTarget requires a bound session key")
-        return "static_message", make_reminder_payload(text, agent_id), target, bound_session_key
+        return (
+            "static_message",
+            _preserve_extensions(make_reminder_payload(text, agent_id), data),
+            target,
+            bound_session_key,
+        )
 
     if kind == SYSTEM_EVENT_KIND:
         if strict and target != SessionTarget.MAIN:
             raise ValueError("system_event payloads require sessionTarget='main'")
-        return "system_event", make_system_event_payload(text, agent_id), target, bound_session_key
+        return (
+            "system_event",
+            _preserve_extensions(make_system_event_payload(text, agent_id), data),
+            target,
+            bound_session_key,
+        )
 
     if strict and target == SessionTarget.MAIN:
         raise ValueError("agent_turn payloads cannot use sessionTarget='main'")
@@ -233,7 +261,12 @@ def normalize_contract(
     ):
         raise ValueError(f"{target.value} sessionTarget requires a bound session key")
 
-    return "agent_run", make_agent_turn_payload(text, agent_id), target, bound_session_key
+    return (
+        "agent_run",
+        _preserve_extensions(make_agent_turn_payload(text, agent_id), data),
+        target,
+        bound_session_key,
+    )
 
 
 __all__ = [

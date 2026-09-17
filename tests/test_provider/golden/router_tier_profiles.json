@@ -57,21 +57,21 @@
   },
   "deepseek": {
     "c0": {
-      "description": "DeepSeek fast route: V4 Flash with no router-requested thinking; request ID pending live smoke.",
-      "model": "deepseek-v4-flash",
+      "description": "DeepSeek fast route: V4.1 Flash with no router-requested thinking.",
+      "model": "deepseek-flash",
       "provider": "deepseek",
-      "supports_image": false,
+      "supports_image": true,
       "thinking_level": "off"
     },
     "c1": {
-      "description": "DeepSeek balanced route: V4 Flash with thinking enabled; request ID pending live smoke.",
-      "model": "deepseek-v4-flash",
+      "description": "DeepSeek balanced route: V4.1 Flash with thinking enabled.",
+      "model": "deepseek-flash",
       "provider": "deepseek",
-      "supports_image": false,
+      "supports_image": true,
       "thinking_level": "low"
     },
     "c2": {
-      "description": "DeepSeek strong route: V4 Pro with thinking enabled; request ID pending live smoke.",
+      "description": "DeepSeek strong route: V4 Pro with thinking enabled.",
       "model": "deepseek-v4-pro",
       "provider": "deepseek",
       "supports_image": false,

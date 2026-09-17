@@ -17,6 +17,7 @@ from opensquilla.provider.codex_auth import (
     refresh_codex_credentials,
 )
 from opensquilla.provider.openai_codex import OpenAICodexProvider, _candidate_wire_digest
+from opensquilla.provider.protocol import project_provider_final_request
 from opensquilla.provider.registry import get_provider_spec
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.types import (
@@ -137,6 +138,86 @@ def _collect(provider: OpenAICodexProvider, *, tools=None, cfg=None):
     return asyncio.run(_run())
 
 
+def test_openai_codex_final_request_proof_blocks_before_http(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    _patch_codex_transport(monkeypatch, handler)
+    provider = OpenAICodexProvider(
+        auth_path=str(_write_auth(tmp_path / "auth.json")),
+    )
+
+    async def _run() -> list[Any]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="x" * 5000)],
+                config=ChatConfig(provider_request_max_chars=1000),
+            )
+        ]
+
+    events = asyncio.run(_run())
+
+    assert requests == []
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_request_budget_exhausted"
+    proof = json.loads(events[0].message)
+    assert proof["projection_adapter"] == "openai_codex"
+    assert proof["request_sequence_key"] == "input"
+    assert proof["request_system_key"] == "instructions"
+    assert proof["request_compaction_supported"] is False
+
+
+def test_openai_codex_projection_matches_exact_transport_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_happy_sse(),
+        )
+
+    _patch_codex_transport(monkeypatch, handler)
+    provider = OpenAICodexProvider(
+        auth_path=str(_write_auth(tmp_path / "auth.json")),
+    )
+    config = ChatConfig(
+        system="Synthetic system",
+        thinking=True,
+        provider_request_max_chars=100_000,
+    )
+    messages = [Message(role="user", content="hi")]
+    projection = project_provider_final_request(
+        provider,
+        messages,
+        [_SEARCH_TOOL],
+        config,
+        message_limit=10,
+    )
+    assert requests == []
+
+    events = _collect(provider, tools=[_SEARCH_TOOL], cfg=config)
+
+    assert not [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(requests) == 1
+    assert projection is not None
+    assert projection.payload == json.loads(requests[0].content)
+    assert projection.wire_message_count == 1
+    assert projection.fits_message_count is True
+    assert projection.fits is True
+
+
 _SEARCH_TOOL = ToolDefinition(
     name="search",
     description="Search things.",
@@ -226,7 +307,14 @@ def test_stream_maps_responses_events(tmp_path: Path, monkeypatch) -> None:
         base_url="https://chatgpt.com",  # normalization adds /backend-api
         auth_path=str(auth),
     )
-    events = _collect(provider, tools=[_SEARCH_TOOL], cfg=ChatConfig(system="be brief"))
+    events = _collect(
+        provider,
+        tools=[_SEARCH_TOOL],
+        cfg=ChatConfig(
+            system="be brief",
+            provider_request_max_chars=100_000,
+        ),
+    )
 
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
     assert captured["headers"]["authorization"] == "Bearer tok-access"
@@ -667,6 +755,40 @@ def test_401_refreshes_and_retries_once(tmp_path: Path, monkeypatch) -> None:
     assert any(isinstance(e, TextDeltaEvent) and e.text == "ok" for e in events)
     assert any(isinstance(e, DoneEvent) for e in events)
     assert json.loads(auth.read_text())["tokens"]["access_token"] == "tok-new"
+
+
+def test_401_does_not_refresh_or_resend_coordinator_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    calls = {"stream": 0, "refresh": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth.openai.com" in str(request.url):
+            calls["refresh"] += 1
+            return httpx.Response(200, json={"access_token": "tok-new"})
+        calls["stream"] += 1
+        return httpx.Response(401, json={"error": {"message": "expired"}})
+
+    _patch_codex_transport(monkeypatch, handler)
+    transport = httpx.MockTransport(handler)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        "opensquilla.provider.codex_auth.httpx.AsyncClient",
+        lambda *a, **kw: real(*a, **{**kw, "transport": transport}),
+    )
+
+    provider = OpenAICodexProvider(auth_path=str(auth))
+    events = _collect(
+        provider,
+        cfg=ChatConfig(physical_attempt_limit=1),
+    )
+
+    assert calls["stream"] == 1
+    assert calls["refresh"] == 0
+    assert any(isinstance(event, ErrorEvent) and event.code == "401" for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_response_failed_yields_error_event(tmp_path: Path, monkeypatch) -> None:

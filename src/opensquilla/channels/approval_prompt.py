@@ -84,6 +84,7 @@ class ApprovalPromptRequest:
     short_code: str
     offer_always: bool = False
     summary_label: str = "Command"
+    notice: str = ""
     origin_channel_id: str = ""
     origin_is_group: bool | None = None
     origin_chat_type: str = ""
@@ -200,13 +201,16 @@ def _prompt_text(request: ApprovalPromptRequest, *, config: Any = None) -> str:
     key: Literal["approval_prompt", "approval_prompt_always"] = (
         "approval_prompt_always" if request.offer_always else "approval_prompt"
     )
-    return render_channel_message(
+    rendered = render_channel_message(
         key,
         config=config,
         label=label,
         command=command,
         code=request.short_code,
     )
+    if request.notice:
+        rendered = f"{rendered}\n⚠️ {request.notice}"
+    return rendered
 
 
 def _interactive_card(request: ApprovalPromptRequest, *, config: Any = None) -> dict[str, Any]:
@@ -224,6 +228,17 @@ def _interactive_card(request: ApprovalPromptRequest, *, config: Any = None) -> 
         "approval_unknown_command", config=config
     )
     label = _summary_label(request, config=config)
+    details = render_channel_message(
+        "approval_card_details",
+        config=config,
+        question=render_channel_message("approval_card_question", config=config),
+        label=label,
+        command=command,
+        code_label=render_channel_message("approval_label_code", config=config),
+        code=request.short_code,
+    )
+    if request.notice:
+        details = f"{details}\n\n⚠️ **{request.notice}**"
 
     def _action_value(decision: str) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -293,15 +308,7 @@ def _interactive_card(request: ApprovalPromptRequest, *, config: Any = None) -> 
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": render_channel_message(
-                        "approval_card_details",
-                        config=config,
-                        question=render_channel_message("approval_card_question", config=config),
-                        label=label,
-                        command=command,
-                        code_label=render_channel_message("approval_label_code", config=config),
-                        code=request.short_code,
-                    ),
+                    "content": details,
                 },
             },
             {

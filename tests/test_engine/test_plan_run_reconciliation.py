@@ -80,6 +80,7 @@ class _ReconcilesCheckpointProvider:
         self.calls = 0
         self.model = "test/model"
         self.requests: list[list[Message]] = []
+        self.tool_names_per_request: list[set[str]] = []
 
     def chat(
         self,
@@ -89,6 +90,7 @@ class _ReconcilesCheckpointProvider:
     ) -> AsyncIterator[Any]:
         self.calls += 1
         self.requests.append(list(messages))
+        self.tool_names_per_request.append({tool.name for tool in tools or []})
         return self._stream(self.calls)
 
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
@@ -122,6 +124,9 @@ class _IgnoresReconciliationProvider(_ReconcilesCheckpointProvider):
 
 
 class _CheckpointThenMutateProvider(_ReconcilesCheckpointProvider):
+    mutation_tool = "write_file"
+    mutation_arguments = {"path": "after-completion.txt", "content": "must not run"}
+
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
             for tool_use_id, tool_name, arguments in (
@@ -132,8 +137,8 @@ class _CheckpointThenMutateProvider(_ReconcilesCheckpointProvider):
                 ),
                 (
                     "write-1",
-                    "write_file",
-                    {"path": "after-completion.txt", "content": "must not run"},
+                    self.mutation_tool,
+                    self.mutation_arguments,
                 ),
             ):
                 yield ProviderToolUseStart(
@@ -152,6 +157,9 @@ class _CheckpointThenMutateProvider(_ReconcilesCheckpointProvider):
 
 
 class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
+    delivery_tool = "publish_artifact"
+    delivery_path = "report.txt"
+
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
             for tool_use_id, tool_name, arguments in (
@@ -162,8 +170,8 @@ class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
                 ),
                 (
                     "publish-1",
-                    "publish_artifact",
-                    {"path": "report.txt"},
+                    self.delivery_tool,
+                    {"path": self.delivery_path},
                 ),
             ):
                 yield ProviderToolUseStart(
@@ -179,6 +187,16 @@ class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
             return
         yield ProviderText(text="The report is ready.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+class _CheckpointThenPreviewProvider(_CheckpointThenPublishProvider):
+    delivery_tool = "open_workspace_preview"
+    delivery_path = "site/index.html"
+
+
+class _CheckpointThenStartServerProvider(_CheckpointThenMutateProvider):
+    mutation_tool = "exec_command"
+    mutation_arguments = {"command": "python -m http.server"}
 
 
 class _SubmitThenCheckpointProvider(_ReconcilesCheckpointProvider):
@@ -316,6 +334,36 @@ def _registry(
         ),
         publish_artifact,
     )
+
+    async def open_workspace_preview(path: str) -> str:
+        if observed_calls is not None:
+            observed_calls.append(f"open_workspace_preview:{path}")
+        return "opened"
+
+    registry.register(
+        ToolSpec(
+            name="open_workspace_preview",
+            description="Open an existing page",
+            parameters={"path": {"type": "string"}},
+            required=["path"],
+        ),
+        open_workspace_preview,
+    )
+
+    async def exec_command(command: str) -> str:
+        if observed_calls is not None:
+            observed_calls.append(f"exec_command:{command}")
+        return "started"
+
+    registry.register(
+        ToolSpec(
+            name="exec_command",
+            description="Run a command",
+            parameters={"command": {"type": "string"}},
+            required=["command"],
+        ),
+        exec_command,
+    )
     return registry
 
 
@@ -350,6 +398,7 @@ async def _run(
         plan_storage=plan_storage,
         plan_revision=_revision(),
         plan_run=plan_storage.run,
+        workspace_preview_opener=_preview_opener,
     )
     try:
         return [
@@ -364,6 +413,10 @@ async def _run(
         ]
     finally:
         await session_storage.close()
+
+
+async def _preview_opener(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return {"resourceId": "document:test"}
 
 
 @pytest.mark.asyncio
@@ -453,6 +506,36 @@ async def test_final_checkpoint_allows_later_artifact_delivery(
     assert next(event for event in events if isinstance(event, DoneEvent)).text == (
         "The report is ready."
     )
+
+
+@pytest.mark.asyncio
+async def test_final_checkpoint_allows_prepared_preview_without_publication(tmp_path: Path) -> None:
+    plan_storage = _PlanStorage()
+    provider = _CheckpointThenPreviewProvider()
+    observed_calls: list[str] = []
+
+    events = await _run(tmp_path, provider, plan_storage, observed_calls=observed_calls)
+
+    assert observed_calls == ["open_workspace_preview:site/index.html"]
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert provider.tool_names_per_request[1] == {"publish_artifact", "open_workspace_preview"}
+    assert plan_storage.run.current_step_id is None
+    approved = "\n".join(str(message.content) for message in provider.requests[0])
+    assert "only when the user explicitly requested" in approved
+
+
+@pytest.mark.asyncio
+async def test_final_checkpoint_rejects_server_start(tmp_path: Path) -> None:
+    plan_storage = _PlanStorage()
+    provider = _CheckpointThenStartServerProvider()
+    observed_calls: list[str] = []
+
+    events = await _run(tmp_path, provider, plan_storage, observed_calls=observed_calls)
+
+    assert observed_calls == []
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    denied_result = "\n".join(str(message.content) for message in provider.requests[1])
+    assert "plan_run_delivery_only" in denied_result
 
 
 @pytest.mark.asyncio

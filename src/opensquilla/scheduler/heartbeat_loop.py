@@ -4,18 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, cast
 
 import structlog
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.asyncio_utils import create_background_task
-from opensquilla.scheduler.heartbeat import (
-    HeartbeatLoopOverrides,
-    is_heartbeat_content_effectively_empty,
-    parse_loop_overrides,
-)
 from opensquilla.scheduler.heartbeat_service import HeartbeatRunResult
 from opensquilla.session.keys import build_main_key
 from opensquilla.tools.types import (
@@ -29,8 +23,7 @@ from opensquilla.tools.types import (
 log = structlog.get_logger(__name__)
 
 DEFAULT_HEARTBEAT_PROMPT = (
-    "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. "
-    "If nothing needs attention, reply HEARTBEAT_OK."
+    "Process any queued system events. If nothing needs attention, reply HEARTBEAT_OK."
 )
 
 
@@ -43,7 +36,6 @@ class HeartbeatLoop:
     ) -> None:
         self._config = config
         self._heartbeat_service = heartbeat_service
-        self._overrides = HeartbeatLoopOverrides()
         self._nudge_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._started = False
@@ -85,69 +77,32 @@ class HeartbeatLoop:
         """
         self.nudge()
 
-    def apply_overrides(self, overrides: HeartbeatLoopOverrides) -> None:
-        """Replace the live HEARTBEAT.md-sourced overrides.
-
-        Called by ``HeartbeatConfigWatcher.reload_now`` on every parse. Pure
-        attribute swap — the in-flight tick keeps its snapshot from
-        ``_snapshot_cfg`` and is unaffected.
-        """
-        self._overrides = overrides
-
     def _snapshot_cfg(self) -> dict[str, Any]:
-        """Resolve effective values once per tick: overrides win, config falls back.
-
-        Returned as a plain dict so the tick body cannot accidentally observe
-        a hot-reload mid-flight.
-        """
+        """Capture configured values once per tick; retired files have no effect."""
         cfg = getattr(self._config, "heartbeat", None)
-        ov = self._overrides
-
-        def _pick(name: str, default: Any) -> Any:
-            ov_val = getattr(ov, name, None)
-            if ov_val is not None:
-                return ov_val
-            if cfg is None:
-                return default
-            return getattr(cfg, name, default)
-
         return {
-            "enabled": _pick("enabled", False),
-            "interval_ms": _pick("interval_ms", 30 * 60 * 1000),
-            "target": _pick("target", "last"),
-            "prompt": _pick("prompt", None),
-            "ack_max_chars": _pick("ack_max_chars", 300),
-            "light_context": _pick("light_context", False),
-            "active_hours": ov.active_hours,
-            # bootstrap-only fields (not in frontmatter)
-            "to": getattr(cfg, "to", "") if cfg is not None else "",
-            "account_id": getattr(cfg, "account_id", "") if cfg is not None else "",
-            "thread_id": getattr(cfg, "thread_id", "") if cfg is not None else "",
+            "enabled": getattr(cfg, "enabled", False),
+            "interval_ms": getattr(cfg, "interval_ms", 30 * 60 * 1000),
+            "target": getattr(cfg, "target", "last"),
+            "prompt": getattr(cfg, "prompt", None),
+            "ack_max_chars": getattr(cfg, "ack_max_chars", 300),
+            "light_context": getattr(cfg, "light_context", False),
+            "to": getattr(cfg, "to", ""),
+            "account_id": getattr(cfg, "account_id", ""),
+            "thread_id": getattr(cfg, "thread_id", ""),
         }
-
-    def _heartbeat_md_path(self) -> Path:
-        cfg = getattr(self._config, "heartbeat", None)
-        configured = getattr(cfg, "config_path", None) if cfg is not None else None
-        if isinstance(configured, str) and configured.strip():
-            return Path(configured).expanduser()
-        workspace_dir = getattr(self._config, "workspace_dir", None)
-        if isinstance(workspace_dir, str) and workspace_dir.strip():
-            return Path(workspace_dir).expanduser() / "HEARTBEAT.md"
-        return Path.home() / ".opensquilla" / "workspace" / "HEARTBEAT.md"
-
-    @staticmethod
-    def _within_active_hours(window: tuple[int, int] | None, moment: datetime) -> bool:
-        if window is None:
-            return True
-        start, end = window
-        hour = moment.hour
-        if start <= end:
-            return start <= hour < end
-        return hour >= start or hour < end
 
     async def start(self) -> None:
         if self._started:
             return
+        cfg = getattr(self._config, "heartbeat", None)
+        if getattr(cfg, "enabled", False) or getattr(cfg, "config_path", None) is not None:
+            log.warning(
+                "heartbeat_loop.workspace_file_retired",
+                detail="HEARTBEAT.md body and frontmatter are ignored; only heartbeat "
+                "configuration applies. Old file-based disabling, quiet hours and "
+                "empty-file suppression no longer apply.",
+            )
         self._started = True
         self._task = create_background_task(self._loop())
 
@@ -181,25 +136,6 @@ class HeartbeatLoop:
         snap = self._snapshot_cfg()
         if not snap["enabled"]:
             return
-        if not self._within_active_hours(snap["active_hours"], datetime.now(UTC)):
-            return
-        heartbeat_md_path = self._heartbeat_md_path()
-        heartbeat_file_has_overrides = (
-            heartbeat_md_path.is_file() and not parse_loop_overrides(heartbeat_md_path).is_empty()
-        )
-        if (
-            heartbeat_md_path.is_file()
-            and not heartbeat_file_has_overrides
-            and is_heartbeat_content_effectively_empty(heartbeat_md_path)
-        ):
-            recorder = getattr(self._heartbeat_service, "record_skip", None)
-            if callable(recorder):
-                recorder(
-                    session_key=build_main_key("main"),
-                    reason="empty-heartbeat-file",
-                )
-            return
-
         prompt = snap["prompt"] or DEFAULT_HEARTBEAT_PROMPT
         target = snap["target"]
         delivery_override = None
@@ -257,32 +193,6 @@ class HeartbeatLoop:
                 reason="disabled",
                 ran_at_ms=ran_at_ms,
             )
-        if not self._within_active_hours(snap["active_hours"], datetime.now(UTC)):
-            return HeartbeatRunResult(
-                status="skipped",
-                session_key=session_key,
-                reason="quiet-hours",
-                ran_at_ms=ran_at_ms,
-            )
-        heartbeat_md_path = self._heartbeat_md_path()
-        heartbeat_file_has_overrides = (
-            heartbeat_md_path.is_file() and not parse_loop_overrides(heartbeat_md_path).is_empty()
-        )
-        if (
-            heartbeat_md_path.is_file()
-            and not heartbeat_file_has_overrides
-            and is_heartbeat_content_effectively_empty(heartbeat_md_path)
-        ):
-            recorder = getattr(self._heartbeat_service, "record_skip", None)
-            if callable(recorder):
-                recorder(session_key=session_key, reason="empty-heartbeat-file")
-            return HeartbeatRunResult(
-                status="skipped",
-                session_key=session_key,
-                reason="empty-heartbeat-file",
-                ran_at_ms=ran_at_ms,
-            )
-
         service_kwargs: dict[str, Any] = {
             "reason": reason,
             "agent_id": agent_id,

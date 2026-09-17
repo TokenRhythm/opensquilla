@@ -34,6 +34,11 @@ class TurnCaptureService:
 
     Raw turns are audit/debug state, not curated memory. They deliberately do
     not index into the ordinary memory store.
+
+    ``memory_config`` accepts either the memory section itself (kept for
+    callers/tests) or the live root Gateway config. Production passes the root
+    object so config patches that replace ``config.memory`` are observed by
+    the next turn without rebuilding the service.
     """
 
     def __init__(
@@ -52,33 +57,45 @@ class TurnCaptureService:
         self._turns_parent = self._turns_dir.parent
         self._memory_config = memory_config
 
+    def _settings(self) -> Any | None:
+        config = self._memory_config
+        if config is None:
+            return None
+        memory = getattr(config, "memory", None)
+        return memory if memory is not None else config
+
     def _enabled(self) -> bool:
-        if self._memory_config is None:
+        config = self._settings()
+        if config is None:
             return True
-        if not bool(getattr(self._memory_config, "auto_capture_enabled", True)):
+        if not bool(getattr(config, "auto_capture_enabled", True)):
             return False
-        return getattr(self._memory_config, "capture_mode", "turn_pair") != "off"
+        return getattr(config, "capture_mode", "turn_pair") != "off"
 
     def _capture_max_chars(self) -> int:
-        if self._memory_config is None:
+        config = self._settings()
+        if config is None:
             return 2000
-        value = int(getattr(self._memory_config, "capture_max_chars", 2000) or 0)
+        value = int(getattr(config, "capture_max_chars", 2000) or 0)
         return max(0, value)
 
     def _capture_user(self) -> bool:
-        if self._memory_config is None:
+        config = self._settings()
+        if config is None:
             return True
-        return bool(getattr(self._memory_config, "capture_user", True))
+        return bool(getattr(config, "capture_user", True))
 
     def _capture_assistant(self) -> bool:
-        if self._memory_config is None:
+        config = self._settings()
+        if config is None:
             return False
-        return bool(getattr(self._memory_config, "capture_assistant", False))
+        return bool(getattr(config, "capture_assistant", False))
 
     def _turn_roll_max_chars(self) -> int:
-        if self._memory_config is None:
+        config = self._settings()
+        if config is None:
             return 50_000
-        value = int(getattr(self._memory_config, "capture_roll_max_chars", 50_000) or 0)
+        value = int(getattr(config, "capture_roll_max_chars", 50_000) or 0)
         return max(0, value)
 
     def _turn_rel_path(self, session_key: str, captured_at: datetime) -> str:
@@ -157,16 +174,18 @@ class TurnCaptureService:
         self,
         *,
         session_key: str,
+        session_namespace: str | None,
         captured_at: datetime,
         entry: str,
     ) -> tuple[str, Path, str | None, str]:
         roll_max_chars = self._turn_roll_max_chars()
+        path_namespace = session_namespace or session_key
 
         for part in range(1, 1000):
             rel_path = (
-                self._turn_rel_path(session_key, captured_at)
+                self._turn_rel_path(path_namespace, captured_at)
                 if part == 1
-                else self._turn_part_rel_path(session_key, captured_at, part)
+                else self._turn_part_rel_path(path_namespace, captured_at, part)
             )
             abs_path = (self._turns_parent / rel_path).resolve()
             try:
@@ -200,6 +219,7 @@ class TurnCaptureService:
         source: dict[str, Any] | None = None,
         captured_at: datetime | None = None,
         no_memory_capture: bool = False,
+        session_namespace: str | None = None,
     ) -> str | None:
         if no_memory_capture:
             return None
@@ -230,6 +250,7 @@ class TurnCaptureService:
         )
         rel_path, abs_path, previous_content, new_content = self._select_turn_target(
             session_key=session_key,
+            session_namespace=session_namespace,
             captured_at=captured_at,
             entry=entry,
         )

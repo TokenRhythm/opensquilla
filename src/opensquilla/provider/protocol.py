@@ -2,20 +2,40 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
+from .execution_identity import project_execution_identity
 from .types import (
     ChatConfig,
+    ContentBlockImage,
+    ContentBlockToolResult,
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
     QuotaStatus,
     StreamEvent,
     ToolDefinition,
+    VisionSupport,
 )
+
+IMAGE_INPUT_UNSUPPORTED_CODE = "image_input_unsupported"
+IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
+    "The selected model cannot process image input. Choose an image-capable "
+    "model or remove the image and try again."
+)
+
+
+class ProviderModelListingResponseError(RuntimeError):
+    """A model-list response arrived but could not be parsed safely."""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 if TYPE_CHECKING:
     from .selector import ProviderConfig, SelectorConfig
@@ -72,6 +92,22 @@ class ProviderMessageCountProjector(Protocol):
         additional_messages: int = 0,
     ) -> ProviderMessageCountProjection:
         """Project the adapter's final wire count without issuing a request."""
+        ...
+
+
+@runtime_checkable
+class ProviderFinalRequestProjector(Protocol):
+    """Optional, side-effect-free projection of one exact outbound request."""
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Build and prove the adapter's exact payload without shaping or I/O."""
         ...
 
 
@@ -169,13 +205,46 @@ def project_provider_message_count(
         return None
     try:
         projection = projection_fn(
-            messages,
+            project_execution_identity(messages, config),
             config,
             additional_messages=additional_messages,
         )
     except Exception:  # noqa: BLE001 - optional capability must stay best-effort
         return None
     return projection if isinstance(projection, ProviderMessageCountProjection) else None
+
+
+def project_provider_final_request(
+    provider: object | None,
+    messages: list[Message],
+    tools: list[ToolDefinition] | None = None,
+    config: ChatConfig | None = None,
+    *,
+    message_limit: int | None = None,
+) -> ProviderFinalRequestProjection | None:
+    """Return an optional exact final-request admission projection.
+
+    This duck-typed capability is deliberately narrower than ``LLMProvider``.
+    Missing, raising, or invalid implementations return ``None`` so callers
+    can fail closed for durable decisions without changing ordinary chat
+    compatibility.
+    """
+
+    if provider is None:
+        return None
+    projection_fn = getattr(provider, "project_final_request", None)
+    if not callable(projection_fn):
+        return None
+    try:
+        projection = projection_fn(
+            project_execution_identity(messages, config),
+            tools,
+            config,
+            message_limit=message_limit,
+        )
+    except Exception:  # noqa: BLE001 - optional capability must be isolated
+        return None
+    return projection if isinstance(projection, ProviderFinalRequestProjection) else None
 
 
 def validate_provider_chat_request(
@@ -204,6 +273,82 @@ def validate_provider_chat_request(
     except Exception:  # noqa: BLE001 - optional preflight must stay best-effort
         return None
     return validation_error if isinstance(validation_error, ErrorEvent) else None
+
+
+def count_provider_image_blocks(messages: Sequence[object]) -> int:
+    """Count typed images in the exact provider request, including tool results."""
+
+    count = 0
+    for message in messages:
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, ContentBlockImage):
+                count += 1
+                continue
+            if not isinstance(block, ContentBlockToolResult):
+                continue
+            if isinstance(block.content, list):
+                count += sum(
+                    1 for item in block.content if isinstance(item, ContentBlockImage)
+                )
+    return count
+
+
+def image_input_admission_error(
+    messages: Sequence[object],
+    *,
+    vision_support: VisionSupport,
+    reject_unknown: bool = False,
+) -> ErrorEvent | None:
+    """Return the stable image admission error when capability evidence rejects."""
+
+    if count_provider_image_blocks(messages) <= 0:
+        return None
+    if vision_support == "supported":
+        return None
+    if vision_support == "unknown" and not reject_unknown:
+        return None
+    return ErrorEvent(
+        message=IMAGE_INPUT_UNSUPPORTED_MESSAGE,
+        code=IMAGE_INPUT_UNSUPPORTED_CODE,
+    )
+
+
+def validate_provider_chat_admission(
+    provider: object | None,
+    messages: list[Message],
+    config: ChatConfig | None,
+) -> ErrorEvent | None:
+    """Run typed admission, then the legacy request validator as a fallback."""
+
+    messages = project_execution_identity(messages, config)
+    raw_vision_support = getattr(config, "model_vision_support", "unknown")
+    vision_support: VisionSupport = (
+        cast(VisionSupport, raw_vision_support)
+        if raw_vision_support in {"supported", "unsupported", "unknown"}
+        else "unknown"
+    )
+    capability_error = image_input_admission_error(
+        messages,
+        vision_support=vision_support,
+    )
+    if capability_error is not None:
+        return capability_error
+    if provider is not None:
+        admission_fn = getattr(provider, "validate_chat_admission", None)
+        if callable(admission_fn):
+            try:
+                result = admission_fn(messages, config)
+            except Exception:  # noqa: BLE001 - optional capability must be isolated
+                pass
+            else:
+                if isinstance(result, ErrorEvent):
+                    return result
+                if result is None:
+                    return None
+    return validate_provider_chat_request(provider, messages)
 
 
 @runtime_checkable

@@ -74,6 +74,27 @@ def _collect(
     return asyncio.run(_run())
 
 
+def test_ollama_final_request_proof_blocks_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_stream(monkeypatch, captured)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(
+        provider,
+        [Message(role="user", content="x" * 5000)],
+        ChatConfig(provider_request_max_chars=1000),
+    )
+
+    assert captured == {}
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_request_budget_exhausted"
+    proof = json.loads(events[0].message)
+    assert proof["projection_adapter"] == "ollama"
+    assert proof["messages_chars"] > 0
+
+
 def test_tool_use_replayed_as_tool_calls_and_correlated_tool_message(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_stream(monkeypatch, captured)
@@ -201,21 +222,31 @@ def test_image_block_attached_to_message_images(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_stream(monkeypatch, captured)
     provider = OllamaProvider(model="llava")
+    image_data = "QkFTRTY0" * 700
     messages = [
         Message(
             role="user",
             content=[
                 ContentBlockText(text="what is this"),
-                ContentBlockImage(source_type="base64", media_type="image/png", data="QkFTRTY0"),
+                ContentBlockImage(
+                    source_type="base64",
+                    media_type="image/png",
+                    data=image_data,
+                ),
             ],
         ),
     ]
 
-    _collect(provider, messages)
+    events = _collect(
+        provider,
+        messages,
+        ChatConfig(provider_request_max_chars=10_000),
+    )
 
     msg = captured["payload"]["messages"][0]
     assert msg["content"] == "what is this"
-    assert msg["images"] == ["QkFTRTY0"]
+    assert msg["images"] == [image_data]
+    assert any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_system_prompt_is_first_message(monkeypatch: Any) -> None:
@@ -426,7 +457,83 @@ def test_stream_normal_mode_keeps_tool_name_limit(monkeypatch: Any) -> None:
         isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
         for event in events
     )
+    assert not any(isinstance(event, ToolUseStartEvent) for event in events)
     assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_stream_malformed_tool_arguments_emit_start_before_terminal_error(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    body = _ndjson(
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_edit",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": [],
+                        },
+                    }
+                ],
+            },
+        },
+        {
+            "model": "llama3",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(provider, [Message(role="user", content="hi")])
+
+    lifecycle = [
+        event
+        for event in events
+        if isinstance(event, ToolUseStartEvent | ToolUseEndEvent | ErrorEvent)
+    ]
+    assert isinstance(lifecycle[0], ToolUseStartEvent)
+    assert lifecycle[0].tool_use_id == "call_edit"
+    assert lifecycle[0].tool_name == "write_file"
+    assert isinstance(lifecycle[1], ErrorEvent)
+    assert lifecycle[1].code == "incomplete_tool_call"
+    assert not any(isinstance(event, ToolUseDeltaEvent | ToolUseEndEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_stream_malformed_tool_call_without_name_does_not_emit_start(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    body = _ndjson(
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_missing_name", "function": {"arguments": []}}
+                ],
+            },
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(provider, [Message(role="user", content="hi")])
+
+    assert not any(isinstance(event, ToolUseStartEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+    assert not any(isinstance(event, ToolUseEndEvent | DoneEvent) for event in events)
 
 
 def test_stream_candidate_mode_retains_malformed_tool_shape(monkeypatch: Any) -> None:

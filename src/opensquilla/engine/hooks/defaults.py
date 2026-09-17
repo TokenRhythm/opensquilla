@@ -138,31 +138,6 @@ class DefaultTranscriptHook:
     def on_event(self, ctx: TurnHookContext, event: TurnEvent) -> None:
         return None
 
-# ---------------------------------------------------------------------------
-# Default memory flush hook — placeholder; production flush stays inline
-# ---------------------------------------------------------------------------
-
-class DefaultMemoryFlushHook:
-    """``TurnHook.after_turn`` implementation reserved for memory flush.
-
-    The actual flush task lives in :mod:`opensquilla.engine.agent` and depends
-    on per-Agent compaction state. This hook is currently reserved; inline
-    memory-flush behavior remains the source of truth.
-    """
-
-    name = "default_memory_flush"
-
-    async def before_turn(self, ctx: TurnHookContext) -> None:
-        return None
-
-    async def after_turn(self, ctx: TurnHookContext, result: TurnHookResult) -> None:
-        return None
-
-    async def on_error(self, ctx: TurnHookContext, exc: BaseException) -> None:
-        return None
-
-    def on_event(self, ctx: TurnHookContext, event: TurnEvent) -> None:
-        return None
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -172,19 +147,17 @@ def build_default_turn_hooks() -> tuple[TurnHook, ...]:
     """Return the canonical default ``TurnHook`` chain.
 
     The order is observational only: trace emitter first so events reach the
-    sink before later hooks observe them, then transcript and flush hooks
-    which currently no-op (the inline code remains the source of truth in
+    sink before later hooks observe them, then the transcript hook
+    which currently no-ops (the inline code remains the source of truth in
     prior runtime path). A later runtime extraction can move the inline bodies into these hooks.
     """
 
     return (
         DefaultTraceEmitterHook(),
         DefaultTranscriptHook(),
-        DefaultMemoryFlushHook(),
     )
 
 __all__ = [
-    "DefaultMemoryFlushHook",
     "DefaultTraceEmitterHook",
     "DefaultTranscriptHook",
     "NoopCompactionHook",
@@ -197,14 +170,12 @@ __all__ = [
 _check_turn: TurnHook = NoopTurnHook()
 _check_trace_turn: TurnHook = DefaultTraceEmitterHook()
 _check_transcript_turn: TurnHook = DefaultTranscriptHook()
-_check_memory_turn: TurnHook = DefaultMemoryFlushHook()
 _check_tool: ToolHook = NoopToolHook()
 _check_compact: CompactionHook = NoopCompactionHook()
 del (
     _check_turn,
     _check_trace_turn,
     _check_transcript_turn,
-    _check_memory_turn,
     _check_tool,
     _check_compact,
 )

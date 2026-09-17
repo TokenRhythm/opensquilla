@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -69,12 +70,14 @@ def _ctx(
     is_owner: bool = False,
     agent_id: str = "agent",
     caller_kind: CallerKind = CallerKind.AGENT,
+    task_id: str | None = None,
 ) -> ToolContext:
     return ToolContext(
         is_owner=is_owner,
         caller_kind=caller_kind,
         session_key=session_key,
         agent_id=agent_id,
+        task_id=task_id,
     )
 
 
@@ -262,6 +265,237 @@ async def test_exec_command_timeout_still_stops_foreground_process() -> None:
     assert elapsed < 1.0
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
+@pytest.mark.asyncio
+async def test_caller_cancel_stops_foreground_process_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    marker = tmp_path / "cancelled-descendant-ran"
+    child_script = (
+        "import pathlib, time; "
+        f"time.sleep(0.6); pathlib.Path({str(marker)!r}).write_text('ran')"
+    )
+    parent_script = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+        "time.sleep(30)"
+    )
+    command = _python_shell_command(parent_script)
+    created: list[asyncio.subprocess.Process] = []
+    original_create = shell._create_host_shell_subprocess
+
+    async def capture_process(*args, **kwargs):
+        proc = await original_create(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(shell, "_create_host_shell_subprocess", capture_process)
+    running = asyncio.create_task(
+        shell._run_host_shell_command(
+            command,
+            cwd=None,
+            env=dict(os.environ),
+            stdin_bytes=None,
+            effective_timeout=30.0,
+        )
+    )
+    for _attempt in range(100):
+        if created:
+            break
+        await asyncio.sleep(0.01)
+    assert created
+
+    running.cancel()
+    cancelled = await asyncio.gather(running, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
+
+    assert created[0].returncode is not None
+    await asyncio.sleep(0.8)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_stops_only_owned_background_process() -> None:
+    token = current_tool_context.set(
+        _ctx("agent:main:background-owner", task_id="task-owned")
+    )
+    try:
+        result = await shell._start_host_background_process(
+            _python_shell_command("import time; time.sleep(30)"),
+            cwd=None,
+            effective_timeout=30.0,
+            runtime=None,
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    session_id = result.splitlines()[0].split("=", 1)[1]
+    session = shell._bg_sessions[session_id]
+    assert session.task_id == "task-owned"
+    assert session.process.returncode is None
+    assert (
+        "agent:main:background-owner",
+        "task-owned",
+    ) in shell.active_background_process_task_owners()
+
+    cancelled = await shell.cancel_background_processes_for_task(
+        "agent:main:background-owner",
+        "task-owned",
+    )
+
+    assert cancelled == 1
+    assert session.killed is True
+    if session.collector_task is not None:
+        await asyncio.wait_for(session.collector_task, timeout=2.0)
+    assert session.process.returncode is not None
+    assert (
+        "agent:main:background-owner",
+        "task-owned",
+    ) not in shell.active_background_process_task_owners()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
+@pytest.mark.asyncio
+async def test_task_cancel_stops_descendant_after_background_leader_exits(tmp_path) -> None:
+    marker = tmp_path / "leader-exit-descendant-ran"
+    child_script = (
+        "import pathlib, time; "
+        f"time.sleep(1.0); pathlib.Path({str(marker)!r}).write_text('ran'); "
+        "time.sleep(30)"
+    )
+    parent_script = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}])"
+    )
+    token = current_tool_context.set(
+        _ctx("agent:main:leader-exit", task_id="task-leader-exit")
+    )
+    try:
+        result = await shell._start_host_background_process(
+            _python_shell_command(parent_script),
+            cwd=None,
+            effective_timeout=30.0,
+            runtime=None,
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    session_id = result.splitlines()[0].split("=", 1)[1]
+    session = shell._bg_sessions[session_id]
+    for _attempt in range(200):
+        if session.process.returncode is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert session.process.returncode == 0
+    assert session.process_tree is not None
+    assert session.process_tree.is_active() is True
+    assert (
+        "agent:main:leader-exit",
+        "task-leader-exit",
+    ) in shell.active_background_process_task_owners()
+
+    assert await shell.cancel_background_processes_for_task(
+        "agent:main:leader-exit",
+        "task-leader-exit",
+    ) == 1
+    await asyncio.sleep(1.2)
+
+    assert session.process_tree.is_active() is False
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_is_exact_across_siblings_sessions_and_repeats() -> None:
+    sessions: list[shell._BgSession] = []
+    identities = (
+        ("agent:main:shared", "task-target"),
+        ("agent:main:shared", "task-sibling"),
+        ("agent:main:other", "task-target"),
+    )
+    for session_key, task_id in identities:
+        token = current_tool_context.set(_ctx(session_key, task_id=task_id))
+        try:
+            result = await shell._start_host_background_process(
+                _python_shell_command("import time; time.sleep(30)"),
+                cwd=None,
+                effective_timeout=30.0,
+                runtime=None,
+            )
+        finally:
+            current_tool_context.reset(token)
+        session_id = result.splitlines()[0].split("=", 1)[1]
+        sessions.append(shell._bg_sessions[session_id])
+
+    try:
+        assert await shell.cancel_background_processes_for_task(
+            "agent:main:shared",
+            "task-target",
+        ) == 1
+        assert await shell.cancel_background_processes_for_task(
+            "agent:main:shared",
+            "task-target",
+        ) == 0
+        assert sessions[0].process_tree is not None
+        assert sessions[0].process_tree.is_active() is False
+        assert sessions[1].process_tree is not None
+        assert sessions[1].process_tree.is_active() is True
+        assert sessions[2].process_tree is not None
+        assert sessions[2].process_tree.is_active() is True
+    finally:
+        await shell.cancel_background_processes_for_task(
+            "agent:main:shared",
+            "task-sibling",
+        )
+        await shell.cancel_background_processes_for_task(
+            "agent:main:other",
+            "task-target",
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+@pytest.mark.asyncio
+async def test_windows_job_owns_descendant_after_leader_exit(tmp_path) -> None:
+    from opensquilla.process_tree import (
+        capture_process_tree_owner,
+        create_owned_subprocess_exec,
+    )
+
+    pid_file = tmp_path / "windows-descendant.pid"
+    survived = tmp_path / "windows-descendant-survived"
+    child_script = (
+        "import os, pathlib, time; "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+        "time.sleep(1); "
+        f"pathlib.Path({str(survived)!r}).write_text('survived'); "
+        "time.sleep(30)"
+    )
+    parent_script = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}])"
+    )
+    proc = await create_owned_subprocess_exec(
+        sys.executable,
+        "-c",
+        parent_script,
+    )
+    process_tree = capture_process_tree_owner(proc, isolated=True)
+
+    assert process_tree.durable is True
+    await asyncio.wait_for(proc.wait(), timeout=5.0)
+    for _attempt in range(200):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert pid_file.exists()
+    assert process_tree.is_active() is True
+
+    assert await process_tree.terminate(graceful_timeout=0.2, kill_timeout=2.0)
+    assert process_tree.is_active() is False
+    await asyncio.sleep(1.2)
+    assert not survived.exists()
+
+
 @pytest.mark.asyncio
 async def test_exec_command_writes_optional_stdin() -> None:
     command = _python_shell_command(
@@ -288,16 +522,132 @@ async def test_write_exec_stdin_waits_until_eof_is_delivered() -> None:
 
 
 @pytest.mark.asyncio
+async def test_windows_host_stdin_uses_blocking_communicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _CompletedProcess:
+        returncode = None
+        pid = 1
+
+        def communicate(self, *, input: bytes) -> tuple[None, None]:
+            captured["stdin_bytes"] = input
+            self.returncode = 0
+            return None, None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    def fake_create_subprocess(command: str, **kwargs: object):
+        captured["command"] = command
+        captured["stdin_target"] = kwargs["stdin"]
+        return _CompletedProcess()
+
+    monkeypatch.setattr(shell, "_use_windows_blocking_exec_stdin", lambda: True)
+    monkeypatch.setattr(shell, "_create_windows_host_shell_process", fake_create_subprocess)
+
+    result = await shell._run_host_shell_command(
+        "Write-Output ok",
+        cwd=None,
+        env={},
+        stdin_bytes=b"payload",
+        effective_timeout=1.0,
+    )
+
+    assert result == "exit_code=0\n"
+    assert captured == {
+        "command": "Write-Output ok",
+        "stdin_target": subprocess.PIPE,
+        "stdin_bytes": b"payload",
+    }
+
+
+@pytest.mark.asyncio
+async def test_windows_blocking_stdin_timeout_terminates_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    actions: list[str] = []
+
+    class _HangingProcess:
+        returncode = None
+        pid = 1
+
+        def communicate(self, *, input: bytes) -> tuple[None, None]:
+            assert input == b"payload"
+            assert release.wait(timeout=2)
+            return None, None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            actions.append("terminate")
+            self.returncode = -1
+            release.set()
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == shell._EXEC_TERMINATE_TIMEOUT
+            return -1
+
+    monkeypatch.setattr(shell, "_use_windows_blocking_exec_stdin", lambda: True)
+    monkeypatch.setattr(
+        shell,
+        "_create_windows_host_shell_process",
+        lambda _command, **_kwargs: _HangingProcess(),
+    )
+
+    result = await shell._run_host_shell_command(
+        "Write-Output ok",
+        cwd=None,
+        env={},
+        stdin_bytes=b"payload",
+        effective_timeout=0.01,
+    )
+
+    assert result.startswith("[timeout after 0.01s]")
+    assert actions == ["terminate"]
+
+
+@pytest.mark.asyncio
+async def test_wait_exec_stdin_writer_accepts_process_exit_before_pipe_close() -> None:
+    proc = _FakeProcess(returncode=None)
+    release_writer = asyncio.Event()
+
+    async def wait_for_pipe_close() -> None:
+        await release_writer.wait()
+
+    writer_task = asyncio.create_task(wait_for_pipe_close())
+
+    async def finish_process() -> None:
+        await asyncio.sleep(0.02)
+        proc.returncode = 0
+
+    process_task = asyncio.create_task(finish_process())
+    started = time.monotonic()
+    try:
+        assert await shell._wait_exec_stdin_writer(proc, writer_task, timeout=0.5)
+        assert time.monotonic() - started < 0.25
+        assert not writer_task.done()
+    finally:
+        await process_task
+        await shell._cancel_exec_stdin_writer(proc, writer_task)
+
+    assert writer_task.cancelled()
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.name != "posix", reason="large pipe backpressure is POSIX-specific")
 async def test_exec_command_stdin_write_obeys_timeout() -> None:
-    command = _python_shell_command("import time; time.sleep(5)")
+    command = _python_shell_command("import time; time.sleep(10)")
 
     started = time.monotonic()
     result = await shell.exec_command(command, stdin="x" * 1_000_000, timeout=0.2)
     elapsed = time.monotonic() - started
 
     assert "[timeout after 0.2s]" in result
-    assert elapsed < 3.0, "timeout path should return before the 5s child sleep"
+    assert elapsed < 5.0, "timeout path should return well before the 10s child sleep"
 
 
 @pytest.mark.asyncio

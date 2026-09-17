@@ -42,6 +42,9 @@ async def run_process_payload(payload: HelperPayload) -> dict[str, Any]:
             proc.communicate(input=stdin),
             timeout=float(payload.policy.get("wallTimeoutS", 60.0)),
         )
+    except asyncio.CancelledError:
+        await asyncio.shield(_terminate_process_group(proc))
+        raise
     except TimeoutError:
         timed_out = True
         stdout_raw, stderr_raw = await _terminate_process_group(proc)

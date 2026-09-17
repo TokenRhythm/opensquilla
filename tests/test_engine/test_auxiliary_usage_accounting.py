@@ -16,8 +16,8 @@ from opensquilla.engine.usage_accounting import (
     bind_usage_accounting_scope,
 )
 from opensquilla.memory.dream.runner import _run_complete
-from opensquilla.memory.session_flush import ProviderCompletionError, _provider_complete
 from opensquilla.onboarding.probe import probe_llm_provider
+from opensquilla.provider.protocol import ProviderMetadata
 from opensquilla.provider.types import DoneEvent, ErrorEvent, Message, TextDeltaEvent
 from opensquilla.tools.builtin.media import _complete_from_stream
 
@@ -71,13 +71,19 @@ class _StreamProvider:
             yield event
 
 
-async def _session_flush_completion(provider: Any) -> str:
-    result = await _provider_complete(
-        provider,
-        messages=[Message(role="user", content="hello")],
-        max_tokens=32,
-    )
-    return result.text
+class _ConfiguredGenericCustomStreamProvider(_StreamProvider):
+    def __init__(self, events: list[Any], *, provider_id: str) -> None:
+        super().__init__(events)
+        self._provider_id = provider_id
+
+    def provider_metadata(self) -> ProviderMetadata:
+        is_anthropic = self._provider_id == "custom_anthropic"
+        return ProviderMetadata(
+            provider_id=self._provider_id,
+            provider_name="anthropic" if is_anthropic else "openai",
+            provider_kind="anthropic" if is_anthropic else "openai_compat",
+            model="gpt-4.1",
+        )
 
 
 async def _dream_completion(provider: Any) -> str:
@@ -98,7 +104,7 @@ async def _media_completion(provider: Any) -> str:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "runner",
-    [_session_flush_completion, _dream_completion, _media_completion],
+    [_dream_completion, _media_completion],
 )
 async def test_auxiliary_chat_done_is_accounted_once(
     runner: Callable[[Any], Awaitable[str]],
@@ -129,13 +135,48 @@ async def test_auxiliary_chat_done_is_accounted_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner",
+    [_dream_completion, _media_completion],
+)
+@pytest.mark.parametrize("provider_id", ["custom", "custom_anthropic"])
+async def test_auxiliary_chat_accounts_configured_generic_custom_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: Callable[[Any], Awaitable[str]],
+    provider_id: str,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    sink = _RecordingSink()
+    provider = _ConfiguredGenericCustomStreamProvider(
+        [
+            TextDeltaEvent(text="ok"),
+            DoneEvent(input_tokens=100_000, output_tokens=1_000, model="gpt-4.1"),
+        ],
+        provider_id=provider_id,
+    )
+
+    with bind_usage_accounting_scope(_scope(sink)):
+        assert await runner(provider) == "ok"
+
+    [call] = sink.started
+    [(_finalized_call, result)] = sink.finalized
+    [item] = result.items
+    assert call.provider == provider_id
+    assert item.provider == provider_id
+    assert result.estimated_cost_nanos == 0
+    assert result.cost_source == "free"
+    assert result.estimate_basis == "free"
+    assert result.price_source == "custom_free"
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_chat_error_is_closed_as_unknown_before_returning() -> None:
     sink = _RecordingSink()
     provider = _StreamProvider([ErrorEvent(message="denied", code="401")])
 
     with bind_usage_accounting_scope(_scope(sink)):
-        with pytest.raises(ProviderCompletionError, match="denied"):
-            await _session_flush_completion(provider)
+        with pytest.raises(RuntimeError, match="denied"):
+            await _dream_completion(provider)
 
     assert len(sink.started) == 1
     assert sink.finalized == []
@@ -227,8 +268,8 @@ async def test_auxiliary_chat_closes_selector_owned_error_accounting() -> None:
     )
 
     with bind_usage_accounting_scope(_scope(sink)):
-        with pytest.raises(ProviderCompletionError, match="busy"):
-            await _session_flush_completion(selector)
+        with pytest.raises(RuntimeError, match="busy"):
+            await _dream_completion(selector)
 
     assert len(sink.started) == 1
     assert sink.finalized == []

@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from './Icon.vue'
 import { getPlatform } from '@/platform'
+import { OBSERVABILITY_KEY, type UpdateNotice } from '@/modules/observability'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 
 // Passive "a newer version is available" notice. The gateway injects the update
 // info into #opensquilla-data (data-update) only when a newer published release
@@ -11,7 +13,7 @@ import { getPlatform } from '@/platform'
 //
 // Suppressed wherever the desktop shell manages update discovery and actions.
 // That includes native electron-updater on macOS and the versioned manual
-// installer flow on unsigned Windows. Browser surfaces keep this passive banner;
+// installer flow on Windows. Browser surfaces keep this passive banner;
 // older Windows shells without the managed capability retain their legacy banner.
 
 const { t } = useI18n()
@@ -19,25 +21,11 @@ const platform = getPlatform()
 const isDesktop = platform.id === 'desktop'
 
 const DISMISS_KEY = 'opensquilla-update-dismissed'
-const RELEASES_FALLBACK = 'https://github.com/opensquilla/opensquilla/releases'
-const UPDATE_STATUS_URL = '/api/system/update'
+const RELEASES_FALLBACK = 'https://github.com/TokenRhythm/opensquilla/releases'
 const POLL_INTERVAL_MS = 15 * 60 * 1000
 const REQUEST_TIMEOUT_MS = 5 * 1000
 
-interface UpdateInfo {
-  current?: string
-  latest?: string
-  available?: boolean
-  url?: string
-}
-
-interface UpdateStatusPayload {
-  current: string
-  latest: string | null
-  available: boolean
-  url: string | null
-  checkedAt: string | null
-}
+type UpdateInfo = UpdateNotice
 
 function readUpdate(): UpdateInfo | null {
   try {
@@ -53,29 +41,13 @@ function readUpdate(): UpdateInfo | null {
   }
 }
 
-function normalizeUpdateStatus(payload: unknown): UpdateInfo | null | undefined {
-  if (!payload || typeof payload !== 'object') return undefined
-  const raw = payload as Partial<UpdateStatusPayload>
-  if (
-    typeof raw.current !== 'string'
-    || typeof raw.available !== 'boolean'
-    || (raw.latest !== null && typeof raw.latest !== 'string')
-    || (raw.url !== null && typeof raw.url !== 'string')
-    || (raw.checkedAt !== null && typeof raw.checkedAt !== 'string')
-  ) {
-    return undefined
-  }
-  if (!raw.available) return null
-  if (typeof raw.latest !== 'string' || !raw.latest.trim()) return undefined
-  return {
-    current: raw.current,
-    latest: raw.latest,
-    available: true,
-    url: typeof raw.url === 'string' && raw.url ? raw.url : undefined,
-  }
-}
-
 const info = ref<UpdateInfo | null>(readUpdate())
+const injectedObservability = inject(OBSERVABILITY_KEY)
+if (!injectedObservability) throw new Error('Observability was not provided')
+const observability = injectedObservability
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
 
 // Assume managed on desktop until the shell confirms otherwise, preventing a
 // native/manual desktop notice from flashing beside the passive banner.
@@ -87,18 +59,8 @@ let activeController: AbortController | null = null
 let activeRequestTimeout: number | null = null
 let inFlight: Promise<void> | null = null
 
-function authHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {}
-  try {
-    const token = sessionStorage.getItem('opensquilla.wsToken') || ''
-    if (token) headers.Authorization = `Bearer ${token}`
-  } catch {
-    // sessionStorage unavailable (private mode) — let gateway auth decide.
-  }
-  return headers
-}
-
 async function refreshUpdateInfo(): Promise<void> {
+  if (!mounted || !pollingEnabled || gatewayAccess.availability !== 'available') return
   if (inFlight) return inFlight
 
   const controller = new AbortController()
@@ -108,16 +70,9 @@ async function refreshUpdateInfo(): Promise<void> {
 
   const request = (async () => {
     try {
-      const response = await fetch(UPDATE_STATUS_URL, {
-        cache: 'no-store',
-        headers: authHeaders(),
-        signal: controller.signal,
-      })
-      if (!response.ok) return
-
-      const next = normalizeUpdateStatus(await response.json())
+      const next = await observability.updateNotice({ signal: controller.signal })
       // undefined means an invalid response: preserve the last known status.
-      if (mounted && next !== undefined) info.value = next
+      if (mounted && !controller.signal.aborted && next !== undefined) info.value = next
     } catch {
       // A transient gateway/network/parse failure must not erase a known update.
     } finally {
@@ -144,7 +99,8 @@ function stopPolling(): void {
 
 function startVisiblePolling(): void {
   stopPolling()
-  if (!pollingEnabled || document.visibilityState !== 'visible') return
+  if (!mounted || !pollingEnabled || gatewayAccess.availability !== 'available'
+    || document.visibilityState !== 'visible') return
   void refreshUpdateInfo()
   pollTimer = window.setInterval(() => {
     void refreshUpdateInfo()
@@ -155,6 +111,25 @@ function onVisibilityChange(): void {
   if (document.visibilityState === 'visible') startVisiblePolling()
   else stopPolling()
 }
+
+function abortActiveRequest(): void {
+  if (activeRequestTimeout !== null) {
+    window.clearTimeout(activeRequestTimeout)
+    activeRequestTimeout = null
+  }
+  activeController?.abort()
+  activeController = null
+  // A disconnected request must not hold up the next connection's refresh.
+  inFlight = null
+}
+
+watch(() => gatewayAccess.availability, state => {
+  if (state === 'available') startVisiblePolling()
+  else {
+    stopPolling()
+    abortActiveRequest()
+  }
+}, { flush: 'sync' })
 
 onMounted(async () => {
   mounted = true
@@ -181,12 +156,7 @@ onBeforeUnmount(() => {
   pollingEnabled = false
   document.removeEventListener('visibilitychange', onVisibilityChange)
   stopPolling()
-  if (activeRequestTimeout !== null) {
-    window.clearTimeout(activeRequestTimeout)
-    activeRequestTimeout = null
-  }
-  activeController?.abort()
-  activeController = null
+  abortActiveRequest()
 })
 
 function readDismissed(): string | null {

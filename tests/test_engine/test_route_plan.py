@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,6 +58,7 @@ def test_route_plan_is_pinned_once_with_capability_snapshot() -> None:
         fallback_capabilities={
             ("provider-a", "fallback/model"): (
                 32_000,
+                8_192,
                 ModelCapabilities(supports_tools=False),
             ),
         },
@@ -65,9 +67,13 @@ def test_route_plan_is_pinned_once_with_capability_snapshot() -> None:
     assert first.as_dict() == turn.metadata["route_plan"]
     assert first.fallback_chain[0].model == "fallback/model"
     assert first.fallback_chain[0].capabilities.context_window == 32_000
+    assert first.fallback_chain[0].capabilities.effective_max_tokens == 8_192
     assert first.fallback_chain[0].capabilities.supports_tools is False
     assert first.capabilities.context_window == 128_000
+    assert first.capabilities.effective_max_tokens == 0
     assert first.capabilities.supports_reasoning is True
+    assert first.version == 2
+    assert first.router_tier_snapshot is None
 
     turn.metadata["routed_model"] = "must-not-replace-the-plan"
     second = pin_route_plan(
@@ -161,3 +167,213 @@ def test_route_plan_adds_deduplicated_selector_execution_candidates() -> None:
     ]
     assert plan.fallback_chain[-1].capabilities.context_window == 128_000
     assert plan.fallback_chain[-1].capabilities.supports_tools is True
+
+
+def test_route_plan_freezes_text_candidates_aliases_ensemble_and_winner() -> None:
+    turn = _turn()
+    turn.config = SimpleNamespace(
+        squilla_router=SimpleNamespace(
+            tiers={
+                "t0": {"provider": "provider-a", "model": "fast/model"},
+                "t1": {"provider": "provider-b", "model": "balanced/model"},
+                "c2": {"provider": "provider-c", "model": ""},
+                "c3": {
+                    "provider": "provider-d",
+                    "model": "quality/model",
+                    "ensemble_enabled": True,
+                },
+                "image_model": {
+                    "provider": "provider-image",
+                    "model": "image/model",
+                    "supports_image": True,
+                    "image_only": True,
+                },
+            }
+        ),
+        llm_ensemble=SimpleNamespace(
+            enabled=False,
+            selection_mode="custom_b5",
+            model_fields_set={"selection_mode"},
+        ),
+    )
+
+    plan = pin_route_plan(
+        turn,
+        turn_id="turn-snapshot-text",
+        provider="provider-c",
+        model="routed/model",
+        context_window=64_000,
+        capabilities=ModelCapabilities(),
+        effective_thinking=False,
+    )
+
+    assert plan is not None
+    snapshot = plan.as_dict()["router_tier_snapshot"]
+    assert snapshot == {
+        "version": 1,
+        "request_kind": "text",
+        "tiers": [
+            {
+                "tier": "c0",
+                "provider": "provider-a",
+                "model": "fast/model",
+                "execution_kind": "single_model",
+            },
+            {
+                "tier": "c1",
+                "provider": "provider-b",
+                "model": "balanced/model",
+                "execution_kind": "single_model",
+            },
+            {
+                "tier": "c2",
+                "provider": "provider-a",
+                "model": "routed/model",
+                "execution_kind": "single_model",
+            },
+            {
+                "tier": "c3",
+                "provider": "provider-d",
+                "model": "quality/model",
+                "execution_kind": "ensemble",
+            },
+        ],
+    }
+    assert turn.metadata["route_plan"]["router_tier_snapshot"] == snapshot
+
+    turn.config.squilla_router.tiers["t0"]["model"] = "changed/model"
+    assert plan.as_dict()["router_tier_snapshot"] == snapshot
+    event = build_router_decision_event(turn)
+    assert event is not None
+    assert event.router_tier_snapshot == snapshot
+
+
+@pytest.mark.parametrize(
+    "image_metadata",
+    [{"routing_source": "image_route"}, {"image_context_has_images": True}],
+)
+def test_route_plan_freezes_configured_image_candidates_without_legacy_tier(
+    image_metadata: dict[str, object],
+) -> None:
+    turn = _turn()
+    turn.metadata.update(
+        {
+            "routed_tier": "c0",
+            "routed_provider": "image-provider",
+            "routed_model": "image/winner",
+            **image_metadata,
+        }
+    )
+    turn.config = SimpleNamespace(
+        squilla_router=SimpleNamespace(
+            tiers={
+                "c0": {
+                    "provider": "vision-provider",
+                    "model": "vision/fallback",
+                    "supports_image": True,
+                },
+                "c1": {"provider": "text-provider", "model": "text/only"},
+                "c3": {
+                    "provider": "fusion-provider",
+                    "model": "vision/fusion-draft",
+                    "supports_image": True,
+                    "ensemble_enabled": True,
+                },
+                "image_model": {
+                    "provider": "old-image-provider",
+                    "model": "image/old-config",
+                    "supports_image": True,
+                    "image_only": True,
+                },
+            }
+        ),
+        llm_ensemble=SimpleNamespace(
+            enabled=False,
+            selection_mode="custom_b5",
+            model_fields_set={"selection_mode"},
+        ),
+    )
+
+    plan = pin_route_plan(
+        turn,
+        turn_id="turn-snapshot-image",
+        provider="image-provider",
+        model="image/winner",
+        context_window=32_000,
+        capabilities=ModelCapabilities(supports_vision=True),
+        effective_thinking=False,
+    )
+
+    assert plan is not None and plan.router_tier_snapshot is not None
+    assert plan.router_tier_snapshot.as_dict() == {
+        "version": 1,
+        "request_kind": "image",
+        "tiers": [
+            {
+                "tier": "c0",
+                "provider": "image-provider",
+                "model": "image/winner",
+                "execution_kind": "single_model",
+            },
+            {
+                "tier": "c1",
+                "provider": "text-provider",
+                "model": "text/only",
+                "execution_kind": "single_model",
+            },
+        ],
+    }
+
+
+def test_route_plan_image_marker_snapshot_keeps_four_configured_text_tiers() -> None:
+    turn = _turn()
+    turn.metadata.update(
+        routed_tier="c1",
+        routed_model="text/actual-winner",
+        routing_source="image_route",
+        image_input_mode="marker",
+    )
+    turn.config = SimpleNamespace(
+        squilla_router=SimpleNamespace(
+            tiers={
+                **{
+                    f"c{index}": {
+                        "model": f"text/configured-{index}",
+                        "supports_image": False,
+                    }
+                    for index in range(4)
+                },
+                "image_model": {
+                    "model": "legacy/unused-vision",
+                    "supports_image": True,
+                    "image_only": True,
+                },
+            }
+        ),
+        llm_ensemble=SimpleNamespace(enabled=False),
+    )
+
+    plan = pin_route_plan(
+        turn,
+        turn_id="turn-snapshot-image-marker",
+        provider="provider-a",
+        model="text/actual-winner",
+        context_window=32_000,
+        capabilities=ModelCapabilities(supports_vision=False),
+        effective_thinking=False,
+    )
+
+    assert plan is not None and plan.router_tier_snapshot is not None
+    snapshot = plan.router_tier_snapshot.as_dict()
+    assert snapshot["request_kind"] == "image"
+    assert [entry["tier"] for entry in snapshot["tiers"]] == ["c0", "c1", "c2", "c3"]
+    assert [entry["model"] for entry in snapshot["tiers"]] == [
+        "text/configured-0",
+        "text/actual-winner",
+        "text/configured-2",
+        "text/configured-3",
+    ]
+    assert turn.metadata["route_plan"]["router_tier_snapshot"] == snapshot
+    event = build_router_decision_event(turn)
+    assert event is not None
+    assert event.router_tier_snapshot == snapshot

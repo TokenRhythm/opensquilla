@@ -1,6 +1,7 @@
 import { desktopCapabilities } from './capabilities'
 import type {
   CliInvocation,
+  DesktopGatewayConnection,
   DesktopUpdateErrorCode,
   DesktopUpdateInstallMode,
   DesktopUpdateSource,
@@ -11,7 +12,50 @@ import type {
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceEventType,
   Platform,
+  SandboxUpgradeReport,
 } from './types'
+
+const DESKTOP_GATEWAY_STATUSES = new Set(['starting', 'ready', 'stopped', 'error'])
+
+function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConnection {
+  const raw = payload && typeof payload === 'object'
+    ? payload as Record<string, unknown>
+    : {}
+  if (
+    raw.schemaVersion !== 1
+    || !Number.isInteger(raw.revision)
+    || !DESKTOP_GATEWAY_STATUSES.has(String(raw.status))
+  ) {
+    throw new Error('The Desktop Gateway connection descriptor is invalid.')
+  }
+  const rawSandboxUpgrade = raw.sandboxUpgrade
+  const sandboxUpgrade: SandboxUpgradeReport | undefined = rawSandboxUpgrade
+    && typeof rawSandboxUpgrade === 'object'
+    && !Array.isArray(rawSandboxUpgrade)
+    ? {
+      status: typeof (rawSandboxUpgrade as Record<string, unknown>).status === 'string'
+        ? (rawSandboxUpgrade as Record<string, unknown>).status as string
+        : undefined,
+      error: typeof (rawSandboxUpgrade as Record<string, unknown>).error === 'string'
+        ? (rawSandboxUpgrade as Record<string, unknown>).error as string
+        : null,
+    }
+    : undefined
+  return {
+    schemaVersion: 1,
+    revision: raw.revision as number,
+    status: raw.status as DesktopGatewayConnection['status'],
+    instanceId: typeof raw.instanceId === 'string' ? raw.instanceId : null,
+    profileFingerprint: typeof raw.profileFingerprint === 'string'
+      ? raw.profileFingerprint
+      : '',
+    httpUrl: typeof raw.httpUrl === 'string' ? raw.httpUrl : null,
+    wsUrl: typeof raw.wsUrl === 'string' ? raw.wsUrl : null,
+    authToken: typeof raw.authToken === 'string' ? raw.authToken : null,
+    error: typeof raw.error === 'string' ? raw.error : null,
+    ...(sandboxUpgrade ? { sandboxUpgrade } : {}),
+  }
+}
 
 function requireDesktopApi(): OpenSquillaDesktopApi {
   const api = window.opensquillaDesktop
@@ -36,6 +80,8 @@ const UPDATE_ERROR_CODES = new Set<DesktopUpdateErrorCode>([
   'manifest_invalid',
   'checksum_unavailable',
   'integrity_failed',
+  'signature_invalid',
+  'signature_unavailable',
   'download_failed',
   'install_failed',
 ])
@@ -53,24 +99,95 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'error',
   'crashed',
   'escape',
+  'browser-opened',
+  'annotation-selected',
+  'annotation-draft-change',
+  'annotation-submit',
+  'annotation-cancel',
+  'annotation-overlay-fallback',
 ])
+
+function normalizeArtifactAnnotationSelection(
+  value: unknown,
+): import('./types').NativeArtifactAnnotationSelection | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const rect = raw.rect && typeof raw.rect === 'object'
+    ? raw.rect as Record<string, unknown>
+    : null
+  const selectionId = typeof raw.selectionId === 'string' ? raw.selectionId : ''
+  const tagName = typeof raw.tagName === 'string' ? raw.tagName : ''
+  const elementPath = typeof raw.elementPath === 'string' ? raw.elementPath : ''
+  const targetRef = typeof raw.targetRef === 'string' ? raw.targetRef : ''
+  const finite = (field: string) => typeof rect?.[field] === 'number'
+    && Number.isFinite(rect[field])
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(selectionId)
+    || !/^[A-Za-z][A-Za-z0-9:_-]{0,127}$/.test(tagName)
+    || !elementPath
+    || elementPath.length > 4096
+    || !targetRef || targetRef.length > 256
+    || !rect
+    || !finite('x')
+    || !finite('y')
+    || !finite('width')
+    || !finite('height')
+  ) return null
+  return {
+    selectionId,
+    tagName: tagName.toLowerCase(),
+    elementPath,
+    targetRef,
+    ...(typeof raw.resourceId === 'string' ? { resourceId: raw.resourceId } : {}),
+    ...(typeof raw.selectionText === 'string' ? { selectionText: raw.selectionText } : {}),
+    ...(typeof raw.locatorHint === 'string' ? { locatorHint: raw.locatorHint } : {}),
+    rect: {
+      x: Number(rect.x),
+      y: Number(rect.y),
+      width: Math.max(0, Number(rect.width)),
+      height: Math.max(0, Number(rect.height)),
+    },
+  }
+}
 
 function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEvent | null {
   if (!payload || typeof payload !== 'object') return null
   const raw = payload as Record<string, unknown>
   if (
-    (raw.version !== 1 && raw.version !== 2)
+    (raw.version !== 1 && raw.version !== 2 && raw.version !== 3 && raw.version !== 4)
     || typeof raw.surfaceId !== 'string'
     || !NATIVE_SURFACE_EVENT_TYPES.has(raw.type as NativeWorkbenchSurfaceEventType)
   ) return null
+  const annotationEvent = typeof raw.type === 'string' && raw.type.startsWith('annotation-')
+  if (annotationEvent && raw.version !== 3 && raw.version !== 4) return null
   const rawDetail = raw.detail && typeof raw.detail === 'object'
     ? raw.detail as Record<string, unknown>
     : null
+  const selection = normalizeArtifactAnnotationSelection(rawDetail?.selection)
+  const annotationId = typeof rawDetail?.annotationId === 'string'
+    && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rawDetail.annotationId)
+    ? rawDetail.annotationId
+    : ''
+  const body = typeof rawDetail?.body === 'string' && rawDetail.body.length <= 16 * 1024
+    ? rawDetail.body
+    : undefined
+  if (raw.type === 'annotation-selected' && !selection) return null
+  if (
+    (raw.type === 'annotation-draft-change' || raw.type === 'annotation-submit')
+    && (!annotationId || body === undefined)
+  ) return null
+  if (
+    (raw.type === 'annotation-cancel' || raw.type === 'annotation-overlay-fallback')
+    && !annotationId
+  ) return null
   const detail = rawDetail
     ? {
         ...(typeof rawDetail.message === 'string' ? { message: rawDetail.message } : {}),
         ...(typeof rawDetail.path === 'string' ? { path: rawDetail.path } : {}),
         ...(typeof rawDetail.reason === 'string' ? { reason: rawDetail.reason } : {}),
+        ...(annotationId ? { annotationId } : {}),
+        ...(body !== undefined ? { body } : {}),
+        ...(selection ? { selection } : {}),
         ...(typeof rawDetail.requestId === 'string' ? { requestId: rawDetail.requestId } : {}),
         ...(typeof rawDetail.permission === 'string'
           ? { permission: rawDetail.permission }
@@ -79,6 +196,8 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
           ? { requestingOrigin: rawDetail.requestingOrigin }
           : {}),
         ...(typeof rawDetail.url === 'string' ? { url: rawDetail.url } : {}),
+        ...(typeof rawDetail.sessionKey === 'string' ? { sessionKey: rawDetail.sessionKey } : {}),
+        ...(typeof rawDetail.targetRef === 'string' ? { targetRef: rawDetail.targetRef } : {}),
         ...(typeof rawDetail.title === 'string' ? { title: rawDetail.title } : {}),
         ...(typeof rawDetail.loading === 'boolean' ? { loading: rawDetail.loading } : {}),
         ...(typeof rawDetail.canGoBack === 'boolean'
@@ -89,6 +208,10 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
           : {}),
         ...(typeof rawDetail.action === 'string' ? { action: rawDetail.action } : {}),
         ...(typeof rawDetail.code === 'string' ? { code: rawDetail.code } : {}),
+        ...(typeof rawDetail.surfaceInstanceId === 'string'
+          && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(rawDetail.surfaceInstanceId)
+          ? { surfaceInstanceId: rawDetail.surfaceInstanceId }
+          : {}),
       }
     : undefined
   return {
@@ -97,6 +220,25 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
     type: raw.type as NativeWorkbenchSurfaceEventType,
     ...(detail ? { detail } : {}),
   }
+}
+
+function normalizeWorkbenchScreenshot(
+  payload: unknown,
+  targetRef: string,
+): import('./types').NativeWorkbenchScreenshot {
+  const raw = payload && typeof payload === 'object'
+    ? payload as Record<string, unknown> : {}
+  const width = Number(raw.width)
+  const height = Number(raw.height)
+  if (
+    raw.targetRef !== targetRef || raw.mimeType !== 'image/png'
+    || typeof raw.dataBase64 !== 'string' || !raw.dataBase64.length
+    || raw.dataBase64.length > 24 * 1024 * 1024
+    || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw.dataBase64)
+    || !Number.isSafeInteger(width) || !Number.isSafeInteger(height)
+    || width < 1 || height < 1 || width > 32_768 || height > 32_768
+  ) throw new Error('The Desktop page screenshot response is invalid.')
+  return { targetRef, mimeType: 'image/png', dataBase64: raw.dataBase64, width, height }
 }
 
 function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchApi | undefined {
@@ -118,7 +260,11 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
         ? payload as Record<string, unknown>
         : {}
       const versions = Array.isArray(raw.protocolVersions)
-        ? raw.protocolVersions.filter((value): value is 1 | 2 => value === 1 || value === 2)
+        ? raw.protocolVersions.filter(
+            (value): value is 1 | 2 | 3 | 4 => (
+              value === 1 || value === 2 || value === 3 || value === 4
+            ),
+          )
         : []
       const modes = Array.isArray(raw.modes)
         ? raw.modes.filter((value): value is 'full' | 'offline' =>
@@ -138,6 +284,48 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
 
   return {
     getCapabilities,
+    ...(typeof api.getArtifactAnnotationCapabilities === 'function'
+      ? {
+          async getArtifactAnnotationCapabilities() {
+            const payload = await api.getArtifactAnnotationCapabilities!()
+            const raw = payload && typeof payload === 'object'
+              ? payload as Record<string, unknown>
+              : {}
+            return {
+              version: raw.version === 4 ? 4 as const : 3 as const,
+              available: (raw.version === 3 || raw.version === 4) && raw.available === true,
+              ...(typeof raw.picker === 'boolean' ? { picker: raw.picker } : {}),
+              ...(typeof raw.trustedOverlay === 'boolean'
+                ? { trustedOverlay: raw.trustedOverlay }
+                : {}),
+              ...(raw.overlayCopyVersion === 1 ? { overlayCopyVersion: 1 as const } : {}),
+              ...(raw.atomicCloseRearm === true ? { atomicCloseRearm: true as const } : {}),
+              ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
+            }
+          },
+        }
+      : {}),
+    ...(typeof api.setArtifactAnnotationMode === 'function'
+      ? { setArtifactAnnotationMode: payload => api.setArtifactAnnotationMode!(payload) }
+      : {}),
+    ...(typeof api.showArtifactAnnotationOverlay === 'function'
+      ? { showArtifactAnnotationOverlay: payload => api.showArtifactAnnotationOverlay!(payload) }
+      : {}),
+    ...(typeof api.closeArtifactAnnotationOverlay === 'function'
+      ? { closeArtifactAnnotationOverlay: payload => api.closeArtifactAnnotationOverlay!(payload) }
+      : {}),
+    ...(typeof api.getWorkbenchBrowserTarget === 'function'
+      ? { getWorkbenchBrowserTarget: payload => api.getWorkbenchBrowserTarget!(payload) } : {}),
+    ...(typeof api.focusWorkbenchAnnotation === 'function'
+      ? { focusWorkbenchAnnotation: payload => api.focusWorkbenchAnnotation!(payload) } : {}),
+    ...(typeof api.captureWorkbenchScreenshot === 'function'
+      ? {
+          async captureWorkbenchScreenshot(payload) {
+            return normalizeWorkbenchScreenshot(
+              await api.captureWorkbenchScreenshot!(payload), payload.targetRef,
+            )
+          },
+        } : {}),
     ...(typeof api.createArtifactPreviewLease === 'function'
       && typeof api.renewArtifactPreviewLease === 'function'
       && typeof api.revokeArtifactPreviewLease === 'function'
@@ -178,6 +366,7 @@ function idleUpdateState(canNativeInstall: boolean, managed = canNativeInstall):
     snoozedUntil: null,
     canCheck: managed,
     canNativeInstall,
+    canInstall: canNativeInstall,
     installMode: canNativeInstall ? 'native' : managed ? 'manual' : 'unsupported',
     releaseUrl: null,
     source: null,
@@ -202,6 +391,9 @@ function normalizeUpdateState(
     : canNativeInstall
   const normalizedCanCheck = typeof raw.canCheck === 'boolean' ? raw.canCheck : managed
   const installMode = String(raw.installMode || '')
+  const normalizedInstallMode = UPDATE_INSTALL_MODES.has(installMode as DesktopUpdateInstallMode)
+    ? installMode as DesktopUpdateInstallMode
+    : normalizedNativeInstall ? 'native' : normalizedCanCheck ? 'manual' : 'unsupported'
   const errorCode = String(raw.errorCode || '')
   const source = String(raw.source || '')
   return {
@@ -217,9 +409,10 @@ function normalizeUpdateState(
     snoozedUntil: typeof raw.snoozedUntil === 'string' && raw.snoozedUntil ? raw.snoozedUntil : null,
     canCheck: normalizedCanCheck,
     canNativeInstall: normalizedNativeInstall,
-    installMode: UPDATE_INSTALL_MODES.has(installMode as DesktopUpdateInstallMode)
-      ? installMode as DesktopUpdateInstallMode
-      : normalizedNativeInstall ? 'native' : normalizedCanCheck ? 'manual' : 'unsupported',
+    canInstall: normalizedInstallMode !== 'unsupported' && (
+      typeof raw.canInstall === 'boolean' ? raw.canInstall : normalizedInstallMode === 'native'
+    ),
+    installMode: normalizedInstallMode,
     releaseUrl: typeof raw.releaseUrl === 'string' && raw.releaseUrl ? raw.releaseUrl : null,
     source: UPDATE_SOURCES.has(source as DesktopUpdateSource) ? source as DesktopUpdateSource : null,
     fallbackUsed: raw.fallbackUsed === true,
@@ -308,7 +501,31 @@ export function createDesktopPlatform(): Platform {
       return managedUpdateCapability(api)
     },
     gateway: {
+      ...(typeof desktopApi.onSystemResume === 'function'
+        ? { onResume: (callback: () => void) => desktopApi.onSystemResume!(callback) }
+        : {}),
       getStatus: () => requireDesktopApi().getGatewayStatus(),
+      ...(typeof desktopApi.getGatewayConnection === 'function'
+        ? {
+            getConnection: async () => normalizeDesktopGatewayConnection(
+              await requireDesktopApi().getGatewayConnection!(),
+            ),
+          }
+        : {}),
+      ...(typeof desktopApi.onGatewayConnectionChanged === 'function'
+        ? {
+            onConnection: (callback: (connection: DesktopGatewayConnection) => void) => (
+              requireDesktopApi().onGatewayConnectionChanged!((payload) => {
+                try {
+                  callback(normalizeDesktopGatewayConnection(payload))
+                } catch {
+                  // Ignore malformed main-process events; the next trusted
+                  // snapshot or event will restore the authoritative state.
+                }
+              })
+            ),
+          }
+        : {}),
       revealLog: () => requireDesktopApi().revealGatewayLog(),
       retryStartup: () => requireDesktopApi().retryStartup(),
       async getCliInvocation(): Promise<CliInvocation | null> {
@@ -342,7 +559,66 @@ export function createDesktopPlatform(): Platform {
       save: (payload) => requireDesktopApi().saveOnboarding(payload),
       cancel: () => requireDesktopApi().cancelOnboarding(),
     },
+    migration: {
+      ...(typeof window.opensquillaDesktop?.getRecoveryState === 'function'
+        ? { getRecoveryState: () => requireDesktopApi().getRecoveryState!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.retryProfileConsolidation === 'function'
+        ? { retryProfileConsolidation: () => requireDesktopApi().retryProfileConsolidation!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.chooseLegacyAgentDataLocation === 'function'
+        ? { chooseLegacyAgentDataLocation: (payload) => requireDesktopApi().chooseLegacyAgentDataLocation!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationSummary === 'function'
+        ? { migrationSummary: (payload) => requireDesktopApi().migrationSummary!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationBrowseSource === 'function'
+        ? { migrationBrowseSource: (payload: { kind: string }) => requireDesktopApi().migrationBrowseSource!(payload as Parameters<NonNullable<OpenSquillaDesktopApi['migrationBrowseSource']>>[0]) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationRun === 'function'
+        ? { migrationRun: (payload) => requireDesktopApi().migrationRun!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationTakeLastResult === 'function'
+        ? { migrationTakeLastResult: () => requireDesktopApi().migrationTakeLastResult!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationPeekLastResult === 'function'
+        ? { migrationPeekLastResult: () => requireDesktopApi().migrationPeekLastResult!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.migrationDismissLastResult === 'function'
+        ? { migrationDismissLastResult: () => requireDesktopApi().migrationDismissLastResult!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.revealRecoveryPath === 'function'
+        ? { revealRecoveryPath: (payload) => requireDesktopApi().revealRecoveryPath!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.onMigrationProgress === 'function'
+        ? { onMigrationProgress: (callback) => requireDesktopApi().onMigrationProgress!(callback) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.inspectDesktopCleanup === 'function'
+        ? { inspectDesktopCleanup: (payload: { mode: string }) => requireDesktopApi().inspectDesktopCleanup!(payload as Parameters<NonNullable<OpenSquillaDesktopApi['inspectDesktopCleanup']>>[0]) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.discardDesktopCleanup === 'function'
+        ? { discardDesktopCleanup: (payload) => requireDesktopApi().discardDesktopCleanup!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.applyDesktopCleanup === 'function'
+        ? { applyDesktopCleanup: (payload) => requireDesktopApi().applyDesktopCleanup!(payload) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.revealDesktopUserData === 'function'
+        ? { revealDesktopUserData: () => requireDesktopApi().revealDesktopUserData!() }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.abandonCleanupTransaction === 'function'
+        ? { abandonCleanupTransaction: () => requireDesktopApi().abandonCleanupTransaction!() }
+        : {}),
+    },
+    window: {
+      ...(typeof window.opensquillaDesktop?.onWindowHidden === 'function'
+        ? { onHidden: (callback) => requireDesktopApi().onWindowHidden!(callback) }
+        : {}),
+    },
     files: {
+      ...(typeof window.opensquillaDesktop?.saveArtifact === 'function'
+        ? { saveArtifact: payload => requireDesktopApi().saveArtifact!(payload) } : {}),
+      ...(typeof window.opensquillaDesktop?.sourceFileAction === 'function'
+        ? { sourceFileAction: payload => requireDesktopApi().sourceFileAction!(payload) } : {}),
       openArtifact: (payload) => requireDesktopApi().openArtifact(payload),
       async chooseProjectDirectory(request) {
         const api = requireDesktopApi()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
@@ -92,6 +92,7 @@ _NEW_COLUMNS: list[tuple[str, str]] = [
     ("creator_session_key", "TEXT NOT NULL DEFAULT ''"),
     ("creator_sender_id", "TEXT NOT NULL DEFAULT ''"),
     ("creator_is_owner", "INTEGER NOT NULL DEFAULT 0"),
+    ("creator_host_execute", "INTEGER NOT NULL DEFAULT 0"),
     ("run_mode", "TEXT NOT NULL DEFAULT ''"),
     ("elevated", "TEXT NOT NULL DEFAULT ''"),
     ("execution_target", "TEXT NOT NULL DEFAULT ''"),
@@ -176,6 +177,7 @@ def _row_to_job(row: aiosqlite.Row) -> CronJob:
         creator_session_key=_get("creator_session_key", "") or "",
         creator_sender_id=_get("creator_sender_id", "") or "",
         creator_is_owner=bool(_get("creator_is_owner", 0)),
+        creator_host_execute=bool(_get("creator_host_execute", 0)),
         run_mode=_get("run_mode", "") or "",
         elevated=_get("elevated", "") or "",
         execution_target=_get("execution_target", "") or "",
@@ -520,9 +522,10 @@ class JobStore:
                  reservation_token, reserved_at, reserved_by, reservation_source,
                  scheduled_run_at, tool_policy_json, tz, anchor_at,
                  creator_session_key, creator_sender_id, creator_is_owner,
+                 creator_host_execute,
                  run_mode, elevated, execution_target, idempotency_key)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 cron_expr=excluded.cron_expr,
@@ -560,6 +563,7 @@ class JobStore:
                 creator_session_key=excluded.creator_session_key,
                 creator_sender_id=excluded.creator_sender_id,
                 creator_is_owner=excluded.creator_is_owner,
+                creator_host_execute=excluded.creator_host_execute,
                 run_mode=excluded.run_mode,
                 elevated=excluded.elevated,
                 execution_target=excluded.execution_target,
@@ -604,6 +608,7 @@ class JobStore:
                 job.creator_session_key or "",
                 job.creator_sender_id or "",
                 1 if job.creator_is_owner else 0,
+                1 if job.creator_host_execute else 0,
                 job.run_mode or "",
                 job.elevated or "",
                 job.execution_target or "",
@@ -615,9 +620,13 @@ class JobStore:
         await self._execute_save(job)
         await self._db().commit()
 
-    async def create_or_get(self, job: CronJob) -> CronJob:
-        """Atomically create an idempotent job or return the existing row."""
+    async def create_or_get(
+        self, job: CronJob, *, validate_new: Callable[[], None] | None = None,
+    ) -> CronJob:
+        """Return an existing row, or validate and create under the idempotency lock."""
         if not job.idempotency_key:
+            if validate_new is not None:
+                validate_new()
             await self.save(job)
             return job
 
@@ -626,6 +635,8 @@ class JobStore:
             if existing is not None:
                 existing.deduplicated = True
                 return existing
+            if validate_new is not None:
+                validate_new()
             try:
                 await self._execute_save(job)
                 await self._db().commit()
@@ -825,15 +836,31 @@ class JobStore:
         job_id: str,
         reservation_token: str,
     ) -> bool:
-        current = await self.get(job_id)
-        if current is None or current.reservation_token != reservation_token:
-            return False
-        clear_reservation(current)
-        if current.status == JobStatus.RUNNING:
-            current.status = JobStatus.PENDING
-        current.updated_at = datetime.now(UTC)
-        await self.save(current)
-        return True
+        # Fence the cleanup in the write itself. A read followed by save()
+        # can overwrite a new owner or resurrect a concurrently deleted job.
+        async with self._db().execute(
+            """
+            UPDATE scheduler_jobs
+            SET status = CASE WHEN status = ? THEN ? ELSE status END,
+                reservation_token = '',
+                reserved_at = NULL,
+                reserved_by = '',
+                reservation_source = '',
+                scheduled_run_at = NULL,
+                updated_at = MAX(updated_at, ?)
+            WHERE id = ? AND reservation_token = ?
+            """,
+            (
+                JobStatus.RUNNING.value,
+                JobStatus.PENDING.value,
+                datetime.now(UTC).isoformat(),
+                job_id,
+                reservation_token,
+            ),
+        ) as cur:
+            released = cur.rowcount == 1
+        await self._db().commit()
+        return released
 
     async def delete(self, job_id: str) -> None:
         await self._db().execute("DELETE FROM scheduler_jobs WHERE id = ?", (job_id,))

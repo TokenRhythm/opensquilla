@@ -4,6 +4,7 @@
   "description": "Compact webpack output while preserving module errors and warnings.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["webpack"],
     "commandIncludes": ["webpack"]
   },
   "transforms": {

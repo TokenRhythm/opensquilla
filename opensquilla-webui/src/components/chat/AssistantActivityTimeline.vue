@@ -3,17 +3,50 @@
     v-if="statusSteps.length || items.length"
     class="assistant-activity-timeline"
   >
-    <ol v-if="statusSteps.length" class="assistant-activity-status">
+    <TransitionGroup
+      v-if="statusSteps.length"
+      name="activity-step"
+      tag="ol"
+      class="assistant-activity-status"
+    >
       <li
         v-for="step in statusSteps"
         :key="step.key"
         class="assistant-activity-status__row"
-        :class="{ 'assistant-activity-status__row--current': step.isCurrent }"
+        :class="{
+          'assistant-activity-status__row--current': step.isCurrent,
+          'assistant-activity-status__row--maintenance': step.category === 'maintenance',
+          'assistant-activity-status__row--failed': step.state === 'failed',
+        }"
+        :data-testid="step.category === 'maintenance' ? 'compaction-event' : undefined"
+        :data-compaction-id="step.id"
+        :data-status="step.state"
+        :data-source="step.source"
+        :data-durability="step.durability"
       >
         <span class="assistant-activity-status__dot" aria-hidden="true" />
-        <span>{{ t(step.label.code, step.label.params) }}</span>
+        <span
+          :role="step.category === 'maintenance' ? (step.state === 'failed' ? 'alert' : 'status') : undefined"
+          :aria-live="step.category === 'maintenance' ? (step.state === 'failed' ? 'assertive' : 'polite') : undefined"
+          :aria-atomic="step.category === 'maintenance' ? 'true' : undefined"
+        >
+          <span>{{ t(step.label.code, step.label.params) }}</span>
+          <span
+            v-if="step.durationSeconds !== undefined"
+            class="assistant-activity-status__duration"
+            aria-hidden="true"
+          >
+            · {{ formatDuration(step.durationSeconds) }}
+          </span>
+          <span
+            v-if="step.category === 'maintenance' && step.durability === 'request_scoped'"
+            class="assistant-activity-status__detail"
+          >
+            {{ t('chat.compact.requestScoped') }}
+          </span>
+        </span>
       </li>
-    </ol>
+    </TransitionGroup>
     <template v-for="segment in segments" :key="segment.key">
       <ActivityNarration
         v-if="segment.type === 'narration'"
@@ -99,11 +132,13 @@ import type {
 } from '@/types/chat'
 import {
   type AssistantActivityTimelineProjection,
-  isSemanticActivityStatusStep,
+  isBeforeReasoningActivityStatusStep,
+  isRoutineActivityPhaseStep,
+  isVisibleActivityStatusStep,
 } from '@/utils/chat/assistantActivity'
 import { toolIconName, toolOperationKey } from '@/utils/chat/toolDisplay'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   projection: AssistantActivityTimelineProjection
   timelineItems?: ChatStreamTimelineItem[]
   isToolGroupOpen: (groupId: string) => boolean
@@ -114,7 +149,13 @@ const props = defineProps<{
   toolElapsedText?: (call: ChatToolCallRenderItem) => string
   variant?: 'checklist'
   stateScope?: string
-}>()
+  statusPosition?: 'all' | 'before-reasoning' | 'after-reasoning'
+  showItems?: boolean
+  preserveItemGroups?: boolean
+}>(), {
+  statusPosition: 'all',
+  showItems: true,
+})
 
 defineEmits<{
   toggleGroup: [groupId: string]
@@ -132,18 +173,30 @@ const { t } = useI18n()
 const statusSteps = computed(() => {
   const isLive = props.projection.lifecycle === 'working'
     || props.projection.lifecycle === 'answering'
-  if (!isLive) return props.projection.statusSteps
+  const meaningfulSteps = props.projection.statusSteps
+    .filter(isVisibleActivityStatusStep)
+  const positionedSteps = props.statusPosition === 'before-reasoning'
+    ? meaningfulSteps.filter(isBeforeReasoningActivityStatusStep)
+    : props.statusPosition === 'after-reasoning'
+      ? meaningfulSteps.filter(step => !isBeforeReasoningActivityStatusStep(step))
+      : meaningfulSteps
+  if (!isLive) return positionedSteps
 
-  // The live header owns the current lifecycle phase. Repeating that phase in
-  // the body creates pairs such as "Working / Working" and makes transport
-  // phases look like meaningful agent actions. The shared predicate keeps this
-  // body filter and the header's step count agreeing by construction;
-  // completed/history playback can still show the full phase record when the
-  // user expands it.
-  return props.projection.statusSteps
-    .filter(isSemanticActivityStatusStep)
+  // During a live turn, routine phase narration is a single changing row.
+  // Completed model phases return once the terminal record is rendered.
+  return positionedSteps
+    .filter(step => !isRoutineActivityPhaseStep(step) || step.isCurrent)
     .slice(-3)
 })
+
+function formatDuration(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds))
+  if (whole < 60) return String(t('chat.activityDurationSeconds', { seconds: whole }))
+  return String(t('chat.activityDurationMinutes', {
+    minutes: Math.floor(whole / 60),
+    seconds: whole % 60,
+  }))
+}
 
 function clusterItem(
   cluster: AssistantActivityTimelineProjection['activityClusters'][number],
@@ -173,7 +226,9 @@ function clusterItem(
 }
 
 const items = computed<ChatStreamTimelineItem[]>(() => {
+  if (props.showItems === false) return []
   if (props.timelineItems?.length) {
+    if (props.preserveItemGroups) return props.timelineItems
     const clusterByCall = new Map(
       props.projection.activityClusters.flatMap(cluster =>
         cluster.calls.map(call => [call.renderKey, cluster] as const),
@@ -286,6 +341,18 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
   color: color-mix(in srgb, var(--text) 82%, transparent);
 }
 
+.activity-step-enter-from {
+  opacity: 0;
+  transform: translateY(0.25rem);
+}
+
+.activity-step-enter-active,
+.activity-step-move {
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+
 /* The dot centers in the same 0.875rem marker column the tool-row icons use,
    so phase text and tool-row labels share one left origin (1.625rem). */
 .assistant-activity-status__dot {
@@ -299,6 +366,40 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
 
 .assistant-activity-status__row--current .assistant-activity-status__dot {
   background: var(--accent);
+}
+
+.assistant-activity-status__row--maintenance {
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+}
+
+.assistant-activity-status__row--maintenance .assistant-activity-status__dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  margin: 0 0.1875rem;
+  border: 1px solid currentColor;
+  background: transparent;
+}
+
+.assistant-activity-status__row--maintenance.assistant-activity-status__row--current
+  .assistant-activity-status__dot {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  background: transparent;
+  animation: compactionActivitySpin 0.9s linear infinite;
+}
+
+.assistant-activity-status__row--failed {
+  color: var(--danger);
+}
+
+.assistant-activity-status__detail {
+  margin-left: auto;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 0.75rem;
+}
+
+@keyframes compactionActivitySpin {
+  to { transform: rotate(360deg); }
 }
 
 .assistant-activity-tool-batch {
@@ -356,8 +457,18 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .activity-step-enter-active,
+  .activity-step-move {
+    transition: none;
+  }
+
   .assistant-activity-tool-batch__chevron {
     transition: none;
+  }
+
+  .assistant-activity-status__row--maintenance.assistant-activity-status__row--current
+    .assistant-activity-status__dot {
+    animation: none;
   }
 }
 </style>

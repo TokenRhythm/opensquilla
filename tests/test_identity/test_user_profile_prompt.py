@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from opensquilla.identity.prompt import assemble_system_prompt
-from opensquilla.identity.types import AgentProfile
+from opensquilla.identity.types import AgentIdentity, AgentProfile
 
 
 def test_default_user_template_names_profile_fields() -> None:
@@ -27,17 +29,17 @@ def test_default_bootstrap_templates_define_distinct_file_roles() -> None:
     agents = (template_dir / "AGENTS.md").read_text(encoding="utf-8")
     soul = (template_dir / "SOUL.md").read_text(encoding="utf-8")
     identity = (template_dir / "IDENTITY.md").read_text(encoding="utf-8")
-    tools = (template_dir / "TOOLS.md").read_text(encoding="utf-8")
     memory = (template_dir / "MEMORY.md").read_text(encoding="utf-8")
 
-    assert "operating rules" in agents
-    assert "Do not store user profile facts here" in agents
+    assert agents == ""
     assert "voice, tone, and interaction style" in soul
     assert "Do not store user profile facts, task history, or tool inventories here" in soul
     assert "agent's public-facing name" in identity
     assert "If the user asks to rename the assistant" in identity
-    assert "local tool conventions" in tools
-    assert "does not register tools, grant permissions, or change tool policy" in tools
+    assert "`AGENTS.md`" in soul
+    for retired in ("TOOLS.md", "HEARTBEAT.md", "BOOTSTRAP.md"):
+        assert not (template_dir / retired).exists()
+        assert retired not in soul
     assert "durable non-profile facts" in memory
     assert "Agent name, tone, and persona belong in IDENTITY.md or SOUL.md" in memory
 
@@ -56,6 +58,30 @@ def test_system_prompt_routes_profile_to_user_md() -> None:
     assert "relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file" in prompt
     assert "decisions, dates, people, preferences, or todos" not in prompt
     assert "prior work, decisions, dated history, todos" in prompt
+
+
+def test_system_prompt_requires_bare_single_token_silent_replies() -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="full"),
+        tools=None,
+    )
+
+    assert "output that single bare token and nothing else" in prompt
+    assert "Do not wrap it in Markdown" in prompt
+    assert "Goal continuation has user-visible information" in prompt
+    assert "Never use `NO_REPLY` for messages from a human user" in prompt
+
+
+def test_system_prompt_explains_dynamic_execution_identity_fields() -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="full"),
+        tools=None,
+    )
+
+    assert "When explicitly asked about the underlying model" in prompt
+    assert "use the current request's execution facts." in prompt
+    assert "Execution selected for this turn" not in prompt
+    assert "router_tier" not in prompt
 
 
 def test_system_prompt_disambiguates_session_memory_results() -> None:
@@ -217,33 +243,15 @@ def test_headless_repo_coding_scaffold_patch_prompt_matches_visible_tools() -> N
     assert "source_symbols" not in prompt
 
 
-def test_patch_evidence_protocol_renders_when_enabled_in_scaffold_mode() -> None:
+def test_headless_repo_coding_scaffold_omits_hidden_git_tool_guidance() -> None:
     prompt = assemble_system_prompt(
-        AgentProfile(
-            agent_id="main",
-            prompt_mode="headless_repo_coding_scaffold",
-            patch_evidence_protocol=True,
-        ),
-        tools=[
-            "exec_command",
-            "read_file",
-            "edit_file",
-            "write_file",
-            "grep_search",
-            "glob_search",
-            "list_dir",
-            "git_status",
-            "git_diff",
-        ],
+        AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
+        tools=["exec_command", "read_file", "edit_file", "write_file"],
     )
 
-    assert "## Patch Evidence Protocol" in prompt
     assert "## Repository Coding Scaffold" in prompt
-    assert "not sufficient final evidence by itself" in prompt
-    assert "Do not modify existing test expectations" in prompt
-    assert "change hypothesis or inspect a different implementation layer" in prompt
-    assert "neighboring existing test" in prompt
-    assert "strongest command/output evidence" in prompt
+    assert "Use `git_status` to inspect the final repository state" not in prompt
+    assert "Use `git_diff` to inspect the final source diff" not in prompt
 
 
 def test_patch_evidence_protocol_absent_by_default() -> None:
@@ -260,6 +268,23 @@ def test_patch_evidence_protocol_absent_by_default() -> None:
     assert "## Patch Evidence Protocol" not in full_prompt
 
 
+@pytest.mark.parametrize(
+    "mode", ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"]
+)
+@pytest.mark.parametrize("tools", [None, ["exec_command", "read_file", "git_diff"]])
+def test_retired_patch_protocol_does_not_change_prompt(mode, tools) -> None:
+    baseline = AgentProfile(agent_id="main", prompt_mode=mode)
+    legacy = AgentProfile(
+        agent_id="main",
+        prompt_mode=mode,
+        patch_evidence_protocol=True,
+    )
+
+    assert assemble_system_prompt(legacy, tools=tools) == assemble_system_prompt(
+        baseline, tools=tools
+    )
+
+
 def test_patch_evidence_protocol_requires_tools() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(
@@ -273,52 +298,37 @@ def test_patch_evidence_protocol_requires_tools() -> None:
     assert "## Patch Evidence Protocol" not in prompt
 
 
-def test_finalize_evidence_gate_section_renders_when_enabled() -> None:
+@pytest.mark.parametrize(
+    "mode", ["full", "minimal", "headless_source_edit", "headless_repo_coding_scaffold"]
+)
+def test_retired_finalize_evidence_gate_cannot_change_prompt(mode: str) -> None:
+    options = {"tools": ["exec_command", "read_file", "edit_file"]}
+    assert assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=mode, finalize_evidence_gate=True), **options
+    ) == assemble_system_prompt(AgentProfile(agent_id="main", prompt_mode=mode), **options)
+
+
+@pytest.mark.parametrize(
+    "mode", ["full", "minimal", "headless_source_edit", "headless_repo_coding_scaffold"]
+)
+def test_tool_prompts_include_autonomous_recovery_contract(mode: str) -> None:
     prompt = assemble_system_prompt(
-        AgentProfile(
-            agent_id="main",
-            prompt_mode="headless_repo_coding_scaffold",
-            finalize_evidence_gate=True,
-        ),
-        tools=["exec_command", "read_file", "edit_file", "git_diff"],
+        AgentProfile(agent_id="main", prompt_mode=mode),
+        tools=["exec_command", "read_file", "edit_file"],
     )
-
-    assert "## Reproduction Evidence" in prompt
-    assert "binding evidence that the issue is not fixed yet" in prompt
-    assert "exits non-zero while the bug is present" in prompt
-    assert "re-run your reproduction and the most relevant existing test" in prompt
-    # The section must not contain minimality directives or wording that
-    # devalues reproduction evidence.
-    section = prompt.split("## Reproduction Evidence", 1)[1].split("## ", 1)[0]
-    assert "minimal" not in section.lower()
-    assert "not sufficient" not in section.lower()
-
-
-def test_finalize_evidence_gate_section_absent_by_default() -> None:
-    scaffold_prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
-        tools=["exec_command", "read_file", "edit_file", "git_diff"],
-    )
-    full_prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full"),
-        tools=["exec_command", "read_file", "edit_file", "git_diff"],
-    )
-
-    assert "## Reproduction Evidence" not in scaffold_prompt
-    assert "## Reproduction Evidence" not in full_prompt
-
-
-def test_finalize_evidence_gate_section_requires_tools() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(
-            agent_id="main",
-            prompt_mode="headless_repo_coding_scaffold",
-            finalize_evidence_gate=True,
-        ),
-        tools=None,
-    )
-
+    assert "including after tool failures" in prompt
+    assert "checks appropriate to the task" in prompt
+    assert "Respect user cancellation and explicit limits" in prompt
+    assert "inspect the current state before repeating" not in prompt
+    assert "explain the error before retrying" not in prompt
+    assert "When uncertain, ask for clarification" not in prompt
     assert "## Reproduction Evidence" not in prompt
+
+
+@pytest.mark.parametrize("mode,tools", [("none", ["exec_command"]), ("full", None)])
+def test_autonomous_recovery_contract_requires_tools_and_prompt(mode, tools) -> None:
+    prompt = assemble_system_prompt(AgentProfile(agent_id="main", prompt_mode=mode), tools=tools)
+    assert "## Task Completion" not in prompt
 
 
 def test_system_prompt_disambiguates_session_send_from_channel_message() -> None:
@@ -373,8 +383,70 @@ def test_system_prompt_guides_generated_file_delivery() -> None:
     assert "local entry path" in prompt
     assert "Do not invent artifact download URLs" in prompt
     assert "do not call `publish_artifact` again" in prompt
-    assert "After `publish_artifact` succeeds" in prompt
+    assert "If `publish_artifact` reports" in prompt
+    assert "registered, published, or delivered" not in prompt
+    assert "Publication does not end the turn" in prompt
+    assert "do not run more tools" not in prompt
     assert "final response" in prompt
+
+
+@pytest.mark.parametrize("tools", [None, ["write_file", "open_workspace_preview"]])
+@pytest.mark.parametrize(
+    "mode", ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"],
+)
+def test_result_focused_response_guidance_is_scoped_to_full_mode(mode, tools) -> None:
+    prompt = assemble_system_prompt(AgentProfile(agent_id="main", prompt_mode=mode), tools=tools)
+
+    assert prompt.count("## Reply Guidelines") == int(mode == "full")
+    for guidance in (
+        "Lead final answers with the result",
+        "understand a material limitation",
+        "routine execution mechanics implicit",
+        "length and structure to the task",
+        "next steps when they meaningfully advance",
+    ):
+        assert (guidance in prompt) is (mode == "full")
+
+
+@pytest.mark.parametrize("preview_available", [True, False])
+def test_preview_file_reference_guidance_requires_preview_capability(
+    preview_available: bool,
+) -> None:
+    tools = ["write_file", "publish_artifact"]
+    if preview_available:
+        tools.append("open_workspace_preview")
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="full"), tools=tools,
+    )
+    guidance = "mention its returned entrypoint as a standalone inline-code path"
+    assert prompt.count(guidance) == int(preview_available)
+    if preview_available:
+        assert "do not invent a file or download URL" in prompt
+        assert "Do not publish an HTML deliverable unless the user explicitly asks" in prompt
+        assert "same-named files" in prompt
+
+
+def test_preview_output_format_has_one_owner_and_tool_keeps_readiness_boundary() -> None:
+    import opensquilla.tools.builtin  # noqa: F401
+    from opensquilla.tools.registry import get_default_registry
+
+    tool = get_default_registry().get("open_workspace_preview")
+    assert tool is not None
+    description = tool.spec.description
+    html_skill = Path("src/opensquilla/skills/bundled/html-coder/SKILL.md").read_text(
+        encoding="utf-8",
+    )
+
+    # Reply formatting belongs to the system prompt; the tool owns its contract
+    # and the skill owns the site-building recipe, not duplicate delivery prose.
+    assert "inline-code" not in description
+    assert "inline-code" not in html_skill
+    assert "immutable delivery snapshot" not in html_skill
+    assert "publish_artifact" not in html_skill
+    assert "previewStatus reports resource readiness" in description
+    assert "not confirmation that a client displayed it" in description
+    assert "does not build, start a server, or end the turn" in description
+    assert "directory" in tool.spec.parameters["bundle"]["description"]
 
 
 def test_system_prompt_limits_file_delivery_when_no_file_authoring_tools() -> None:
@@ -468,27 +540,44 @@ def test_headless_source_edit_prompt_is_source_edit_focused() -> None:
     assert "## Runtime" not in prompt
 
 
-def test_legacy_prompt_style_restores_compact_directives() -> None:
+def test_headless_source_edit_prompt_omits_hidden_git_diff_guidance() -> None:
     prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full", legacy_prompt_style=True),
-        tools=["exec_command", "apply_patch"],
+        AgentProfile(agent_id="main", prompt_mode="headless_source_edit"),
+        tools=["read_source", "edit_source", "exec_command"],
     )
 
-    assert (
-        "## Tool Call Style\n\n"
-        "- Narrate what you are about to do before invoking a tool.\n"
-        "- Only call tools when the task genuinely requires it."
-    ) in prompt
-    assert (
-        "## Reply Guidelines\n\n"
-        "- Use the conversation's language for replies\n"
-        "- When uncertain, ask for clarification rather than guessing\n"
-        "- Prefer concise replies unless detail is requested"
-    ) in prompt
-    assert "Before invoking a tool, send a brief user-visible note" not in prompt
-    assert "same language as the user's current conversation" not in prompt
-    assert "If the user writes in Chinese" not in prompt
-    assert "Match reply length to the request" not in prompt
+    assert "## Source Edit Contract" in prompt
+    assert "Inspect the final source diff with `git_diff`" not in prompt
+
+
+@pytest.mark.parametrize(
+    "prompt_mode",
+    ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"],
+)
+@pytest.mark.parametrize("tools", [None, ["exec_command", "apply_patch"]])
+@pytest.mark.parametrize(
+    "runtime_info", [None, {"os": "Linux", "shell": "/bin/bash", "workspace_dir": "/tmp/ws"}]
+)
+def test_retired_legacy_prompt_style_does_not_change_rendering(
+    prompt_mode, tools, runtime_info
+) -> None:
+    expected = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=prompt_mode),
+        tools=tools,
+        runtime_info=runtime_info,
+    )
+    assert assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=prompt_mode, legacy_prompt_style=True),
+        tools=tools,
+        runtime_info=runtime_info,
+    ) == expected
+
+
+def test_retired_legacy_prompt_style_preserves_profile_positional_slot() -> None:
+    profile = AgentProfile("main", AgentIdentity(), None, {}, "full", False, False, True, False)
+
+    assert profile.legacy_prompt_style is True
+    assert profile.inject_time_prefix is False
 
 
 def test_legacy_prompt_style_absent_by_default() -> None:
@@ -502,21 +591,13 @@ def test_legacy_prompt_style_absent_by_default() -> None:
     assert "Prefer concise replies unless detail is requested" not in prompt
 
 
-def test_legacy_prompt_style_restores_runtime_section_spacing() -> None:
+def test_default_prompt_preserves_runtime_section_spacing() -> None:
     runtime_info = {"os": "Linux", "shell": "/bin/bash", "workspace_dir": "/tmp/ws"}
 
-    legacy_prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full", legacy_prompt_style=True),
-        tools=["exec_command"],
-        runtime_info=runtime_info,
-    )
     default_prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),
         tools=["exec_command"],
         runtime_info=runtime_info,
     )
 
-    # Legacy style keeps a blank separator line between the Runtime section
-    # and the next header; the current style renders them adjacent.
-    assert "- Shell: /bin/bash\n\n## Reply Guidelines" in legacy_prompt
     assert "- Shell: /bin/bash\n## Reply Guidelines" in default_prompt

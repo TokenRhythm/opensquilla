@@ -23,6 +23,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from opensquilla.provider.anthropic import AnthropicProvider
 from opensquilla.provider.ollama import OllamaProvider
@@ -62,8 +63,16 @@ def _anthropic_sse(events: list[dict[str, Any]]) -> bytes:
     return b"".join(parts)
 
 
-def _patch_transport(monkeypatch: Any, module: str, response: httpx.Response) -> None:
+def _patch_transport(
+    monkeypatch: Any,
+    module: str,
+    response: httpx.Response,
+    *,
+    calls: list[httpx.Request] | None = None,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if calls is not None:
+            calls.append(request)
         return response
 
     transport = httpx.MockTransport(handler)
@@ -76,22 +85,34 @@ def _patch_transport(monkeypatch: Any, module: str, response: httpx.Response) ->
     monkeypatch.setattr(f"opensquilla.provider.{module}.httpx.AsyncClient", patched_async_client)
 
 
-def _patch_stream_body(monkeypatch: Any, module: str, body: bytes) -> None:
+def _patch_stream_body(
+    monkeypatch: Any,
+    module: str,
+    body: bytes,
+    *,
+    calls: list[httpx.Request] | None = None,
+) -> None:
     _patch_transport(
         monkeypatch,
         module,
         httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body),
+        calls=calls,
     )
 
 
-def _collect(provider: Any, *, tools: list[ToolDefinition] | None = None) -> list[Any]:
+def _collect(
+    provider: Any,
+    *,
+    tools: list[ToolDefinition] | None = None,
+    config: ChatConfig | None = None,
+) -> list[Any]:
     async def _run() -> list[Any]:
         return [
             ev
             async for ev in provider.chat(
                 [Message(role="user", content="hi")],
                 tools=tools,
-                config=ChatConfig(),
+                config=config or ChatConfig(),
             )
         ]
 
@@ -199,18 +220,36 @@ def test_null_tool_calls_delta_is_treated_as_empty(monkeypatch: Any) -> None:
     assert any(isinstance(e, DoneEvent) for e in events)
 
 
-def test_empty_stream_falls_back_to_non_stream_for_policy_kind(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("stream_failure", ["read_timeout", "empty_eof", "empty_stop"])
+@pytest.mark.parametrize("fallback_error", [None, httpx.ConnectError, httpx.ConnectTimeout])
+def test_stream_compatibility_fallback_preserves_completion_and_error_classification(
+    monkeypatch: Any, stream_failure: str, fallback_error: Any,
+) -> None:
     calls: list[dict[str, Any]] = []
+
+    class TimeoutBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise httpx.ReadTimeout("stream interrupted after HTTP 200")
+            yield b""  # pragma: no cover
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content.decode("utf-8"))
         calls.append(payload)
         if payload.get("stream") is True:
+            if stream_failure == "read_timeout":
+                return httpx.Response(
+                    200, headers={"content-type": "text/event-stream"}, stream=TimeoutBody(),
+                )
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
-                content=b"data: [DONE]\n\n",
+                content=(
+                    b"" if stream_failure == "empty_eof"
+                    else _openai_sse([{"choices": [{"delta": {}, "finish_reason": "stop"}]}])
+                ),
             )
+        if fallback_error is not None:
+            raise fallback_error("non-stream connection failed", request=request)
         return httpx.Response(
             200,
             json={
@@ -228,15 +267,100 @@ def test_empty_stream_falls_back_to_non_stream_for_policy_kind(monkeypatch: Any)
         return real_async_client(*args, **kwargs)
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
-    provider = OpenAIProvider(api_key="k", model="kimi-for-coding", provider_kind="moonshot")
+    provider = OpenAIProvider(
+        api_key="k", model="test-model",
+        provider_kind="openrouter" if stream_failure == "read_timeout" else "moonshot",
+    )
     events = _collect(provider)
 
     assert len(calls) == 2
     assert calls[0]["stream"] is True
     assert calls[1]["stream"] is False
     assert any(isinstance(e, ProviderHeartbeatEvent) for e in events)
-    assert [e.text for e in events if isinstance(e, TextDeltaEvent)] == ["fallback ok"]
-    assert any(isinstance(e, DoneEvent) for e in events)
+    if fallback_error is None:
+        assert [e.text for e in events if isinstance(e, TextDeltaEvent)] == ["fallback ok"]
+        assert any(isinstance(e, DoneEvent) for e in events)
+        assert not any(isinstance(e, ErrorEvent) for e in events)
+    else:
+        expected = "timeout" if fallback_error is httpx.ConnectTimeout else "request_error"
+        assert [e.code for e in events if isinstance(e, ErrorEvent)] == [expected]
+        assert not any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_coordinator_attempt_does_not_retry_empty_stream_as_non_stream(
+    monkeypatch: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        calls.append(payload)
+        if payload.get("stream") is True:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"data: [DONE]\n\n",
+            )
+        raise AssertionError("coordinator-owned attempt must not resend non-stream")
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
+    provider = OpenAIProvider(api_key="k", model="kimi-for-coding", provider_kind="moonshot")
+    events = _collect(provider, config=ChatConfig(physical_attempt_limit=1))
+
+    assert len(calls) == 1
+    assert calls[0]["stream"] is True
+    assert not any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(isinstance(event, ErrorEvent) for event in events)
+
+
+def test_coordinator_attempt_does_not_retry_stream_timeout(
+    monkeypatch: Any,
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise httpx.ReadTimeout("stream stalled")
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
+    provider = OpenAIProvider(api_key="k", model="kimi-for-coding", provider_kind="moonshot")
+    events = _collect(provider, config=ChatConfig(physical_attempt_limit=1))
+
+    assert len(calls) == 1
+    assert not any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(isinstance(event, ErrorEvent) and event.code == "timeout" for event in events)
+
+
+def test_openai_auth_failure_uses_one_physical_request(monkeypatch: Any) -> None:
+    calls: list[httpx.Request] = []
+    _patch_transport(
+        monkeypatch,
+        "openai",
+        httpx.Response(401, json={"error": {"message": "expired"}}),
+        calls=calls,
+    )
+    provider = OpenAIProvider(api_key="k", model="m", provider_kind="openai")
+    events = _collect(provider, config=ChatConfig(physical_attempt_limit=1))
+
+    assert len(calls) == 1
+    assert any(isinstance(event, ErrorEvent) and event.code == "401" for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_reasoning_only_stream_does_not_trigger_empty_stream_fallback(monkeypatch: Any) -> None:
@@ -405,10 +529,12 @@ def test_anthropic_streaming_tool_call_assembly(monkeypatch: Any) -> None:
 def test_anthropic_truncated_stream_does_not_commit_tool_or_done(monkeypatch: Any) -> None:
     """A stream dropped before message_stop must not authorize partial tools."""
     body = _anthropic_sse(_anthropic_tool_events(include_stop=False))
-    _patch_stream_body(monkeypatch, "anthropic", body)
+    calls: list[httpx.Request] = []
+    _patch_stream_body(monkeypatch, "anthropic", body, calls=calls)
     provider = AnthropicProvider(api_key="k", model="claude-x")
     events = _collect(provider, tools=[_SEARCH_TOOL])
 
+    assert len(calls) == 1
     ends = [e for e in events if isinstance(e, ToolUseEndEvent)]
     dones = [e for e in events if isinstance(e, DoneEvent)]
     errors = [e for e in events if isinstance(e, ErrorEvent)]
@@ -449,9 +575,11 @@ def test_ollama_non_utf8_error_body_yields_error_event(monkeypatch: Any) -> None
         headers={"content-type": "text/plain"},
         content=b"\xff\xfe boom",
     )
-    _patch_transport(monkeypatch, "ollama", response)
+    calls: list[httpx.Request] = []
+    _patch_transport(monkeypatch, "ollama", response, calls=calls)
     provider = OllamaProvider(model="llama3")
     events = _collect(provider)
+    assert len(calls) == 1
     errors = [e for e in events if isinstance(e, ErrorEvent)]
     assert len(errors) == 1
     assert errors[0].code == "500"

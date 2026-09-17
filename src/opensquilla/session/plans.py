@@ -13,6 +13,7 @@ from opensquilla.session.models import PlanRevisionRecord, PlanRunRecord, PlanRu
 MAX_PLAN_STEPS = 64
 MAX_PLAN_TITLE_CHARS = 512
 MAX_PLAN_MARKDOWN_CHARS = 100_000
+MAX_PLAN_STEP_ID_CHARS = 128
 MAX_PLAN_STEP_TITLE_CHARS = 240
 MAX_PLAN_STEP_DETAILS_CHARS = 4_000
 MAX_PLAN_STEP_REASON_CHARS = 2_000
@@ -37,7 +38,9 @@ PLAN_STEP_STATUSES = frozenset(
 )
 PLAN_STEP_TERMINAL_STATUSES = frozenset({"completed", "skipped"})
 
-_STEP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_STEP_ID_PATTERN = re.compile(
+    rf"^[A-Za-z0-9][A-Za-z0-9._:-]{{0,{MAX_PLAN_STEP_ID_CHARS - 1}}}$"
+)
 
 
 class PlanValidationError(ValueError):
@@ -120,7 +123,8 @@ def normalize_plan_steps(steps: Sequence[Mapping[str, Any]]) -> list[dict[str, A
         step_id = raw_step_id.strip()
         if not _STEP_ID_PATTERN.fullmatch(step_id):
             raise PlanValidationError(
-                f"steps[{index}].step_id must be 1-128 portable identifier characters"
+                f"steps[{index}].step_id must be 1-{MAX_PLAN_STEP_ID_CHARS} "
+                "portable identifier characters"
             )
         if step_id in seen_ids:
             raise PlanValidationError(f"duplicate plan step id: {step_id}")
@@ -340,16 +344,19 @@ def checkpoint_plan_step_states(
         # the run terminal through complete_plan_run().
         return updated, None, PlanRunStatus.RUNNING.value
 
-    candidate = next_step_id
-    if candidate is None:
-        candidate = next(
-            (
-                str(state["step_id"])
-                for state in updated[index + 1 :] + updated[:index]
-                if state.get("status") not in PLAN_STEP_TERMINAL_STATUSES
-            ),
-            None,
-        )
+    # The revision order is authoritative. ``next_step_id`` remains in the
+    # internal signature only so persisted/cached legacy calls keep decoding;
+    # callers may not reorder the execution overlay with it. Selecting from
+    # the beginning also lets a pre-fix out-of-order run lazily converge after
+    # its truthful current step is closed.
+    candidate = next(
+        (
+            str(state["step_id"])
+            for state in updated
+            if state.get("status") not in PLAN_STEP_TERMINAL_STATUSES
+        ),
+        None,
+    )
     if candidate is None or candidate not in by_id:
         raise PlanValidationError("next_step_id must identify a non-terminal plan step")
     candidate_state = updated[by_id[candidate]]

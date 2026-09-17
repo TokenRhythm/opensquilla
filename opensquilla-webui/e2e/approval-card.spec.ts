@@ -15,6 +15,11 @@ interface MockApproval {
   agent?: string
   sessionKey: string
   created_at?: number
+  displayKind?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backupState?: string
 }
 
 const execApproval: MockApproval = {
@@ -26,6 +31,8 @@ const execApproval: MockApproval = {
   agent: 'main',
   sessionKey: SESSION_KEY,
   created_at: Date.now() / 1000,
+  displayKind: 'run_command',
+  displayTarget: 'rm -rf build/cache',
 }
 
 const genericApproval: MockApproval = {
@@ -34,6 +41,19 @@ const genericApproval: MockApproval = {
   toolName: 'browser_navigate',
   args: { url: 'https://example.com/admin', reason: 'inspect dashboard' },
   sessionKey: SESSION_KEY,
+}
+
+const destructiveApproval: MockApproval = {
+  id: 'ap-e2e-destructive',
+  namespace: 'exec',
+  toolName: 'sandbox_elevation',
+  args: { action_kind: 'fs.recursive_delete', internal_policy: true },
+  sessionKey: SESSION_KEY,
+  displayKind: 'delete',
+  displayTarget: '/srv/demo/old-project',
+  destructive: true,
+  irreversible: false,
+  backupState: 'enabled',
 }
 
 function snapshot(pending: MockApproval[]) {
@@ -64,18 +84,65 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
     // only Allow once / Deny.
     await expect(card.getByRole('button', { name: 'Always allow this' })).toHaveCount(0)
     await expect(card.getByRole('button', { name: 'Deny' })).toBeVisible()
-    await expect(card.locator('.approval-card__note')).toBeVisible()
+    await expect(card.locator('.approval-card__note')).toHaveCount(0)
   })
 
-  test('generic approval falls back to tool name plus formatted args', async ({ page }) => {
+  test('generic approval uses a safe label and never renders tool names or raw args', async ({ page }) => {
     await mockApprovalsRoute(page, () => [genericApproval])
     await openMockedChat(page)
 
     const card = page.getByTestId('approval-card')
     await expect(card).toBeVisible({ timeout: 10000 })
-    await expect(card.locator('.approval-card__tool')).toHaveText('browser_navigate')
-    await expect(card.locator('.approval-card__pre')).toContainText('https://example.com/admin')
+    await expect(card.getByRole('heading', { name: 'Sensitive operation' })).toBeVisible()
+    await expect(card).not.toContainText('browser_navigate')
+    await expect(card).not.toContainText('https://example.com/admin')
     // No command and not a sandbox request — the same-type shortcut never renders.
+    await expect(card.getByRole('button', { name: 'Always allow this' })).toHaveCount(0)
+  })
+
+  test('destructive approval shows the exact target and backup guarantee without internals', async ({ page }) => {
+    await mockApprovalsRoute(page, () => [destructiveApproval])
+    await openMockedChat(page)
+
+    const card = page.getByTestId('approval-card')
+    await expect(card.getByRole('heading', { name: 'Delete files or folders' })).toBeVisible()
+    await expect(card).toContainText('/srv/demo/old-project')
+    await expect(card).toContainText('A recoverable backup will be created before this change.')
+    await expect(card).toContainText('Older backups may be removed automatically to make room.')
+    await expect(card).not.toContainText('sandbox_elevation')
+    await expect(card).not.toContainText('fs.recursive_delete')
+    await expect(card).not.toContainText('internal_policy')
+  })
+
+  test('unavailable backup requires an explicit irreversible confirmation', async ({ page }) => {
+    await mockApprovalsRoute(page, () => [{
+      ...destructiveApproval,
+      id: 'ap-e2e-no-backup',
+      irreversible: true,
+      backupState: 'unavailable_requires_confirmation',
+    }])
+    await openMockedChat(page)
+
+    const card = page.getByTestId('approval-card')
+    await expect(card).toContainText('No backup is available')
+    await expect(card).toContainText('This action cannot be recovered.')
+    await expect(card.getByRole('button', { name: 'Continue without backup' })).toBeVisible()
+    await expect(card.getByRole('button', { name: 'Always allow this' })).toHaveCount(0)
+  })
+
+  test('disabled backup warns about recovery and points to the file-safety setting', async ({ page }) => {
+    await mockApprovalsRoute(page, () => [{
+      ...destructiveApproval,
+      id: 'ap-e2e-backup-disabled',
+      irreversible: true,
+      backupState: 'disabled',
+    }])
+    await openMockedChat(page)
+
+    const card = page.getByTestId('approval-card')
+    await expect(card).toContainText('No backup will be created')
+    await expect(card).toContainText('This action may be impossible to recover.')
+    await expect(card).toContainText('Turn on backups in Settings > Sandbox > File safety.')
     await expect(card.getByRole('button', { name: 'Always allow this' })).toHaveCount(0)
   })
 
@@ -90,7 +157,7 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
       expect(body.allowAlways).toBeUndefined()
       expect(body.rememberIntent).toBeUndefined()
       resolved = true
-      await route.fulfill({ json: { ok: true } })
+      await route.fulfill({ json: { resolved: true, approved: true } })
     })
     await openMockedChat(page)
 
@@ -100,33 +167,30 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
 
     const outcome = page.getByTestId('approval-outcome')
     await expect(outcome).toBeVisible()
-    await expect(outcome).toContainText('Approved · run resumed')
+    await expect(outcome).toContainText('Approved. Run resumed')
     await expect(page.getByTestId('approval-card')).toHaveCount(0)
   })
 
-  test('Deny sends approved=false and queues the optional note for the agent', async ({ page }) => {
+  test('Deny sends approved=false exactly once and does not create another agent turn', async ({ page }) => {
     let resolved = false
+    let resolveCalls = 0
     await mockApprovalsRoute(page, () => (resolved ? [] : [execApproval]))
     await page.route('**/api/approvals/resolve', async route => {
+      resolveCalls += 1
       const body = route.request().postDataJSON() as Record<string, unknown>
       expect(body.id).toBe('ap-e2e-1')
       expect(body.approved).toBe(false)
       resolved = true
-      await route.fulfill({ json: { ok: true } })
+      await route.fulfill({ json: { resolved: true, approved: false } })
     })
     await openMockedChat(page)
 
     const card = page.getByTestId('approval-card')
     await expect(card).toBeVisible({ timeout: 10000 })
-    await card.locator('.approval-card__note').fill('use the staging directory instead')
     await card.getByRole('button', { name: 'Deny' }).click()
 
     await expect(page.getByTestId('approval-outcome')).toContainText('Denied')
-    // The note rides the normal send path; with no live turn it lands in the
-    // visible message flow (user bubble) or the pending queue chip.
-    await expect(
-      page.locator('.chat-pending-chip, .msg-user').filter({ hasText: 'staging directory' }).first(),
-    ).toBeVisible()
+    expect(resolveCalls).toBe(1)
   })
 
   test('topbar pill deep-links to the blocked session chat, not the retired approvals destination', async ({ page }) => {
@@ -170,11 +234,11 @@ test.describe('Approval flow (live gateway, Standard execution mode)', () => {
     await expect(card.locator('.approval-card__pre--cmd')).toContainText('approval-e2e-ok')
 
     await card.getByRole('button', { name: 'Allow once' }).click()
-    await expect(page.getByTestId('approval-outcome')).toContainText('Approved · run resumed')
+    await expect(page.getByTestId('approval-outcome')).toContainText('Approved. Run resumed')
     await expect(page.locator('.msg-ai').last()).toContainText('approval-e2e-ok', { timeout: 120000 })
   })
 
-  test('Deny terminates the command and the note reaches the agent', async ({ page }) => {
+  test('Deny terminates the command without scheduling another agent turn', async ({ page }) => {
     test.slow()
     await page.goto(CONTROL_URL + 'chat/new')
     await page.waitForSelector('.conn-pill.connected', { timeout: 15000 })
@@ -187,13 +251,7 @@ test.describe('Approval flow (live gateway, Standard execution mode)', () => {
     const card = page.getByTestId('approval-card')
     await expect(card).toBeVisible({ timeout: 90000 })
 
-    await card.locator('.approval-card__note').fill('do not run shell commands in this session')
     await card.getByRole('button', { name: 'Deny' }).click()
     await expect(page.getByTestId('approval-outcome')).toContainText('Denied')
-
-    // The note is delivered through the queue once the denied turn settles.
-    await expect(
-      page.locator('.msg-user').filter({ hasText: 'do not run shell commands' }).first(),
-    ).toBeVisible({ timeout: 120000 })
   })
 })

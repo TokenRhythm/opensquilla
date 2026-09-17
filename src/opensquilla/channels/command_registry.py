@@ -23,6 +23,7 @@ from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.scopes import READ_SCOPE, WRITE_SCOPE
+from opensquilla.run_mode import normalize_run_mode
 
 
 class CommandRegistry:
@@ -141,8 +142,9 @@ def _channel_command_params(
     parts = message_content.strip().split()
     if len(parts) < 2:
         return None
-    run_mode = parts[1].strip().lower()
-    if run_mode not in {"standard", "trusted", "full"}:
+    try:
+        run_mode = normalize_run_mode(parts[1]).value
+    except ValueError:
         return None
     return {**params, "runMode": run_mode}
 
@@ -173,10 +175,8 @@ def _format_channel_sandbox_reply(
         )
     payload = res.payload if isinstance(res.payload, dict) else {}
     run_mode = str(payload.get("runMode") or "").strip()
-    if run_mode == "standard":
-        label = render_channel_message("command_sandbox_standard", config=config)
-    elif run_mode == "trusted":
-        label = render_channel_message("command_sandbox_trusted", config=config)
+    if run_mode == "safe":
+        label = render_channel_message("command_sandbox_safe", config=config)
     elif run_mode == "full":
         label = render_channel_message("command_sandbox_full", config=config)
     else:

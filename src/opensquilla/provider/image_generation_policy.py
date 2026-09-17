@@ -11,6 +11,7 @@ from opensquilla.provider.qwen_token_plan import QWEN_TOKEN_PLAN_IMAGE_BASE_URL
 IMAGE_GENERATION_OFFICIAL_BASE_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
+    "tokenrhythm": "https://tokenrhythm.studio/v1",
     "qwen_token_plan": QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
 }
 _PROVIDER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -116,6 +117,7 @@ def resolve_image_generation_base_url(
     provider_config: object | None,
     llm_config: object | None,
     default_base_url: str,
+    gateway_config: object | None = None,
 ) -> str:
     """Resolve the image endpoint, including same-provider LLM inheritance.
 
@@ -135,7 +137,20 @@ def resolve_image_generation_base_url(
         llm_config,
         provider_id,
     ):
-        return _llm_chosen_base_url(llm_config) or base_url
+        if _field_was_set(llm_config, "base_url"):
+            return _llm_chosen_base_url(llm_config) or base_url
+        return base_url
+    if not _field_was_set(provider_config, "base_url") and gateway_config is not None:
+        profiles = getattr(gateway_config, "llm_profiles", None) or {}
+        if isinstance(profiles, dict):
+            provider = provider_id.strip().lower()
+            for key, profile in profiles.items():
+                if str(key or "").strip().lower() != provider:
+                    continue
+                profile_base_url = _config_string(profile, "base_url").strip()
+                if profile_base_url and _field_was_set(profile, "base_url"):
+                    return profile_base_url
+                break
     return base_url
 
 

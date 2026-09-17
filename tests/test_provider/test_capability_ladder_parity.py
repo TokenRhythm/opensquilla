@@ -13,8 +13,9 @@ The expected literals were transcribed by running get_capabilities on the
 UNMODIFIED tree (staging/provider-overhaul@43d6475c) via a one-off harness;
 a sample is cross-checked against the pre-change ladder logic in
 test_parity_legacy_capabilities_unchanged (test_catalog_layers.py). Do NOT
-edit an expected tuple to make a test pass — a diff here is a real behavior
-change in the migration.
+edit an expected tuple merely to make a test pass — a diff here is a real
+behavior change. Later verified provider metadata corrections are documented
+beside the affected literal; the exhaustive sweep still covers every row.
 
 Also freezes the two named provider sets moved into registry.py
 (KEYLESS_PROVIDERS drives requires_api_key; LOCAL_RUNTIME_PROVIDERS drives
@@ -264,7 +265,9 @@ _EXPECTED_CAPS: dict[tuple[str, str, str], tuple[bool, bool, bool, str]] = {
     ("deepseek", "gpt-5.5", ""): (True, True, False, "deepseek"),
     ("deepseek", "deepseek-chat", ""): (True, True, False, "deepseek"),
     ("deepseek", "deepseek-reasoner", ""): (True, True, False, "deepseek"),
-    ("deepseek", "deepseek-v4-flash", ""): (True, True, False, "deepseek"),
+    # The official pricing/model table now maps this alias to the vision-capable
+    # DeepSeek V4.1 Flash: https://api-docs.deepseek.com/quick_start/pricing.
+    ("deepseek", "deepseek-v4-flash", ""): (True, True, True, "deepseek"),
     ("gemini", "totally-unknown-model-x1", ""): (False, True, True, "none"),
     ("gemini", "gpt-4o", ""): (False, True, True, "none"),
     ("gemini", "deepseek-r1", ""): (False, True, True, "none"),
@@ -721,10 +724,10 @@ _EXPECTED_CAPS: dict[tuple[str, str, str], tuple[bool, bool, bool, str]] = {
     ("tencent_tokenhub_intl", "gpt-5.5", ""): (False, True, True, "none"),
     ("tencent_tokenhub_intl", "hy3", ""): (False, True, False, "none"),
     ("tencent_tokenhub_intl", "hy3-preview", ""): (False, True, False, "none"),
-    # tokenrhythm: the [tokenrhythm.*] corrections rows pin
-    # reasoning_format="none" (the relay streams reasoning_content on its
-    # own but rejects thinking toggles), so effective supports_reasoning is
-    # False everywhere; vision only on the live-verified kimi rows.
+    # tokenrhythm: the mixed-family catalog stays at reasoning_format="none",
+    # so effective catalog supports_reasoning remains False. Exact official V4
+    # request controls live in compat policy instead; vision is limited to the
+    # live-verified kimi rows.
     ("tokenrhythm", "totally-unknown-model-x1", ""): (False, True, False, "none"),
     ("tokenrhythm", "gpt-4o", ""): (False, True, False, "none"),
     ("tokenrhythm", "deepseek-r1", ""): (False, True, False, "none"),

@@ -68,6 +68,7 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "web_discover",
         "web_fetch",
         "web_search",
+        "tool_search",
     }
 )
 
@@ -82,6 +83,39 @@ _CHANNEL_HARD_DENY_NON_OWNER: frozenset[str] = frozenset(
         "write_file",
     }
 )
+
+GUEST_SAFE_BASE_TOOL_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "read_source",
+        "read_spreadsheet",
+        "write_file",
+        "create_source",
+        "edit_file",
+        "edit_source",
+        "list_dir",
+        "glob_search",
+        "source_symbols",
+        "grep_search",
+        "apply_patch",
+        "http_request",
+        "web_fetch",
+        "web_search",
+        "web_discover",
+    }
+)
+
+
+def guest_safe_tool_allowlist() -> frozenset[str]:
+    """Return the trusted, default-deny model tool surface for Web guests."""
+
+    return GUEST_SAFE_BASE_TOOL_ALLOWLIST
+
+
+def guest_safe_tool_allowed(ctx: ToolContext | None, tool_name: str) -> bool:
+    if ctx is None or not ctx.guest_safe:
+        return True
+    return tool_name in guest_safe_tool_allowlist()
 
 
 def filter_by_profile(
@@ -245,6 +279,9 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
     if not plan_access_allows(rt.spec, ctx):
         log.debug("tool_filtered", tool=rt.spec.name, reason="plan_mode_denied")
         return False
+    if not guest_safe_tool_allowed(ctx, rt.spec.name):
+        log.debug("tool_filtered", tool=rt.spec.name, reason="guest_safe_not_allowed")
+        return False
     explicitly_allowed = (
         ctx is not None and ctx.allowed_tools is not None and rt.spec.name in ctx.allowed_tools
     )
@@ -264,7 +301,7 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
         )
     )
     if (
-        not rt.spec.exposed_by_default
+        rt.spec.default_access == "deny"
         and not explicitly_allowed
         and not surfaced
         and not channel_profile_visible

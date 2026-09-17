@@ -1,5 +1,9 @@
 export type PlatformId = 'web' | 'desktop'
 
+/** Native Workbench protocol versions accepted during the v3→v4 rollout. */
+export type NativeWorkbenchProtocolVersion = 1 | 2 | 3 | 4
+export type NativeWorkbenchInteractiveProtocolVersion = 2 | 3 | 4
+
 export interface GatewayStatus {
   url: string
   port: number
@@ -7,6 +11,31 @@ export interface GatewayStatus {
   status: 'starting' | 'ready' | 'stopped' | 'error'
   logPath: string
   error?: string
+}
+
+export type DesktopGatewayConnectionStatus = 'starting' | 'ready' | 'stopped' | 'error'
+
+/**
+ * Connection facts published only to the trusted Desktop main frame. The
+ * instance-scoped auth token is derived from the owned Gateway launch and
+ * expires with that process; it is never the operator's configured token.
+ */
+export interface DesktopGatewayConnection {
+  schemaVersion: 1
+  revision: number
+  status: DesktopGatewayConnectionStatus
+  instanceId: string | null
+  profileFingerprint: string
+  httpUrl: string | null
+  wsUrl: string | null
+  authToken?: string | null
+  error: string | null
+  sandboxUpgrade?: SandboxUpgradeReport | null
+}
+
+export interface SandboxUpgradeReport {
+  status?: string
+  error?: string | null
 }
 
 export interface DesktopRetryStartupResult {
@@ -31,6 +60,8 @@ export type DesktopUpdateErrorCode =
   | 'manifest_invalid'
   | 'checksum_unavailable'
   | 'integrity_failed'
+  | 'signature_invalid'
+  | 'signature_unavailable'
   | 'download_failed'
   | 'install_failed'
 
@@ -45,6 +76,8 @@ export interface DesktopUpdateState {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  /** Explicit shell permission to launch installation; older manual shells omit it. */
+  canInstall?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
   source: DesktopUpdateSource | null
@@ -105,6 +138,7 @@ export interface DesktopPreferences {
   effectiveWorkbenchPreviewMode?: WorkbenchPreviewMode
   workbenchPreviewNoticeShown?: boolean
   workbenchPreviewForcedOffline?: boolean
+  sandboxUnavailableWarningSuppressed?: boolean
 }
 
 export interface PlatformCapabilities {
@@ -113,7 +147,6 @@ export interface PlatformCapabilities {
   canManageLocalApiKeys: boolean
   canRevealGatewayLog: boolean
   canRestartGateway: boolean
-  hasDesktopOnboarding: boolean
   hasWebConfig: boolean
   /**
    * The operator likely has a terminal where `opensquilla` resolves (web
@@ -152,6 +185,14 @@ export interface ProjectDirectoryPickerRequest {
 }
 
 export interface PlatformFilesApi {
+  saveArtifact?: (payload: ArtifactOpenRequest) => Promise<{ status: 'saved' | 'cancelled' }>
+  sourceFileAction?: (payload: {
+    gatewayInstanceId: string
+    sessionKey: string
+    documentId: string
+    pagePath?: string
+    action: 'open' | 'reveal'
+  }) => Promise<void>
   /** Write the bytes to a temp file and open it with the OS default app. */
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
   /** Open the trusted host's native folder picker. Undefined on the web. */
@@ -176,7 +217,7 @@ export interface NativeWorkbenchCreateSurfaceRequestV1 {
 }
 
 export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
-  version: 2
+  version: 2 | 3 | 4
   surfaceId: string
   kind: 'artifact-preview'
   payload: {
@@ -188,7 +229,7 @@ export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
 }
 
 export interface NativeWorkbenchCreateUrlSurfaceRequestV2 {
-  version: 2
+  version: 2 | 3 | 4
   surfaceId: string
   kind: 'url-preview'
   payload: {
@@ -203,9 +244,79 @@ export type NativeWorkbenchCreateSurfaceRequest =
   | NativeWorkbenchCreateUrlSurfaceRequestV2
 
 export interface NativeWorkbenchCapabilities {
-  protocolVersions: Array<1 | 2>
+  protocolVersions: Array<NativeWorkbenchProtocolVersion>
   modes: WorkbenchPreviewMode[]
   maxSurfaces: number
+}
+
+export interface NativeArtifactAnnotationCapabilities {
+  version: 3 | 4
+  available: boolean
+  picker?: boolean
+  trustedOverlay?: boolean
+  overlayCopyVersion?: 1
+  atomicCloseRearm?: true
+  reason?: string
+}
+
+export interface NativeArtifactAnnotationModeRequest {
+  version: 3 | 4
+  surfaceId: string
+  enabled: boolean
+}
+
+export interface NativeArtifactAnnotationOverlayRequest {
+  version: 3 | 4
+  surfaceId: string
+  selectionId: string
+  annotationId: string
+  initialBody?: string
+  overlayCopyVersion?: 1
+  copy?: {
+    targetLabel: string
+    contextLabel: string
+    bodyLabel: string
+    placeholder: string
+    newlineHint: string
+    cancelLabel: string
+    submitLabel: string
+    emptyBodyMessage: string
+  }
+}
+
+export interface NativeArtifactAnnotationOverlayCloseRequest {
+  version: 3 | 4
+  surfaceId: string
+  annotationId?: string
+  rearm?: true
+}
+
+export interface NativeWorkbenchBrowserTarget {
+  targetRef: string
+  surfaceId: string
+  url: string
+  title: string
+  resourceId?: string
+  sessionKey: string
+}
+
+export interface NativeWorkbenchScreenshot {
+  targetRef: string
+  mimeType: 'image/png'
+  dataBase64: string
+  width: number
+  height: number
+}
+
+export interface NativeArtifactAnnotationSelection {
+  selectionId: string
+  targetRef: string
+  resourceId?: string
+  tagName: string
+  elementPath: string
+  selectionText?: string
+  locatorHint?: string
+  rect: { x: number; y: number; width: number; height: number }
 }
 
 export interface NativeWorkbenchSurfaceRectRequest {
@@ -219,7 +330,10 @@ export interface NativeWorkbenchSurfaceRectRequest {
 
 export interface NativeWorkbenchSurfaceResult {
   ok: boolean
+  code?: string
+  retryable?: boolean
   message?: string
+  surfaceInstanceId?: string
 }
 
 export type NativeWorkbenchSurfaceEventType =
@@ -235,9 +349,15 @@ export type NativeWorkbenchSurfaceEventType =
   | 'error'
   | 'crashed'
   | 'escape'
+  | 'browser-opened'
+  | 'annotation-selected'
+  | 'annotation-draft-change'
+  | 'annotation-submit'
+  | 'annotation-cancel'
+  | 'annotation-overlay-fallback'
 
 export interface NativeWorkbenchSurfaceEvent {
-  version: 1 | 2
+  version: NativeWorkbenchProtocolVersion
   surfaceId: string
   type: NativeWorkbenchSurfaceEventType
   detail?: {
@@ -251,21 +371,27 @@ export interface NativeWorkbenchSurfaceEvent {
     canGoForward?: boolean
     action?: string
     code?: string
+    surfaceInstanceId?: string
     message?: string
     path?: string
     reason?: string
+    annotationId?: string
+    sessionKey?: string
+    targetRef?: string
+    selection?: NativeArtifactAnnotationSelection
+    body?: string
   }
 }
 
 export interface NativeWorkbenchNavigateRequest {
-  version: 2
+  version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
   action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate'
   url?: string
 }
 
 export interface NativeWorkbenchPermissionResponse {
-  version: 2
+  version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
   requestId: string
   allow: boolean
@@ -277,6 +403,7 @@ export interface NativeArtifactPreviewLeaseCreateRequest {
   scopeId: string
   mode: WorkbenchPreviewMode
   authToken?: string
+  pagePath?: string
 }
 
 export interface NativeArtifactPreviewLeaseControlRequest {
@@ -299,6 +426,23 @@ export type NativeArtifactPreviewLeaseBrokerResult = {
 
 export interface NativeWorkbenchApi {
   getCapabilities?(): Promise<NativeWorkbenchCapabilities>
+  getArtifactAnnotationCapabilities?(): Promise<NativeArtifactAnnotationCapabilities>
+  setArtifactAnnotationMode?(
+    request: NativeArtifactAnnotationModeRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  showArtifactAnnotationOverlay?(
+    request: NativeArtifactAnnotationOverlayRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  closeArtifactAnnotationOverlay?(
+    request: NativeArtifactAnnotationOverlayCloseRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
+  focusWorkbenchAnnotation?(request: {
+    surfaceId: string; targetRef: string; locatorHint: string; pagePath?: string
+  }): Promise<NativeWorkbenchSurfaceResult>
+  captureWorkbenchScreenshot?(request: {
+    surfaceId: string; targetRef: string
+  }): Promise<NativeWorkbenchScreenshot>
   createArtifactPreviewLease?(
     request: NativeArtifactPreviewLeaseCreateRequest,
   ): Promise<NativeArtifactPreviewLeaseBrokerResult>
@@ -340,7 +484,13 @@ export interface CliInvocation {
 }
 
 export interface PlatformGatewayApi {
+  /** Observation only: never restart the Gateway or reload the renderer. */
+  onResume?: (callback: () => void) => () => void
   getStatus(): Promise<GatewayStatus>
+  getConnection?: () => Promise<DesktopGatewayConnection>
+  onConnection?: (
+    callback: (connection: DesktopGatewayConnection) => void,
+  ) => () => void
   revealLog?: () => Promise<boolean>
   retryStartup?: () => Promise<DesktopRetryStartupResult>
   /** null when the shell predates the bridge or the lookup fails; callers
@@ -358,6 +508,7 @@ export interface PlatformSettingsApi {
       mainWindowCloseBehavior?: DesktopMainWindowCloseBehavior
       workbenchPreviewMode?: WorkbenchPreviewMode
       workbenchPreviewNoticeShown?: boolean
+      sandboxUnavailableWarningSuppressed?: boolean
     },
   ) => Promise<DesktopPreferences>
 }
@@ -366,6 +517,30 @@ export interface PlatformOnboardingApi {
   getDefaults?: () => Promise<unknown>
   save?: (payload: unknown) => Promise<unknown>
   cancel?: () => Promise<unknown>
+}
+
+/** Desktop-only migration operations; Web exposes an empty implementation. */
+export interface PlatformMigrationApi {
+  getRecoveryState?: () => Promise<unknown>
+  retryProfileConsolidation?: () => Promise<{ ok: boolean; error?: string }>
+  chooseLegacyAgentDataLocation?: (payload?: Record<string, never>) => Promise<unknown>
+  migrationSummary?: (payload?: { source?: string }) => Promise<unknown>
+  migrationBrowseSource?: (payload: { kind: string }) => Promise<unknown>
+  migrationRun?: (payload: { previewId: string; overwrite?: boolean }) => Promise<unknown>
+  migrationTakeLastResult?: () => Promise<unknown>
+  migrationPeekLastResult?: () => Promise<unknown>
+  migrationDismissLastResult?: () => Promise<unknown>
+  revealRecoveryPath?: (payload: { target: 'primary' | 'backups' }) => Promise<boolean>
+  onMigrationProgress?: (callback: (payload: unknown) => void) => () => void
+  inspectDesktopCleanup?: (payload: { mode: string }) => Promise<unknown>
+  discardDesktopCleanup?: (payload: { previewId: string }) => Promise<boolean>
+  applyDesktopCleanup?: (payload: { previewId: string; acknowledged: boolean; confirmation: string }) => Promise<unknown>
+  revealDesktopUserData?: () => Promise<boolean>
+  abandonCleanupTransaction?: () => Promise<unknown>
+}
+
+export interface PlatformWindowApi {
+  onHidden?: (callback: () => void) => void | (() => void)
 }
 
 export interface PlatformUpdatesApi {
@@ -383,6 +558,8 @@ export interface Platform {
   gateway: PlatformGatewayApi
   settings: PlatformSettingsApi
   onboarding: PlatformOnboardingApi
+  migration: PlatformMigrationApi
+  window: PlatformWindowApi
   files: PlatformFilesApi
   workbench: PlatformWorkbenchApi
   updates: PlatformUpdatesApi
@@ -398,13 +575,13 @@ export interface Platform {
    * returns false; desktop returns the shell's live native-update capability,
    * including runtime guards such as macOS requiring /Applications.
    * Presentation ownership is intentionally reported separately by
-   * desktopUpdateManaged(), since unsigned Windows can discover an update and
+   * desktopUpdateManaged(), since Windows can discover an update and
    * open a manual installer without applying it natively.
    */
   nativeAutoUpdateEnabled: () => Promise<boolean>
   /**
    * Whether the desktop shell owns update discovery and presentation, including
-   * manual versioned installers on unsigned Windows builds. This is deliberately
+   * manual versioned installers on Windows builds. This is deliberately
    * separate from nativeAutoUpdateEnabled so the passive gateway banner does not
    * duplicate the shell-managed Windows notice.
    */

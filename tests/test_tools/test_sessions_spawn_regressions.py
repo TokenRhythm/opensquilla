@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +38,7 @@ from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.builtin import sessions as sessions_tool
-from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
 
 
 class _ConfigurableConfig:
@@ -230,6 +231,140 @@ async def test_max_children_uses_spawned_by_filter_not_global_page() -> None:
         current_tool_context.reset(token)
 
 
+def test_sessions_spawn_exposes_optional_bounded_title_schema() -> None:
+    from opensquilla.tools.registry import get_default_registry
+
+    registered = get_default_registry().get("sessions_spawn")
+
+    assert registered is not None
+    assert "title" not in registered.spec.required
+    assert registered.spec.parameters["title"] == {
+        "type": "string",
+        "description": (
+            "Short human-readable task title (3-8 words). Name the work, not "
+            "the agent, and avoid generic labels such as 'Subagent task'. Omit "
+            "or leave blank to derive a bounded title from the task description."
+        ),
+        "maxLength": 512,
+    }
+    assert list(inspect.signature(sessions_tool.sessions_spawn).parameters) == [
+        "agent_id",
+        "task",
+        "model",
+        "title",
+    ]
+    assert sessions_tool._normalize_spawn_title("界" * 512, "unused") == "界" * 512
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        ("👨‍👩‍👧‍👦" * 6, "👨‍👩‍👧‍👦" * 4 + "..."),
+        ("🇨🇳" * 20, "🇨🇳" * 15 + "..."),
+        ("e\u0301" * 20, "e\u0301" * 15 + "..."),
+        ("각" * 12, "각" * 10 + "..."),
+    ],
+)
+def test_sessions_spawn_task_fallback_preserves_grapheme_clusters(
+    task: str,
+    expected: str,
+) -> None:
+    assert sessions_tool._normalize_spawn_title(None, task) == expected
+    assert len(expected) <= 34
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("title", "task", "expected"),
+    [
+        (
+            "  Issue #1130  搜索工具策略\n分析  🧪  ",
+            "This task body must not replace the explicit title.",
+            "Issue #1130 搜索工具策略 分析 🧪",
+        ),
+        (
+            None,
+            "Analyze the readiness search regression",
+            "Analyze the readiness search re...",
+        ),
+        (
+            " \n\t ",
+            "分析 Issue #1115 Windows 工具持续超时",
+            "分析 Issue #1115 Windows 工具持续超时",
+        ),
+    ],
+)
+async def test_sessions_spawn_persists_explicit_or_task_derived_title(
+    title: str | None,
+    task: str,
+    expected: str,
+) -> None:
+    mgr = _PaginatingSessionManager(
+        agents={"caller": {"id": "caller", "enabled": True}},
+        children_for_parent={},
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(runtime)
+
+    token = current_tool_context.set(_ctx())
+    try:
+        result = json.loads(await sessions_tool.sessions_spawn(task=task, title=title))
+    finally:
+        current_tool_context.reset(token)
+
+    assert mgr.created[0]["derived_title"] == expected
+    assert result["title"] == expected
+    assert mgr.created[0]["origin"]["task"] == task
+    assert mgr.created[0]["origin"]["execution_task"].endswith(task)
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_rejects_overlong_title_before_creation() -> None:
+    mgr = _PaginatingSessionManager(
+        agents={"caller": {"id": "caller", "enabled": True}},
+        children_for_parent={},
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(runtime)
+
+    token = current_tool_context.set(_ctx())
+    try:
+        with pytest.raises(ToolError, match="Title must not exceed 512 characters"):
+            await sessions_tool.sessions_spawn(task="bounded task", title="x" * 513)
+    finally:
+        current_tool_context.reset(token)
+
+    assert mgr.created == []
+    assert runtime.enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_spawn_keeps_each_title_isolated() -> None:
+    mgr = _PaginatingSessionManager(
+        agents={"caller": {"id": "caller", "enabled": True}},
+        children_for_parent={},
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(runtime)
+
+    async def spawn(title: str) -> None:
+        token = current_tool_context.set(_ctx())
+        try:
+            await sessions_tool.sessions_spawn(task=f"Task body for {title}", title=title)
+        finally:
+            current_tool_context.reset(token)
+
+    await asyncio.gather(spawn("Issue #1115"), spawn("Issue #1130"))
+
+    assert {row["derived_title"] for row in mgr.created} == {
+        "Issue #1115",
+        "Issue #1130",
+    }
+
+
 # Bug 3 — concurrent spawns must not both pass the gate
 @pytest.mark.asyncio
 async def test_concurrent_spawn_respects_max_children_one() -> None:
@@ -400,7 +535,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
     config = GatewayConfig(
         workspace_dir=str(workspace),
         sandbox={"run_mode": "full"},
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
         agent_stream_heartbeat_interval_seconds=0.0,
         agent_stream_idle_timeout_seconds=1.0,
@@ -409,7 +544,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
     manager = SessionManager(storage, inject_time_prefix=False)
     parent_key = "agent:main:webchat:spawn-parent-restart"
     parent_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(
             MountGrant(path=str(mounted), access="rw", scope="chat"),
@@ -461,7 +596,10 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
     token = current_tool_context.set(parent_tool_context)
     try:
         spawned = json.loads(
-            await sessions_tool.sessions_spawn(task="exercise inherited authority")
+            await sessions_tool.sessions_spawn(
+                task="exercise inherited authority",
+                title="Inherited authority audit",
+            )
         )
     finally:
         current_tool_context.reset(token)
@@ -566,15 +704,15 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
             event_emitter=emit,
         )
 
-        assert observations["mode"] is RunMode.STANDARD
+        assert observations["mode"] is RunMode.SAFE
         assert observations["source"] == "route_metadata"
         assert observations["run_mode_source"] == "user"
         assert [(grant.path, grant.access, grant.scope) for grant in observations["mounts"]] == [
             (str(mounted), "rw", "chat")
         ]
         assert observations["granted_network"].reason == "domain_grant"
-        assert observations["unknown_network"].status == "ask"
-        assert observations["unknown_network"].reason == "unknown_domain"
+        assert observations["unknown_network"].status == "allow"
+        assert observations["unknown_network"].reason == "public_default"
         assert observations["caller_kind"] is CallerKind.SUBAGENT
         assert observations["subagent_depth"] == 1
         assert len(backend_operations) == 1
@@ -585,8 +723,9 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
         assert child.spawn_depth == 1
         assert child.parent_session_key == parent_key
         assert child.origin is not None
+        assert child.derived_title == "Inherited authority audit"
         assert child.origin["parent_task_id"] == "parent-task-restart"
-        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "safe"
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode_source"] == "user"
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["mounts"] == [
             {"path": str(mounted), "access": "rw", "scope": "chat"}
@@ -608,6 +747,175 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
     finally:
         await restarted_storage.close()
         reset_resolved_run_context_overlays()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["managed", "configured"])
+@pytest.mark.parametrize("root_change", [None, "missing", "symlink", "ancestor_symlink"])
+async def test_task_workspace_spawn_survives_restart_and_revalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str, root_change: str | None,
+) -> None:
+    from opensquilla.execution_workspaces import configured_execution_workspace
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError
+    from opensquilla.sandbox.escalation import (
+        current_tool_run_context,
+        reset_resolved_run_context_overlays,
+    )
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.tools.builtin import filesystem
+
+    reset_resolved_run_context_overlays()
+    root = tmp_path / "task-parent" / "task-root"
+    fallback = tmp_path / "other-agent-default"
+    root.mkdir(parents=True)
+    fallback.mkdir()
+    binding = configured_execution_workspace(root)
+    binding["kind"] = kind
+    config = GatewayConfig(
+        workspace_dir=str(fallback), sandbox={"run_mode": "full"},
+        memory={}, naming={"enabled": False},
+    )
+    database = tmp_path / "task-sessions.db"
+    storage = await SessionStorage.open(str(database))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    runtime = _StubTaskRuntime()
+    parent = await manager.create(
+        "agent:main:webchat:task-parent", execution_workspace=binding,
+    )
+    sessions_tool.set_gateway_config(config)
+    sessions_tool.set_session_manager(manager)
+    sessions_tool.set_task_runtime(runtime)
+    # Even an old saved context cannot replace the durable directory authority.
+    context = RunContext(
+        workspace=str(fallback), run_mode=RunMode.SAFE,
+        run_mode_source="user", source="saved",
+    )
+    parent_context = ToolContext(
+        is_owner=True, caller_kind=CallerKind.AGENT, agent_id="main",
+        session_key=parent.session_key, task_id="task-parent",
+        sandbox_run_context=context, run_mode="standard",
+    )
+    setattr(parent_context, "_sandbox_run_context_fresh", True)
+    token = current_tool_context.set(parent_context)
+    try:
+        spawned = json.loads(await sessions_tool.sessions_spawn(
+            task="write child.txt in this task", agent_id="worker",
+        ))
+        child = await storage.get_session(spawned["session_key"])
+        assert child is not None
+        assert child.execution_workspace == binding
+        assert child.agent_id == "worker"
+    finally:
+        current_tool_context.reset(token)
+        await storage.close()
+
+    queued = runtime.enqueued[0]
+    run = TaskRun(
+        task_id=spawned["task_id"], envelope=queued["envelope"],
+        message=queued["message"], queue_mode=queued["mode"], run_kind=queued["run_kind"],
+    )
+    restarted = await SessionStorage.open(str(database))
+    observations: list[tuple[str | None, RunMode]] = []
+
+    class Backend:
+        name = "recording-filesystem"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: Any) -> SandboxOperationResult:
+            request = operation.request
+            request.path.write_text(request.content, encoding="utf-8")
+            return SandboxOperationResult(message="written", created=True)
+
+    monkeypatch.setattr(filesystem, "get_runtime", lambda: SimpleNamespace(
+        effective=SimpleNamespace(sandbox_enabled=True), backend=Backend(),
+        settings=SimpleNamespace(host_root_readonly=False), workspace=fallback,
+    ))
+
+    class Runner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            child_token = current_tool_context.set(kwargs["tool_context"])
+            try:
+                effective = current_tool_run_context()
+                assert effective is not None
+                observations.append((effective.workspace, effective.run_mode))
+                await filesystem.write_file("child.txt", "inherited task")
+            finally:
+                current_tool_context.reset(child_token)
+            yield DoneEvent()
+
+    async def emit(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    if root_change == "ancestor_symlink":
+        root.parent.rename(tmp_path / "original-task-parent")
+        (fallback / "task-root").mkdir()
+        root.parent.symlink_to(fallback, target_is_directory=True)
+    elif root_change is not None:
+        root.rename(tmp_path / "original-task-root")
+        if root_change == "symlink":
+            root.symlink_to(fallback, target_is_directory=True)
+    try:
+        dispatch = dispatch_task_runtime_turn(
+            run, config=config,
+            session_manager=SessionManager(restarted, inject_time_prefix=False),
+            turn_runner=Runner(), event_emitter=emit,
+        )
+        if root_change is None:
+            await dispatch
+            assert observations == [(str(root), RunMode.SAFE)]
+            assert (root / "child.txt").read_text() == "inherited task"
+        else:
+            with pytest.raises(ProjectWorkspaceStateError):
+                await dispatch
+            assert observations == []
+            if root_change == "missing":
+                assert not root.exists()
+        assert not (fallback / "child.txt").exists()
+        assert not (fallback / "task-root" / "child.txt").exists()
+    finally:
+        await restarted.close()
+        reset_resolved_run_context_overlays()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_change", ["missing", "symlink"])
+async def test_task_workspace_spawn_rejects_invalid_root_before_creating_child(
+    tmp_path: Path, root_change: str,
+) -> None:
+    from opensquilla.execution_workspaces import configured_execution_workspace
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+    root = tmp_path / "parent-workspace"
+    replacement = tmp_path / "replacement"
+    root.mkdir()
+    replacement.mkdir()
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    parent = await manager.create(
+        "agent:main:webchat:invalid-root-parent",
+        execution_workspace=configured_execution_workspace(root),
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(manager)
+    sessions_tool.set_task_runtime(runtime)
+    root.rename(tmp_path / "original-workspace")
+    if root_change == "symlink":
+        root.symlink_to(replacement, target_is_directory=True)
+    token = current_tool_context.set(ToolContext(
+        is_owner=True, caller_kind=CallerKind.AGENT,
+        agent_id="main", session_key=parent.session_key,
+    ))
+    try:
+        with pytest.raises(ProjectWorkspaceStateError):
+            await sessions_tool.sessions_spawn(task="must not run")
+        assert runtime.enqueued == []
+        assert len(await manager.list_sessions()) == 1
+        assert list(replacement.iterdir()) == []
+    finally:
+        current_tool_context.reset(token)
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -638,7 +946,7 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
     config = GatewayConfig(
         workspace_dir=str(global_workspace),
         sandbox={"run_mode": "full"},
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
         agent_stream_heartbeat_interval_seconds=0.0,
         agent_stream_idle_timeout_seconds=1.0,
@@ -665,7 +973,7 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         },
     )
     authoritative_parent = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(project_path),
         mounts=(MountGrant(path=str(mounted), access="rw", scope="chat"),),
         domains=(
@@ -792,10 +1100,10 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         assert child.workspace_id == project.workspace_id
         assert child.origin is not None
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["workspace"] == str(project_path)
-        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "safe"
         assert observations == [
             {
-                "mode": RunMode.STANDARD,
+                "mode": RunMode.SAFE,
                 "workspace": str(project_path),
                 "run_mode_source": "project_default",
                 "network": observations[0]["network"],

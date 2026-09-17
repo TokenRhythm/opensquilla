@@ -62,6 +62,7 @@ def test_owner_cron_route_does_not_apply_non_owner_cron_allowlist() -> None:
         id="owner-policy",
         name="Owner Policy",
         creator_is_owner=True,
+        creator_host_execute=True,
         tool_policy={
             "profile": "minimal",
             "also_allow": ["memory_search", "exec_command"],

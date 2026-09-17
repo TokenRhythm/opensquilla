@@ -1,13 +1,12 @@
 import { computed, type ComputedRef } from 'vue'
 import i18n from '@/i18n'
-import type { ModelCard, SessionRow } from '@/types/usage'
+import type { ModelCard, UsageSession } from '@/types/usage'
 
 const t = i18n.global.t
 
 export function useUsageModelCards(options: {
-  visibleSessions: ComputedRef<SessionRow[]>
+  visibleSessions: ComputedRef<UsageSession[]>
   serverModels?: ComputedRef<ModelCard[] | null>
-  rowVal: (row: Record<string, unknown>, ...keys: string[]) => unknown
 }) {
   const modelCards = computed((): ModelCard[] => {
     if (options.serverModels?.value) return options.serverModels.value
@@ -22,15 +21,15 @@ export function useUsageModelCards(options: {
       const breakdown = Array.isArray(row.modelBreakdown) ? row.modelBreakdown : []
       const items = breakdown.length > 0 ? breakdown : [{
         model: row.model || 'unknown',
-        inputTokens: Number(options.rowVal(row, 'input_tokens', 'inputTokens') || 0),
-        outputTokens: Number(options.rowVal(row, 'output_tokens', 'outputTokens') || 0),
-        cacheReadTokens: Number(options.rowVal(row, 'cache_read_tokens', 'cacheReadTokens') || 0),
-        cacheWriteTokens: Number(options.rowVal(row, 'cache_write_tokens', 'cacheWriteTokens') || 0),
-        costUsd: Number(options.rowVal(row, 'cost_usd', 'costUsd') || 0),
+        inputTokens: row.inputTokens,
+        outputTokens: row.outputTokens,
+        cacheReadTokens: row.cacheReadTokens,
+        cacheWriteTokens: row.cacheWriteTokens,
+        costUsd: row.costUsd,
         // Fallback (whole-session) items carry the row's own provenance so
         // the aggregate costSource/anyCacheBlind below still reflect it.
-        costSource: options.rowVal(row, 'cost_source', 'costSource'),
-        estimateBasis: options.rowVal(row, 'estimate_basis', 'estimateBasis'),
+        costSource: row.costSource,
+        estimateBasis: row.estimateBasis,
       }]
       const modelsSeenInSession = new Set<string>()
       items.forEach(item => {
@@ -54,16 +53,16 @@ export function useUsageModelCards(options: {
           costSources[model] = new Set()
           cacheBlind[model] = false
         }
-        map[model].inputTokens += Number(options.rowVal(item, 'input_tokens', 'inputTokens') || 0)
-        map[model].outputTokens += Number(options.rowVal(item, 'output_tokens', 'outputTokens') || 0)
-        map[model].cacheReadTokens += Number(options.rowVal(item, 'cache_read_tokens', 'cacheReadTokens') || 0)
-        map[model].cacheWriteTokens += Number(options.rowVal(item, 'cache_write_tokens', 'cacheWriteTokens') || 0)
-        map[model].costUsd += Number(options.rowVal(item, 'cost_usd', 'costUsd') || 0)
-        const itemCostSource = options.rowVal(item, 'cost_source', 'costSource')
+        map[model].inputTokens += Number(item.inputTokens || 0)
+        map[model].outputTokens += Number(item.outputTokens || 0)
+        map[model].cacheReadTokens += Number(item.cacheReadTokens || 0)
+        map[model].cacheWriteTokens += Number(item.cacheWriteTokens || 0)
+        map[model].costUsd += Number(item.costUsd || 0)
+        const itemCostSource = item.costSource
         if (itemCostSource != null && itemCostSource !== '') {
           costSources[model].add(String(itemCostSource))
         }
-        const itemEstimateBasis = options.rowVal(item, 'estimate_basis', 'estimateBasis')
+        const itemEstimateBasis = item.estimateBasis
         if (itemEstimateBasis === 'cache_blind') {
           cacheBlind[model] = true
         }

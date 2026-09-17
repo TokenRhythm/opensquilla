@@ -8,6 +8,13 @@ import uuid
 from typing import Any, cast
 from urllib.parse import urlparse, urlunparse
 
+from opensquilla.contracts.adapters.sessions_list_contract import call_sessions_list
+from opensquilla.contracts.adapters.sessions_resolve_contract import call_sessions_resolve
+from opensquilla.contracts.gateway_transport import (
+    GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+    GATEWAY_CLIENT_MAX_QUEUE,
+)
+
 
 class GatewayRPCError(Exception):
     """RPC failure returned by the OpenSquilla gateway."""
@@ -87,7 +94,11 @@ class GatewayRPCClient:
         except ImportError as exc:  # pragma: no cover - dependency is part of base install.
             raise RuntimeError("websockets package is required") from exc
 
-        self._ws = await websockets.connect(normalize_gateway_url(url))
+        self._ws = await websockets.connect(
+            normalize_gateway_url(url),
+            max_size=GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+            max_queue=GATEWAY_CLIENT_MAX_QUEUE,
+        )
 
         try:
             raw = await self._ws.recv()
@@ -164,10 +175,10 @@ class GatewayRPCClient:
         return {} if payload is None else payload
 
     async def list_sessions(self, limit: int = 50) -> dict[str, Any]:
-        return cast(dict[str, Any], await self.call("sessions.list", {"limit": limit}))
+        return await call_sessions_list(self.call, limit=limit)
 
     async def resolve_session(self, key: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self.call("sessions.resolve", {"key": key}))
+        return await call_sessions_resolve(self.call, key=key)
 
     async def session_history(
         self,

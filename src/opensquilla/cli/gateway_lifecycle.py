@@ -17,25 +17,17 @@ from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from opensquilla.cli.url_utils import normalize_gateway_url
-from opensquilla.paths import default_opensquilla_home, state_dir
+from opensquilla.paths import (
+    default_opensquilla_home,
+    desktop_profile_lifecycle_active,
+    state_dir,
+)
 
 UNMANAGED_GATEWAY_RUNNING = "UNMANAGED_GATEWAY_RUNNING"
 MANAGED_GATEWAY_TARGET_MISMATCH = "MANAGED_GATEWAY_TARGET_MISMATCH"
 REMOTE_GATEWAY_UNAVAILABLE = "REMOTE_GATEWAY_UNAVAILABLE"
 DESKTOP_PROFILE_RECOVERY_REQUIRED = "DESKTOP_PROFILE_RECOVERY_REQUIRED"
 DESKTOP_CONFIG_OUTSIDE_PROFILE = "desktop_config_outside_profile"
-
-_DESKTOP_PROFILE_KINDS = frozenset({"desktop-primary", "desktop-recovery"})
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
-
-def desktop_profile_lifecycle_active() -> bool:
-    """Return whether lifecycle bookkeeping belongs to a Desktop profile."""
-
-    profile_kind = os.environ.get("OPENSQUILLA_PROFILE_KIND", "").strip().lower()
-    if profile_kind:
-        return profile_kind in _DESKTOP_PROFILE_KINDS
-    return os.environ.get("OPENSQUILLA_DESKTOP", "").strip().lower() in _TRUTHY
 
 
 def desktop_config_path_is_profile_local(config_path: str | None = None) -> bool:
@@ -164,6 +156,14 @@ class GatewayLifecycleResult:
         elif not self.ok:
             payload["details"] = {}
         return payload
+
+
+@dataclass(frozen=True)
+class ManagedGatewayTarget:
+    """Connection target recorded for a profile-managed Gateway."""
+
+    url: str
+    config_path: str | None = None
 
 
 class GatewayLifecycleManager:
@@ -777,6 +777,58 @@ class GatewayLifecycleManager:
     @staticmethod
     def _now() -> str:
         return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def active_managed_gateway_target() -> ManagedGatewayTarget | None:
+    """Return the active managed Gateway target for the selected profile.
+
+    ``gateway start`` records its effective runtime target in the profile-local
+    lifecycle file.  That record is authoritative when a one-off ``--port`` or
+    ``--listen`` override differs from the persisted config while the recorded
+    process is still alive.  An unhealthy managed process remains authoritative
+    so callers fail against the selected profile instead of silently falling
+    back to another Gateway.
+    """
+
+    lifecycle = GatewayLifecycleManager()
+    record, error = lifecycle._read_pidfile()
+    if error is not None or record is None:
+        return None
+
+    host = record.get("host")
+    if not isinstance(host, str) or not host.strip():
+        return None
+    host = host.strip()
+    raw_port = record.get("port")
+    if not isinstance(raw_port, (str, int)) or isinstance(raw_port, bool):
+        return None
+    try:
+        port = int(raw_port)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+
+    config_path = record.get("configPath")
+    if not isinstance(config_path, str) or not config_path.strip():
+        config_path = None
+    lifecycle = GatewayLifecycleManager(
+        host=host,
+        port=port,
+        config_path=config_path,
+    )
+    status = lifecycle.status()
+    if status.state not in {"running", "unhealthy"} or not status.managed:
+        return None
+    url = normalize_gateway_url(f"ws://{_format_url_host(lifecycle.probe_host)}:{port}/ws")
+    return ManagedGatewayTarget(url=url, config_path=config_path)
+
+
+def active_managed_gateway_url() -> str | None:
+    """Return the active managed Gateway URL for the selected profile."""
+
+    target = active_managed_gateway_target()
+    return target.url if target is not None else None
 
 
 def _health_probe_host(host: str) -> str:

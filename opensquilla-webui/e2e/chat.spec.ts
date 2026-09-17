@@ -237,6 +237,42 @@ test.describe('Chat Interaction', () => {
     await expect(textarea).toHaveValue('Hello, this is a test message')
   })
 
+  test('keeps slash selection visible and closes the menu on outside pointerdown', async ({ page }) => {
+    const textarea = page.locator('.chat-textarea')
+    const menu = page.locator('.chat-slash')
+
+    await textarea.fill('/')
+    await expect(menu).toBeVisible()
+
+    const items = menu.locator('.chat-slash-item')
+    const itemCount = await items.count()
+    expect(itemCount).toBeGreaterThan(1)
+    await expect.poll(() => menu.evaluate(element => element.scrollHeight > element.clientHeight))
+      .toBe(true)
+
+    for (let index = 1; index < itemCount; index += 1) {
+      await textarea.press('ArrowDown')
+    }
+
+    const activeItem = menu.locator('.chat-slash-item--active')
+    await expect(activeItem).toHaveCount(1)
+    await expect.poll(() => menu.evaluate(element => element.scrollTop)).toBeGreaterThan(0)
+    expect(await menu.evaluate(element => {
+      const active = element.querySelector<HTMLElement>('.chat-slash-item--active')
+      if (!active) return false
+      const menuRect = element.getBoundingClientRect()
+      const activeRect = active.getBoundingClientRect()
+      return activeRect.top >= menuRect.top && activeRect.bottom <= menuRect.bottom
+    })).toBe(true)
+
+    await activeItem.dispatchEvent('pointerdown', { pointerType: 'mouse', button: 0 })
+    await expect(menu).toBeVisible()
+
+    await page.locator('.chat-thread').click({ position: { x: 8, y: 8 } })
+    await expect(menu).toHaveCount(0)
+    await expect(textarea).toHaveValue('/')
+  })
+
   test('sidebar toggle works on mobile viewport', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 667 })
 

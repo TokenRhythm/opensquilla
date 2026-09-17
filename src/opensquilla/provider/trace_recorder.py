@@ -1,9 +1,9 @@
 """Best-effort provider request/response trace recorder.
 
 The recorder is intentionally side-effect safe: failures to write traces must
-never affect model calls. It records no authorization headers and is enabled by
-environment so external harnesses can keep full diagnostics without changing
-provider behavior.
+never affect model calls. It records no authorization headers or upstream error
+prose and is enabled by environment so external harnesses can keep bounded
+diagnostics without changing provider behavior.
 """
 
 from __future__ import annotations
@@ -22,8 +22,10 @@ from opensquilla.safety.secret_redaction import redact_secret_value
 from .tokenrhythm_correlation import (
     TOKENRHYTHM_CALL_KIND_HEADER,
     TOKENRHYTHM_EXECUTION_ID_HEADER,
+    TOKENRHYTHM_INSTALL_ID_HEADER,
     TOKENRHYTHM_SESSION_ID_HEADER,
     TOKENRHYTHM_TURN_ID_HEADER,
+    redact_tokenrhythm_install_ids,
 )
 
 _DEFAULT_TRACE_PATH = "/tmp/opensquilla-llm-calls.jsonl"
@@ -36,6 +38,7 @@ _PRESENT = "[PRESENT]"
 _CORRELATION_HEADER_NAMES = frozenset(
     name.lower()
     for name in (
+        TOKENRHYTHM_INSTALL_ID_HEADER,
         TOKENRHYTHM_SESSION_ID_HEADER,
         TOKENRHYTHM_TURN_ID_HEADER,
         TOKENRHYTHM_EXECUTION_ID_HEADER,
@@ -65,7 +68,22 @@ def _include_chunks_from_env() -> bool:
 
 
 def _redact(value: Any, *, key: str | None = None) -> Any:
-    return redact_secret_value(value, key=key)
+    return _redact_install_ids(redact_secret_value(value, key=key))
+
+
+def _redact_install_ids(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_tokenrhythm_install_ids(value)
+    if isinstance(value, dict):
+        return {
+            redact_tokenrhythm_install_ids(str(item_key)): _redact_install_ids(item_value)
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_install_ids(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_install_ids(item) for item in value)
+    return value
 
 
 def _redact_request_headers(headers: dict[str, Any]) -> dict[str, Any]:
@@ -139,6 +157,23 @@ class LLMTraceRecorder:
             }
         )
 
+    def record_response_headers(
+        self,
+        *,
+        response_ids: list[str] | None = None,
+    ) -> None:
+        """Record response identity without retaining arbitrary HTTP headers."""
+
+        safe_ids = _redact(response_ids or [])
+        if not safe_ids:
+            return
+        self._append(
+            {
+                "event": "llm.response_headers",
+                "response_ids": safe_ids,
+            }
+        )
+
     def record_response(
         self,
         *,
@@ -158,12 +193,12 @@ class LLMTraceRecorder:
                 "response": _redact(response or {}),
                 "response_sha256": _sha256(_redact(response or {})) if response else None,
                 "usage": _redact(usage or {}),
-                "stop_reason": stop_reason,
-                "actual_model": actual_model,
+                "stop_reason": _redact(stop_reason),
+                "actual_model": _redact(actual_model),
                 "assistant_text": _redact(assistant_text),
                 "reasoning_content": _redact(reasoning_content),
                 "tool_calls": _redact(tool_calls or []),
-                "response_ids": response_ids or [],
+                "response_ids": _redact(response_ids or []),
                 "metadata": _redact(metadata or {}),
             }
         )
@@ -177,13 +212,49 @@ class LLMTraceRecorder:
         response_body: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        """Record bounded error diagnostics without retaining upstream prose.
+
+        Provider error messages and response bodies are untrusted and can echo
+        prompts, generated text, credentials, or provider-internal details.
+        Preserve their sizes for diagnostics, but never persist their content
+        in the normal trace record.
+        """
+
+        normalized_code = str(code or "").strip().lower().replace("-", "_")
+        safe_codes = {
+            "cancelled",
+            "empty_response",
+            "incomplete_stream",
+            "incomplete_tool_call",
+            "incomplete_tool_stream",
+            "invalid_json",
+            "invalid_response",
+            "invalid_stream_frame",
+            "invalid_stream_order",
+            "provider_protocol_error",
+            "provider_pretext_buffer_exhausted",
+            "request_error",
+            "timeout",
+        }
+        safe_code = (
+            str(status_code)
+            if status_code is not None
+            else normalized_code
+            if normalized_code in safe_codes
+            else "provider_error"
+        )
         self._append(
             {
                 "event": "llm.error",
-                "code": code,
-                "message": _redact(message),
+                "code": safe_code,
+                "code_chars": len(code or ""),
+                "message": "Provider request failed",
+                "message_chars": len(message),
                 "status_code": status_code,
-                "response_body": _redact(response_body),
+                # Keep the legacy field for trace-schema compatibility while
+                # enforcing the no-upstream-body storage boundary.
+                "response_body": None,
+                "response_body_chars": len(response_body or ""),
                 "metadata": _redact(metadata or {}),
             }
         )
@@ -209,5 +280,8 @@ class LLMTraceRecorder:
             with target.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str))
                 handle.write("\n")
-        except OSError:
+        except Exception:
+            # Provider tracing is optional diagnostics. Invalid paths, custom
+            # serializers, or local filesystem failures must never affect the
+            # physical model request whose already-redacted row is being saved.
             return

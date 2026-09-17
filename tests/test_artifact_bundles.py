@@ -146,6 +146,34 @@ def test_auto_bundle_reports_partial_for_missing_dynamic_and_unsafe_dependencies
     assert {item.path for item in bundle.files} == {"app.js", "index.html"}
 
 
+def test_auto_bundle_keeps_remote_css_url_import_single_file_complete(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    html = workspace / "index.html"
+    html.write_text(
+        """
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Inter');
+        </style>
+        <h1>Remote font stays an external preview resource</h1>
+        """,
+        encoding="utf-8",
+    )
+
+    bundle = collect_artifact_bundle(
+        html,
+        workspace_root=workspace,
+        mode="auto",
+    )
+
+    assert bundle is not None
+    assert bundle.collection_status == "complete"
+    assert bundle.warning_codes == ()
+    assert {item.path for item in bundle.files} == {"index.html"}
+
+
 def test_auto_bundle_collects_literal_service_worker_and_marks_dynamic_url_partial(
     tmp_path: Path,
 ) -> None:
@@ -810,6 +838,75 @@ async def test_publish_artifact_defaults_to_auto_bundle_and_reports_partial(
     )
     assert manifest is not None
     assert {item.path for item in manifest.files} == {"app.js", "index.html"}
+
+
+@pytest.mark.parametrize(
+    ("bundle", "bundle_root"),
+    [
+        ("none", ""),
+        ("none", " \t\r\n"),
+        ("auto", ""),
+        ("auto", " \t\r\n"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_publish_artifact_treats_blank_optional_bundle_root_as_omitted(
+    tmp_path: Path,
+    bundle: str,
+    bundle_root: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "index.html").write_text("<p>entry</p>", encoding="utf-8")
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        result = json.loads(
+            await publish_artifact(
+                path="index.html",
+                bundle=bundle,
+                bundle_root=bundle_root,
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result["status"] == "published"
+    assert ("bundle" in result) is (bundle == "auto")
+
+
+@pytest.mark.parametrize("bundle", ["none", "auto"])
+@pytest.mark.asyncio
+async def test_publish_artifact_rejects_nonempty_bundle_root_outside_directory_mode(
+    tmp_path: Path,
+    bundle: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "index.html").write_text("<p>entry</p>", encoding="utf-8")
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError, match="only valid with directory mode"):
+            await publish_artifact(
+                path="index.html",
+                bundle=bundle,
+                bundle_root=".",
+            )
+    finally:
+        current_tool_context.reset(token)
 
 
 @pytest.mark.asyncio

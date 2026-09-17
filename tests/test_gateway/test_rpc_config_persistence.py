@@ -21,9 +21,11 @@ import structlog.testing
 
 import opensquilla.gateway.rpc_config as rpc_config
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_config import (
     _handle_config_apply,
+    _handle_config_patch,
     _handle_config_patch_safe,
     _handle_config_set,
 )
@@ -48,6 +50,57 @@ def _write_small_config(path) -> None:
 
 
 # --- sparse persist -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("writer", ["set", "patch", "apply"])
+async def test_config_writers_reject_provider_only_compaction(
+    cfg_path,
+    writer: str,
+) -> None:
+    cfg = GatewayConfig(config_path=str(cfg_path))
+    ctx = _ctx(cfg)
+
+    with pytest.raises(
+        ValueError,
+        match="compaction.provider requires compaction.model",
+    ):
+        if writer == "set":
+            await _handle_config_set(
+                {"path": "compaction.provider", "value": "openai"},
+                ctx,
+            )
+        elif writer == "patch":
+            await _handle_config_patch(
+                {"patches": {"compaction.provider": "openai"}},
+                ctx,
+            )
+        else:
+            payload = cfg.model_dump(mode="python")
+            payload["compaction"]["provider"] = "openai"
+            payload["compaction"]["model"] = None
+            await _handle_config_apply({"config": payload}, ctx)
+
+    assert cfg.compaction.provider is None
+    assert cfg.compaction.model is None
+    assert not cfg_path.exists()
+
+
+async def test_config_writer_accepts_complete_compaction_deployment(cfg_path) -> None:
+    cfg = GatewayConfig(config_path=str(cfg_path))
+
+    await _handle_config_set(
+        {
+            "path": "compaction",
+            "value": {"provider": "openai", "model": "gpt-summary"},
+        },
+        _ctx(cfg),
+    )
+
+    assert cfg.compaction.provider == "openai"
+    assert cfg.compaction.model == "gpt-summary"
+    persisted = tomllib.loads(cfg_path.read_text())
+    assert persisted["compaction"]["provider"] == "openai"
+    assert persisted["compaction"]["model"] == "gpt-summary"
 
 
 async def test_config_set_is_sparse_and_preserves_foreign_disk_keys(cfg_path) -> None:
@@ -442,6 +495,6 @@ def test_rpc_config_persist_delegates_to_sparse_persister(
 
     monkeypatch.setattr(config_store, "persist_config", _record)
 
-    rpc_config._persist_config(cfg)
+    persist_gateway_config(cfg)
 
     assert calls == [(cfg, cfg.config_path)]

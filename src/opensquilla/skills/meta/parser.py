@@ -156,6 +156,22 @@ def parse_meta_plan(spec: SkillSpec) -> MetaPlan | None:
                 f"a non-empty string (target step id) or omitted",
             )
 
+        side_effect_raw = raw.get("side_effect", "")
+        if side_effect_raw in (None, ""):
+            side_effect = ""
+        elif side_effect_raw == "external_paid_submit":
+            if kind != "skill_exec":
+                raise MetaPlanError(
+                    f"meta-skill {spec.name!r}: step {step_id!r} "
+                    "external_paid_submit is only valid for kind=skill_exec",
+                )
+            side_effect = side_effect_raw
+        else:
+            raise MetaPlanError(
+                f"meta-skill {spec.name!r}: step {step_id!r} side_effect must be "
+                "'external_paid_submit' or omitted",
+            )
+
         clarify_config = None
         if kind == "user_input":
             clarify_config = _parse_clarify_config(
@@ -208,6 +224,7 @@ def parse_meta_plan(spec: SkillSpec) -> MetaPlan | None:
                 tool_args=tool_args,
                 tool_allowlist=tool_allowlist,
                 on_failure=on_failure,
+                side_effect=side_effect,
                 clarify_config=clarify_config,
                 label=label,
                 label_by_language=label_by_language,

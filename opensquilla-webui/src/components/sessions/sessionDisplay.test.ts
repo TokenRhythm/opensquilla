@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { sessionAgentIdentity, sessionStatusBadge } from './sessionDisplay'
+import { sessionAgentIdentity, sessionStatusBadge, subagentRowTitle } from './sessionDisplay'
 import type { SessionItem } from '@/composables/useSessions'
 
 function sessionItem(overrides: Partial<SessionItem>): SessionItem {
@@ -12,18 +12,15 @@ function sessionItem(overrides: Partial<SessionItem>): SessionItem {
     sessionKind: 'chat',
     surface: 'webchat',
     conversationKind: 'direct',
-    threadLabel: '',
-    channelContext: null,
     status: 'killed',
-    visualStatus: 'killed',
     runStatus: 'cancelled',
     runLabel: 'Stopped after 1s',
     messageCount: 1,
     updatedAt: 1000,
-    interactive: true,
+    model: '',
+    parent: null,
     forkedFromParent: false,
-    contractGaps: [],
-    raw: { key: 'agent:main:webchat:test' },
+    hasContractGaps: false,
     ...overrides,
   }
 }
@@ -64,5 +61,15 @@ describe('sessionAgentIdentity', () => {
       kind: 'known',
       value: 'Main agent',
     })
+  })
+})
+
+describe('subagentRowTitle', () => {
+  it('shows the child title while retaining the lineage marker', () => {
+    expect(subagentRowTitle('Analyze checkout failures')).toBe('↳ Analyze checkout failures')
+  })
+
+  it('keeps the localized compatibility fallback for an empty title', () => {
+    expect(subagentRowTitle('  ')).toBe('↳ Subagent')
   })
 })

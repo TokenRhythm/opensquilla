@@ -50,6 +50,7 @@ from opensquilla.engine.routing.policy import (
     record_budget_gate_trail,
     record_capability_gate_trail,
     record_provider_mismatch_veto_trail,
+    resolve_large_context_floor_tier,
     route_class_for_tier,
     tier_for_route_class,
 )
@@ -94,6 +95,7 @@ __all__ = [
     "record_capability_gate_trail",
     "record_provider_mismatch_veto_trail",
     "route_class_for_tier",
+    "resolve_large_context_floor_tier",
     "save_calibration",
     "tier_for_route_class",
 ]

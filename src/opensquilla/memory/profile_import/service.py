@@ -128,6 +128,27 @@ def _declared_source(request: ProfileImportPreviewRequest) -> str | None:
     return source or None
 
 
+def _has_applied_import_decision(output: FusionOutput) -> bool:
+    return any(
+        decision.outcome is DecisionOutcome.APPLIED
+        and decision.target is DecisionTarget.IMPORT
+        for decision in output.decisions
+    )
+
+
+def _validate_normal_import_output(output: FusionOutput) -> None:
+    has_applied_import = _has_applied_import_decision(output)
+    has_import_content = bool((output.candidate.import_md or "").strip())
+    if has_applied_import and not has_import_content:
+        raise ProfileImportInvalidOutputError(
+            "profile fusion output applies IMPORT without non-empty IMPORT content"
+        )
+    if has_import_content and not has_applied_import:
+        raise ProfileImportInvalidOutputError(
+            "profile fusion output contains IMPORT content without an applied IMPORT decision"
+        )
+
+
 class ProfileImportService:
     """One-agent profile import service with a dependency-injected model call."""
 
@@ -394,6 +415,8 @@ class ProfileImportService:
                 system_prompt=FUSION_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 evidence_source=raw_text,
+                retry_invalid_response=True,
+                validate_normal_import=True,
             )
         except asyncio.CancelledError:
             async with _agent_lock(self.paths):
@@ -683,6 +706,8 @@ class ProfileImportService:
                 if record.status is ImportStatus.DISCARDED or record.expires_at <= now:
                     raise ProfileImportPreviewExpiredError("profile import preview has expired")
 
+                self._assert_import_preview_consistent(record)
+
                 key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
                 if (
                     record.idempotency_key_hash is not None
@@ -906,6 +931,8 @@ class ProfileImportService:
         system_prompt: str,
         user_prompt: str,
         evidence_source: str,
+        retry_invalid_response: bool = False,
+        validate_normal_import: bool = False,
     ) -> FusionOutput:
         if self.complete is None:
             raise ProfileImportUnavailableError("the configured default model is unavailable")
@@ -924,8 +951,26 @@ class ProfileImportService:
             raise ProfileImportInputTooLargeError(
                 "the complete profile import request exceeds the model input limit"
             )
+
+        def parse_and_validate(raw_response: str) -> FusionOutput:
+            output = parse_fusion_output(raw_response, imported_profile=evidence_source)
+            if validate_normal_import:
+                _validate_normal_import_output(output)
+            return output
+
         raw = await self._call_model(initial)
-        return parse_fusion_output(raw, imported_profile=evidence_source)
+        try:
+            return parse_and_validate(raw)
+        except ProfileImportInvalidOutputError:
+            if not retry_invalid_response:
+                raise
+        # A provider can satisfy the transport contract while returning a
+        # malformed structured result. Keep that provider noise inside the
+        # import operation: retry the identical bounded request once, then run
+        # the same schema and evidence validation again. Do not retry provider
+        # failures, oversized/non-text responses, or the undo flow.
+        retry_raw = await self._call_model(initial)
+        return parse_and_validate(retry_raw)
 
     async def _call_model(self, request: FusionModelRequest) -> str:
         assert self.complete is not None
@@ -957,6 +1002,18 @@ class ProfileImportService:
         ):
             raise ProfileImportStalePreviewError(
                 "the local profile changed after this import preview"
+            )
+
+    def _assert_import_preview_consistent(self, record: InternalPreviewRecord) -> None:
+        if record.operation != "import":
+            return
+        has_applied_import = _has_applied_import_decision(record.fusion_output)
+        has_import_plan = any(
+            plan.target is DecisionTarget.IMPORT for plan in record.files
+        )
+        if has_applied_import != has_import_plan:
+            raise ProfileImportStalePreviewError(
+                "profile import preview is incomplete; generate a new preview before applying"
             )
 
     def _apply_import(

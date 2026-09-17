@@ -584,6 +584,8 @@ async def test_preflight_rejects_tool_not_in_allowed_list() -> None:
     assert payload["error_class"] == "PolicyDenied"
 
 
+
+
 @pytest.mark.asyncio
 async def test_preflight_blocks_untrusted_origin() -> None:
     """A tool_call whose origin trace lies inside an <untrusted> block is

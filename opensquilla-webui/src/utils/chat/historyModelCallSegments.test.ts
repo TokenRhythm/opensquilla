@@ -46,6 +46,11 @@ describe('interleaveHistoryModelCallSegments', () => {
         turnId: 'turn-1',
         restoredFromHistory: true,
         usage: {
+          routed_tier: 'c1',
+          routed_model: 'provider/initial',
+          routing_source: 'squilla_router',
+          router_model_call_id: '1.0',
+          router_iteration: 1,
           model_call_segments: [{
             model_call_id: '2.0',
             iteration: 2,
@@ -66,6 +71,13 @@ describe('interleaveHistoryModelCallSegments', () => {
     ])
     expect(result[1]?.messageId).toBeUndefined()
     expect(result[1]?.clientId).toContain('history-model-call-segment:')
+    expect(result[1]?.usage).toBeUndefined()
+    expect(result[1]?.routerUsage).toMatchObject({
+      routed_tier: 'c1',
+      router_model_call_id: '1.0',
+    })
+    expect(result[1]?.routerModelCallId).toBe('1.0')
+    expect(result[1]?.routerIteration).toBe(1)
     expect(result[3]?.messageId).toBe('assistant-1')
     expect(result[3]?.usage?.model_call_segments).toHaveLength(1)
   })

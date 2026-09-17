@@ -5,16 +5,26 @@ from __future__ import annotations
 import inspect
 import json
 import re
-import subprocess
 import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
+from opensquilla.git_runtime import (
+    GitRunResult,
+    GitRunState,
+    probe_git_repository,
+    run_git,
+)
+
 RuntimeResult = dict[str, Any] | Awaitable[dict[str, Any]]
 RuntimeRunner = Callable[..., RuntimeResult]
 RuntimeJudge = Callable[..., RuntimeResult]
+
+
+class _RuntimeWorkspaceGitError(RuntimeError):
+    """A structured Git setup failure that the runtime runner can report."""
 
 
 def _normalise_prompts(eval_prompts: object, skill_md: str) -> list[str]:
@@ -92,14 +102,27 @@ def _normalise_winner(value: object) -> str:
 
 
 def _is_git_repo(path: Path) -> bool:
-    proc = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return proc.returncode == 0 and proc.stdout.strip() == "true"
+    return probe_git_repository(path) is GitRunState.OK
+
+
+def _require_runtime_git(
+    args: tuple[str, ...],
+    *,
+    cwd: Path,
+    operation: str,
+) -> None:
+    result = run_git(args, cwd=cwd, timeout=10.0)
+    if result.ok:
+        return
+    raise _RuntimeWorkspaceGitError(_runtime_git_error(operation, result))
+
+
+def _runtime_git_error(operation: str, result: GitRunResult) -> str:
+    if result.state is GitRunState.UNAVAILABLE:
+        reason = result.capability.reason or "git_not_found"
+        return f"runtime E2E workspace requires Git, but it is unavailable ({reason})"
+    detail = result.stderr_text.strip() or result.stdout_text.strip() or result.state.value
+    return f"runtime E2E workspace Git {operation} failed ({detail[:500]})"
 
 
 def _prepare_runtime_workspace(root: Path, workspace_dir: str | None) -> Path:
@@ -110,32 +133,32 @@ def _prepare_runtime_workspace(root: Path, workspace_dir: str | None) -> Path:
 
     runtime_workspace = root / "runtime-workspace"
     runtime_workspace.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "init"],
+    _require_runtime_git(
+        ("init",),
         cwd=runtime_workspace,
-        capture_output=True,
-        text=True,
-        check=True,
+        operation="init",
     )
-    subprocess.run(
-        ["git", "config", "user.email", "runtime-e2e@example.test"],
+    _require_runtime_git(
+        ("config", "user.email", "runtime-e2e@example.test"),
         cwd=runtime_workspace,
-        check=True,
+        operation="config user.email",
     )
-    subprocess.run(
-        ["git", "config", "user.name", "Runtime E2E"],
+    _require_runtime_git(
+        ("config", "user.name", "Runtime E2E"),
         cwd=runtime_workspace,
-        check=True,
+        operation="config user.name",
     )
     sample = runtime_workspace / "README.md"
     sample.write_text("# Runtime E2E fixture\n\nbaseline\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=runtime_workspace, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "baseline"],
+    _require_runtime_git(
+        ("add", "README.md"),
         cwd=runtime_workspace,
-        capture_output=True,
-        text=True,
-        check=True,
+        operation="add fixture",
+    )
+    _require_runtime_git(
+        ("commit", "-m", "baseline"),
+        cwd=runtime_workspace,
+        operation="commit fixture",
     )
     sample.write_text(
         "# Runtime E2E fixture\n\nbaseline\n\ncandidate change\n",
@@ -376,7 +399,15 @@ def make_runtime_e2e_context(
             skill_dir = candidate_root / skill_name
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
-            runtime_workspace = _prepare_runtime_workspace(tmp_path, workspace_dir)
+            try:
+                runtime_workspace = _prepare_runtime_workspace(tmp_path, workspace_dir)
+            except _RuntimeWorkspaceGitError as exc:
+                return {
+                    "route": "meta",
+                    "text": "",
+                    "ok": False,
+                    "error": str(exc),
+                }
 
             from opensquilla.skills.loader import SkillLoader
 

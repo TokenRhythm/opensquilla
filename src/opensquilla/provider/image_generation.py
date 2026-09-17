@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from io import BytesIO
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -21,9 +23,14 @@ from opensquilla.provider.correlation_context import (
     bind_provider_request_correlation,
     current_provider_request_correlation,
 )
+from opensquilla.provider.error_redaction import redacted_httpx_error
+from opensquilla.provider.image_generation_credentials import (
+    ImageGenerationCredentialResolution,
+    report_image_generation_pool_failure,
+    resolve_image_generation_credential,
+)
 from opensquilla.provider.image_generation_policy import (
     conflicting_image_generation_endpoint_provider,
-    image_generation_llm_endpoint_allows_credential_reuse,
     is_valid_image_generation_base_url,
     parse_image_generation_model_ref,
     resolve_image_generation_base_url,
@@ -33,7 +40,10 @@ from opensquilla.provider.qwen_token_plan import (
     QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
 )
 from opensquilla.provider.tokenrhythm_correlation import (
+    is_tokenrhythm_correlation_target,
+    redact_tokenrhythm_install_ids,
     tokenrhythm_correlation_headers,
+    tokenrhythm_install_id_headers,
 )
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
@@ -50,6 +60,11 @@ class ImageGenerationRequest:
     output_format: str = "png"
     timeout_seconds: float = 180.0
     provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
+    credential_session_key: str = field(default="", repr=False)
+    credential_resolution: ImageGenerationCredentialResolution | None = field(
         default=None,
         repr=False,
     )
@@ -78,6 +93,70 @@ class ImageGenerationProvider(Protocol):
     auth_env_vars: tuple[str, ...]
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult: ...
+
+
+ImageCredentialResolver = Callable[
+    [ImageGenerationRequest],
+    ImageGenerationCredentialResolution,
+]
+
+
+def _api_key_for_request(provider: object, request: ImageGenerationRequest) -> str:
+    resolution = request.credential_resolution
+    if resolution is not None:
+        return clean_header_secret(
+            resolution.api_key,
+            label=f"{getattr(provider, 'provider_id', 'image')} image API key",
+        )
+    resolver = getattr(provider, "_credential_resolver", None)
+    if callable(resolver):
+        resolved = resolver(request)
+        return clean_header_secret(
+            resolved.api_key,
+            label=f"{getattr(provider, 'provider_id', 'image')} image API key",
+        )
+    fallback = getattr(provider, "_resolve_api_key", None)
+    return str(fallback() if callable(fallback) else "")
+
+
+def _install_id_safe_exception(
+    exc: Exception,
+    *,
+    api_key: str,
+) -> Exception | None:
+    """Return a safe replacement when an exception may retain provider secrets."""
+
+    if isinstance(exc, httpx.HTTPError):
+        # HTTPX errors retain their request and, for status errors, response
+        # objects. The install id may therefore be present even when str(exc)
+        # contains no echo of it.
+        return redacted_httpx_error(exc, api_key=api_key)
+
+    if isinstance(exc, json.JSONDecodeError):
+        safe_document = redact_tokenrhythm_install_ids(exc.doc)
+        if safe_document != exc.doc:
+            # JSONDecodeError retains the complete response body in ``doc``
+            # even though its normal string form only reports line/column.
+            return RuntimeError("Image generation provider returned invalid JSON")
+
+    raw_error = str(exc)
+    safe_error = redact_tokenrhythm_install_ids(raw_error)
+    if safe_error != raw_error:
+        return RuntimeError(safe_error)
+
+    retained_state = repr(getattr(exc, "__dict__", {}))
+    if redact_tokenrhythm_install_ids(retained_state) != retained_state:
+        return RuntimeError("Image generation provider request failed")
+    return None
+
+
+def _detach_exception(exc: Exception) -> Exception:
+    """Detach traceback links before re-raising from a scrubbed boundary."""
+
+    exc.__cause__ = None
+    exc.__context__ = None
+    exc.__traceback__ = None
+    return exc
 
 
 class OpenAIImageGenerationProvider:
@@ -111,9 +190,13 @@ class OpenAIImageGenerationProvider:
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         _raise_for_conflicting_official_endpoint(self.provider_id, self._base_url)
-        api_key = self._resolve_api_key()
+        api_key = _api_key_for_request(self, request)
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
+        protect_install_id = is_tokenrhythm_correlation_target(
+            self._provider_kind,
+            self._base_url,
+        )
 
         payload = {
             "model": request.model,
@@ -129,6 +212,11 @@ class OpenAIImageGenerationProvider:
             model=request.model,
             base_url=self._base_url,
         )
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        response: Any = None
+        data: Any = None
         try:
             async with httpx.AsyncClient(
                 timeout=request.timeout_seconds,
@@ -139,6 +227,10 @@ class OpenAIImageGenerationProvider:
                     self._api_url("/v1/images/generations"),
                     headers={
                         "Authorization": f"Bearer {api_key}",
+                        **tokenrhythm_install_id_headers(
+                            self._provider_kind,
+                            self._base_url,
+                        ),
                         **tokenrhythm_correlation_headers(
                             self._provider_kind,
                             self._base_url,
@@ -154,28 +246,127 @@ class OpenAIImageGenerationProvider:
                     raw_json=str(getattr(response, "text", "") or ""),
                 )
         except asyncio.CancelledError:
-            await usage.mark_unknown("cancelled")
-            raise
-        except Exception:
-            await usage.mark_unknown("direct_request_failed")
-            raise
+            if not protect_install_id:
+                await usage.mark_unknown("cancelled")
+                raise
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("cancelled")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            cancelled_request_error = asyncio.CancelledError()
+        except Exception as exc:
+            if not protect_install_id:
+                await usage.mark_unknown("direct_request_failed")
+                raise
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            if safe_error is None:
+                safe_error = _detach_exception(exc)
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("direct_request_failed")
+            except asyncio.CancelledError:
+                cancelled_request_error = asyncio.CancelledError()
+            except Exception:
+                safe_request_error = safe_error
+            else:
+                safe_request_error = safe_error
 
-        items = data.get("data") or []
-        if not items:
-            raise RuntimeError("Image generation provider returned no images")
-        first = items[0]
-        b64_json = first.get("b64_json")
-        if not b64_json:
-            raise RuntimeError("Image generation provider returned no b64_json")
-        image_bytes = base64.b64decode(b64_json)
+        if cancelled_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            # Raise outside the exception handler so the original exception is
+            # not retained as a secret-bearing ``__context__``.
+            raise safe_request_error
+
+        if not protect_install_id:
+            items = data.get("data") or []
+            if not items:
+                raise RuntimeError("Image generation provider returned no images")
+            first = items[0]
+            b64_json = first.get("b64_json")
+            if not b64_json:
+                raise RuntimeError(
+                    "Image generation provider returned no b64_json"
+                )
+            image_bytes = base64.b64decode(b64_json)
+            output_format = request.output_format.lower()
+            mime_type = (
+                "image/jpeg"
+                if output_format in {"jpg", "jpeg"}
+                else f"image/{output_format}"
+            )
+            return ImageGenerationResult(
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+                model=request.model,
+                provider=self.provider_id,
+                revised_prompt=first.get("revised_prompt"),
+            )
+
+        postprocess_error: Exception | None = None
+        safe_items: Any = None
+        safe_first: Any = None
+        safe_b64_json: Any = None
+        raw_revised_prompt: Any = None
+        revised_prompt: str | None = None
+        try:
+            safe_items = data.get("data") or []
+            if not safe_items:
+                raise RuntimeError("Image generation provider returned no images")
+            safe_first = safe_items[0]
+            safe_b64_json = safe_first.get("b64_json")
+            if not safe_b64_json:
+                raise RuntimeError(
+                    "Image generation provider returned no b64_json"
+                )
+            image_bytes = base64.b64decode(safe_b64_json)
+            raw_revised_prompt = safe_first.get("revised_prompt")
+            if isinstance(raw_revised_prompt, str):
+                revised_prompt = redact_tokenrhythm_install_ids(raw_revised_prompt)
+        except Exception as exc:
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            postprocess_error = safe_error or _detach_exception(exc)
+
+        client = None
+        response = None
+        data = None
+        payload = {}
+        safe_items = None
+        safe_first = None
+        safe_b64_json = None
+        raw_revised_prompt = None
+        if postprocess_error is not None:
+            raise postprocess_error
+
         output_format = request.output_format.lower()
-        mime_type = "image/jpeg" if output_format in {"jpg", "jpeg"} else f"image/{output_format}"
+        mime_type = (
+            "image/jpeg"
+            if output_format in {"jpg", "jpeg"}
+            else f"image/{output_format}"
+        )
         return ImageGenerationResult(
             image_bytes=image_bytes,
             mime_type=mime_type,
             model=request.model,
             provider=self.provider_id,
-            revised_prompt=first.get("revised_prompt"),
+            revised_prompt=revised_prompt,
         )
 
 
@@ -219,9 +410,13 @@ class OpenRouterImageGenerationProvider:
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         _raise_for_conflicting_official_endpoint(self.provider_id, self._base_url)
-        api_key = self._resolve_api_key()
+        api_key = _api_key_for_request(self, request)
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
+        protect_install_id = is_tokenrhythm_correlation_target(
+            self._provider_kind,
+            self._base_url,
+        )
 
         payload = {
             "model": request.model,
@@ -237,6 +432,11 @@ class OpenRouterImageGenerationProvider:
             model=request.model,
             base_url=self._base_url,
         )
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        response: Any = None
+        data: Any = None
         try:
             async with httpx.AsyncClient(
                 timeout=request.timeout_seconds,
@@ -249,6 +449,10 @@ class OpenRouterImageGenerationProvider:
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                         **provider_app_headers(self._base_url),
+                        **tokenrhythm_install_id_headers(
+                            self._provider_kind,
+                            self._base_url,
+                        ),
                         **tokenrhythm_correlation_headers(
                             self._provider_kind,
                             self._base_url,
@@ -264,21 +468,299 @@ class OpenRouterImageGenerationProvider:
                     raw_json=str(getattr(response, "text", "") or ""),
                 )
         except asyncio.CancelledError:
-            await usage.mark_unknown("cancelled")
-            raise
-        except Exception:
-            await usage.mark_unknown("direct_request_failed")
-            raise
+            if not protect_install_id:
+                await usage.mark_unknown("cancelled")
+                raise
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("cancelled")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            cancelled_request_error = asyncio.CancelledError()
+        except Exception as exc:
+            if not protect_install_id:
+                await usage.mark_unknown("direct_request_failed")
+                raise
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            if safe_error is None:
+                safe_error = _detach_exception(exc)
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("direct_request_failed")
+            except asyncio.CancelledError:
+                cancelled_request_error = asyncio.CancelledError()
+            except Exception:
+                safe_request_error = safe_error
+            else:
+                safe_request_error = safe_error
 
-        image_url = _extract_openrouter_image_url(data)
-        if not image_url:
-            raise RuntimeError("Image generation provider returned no images")
-        mime_type, image_bytes = _decode_data_url(image_url)
+        if cancelled_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise safe_request_error
+
+        if not protect_install_id:
+            image_url = _extract_openrouter_image_url(data)
+            if not image_url:
+                raise RuntimeError("Image generation provider returned no images")
+            mime_type, image_bytes = _decode_data_url(image_url)
+            return ImageGenerationResult(
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+                model=request.model,
+                provider=self.provider_id,
+            )
+
+        postprocess_error: Exception | None = None
+        safe_image_url: str | None = None
+        try:
+            safe_image_url = _extract_openrouter_image_url(data)
+            if not safe_image_url:
+                raise RuntimeError("Image generation provider returned no images")
+            mime_type, image_bytes = _decode_data_url(safe_image_url)
+        except Exception as exc:
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            postprocess_error = safe_error or _detach_exception(exc)
+
+        client = None
+        response = None
+        data = None
+        payload = {}
+        safe_image_url = None
+        if postprocess_error is not None:
+            raise postprocess_error
+
         return ImageGenerationResult(
             image_bytes=image_bytes,
             mime_type=mime_type,
             model=request.model,
             provider=self.provider_id,
+        )
+
+
+class TokenRhythmImageGenerationProvider:
+    """OpenAI Images-compatible adapter for TokenRhythm image models."""
+
+    provider_id = "tokenrhythm"
+    default_model = "qwen-image-2.0"
+    auth_env_vars: tuple[str, ...] = ("TOKENRHYTHM_API_KEY",)
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_key_env: str = "TOKENRHYTHM_API_KEY",
+        base_url: str = "https://tokenrhythm.studio/v1",
+    ) -> None:
+        self._api_key = api_key
+        self._api_key_env = api_key_env
+        self._base_url = base_url.rstrip("/")
+
+    def _resolve_api_key(self) -> str:
+        return clean_header_secret(
+            self._api_key or os.environ.get(self._api_key_env, ""),
+            label=f"{self.provider_id} image API key",
+        )
+
+    def _api_url(self, path: str) -> str:
+        if self._base_url.endswith("/v1") and path.startswith("/v1/"):
+            return f"{self._base_url}{path[3:]}"
+        return f"{self._base_url}{path}"
+
+    async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+        _raise_for_conflicting_official_endpoint(self.provider_id, self._base_url)
+        api_key = _api_key_for_request(self, request)
+        if not api_key:
+            raise RuntimeError(f"{self._api_key_env} is not set")
+
+        payload = {
+            "model": request.model,
+            "prompt": request.prompt,
+            "size": request.size,
+            "n": 1,
+        }
+        from opensquilla.engine.usage_http import reserve_direct_usage_call
+
+        usage = await reserve_direct_usage_call(
+            provider=self.provider_id,
+            model=request.model,
+            base_url=self._base_url,
+        )
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        response: Any = None
+        data: Any = None
+        try:
+            async with httpx.AsyncClient(
+                timeout=request.timeout_seconds,
+                trust_env=_trust_env(),
+                follow_redirects=False,
+            ) as client:
+                response = await client.post(
+                    self._api_url("/v1/images/generations"),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        **provider_app_headers(self._base_url),
+                        **tokenrhythm_install_id_headers(
+                            "tokenrhythm",
+                            self._base_url,
+                        ),
+                        **tokenrhythm_correlation_headers(
+                            "tokenrhythm",
+                            self._base_url,
+                            request.provider_request_correlation,
+                        ),
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                await usage.finalize_openai_response(
+                    data,
+                    raw_json=str(getattr(response, "text", "") or ""),
+                    allow_billing_only=True,
+                )
+        except asyncio.CancelledError:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("cancelled")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            cancelled_request_error = asyncio.CancelledError()
+        except Exception as exc:
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            if safe_error is None:
+                safe_error = _detach_exception(exc)
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("direct_request_failed")
+            except asyncio.CancelledError:
+                cancelled_request_error = asyncio.CancelledError()
+            except Exception:
+                safe_request_error = safe_error
+            else:
+                safe_request_error = safe_error
+
+        if cancelled_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise safe_request_error
+
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+            client = None
+            response = None
+            data = None
+            payload = {}
+            items = None
+            raise RuntimeError("Image generation provider returned no images")
+        first: Any = items[0]
+        b64_json: Any = first.get("b64_json")
+        image_url: Any = first.get("url")
+        raw_revised_prompt = first.get("revised_prompt")
+        revised_prompt = (
+            redact_tokenrhythm_install_ids(raw_revised_prompt)
+            if isinstance(raw_revised_prompt, str)
+            else None
+        )
+        client = None
+        response = None
+        data = None
+        payload = {}
+        items = None
+        first = None
+        raw_revised_prompt = None
+        if isinstance(b64_json, str) and b64_json:
+            invalid_b64_json = False
+            try:
+                image_bytes = base64.b64decode(b64_json)
+            except (ValueError, TypeError):
+                invalid_b64_json = True
+            b64_json = None
+            image_url = None
+            if invalid_b64_json:
+                raise RuntimeError(
+                    "Image generation provider returned invalid b64_json"
+                )
+            output_format = request.output_format.lower()
+            mime_type = (
+                "image/jpeg"
+                if output_format in {"jpg", "jpeg"}
+                else f"image/{output_format}"
+            )
+        else:
+            if not isinstance(image_url, str) or not image_url:
+                b64_json = None
+                image_url = None
+                raise RuntimeError(
+                    "Image generation provider returned neither b64_json nor url"
+                )
+            download_error: Exception | None = None
+            download_cancelled: asyncio.CancelledError | None = None
+            if image_url.startswith("data:"):
+                try:
+                    mime_type, image_bytes = _decode_data_url(image_url)
+                except Exception as exc:
+                    safe_error = _install_id_safe_exception(exc, api_key=api_key)
+                    download_error = safe_error or _detach_exception(exc)
+            else:
+                try:
+                    mime_type, image_bytes = await _download_tokenrhythm_image(
+                        image_url,
+                        timeout_seconds=request.timeout_seconds,
+                    )
+                except asyncio.CancelledError:
+                    download_cancelled = asyncio.CancelledError()
+                except Exception as exc:
+                    safe_error = _install_id_safe_exception(exc, api_key=api_key)
+                    download_error = safe_error or _detach_exception(exc)
+            b64_json = None
+            image_url = None
+            if download_cancelled is not None:
+                raise download_cancelled
+            if download_error is not None:
+                raise download_error
+
+        return ImageGenerationResult(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            model=request.model,
+            provider=self.provider_id,
+            revised_prompt=revised_prompt,
         )
 
 
@@ -321,7 +803,7 @@ class QwenTokenPlanImageGenerationProvider:
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         _raise_for_conflicting_official_endpoint(self.provider_id, self._base_url)
-        api_key = self._resolve_api_key()
+        api_key = _api_key_for_request(self, request)
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
 
@@ -425,6 +907,35 @@ async def _download_qwen_token_plan_image(
 ) -> tuple[str, bytes]:
     """Download one signed result URL without exposing it in failures."""
 
+    return await _download_generated_image(
+        image_url,
+        timeout_seconds=timeout_seconds,
+        provider_label="Token Plan",
+    )
+
+
+async def _download_tokenrhythm_image(
+    image_url: str,
+    *,
+    timeout_seconds: float,
+) -> tuple[str, bytes]:
+    """Download one TokenRhythm result URL through the shared SSRF guard."""
+
+    return await _download_generated_image(
+        image_url,
+        timeout_seconds=timeout_seconds,
+        provider_label="TokenRhythm",
+    )
+
+
+async def _download_generated_image(
+    image_url: str,
+    *,
+    timeout_seconds: float,
+    provider_label: str,
+) -> tuple[str, bytes]:
+    """Download one signed generated-image URL without exposing it in failures."""
+
     from opensquilla.tools.ssrf import (
         environment_proxy_url,
         pinned_transport,
@@ -491,15 +1002,15 @@ async def _download_qwen_token_plan_image(
             raise
         except Exception:
             raise RuntimeError(
-                "Failed to securely download the generated Token Plan image"
+                f"Failed to securely download the generated {provider_label} image"
             ) from None
 
         if not image_bytes:
-            raise RuntimeError("Token Plan returned an empty generated image")
+            raise RuntimeError(f"{provider_label} returned an empty generated image")
         mime_type = content_type if content_type.startswith("image/") else "image/png"
         return mime_type, bytes(image_bytes)
 
-    raise RuntimeError("Token Plan generated image exceeded the redirect limit")
+    raise RuntimeError(f"{provider_label} generated image exceeded the redirect limit")
 
 
 def _decode_data_url(data_url: str) -> tuple[str, bytes]:
@@ -597,50 +1108,64 @@ def _field_was_set(config: object | None, name: str) -> bool:
     return isinstance(fields_set, set) and name in fields_set
 
 
-def _resolve_configured_api_key(
-    *,
-    provider_id: str,
-    provider_config: object | None,
-    llm_config: object | None,
-    api_key_env: str,
-    default_base_url: str,
-    effective_base_url: str,
-) -> str | None:
-    explicit = _get_config_attr(provider_config, "api_key")
-    if explicit:
-        return explicit
-
-    env_value = os.environ.get(api_key_env, "")
-    if env_value:
-        return env_value
-
-    if image_generation_llm_endpoint_allows_credential_reuse(
-        provider_id=provider_id,
-        llm_config=llm_config,
-        default_base_url=default_base_url,
-        effective_base_url=effective_base_url,
-    ):
-        # The primary LLM key is a credential for the LLM's endpoint only:
-        # it must not follow a custom image base_url to a different
-        # scheme/host/effective port. Fail closed so generate() reports the
-        # missing key and the operator enters one for the image endpoint.
-        return _get_config_attr(llm_config, "api_key") or None
-    return None
-
-
 def _resolve_configured_base_url(
     *,
     provider_id: str,
     provider_config: object | None,
     llm_config: object | None,
     default_base_url: str,
+    gateway_config: object | None = None,
 ) -> str:
     return resolve_image_generation_base_url(
         provider_id=provider_id,
         provider_config=provider_config,
         llm_config=llm_config,
         default_base_url=default_base_url,
+        gateway_config=gateway_config,
     )
+
+
+def _credential_resolver_for_provider(
+    *,
+    provider_id: str,
+    provider_config: object | None,
+    default_env_key: str,
+    default_base_url: str,
+    effective_base_url: str,
+    gateway_config: object | None,
+    llm_config: object | None,
+) -> ImageCredentialResolver:
+    def resolve(request: ImageGenerationRequest) -> ImageGenerationCredentialResolution:
+        correlation = request.provider_request_correlation
+        session_key = (
+            request.credential_session_key
+            or (correlation.session_id if correlation is not None else "")
+            or (correlation.execution_id if correlation is not None else "")
+            or "image-generation"
+        )
+        return resolve_image_generation_credential(
+            provider_id=provider_id,
+            provider_config=provider_config,
+            default_env_key=default_env_key,
+            default_base_url=default_base_url,
+            effective_base_url=effective_base_url,
+            gateway_config=gateway_config,
+            llm_config=llm_config,
+            model=request.model,
+            runtime=True,
+            session_key=session_key,
+        )
+
+    return resolve
+
+
+def _register_configured_provider(
+    provider: ImageGenerationProvider,
+    *,
+    credential_resolver: ImageCredentialResolver,
+) -> None:
+    setattr(provider, "_credential_resolver", credential_resolver)
+    register_image_generation_provider(provider)
 
 
 def register_image_generation_provider(provider: ImageGenerationProvider) -> None:
@@ -651,11 +1176,13 @@ def reset_image_generation_providers(
     image_config: object | None = None,
     *,
     llm_config: object | None = None,
+    gateway_config: object | None = None,
 ) -> None:
     _PROVIDERS.clear()
     providers_config = getattr(image_config, "providers", None)
     openai_config = getattr(providers_config, "openai", None)
     openrouter_config = getattr(providers_config, "openrouter", None)
+    tokenrhythm_config = getattr(providers_config, "tokenrhythm", None)
     qwen_token_plan_config = getattr(providers_config, "qwen_token_plan", None)
 
     openai_base_url = _resolve_configured_base_url(
@@ -663,6 +1190,7 @@ def reset_image_generation_providers(
         provider_config=openai_config,
         llm_config=llm_config,
         default_base_url="https://api.openai.com/v1",
+        gateway_config=gateway_config,
     )
     openai_api_key_env = credential_env_for_endpoint(
         configured_env=_get_config_attr(openai_config, "api_key_env", "OPENAI_API_KEY"),
@@ -671,25 +1199,38 @@ def reset_image_generation_providers(
         default_base_url="https://api.openai.com/v1",
         effective_base_url=openai_base_url,
     )
-    register_image_generation_provider(
+    openai_credential_resolver = _credential_resolver_for_provider(
+        provider_id="openai",
+        provider_config=openai_config,
+        default_env_key="OPENAI_API_KEY",
+        default_base_url="https://api.openai.com/v1",
+        effective_base_url=openai_base_url,
+        gateway_config=gateway_config,
+        llm_config=llm_config,
+    )
+    openai_initial_credential = resolve_image_generation_credential(
+        provider_id="openai",
+        provider_config=openai_config,
+        default_env_key="OPENAI_API_KEY",
+        default_base_url="https://api.openai.com/v1",
+        effective_base_url=openai_base_url,
+        gateway_config=gateway_config,
+        llm_config=llm_config,
+    )
+    _register_configured_provider(
         OpenAIImageGenerationProvider(
-            api_key=_resolve_configured_api_key(
-                provider_id="openai",
-                provider_config=openai_config,
-                llm_config=llm_config,
-                api_key_env=openai_api_key_env,
-                default_base_url="https://api.openai.com/v1",
-                effective_base_url=openai_base_url,
-            ),
+            api_key=openai_initial_credential.api_key,
             api_key_env=openai_api_key_env,
             base_url=openai_base_url,
-        )
+        ),
+        credential_resolver=openai_credential_resolver,
     )
     openrouter_base_url = _resolve_configured_base_url(
         provider_id="openrouter",
         provider_config=openrouter_config,
         llm_config=llm_config,
         default_base_url="https://openrouter.ai/api/v1",
+        gateway_config=gateway_config,
     )
     openrouter_api_key_env = credential_env_for_endpoint(
         configured_env=_get_config_attr(
@@ -702,25 +1243,82 @@ def reset_image_generation_providers(
         default_base_url="https://openrouter.ai/api/v1",
         effective_base_url=openrouter_base_url,
     )
-    register_image_generation_provider(
+    openrouter_credential_resolver = _credential_resolver_for_provider(
+        provider_id="openrouter",
+        provider_config=openrouter_config,
+        default_env_key="OPENROUTER_API_KEY",
+        default_base_url="https://openrouter.ai/api/v1",
+        effective_base_url=openrouter_base_url,
+        gateway_config=gateway_config,
+        llm_config=llm_config,
+    )
+    openrouter_initial_credential = resolve_image_generation_credential(
+        provider_id="openrouter",
+        provider_config=openrouter_config,
+        default_env_key="OPENROUTER_API_KEY",
+        default_base_url="https://openrouter.ai/api/v1",
+        effective_base_url=openrouter_base_url,
+        gateway_config=gateway_config,
+        llm_config=llm_config,
+    )
+    _register_configured_provider(
         OpenRouterImageGenerationProvider(
-            api_key=_resolve_configured_api_key(
-                provider_id="openrouter",
-                provider_config=openrouter_config,
-                llm_config=llm_config,
-                api_key_env=openrouter_api_key_env,
-                default_base_url="https://openrouter.ai/api/v1",
-                effective_base_url=openrouter_base_url,
-            ),
+            api_key=openrouter_initial_credential.api_key,
             api_key_env=openrouter_api_key_env,
             base_url=openrouter_base_url,
-        )
+        ),
+        credential_resolver=openrouter_credential_resolver,
+    )
+    tokenrhythm_base_url = _resolve_configured_base_url(
+        provider_id="tokenrhythm",
+        provider_config=tokenrhythm_config,
+        llm_config=llm_config,
+        default_base_url="https://tokenrhythm.studio/v1",
+        gateway_config=gateway_config,
+    )
+    tokenrhythm_api_key_env = credential_env_for_endpoint(
+        configured_env=_get_config_attr(
+            tokenrhythm_config,
+            "api_key_env",
+            "TOKENRHYTHM_API_KEY",
+        ),
+        configured_explicitly=_field_was_set(tokenrhythm_config, "api_key_env"),
+        default_env="TOKENRHYTHM_API_KEY",
+        default_base_url="https://tokenrhythm.studio/v1",
+        effective_base_url=tokenrhythm_base_url,
+    )
+    tokenrhythm_credential_resolver = _credential_resolver_for_provider(
+        provider_id="tokenrhythm",
+        provider_config=tokenrhythm_config,
+        default_env_key="TOKENRHYTHM_API_KEY",
+        default_base_url="https://tokenrhythm.studio/v1",
+        effective_base_url=tokenrhythm_base_url,
+        gateway_config=gateway_config,
+        llm_config=llm_config,
+    )
+    tokenrhythm_initial_credential = resolve_image_generation_credential(
+        provider_id="tokenrhythm",
+        provider_config=tokenrhythm_config,
+        default_env_key="TOKENRHYTHM_API_KEY",
+        default_base_url="https://tokenrhythm.studio/v1",
+        effective_base_url=tokenrhythm_base_url,
+        gateway_config=gateway_config,
+        llm_config=llm_config,
+    )
+    _register_configured_provider(
+        TokenRhythmImageGenerationProvider(
+            api_key=tokenrhythm_initial_credential.api_key,
+            api_key_env=tokenrhythm_api_key_env,
+            base_url=tokenrhythm_base_url,
+        ),
+        credential_resolver=tokenrhythm_credential_resolver,
     )
     qwen_token_plan_base_url = _resolve_configured_base_url(
         provider_id="qwen_token_plan",
         provider_config=qwen_token_plan_config,
         llm_config=llm_config,
         default_base_url=QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+        gateway_config=gateway_config,
     )
     qwen_token_plan_api_key_env = credential_env_for_endpoint(
         configured_env=_get_config_attr(
@@ -736,19 +1334,31 @@ def reset_image_generation_providers(
         default_base_url=QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
         effective_base_url=qwen_token_plan_base_url,
     )
-    register_image_generation_provider(
+    qwen_token_plan_credential_resolver = _credential_resolver_for_provider(
+        provider_id="qwen_token_plan",
+        provider_config=qwen_token_plan_config,
+        default_env_key=QWEN_TOKEN_PLAN_API_KEY_ENV,
+        default_base_url=QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+        effective_base_url=qwen_token_plan_base_url,
+        gateway_config=gateway_config,
+        llm_config=llm_config,
+    )
+    qwen_token_plan_initial_credential = resolve_image_generation_credential(
+        provider_id="qwen_token_plan",
+        provider_config=qwen_token_plan_config,
+        default_env_key=QWEN_TOKEN_PLAN_API_KEY_ENV,
+        default_base_url=QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+        effective_base_url=qwen_token_plan_base_url,
+        gateway_config=gateway_config,
+        llm_config=llm_config,
+    )
+    _register_configured_provider(
         QwenTokenPlanImageGenerationProvider(
-            api_key=_resolve_configured_api_key(
-                provider_id="qwen_token_plan",
-                provider_config=qwen_token_plan_config,
-                llm_config=llm_config,
-                api_key_env=qwen_token_plan_api_key_env,
-                default_base_url=QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
-                effective_base_url=qwen_token_plan_base_url,
-            ),
+            api_key=qwen_token_plan_initial_credential.api_key,
             api_key_env=qwen_token_plan_api_key_env,
             base_url=qwen_token_plan_base_url,
-        )
+        ),
+        credential_resolver=qwen_token_plan_credential_resolver,
     )
 
 
@@ -803,10 +1413,12 @@ async def generate_with_fallbacks(
         try:
             provider_id, model = parse_image_generation_model_ref(candidate)
         except ValueError as exc:
+            raw_error = str(exc)
+            safe_error = redact_tokenrhythm_install_ids(raw_error)
             attempts.append(
-                ImageGenerationAttempt(provider="", model=candidate, error=str(exc))
+                ImageGenerationAttempt(provider="", model=candidate, error=safe_error)
             )
-            last_error = exc
+            last_error = exc if safe_error == raw_error else RuntimeError(safe_error)
             continue
         provider = get_image_generation_provider(provider_id)
         if provider is None:
@@ -819,30 +1431,43 @@ async def generate_with_fallbacks(
             if candidate_index == 0
             else _provider_fallback_correlation(correlation)
         )
+        call_request = replace(
+            request,
+            model=model,
+            provider_request_correlation=call_correlation,
+        )
+        credential_resolution: ImageGenerationCredentialResolution | None = None
         try:
-            with bind_provider_request_correlation(call_correlation):
-                result = await provider.generate(
-                    replace(
-                        request,
-                        model=model,
-                        provider_request_correlation=call_correlation,
-                    )
+            credential_resolver = getattr(provider, "_credential_resolver", None)
+            if callable(credential_resolver):
+                credential_resolution = credential_resolver(call_request)
+                call_request = replace(
+                    call_request,
+                    credential_resolution=credential_resolution,
                 )
+            with bind_provider_request_correlation(call_correlation):
+                result = await provider.generate(call_request)
             if not result.image_bytes:
                 raise RuntimeError("Image generation provider returned empty image")
             result = _normalize_generated_image(result, request.output_format)
             result.attempts = attempts
             return result
         except Exception as exc:  # noqa: BLE001 - failures are summarized for fallback
-            attempts.append(ImageGenerationAttempt(provider_id, model, str(exc)))
-            last_error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            report_image_generation_pool_failure(credential_resolution, exc)
+            raw_error = str(exc)
+            safe_error = redact_tokenrhythm_install_ids(raw_error)
+            attempts.append(ImageGenerationAttempt(provider_id, model, safe_error))
+            last_error = exc if safe_error == raw_error else RuntimeError(safe_error)
 
     if len(attempts) <= 1 and last_error is not None:
         raise last_error
     summary = " | ".join(
         f"{attempt.provider}/{attempt.model}: {attempt.error}" for attempt in attempts
     )
-    raise RuntimeError(f"All image generation models failed ({len(attempts)}): {summary}")
+    message = redact_tokenrhythm_install_ids(
+        f"All image generation models failed ({len(attempts)}): {summary}"
+    )
+    raise RuntimeError(message)
 
 
 reset_image_generation_providers()

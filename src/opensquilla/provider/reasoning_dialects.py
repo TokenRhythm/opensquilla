@@ -89,6 +89,7 @@ class ReasoningEnableArgs:
     thinking_budget_tokens: int
     model: str = ""
     thinking_budget_explicit: bool = False
+    reasoning_effort_override: str | None = None
 
     @property
     def effort(self) -> str:
@@ -119,7 +120,10 @@ def _enable_reasoning_effort(payload: dict[str, Any], args: ReasoningEnableArgs)
 
 def _enable_deepseek(payload: dict[str, Any], args: ReasoningEnableArgs) -> None:
     payload["thinking"] = {"type": "enabled"}
-    payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(args.thinking_level)
+    payload["reasoning_effort"] = (
+        args.reasoning_effort_override
+        or _resolve_deepseek_reasoning_effort(args.thinking_level)
+    )
 
 
 def _enable_tencent_tokenhub(payload: dict[str, Any], args: ReasoningEnableArgs) -> None:

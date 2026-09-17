@@ -7,6 +7,7 @@ import type {
   ChatStreamTimelineItem,
   ChatToolCallRenderItem,
 } from '@/types/chat'
+import type { StatusPart } from '@/types/parts'
 import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 import AssistantActivityTimeline from './AssistantActivityTimeline.vue'
 import timelineSource from './AssistantActivityTimeline.vue?raw'
@@ -59,7 +60,7 @@ function group(call: ChatToolCallRenderItem): ChatStreamTimelineItem {
 
 async function mountTimeline(
   timelineItems: ChatStreamTimelineItem[],
-  statusHistory: Array<{ action: string; label: string; at: number }> = [],
+  statusHistory: StatusPart[] = [],
   lifecycle: 'working' | 'answering' | 'settled' = 'working',
 ) {
   const root = document.createElement('div')
@@ -67,6 +68,7 @@ async function mountTimeline(
   const projection = projectAssistantActivityTimeline(timelineItems, {
     lifecycle,
     statusHistory,
+    endedAt: (statusHistory[statusHistory.length - 1]?.at ?? 0) + 3_000,
   })
   const app = createApp({
     render: () => h(AssistantActivityTimeline, {
@@ -98,6 +100,30 @@ afterEach(() => {
 })
 
 describe('AssistantActivityTimeline', () => {
+  it.each(['working', 'settled'] as const)('distinguishes temporary reductions from saved summaries while %s', async lifecycle => {
+    const root = await mountTimeline([], [
+      {
+        action: 'context_compaction', label: '', at: 1_000,
+        id: 'cmp-temporary', category: 'maintenance', state: 'completed',
+        source: 'automatic', durability: 'request_scoped',
+      },
+      {
+        action: 'context_compaction', label: '', at: 2_000,
+        id: 'cmp-saved', category: 'maintenance', state: 'completed',
+        source: 'automatic', durability: 'durable',
+      },
+    ], lifecycle)
+
+    const events = root.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
+    expect(events).toHaveLength(2)
+    expect(events[0]?.textContent).toContain('History temporarily reduced; continuing')
+    expect(events[0]?.textContent).not.toContain('Summary saved')
+    expect(events[0]?.dataset.status).toBe('completed')
+    expect(events[0]?.dataset.durability).toBe('request_scoped')
+    expect(events[1]?.textContent).toContain('Summary saved')
+    expect(root.querySelector('.assistant-activity-status__row--current')).toBeNull()
+  })
+
   it('inherits caller attributes on its semantic root without Vue fragment warnings', async () => {
     const root = await mountTimeline([
       group(toolCall('attribute-root', 'read_file')),
@@ -181,7 +207,7 @@ describe('AssistantActivityTimeline', () => {
     expect(batch?.open).toBe(true)
   })
 
-  it('keeps lifecycle phases out of the live action body', async () => {
+  it('shows only the current routine phase live and restores it with duration when settled', async () => {
     const statusHistory = [
       {
         action: 'Sending',
@@ -196,17 +222,34 @@ describe('AssistantActivityTimeline', () => {
     ]
     const liveRoot = await mountTimeline([], statusHistory, 'answering')
 
-    expect(liveRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(0)
-    expect(liveRoot.querySelector('.assistant-activity-timeline')).toBeNull()
+    expect(liveRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(1)
+    expect(liveRoot.textContent).toContain('Writing the answer')
+    expect(liveRoot.textContent).toContain('3s')
     expect(liveRoot.textContent).not.toContain('/private/customer')
     expect(liveRoot.textContent).not.toContain('secret')
 
     const settledRoot = await mountTimeline([], statusHistory, 'settled')
-    expect(settledRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(2)
-    expect(settledRoot.textContent).toContain('Working')
-    expect(settledRoot.textContent).toContain('Writing the answer')
+    expect(settledRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(1)
+    expect(settledRoot.textContent).not.toContain('Working')
+    expect(settledRoot.textContent).toContain('Answer composition')
+    expect(settledRoot.textContent).toContain('3s')
     expect(settledRoot.textContent).not.toContain('/private/customer')
     expect(settledRoot.textContent).not.toContain('secret')
+  })
+
+  it('retains the waiting duration and exceptional provider transitions without a duplicate reasoning row', async () => {
+    const root = await mountTimeline([], [
+      { action: 'provider:requesting', label: 'Waiting', at: 1_000 },
+      { action: 'provider:reasoning', label: 'Reasoning', at: 2_000 },
+      { action: 'provider:fallback', label: 'Fallback', at: 3_000 },
+    ], 'settled')
+
+    const rows = root.querySelectorAll('.assistant-activity-status__row')
+    expect(rows).toHaveLength(2)
+    expect(root.textContent).toContain('Model response')
+    expect(root.textContent).toContain('1s')
+    expect(root.textContent).not.toContain('Thinking deeply')
+    expect(root.textContent).toContain('Switching to backup model')
   })
 
   it('shows prior semantic context but leaves the current action to the live header', async () => {

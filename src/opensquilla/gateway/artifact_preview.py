@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -22,8 +22,18 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from opensquilla.application.artifact_workbench import (
+    PreviewLeaseCreate,
+    PreviewLeaseGrant,
+    PreviewLeaseIdentity,
+    PreviewLeaseRenewal,
+    PreviewMaterialApplication,
+    PreviewMaterialPort,
+)
+from opensquilla.artifact_session.working_files import WorkingFiles
 from opensquilla.artifacts import (
     ArtifactBundleUnsupportedError,
+    ArtifactError,
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactStore,
@@ -35,6 +45,7 @@ from opensquilla.gateway.origin_guard import (
     request_origin_allowed,
 )
 from opensquilla.gateway.scopes import is_loopback_address
+from opensquilla.html_format import is_html_preview_path
 from opensquilla.paths import media_root_from_config, native_io_path
 
 log = structlog.get_logger(__name__)
@@ -42,9 +53,7 @@ log = structlog.get_logger(__name__)
 PREVIEW_LEASE_IDLE_SECONDS = 8 * 60 * 60
 PREVIEW_LEASE_LIMIT_PER_SESSION = 8
 _PREVIEW_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
-_PREVIEW_AUTHORITY_RE = re.compile(
-    r"^p-([0-9a-f]{32})\.localhost:([0-9]{1,5})$"
-)
+_PREVIEW_AUTHORITY_RE = re.compile(r"^p-([0-9a-f]{32})\.localhost:([0-9]{1,5})$")
 _HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
 _HTML_SUFFIXES = frozenset({".html", ".htm", ".xhtml"})
 _URL_PATH_SAFE = "/!$&'()*+,;=:@-._~"
@@ -80,6 +89,7 @@ class ArtifactPreviewLease:
     source: dict[str, Any]
     created_at: float
     last_access_at: float
+    working_files: WorkingFiles | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +99,7 @@ class _ResolvedPreviewResource:
     sha256: str
     size: int
     path: Path
+    data: bytes | None = None
 
 
 class ArtifactPreviewLeaseService:
@@ -111,6 +122,7 @@ class ArtifactPreviewLeaseService:
         self._lease_id_by_token_hash: dict[str, str] = {}
         self._expired_lease_ids: dict[str, float] = {}
         self._expired_token_hashes: dict[str, float] = {}
+        self._working_files: dict[tuple[str, str], WorkingFiles] = {}
         self._listener_port: int | None = None
 
     @property
@@ -145,9 +157,11 @@ class ArtifactPreviewLeaseService:
         )
         if manifest is None:
             entrypoint = str(getattr(ref, "name", "") or "index.html")
-            warning_codes = legacy_html_bundle_warning_codes(
-                entrypoint,
-                native_io_path(entry_path).read_bytes(),
+            warning_codes = list(
+                legacy_html_bundle_warning_codes(
+                    entrypoint,
+                    native_io_path(entry_path).read_bytes(),
+                )
             )
             source = {
                 "kind": "single_file",
@@ -160,16 +174,29 @@ class ArtifactPreviewLeaseService:
             entrypoint = str(getattr(manifest, "entrypoint", "") or "")
             if not entrypoint:
                 raise ArtifactIntegrityError("artifact bundle entrypoint is missing")
+            collection_status = str(
+                getattr(manifest, "collection_status", "complete") or "complete"
+            )
+            warning_codes = [str(code) for code in (getattr(manifest, "warning_codes", ()) or ())]
+            if (
+                collection_status == "partial"
+                and warning_codes == ["missing_dependency"]
+                and store.supports_single_file_editing(
+                    artifact_id,
+                    session_id=session_id,
+                )
+            ):
+                # Old collectors could treat a remote CSS @import as a missing
+                # local dependency. Keep the immutable manifest unchanged, but
+                # expose the integrity-checked effective preview state.
+                collection_status = "complete"
+                warning_codes = []
             source = {
                 "kind": "bundle",
-                "collection_status": str(
-                    getattr(manifest, "collection_status", "complete") or "complete"
-                ),
+                "collection_status": collection_status,
                 "file_count": int(getattr(manifest, "file_count", 0) or 0),
                 "total_bytes": int(getattr(manifest, "total_size", 0) or 0),
-                "warning_codes": [
-                    str(code) for code in (getattr(manifest, "warning_codes", ()) or ())
-                ],
+                "warning_codes": warning_codes,
             }
 
         if manifest is None:
@@ -202,6 +229,7 @@ class ArtifactPreviewLeaseService:
                 source=source,
                 created_at=now,
                 last_access_at=now,
+                working_files=self._working_files.get((session_id, artifact_id)),
             )
             self._leases_by_id[lease.lease_id] = lease
             self._lease_id_by_token_hash[token_hash] = lease.lease_id
@@ -294,11 +322,67 @@ class ArtifactPreviewLeaseService:
             lease.last_access_at = now
             return lease
 
+    def register_working_files(
+        self,
+        *,
+        session_id: str,
+        artifact_id: str,
+        binding: WorkingFiles,
+    ) -> None:
+        with self._lock:
+            for key, previous in tuple(self._working_files.items()):
+                if key[0] == session_id and previous.document_id == binding.document_id:
+                    del self._working_files[key]
+            self._working_files[(session_id, artifact_id)] = binding
+            for lease in self._leases_by_id.values():
+                if lease.session_id == session_id and (
+                    lease.artifact_id == artifact_id
+                    or (
+                        lease.working_files is not None
+                        and lease.working_files.document_id == binding.document_id
+                    )
+                ):
+                    lease.working_files = binding
+
     def resolve_resource(
         self,
         lease: ArtifactPreviewLease,
         logical_path: str | None,
     ) -> _ResolvedPreviewResource:
+        if lease.working_files is not None:
+            from opensquilla.artifacts import artifact_bundle_manifest
+
+            working = lease.working_files
+            bundle = working.bundle()
+            requested = logical_path or working.entrypoint
+            if logical_path and lease.entrypoint != working.entrypoint:
+                if logical_path == lease.entrypoint:
+                    requested = working.entrypoint
+                else:
+                    try:
+                        relative = PurePosixPath(logical_path).relative_to(
+                            PurePosixPath(lease.entrypoint).parent
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        requested = (
+                            PurePosixPath(working.entrypoint).parent / relative
+                        ).as_posix()
+            source = next((item for item in bundle.files if item.path == requested), None)
+            if source is None:
+                raise ArtifactNotFoundError("Working preview resource not found")
+            return _ResolvedPreviewResource(
+                logical_path=source.path,
+                mime=source.mime,
+                sha256=artifact_bundle_manifest(bundle).bundle_digest,
+                size=len(source.data),
+                path=(
+                    working.entry if source.path == working.entrypoint
+                    else working.root / source.path
+                ),
+                data=source.data,
+            )
         store = self._store()
         resolver = getattr(store, "resolve_preview_resource", None)
         if callable(resolver):
@@ -378,21 +462,67 @@ class ArtifactPreviewLeaseService:
         self._expired_token_hashes[lease.token_hash] = now
 
 
+class GatewayPreviewMaterialPort(PreviewMaterialPort):
+    """Adapt the existing preview lease state machine to domain commands."""
+
+    def __init__(self, service: ArtifactPreviewLeaseService) -> None:
+        self._service = service
+
+    def _grant(self, lease: ArtifactPreviewLease, token: str) -> PreviewLeaseGrant:
+        return PreviewLeaseGrant(
+            lease_id=lease.lease_id,
+            token=token,
+            entrypoint=lease.entrypoint,
+            mode=lease.mode,
+            client=lease.client,
+            source=dict(lease.source),
+            expires_at=self._service.expires_at(lease),
+            working_document_id=(
+                lease.working_files.document_id if lease.working_files is not None else None
+            ),
+        )
+
+    async def create_lease(self, command: PreviewLeaseCreate) -> PreviewLeaseGrant:
+        lease, token = await asyncio.to_thread(
+            self._service.create,
+            artifact_id=command.artifact_id,
+            session_id=command.session_id,
+            session_key=command.session_key,
+            mode=command.mode,
+            client=command.client,
+        )
+        return self._grant(lease, token)
+
+    async def renew_lease(self, identity: PreviewLeaseIdentity) -> PreviewLeaseRenewal:
+        lease = self._service.renew(
+            identity.lease_id,
+            session_id=identity.session_id,
+            session_key=identity.session_key,
+        )
+        return PreviewLeaseRenewal(
+            lease_id=lease.lease_id,
+            expires_at=self._service.expires_at(lease),
+        )
+
+    async def revoke_lease(self, identity: PreviewLeaseIdentity) -> None:
+        self._service.revoke(
+            identity.lease_id,
+            session_id=identity.session_id,
+            session_key=identity.session_key,
+        )
+
+
+
+
 def create_artifact_preview_resource_app(
     service: ArtifactPreviewLeaseService,
 ) -> Starlette:
     """Build the isolated loopback-only resource listener."""
 
     async def preview_resource(request: Request) -> Response:
-        match = _PREVIEW_AUTHORITY_RE.fullmatch(
-            request.headers.get("host", "").casefold()
-        )
+        match = _PREVIEW_AUTHORITY_RE.fullmatch(request.headers.get("host", "").casefold())
         port = service.listener_port
-        if (
-            match is None
-            or port is None
-            or int(match.group(2)) != port
-        ):
+        if match is None or port is None or int(match.group(2)) != port:
             return _preview_error("Preview resource not found", "NOT_FOUND", 404)
         if request.path_params.get("resource_path") == _CLEAR_SITE_DATA_PATH:
             return _clear_preview_site_data(service, match.group(1))
@@ -423,6 +553,7 @@ def register_artifact_preview_routes(
     """Register authenticated lease controls and the remote offline transport."""
 
     lease_service = service or ArtifactPreviewLeaseService(config=config)
+    preview_material = PreviewMaterialApplication(GatewayPreviewMaterialPort(lease_service))
 
     async def create_lease(request: Request) -> Response:
         if not request_origin_allowed(request, config):
@@ -448,6 +579,11 @@ def register_artifact_preview_routes(
             return _api_error("mode must be full or offline", "INVALID_REQUEST", 400)
         if client not in {"desktop", "web"}:
             return _api_error("client must be desktop or web", "INVALID_REQUEST", 400)
+        page_path = body.get("pagePath")
+        if "pagePath" in body and not is_html_preview_path(page_path):
+            return _api_error(
+                "pagePath must be a normalized relative HTML path", "INVALID_REQUEST", 400,
+            )
 
         effective_mode = (
             "full"
@@ -474,13 +610,14 @@ def register_artifact_preview_routes(
                 )
         artifact_id = str(request.path_params.get("artifact_id") or "")
         try:
-            lease, token = await asyncio.to_thread(
-                lease_service.create,
-                artifact_id=artifact_id,
-                session_id=session_id,
-                session_key=session_key,
-                mode=effective_mode,
-                client=client,
+            grant = await preview_material.create(
+                PreviewLeaseCreate(
+                    session_key=session_key,
+                    session_id=session_id,
+                    artifact_id=artifact_id,
+                    mode=effective_mode,
+                    client=client,
+                )
             )
         except PreviewLeaseLimitError:
             return _api_error("Preview lease limit reached", "PREVIEW_LEASE_LIMIT", 429)
@@ -495,23 +632,49 @@ def register_artifact_preview_routes(
         except (ArtifactNotFoundError, ValueError):
             return _api_error("Artifact not found", "NOT_FOUND", 404)
 
+        if page_path is not None:
+            try:
+                lease = lease_service.resolve_token(grant.token)
+                resource = await asyncio.to_thread(
+                    lease_service.resolve_resource, lease, page_path,
+                )
+                if (
+                    resource.logical_path != page_path
+                    or resource.mime.split(";", 1)[0].strip().lower() not in _HTML_MIMES
+                ):
+                    raise ArtifactNotFoundError("Preview page not found")
+            except (ArtifactError, OSError, ValueError) as exc:
+                lease_service.revoke(
+                    grant.lease_id, session_id=session_id, session_key=session_key,
+                )
+                if isinstance(exc, ArtifactIntegrityError):
+                    return _api_error("Artifact integrity check failed", "INTEGRITY_ERROR", 409)
+                return _api_error("Preview page not found", "NOT_FOUND", 404)
+
+        launch_path = page_path or grant.entrypoint
         use_loopback_transport = client == "desktop" or effective_mode == "full"
         if use_loopback_transport:
-            launch_url = lease_service.full_launch_url(token, lease.entrypoint)
-            preview_origin = f"http://p-{token}.localhost:{lease_service.listener_port}"
+            launch_url = lease_service.full_launch_url(grant.token, launch_path)
+            preview_origin = (
+                f"http://p-{grant.token}.localhost:{lease_service.listener_port}"
+            )
         else:
             encoded_entrypoint = quote(
-                lease.entrypoint.lstrip("/"),
+                launch_path.lstrip("/"),
                 safe=_URL_PATH_SAFE,
             )
-            launch_url = f"/api/v1/artifact-preview/{token}/{encoded_entrypoint}"
+            launch_url = f"/api/v1/artifact-preview/{grant.token}/{encoded_entrypoint}"
             preview_origin = None
         payload = _lease_payload(
-            lease_service,
-            lease,
+            grant,
             launch_url=launch_url,
             preview_origin=preview_origin,
+            include_working_document=(
+                request.headers.get("x-opensquilla-preview-working-document") == "1"
+            ),
         )
+        if page_path is not None:
+            payload["page_path"] = page_path
         response = JSONResponse(payload, status_code=201)
         _set_control_no_store(response)
         return response
@@ -527,10 +690,8 @@ def register_artifact_preview_routes(
             return _api_error("Preview lease not found", "NOT_FOUND", 404)
         lease_id = str(request.path_params.get("lease_id") or "")
         try:
-            lease = lease_service.renew(
-                lease_id,
-                session_id=session_id,
-                session_key=session_key,
+            renewal = await preview_material.renew(
+                PreviewLeaseIdentity(session_key, session_id, lease_id)
             )
         except PreviewLeaseExpiredError:
             return _api_error("Preview lease expired", "PREVIEW_LEASE_EXPIRED", 410)
@@ -539,8 +700,8 @@ def register_artifact_preview_routes(
         response = JSONResponse(
             {
                 "version": 1,
-                "lease_id": lease.lease_id,
-                "expires_at": lease_service.expires_at(lease),
+                "lease_id": renewal.lease_id,
+                "expires_at": renewal.expires_at,
             }
         )
         _set_control_no_store(response)
@@ -557,10 +718,8 @@ def register_artifact_preview_routes(
             return _api_error("Preview lease not found", "NOT_FOUND", 404)
         lease_id = str(request.path_params.get("lease_id") or "")
         try:
-            lease_service.revoke(
-                lease_id,
-                session_id=session_id,
-                session_key=session_key,
+            await preview_material.revoke(
+                PreviewLeaseIdentity(session_key, session_id, lease_id)
             )
         except PreviewLeaseExpiredError:
             return _api_error("Preview lease expired", "PREVIEW_LEASE_EXPIRED", 410)
@@ -569,6 +728,8 @@ def register_artifact_preview_routes(
         response = Response(status_code=204)
         _set_control_no_store(response)
         return response
+
+
 
     async def offline_resource(request: Request) -> Response:
         return await _serve_preview_resource(
@@ -721,13 +882,20 @@ async def _serve_preview_resource(
         offline=lease.mode == "offline",
         opaque_cors=offline_transport,
         offline_source=(
-            _offline_capability_source(request, token)
-            if offline_transport
-            else "'self'"
+            _offline_capability_source(request, token) if offline_transport else "'self'"
         ),
     )
+    if lease.working_files is not None:
+        headers["X-OpenSquilla-Working-Preview"] = "1"
     if request.headers.get("if-none-match") == headers["ETag"]:
         return Response(status_code=304, headers=headers)
+    if resource.data is not None:
+        headers["Content-Length"] = str(resource.size)
+        return Response(
+            content=b"" if request.method == "HEAD" else resource.data,
+            media_type=resource.mime,
+            headers=headers,
+        )
     return FileResponse(
         native_io_path(resource.path),
         media_type=resource.mime,
@@ -789,10 +957,7 @@ def _full_preview_allowed(
 
 def _desktop_preview_request_allowed(request: Request) -> bool:
     peer_ip = request.client.host if request.client is not None else None
-    return (
-        is_loopback_address(peer_ip)
-        and request.headers.get("origin") is None
-    )
+    return is_loopback_address(peer_ip) and request.headers.get("origin") is None
 
 
 def _is_loopback_hostname(hostname: str | None) -> bool:
@@ -817,22 +982,26 @@ def _force_offline() -> bool:
 
 
 def _lease_payload(
-    service: ArtifactPreviewLeaseService,
-    lease: ArtifactPreviewLease,
+    grant: PreviewLeaseGrant,
     *,
     launch_url: str,
     preview_origin: str | None,
+    include_working_document: bool = False,
 ) -> dict[str, Any]:
     return {
         "version": 1,
-        "lease_id": lease.lease_id,
-        "effective_mode": lease.mode,
+        "lease_id": grant.lease_id,
+        "effective_mode": grant.mode,
         "launch_url": launch_url,
         "preview_origin": preview_origin,
-        "entrypoint": lease.entrypoint,
-        "expires_at": service.expires_at(lease),
+        "entrypoint": grant.entrypoint,
+        "expires_at": grant.expires_at,
         "idle_timeout_seconds": PREVIEW_LEASE_IDLE_SECONDS,
-        "source": lease.source,
+        "source": grant.source,
+        **(
+            {"workingDocumentId": grant.working_document_id}
+            if include_working_document and grant.working_document_id else {}
+        ),
     }
 
 

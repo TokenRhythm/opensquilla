@@ -48,7 +48,7 @@ def test_build_request_uses_runtime_run_mode_when_no_context(tmp_path: Path) -> 
         policy=policy,
     )
 
-    assert request.run_mode == RunMode.TRUSTED.value
+    assert request.run_mode == RunMode.SAFE.value
 
 
 def test_hybrid_runtime_uses_full_without_context_and_standard_with_context(
@@ -92,7 +92,7 @@ def test_hybrid_runtime_uses_full_without_context_and_standard_with_context(
             )
         finally:
             current_tool_context.reset(token)
-        assert standard_request.run_mode == RunMode.STANDARD.value
+        assert standard_request.run_mode == RunMode.SAFE.value
     finally:
         reset_runtime()
 
@@ -122,9 +122,9 @@ def test_managed_network_env_preserves_run_mode(tmp_path: Path) -> None:
         cwd=tmp_path,
         action_kind="shell.exec",
         policy=policy,
-        run_mode=RunMode.STANDARD.value,
+        run_mode=RunMode.SAFE.value,
     )
 
     updated = request_with_managed_network_proxy_env(request, backend_name="windows_default")
 
-    assert updated.run_mode == RunMode.STANDARD.value
+    assert updated.run_mode == RunMode.SAFE.value

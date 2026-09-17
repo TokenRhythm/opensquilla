@@ -1,0 +1,96 @@
+{
+  "format_version": 1,
+  "kind": "error",
+  "cases": [
+    {
+      "id": "error.missing-key",
+      "coverage": "missing-key",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-invalid",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "params.key is required"
+        }
+      }
+    },
+    {
+      "id": "error.non-string-key",
+      "coverage": "non-string-key",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-invalid-type",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "params.key must be a string"
+        }
+      }
+    },
+    {
+      "id": "error.ambiguous-prefix",
+      "coverage": "ambiguous-prefix",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-ambiguous",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "INVALID_REQUEST",
+          "message": "Ambiguous session id 'abc'; matches: agent:default:abc123, agent:bench:abc999"
+        }
+      }
+    },
+    {
+      "id": "error.not-found",
+      "coverage": "not-found-keyerror-mapping",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-missing",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "'Session not found: nonexistent'"
+        }
+      }
+    },
+    {
+      "id": "error.no-manager",
+      "coverage": "no-session-manager-keyerror-mapping",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-no-manager",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "'No session manager available'"
+        }
+      }
+    },
+    {
+      "id": "error.no-scope",
+      "coverage": "operator-read-scope",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-no-scope",
+        "ok": false,
+        "payload": null,
+        "error": {
+          "code": "UNAUTHORIZED",
+          "message": "Insufficient scope for method: sessions.resolve: missing operator.read"
+        }
+      }
+    }
+  ]
+}

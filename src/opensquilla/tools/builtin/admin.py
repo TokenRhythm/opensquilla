@@ -560,11 +560,15 @@ async def cron(
             else ""
         )
         context_run_mode = str(getattr(ctx, "run_mode", "") or "") if ctx is not None else ""
-        creator_run_mode = (
-            context_run_mode
-            if context_run_mode in {"standard", "trusted", "full"}
-            else ("full" if is_owner_caller else "trusted")
-        )
+        from opensquilla.run_mode import RunMode, normalize_run_mode
+
+        try:
+            creator_run_mode = normalize_run_mode(
+                context_run_mode,
+                default=RunMode.FULL if is_owner_caller else RunMode.SAFE,
+            ).value
+        except ValueError:
+            creator_run_mode = "full" if is_owner_caller else "safe"
         job = await sched.add_job(
             name=task or "cron-tool-job",
             handler_key=handler_key,
@@ -788,11 +792,11 @@ async def audio_config(
 
     from types import SimpleNamespace
 
-    from opensquilla.gateway.rpc_onboarding import apply_agent_audio_provider_configuration
+    from opensquilla.gateway.audio_configuration import configure_agent_audio_provider
 
     holder = SimpleNamespace(config=_gateway_config)
     try:
-        result = apply_agent_audio_provider_configuration(
+        result = await configure_agent_audio_provider(
             holder,
             provider_id=provider,
             api_key=api_key,

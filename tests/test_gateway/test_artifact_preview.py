@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
+import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
+from opensquilla.artifact_session.working_files import WorkingFiles
 from opensquilla.artifacts import (
     ARTIFACT_BUNDLE_BLOBS_DIR,
     ArtifactBundle,
@@ -83,15 +86,133 @@ def _create(
     mode: str = "offline",
     preview_client: str = "web",
     origin: str | None = "http://127.0.0.1:18791",
+    page_path: str | None = None,
 ):
     headers = dict(_AUTH_HEADERS)
     if origin is not None:
         headers["Origin"] = origin
     return client.post(
         f"/api/v1/artifacts/{artifact_id}/preview-leases",
-        json={"version": 1, "mode": mode, "client": preview_client},
+        json={
+            "version": 1, "mode": mode, "client": preview_client,
+            **({"pagePath": page_path} if page_path is not None else {}),
+        },
         headers=headers,
     )
+
+
+def _publish_preview_site(tmp_path: Path):
+    return ArtifactStore(tmp_path).publish_bundle(
+        ArtifactBundle(entrypoint="index.html", files=(
+            ArtifactBundleSourceFile("index.html", "text/html", b"<h1>Home</h1>"),
+            ArtifactBundleSourceFile(
+                "layouts/editorial.html", "text/html", b"<h1>Editorial</h1>",
+            ),
+            ArtifactBundleSourceFile("style.css", "text/css", b"h1 { color: blue }"),
+            ArtifactBundleSourceFile("not-html.html", "text/plain", b"Not a page"),
+        )),
+        session_id=_SESSION_ID, session_key=_SESSION_KEY,
+        name="index.html", mime="text/html", source="test-preview-pages",
+    )
+
+
+@pytest.mark.parametrize("preview_client", ["web", "desktop"])
+def test_selected_member_page_keeps_canonical_lease_identity(
+    tmp_path: Path, preview_client,
+) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    service.set_listener_port(43123)
+    with TestClient(
+        app, base_url="http://127.0.0.1:18791", client=("127.0.0.1", 51000),
+    ) as client:
+        created = _create(
+            client, ref.id, preview_client=preview_client,
+            page_path="layouts/editorial.html",
+            origin=None if preview_client == "desktop" else "http://127.0.0.1:18791",
+        )
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        assert payload["entrypoint"] == "index.html"
+        assert payload["page_path"] == "layouts/editorial.html"
+        if preview_client == "desktop":
+            with TestClient(
+                create_artifact_preview_resource_app(service),
+                base_url=payload["preview_origin"],
+            ) as native_client:
+                result = native_client.get(payload["launch_url"])
+        else:
+            result = client.get(payload["launch_url"])
+        assert result.status_code == 200
+        assert result.content == b"<h1>Editorial</h1>"
+
+
+@pytest.mark.parametrize("page_path", [
+    None, 1, False, [], {}, "", " ", "/index.html", "../index.html", "a/../index.html",
+    "./index.html", "a//index.html", "a\\index.html", "index.html?x=1", "index.html#top",
+    "%2e%2e/index.html", "a%2Findex.html", "file:index.html", "style.css", "index.html\x00",
+    " index.html", pytest.param("a" * 4097 + ".html", id="overlong"),
+])
+def test_selected_page_path_rejected_before_lease_allocation(tmp_path: Path, page_path) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        response = client.post(
+            f"/api/v1/artifacts/{ref.id}/preview-leases",
+            headers=_AUTH_HEADERS,
+            json={"version": 1, "mode": "offline", "client": "web", "pagePath": page_path},
+        )
+    assert response.status_code == 400, response.text
+    assert response.json()["code"] == "INVALID_REQUEST"
+    assert service._leases_by_id == {}
+
+
+@pytest.mark.parametrize("page_path", ["missing.html", "outside/index.html", "not-html.html"])
+def test_selected_page_must_be_a_collected_html_member(tmp_path: Path, page_path) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside/index.html").write_text("Private outside page")
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        response = _create(client, ref.id, page_path=page_path)
+    assert response.status_code == 404, response.text
+    assert response.json()["code"] == "NOT_FOUND"
+    assert service._leases_by_id == {}
+
+
+def test_selected_working_page_reads_live_source_not_published_snapshot(tmp_path: Path) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "site/layouts").mkdir(parents=True)
+    (workspace / "site/index.html").write_text("<h1>Live home</h1>")
+    selected = workspace / "site/layouts/editorial.html"
+    selected.write_text("<h1>Live editorial</h1>")
+    service.register_working_files(
+        session_id=_SESSION_ID, artifact_id=ref.id,
+        binding=WorkingFiles(
+            document_id="doc-site", workspace=str(workspace), relative_root="site",
+            entrypoint="index.html", base_revision_id="revision-initial",
+        ),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        created = _create(client, ref.id, page_path="layouts/editorial.html")
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        assert client.get(payload["launch_url"]).content == b"<h1>Live editorial</h1>"
+        selected.write_text("<h1>Changed editorial</h1>")
+        assert client.get(payload["launch_url"]).content == b"<h1>Changed editorial</h1>"
+        selected.unlink()
+        assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 404
+        private = workspace / "private.html"
+        private.write_text("<h1>Private page</h1>")
+        selected.symlink_to(private)
+        assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 404
+        assert len(service._leases_by_id) == 1
+    immutable = ArtifactStore(tmp_path).resolve_preview_resource(
+        ref.id, session_id=_SESSION_ID, logical_path="layouts/editorial.html",
+    )
+    assert immutable.path.read_bytes() == b"<h1>Editorial</h1>"
 
 
 def test_offline_lease_serves_html_without_gateway_credentials(tmp_path: Path) -> None:
@@ -136,6 +257,98 @@ def test_offline_lease_serves_html_without_gateway_credentials(tmp_path: Path) -
     assert ranged.content == b"<!doctype"
 
 
+@pytest.mark.parametrize("preview_client", ["web", "desktop"])
+@pytest.mark.parametrize("binding_scope", [None, "another-session", _SESSION_ID])
+@pytest.mark.parametrize("working_identity_header", [None, "true", "1"])
+def test_preview_working_identity_requires_same_session_binding(
+    tmp_path: Path, preview_client: str, binding_scope: str | None,
+    working_identity_header: str | None,
+) -> None:
+    ref = _publish_html(tmp_path)
+    app, service = _app(tmp_path)
+    service.set_listener_port(43123)
+    if binding_scope is not None:
+        workspace = (tmp_path / "workspace").resolve()
+        workspace.mkdir()
+        (workspace / "index.html").write_bytes(b"<h1>Current working page</h1>")
+        service.register_working_files(
+            session_id=binding_scope,
+            artifact_id=ref.id,
+            binding=WorkingFiles(
+                document_id="doc-preview", workspace=str(workspace.parent),
+                relative_root="workspace",
+                entrypoint="index.html", base_revision_id="revision-initial",
+            ),
+        )
+
+    with TestClient(
+        app, base_url="http://127.0.0.1:18791", client=("127.0.0.1", 51000),
+    ) as client:
+        if working_identity_header is not None:
+            client.headers["x-opensquilla-preview-working-document"] = working_identity_header
+        created = _create(
+            client, ref.id, preview_client=preview_client,
+            origin=None if preview_client == "desktop" else "http://127.0.0.1:18791",
+        )
+    assert created.status_code == 201, created.text
+    payload = created.json()
+    if binding_scope == _SESSION_ID and working_identity_header == "1":
+        assert payload["workingDocumentId"] == "doc-preview"
+    else:
+        assert set(payload) == {
+            "version", "lease_id", "effective_mode", "launch_url", "preview_origin",
+            "entrypoint", "expires_at", "idle_timeout_seconds", "source",
+        }
+
+
+def test_working_publication_keeps_existing_preview_lease_current(tmp_path: Path) -> None:
+    ref = _publish_html(tmp_path)
+    app, service = _app(tmp_path)
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    first = b"<h1>First working page</h1>"
+    changed = b"<h1>Renamed working page</h1>"
+    (workspace / "index.html").write_bytes(first)
+    working = WorkingFiles(
+        document_id="doc-preview", workspace=str(workspace.parent), relative_root="workspace",
+        entrypoint="index.html", base_revision_id="revision-initial",
+    )
+    service.register_working_files(
+        session_id=_SESSION_ID, artifact_id=ref.id, binding=working,
+    )
+    assert working.bundle().entrypoint == "index.html"
+
+    with TestClient(
+        app, base_url="http://127.0.0.1:18791", client=("127.0.0.1", 51000),
+    ) as client:
+        client.headers["x-opensquilla-preview-working-document"] = "1"
+        created = _create(client, ref.id)
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        assert payload["workingDocumentId"] == working.document_id
+        assert client.get(payload["launch_url"]).content == first
+        (workspace / "index.html").unlink()
+        (workspace / "updated.html").write_bytes(changed)
+        new_ref = _publish_html(tmp_path, changed)
+        service.register_working_files(
+            session_id=_SESSION_ID,
+            artifact_id=new_ref.id,
+            binding=replace(working, entrypoint="updated.html", base_revision_id="revision-next"),
+        )
+        refreshed = client.get(payload["launch_url"])
+        renewed = client.post(
+            f"/api/v1/artifact-preview-leases/{payload['lease_id']}/renew",
+            json={"version": 1}, headers=_AUTH_HEADERS,
+        )
+        new_payload = _create(client, new_ref.id).json()
+
+    assert refreshed.status_code == 200
+    assert refreshed.content == changed
+    assert renewed.status_code == 200
+    assert renewed.json()["lease_id"] == payload["lease_id"]
+    assert new_payload["workingDocumentId"] == working.document_id
+
+
 def test_legacy_single_file_with_local_dependencies_is_explicitly_partial(
     tmp_path: Path,
 ) -> None:
@@ -165,6 +378,84 @@ def test_legacy_single_file_with_local_dependencies_is_explicitly_partial(
         "warning_codes": ["legacy_single_file_dependencies_unavailable"],
     }
     assert missing.status_code == 404
+
+
+def test_stale_remote_import_bundle_warning_is_revalidated_for_preview(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    stale_remote_import = store.publish_bundle(
+        ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    path="index.html",
+                    mime="text/html",
+                    data=(
+                        b"<style>@import url('https://fonts.googleapis.com/css2?family=Inter');"
+                        b"</style><h1>Remote font</h1>"
+                    ),
+                ),
+            ),
+            collection_status="partial",
+            warning_codes=("missing_dependency",),
+        ),
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        name="legacy-remote-font.html",
+        mime="text/html",
+        source="stale-preview-revalidation-test",
+    )
+    actual_missing_dependency = store.publish_bundle(
+        ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    path="index.html",
+                    mime="text/html",
+                    data=b"<link rel='stylesheet' href='missing.css'><h1>Incomplete</h1>",
+                ),
+            ),
+            collection_status="partial",
+            warning_codes=("missing_dependency",),
+        ),
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        name="actual-missing-dependency.html",
+        mime="text/html",
+        source="stale-preview-revalidation-test",
+    )
+    app, _service = _app(tmp_path)
+
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1:18791",
+        client=("127.0.0.1", 51000),
+    ) as client:
+        stale_payload = _create(client, stale_remote_import.id).json()
+        missing_payload = _create(client, actual_missing_dependency.id).json()
+
+    assert stale_payload["source"] == {
+        "kind": "bundle",
+        "collection_status": "complete",
+        "file_count": 1,
+        "total_bytes": stale_remote_import.size,
+        "warning_codes": [],
+    }
+    assert missing_payload["source"] == {
+        "kind": "bundle",
+        "collection_status": "partial",
+        "file_count": 1,
+        "total_bytes": actual_missing_dependency.size,
+        "warning_codes": ["missing_dependency"],
+    }
+    unchanged = store.describe_preview_bundle(
+        stale_remote_import.id,
+        session_id=_SESSION_ID,
+    )
+    assert unchanged is not None
+    assert unchanged.collection_status == "partial"
+    assert unchanged.warning_codes == ("missing_dependency",)
 
 
 def test_full_loopback_lease_uses_isolated_random_localhost_origin(tmp_path: Path) -> None:
@@ -248,7 +539,7 @@ def test_full_web_preview_origin_can_clear_site_data_before_revoke(tmp_path: Pat
     assert cleared.headers["cache-control"] == "no-store"
 
 
-def test_remote_web_request_is_forced_offline(tmp_path: Path) -> None:
+def test_public_web_request_is_rejected_before_preview_creation(tmp_path: Path) -> None:
     ref = _publish_html(tmp_path)
     app, service = _app(
         tmp_path,
@@ -269,10 +560,7 @@ def test_remote_web_request_is_forced_offline(tmp_path: Path) -> None:
             origin="https://gateway.example",
         )
 
-    assert created.status_code == 201
-    assert created.json()["effective_mode"] == "offline"
-    assert created.json()["launch_url"].startswith("/api/v1/artifact-preview/")
-    assert created.json()["preview_origin"] is None
+    assert created.status_code == 401
 
 
 def test_desktop_originless_loopback_request_can_use_full_mode(tmp_path: Path) -> None:
@@ -449,9 +737,7 @@ def test_idle_expiry_returns_gone_while_unknown_tokens_return_not_found(tmp_path
         payload = _create(client, ref.id).json()
         now[0] += 11
         expired = client.get(payload["launch_url"])
-        unknown = client.get(
-            "/api/v1/artifact-preview/00000000000000000000000000000000/index.html"
-        )
+        unknown = client.get("/api/v1/artifact-preview/00000000000000000000000000000000/index.html")
 
     assert expired.status_code == 410
     assert unknown.status_code == 404
@@ -503,11 +789,7 @@ def test_missing_manifest_entry_blob_rejects_lease_as_integrity_failure(
     manifest = store.describe_preview_bundle(ref.id, session_id=_SESSION_ID)
     assert manifest is not None
     entry = next(item for item in manifest.files if item.path == manifest.entrypoint)
-    (
-        store.path_for(ref).parent
-        / ARTIFACT_BUNDLE_BLOBS_DIR
-        / entry.sha256
-    ).unlink()
+    (store.path_for(ref).parent / ARTIFACT_BUNDLE_BLOBS_DIR / entry.sha256).unlink()
     app, _service = _app(tmp_path)
 
     with TestClient(
@@ -551,11 +833,9 @@ def test_corrupt_non_entry_bundle_member_rejects_lease_before_issuance(
     manifest = store.describe_preview_bundle(ref.id, session_id=_SESSION_ID)
     assert manifest is not None
     member = next(item for item in manifest.files if item.path == "assets/app.js")
-    (
-        store.path_for(ref).parent
-        / ARTIFACT_BUNDLE_BLOBS_DIR
-        / member.sha256
-    ).write_bytes(b"tampered")
+    (store.path_for(ref).parent / ARTIFACT_BUNDLE_BLOBS_DIR / member.sha256).write_bytes(
+        b"tampered"
+    )
     app, service = _app(tmp_path)
 
     with TestClient(

@@ -29,6 +29,7 @@ async function mountHost(
   availableWidth?: number,
   parentWidth?: number,
   renderPanelProbe = false,
+  beforeCloseItem?: (item: WorkbenchItem) => boolean | Promise<boolean>,
 ) {
   const host = document.createElement('div')
   if (typeof parentWidth === 'number') {
@@ -60,6 +61,7 @@ async function mountHost(
       modalBlocked: modalBlocked.value,
       onSurfaceRect,
       routeActive: routeActive.value,
+      beforeCloseItem,
     },
     renderPanelProbe
       ? {
@@ -244,6 +246,21 @@ describe('WorkbenchHost', () => {
     expect(document.activeElement).toBe(
       mounted.host.querySelector('[aria-label="Collapse workbench"]'),
     )
+  })
+
+  it('keeps a tab mounted when its pending source save rejects close', async () => {
+    const beforeCloseItem = vi.fn(async () => false)
+    const mounted = await mountHost(1200, undefined, false, beforeCloseItem)
+    mounted.store.openItem(item('two'))
+    await nextTick()
+
+    mounted.host.querySelector<HTMLButtonElement>(
+      '[aria-label="Close tab: two.html"]',
+    )?.click()
+    await vi.waitFor(() => expect(beforeCloseItem).toHaveBeenCalledOnce())
+
+    expect(mounted.store.items.map(candidate => candidate.id)).toEqual(['one', 'two'])
+    expect(mounted.store.activeItemId).toBe('two')
   })
 
   it('uses one desktop collapse control and preserves open tabs', async () => {

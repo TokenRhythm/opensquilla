@@ -17,6 +17,11 @@ from typing import Any
 import pytest
 
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.turn_runner.harness import (
+    _TurnRunnerCompactionPersistAdapter,
+    _TurnRunnerHistoryLoaderAdapter,
+    _TurnRunnerRouterContextAdapter,
+)
 from opensquilla.engine.types import (
     CompactionEvent,
     DoneEvent,
@@ -26,6 +31,8 @@ from opensquilla.engine.types import (
     ToolUseStartEvent,
     WarningEvent,
 )
+from opensquilla.telemetry.contracts.reliability import TurnFailureStage
+from opensquilla.telemetry.runtime_facts import current_turn_failure_stage
 
 # Reuse upstream patch helpers from's equivalence harness -- this
 # stage sits after all six prior stages so the same upstream patching
@@ -102,12 +109,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
     def _max_iter(self, session_key, mi):  # noqa: ARG001, ARG002
         return mi if mi is not None else 10
 
-    def _iter_t(self, session_key, it):  # noqa: ARG001, ARG002
-        return it if it is not None else 30.0
-
-    def _tool_t(self, session_key, tt):  # noqa: ARG001, ARG002
-        return tt if tt is not None else 20.0
-
     def _req_t(self, session_key, rt):  # noqa: ARG001, ARG002
         return rt if rt is not None else 120.0
 
@@ -116,8 +117,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
 
     runner._resolve_agent_runtime_timeout = _runtime.__get__(runner, TurnRunner)
     runner._resolve_agent_max_iterations = _max_iter.__get__(runner, TurnRunner)
-    runner._resolve_agent_iteration_timeout = _iter_t.__get__(runner, TurnRunner)
-    runner._resolve_agent_tool_timeout = _tool_t.__get__(runner, TurnRunner)
     runner._resolve_agent_request_timeout = _req_t.__get__(runner, TurnRunner)
     runner._resolve_agent_max_provider_retries = _retries.__get__(runner, TurnRunner)
 
@@ -148,8 +147,19 @@ class _RecordingSessionManager:
         self.calls: list[Any] = []
         self.raises = raises
 
-    async def persist_compaction_result(self, session_key, summary, kept):
-        self.calls.append(("persist", session_key, summary, list(kept)))
+    async def persist_compaction_result(
+        self,
+        session_key,
+        summary,
+        kept,
+        *,
+        expected_session_id=None,
+        expected_session_epoch=None,
+        **kwargs,
+    ):
+        kwargs["expected_session_id"] = expected_session_id
+        kwargs["expected_session_epoch"] = expected_session_epoch
+        self.calls.append(("persist", session_key, summary, list(kept), kwargs))
         if self.raises is not None:
             raise self.raises("persist boom")
 
@@ -160,6 +170,14 @@ class _RecordingSessionManager:
         return None
 
     async def update(self, *args, **kwargs):  # noqa: ARG002
+        return None
+
+
+class _NoopAsyncContext:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *_args: Any) -> None:
         return None
 
 
@@ -415,7 +433,7 @@ def _build_runner(*, compaction_hooks=None) -> TurnRunner:
         model_catalog=_StubModelCatalog(),
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,
@@ -476,7 +494,12 @@ def _setup_runner(
     return runner
 
 
-async def _drive(runner: TurnRunner) -> tuple[list[Any], BaseException | None]:
+async def _drive(
+    runner: TurnRunner,
+    *,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
+) -> tuple[list[Any], BaseException | None]:
     yielded: list[Any] = []
     raised: BaseException | None = None
     gen = runner._run_turn(
@@ -491,6 +514,8 @@ async def _drive(runner: TurnRunner) -> tuple[list[Any], BaseException | None]:
         input_provenance=None,
         history_has_persisted_user=True,
         semantic_message=None,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
     )
     try:
         async for event in gen:
@@ -500,6 +525,214 @@ async def _drive(runner: TurnRunner) -> tuple[list[Any], BaseException | None]:
     finally:
         await gen.aclose()
     return yielded, raised
+
+
+@pytest.mark.parametrize("capability", ["explicit", "durable_kwargs", "legacy_kwargs"])
+@pytest.mark.asyncio
+async def test_history_adapter_exact_owner_capability(capability: str) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def explicit_load(
+        _agent: Any,
+        _session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        calls.append(
+            {
+                **kwargs,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
+            }
+        )
+
+    async def kwargs_load(
+        _agent: Any,
+        _session_key: str,
+        **kwargs: Any,
+    ) -> None:
+        calls.append(kwargs)
+
+    session_manager = (
+        SimpleNamespace(_storage=object())
+        if capability != "legacy_kwargs"
+        else SimpleNamespace()
+    )
+    runner = SimpleNamespace(
+        _session_manager=session_manager,
+        _load_history=(explicit_load if capability == "explicit" else kwargs_load),
+    )
+    adapter = _TurnRunnerHistoryLoaderAdapter(runner)
+
+    if capability == "durable_kwargs":
+        with pytest.raises(RuntimeError, match="does not support exact ownership"):
+            await adapter.load(
+                agent=object(),
+                session_key="agent:main:owner-capability",
+                trim_last_user=False,
+                expected_session_id="session-owner",
+                expected_session_epoch=4,
+            )
+        assert calls == []
+        return
+
+    await adapter.load(
+        agent=object(),
+        session_key="agent:main:owner-capability",
+        trim_last_user=False,
+        expected_session_id="session-owner",
+        expected_session_epoch=4,
+    )
+    assert len(calls) == 1
+    if capability == "explicit":
+        assert calls[0]["expected_session_id"] == "session-owner"
+        assert calls[0]["expected_session_epoch"] == 4
+    else:
+        assert "expected_session_id" not in calls[0]
+        assert "expected_session_epoch" not in calls[0]
+
+
+@pytest.mark.parametrize("capability", ["explicit", "durable_kwargs", "legacy_kwargs"])
+@pytest.mark.asyncio
+async def test_router_context_adapter_exact_owner_capability(capability: str) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def explicit_context(
+        _session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        calls.append(
+            {
+                **kwargs,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
+            }
+        )
+        return {}
+
+    async def kwargs_context(
+        _session_key: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {}
+
+    runner = SimpleNamespace(
+        _session_manager=(
+            SimpleNamespace(_storage=object())
+            if capability != "legacy_kwargs"
+            else SimpleNamespace()
+        ),
+        _router_previous_assistant_context=(
+            explicit_context if capability == "explicit" else kwargs_context
+        ),
+    )
+    adapter = _TurnRunnerRouterContextAdapter(runner)
+
+    if capability == "durable_kwargs":
+        with pytest.raises(RuntimeError, match="does not support exact ownership"):
+            await adapter.fetch_router_context(
+                "agent:main:owner-capability",
+                exclude_last_user=True,
+                expected_session_id="session-owner",
+                expected_session_epoch=4,
+            )
+        assert calls == []
+        return
+
+    await adapter.fetch_router_context(
+        "agent:main:owner-capability",
+        exclude_last_user=True,
+        expected_session_id="session-owner",
+        expected_session_epoch=4,
+    )
+    assert len(calls) == 1
+    if capability == "explicit":
+        assert calls[0]["expected_session_id"] == "session-owner"
+        assert calls[0]["expected_session_epoch"] == 4
+    else:
+        assert "expected_session_id" not in calls[0]
+        assert "expected_session_epoch" not in calls[0]
+
+
+@pytest.mark.parametrize("capability", ["explicit", "durable_kwargs", "legacy_kwargs"])
+@pytest.mark.asyncio
+async def test_compaction_persist_adapter_exact_owner_capability(
+    capability: str,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def explicit_persist(
+        _session_key: str,
+        _summary: str,
+        _kept_entries: list[Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **kwargs: Any,
+    ) -> bool:
+        calls.append(
+            {
+                **kwargs,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
+            }
+        )
+        return True
+
+    async def kwargs_persist(
+        _session_key: str,
+        _summary: str,
+        _kept_entries: list[Any],
+        **kwargs: Any,
+    ) -> bool:
+        calls.append(kwargs)
+        return True
+
+    session_manager = SimpleNamespace(
+        persist_compaction_result=(
+            explicit_persist if capability == "explicit" else kwargs_persist
+        ),
+    )
+    if capability != "legacy_kwargs":
+        session_manager._storage = object()
+    runner = SimpleNamespace(
+        _session_manager=session_manager,
+        _session_write_context=lambda _session_key: _NoopAsyncContext(),
+    )
+    adapter = _TurnRunnerCompactionPersistAdapter(runner)
+
+    if capability == "durable_kwargs":
+        with pytest.raises(RuntimeError, match="does not support exact ownership"):
+            await adapter.persist_and_notify(
+                session_key="agent:main:owner-capability",
+                summary="summary",
+                kept_entries=[],
+                expected_session_id="session-owner",
+                expected_session_epoch=4,
+            )
+        assert calls == []
+        return
+
+    await adapter.persist_and_notify(
+        session_key="agent:main:owner-capability",
+        summary="summary",
+        kept_entries=[],
+        expected_session_id="session-owner",
+        expected_session_epoch=4,
+    )
+    assert len(calls) == 1
+    if capability == "explicit":
+        assert calls[0]["expected_session_id"] == "session-owner"
+        assert calls[0]["expected_session_epoch"] == 4
+    else:
+        assert "expected_session_id" not in calls[0]
+        assert "expected_session_epoch" not in calls[0]
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +780,7 @@ async def test_stream_consumer_stage_snapshot(
     if case.expected_pending_error_code is not None:
         tail = next(e for e in reversed(yielded) if isinstance(e, ErrorEvent))
         assert tail.code == case.expected_pending_error_code
+        assert current_turn_failure_stage() is TurnFailureStage.AGENT_EXECUTION
 
     if case.expected_done_present:
         assert any(isinstance(e, DoneEvent) for e in yielded)

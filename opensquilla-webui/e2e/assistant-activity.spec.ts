@@ -1,12 +1,39 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
+
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-assistant-activity'
 const LIFECYCLE_SESSION_KEY = 'agent:main:webchat:e2e-assistant-activity-lifecycle'
 const LIFECYCLE_TASK_ID = 'task-e2e-assistant-activity-lifecycle'
+const ACTIVITY_SCREENSHOT_DIR = process.env.OPENSQUILLA_ACTIVITY_SCREENSHOT_DIR || ''
+
+async function captureActivityScreenshot(page: Page, name: string) {
+  if (!ACTIVITY_SCREENSHOT_DIR) return
+  fs.mkdirSync(ACTIVITY_SCREENSHOT_DIR, { recursive: true, mode: 0o700 })
+  await page.screenshot({
+    path: path.join(ACTIVITY_SCREENSHOT_DIR, `${name}.png`),
+    fullPage: true,
+  })
+}
 
 interface ActivityFixture {
   failed?: boolean
+  searchTargets?: boolean
+  recoveredEdit?: boolean
+}
+
+interface ControlledActivityLifecycleFixture {
+  donePayload?: Record<string, unknown>
+  settledMessages?: (acceptedUserMessageId: string) => Array<Record<string, unknown>>
 }
 
 function wsResponse(id: string | number | undefined, payload: unknown) {
@@ -18,6 +45,31 @@ function wsEvent(event: string, payload: unknown) {
 }
 
 async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
+  const isSearchFixture = fixture.searchTargets === true
+  const now = Math.floor(Date.now() / 1000)
+  const recoveredTurnId = 'turn-activity-recovered-edit'
+  const recoveredToolCalls = fixture.recoveredEdit
+    ? [{
+        tool_use_id: 'activity-edit-failed',
+        name: 'edit_file',
+        groupId: 'activity-group',
+        input: { path: 'beijing-site/index.html', old_text: 'Old title', new_text: 'New title' },
+        result: 'old_text was not found; read the current file and retry.',
+        is_error: true,
+        execution_status: { status: 'error' },
+      }, {
+        tool_use_id: 'activity-edit-retried',
+        name: 'edit_file',
+        groupId: 'activity-group',
+        input: { path: 'beijing-site/index.html', old_text: 'Current title', new_text: 'New title' },
+        result: 'Successfully edited beijing-site/index.html',
+        is_error: false,
+        execution_status: { status: 'success' },
+      }]
+    : undefined
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.onMessage(message => {
       let frame: Record<string, unknown>
@@ -28,7 +80,7 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
       }
       if (frame.type !== 'req' || frame.id === undefined) return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: {} }))
+        ws.send(helloOkResponse())
         return
       }
       if (frame.method === 'chat.history') {
@@ -36,19 +88,29 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
           type: 'res',
           id: frame.id,
           ok: true,
-          payload: {
-            messages: [{
+          payload: chatHistoryPayload([{
               role: 'assistant',
               text: 'The canonical answer is complete.',
               id: `assistant-activity-${fixture.failed ? 'failed' : 'success'}`,
-              timestamp: Math.floor(Date.now() / 1000) - 30,
+              timestamp: now - 30,
+              ...(fixture.recoveredEdit ? { turn_context: { turn_id: recoveredTurnId } } : {}),
               reasoning_content: 'I compared the available evidence before answering.',
-              tool_calls: [{
-                tool_use_id: 'activity-search',
-                name: 'web_search',
+              tool_calls: recoveredToolCalls ?? [{
+                tool_use_id: isSearchFixture ? 'activity-search' : 'activity-tool',
+                name: isSearchFixture ? 'web_search' : 'custom_tool',
                 groupId: 'activity-group',
-                input: { query: 'OpenSquilla activity' },
-                result: fixture.failed ? 'Search service unavailable' : 'One verified result',
+                input: isSearchFixture
+                  ? { query: 'private search query' }
+                  : { name: 'OpenSquilla activity' },
+                result: fixture.failed ? 'Tool unavailable' : 'One verified result',
+                ...(isSearchFixture
+                  ? {
+                      sources: [
+                        { url: 'https://example.test/one', title: 'First result' },
+                        { url: 'https://docs.example.test/two', title: 'Second result' },
+                      ],
+                    }
+                  : {}),
                 is_error: fixture.failed === true,
                 execution_status: { status: fixture.failed ? 'error' : 'success' },
               }],
@@ -57,19 +119,186 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
                 { type: 'tool-group', groupId: 'activity-group' },
                 { type: 'text', raw: 'Non-canonical streamed suffix.' },
               ],
-            }],
-            has_more: false,
-          },
+            }], fixture.recoveredEdit ? {
+              turn_outcomes: [{
+                turn_id: recoveredTurnId,
+                task_id: 'task-activity-recovered-edit',
+                status: 'succeeded',
+                started_at: now - 74,
+                finished_at: now - 30,
+                outcome: { kind: 'completed' },
+              }],
+            } : {}),
         }))
         return
       }
-      ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }))
+      if (frame.method === 'sessions.messages.subscribe') {
+        const key = String((frame.params as Record<string, unknown> | undefined)?.key || SESSION_KEY)
+        ws.send(wsResponse(frame.id as string | number, sessionMessagesSubscribePayload(
+          key,
+        )))
+        return
+      }
+      if (frame.method === 'sessions.messages.snapshot') {
+        const key = String((frame.params as Record<string, unknown> | undefined)?.key || SESSION_KEY)
+        ws.send(wsResponse(frame.id as string | number, sessionMessagesSnapshotPayload(
+          key,
+        )))
+        return
+      }
+      if (frame.method === 'sessions.messages.hydrate') {
+        const key = String((frame.params as Record<string, unknown> | undefined)?.key || SESSION_KEY)
+        ws.send(wsResponse(frame.id as string | number, sessionMessagesHydratePayload(
+          key,
+        )))
+        return
+      }
+      const payloads: Record<string, unknown> = {
+        'agents.list': { agents: [] },
+        'commands.list_for_surface': { commands: [] },
+        'config.get': {
+          squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
+          permissions: {},
+          skills: {},
+        },
+        'onboarding.status': { audioConfigured: false },
+        'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
+        'sandbox.capability.status': { available: false },
+        'sessions.list': { sessions: [], count: 0, ts: now, has_more: false },
+        'usage.status': { sessions: [] },
+      }
+      ws.send(wsResponse(frame.id as string | number, payloads[String(frame.method || '')] ?? {}))
     })
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
   })
 }
 
-async function mockControlledActivityLifecycle(page: Page) {
+async function mockUnifiedTurnReceiptHistory(page: Page) {
+  const now = Math.floor(Date.now() / 1000)
+  const kinds = ['default', 'plan', 'goal', 'cron'] as const
+  const messages = kinds.flatMap((kind, index) => {
+    const turnId = `turn-unified-receipt-${kind}`
+    const messageId = `assistant-unified-receipt-${kind}`
+    return [{
+      role: 'user',
+      text: `Trigger the ${kind} turn.`,
+      id: `user-unified-receipt-${kind}`,
+      message_id: `user-unified-receipt-${kind}`,
+      timestamp: now - 120 + index * 20,
+      turn_context: { turn_id: turnId },
+    }, {
+      role: 'assistant',
+      text: `The ${kind} turn completed.`,
+      id: messageId,
+      message_id: messageId,
+      timestamp: now - 115 + index * 20,
+      turn_context: {
+        turn_id: turnId,
+        input_mode: kind === 'goal' ? 'system_event' : 'user',
+        run_kind: kind,
+      },
+      ...(kind === 'cron'
+        ? { provenance_kind: 'cron', provenance_source_tool: 'cron.run' }
+        : {}),
+      ...(kind === 'plan'
+        ? {
+            tool_calls: [{
+              type: 'plan',
+              snapshot: {
+                revision_id: 'revision-unified-receipt',
+                plan_id: 'plan-unified-receipt',
+                title: 'Unified receipt plan',
+                markdown: 'Verify the shared completion receipt.',
+                steps: [{ step_id: 'step-1', title: 'Inspect the receipt' }],
+                current: true,
+              },
+            }],
+          }
+        : {}),
+      usage: {
+        model: `fixture/${kind}-e2e`,
+        input_tokens: 100 + index,
+        output_tokens: 10 + index,
+        cached_tokens: 3 + index,
+        reasoning_tokens: 2 + index,
+        cost_usd: 0.001 + index * 0.001,
+      },
+    }]
+  })
+  const turnOutcomes = kinds.map((kind, index) => ({
+    turn_id: `turn-unified-receipt-${kind}`,
+    task_id: `task-unified-receipt-${kind}`,
+    status: 'succeeded',
+    started_at: now - 118 + index * 20,
+    finished_at: now - 115 + index * 20,
+    outcome: { kind: 'completed' },
+  }))
+
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
+  await page.route('**/api/approvals', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
+  }))
+  await page.routeWebSocket(/\/ws$/, ws => {
+    ws.send(wsEvent('connect.challenge', {}))
+    ws.onMessage(message => {
+      let frame: Record<string, unknown>
+      try {
+        frame = JSON.parse(String(message)) as Record<string, unknown>
+      } catch {
+        return
+      }
+      if (frame.type !== 'req' || frame.id === undefined) return
+      if (frame.method === 'connect') {
+        ws.send(helloOkResponse())
+        return
+      }
+      if (frame.method === 'chat.history') {
+        ws.send(wsResponse(frame.id as string | number, chatHistoryPayload(messages, {
+          turn_outcomes: turnOutcomes,
+        })))
+        return
+      }
+      const params = frame.params && typeof frame.params === 'object'
+        ? frame.params as Record<string, unknown>
+        : {}
+      const sessionKey = String(params.key || `${SESSION_KEY}-unified-receipts`)
+      const payloads: Record<string, unknown> = {
+        'agents.list': { agents: [] },
+        'commands.list_for_surface': { commands: [] },
+        'config.get': {
+          squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
+          permissions: {},
+          skills: {},
+        },
+        'onboarding.status': { audioConfigured: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(
+          sessionKey,
+        ),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(
+          sessionKey,
+        ),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(
+          sessionKey,
+        ),
+        'usage.status': { sessions: [] },
+      }
+      ws.send(wsResponse(
+        frame.id as string | number,
+        payloads[String(frame.method || '')] ?? {},
+      ))
+    })
+  })
+}
+
+async function mockControlledActivityLifecycle(
+  page: Page,
+  fixture: ControlledActivityLifecycleFixture = {},
+) {
   let sendFrame: ((frame: string) => void) | null = null
   let streamSeq = 3
   let settled = false
@@ -91,7 +320,7 @@ async function mockControlledActivityLifecycle(page: Page) {
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     sendFrame = frame => ws.send(frame)
@@ -106,9 +335,8 @@ async function mockControlledActivityLifecycle(page: Page) {
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000, webui_stream_idle_grace_ms: 1_260_000 },
+        ws.send(helloOkResponse({
+          policy: { webui_stream_idle_grace_ms: 1_260_000 },
         }))
         return
       }
@@ -141,45 +369,54 @@ async function mockControlledActivityLifecycle(page: Page) {
         }))
         return
       }
+      const defaultSettledMessages = (): Array<Record<string, unknown>> => [{
+        role: 'user',
+        text: 'Inspect, draft, verify, and answer.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 30,
+      }, {
+        role: 'assistant',
+        text: 'Final verified answer.',
+        id: 'activity-lifecycle-assistant',
+        message_id: 'activity-lifecycle-assistant',
+        timestamp: Math.floor(Date.now() / 1000),
+        usage: {
+          model: 'test/activity',
+          input_tokens: 12,
+          output_tokens: 4,
+          cached_tokens: 3,
+          reasoning_tokens: 2,
+          cost_usd: 0.0012,
+        },
+        tool_calls: [{
+          tool_use_id: 'activity-inspect',
+          name: 'read_file',
+          groupId: 'activity-inspect-group',
+          input: { path: '/private/project/chat.ts' },
+          result: 'read',
+          execution_status: { status: 'success' },
+        }, {
+          tool_use_id: 'activity-verify',
+          name: 'bash_exec',
+          groupId: 'activity-verify-group',
+          input: { command: 'npm test' },
+          result: 'verified',
+          execution_status: { status: 'success' },
+        }],
+        timeline: [
+          { type: 'tool-group', groupId: 'activity-inspect-group' },
+          { type: 'text', raw: 'Draft candidate.' },
+          { type: 'tool-group', groupId: 'activity-verify-group' },
+          { type: 'text', raw: 'Final verified answer.' },
+        ],
+      }]
       const messages = settled
-        ? [{
-            role: 'user',
-            text: 'Inspect, draft, verify, and answer.',
-            id: acceptedUserMessageId,
-            message_id: acceptedUserMessageId,
-            timestamp: Math.floor(Date.now() / 1000) - 30,
-          }, {
-            role: 'assistant',
-            text: 'Final verified answer.',
-            id: 'activity-lifecycle-assistant',
-            message_id: 'activity-lifecycle-assistant',
-            timestamp: Math.floor(Date.now() / 1000),
-            tool_calls: [{
-              tool_use_id: 'activity-inspect',
-              name: 'read_file',
-              groupId: 'activity-inspect-group',
-              input: { path: '/private/project/chat.ts' },
-              result: 'read',
-              execution_status: { status: 'success' },
-            }, {
-              tool_use_id: 'activity-verify',
-              name: 'bash_exec',
-              groupId: 'activity-verify-group',
-              input: { command: 'npm test' },
-              result: 'verified',
-              execution_status: { status: 'success' },
-            }],
-            timeline: [
-              { type: 'tool-group', groupId: 'activity-inspect-group' },
-              { type: 'text', raw: 'Draft candidate.' },
-              { type: 'tool-group', groupId: 'activity-verify-group' },
-              { type: 'text', raw: 'Final verified answer.' },
-            ],
-          }]
+        ? fixture.settledMessages?.(acceptedUserMessageId) ?? defaultSettledMessages()
         : []
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
-        'chat.history': { messages, has_more: false, canonical_complete: true },
+        'chat.history': chatHistoryPayload(messages),
         'commands.list_for_surface': { commands: [] },
         'config.get': {
           squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
@@ -187,13 +424,16 @@ async function mockControlledActivityLifecycle(page: Page) {
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-        },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(
+          LIFECYCLE_SESSION_KEY,
+        ),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(
+          LIFECYCLE_SESSION_KEY,
+        ),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(
+          LIFECYCLE_SESSION_KEY,
+        ),
         'usage.status': { sessions: [] },
       }
       ws.send(wsResponse(
@@ -212,12 +452,55 @@ async function mockControlledActivityLifecycle(page: Page) {
         model: 'test/activity',
         input_tokens: 12,
         output_tokens: 4,
+        ...fixture.donePayload,
       })
     },
   }
 }
 
 test.describe('Completed assistant activity disclosure', () => {
+  test('uses compact footer usage for Default, Plan, Goal, and Cron turns', async ({
+    page,
+  }) => {
+    await mockUnifiedTurnReceiptHistory(page)
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-unified-receipts`),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+
+    const kinds = ['default', 'plan', 'goal', 'cron'] as const
+    await expect(page.locator('.msg-ai .assistant-activity')).toHaveCount(0)
+    await expect(page.locator('.msg-ai .msg-meta__more-btn')).toHaveCount(kinds.length)
+
+    for (const kind of kinds) {
+      const message = page.locator(
+        `.msg-ai[data-message-id="assistant-unified-receipt-${kind}"]`,
+      )
+      await expect(message).toBeVisible()
+      const trigger = message.getByRole('button', { name: 'Usage details' })
+      await expect(trigger).toHaveCount(1)
+      await trigger.click()
+      await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+      const usage = message.locator('.msg-meta-popover')
+      await expect(usage).toBeVisible()
+      await expect(usage).toContainText(`${kind}-e2e`)
+      await expect(usage).toContainText(`↑${100 + kinds.indexOf(kind)}`)
+      await page.keyboard.press('Escape')
+      await expect(usage).toHaveCount(0)
+      await expect(trigger).toBeFocused()
+    }
+
+    await expect(
+      page.locator('.msg-ai[data-message-id="assistant-unified-receipt-plan"] .plan-card'),
+    ).toBeVisible()
+    await expect(
+      page.locator('.msg-ai[data-message-id="assistant-unified-receipt-plan"] .msg-ai-actions'),
+    ).toHaveCount(0)
+    await expect(
+      page.locator('.msg-ai[data-message-id="assistant-unified-receipt-cron"] .msg-provenance-chip'),
+    ).toContainText('Scheduled')
+  })
+
   test('keeps the canonical answer visible and supports keyboard disclosure', async ({ page }) => {
     await mockActivityHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
@@ -240,7 +523,7 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(processPrefix).toBeHidden()
     await expect(page.getByText('Non-canonical streamed suffix.')).toHaveCount(0)
 
-    const row = activity.locator('.tool-row[data-op="web.search"]')
+    const row = activity.locator('.tool-row[data-op="tool.custom.tool"]')
     await expect(row).toBeHidden()
 
     const summary = activity.locator('.assistant-activity__summary')
@@ -361,7 +644,36 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(answer).toBeVisible()
   })
 
-  test('omits failed work from the activity disclosure', async ({ page }) => {
+  test('keeps web-search URLs collapsed without exposing invocation parameters', async ({ page }) => {
+    await mockActivityHistory(page, { searchTargets: true })
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-search`))
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+
+    const activity = page.getByTestId('assistant-activity')
+    const summary = activity.locator('.assistant-activity__summary')
+    await summary.press('Enter')
+
+    const row = activity.locator('.tool-row[data-op="web.search"]')
+    const targets = activity.locator('.tool-row-target--url')
+    await expect(row).toHaveAttribute('aria-expanded', 'false')
+    await expect(targets).toHaveCount(0)
+    await expect(activity).not.toContainText('private search query')
+    await expect(activity).not.toContainText('INPUT')
+    await expect(activity).not.toContainText('RESULT')
+
+    await row.press('Enter')
+    await expect(row).toHaveAttribute('aria-expanded', 'true')
+    await expect(targets).toHaveCount(2)
+    await expect(targets.nth(0)).toContainText('https://example.test/one')
+    await expect(targets.nth(1)).toContainText('https://docs.example.test/two')
+    await expect(activity).not.toContainText('private search query')
+
+    await row.press('Space')
+    await expect(row).toHaveAttribute('aria-expanded', 'false')
+    await expect(targets).toHaveCount(0)
+  })
+
+  test('keeps failed work inspectable apart from the final answer', async ({ page }) => {
     await mockActivityHistory(page, { failed: true })
     await page.setViewportSize({ width: 320, height: 844 })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-failed`))
@@ -373,12 +685,21 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(activity).not.toContainText('failure recovered')
 
     const errorRow = activity.locator('.tool-row--error')
-    await expect(errorRow).toHaveCount(0)
+    await expect(errorRow).toHaveCount(1)
     const summary = activity.locator('.assistant-activity__summary')
     await summary.press('Enter')
     await expect(activity).toHaveAttribute('data-share-expanded', 'true')
-    await expect(errorRow).toHaveCount(0)
-    await expect(activity).not.toContainText('Search service unavailable')
+    await expect(errorRow).toHaveCount(1)
+    await expect(errorRow).toBeVisible()
+    await expect(errorRow).toHaveAttribute('aria-expanded', 'true')
+    const failureDetail = activity.getByText('Tool unavailable', { exact: true })
+    await expect(failureDetail).toBeVisible()
+    await errorRow.press('Enter')
+    await expect(errorRow).toHaveAttribute('aria-expanded', 'false')
+    await expect(failureDetail).not.toBeVisible()
+    await errorRow.press('Space')
+    await expect(errorRow).toHaveAttribute('aria-expanded', 'true')
+    await expect(failureDetail).toBeVisible()
     await expect(activity.locator('.tool-row-section--error')).toHaveCount(0)
     await expect(
       page.getByText('The canonical answer is complete.', { exact: true }),
@@ -395,10 +716,241 @@ test.describe('Completed assistant activity disclosure', () => {
       document.documentElement.scrollWidth - document.documentElement.clientWidth,
     )
     expect(pageOverflow).toBeLessThanOrEqual(1)
+    await captureActivityScreenshot(page, 'failed-work-details')
   })
+
+  for (const width of [1440, 390] as const) {
+    test(`shows successful recovered edits without hiding the original error at ${width}px`, async ({
+      page,
+    }) => {
+      const runtimeErrors: string[] = []
+      page.on('pageerror', error => runtimeErrors.push(error.message))
+      page.on('console', message => {
+        if (message.type() === 'error' || message.type() === 'warning') {
+          runtimeErrors.push(message.text())
+        }
+      })
+      await page.route('**/api/approvals', route => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ mode: 'prompt', pending: [] }),
+      }))
+      await page.route('**/api/system/update', route => route.fulfill({
+        json: { available: false },
+      }))
+      await page.route('**/api/elevated-mode', route => route.fulfill({
+        json: { enabled: false },
+      }))
+      await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
+        contentType: 'image/png',
+        body: fs.readFileSync(new URL('../public/opensquilla-mark.png', import.meta.url)),
+      }))
+      await mockActivityHistory(page, { recoveredEdit: true })
+      await page.setViewportSize({ width, height: width === 390 ? 844 : 900 })
+      await page.emulateMedia({ reducedMotion: 'reduce' })
+      const sessionKey = `${SESSION_KEY}-recovered-${width}`
+      await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(sessionKey))
+      await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+      expect(new URL(page.url()).pathname).toBe('/control/chat')
+      expect(new URL(page.url()).searchParams.get('session')).toBe(sessionKey)
+      await expect(page).toHaveTitle(/OpenSquilla/)
+      await expect(page.locator('vite-error-overlay, #webpack-dev-server-client-overlay')).toHaveCount(0)
+      await expect(page.getByText('The canonical answer is complete.', { exact: true })).toBeVisible()
+
+      const activity = page.getByTestId('assistant-activity')
+      const summary = activity.locator('.assistant-activity__summary')
+      await expect(activity).toHaveAttribute('data-share-expanded', 'false')
+      await expect(summary).toHaveText('Completed · 44s')
+      await expect(summary).not.toContainText('Failed')
+      await captureActivityScreenshot(page, `recovered-edit-${width}-collapsed`)
+
+      await summary.press('Enter')
+      await expect(activity).toHaveAttribute('data-share-expanded', 'true')
+      const toolBatch = activity.locator('.assistant-activity-tool-batch')
+      await toolBatch.locator('summary').click()
+      await expect(toolBatch).toHaveAttribute('open', '')
+      const errorRow = activity.locator('.tool-row--error')
+      await expect(errorRow).toHaveCount(1)
+      await expect(errorRow).toBeVisible()
+      await expect(activity.getByText(
+        'old_text was not found; read the current file and retry.', { exact: true },
+      )).toBeVisible()
+      await expect(activity.locator('.tool-row[data-op="file.edit"]:not(.tool-row--error)')).toHaveCount(1)
+      await expect(summary).toHaveText('Completed · 44s')
+      const pageOverflow = await page.evaluate(() =>
+        document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      )
+      expect(pageOverflow).toBeLessThanOrEqual(1)
+      await captureActivityScreenshot(page, `recovered-edit-${width}-expanded`)
+      expect(runtimeErrors).toEqual([])
+    })
+  }
+
+  for (const width of [1440, 390] as const) {
+    for (const theme of ['light', 'dark'] as const) {
+      for (const reducedMotion of ['no-preference', 'reduce'] as const) {
+        test(`keeps compact receipts inside ${width}px ${theme} ${reducedMotion}`, async ({
+          page,
+        }) => {
+          const runtimeErrors: string[] = []
+          page.on('pageerror', error => runtimeErrors.push(error.message))
+          page.on('console', message => {
+            if (
+              message.type() === 'error'
+              && !message.text().startsWith('Failed to load resource:')
+            ) runtimeErrors.push(message.text())
+          })
+          await page.setViewportSize({ width, height: width === 390 ? 844 : 900 })
+          await page.emulateMedia({ reducedMotion })
+          await page.addInitScript(selectedTheme => {
+            window.localStorage.setItem('opensquilla-theme', selectedTheme)
+          }, theme)
+          await mockUnifiedTurnReceiptHistory(page)
+          await page.goto(
+            CONTROL_URL
+            + 'chat?session='
+            + encodeURIComponent(`${SESSION_KEY}-${width}-${theme}-${reducedMotion}`),
+          )
+          await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+          await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+          await expect(page.locator('.msg-ai .msg-meta__more-btn')).toHaveCount(4)
+          await expect(page.locator('.msg-ai .assistant-activity')).toHaveCount(0)
+
+          const cronMessage = page.locator(
+            '.msg-ai[data-message-id="assistant-unified-receipt-cron"]',
+          )
+          const trigger = cronMessage.getByRole('button', { name: 'Usage details' })
+          await trigger.click()
+          const popover = cronMessage.locator('.msg-meta-popover')
+          await expect(popover).toBeVisible()
+          const box = await popover.boundingBox()
+          expect(box).not.toBeNull()
+          expect(box!.x).toBeGreaterThanOrEqual(0)
+          expect(box!.x + box!.width).toBeLessThanOrEqual(width)
+          expect(runtimeErrors).toEqual([])
+        })
+      }
+    }
+  }
 })
 
 test.describe('Live assistant activity lifecycle', () => {
+  test('renders an unbounded provider retry as an attempt label', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page)
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await page.locator('.chat-textarea').fill('Reconnect and finish this task.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    const liveActivity = page.locator('.assistant-activity--live')
+    await expect(liveActivity).toBeVisible()
+    lifecycle.emit('session.event.provider_activity', {
+      phase: 'retrying',
+      reason: 'transport_transient',
+      retry_attempt: 7,
+      retry_limit: 0,
+    })
+    await expect(liveActivity.getByText('Retrying · attempt 7', { exact: true })).toBeVisible()
+    await expect(liveActivity).not.toContainText('7/0')
+    await expect(page.locator('.msg-error')).toHaveCount(0)
+
+    lifecycle.finish()
+    await expect(liveActivity).toHaveCount(0)
+    await expect(page.locator('.msg-ai .assistant-activity__summary')).toContainText('Completed')
+  })
+
+  test('keeps a failed tool row when a later tool succeeds and the turn completes', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: { text: 'Recovered final answer.' },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Recover after a tool failure.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 30,
+      }, {
+        role: 'assistant',
+        text: 'Recovered final answer.',
+        id: 'activity-recovered-assistant',
+        message_id: 'activity-recovered-assistant',
+        timestamp: Math.floor(Date.now() / 1000),
+        tool_calls: [{
+          tool_use_id: 'activity-failing',
+          name: 'bash_exec',
+          groupId: 'activity-failure-group',
+          input: { command: 'exit 7' },
+          result: 'exit 7',
+          is_error: true,
+          execution_status: { status: 'error' },
+        }, {
+          tool_use_id: 'activity-recovered',
+          name: 'bash_exec',
+          groupId: 'activity-recovery-group',
+          input: { command: 'printf recovered' },
+          result: 'recovered',
+          execution_status: { status: 'success' },
+        }],
+        timeline: [
+          { type: 'tool-group', groupId: 'activity-failure-group' },
+          { type: 'tool-group', groupId: 'activity-recovery-group' },
+          { type: 'text', raw: 'Recovered final answer.' },
+        ],
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+
+    await page.locator('.chat-textarea').fill('Recover after a tool failure.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    const liveActivity = page.locator('.assistant-activity--live')
+    await expect(liveActivity).toBeVisible()
+
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'activity-failing',
+      name: 'bash_exec',
+      input: { command: 'exit 7' },
+    })
+    lifecycle.emit('session.event.tool_result', {
+      tool_use_id: 'activity-failing',
+      name: 'bash_exec',
+      input: { command: 'exit 7' },
+      result: 'exit 7',
+      is_error: true,
+      execution_status: { status: 'error' },
+    })
+    const failedRow = liveActivity.locator('.tool-row--error').first()
+    await expect(failedRow).toBeVisible()
+
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'activity-recovered',
+      name: 'bash_exec',
+      input: { command: 'printf recovered' },
+    })
+    lifecycle.emit('session.event.tool_result', {
+      tool_use_id: 'activity-recovered',
+      name: 'bash_exec',
+      input: { command: 'printf recovered' },
+      result: 'recovered',
+      execution_status: { status: 'success' },
+    })
+    lifecycle.emit('session.event.text_delta', { text: 'Recovered final answer.' })
+    await expect(page.getByText('Recovered final answer.', { exact: true })).toBeVisible()
+
+    lifecycle.finish()
+    await expect(liveActivity).toHaveCount(0)
+    const settled = page.locator('.msg-ai .assistant-activity').last()
+    await expect(settled).toBeVisible()
+    await expect(settled.locator('.assistant-activity__summary')).toContainText('Completed')
+    await expect(settled.locator('.tool-row--error')).toHaveCount(1)
+    await expect(settled.locator('.tool-row[data-op="command.run"]')).toHaveCount(2)
+    await expect(page.getByText('Recovered final answer.', { exact: true })).toHaveCount(1)
+    await expect(page.locator('.msg-error')).toHaveCount(0)
+  })
+
   test('moves draft text back into activity when a later tool starts, then settles', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'no-preference' })
     const lifecycle = await mockControlledActivityLifecycle(page)
@@ -414,8 +966,6 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveActivity).toBeVisible()
     await expect(page.locator('.work-card')).toHaveCount(0)
     const liveSummary = liveActivity.locator('.assistant-activity__live-head')
-    await expect(liveSummary).toHaveAttribute('aria-expanded', 'false')
-    await liveSummary.click()
     await expect(liveSummary).toHaveAttribute('aria-expanded', 'true')
     const liveStatus = liveActivity.locator('.assistant-activity__live-label')
     await expect(liveStatus).toHaveText('Working')
@@ -423,8 +973,8 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveStatus).toHaveAttribute('aria-live', 'polite')
     await expect(liveStatus).toHaveAttribute('aria-atomic', 'true')
     await expect(liveActivity.getByText('Working', { exact: true })).toHaveCount(1)
-    // The phase label is the only polite live region. Failed work is omitted
-    // from the disclosure, so it must not mount a second announcement region.
+    // The phase label is the only polite live region; tool details must not
+    // add duplicate announcements.
     await expect(liveActivity.locator('[role="status"]')).toHaveCount(1)
     await expect(liveActivity.locator('.assistant-activity__live-failure')).toHaveCount(0)
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
@@ -448,9 +998,12 @@ test.describe('Live assistant activity lifecycle', () => {
     })
     const inspectRow = liveActivity.locator('.tool-row[data-op="file.inspect"]')
     await expect(inspectRow).toBeVisible()
-    await expect(inspectRow).toHaveAttribute('aria-expanded', 'false')
-    await expect(inspectRow.locator('.tool-row__activity-arrow')).toHaveCount(1)
+    await expect(inspectRow).not.toHaveAttribute('aria-expanded', /.+/)
+    await expect(inspectRow.locator('.tool-row__activity-arrow')).toHaveCount(0)
     await expect(inspectRow.locator('.tool-row__bullet')).toHaveCount(0)
+    const inspectPath = liveActivity.locator('.tool-row-target--path')
+    await expect(inspectPath).toHaveText('…/chat.ts')
+    await expect(inspectPath).not.toHaveAttribute('role', 'button')
     await expect(liveActivity).not.toContainText('/private/project/chat.ts')
     await expect(liveStatus).toHaveText('Working')
     // A cluster still in flight reads in the present tense; it settles into
@@ -467,21 +1020,24 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveActivity.getByText('Inspected files', { exact: true })).toHaveCount(1)
     lifecycle.emit('session.event.text_delta', { text: 'Draft candidate.' })
 
-    const answerCandidate = page.locator('.live-answer-candidate')
-    await expect(answerCandidate).toHaveText('Draft candidate.')
-    await expect(liveActivity.getByText('Draft candidate.', { exact: true })).toHaveCount(0)
-    await expect(liveStatus).toHaveText('Writing the answer')
+    const draftCandidate = page.getByText('Draft candidate.', { exact: true })
+    await expect(draftCandidate).toBeVisible()
+    expect(await draftCandidate.evaluate(element =>
+      element.closest('.assistant-activity') === null,
+    )).toBe(true)
+    // The parent remains a turn-wide working indicator while only the child
+    // phase changes as the model moves from tools into answer composition.
+    await expect(liveStatus).toHaveText('Working')
     await expect(
       liveActivity.getByText('Writing the answer', { exact: true }),
     ).toHaveCount(1)
-    await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
+    await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(1)
 
     lifecycle.emit('session.event.tool_use_start', {
       tool_use_id: 'activity-verify',
       name: 'bash_exec',
       input: { command: 'npm test' },
     })
-    await expect(answerCandidate).toHaveCount(0)
     await expect(liveActivity.getByText('Draft candidate.', { exact: true })).toBeVisible()
     await expect(liveActivity.locator('.tool-row[data-op="command.run"]')).toBeVisible()
     await expect(liveStatus).toHaveText('Working')
@@ -495,8 +1051,13 @@ test.describe('Live assistant activity lifecycle', () => {
       execution_status: { status: 'success' },
     })
     lifecycle.emit('session.event.text_delta', { text: 'Final verified answer.' })
-    await expect(answerCandidate).toHaveText('Final verified answer.')
+    const finalCandidate = page.getByText('Final verified answer.', { exact: true })
+    await expect(finalCandidate).toBeVisible()
+    expect(await finalCandidate.evaluate(element =>
+      element.closest('.assistant-activity') === null,
+    )).toBe(true)
     await expect(liveActivity).toBeVisible()
+    await captureActivityScreenshot(page, '01-running-expanded')
 
     lifecycle.finish()
     await expect(liveActivity).toHaveCount(0)
@@ -510,12 +1071,31 @@ test.describe('Live assistant activity lifecycle', () => {
     expect(await finalAnswer.evaluate(element =>
       element.closest('.assistant-activity') === null,
     )).toBe(true)
-    await settled.locator('.assistant-activity__summary').click()
-    await expect(settled.getByText('Draft candidate.', { exact: true })).toBeVisible()
+    expect(await settled.evaluate((activity) => {
+      const answer = activity.parentElement?.querySelector('.assistant-answer')
+      return !!answer && !!(activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING)
+    })).toBe(true)
+    await captureActivityScreenshot(page, '02-completed-collapsed')
+    // The fixture uses a paused browser clock. Motion has already been
+    // asserted above; disable it before the settled disclosure interaction so
+    // Chromium does not remain frozen on the transition's first frame.
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    const settledSummary = settled.locator('.assistant-activity__summary')
+    await settledSummary.click()
+    await expect(settledSummary).toHaveAttribute('aria-expanded', 'true')
+    await expect(settled).toHaveAttribute('data-share-expanded', 'true')
+    await expect(settled.locator('.assistant-activity__body')).toBeVisible()
+    const settledDraft = settled.getByText('Draft candidate.', { exact: true })
+    await expect(settledDraft).toBeVisible()
+    await captureActivityScreenshot(page, '03-completed-expanded')
     await expect(
       settled.getByText('Final verified answer.', { exact: true }),
     ).toHaveCount(0)
     await expect(page.getByText('Final verified answer.', { exact: true })).toHaveCount(1)
+    const usageTrigger = page.locator('.msg-ai .msg-meta__more-btn')
+    await usageTrigger.click()
+    await expect(page.locator('.msg-ai .msg-meta-popover')).toBeVisible()
+    await captureActivityScreenshot(page, '04-usage-popover')
   })
 
   test('disables live activity motion when reduced motion is requested', async ({ page }) => {
@@ -540,5 +1120,187 @@ test.describe('Live assistant activity lifecycle', () => {
       ).animationName,
     }))
     expect(liveMotion).toEqual({ dot: 'none', label: 'none' })
+  })
+})
+
+test.describe('Silent assistant delivery lifecycle', () => {
+  test('removes a visible sentinel delta after an authoritative suppressed Done', async ({
+    page,
+  }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: {
+        text: '',
+        text_snapshot: '',
+        delivery: 'suppressed',
+        suppression_reason: 'no_reply',
+      },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Run silently.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000),
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await page.locator('.chat-textarea').fill('Run silently.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    lifecycle.emit('session.event.text_delta', { text: 'NO_REPLY' })
+    await expect(page.locator('.live-answer .msg-ai-text')).toHaveText('NO_REPLY')
+
+    lifecycle.finish()
+
+    await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
+    await expect(page.locator('.msg-ai')).toHaveCount(0)
+    await expect(page.getByText('NO_REPLY', { exact: true })).toHaveCount(0)
+  })
+
+  test('keeps a normalized Goal answer sentinel-free before and after visible Done', async ({
+    page,
+  }) => {
+    const answer = 'The Goal is waiting for your Desktop confirmation.'
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: {
+        text: answer,
+        text_snapshot: answer,
+        delivery: 'visible',
+        suppression_reason: null,
+      },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Continue the Goal.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 1,
+      }, {
+        role: 'assistant',
+        text: answer,
+        id: 'normalized-goal-answer',
+        message_id: 'normalized-goal-answer',
+        timestamp: Math.floor(Date.now() / 1000),
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await page.locator('.chat-textarea').fill('Continue the Goal.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    lifecycle.emit('session.event.goal', {
+      goalId: 'silent-delivery-goal',
+      sessionKey: LIFECYCLE_SESSION_KEY,
+      sessionId: 'silent-delivery-session',
+      epoch: 1,
+      objective: 'Continue the Goal without leaking internal sentinels',
+      status: 'active',
+      stateRevision: 1,
+      objectiveRevision: 1,
+      progressRevision: 0,
+      progress: null,
+      continuationSeq: 0,
+      activeTaskId: LIFECYCLE_TASK_ID,
+      executionState: 'working',
+      continuationDeferredReason: null,
+      turnsStarted: 1,
+      turnsSettled: 0,
+      windowTurnsStarted: 1,
+      activeTimeMs: 0,
+      windowActiveTimeMs: 0,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 0,
+      },
+      pauseReason: null,
+      blockedReason: null,
+      terminalReason: null,
+      createdAt: 1_000,
+      updatedAt: 1_000,
+      finishedAt: null,
+    })
+    await expect(page.locator('.goal-ribbon')).toHaveAttribute('data-status', 'active')
+    lifecycle.emit('session.event.text_delta', { text: answer })
+    await expect(page.locator('.live-answer .msg-ai-text')).toHaveText(answer)
+    await expect(page.getByText('NO_REPLY', { exact: true })).toHaveCount(0)
+    await expect(page.getByText('HEARTBEAT_OK', { exact: true })).toHaveCount(0)
+
+    lifecycle.finish()
+
+    await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
+    await expect(page.locator('.msg-ai-text')).toHaveText(answer)
+    await expect(page.getByText(answer, { exact: true })).toHaveCount(1)
+    await expect(page.getByText('NO_REPLY', { exact: true })).toHaveCount(0)
+    await expect(page.getByText('HEARTBEAT_OK', { exact: true })).toHaveCount(0)
+  })
+
+  test('retains a completed tool row when suppressed Done removes its text', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: {
+        text: '',
+        text_snapshot: '',
+        delivery: 'suppressed',
+        suppression_reason: 'heartbeat_ack',
+      },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Inspect silently.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 1,
+      }, {
+        role: 'assistant',
+        text: '',
+        id: 'suppressed-tool-answer',
+        message_id: 'suppressed-tool-answer',
+        timestamp: Math.floor(Date.now() / 1000),
+        tool_calls: [{
+          tool_use_id: 'silent-inspect',
+          name: 'read_file',
+          groupId: 'silent-inspect-group',
+          input: { path: '/private/project/status.txt' },
+          result: 'ready',
+          execution_status: { status: 'success' },
+        }],
+        timeline: [{ type: 'tool-group', groupId: 'silent-inspect-group' }],
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await page.locator('.chat-textarea').fill('Inspect silently.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'silent-inspect',
+      name: 'read_file',
+      input: { path: '/private/project/status.txt' },
+    })
+    lifecycle.emit('session.event.tool_result', {
+      tool_use_id: 'silent-inspect',
+      name: 'read_file',
+      input: { path: '/private/project/status.txt' },
+      result: 'ready',
+      execution_status: { status: 'success' },
+    })
+    lifecycle.emit('session.event.text_delta', { text: 'HEARTBEAT_OK' })
+    await expect(page.locator('.live-answer .msg-ai-text')).toHaveText('HEARTBEAT_OK')
+
+    lifecycle.finish()
+
+    await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
+    const settledActivity = page.locator('.msg-ai .assistant-activity')
+    await expect(settledActivity).toBeVisible()
+    await settledActivity.locator('.assistant-activity__summary').click()
+    await expect(settledActivity.locator('.tool-row[data-op="file.inspect"]')).toBeVisible()
+    await expect(page.getByText('HEARTBEAT_OK', { exact: true })).toHaveCount(0)
   })
 })

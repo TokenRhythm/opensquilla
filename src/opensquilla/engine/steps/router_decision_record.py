@@ -231,12 +231,18 @@ def stage_router_decision(
         extra: Mapping[str, Any] = routing_extra if isinstance(routing_extra, Mapping) else {}
         metadata: dict[str, Any] = ctx.metadata
         decision_id = uuid.uuid4().hex
-        turn_index: int | None = None
-        history = metadata.get("routing_history")
-        if isinstance(history, list) and history:
-            last = history[-1]
-            if isinstance(last, dict) and isinstance(last.get("turn_index"), int):
-                turn_index = last["turn_index"]
+        raw_turn_index = metadata.get("routing_turn_index")
+        turn_index = (
+            raw_turn_index
+            if isinstance(raw_turn_index, int) and not isinstance(raw_turn_index, bool)
+            else None
+        )
+        if turn_index is None:
+            history = metadata.get("routing_history")
+            if isinstance(history, list) and history:
+                last = history[-1]
+                if isinstance(last, dict) and isinstance(last.get("turn_index"), int):
+                    turn_index = last["turn_index"]
         record: dict[str, Any] = {
             "decision_id": decision_id,
             "session_key": str(ctx.session_key),
@@ -459,7 +465,8 @@ def rehydrate_history_from_writer(
             window_seconds=window_seconds,
             per_session=per_session,
         )
-        if not grouped:
+        next_turn_indexes = writer.load_next_turn_indexes()
+        if not grouped and not next_turn_indexes:
             return 0
         now_ms = int(time.time() * 1000)
         now_mono = time.monotonic()
@@ -485,7 +492,10 @@ def rehydrate_history_from_writer(
                 entries.append(entry)
             if entries:
                 entries_by_session[session_key] = entries
-        return seed_routing_history(entries_by_session)
+        return seed_routing_history(
+            entries_by_session,
+            next_turn_indexes=next_turn_indexes,
+        )
     except Exception:  # noqa: BLE001 — rehydration must never block boot
         log.warning("router_decision_record.rehydrate_failed", exc_info=True)
         return 0

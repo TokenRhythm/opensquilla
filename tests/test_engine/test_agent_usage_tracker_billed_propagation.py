@@ -26,6 +26,13 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
+from opensquilla.contracts.turn_execution import (
+    EnsembleContinuationSnapshot,
+    TurnExecutionContext,
+    TurnIdentity,
+)
 from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
 from opensquilla.engine.types import ToolCall
@@ -254,21 +261,47 @@ def test_ensemble_breakdown_accumulates_each_underlying_model() -> None:
 
 class _TwoStepEnsembleBreakdownProvider:
     provider_name = "fake"
+    execution_context_aware = True
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        request_counts: tuple[int, ...],
+        *,
+        retry_empty_continuation: bool = False,
+    ) -> None:
         self.calls = 0
+        self.request_counts = request_counts
+        self.retry_empty_continuation = retry_empty_continuation
 
     def chat(
         self,
         messages: list[Message],
         tools: list[Any] | None = None,
         config: ChatConfig | None = None,
+        *,
+        execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[Any]:
         self.calls += 1
-        return self._stream(self.calls)
+        return self._stream(self.calls, execution_context)
 
-    async def _stream(self, call: int) -> AsyncIterator[Any]:
+    async def _stream(
+        self,
+        call: int,
+        execution_context: TurnExecutionContext | None,
+    ) -> AsyncIterator[Any]:
         if call == 1:
+            trace = {
+                "profile": "default",
+                "llm_request_count": self.request_counts[0],
+            }
+            if execution_context is not None:
+                execution_context.record_ensemble_continuation_snapshot(
+                    EnsembleContinuationSnapshot(
+                        ensemble_trace=trace,
+                        physical_request_count=self.request_counts[0],
+                        request_started=True,
+                    )
+                )
             yield ProviderToolUseStartEvent(tool_use_id="lookup-1", tool_name="lookup")
             yield ProviderToolUseEndEvent(
                 tool_use_id="lookup-1",
@@ -281,7 +314,7 @@ class _TwoStepEnsembleBreakdownProvider:
                 output_tokens=3,
                 billed_cost=0.03,
                 model="z-ai/glm-5.2",
-                ensemble_trace={"profile": "default", "llm_request_count": 2},
+                ensemble_trace=trace,
                 model_usage_breakdown=[
                     {
                         "role": "proposer",
@@ -306,6 +339,16 @@ class _TwoStepEnsembleBreakdownProvider:
                 ],
             )
             return
+        if self.retry_empty_continuation and call == 2:
+            yield ProviderDoneEvent(
+                stop_reason="end_turn",
+                model="z-ai/glm-5.2",
+                ensemble_trace={
+                    "profile": "default",
+                    "llm_request_count": self.request_counts[1],
+                },
+            )
+            return
         yield ProviderTextDeltaEvent(text="final answer")
         yield ProviderDoneEvent(
             stop_reason="end_turn",
@@ -313,7 +356,10 @@ class _TwoStepEnsembleBreakdownProvider:
             output_tokens=4,
             billed_cost=0.04,
             model="z-ai/glm-5.2",
-            ensemble_trace={"profile": "default", "llm_request_count": 2},
+            ensemble_trace={
+                "profile": "default",
+                "llm_request_count": self.request_counts[call - 1],
+            },
             model_usage_breakdown=[
                 {
                     "role": "proposer",
@@ -342,7 +388,19 @@ class _TwoStepEnsembleBreakdownProvider:
         return []
 
 
-def test_agent_final_done_summarizes_ensemble_breakdown_across_tool_iterations() -> None:
+@pytest.mark.parametrize("with_execution_context", [True, False])
+def test_agent_final_done_summarizes_ensemble_breakdown_across_tool_iterations(
+    with_execution_context: bool,
+) -> None:
+    request_counts = (3, 4)
+    execution_context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-ensemble-usage",
+            "assistant-ensemble-usage",
+            "agent:test:webchat:ensemble-usage",
+        )
+    )
+
     async def tool_handler(call: ToolCall) -> ToolResult:
         return ToolResult(
             tool_use_id=call.tool_use_id,
@@ -352,7 +410,7 @@ def test_agent_final_done_summarizes_ensemble_breakdown_across_tool_iterations()
 
     async def run() -> EngineDoneEvent:
         agent = Agent(
-            provider=_TwoStepEnsembleBreakdownProvider(),
+            provider=_TwoStepEnsembleBreakdownProvider(request_counts),
             config=AgentConfig(max_iterations=3),
             tool_definitions=[
                 ToolDefinition(
@@ -362,6 +420,7 @@ def test_agent_final_done_summarizes_ensemble_breakdown_across_tool_iterations()
                 )
             ],
             tool_handler=tool_handler,
+            execution_context=execution_context if with_execution_context else None,
         )
         events = [event async for event in agent.run_turn("hi")]
         done_events = [event for event in events if isinstance(event, EngineDoneEvent)]
@@ -389,10 +448,65 @@ def test_agent_final_done_summarizes_ensemble_breakdown_across_tool_iterations()
     assert aggregator_row["cost_usd"] == 0.04
     assert aggregator_row["request_count"] == 2
     assert done.ensemble_trace is not None
-    assert done.ensemble_trace["llm_request_count"] == 4
+    assert done.ensemble_trace["llm_request_count"] == request_counts[-1]
     assert done.input_tokens == 70
     assert done.output_tokens == 7
     assert done.billed_cost == 0.07
+
+
+@pytest.mark.parametrize(
+    ("with_execution_context", "request_counts", "expected_request_count"),
+    [
+        (True, (3, 4, 4), 5),
+        (False, (3, 4, 3), 7),
+    ],
+)
+def test_agent_counts_each_retried_ensemble_continuation_request(
+    with_execution_context: bool,
+    request_counts: tuple[int, ...],
+    expected_request_count: int,
+) -> None:
+    execution_context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-ensemble-retry",
+            "assistant-ensemble-retry",
+            "agent:test:webchat:ensemble-retry",
+        )
+    )
+    provider = _TwoStepEnsembleBreakdownProvider(
+        request_counts,
+        retry_empty_continuation=True,
+    )
+
+    async def tool_handler(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="lookup result",
+        )
+
+    async def run() -> EngineDoneEvent:
+        agent = Agent(
+            provider=provider,
+            config=AgentConfig(max_iterations=3),
+            tool_definitions=[
+                ToolDefinition(
+                    name="lookup",
+                    description="lookup",
+                    input_schema=ToolInputSchema(properties={}, required=[]),
+                )
+            ],
+            tool_handler=tool_handler,
+            execution_context=execution_context if with_execution_context else None,
+        )
+        events = [event async for event in agent.run_turn("hi")]
+        return next(event for event in events if isinstance(event, EngineDoneEvent))
+
+    done = asyncio.run(run())
+
+    assert provider.calls == 3
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["llm_request_count"] == expected_request_count
 
 
 def test_ensemble_breakdown_malformed_usage_values_do_not_raise() -> None:

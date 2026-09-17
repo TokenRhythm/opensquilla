@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -140,6 +141,12 @@ class _SecondCallFirstPullFailureProvider(_NoToolProvider):
             raise RuntimeError("provider stream did not start")
         yield ProviderText(text="done")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+class _FailingApplyPendingInputProvider(ListPendingInputProvider):
+    def mark_applied(self, *, iteration: int, model_call_id: str) -> None:
+        del iteration, model_call_id
+        raise RuntimeError("pending input apply failed")
 
 
 class _SequencedPlainProvider:
@@ -408,10 +415,15 @@ async def test_pending_input_waits_for_the_complete_tool_batch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_pending_provider_anchors_current_request_after_tool_result(
+@pytest.mark.parametrize("legacy_setting", [None, "on", "trim:800", "sometimes"])
+async def test_retired_reminder_keeps_actual_user_request_without_extra_nudge(
     monkeypatch: pytest.MonkeyPatch,
+    legacy_setting: str | None,
 ) -> None:
-    monkeypatch.setenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", "on")
+    if legacy_setting is None:
+        monkeypatch.delenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", legacy_setting)
     provider = _ToolBoundaryProvider()
     agent = _agent(provider)
 
@@ -419,27 +431,20 @@ async def test_no_pending_provider_anchors_current_request_after_tool_result(
 
     assert len(provider.calls) == 2
     second_request = provider.calls[1]
-    tool_result_index = _tool_result_index(second_request)
-    reminder_text = _message_text(second_request[tool_result_index + 1])
-    assert "Current user request" in reminder_text
-    assert "run echo" in reminder_text
+    assert _tool_result_index(second_request) > 0
+    actual_requests = [
+        message
+        for message in second_request
+        if message.role == "user"
+        and _message_text(message).split("\n\n[Runtime context for this turn]", 1)[0]
+        == "run echo"
+    ]
+    assert len(actual_requests) == 1
+    assert actual_requests[0].role == "user"
+    assert sum(message.content == "run echo" for message in agent._history) == 1
     assert not any(
         "Current user request" in _message_text(message) for message in agent._history
     )
-
-
-@pytest.mark.asyncio
-async def test_no_pending_default_sends_no_reminder_after_tool_result(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", raising=False)
-    provider = _ToolBoundaryProvider()
-    agent = _agent(provider)
-
-    _events = [event async for event in agent.run_turn("run echo")]
-
-    assert len(provider.calls) == 2
-    second_request = provider.calls[1]
     assert not any(
         "Current user request" in _message_text(message) for message in second_request
     )
@@ -507,8 +512,14 @@ async def test_done_event_records_unicode_model_call_segment_for_applied_steer()
         event async for event in agent.run_turn("原始问题", pending_input_provider=pending)
     ]
     done = next(event for event in events if event.kind == "done")
+    text_events = [event for event in events if event.kind == "text_delta"]
 
     assert done.text == "前😀后续"
+    assert done.router_model_call_id == "1.0"
+    assert done.router_iteration == 1
+    assert [
+        (event.text, event.model_call_id, event.iteration) for event in text_events
+    ] == [("前😀", "1.0", 1), ("后续", "2.0", 2)]
     assert done.model_call_segments == [
         {
             "model_call_id": "2.0",
@@ -649,18 +660,23 @@ async def test_claimed_input_is_not_applied_when_the_next_provider_call_cannot_s
     pending.append("RETRY_LATER")
     agent = _agent(provider)
 
-    with pytest.raises(RuntimeError, match="provider call did not start"):
-        _events = [
-            event
-            async for event in agent.run_turn(
-                "just answer",
-                pending_input_provider=pending,
-            )
-        ]
+    events = [
+        event
+        async for event in agent.run_turn(
+            "just answer",
+            pending_input_provider=pending,
+        )
+    ]
 
-    assert len(provider.calls) == 2
-    assert pending.applications == ()
-    assert pending.reclaim_pending() == ["RETRY_LATER"]
+    assert len(provider.calls) == 3
+    assert len(pending.applications) == 1
+    assert pending.applications[0].texts == ("RETRY_LATER",)
+    # The failed call was 2.0. The claim is committed only after retry 2.1
+    # produces its first event, so the failed physical request cannot consume it.
+    assert pending.applications[0].model_call_id == "2.1"
+    assert pending.reclaim_pending() == []
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "error" for event in events)
 
 
 @pytest.mark.asyncio
@@ -670,7 +686,31 @@ async def test_claimed_input_is_not_applied_when_first_stream_pull_fails() -> No
     pending.append("RETRY_AFTER_FIRST_PULL")
     agent = _agent(provider)
 
-    with pytest.raises(RuntimeError, match="provider stream did not start"):
+    events = [
+        event
+        async for event in agent.run_turn(
+            "just answer",
+            pending_input_provider=pending,
+        )
+    ]
+
+    assert len(provider.calls) == 3
+    assert len(pending.applications) == 1
+    assert pending.applications[0].texts == ("RETRY_AFTER_FIRST_PULL",)
+    assert pending.applications[0].model_call_id == "2.1"
+    assert pending.reclaim_pending() == []
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "error" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_internal_pending_apply_error_is_not_projected_as_provider_retry() -> None:
+    provider = _NoToolProvider()
+    pending = _FailingApplyPendingInputProvider()
+    pending.append("RETRY_INTERNAL_APPLY")
+    agent = _agent(provider)
+
+    with pytest.raises(RuntimeError, match="pending input apply failed"):
         _events = [
             event
             async for event in agent.run_turn(
@@ -681,7 +721,7 @@ async def test_claimed_input_is_not_applied_when_first_stream_pull_fails() -> No
 
     assert len(provider.calls) == 2
     assert pending.applications == ()
-    assert pending.reclaim_pending() == ["RETRY_AFTER_FIRST_PULL"]
+    assert pending.reclaim_pending() == ["RETRY_INTERNAL_APPLY"]
 
 
 @pytest.mark.asyncio
@@ -796,9 +836,28 @@ async def test_terminal_control_tool_prevents_later_batch_calls_from_dispatching
 
 
 @pytest.mark.asyncio
-async def test_deferred_user_input_resumes_same_tool_call_without_user_injection() -> None:
+@pytest.mark.parametrize(("timeout", "iteration_timeout"), [(60, 600), (0, 60)])
+@pytest.mark.parametrize("answer_phase", ["immediate", "published", "waiting"])
+async def test_deferred_user_input_resumes_same_tool_call_without_user_injection(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: int,
+    iteration_timeout: int,
+    answer_phase: str,
+) -> None:
     provider = _DeferredUserInputProvider()
     broker = StructuredUserInputBroker()
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    clock_offset = 0.0
+    monkeypatch.setattr(loop, "time", lambda: real_time() + clock_offset)
+    waiting = asyncio.Event()
+    original_wait = broker.wait_for_response
+
+    async def wait_for_response(request_id: str) -> dict[str, Any]:
+        waiting.set()
+        return await original_wait(request_id)
+
+    monkeypatch.setattr(broker, "wait_for_response", wait_for_response)
 
     async def _request_user_input(call: ToolCall) -> ToolResult:
         return ToolResult(
@@ -826,7 +885,11 @@ async def test_deferred_user_input_resumes_same_tool_call_without_user_injection
 
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=3),
+        config=AgentConfig(
+            max_iterations=3,
+            timeout=timeout,
+            iteration_timeout=iteration_timeout,
+        ),
         tool_definitions=[_tool_def("request_user_input")],
         tool_handler=_request_user_input,
         session_key="agent:main:webchat:deferred-input",
@@ -839,19 +902,48 @@ async def test_deferred_user_input_resumes_same_tool_call_without_user_injection
 
     stream = agent.run_turn("make a plan")
     events = []
-    async for event in stream:
-        events.append(event)
-        if isinstance(event, ToolResultEvent):
-            payload = json.loads(event.result)
-            if payload.get("status") == "input_required":
-                assert len(provider.calls) == 1
-                assert payload["request_id"]
-                broker.resolve(
-                    session_key="agent:main:webchat:deferred-input",
-                    request_id=payload["request_id"],
-                    fields={"scope": "Core"},
-                )
+    request: dict[str, Any] = {}
 
+    def answer() -> None:
+        broker.resolve(
+            session_key="agent:main:webchat:deferred-input",
+            request_id=request["request_id"],
+            fields={"scope": "Core"},
+        )
+
+    async def consume() -> None:
+        nonlocal clock_offset
+        async for event in stream:
+            events.append(event)
+            if isinstance(event, ToolResultEvent):
+                payload = json.loads(event.result)
+                if payload.get("status") == "input_required":
+                    assert len(provider.calls) == 1
+                    request.update(payload)
+                    if answer_phase == "published":
+                        # The consumer can keep the pending event on screen
+                        # before the generator reaches wait_for_response.
+                        clock_offset += 120.0
+                    if answer_phase != "waiting":
+                        answer()
+
+    consumer = asyncio.create_task(consume())
+    try:
+        if answer_phase == "waiting":
+            await asyncio.wait_for(waiting.wait(), timeout=5)
+            assert not consumer.done()
+            clock_offset += 120.0
+            answer()
+        # A published-phase jump also advances asyncio's watchdog clock;
+        # retain five real seconds beyond the simulated human wait.
+        await asyncio.wait_for(consumer, timeout=125 if answer_phase == "published" else 5)
+    finally:
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    assert broker.pending_for_session("agent:main:webchat:deferred-input") == []
+    assert not any(event.kind == "error" for event in events)
     tool_results = [
         event for event in events if isinstance(event, ToolResultEvent)
     ]
@@ -881,6 +973,89 @@ async def test_deferred_user_input_resumes_same_tool_call_without_user_injection
     assert not any(
         message.role == "user" and _text_block_texts(message) == ["Core"]
         for message in second_request
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["cancelled", "failed"])
+async def test_deferred_user_input_cleans_up_when_wait_does_not_complete(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    provider = _DeferredUserInputProvider()
+    broker = StructuredUserInputBroker()
+    session_key = "agent:main:webchat:interrupted-input"
+    waiting = asyncio.Event()
+    fail_wait = asyncio.Event()
+    original_wait = broker.wait_for_response
+
+    async def wait_for_response(request_id: str) -> dict[str, Any]:
+        waiting.set()
+        if outcome == "failed":
+            await fail_wait.wait()
+            raise RuntimeError("synthetic input transport failure")
+        return await original_wait(request_id)
+
+    monkeypatch.setattr(broker, "wait_for_response", wait_for_response)
+
+    async def request_user_input(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=json.dumps(
+                {
+                    "status": "input_required",
+                    "kind": "user_input",
+                    "paused": True,
+                    "clarify_schema": {
+                        "fields": [{"name": "scope", "type": "string", "required": True}],
+                    },
+                },
+            ),
+            terminates_turn=True,
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[_tool_def("request_user_input")],
+        tool_handler=request_user_input,
+        session_key=session_key,
+        tool_context=ToolContext(
+            session_key=session_key,
+            task_id="interrupted-input-task",
+            user_input_provider=broker,
+        ),
+    )
+    events = []
+
+    async def consume() -> None:
+        async for event in agent.run_turn("make a plan"):
+            events.append(event)
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        assert len(broker.pending_for_session(session_key)) == 1
+        if outcome == "cancelled":
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+        else:
+            fail_wait.set()
+            with pytest.raises(RuntimeError, match="synthetic input transport failure"):
+                await asyncio.wait_for(consumer, timeout=5)
+    finally:
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    assert broker.pending_for_session(session_key) == []
+    assert len(provider.calls) == 1
+    assert not any(
+        isinstance(event, ToolResultEvent)
+        and json.loads(event.result).get("status") == "answered"
+        for event in events
     )
 
 
@@ -973,3 +1148,62 @@ async def test_deferred_user_input_defers_later_batch_calls_until_after_answer()
     }
     assert second_results["request-1"]["answers"] == {"scope": "Core"}
     assert second_results["write-1"]["status"] == "not_executed"
+
+
+@pytest.mark.asyncio
+async def test_failed_user_input_still_blocks_later_calls_in_same_provider_response() -> None:
+    provider = _ControlBoundaryProvider(
+        [
+            (
+                "request-invalid",
+                "request_user_input",
+                {"questions": [{"id": "scope", "options": ["too", "many"]}]},
+            ),
+            ("submit-1", "submit_plan", {"title": "must not dispatch"}),
+        ]
+    )
+    dispatched: list[str] = []
+
+    async def _handler(call: ToolCall) -> ToolResult:
+        dispatched.append(call.tool_name)
+        if call.tool_name != "request_user_input":
+            raise AssertionError("tail submit crossed the user-input dispatch boundary")
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=json.dumps(
+                {
+                    "status": "error",
+                    "error_class": "RetryableToolInputError",
+                    "retry_allowed": True,
+                }
+            ),
+            is_error=True,
+            terminates_turn=False,
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[
+            _tool_def("request_user_input"),
+            _tool_def("submit_plan"),
+        ],
+        tool_handler=_handler,
+    )
+
+    events = [event async for event in agent.run_turn("make a plan")]
+
+    assert dispatched == ["request_user_input"]
+    assert len(provider.calls) == 2
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    assert [event.tool_use_id for event in results] == [
+        "request-invalid",
+        "submit-1",
+    ]
+    assert json.loads(results[1].result) == {
+        "status": "not_executed",
+        "reason": "prior_tool_dispatch_boundary",
+        "boundary_tool": "request_user_input",
+        "boundary_tool_use_id": "request-invalid",
+    }

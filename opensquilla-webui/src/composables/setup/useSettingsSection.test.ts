@@ -1,10 +1,30 @@
 import { describe, it, expect } from 'vitest'
-import { sectionFromRouteParam, isKnownSectionParam, parseProviderHash } from './useSettingsSection'
+import {
+  isKnownSectionParam,
+  parseProviderHash,
+  sectionFromRouteParam,
+  settingsSectionAliasFor,
+} from './useSettingsSection'
 import { SETTINGS_SECTIONS } from './settingsSections'
 import en from '@/locales/en.json'
 import zhHans from '@/locales/zh-Hans.json'
 
 describe('settings section IA', () => {
+  it('exposes the approved ten first-level settings pages in order', () => {
+    expect(SETTINGS_SECTIONS.map(section => section.id)).toEqual([
+      'gateway',
+      'provider',
+      'modelStrategy',
+      'capabilities',
+      'general',
+      'interface',
+      'shortcuts',
+      'securityPrivacy',
+      'memory',
+      'advanced',
+    ])
+  })
+
   it('has one Model Strategy section instead of split Router and Ensemble sections', () => {
     const ids = SETTINGS_SECTIONS.map(s => s.id)
     expect(ids).toContain('modelStrategy')
@@ -59,16 +79,42 @@ describe('settings section IA', () => {
     expect(SETTINGS_SECTIONS.find(s => s.id === 'provider')?.label).toBe('Model Service')
   })
 
-  it('keeps Memory & Profile as a first-level action panel outside global save state', () => {
+  it('makes Memory & Export first-level and preserves the old profile-import deep link', () => {
     const memory = SETTINGS_SECTIONS.find(s => s.id === 'memory')
     expect(memory).toMatchObject({
-      label: 'Memory & Profile',
-      group: 'preferences',
+      label: 'Memory & Export',
+      group: 'safetyData',
       client: true,
       desktopOnly: false,
     })
-    expect(en.settings.rail.memory).toBe('Memory & Profile')
-    expect(zhHans.settings.rail.memory).toBe('记忆与画像')
+    expect(en.settings.rail.memory).toBe('Memory & Export')
+    expect(zhHans.settings.rail.memory).toBe('记忆与导出')
+    expect(SETTINGS_SECTIONS.map(s => s.id)).not.toContain('profileImport')
+    expect(sectionFromRouteParam('profileImport')).toBe('memory')
+    expect(settingsSectionAliasFor('profileImport')).toEqual({ section: 'memory' })
+  })
+
+  it('preserves aliases for pages consolidated into the ten-section IA', () => {
+    expect(sectionFromRouteParam('connection')).toBe('gateway')
+    expect(sectionFromRouteParam('runtime')).toBe('gateway')
+    expect(sectionFromRouteParam('behavior')).toBe('general')
+    expect(sectionFromRouteParam('appearance')).toBe('interface')
+    expect(sectionFromRouteParam('keyboard')).toBe('shortcuts')
+    expect(sectionFromRouteParam('privacy')).toBe('securityPrivacy')
+    expect(sectionFromRouteParam('sandbox')).toBe('securityPrivacy')
+  })
+
+  it('keeps canonical subsection hashes beside their legacy route aliases', () => {
+    expect(settingsSectionAliasFor('connection')).toEqual({
+      section: 'gateway',
+      hash: '#connection',
+    })
+    expect(settingsSectionAliasFor('sandbox')).toEqual({
+      section: 'securityPrivacy',
+      hash: '#sandbox',
+    })
+    expect(settingsSectionAliasFor('behavior')).toEqual({ section: 'general' })
+    expect(settingsSectionAliasFor('does-not-exist')).toBeNull()
   })
 
   it('aliases stale Router and Ensemble deep links to Model Strategy', () => {

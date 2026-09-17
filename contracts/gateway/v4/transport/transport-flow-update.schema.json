@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/transport/transport-flow-update.schema.json",
+  "title": "OpenSquilla transport.flow.update Contract",
+  "description": "Connection-local delivery credit and in-place recovery control. Never grants subscriptions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/TransportFlowUpdateRequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/TransportFlowUpdateResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.75.1",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "15.0.4"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.17.1",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "transport.flow.update",
+    "kind": "command",
+    "scope": "operator.read",
+    "guestAllowed": true,
+    "idempotency": "idempotent",
+    "timeout": {
+      "policy": "transport"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "transport.flow.update"
+    },
+    "request": "#/$defs/TransportFlowUpdateRequestFrame",
+    "params": "#/$defs/TransportFlowUpdateParams",
+    "response": "#/$defs/TransportFlowUpdateResponseFrame",
+    "result": "#/$defs/TransportFlowUpdateResult",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "FLOW_DISABLED"
+      },
+      {
+        "code": "FLOW_STALE"
+      },
+      {
+        "code": "SNAPSHOT_STALE"
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "accepted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "TransportFlowUpdateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivery_epoch",
+        "ack_delivery_id"
+      ],
+      "properties": {
+        "delivery_epoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "ack_delivery_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "staged_delivery_ids": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+        },
+        "dirty_keys": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "resume": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "key",
+              "sync_revision",
+              "stream_generation",
+              "stream_seq"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "snapshot_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "sync_revision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "stream_generation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "stream_seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          }
+        }
+      }
+    },
+    "TransportFlowUpdateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivery_epoch",
+        "ack_delivery_id",
+        "dirty_keys",
+        "global_dirty"
+      ],
+      "properties": {
+        "delivery_epoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "ack_delivery_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "dirty_keys": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "global_dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "TransportFlowUpdateRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "transport.flow.update"
+        },
+        "params": {
+          "$ref": "#/$defs/TransportFlowUpdateParams"
+        }
+      }
+    },
+    "TransportFlowUpdateOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/TransportFlowUpdateResult"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "TransportFlowUpdateErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "TransportFlowUpdateResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TransportFlowUpdateOkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/TransportFlowUpdateErrorResponseFrame"
+        }
+      ]
+    }
+  }
+}

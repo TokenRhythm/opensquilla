@@ -134,12 +134,14 @@ def test_selectable_model_catalog_is_enabled_only_for_verified_providers() -> No
         if spec.selectable_model_catalog == "verified_live"
     }
     assert trusted == {
+        "deepseek",
         "openrouter",
         "qwen_token_plan",
         "qwen_token_plan_anthropic",
         "tokenrhythm",
     }
 
+    assert get_provider_spec("deepseek").compat.official_host == "api.deepseek.com"
     assert get_provider_spec("openrouter").compat.official_host == "openrouter.ai"
     assert get_provider_spec("tokenrhythm").compat.official_host == "tokenrhythm.studio"
     assert (

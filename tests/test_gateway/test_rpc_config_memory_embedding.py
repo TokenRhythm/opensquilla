@@ -118,7 +118,7 @@ async def test_config_patch_same_permissions_default_does_not_report_restart_req
 
 
 @pytest.mark.asyncio
-async def test_config_apply_sandbox_posture_reports_restart_required(tmp_path):
+async def test_config_apply_legacy_sandbox_posture_does_not_require_restart(tmp_path):
     cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
     payload = cfg.model_dump(mode="python")
     payload["sandbox"]["sandbox"] = False
@@ -133,7 +133,7 @@ async def test_config_apply_sandbox_posture_reports_restart_required(tmp_path):
     )
 
     assert res.error is None, res.error
-    assert res.payload["restartRequired"] is True
+    assert res.payload["restartRequired"] is False
 
 
 @pytest.mark.asyncio
@@ -234,7 +234,10 @@ async def test_config_apply_preserves_redacted_memory_remote_secrets(tmp_path):
     assert apply_res.error is None, apply_res.error
     _assert_memory_remote_secrets_preserved(cfg, config_path)
     persisted = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    assert "network_observability_disabled_effective" not in persisted.get("privacy", {})
+    persisted_privacy = persisted.get("privacy", {})
+    assert "network_observability_disabled_effective" not in persisted_privacy
+    assert "reliability_diagnostics_forced_off" not in persisted_privacy
+    assert "product_analytics_forced_off" not in persisted_privacy
 
 
 @pytest.mark.asyncio

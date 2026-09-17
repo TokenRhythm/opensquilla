@@ -53,6 +53,14 @@ def test_certification_environment_only_lists_provider_adapter_fields() -> None:
     }.isdisjoint(environment)
 
 
+def test_dingtalk_stream_probe_does_not_require_artifact_robot_code() -> None:
+    environment = certification_environment("dingtalk")
+
+    assert environment["client_id"]["required"] is True
+    assert environment["client_secret"]["required"] is True
+    assert environment["robot_code"]["required"] is False
+
+
 @pytest.mark.asyncio
 async def test_safe_probe_uses_environment_and_redacts_all_evidence(monkeypatch) -> None:
     secret = "123456:secret-value"

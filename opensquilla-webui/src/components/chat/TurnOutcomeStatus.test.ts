@@ -92,4 +92,49 @@ describe('TurnOutcomeStatus', () => {
     expect(host.querySelector('.msg-ai')).toBeNull()
     app.unmount()
   })
+
+  it.each([
+    { reason: 'process_restart' },
+    { errorClass: 'process_restart' },
+  ])('shows restart-specific cause and recovery guidance for $reason$errorClass', async (proof) => {
+    const { app, host } = await renderOutcome({
+      turnId: 'turn-restart',
+      status: 'abandoned',
+      kind: 'interrupted',
+      ...proof,
+    })
+
+    expect(host.querySelector('.turn-outcome--process-restart')).not.toBeNull()
+    expect(host.querySelector('.turn-outcome__title')?.textContent)
+      .toContain('OpenSquilla restarted and interrupted this task.')
+    expect(host.querySelector('.turn-outcome__guidance')?.textContent)
+      .toContain("This task won't continue automatically.")
+    expect(host.textContent).toContain('Review any existing results or tool activity')
+    app.unmount()
+  })
+
+  it('does not treat a generic gateway cancellation as a process restart', async () => {
+    const { app, host } = await renderOutcome({
+      turnId: 'turn-disconnect',
+      status: 'cancelled',
+      cancellationSource: 'gateway_restart',
+    })
+
+    expect(host.querySelector('.turn-outcome--process-restart')).toBeNull()
+    expect(host.textContent).toContain('Interrupted')
+    expect(host.textContent).not.toContain("won't continue automatically")
+    app.unmount()
+  })
+
+  it('requires the exact process restart reason', async () => {
+    const { app, host } = await renderOutcome({
+      turnId: 'turn-lookalike',
+      status: 'interrupted',
+      reason: 'PROCESS_RESTART',
+    })
+
+    expect(host.querySelector('.turn-outcome--process-restart')).toBeNull()
+    expect(host.textContent).toContain('Interrupted')
+    app.unmount()
+  })
 })

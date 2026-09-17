@@ -10,11 +10,28 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Awaitable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
+from opensquilla.application.sandbox_runtime import (
+    SandboxCapabilityUnavailableError,
+    SandboxPolicyConflictError,
+    SandboxRuntime,
+    SandboxRuntimeDiscardError,
+    SandboxRuntimeIdentityError,
+    SandboxRuntimeOperationConflictError,
+    SandboxUnavailableError,
+)
+from opensquilla.gateway.adapters.sandbox_runtime_contract import (
+    register_sandbox_runtime_contract,
+)
+from opensquilla.gateway.adapters.workspace_catalog_contract import (
+    register_workspace_catalog_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.project_workspace_runtime import (
     authoritative_project_run_context,
     map_project_workspace_error,
@@ -27,9 +44,16 @@ from opensquilla.gateway.rpc import (
     get_dispatcher,
 )
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.token_store import TokenRecord, TokenStore
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
+)
+from opensquilla.run_mode import (
+    RunMode,
+    display_name,
+    execution_target,
+    normalize_run_mode,
 )
 from opensquilla.sandbox.domain_validation import validate_domain_pattern
 from opensquilla.sandbox.escalation import remember_resolved_run_context
@@ -55,31 +79,20 @@ from opensquilla.sandbox.run_context_service import (
     remove_mount_grant,
     set_workspace,
 )
-from opensquilla.sandbox.run_mode import (
-    RunMode,
-    config_run_mode,
-    display_name,
-    execution_target,
-    normalize_run_mode,
-)
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
     run_mode_allowed_for_principal,
 )
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.setup_runtime import (
+    current_sandbox_capability_report,
     current_sandbox_setup_runtime_status,
     ensure_sandbox_setup_auto,
-)
-from opensquilla.sandbox.setup_state import (
-    SandboxSetupState,
-    current_sandbox_setup_status,
 )
 from opensquilla.sandbox.status import status_payload
 from opensquilla.session.keys import parse_agent_id
 
 _d = get_dispatcher()
-_RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
-_RUN_MODE_PREFERENCE_CHANGED_EVENT = "sandbox.run_mode.preference.changed"
 _WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -87,6 +100,24 @@ def _require_params(params: dict | None) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
     return params
+
+
+def _sandbox_token_store(ctx: RpcContext) -> TokenStore:
+    state_dir = getattr(ctx.config, "state_dir", None)
+    if not state_dir:
+        raise RpcUnavailableError("Sandbox token storage is unavailable.")
+    return TokenStore(Path(str(state_dir)) / "sessions.db")
+
+
+def _sandbox_token_payload(record: TokenRecord) -> dict[str, Any]:
+    return {
+        "publicId": record.public_id,
+        "name": record.name,
+        "capabilities": sorted(record.capabilities),
+        "createdAt": record.created_at,
+        "lastUsedAt": record.last_used_at,
+        "lastPeer": record.last_peer,
+    }
 
 
 def _require_session_key(params: dict[str, Any]) -> str:
@@ -321,13 +352,10 @@ def _pick_directory_path(initial_dir: str | None = None) -> str | None:
 
 
 async def _pick_directory_path_windows(initial_dir: str | None = None) -> str | None:
-    command = [
-        sys.executable,
-        "-m",
-        "opensquilla.gateway.windows_directory_picker",
-    ]
+    arguments: list[str] = []
     if initial_dir:
-        command.append(initial_dir)
+        arguments.append(initial_dir)
+    command = internal_child_argv(ChildRole.DIRECTORY_PICKER, args=arguments)
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -384,13 +412,6 @@ def _run_mode_preference_registry() -> Any:
     from opensquilla.gateway.websocket import get_registry
 
     return get_registry()
-
-
-def _runtime_preference_storage(ctx: RpcContext) -> Any:
-    storage = get_session_storage(getattr(ctx, "session_manager", None))
-    if storage is None:
-        raise RpcUnavailableError("Session storage is not configured")
-    return storage
 
 
 def _context_for_principal(context: RunContext, principal: Any) -> RunContext:
@@ -662,22 +683,351 @@ def _explain_messages(status: dict[str, Any]) -> list[dict[str, str]]:
     ]
 
 
+def _sandbox_application(ctx: RpcContext) -> SandboxRuntime:
+    """Compose the transport-neutral SandboxRuntime Module for this request."""
+    from opensquilla.gateway.adapters.sandbox_runtime import (
+        GatewaySandboxPolicyAdapter,
+        GatewaySandboxResumeAdapter,
+        GatewaySandboxRunModeAdapter,
+        GatewaySandboxRunModeEventsAdapter,
+        GatewaySandboxRuntimePackAdapter,
+        GatewaySandboxSetupAdapter,
+    )
+
+    async def publish(event: str, payload: dict[str, str]) -> None:
+        await _run_mode_preference_registry().broadcast(event, payload)
+
+    return SandboxRuntime(
+        setup=GatewaySandboxSetupAdapter(
+            ctx.config,
+            status_reader=current_sandbox_setup_runtime_status,
+            setup_runner=ensure_sandbox_setup_auto,
+            capability_reader=current_sandbox_capability_report,
+        ),
+        policy=GatewaySandboxPolicyAdapter(getattr(ctx.config, "state_dir", None)),
+        run_modes=GatewaySandboxRunModeAdapter(
+            session_manager=getattr(ctx, "session_manager", None),
+            config=ctx.config,
+            principal=ctx.principal,
+        ),
+        run_mode_events=GatewaySandboxRunModeEventsAdapter(publish),
+        runtime_packs=GatewaySandboxRuntimePackAdapter(_runtime_state_dir(ctx)),
+        resume=GatewaySandboxResumeAdapter(),
+    )
+
+
+async def _sandbox_payload(
+    operation: Awaitable[Any],
+    *,
+    structured_unavailable: bool = False,
+) -> dict[str, Any]:
+    from opensquilla.gateway.adapters.sandbox_runtime import (
+        sandbox_application_payload,
+        sandbox_capability_payload,
+        sandbox_policy_payload,
+    )
+
+    try:
+        result = await operation
+    except SandboxCapabilityUnavailableError as exc:
+        raise RpcHandlerError(
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            str(exc),
+            details=sandbox_capability_payload(exc.report),
+        ) from exc
+    except SandboxPolicyConflictError as exc:
+        raise RpcHandlerError(
+            "POLICY_VERSION_CONFLICT",
+            str(exc),
+            details={"currentPolicy": sandbox_policy_payload(exc.current_policy)},
+        ) from exc
+    except (SandboxRuntimeOperationConflictError, SandboxRuntimeIdentityError) as exc:
+        raise RpcHandlerError(
+            "RUNTIME_JOB_CONFLICT",
+            "The Runtime Pack operation changed; refresh its status and try again.",
+        ) from exc
+    except SandboxRuntimeDiscardError as exc:
+        raise RpcHandlerError(
+            "RUNTIME_DISCARD_FAILED",
+            str(exc),
+        ) from exc
+    except SandboxUnavailableError as exc:
+        if structured_unavailable:
+            raise RpcHandlerError(
+                "UNAVAILABLE",
+                str(exc),
+                retryable=exc.retryable,
+            ) from exc
+        raise RpcUnavailableError(str(exc)) from exc
+    return sandbox_application_payload(result)
+
+
 @_d.method("sandbox.status", scope="operator.read")
 async def _handle_sandbox_status(params: dict | None, ctx: RpcContext) -> dict:
     return status_payload(ctx.config)
 
 
-@_d.method("sandbox.setup.status", scope="operator.read")
 async def _handle_sandbox_setup_status(params: dict | None, ctx: RpcContext) -> dict:
-    result = await current_sandbox_setup_runtime_status(ctx.config)
-    return result.to_payload()
+    return await _sandbox_payload(_sandbox_application(ctx).inspect_setup())
 
 
-@_d.method("sandbox.setup.ensure", scope="operator.write")
+_handle_sandbox_setup_status_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.setup.status",
+    _handle_sandbox_setup_status,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_sandbox_capability_status(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    refresh = (params or {}).get("refresh", False)
+    if not isinstance(refresh, bool):
+        raise ValueError("params.refresh must be a boolean")
+    return await _sandbox_payload(
+        _sandbox_application(ctx).inspect_capability(refresh=refresh)
+    )
+
+
+_handle_sandbox_capability_status_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.capability.status",
+    _handle_sandbox_capability_status,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_sandbox_policy_get(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return await _sandbox_payload(_sandbox_application(ctx).read_policy())
+
+
+_handle_sandbox_policy_get_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.policy.get",
+    _handle_sandbox_policy_get,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_sandbox_policy_defaults(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return await _sandbox_payload(_sandbox_application(ctx).read_policy_defaults())
+
+
+_handle_sandbox_policy_defaults_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.policy.defaults",
+    _handle_sandbox_policy_defaults,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+def _runtime_component_param(params: dict | None) -> str:
+    values = _require_params(params)
+    component_id = values.get("componentId")
+    if component_id not in {"python", "node", "gitBash"}:
+        raise ValueError("params.componentId must be python, node, or gitBash")
+    return str(component_id)
+
+
+def _runtime_state_dir(ctx: RpcContext) -> str | Path | None:
+    value = getattr(ctx.config, "state_dir", None)
+    return value if value and str(value).strip() else None
+
+
+async def _handle_sandbox_runtime_status(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return await _sandbox_payload(_sandbox_application(ctx).inspect_runtime_packs())
+
+
+_handle_sandbox_runtime_status_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.status",
+    _handle_sandbox_runtime_status,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_sandbox_runtime_install(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.runtime.install")
+    component_id = _runtime_component_param(params)
+    return await _sandbox_payload(
+        _sandbox_application(ctx).install_runtime_pack(component_id)
+    )
+
+
+_handle_sandbox_runtime_install_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.install",
+    _handle_sandbox_runtime_install,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_sandbox_runtime_cancel(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.runtime.cancel")
+    component_id = _runtime_component_param(params)
+    operation_id = _require_string_param(
+        _require_params(params),
+        "operationId",
+        "params.operationId is required",
+    ).strip()
+    return await _sandbox_payload(
+        _sandbox_application(ctx).cancel_runtime_pack_install(
+            component_id,
+            operation_id,
+        )
+    )
+
+
+_handle_sandbox_runtime_cancel_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.cancel",
+    _handle_sandbox_runtime_cancel,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_sandbox_runtime_remove(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.runtime.remove")
+    component_id = _runtime_component_param(params)
+    return await _sandbox_payload(
+        _sandbox_application(ctx).remove_runtime_pack(component_id)
+    )
+
+
+_handle_sandbox_runtime_remove_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.remove",
+    _handle_sandbox_runtime_remove,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_sandbox_runtime_discard_download(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict:
+    _require_owner(ctx, "sandbox.runtime.discard_download")
+    component_id = _runtime_component_param(params)
+    return await _sandbox_payload(
+        _sandbox_application(ctx).discard_runtime_pack_download(component_id)
+    )
+
+
+_handle_sandbox_runtime_discard_download_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.runtime.discard_download",
+    _handle_sandbox_runtime_discard_download,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.gateway.adapters.sandbox_runtime import sandbox_policy_from_payload
+
+    _require_owner(ctx, "sandbox.policy.update")
+    values = _require_params(params)
+    base_version = values.get("basePolicyVersion")
+    if not isinstance(base_version, int) or isinstance(base_version, bool):
+        raise ValueError("params.basePolicyVersion must be an integer")
+    policy = values.get("policy")
+    if not isinstance(policy, dict):
+        raise ValueError("params.policy must be an object")
+    return await _sandbox_payload(
+        _sandbox_application(ctx).replace_policy(
+            base_version,
+            sandbox_policy_from_payload(policy),
+        )
+    )
+
+
+_handle_sandbox_policy_update_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.policy.update",
+    _handle_sandbox_policy_update,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+@_d.method("sandbox.tokens.list", scope="operator.read")
+async def _handle_sandbox_token_list(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.list")
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return {
+        "tokens": [
+            _sandbox_token_payload(record)
+            for record in _sandbox_token_store(ctx).list_active()
+        ]
+    }
+
+
+@_d.method("sandbox.tokens.create", scope="operator.write")
+async def _handle_sandbox_token_create(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.create")
+    values = _require_params(params)
+    name = values.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("params.name must be a non-empty string")
+    host_execute = values.get("hostExecute", True)
+    if not isinstance(host_execute, bool):
+        raise ValueError("params.hostExecute must be a boolean")
+    capabilities = {"task.read", "task.submit"}
+    if host_execute:
+        capabilities.add("host.execute")
+    issued = _sandbox_token_store(ctx).create(
+        name=name.strip(),
+        roles={"operator"},
+        scopes={"operator.read", "operator.write"},
+        capabilities=capabilities,
+    )
+    return {
+        "token": issued.token,
+        "record": _sandbox_token_payload(issued.record),
+    }
+
+
+@_d.method("sandbox.tokens.revoke", scope="operator.write")
+async def _handle_sandbox_token_revoke(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.revoke")
+    values = _require_params(params)
+    public_id = values.get("publicId")
+    if not isinstance(public_id, str) or not public_id.strip():
+        raise ValueError("params.publicId must be a non-empty string")
+    return {
+        "publicId": public_id.strip(),
+        "revoked": _sandbox_token_store(ctx).revoke(public_id.strip()),
+    }
+
+
 async def _handle_sandbox_setup_ensure(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.setup.ensure")
-    result = await ensure_sandbox_setup_auto(ctx.config)
-    return result.to_payload()
+    return await _sandbox_payload(_sandbox_application(ctx).prepare())
+
+
+_handle_sandbox_setup_ensure_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.setup.ensure",
+    _handle_sandbox_setup_ensure,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sandbox.explain", scope="operator.read")
@@ -716,7 +1066,6 @@ async def _session_autonomous_paused(session_key: str) -> bool:
     return await runtime.ledger.is_paused(session_key)
 
 
-@_d.method("sandbox.resume", scope="operator.write")
 async def _handle_sandbox_resume(params: dict | None, ctx: RpcContext) -> dict:
     """Clear a denial-ledger autonomous pause so a stuck run can continue.
 
@@ -727,44 +1076,52 @@ async def _handle_sandbox_resume(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.resume")
     params = _require_params(params)
     session_key = _require_session_key(params)
-    from opensquilla.sandbox.integration import get_runtime
+    return await _sandbox_payload(
+        _sandbox_application(ctx).resume_paused_session(session_key),
+        structured_unavailable=True,
+    )
 
-    runtime = get_runtime()
-    if runtime is None:
-        raise RpcHandlerError("UNAVAILABLE", "Sandbox runtime is not configured.", retryable=True)
-    resumed = await runtime.ledger.clear_pause(session_key)
-    return {"sessionKey": session_key, "resumed": resumed, "autonomousPaused": False}
+
+_handle_sandbox_resume_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.resume",
+    _handle_sandbox_resume,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def _require_sandbox_setup_ready_for_mode(ctx: RpcContext, run_mode: Any) -> None:
     normalized = normalize_run_mode(run_mode)
     if normalized == RunMode.FULL:
         return
-    status = await current_sandbox_setup_status(ctx.config)
-    if status.state != SandboxSetupState.READY:
+    report = await current_sandbox_capability_report(ctx.config)
+    if not report.available:
         raise RpcHandlerError(
-            "SANDBOX_SETUP_REQUIRED",
-            "Sandbox setup must be completed before enabling sandbox run modes.",
-            details=status.to_payload(),
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            "Safe mode cannot be enabled because sandbox initialization is not ready.",
+            details=report.to_payload(),
         )
 
 
-@_d.method("sandbox.run_mode.preference.get", scope="operator.read")
 async def _handle_run_mode_preference_get(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, str]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    storage = _runtime_preference_storage(ctx)
-    stored = await storage.get_runtime_preference(_RUN_MODE_PREFERENCE_KEY)
-    source = "preference" if stored is not None else "config"
-    mode = normalize_run_mode(stored, default=config_run_mode(ctx.config))
-    mode = coerce_run_mode_for_principal(mode, ctx.principal)
-    return {"runMode": mode.value, "source": source}
+    return await _sandbox_payload(_sandbox_application(ctx).read_run_mode())
 
 
-@_d.method("sandbox.run_mode.preference.set", scope="operator.write")
+_handle_run_mode_preference_get_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.run_mode.preference.get",
+    _handle_run_mode_preference_get,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_run_mode_preference_set(
     params: dict | None,
     ctx: RpcContext,
@@ -772,18 +1129,18 @@ async def _handle_run_mode_preference_set(
     _require_owner(ctx, "sandbox.run_mode.preference.set")
     params = _require_params(params)
     mode = normalize_run_mode(params.get("runMode"))
-    await _require_sandbox_setup_ready_for_mode(ctx, mode)
-    storage = _runtime_preference_storage(ctx)
-    confirmed = await storage.set_runtime_preference(
-        _RUN_MODE_PREFERENCE_KEY,
-        mode.value,
+    return await _sandbox_payload(
+        _sandbox_application(ctx).select_run_mode(mode.value)
     )
-    payload = {"runMode": confirmed, "source": "preference"}
-    await _run_mode_preference_registry().broadcast(
-        _RUN_MODE_PREFERENCE_CHANGED_EVENT,
-        payload,
-    )
-    return payload
+
+
+_handle_run_mode_preference_set_contract = register_sandbox_runtime_contract(
+    _d,
+    "sandbox.run_mode.preference.set",
+    _handle_run_mode_preference_set,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("sandbox.run_context.get", scope="operator.read")
@@ -1059,7 +1416,6 @@ async def _handle_sandbox_bundle_disable(params: dict | None, ctx: RpcContext) -
     return _payload(context)
 
 
-@_d.method("sandbox.path.list", scope="operator.read")
 async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dict:
     params = _require_params(params)
     session_key = _require_session_key(params)
@@ -1090,7 +1446,6 @@ async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dic
     }
 
 
-@_d.method("sandbox.path.create-directory", scope="operator.write")
 async def _handle_sandbox_path_create_directory(
     params: dict | None,
     ctx: RpcContext,
@@ -1134,7 +1489,6 @@ async def _handle_sandbox_path_create_directory(
     }
 
 
-@_d.method("sandbox.path.pick", scope="operator.write")
 async def _handle_sandbox_path_pick(params: dict | None, ctx: RpcContext) -> dict:
     params = _require_params(params)
     session_key = _require_session_key(params)
@@ -1194,6 +1548,13 @@ async def _handle_sandbox_workspace_set(params: dict | None, ctx: RpcContext) ->
         session=session,
     )
     current_workspace = base_context.workspace
+    if getattr(session, "execution_workspace", None) is not None:
+        if workspace_path != current_workspace:
+            raise RpcHandlerError(
+                "EXECUTION_WORKSPACE_FIXED",
+                "A task-bound session cannot change its execution workspace.",
+            )
+        return _payload(base_context)
     context = await set_workspace(
         manager,
         session_key,
@@ -1212,3 +1573,21 @@ async def _handle_sandbox_workspace_set(params: dict | None, ctx: RpcContext) ->
     if callable(invalidate_adoption):
         invalidate_adoption()
     return _payload(context)
+
+
+_SANDBOX_PATH_CONTRACT_IMPLEMENTATIONS = {
+    "sandbox.path.list": _handle_sandbox_path_list,
+    "sandbox.path.create-directory": _handle_sandbox_path_create_directory,
+    "sandbox.path.pick": _handle_sandbox_path_pick,
+}
+
+_SANDBOX_PATH_CONTRACT_HANDLERS = {
+    method: register_workspace_catalog_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _SANDBOX_PATH_CONTRACT_IMPLEMENTATIONS.items()
+}

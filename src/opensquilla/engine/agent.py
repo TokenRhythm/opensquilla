@@ -6,7 +6,9 @@ Core loop is under 500 lines. No recursive calls.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import copy
 import functools
 import hashlib
 import inspect
@@ -15,103 +17,88 @@ import math
 import os
 import re
 import stat
-import subprocess
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
+from itertools import chain
 from pathlib import Path
 from typing import Any, Literal
 
 import structlog
 
 from opensquilla.artifacts import artifact_payload
+from opensquilla.attachment_workspace import (
+    AttachmentWorkspaceMaterializer,
+    workspace_attachment_budget_from_config,
+)
+from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.context_budget import ContextBudgetClass, ContextBudgetGovernor
+from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_MIMES, normalize_attachment_mime
+from opensquilla.contracts.image_validation import validate_image_bytes
+from opensquilla.contracts.turn_execution import TurnExecutionContext
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import (
     check_response_for_cache_break,
     notify_compaction,
     record_prompt_state,
 )
+from opensquilla.engine.cancellation import (
+    STOP_CANCEL_GRACE_SECONDS,
+    TIMEOUT_CANCEL_GRACE_SECONDS,
+    CancellationPolicy,
+    cancel_task,
+    cancel_tasks,
+    defer_async_cleanup,
+)
 from opensquilla.engine.elevation_triage import RuleAssessment, local_elevation_assessment
-from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep
-from opensquilla.engine.final_diff_contract import (
-    FinalDiffContractObservation,
-    build_final_diff_contract_observation,
-    final_diff_contract_recovery_message,
+from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep, sleep_before_retry
+from opensquilla.engine.history import (
+    limit_turns,
+    project_incomplete_tool_history,
+    reconstruct_messages_from_entry,
+    repair_tool_pairing,
 )
-from opensquilla.engine.finalize_evidence_gate import (
-    EXECUTION_TOOL_NAMES as _GATE_EXECUTION_TOOL_NAMES,
+from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
+from opensquilla.engine.repetition_guard import (
+    MODEL_REPETITION_LOOP_CODE,
+    MODEL_REPETITION_LOOP_MESSAGE,
+    ModelRepetitionLoopError,
+    close_async_iterator_bounded,
+    guard_provider_text_stream,
 )
-from opensquilla.engine.finalize_evidence_gate import (
-    FINALIZE_EVIDENCE_GATE_CHALLENGE_LIMIT,
-    FinalizeEvidenceTracker,
-    execution_signals_from_result,
-    finalize_evidence_challenge_message,
-    finalize_evidence_gate_key,
-    is_repro_script_path,
+from opensquilla.engine.replay_compat import rebase_incomplete_reasoning_history
+from opensquilla.engine.request_window import (
+    RequestWindowCandidate,
+    compact_request_window_tools,
+    iter_request_window_candidates,
 )
-from opensquilla.engine.finalize_evidence_gate import (
-    WRITE_TOOL_NAMES as _GATE_WRITE_TOOL_NAMES,
-)
-from opensquilla.engine.history import limit_turns, repair_tool_pairing
-from opensquilla.engine.patch_evidence_ledger import PatchEvidenceLedger
-from opensquilla.engine.post_write_convergence import (
-    PostWriteConvergenceDecision,
-    PostWriteConvergenceObservation,
-    PostWriteConvergenceTracker,
-)
-from opensquilla.engine.progress_watchdog import ProgressObservation, ProgressWatchdog
 from opensquilla.engine.runtime_diagnostics import RuntimeDiagnosticsObserver
 from opensquilla.engine.runtime_events import append_runtime_event
 from opensquilla.engine.runtime_recovery import (
-    RuntimeRecoveryDecision,
     RuntimeRecoveryMode,
     post_tool_empty_decision,
     reasoning_continuation_decision,
     reasoning_prefill_decision,
-    source_loop_recovery_decision,
     supports_reasoning_prefill_replay,
-)
-from opensquilla.engine.runtime_state_capsule import (
-    build_runtime_state_capsule,
-    runtime_state_capsule_message,
 )
 from opensquilla.engine.session_sanitize import (
     SessionSanitizeResult,
     project_historical_tool_payloads,
+    recoverable_tool_result_reference,
     sanitize_session_messages,
     session_payload_chars,
 )
-from opensquilla.engine.submit_review import (
-    SubmitAction,
-    SubmitReviewState,
-    build_submit_review_message,
-    evaluate_explicit_submit,
-)
-from opensquilla.engine.submit_review import (
-    confirmation_message as submit_review_confirmation_message,
-)
-from opensquilla.engine.submit_review import (
-    diff_is_truncated as submit_review_diff_is_truncated,
-)
-from opensquilla.engine.submit_review import (
-    empty_diff_note as submit_review_empty_diff_note,
-)
-from opensquilla.engine.submit_review import (
-    nudge_message as submit_review_nudge_message,
-)
-from opensquilla.engine.submit_review import (
-    observe_tool_activity as submit_review_observe_tool_activity,
-)
-from opensquilla.engine.submit_review import (
-    should_fire_implicit as submit_review_should_fire_implicit,
-)
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
+from opensquilla.engine.tool_failure_recovery import (
+    FAILURE_RECOVERY_CODE,
+    FAILURE_RECOVERY_INSTRUCTION,
+    ToolFailureRecovery,
+)
 from opensquilla.engine.tool_result_store import (
     TOOL_RESULT_META_NAME,
     ToolResultRecord,
@@ -122,6 +109,8 @@ from opensquilla.engine.tool_token_estimate import estimate_tokens as get_approx
 from opensquilla.engine.usage import model_usage_cost_fields
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
+    UsageAccountingUnavailableError,
+    UsageCallResult,
     UsageCallStart,
     UsageEventSink,
     UsageExecutionContext,
@@ -132,11 +121,17 @@ from opensquilla.engine.usage_accounting import (
     provider_accounts_physical_usage,
     start_usage_call,
 )
+from opensquilla.engine.web_search_projection import (
+    SEARCH_PREVIEW_REDUCER,
+    reduce_canonical_search,
+)
 from opensquilla.execution_status import (
     mark_execution_status_truncated,
     runtime_execution_status,
 )
+from opensquilla.git_runtime import GitRunState, run_git
 from opensquilla.observability.turn_call_log import TurnCallLogger
+from opensquilla.persistence.meta_run_writer import replay_inputs_are_modified
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockText,
@@ -145,6 +140,7 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     LLMProvider,
     Message,
+    ProviderGenerationResetEvent,
     ProviderHeartbeatEvent,
     ToolDefinition,
     ToolUseEndEvent,
@@ -154,6 +150,9 @@ from opensquilla.provider import (
 )
 from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
+)
+from opensquilla.provider import (
+    ProviderActivityEvent as ProviderDomainActivityEvent,
 )
 from opensquilla.provider import (
     ReasoningDeltaEvent as ProviderReasoningDelta,
@@ -168,16 +167,53 @@ from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
-from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.execution_identity import (
+    execution_from_evidence,
+    project_execution_identity,
+    with_execution_identity,
+    with_execution_span,
+)
+from opensquilla.provider.failures import (
+    CONNECTION_FAILED_CODE,
+    ProviderFailureKind,
+    classify_provider_error,
+    is_connection_failure,
+)
+from opensquilla.provider.image_projection import (
+    ImageMarkerState,
+    ImageProjectionMode,
+    assert_text_only_messages,
+    classify_image_failure,
+    project_messages,
+)
+from opensquilla.provider.image_projection import (
+    count_image_blocks as count_projected_image_blocks,
+)
 from opensquilla.provider.protocol import (
+    count_provider_image_blocks,
+    project_provider_final_request,
     project_provider_message_count,
-    validate_provider_chat_request,
+    provider_metadata,
+    validate_provider_chat_admission,
+)
+from opensquilla.provider.request_proof import (
+    ProviderRequestBudgetExceededError,
+    effective_proof_token_budget,
+    project_provider_payload,
+    projected_generation_budget,
+    prove_provider_payload,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from opensquilla.provider.types import (
     ContentBlockImage,
+    ExecutionIdentity,
     FailureInjector,
+    ModelCapabilities,
+    ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ProviderReplayState,
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
@@ -202,53 +238,88 @@ from opensquilla.sandbox.elevation import (
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
+    CompactionRequestContext,
+    CompactionResult,
+    arm_compaction_deadline,
     build_compaction_config_from_provider,
     compact_context,
+    compaction_prompt_layout,
+    compaction_replay_summary,
 )
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
+    CompactionTimeoutError,
+    ConsumerAdmissionStaleError,
     compaction_effect_payload,
     compaction_lifecycle_payload,
     compaction_result_payload,
-    flush_receipt_allows_destructive_compaction,
-    flush_receipt_is_successful_flush,
-    flush_trigger_enabled,
     new_compaction_id,
-    pre_compaction_flush_requires_safe_receipt,
 )
-from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.session.context_view import format_compaction_summary_context
+from opensquilla.session.terminal_reply import (
+    CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES,
+    build_terminal_reply,
+    safe_provider_failure_code,
+)
+from opensquilla.telemetry.contracts.reliability import (
+    ToolCategory,
+    ToolErrorCode,
+    ToolOutcome,
+)
+from opensquilla.telemetry.runtime_facts import (
+    ToolCallReliabilityFacts,
+    ToolReliabilitySink,
+    classify_tool_result,
+    tool_category_for_name,
+)
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
-from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
-from opensquilla.tools.types import ToolContext, current_tool_context
-from opensquilla.tools.write_policy import match_workspace_write_deny
-from opensquilla.tools.write_tracking import classify_workspace_path
+from opensquilla.tools.types import (
+    ToolContext,
+    ToolResultSnapshotReference,
+    ToolResultSnapshotWriter,
+    current_tool_context,
+    is_goal_owned_main_default_turn,
+)
 from opensquilla.usage_reasons import (
     normalize_usage_unknown_reason,
     provider_error_usage_reason,
 )
 
 from .context import ContextAssembly
-from .subagent import SubagentManager, SubagentSpec, SubagentUsage
+from .subagent import (
+    MAX_REFERENCED_SUBAGENT_TASK_BYTES,
+    SubagentManager,
+    SubagentSpec,
+    SubagentUsage,
+    render_subagent_task_reference,
+    resolve_subagent_execution_target,
+    subagent_task_inline_limit_bytes,
+    subagent_task_reference_slice_limit_chars,
+)
 from .types import (
     _THINKING_BUDGET_DEFAULT,
     AgentConfig,
     AgentEvent,
     AgentState,
+    AnswerGenerationResetEvent,
     ArtifactEvent,
     CompactionEvent,
     CompactionOutcome,
     DoneEvent,
     EnsembleProgressEvent,
     ErrorEvent,
+    ProviderActivityEvent,
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
+    ThinkingEndEvent,
     ThinkingEvent,
     ThinkingLevel,
+    ThinkingStartEvent,
     ToolCall,
     ToolResult,
     ToolResultEvent,
@@ -256,41 +327,12 @@ from .types import (
     ToolUseStartEvent,
     WarningEvent,
 )
+from .types import (
+    ToolUseEndEvent as EngineToolUseEndEvent,
+)
 
 logger = structlog.get_logger("opensquilla.engine.agent")
 
-_TURN_OBJECTIVE_REMINDER_MAX_CHARS = 2000
-
-_TURN_OBJECTIVE_REMINDER_ENV = "OPENSQUILLA_TURN_OBJECTIVE_REMINDER"
-_TURN_OBJECTIVE_REMINDER_ON = {"on", "1", "true", "yes"}
-_TURN_OBJECTIVE_REMINDER_OFF = {"off", "0", "false", "no"}
-_TURN_OBJECTIVE_REMINDER_TRIM_PREFIX = "trim:"
-
-
-def _resolve_turn_objective_reminder() -> tuple[bool, int]:
-    """Resolve the turn-objective reminder override.
-
-    ``OPENSQUILLA_TURN_OBJECTIVE_REMINDER`` accepts "on"/"off" or
-    "trim:<chars>" (a positive integer replacing the default truncation cap).
-    Unset or "off" suppresses the per-turn "[Current user request reminder]"
-    message; "on" restores it with the shipped truncation cap.
-    Unrecognized values raise instead of being silently ignored so a run
-    manifest cannot record an override the run did not actually apply.
-    """
-    env_value = os.environ.get(_TURN_OBJECTIVE_REMINDER_ENV, "").strip().lower()
-    if not env_value or env_value in _TURN_OBJECTIVE_REMINDER_OFF:
-        return False, _TURN_OBJECTIVE_REMINDER_MAX_CHARS
-    if env_value in _TURN_OBJECTIVE_REMINDER_ON:
-        return True, _TURN_OBJECTIVE_REMINDER_MAX_CHARS
-    if env_value.startswith(_TURN_OBJECTIVE_REMINDER_TRIM_PREFIX):
-        raw_chars = env_value[len(_TURN_OBJECTIVE_REMINDER_TRIM_PREFIX) :]
-        if raw_chars.isdigit() and int(raw_chars) > 0:
-            return True, int(raw_chars)
-    raise ValueError(
-        f"{_TURN_OBJECTIVE_REMINDER_ENV} must be one of: "
-        + ", ".join(sorted(_TURN_OBJECTIVE_REMINDER_ON | _TURN_OBJECTIVE_REMINDER_OFF))
-        + ", or trim:<positive integer>"
-    )
 
 _PROVIDER_OUTPUT_TRUNCATED_REPLY = build_terminal_reply(
     {
@@ -306,14 +348,8 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "been written. If a tool call was interrupted or incomplete, regenerate a complete "
     "tool call from scratch."
 )
-_TEXT_ONLY_TOOL_RECOVERY_LIMIT = 2
-_TEXT_ONLY_TOOL_RECOVERY_MESSAGE = (
-    "[Runtime recovery]\n"
-    "Previous assistant turn had text only and no tool calls. If the task still "
-    "requires repo inspection, editing, or verification, call the appropriate tool "
-    "now; if complete, answer briefly."
-)
 _PLAN_RUN_RECONCILIATION_LIMIT = 1
+PLAN_RUN_DELIVERY_TOOLS = frozenset({"publish_artifact", "open_workspace_preview"})
 
 
 def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
@@ -335,22 +371,14 @@ def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
     if not steps:
         return False
     statuses = [
-        str(
-            step.get("status")
-            if isinstance(step, Mapping)
-            else getattr(step, "status", "")
-        )
+        str(step.get("status") if isinstance(step, Mapping) else getattr(step, "status", ""))
         for step in steps
     ]
     return all(status in {"completed", "skipped"} for status in statuses)
 
 
 def _plan_run_checkpoint_enters_delivery_phase(result: ToolResult | None) -> bool:
-    if (
-        result is None
-        or result.tool_name != "plan_run_checkpoint"
-        or result.is_error
-    ):
+    if result is None or result.tool_name != "plan_run_checkpoint" or result.is_error:
         return False
     try:
         payload = json.loads(result.content)
@@ -361,47 +389,6 @@ def _plan_run_checkpoint_enters_delivery_phase(result: ToolResult | None) -> boo
     return _plan_run_steps_ready_for_delivery(payload.get("plan_run"))
 
 
-_SOURCE_CONTEXT_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "glob_search",
-        "grep_search",
-        "list_dir",
-        "read_file",
-        "git_diff",
-        "git_log",
-        "git_show",
-        "git_status",
-    }
-)
-_REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES: frozenset[str] = frozenset(
-    {"exec_command", "glob_search", "grep_search", "list_dir"}
-)
-_EXECUTION_TOOL_NAMES: frozenset[str] = frozenset(
-    {"background_process", "exec_command", "execute_code"}
-)
-_FOCUSED_VERIFICATION_MARKERS: tuple[str, ...] = (
-    "pytest",
-    " unittest",
-    "python -m unittest",
-    "ruff check",
-    "cargo test",
-    "cargo build",
-    "cargo check",
-    "go test",
-    "npm test",
-    "pnpm test",
-    "yarn test",
-    "mvn test",
-    "gradle test",
-    "ctest",
-    "rspec",
-    "tox",
-    " make check",
-    " make test",
-    " run-tests.py",
-    " ./run-tests.py",
-    " tests/jqtest",
-)
 _CLEAN_TEST_SUMMARY_RE = re.compile(
     r"\btests run:\s*\d+,\s*failures:\s*0,\s*errors:\s*0"
     r"(?:,\s*skipped:\s*\d+)?\b",
@@ -411,108 +398,9 @@ _CLEAN_PASSED_FAILED_SUMMARY_RE = re.compile(
     r"\b\d+\s+passed\b[^\n\r;]*(?:;|,)?[^\n\r]*\b0\s+failed\b",
     re.IGNORECASE,
 )
-_PLAIN_PASSED_SUMMARY_RE = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
 _CLEAN_ERROR_COUNT_RE = re.compile(r"\b0\s+error\(s\)(?:\W|$)", re.IGNORECASE)
-_FAILED_FINALIZATION_RECOVERY_LIMIT = 3
-_PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT = 2
-# Scratch verify-mirror (OPENSQUILLA_SCRATCH_VERIFY_MIRROR): directory name
-# under the scratch dir, and the fail-closed cap on mirror files the hash
-# guard will inspect per execution.
-_VERIFY_MIRROR_DIR_NAME = "verify-mirror"
-_VERIFY_MIRROR_MAX_FILES = 200
 
 
-def _patch_hygiene_block_key(offending_paths: list[str]) -> str:
-    """Dedup key: the same set of offending paths never re-fires."""
-
-    encoded = json.dumps(sorted(offending_paths), ensure_ascii=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
-
-
-def _patch_hygiene_block_message(test_paths: list[str]) -> str:
-    rendered = ", ".join(test_paths[:5])
-    if len(test_paths) > 5:
-        rendered += f" (and {len(test_paths) - 5} more)"
-    return (
-        "[Patch hygiene check]\n"
-        "You are about to finish, but the workspace diff still changes test "
-        f"files: {rendered}. The final change must live in the project source; "
-        "the repository's test suite is managed separately and modifications "
-        "to it do not count as part of the fix. Do not finalize yet. Revert "
-        "the listed test-file changes (restore modified or deleted test files "
-        "to their original content and remove newly added ones) so the diff "
-        "contains only non-test changes. If editing a test was your only "
-        "change, implement the actual fix in the source code instead. Keeping "
-        "a copy of any reproduction script under the scratch directory is "
-        "fine; test directories are not."
-    )
-
-
-def _patch_hygiene_block_protected_message(protected_paths: list[str]) -> str:
-    rendered = ", ".join(protected_paths[:5])
-    if len(protected_paths) > 5:
-        rendered += f" (and {len(protected_paths) - 5} more)"
-    return (
-        "[Patch hygiene check]\n"
-        "You are about to finish, but the workspace diff still changes files "
-        f"that this deployment's write policy protects: {rendered}. Protected "
-        "paths must stay unchanged in the final diff; edits to them do not "
-        "count as part of the fix. Do not finalize yet. Revert the listed "
-        "changes (restore modified or deleted files to their original content "
-        "and remove newly added ones) so the diff no longer touches protected "
-        "paths. If a protected file was the only thing you changed, implement "
-        "the actual fix in unprotected project source instead. Keeping copies "
-        "or new files under the scratch directory is fine."
-    )
-
-
-def _finalize_variant_challenge_message() -> str:
-    """Uniform one-shot variant-sweep challenge (finalize_variant_challenge).
-
-    Same text for every task and every fire: the wording names failure
-    classes in the abstract (alternate spellings of a construct, boundary
-    values, sibling shapes handled by the same logic, and reworks that
-    change contracts callers observe) and never any task-specific content.
-    """
-
-    return (
-        "[Variant sweep check]\n"
-        "Before you finish: enumerate the distinct input or construct classes "
-        "that can reach the code paths you changed (for example alternate "
-        "syntaxes or spellings of the same construct, boundary or edge-case "
-        "values, and sibling types or code shapes handled by the same logic). "
-        "Then run your verification against each class you listed, not only "
-        "the case from the task description. If any class fails, fix your "
-        "change and re-run until green. If this leads you to rework your "
-        "approach, preserve the behavior contracts callers can observe "
-        "unless the task itself asks to change them: the types of raised or "
-        "propagated errors, public signatures and return types, and output "
-        "formats. If every class passes, finish and briefly note which "
-        "classes you checked."
-    )
-
-
-_CODE_CHANGE_TASK_MARKERS: tuple[str, ...] = (
-    "bug",
-    "fix",
-    "failing",
-    "failure",
-    "implement",
-    "patch",
-    "traceback",
-    "error",
-    "exception",
-    "regression",
-    "test",
-)
-_NO_CHANGE_FINAL_MARKERS: tuple[str, ...] = (
-    "no code change",
-    "no file change",
-    "no changes are required",
-    "no changes needed",
-    "diff should remain empty",
-    "repository diff should remain empty",
-)
 _ROOT_SCRATCH_ARTIFACT_NAMES: frozenset[str] = frozenset(
     {
         "actual.json",
@@ -558,41 +446,6 @@ _ROOT_SCRATCH_ARTIFACT_PREFIXES: tuple[str, ...] = (
 _ROOT_SCRATCH_ARTIFACT_SUFFIXES: frozenset[str] = frozenset(
     {".json", ".js", ".log", ".out", ".py", ".sh", ".ts", ".txt"}
 )
-_SUSPICIOUS_NEW_WORKSPACE_WRITE_PREFIXES: tuple[str, ...] = (
-    "debug_marker",
-    "guard_unlock",
-    "runtime_guard",
-    "temp_marker",
-)
-_SUSPICIOUS_NEW_WORKSPACE_WRITE_CONTENT_MARKERS: tuple[str, ...] = (
-    "debug marker",
-    "guard unlock",
-    "placeholder for runtime guard",
-    "runtime guard unlock",
-    "satisfy the runtime guard",
-    "temp marker",
-)
-_NO_WORKSPACE_WRITE_REASONS: frozenset[str] = frozenset(
-    {
-        "source_context_without_workspace_write",
-        "source_context_exploration_without_workspace_write",
-        "repeated_failure_anchor_without_workspace_write",
-        "tool_activity_without_workspace_write",
-    }
-)
-_WORKSPACE_EDIT_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "apply_patch",
-        "edit_file",
-        "write_file",
-    }
-)
-_DIAGNOSTIC_RETRIEVAL_GATED_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        *_WORKSPACE_EDIT_TOOL_NAMES,
-        "finalize",
-    }
-)
 
 _meta_invoke_depth: ContextVar[int] = ContextVar("opensquilla_meta_invoke_depth", default=0)
 _meta_invoke_turn_count: ContextVar[int] = ContextVar(
@@ -605,118 +458,6 @@ def _normalize_workspace_relative_path(path: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized.lstrip("/")
-
-
-def _progress_watchdog_guidance_message(reason: str, details: Mapping[str, Any]) -> str:
-    no_workspace_write_reason = reason in _NO_WORKSPACE_WRITE_REASONS
-    if reason == "repeated_provider_failure":
-        signal = "repeated provider failures"
-    elif reason == "repeated_tool_error":
-        signal = "repeated tool errors"
-    elif reason == "repeated_failure_anchor_without_workspace_write":
-        signal = "the same failure anchor repeating without a new workspace edit"
-    elif reason in {
-        "source_context_without_workspace_write",
-        "source_context_exploration_without_workspace_write",
-        "source_context_after_workspace_write",
-    }:
-        signal = (
-            "source-context exploration continuing after repository edits"
-            if reason == "source_context_after_workspace_write"
-            else "source-context exploration continuing without clear patch progress"
-        )
-    elif reason == "tool_activity_without_workspace_write":
-        signal = "tool activity continuing without a real workspace edit"
-    elif reason == "verified_workspace_diff_continued_tool_activity":
-        signal = "continued tool activity after a workspace diff and focused verification"
-    else:
-        signal = "repeated no-progress activity"
-
-    count = details.get("count")
-    count_text = f" Count: {count}." if isinstance(count, int) and count > 0 else ""
-    workspace_change_likely_required = bool(
-        details.get("workspace_change_likely_required")
-    )
-    failure_summary = str(details.get("failure_anchor_summary") or "").strip()
-    if len(failure_summary) > 700:
-        failure_summary = failure_summary[:697].rstrip() + "..."
-    failure_text = f" Recent failure anchor(s): {failure_summary}." if failure_summary else ""
-    if no_workspace_write_reason and workspace_change_likely_required:
-        next_step_text = (
-            "This task appears to require a repository patch, but no tracked "
-            "workspace source file has been changed yet. Avoid repeating broad "
-            "exploration or writing more scratch notes. If the exact edit is not "
-            "localized yet, use targeted source reads/searches; once localized, use "
-            "an available source-edit tool on the real project source file allowed "
-            "by the workspace write policy, then run one focused validation command."
-        )
-    elif reason in {
-        "source_context_after_workspace_write",
-        "verified_workspace_diff_continued_tool_activity",
-    }:
-        if isinstance(count, int) and count >= 6:
-            next_step_text = (
-                "You already have repository edits and have received this warning "
-                "again. Do not call read_file, grep_search, glob_search, list_dir, "
-                "or write more scratch files next. Use the current context: make a "
-                "source edit, run one focused validation command, or finalize if "
-                "validation is clean."
-            )
-        else:
-            next_step_text = (
-                "You already have repository edits. Stop broad source exploration. "
-                "Use the current diff and latest verification result: either fix the "
-                "patch, run one focused validation command, or finalize if validation "
-                "is clean."
-            )
-    else:
-        next_step_text = (
-            "Do not repeat the same action unchanged. Change approach, inspect the "
-            "current workspace diff and the latest failure signal, make the smallest "
-            "justified source edit if one is available, or explain the concrete blocker."
-        )
-    return (
-        "[Runtime progress warning]\n"
-        f"The runtime observed {signal}.{count_text}{failure_text} "
-        f"{next_step_text}"
-    )
-
-
-def _post_write_convergence_message(
-    decision: PostWriteConvergenceDecision,
-) -> str:
-    details = decision.details
-    stable_count = details.get("stable_count")
-    count_text = (
-        f" for {stable_count} post-verification tool turn(s)"
-        if isinstance(stable_count, int) and stable_count > 0
-        else ""
-    )
-    paths = details.get("diff_paths")
-    if isinstance(paths, list) and paths:
-        path_text = ", ".join(str(path) for path in paths[:5])
-        if len(paths) > 5:
-            path_text += ", ..."
-        path_text = f" Current diff paths: {path_text}."
-    else:
-        path_text = ""
-    if decision.action == "finalize":
-        next_step = (
-            "Do not call tools. Provide the final answer from the current patch and "
-            "latest clean validation result. Only mention a blocker if the current "
-            "diff is known to be incomplete."
-        )
-    else:
-        next_step = (
-            "Stop broad source exploration. Use the current diff and latest clean "
-            "validation result: finalize if the patch is ready, or make one small "
-            "source edit only if the validation evidence requires it."
-        )
-    return (
-        "[Runtime post-write convergence]\n"
-        f"The current diff has stayed unchanged{count_text} after a successful "
-        f"focused validation.{path_text} {next_step}"
-    )
 
 
 def _cost_source_for_usage(
@@ -736,9 +477,7 @@ def _cost_source_for_usage(
     return "unavailable"
 
 
-_ESTIMATE_COST_SOURCES = frozenset(
-    {"opensquilla_estimate", "opensquilla_static_estimate"}
-)
+_ESTIMATE_COST_SOURCES = frozenset({"opensquilla_estimate", "opensquilla_static_estimate"})
 
 
 def _cost_component_flags(
@@ -761,12 +500,7 @@ def _cost_component_flags(
     )
     estimated = source in _ESTIMATE_COST_SOURCES or cost_usd > billed_cost + 1e-12
     missing = max(0, int(missing_cost_entries or 0))
-    if (
-        infer_missing
-        and source == "unavailable"
-        and estimate_basis != "free"
-        and missing == 0
-    ):
+    if infer_missing and source == "unavailable" and estimate_basis != "free" and missing == 0:
         missing = 1
     return billed, estimated, missing
 
@@ -792,9 +526,7 @@ def _classify_cost_components(
         return "provider_billed"
     if has_estimate:
         return (
-            estimate_source
-            if estimate_source in _ESTIMATE_COST_SOURCES
-            else "opensquilla_estimate"
+            estimate_source if estimate_source in _ESTIMATE_COST_SOURCES else "opensquilla_estimate"
         )
     return "unavailable"
 
@@ -811,6 +543,51 @@ def _usage_float(value: Any) -> float:
         return max(0.0, float(value or 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _normalized_usage_breakdown_rows(
+    event: object,
+    usage: UsageCallResult,
+) -> list[dict[str, Any]]:
+    """Preserve provider metadata while replacing additive usage with canonical values."""
+
+    raw_breakdown = getattr(event, "model_usage_breakdown", None)
+    raw_rows = raw_breakdown if isinstance(raw_breakdown, list) else []
+    rows: list[dict[str, Any]] = []
+    for item in usage.items:
+        row = (
+            dict(raw_rows[item.ordinal])
+            if item.ordinal < len(raw_rows) and isinstance(raw_rows[item.ordinal], dict)
+            else {}
+        )
+        billed_cost = item.billed_cost_nanos / 1_000_000_000
+        model = item.model or "unknown"
+        row.update(
+            {
+                "provider": item.provider,
+                "model": model,
+                "input_tokens": item.input_tokens,
+                "inputTokens": item.input_tokens,
+                "output_tokens": item.output_tokens,
+                "outputTokens": item.output_tokens,
+                "reasoning_tokens": item.reasoning_tokens,
+                "reasoningTokens": item.reasoning_tokens,
+                "cache_read_tokens": item.cache_read_tokens,
+                "cacheReadTokens": item.cache_read_tokens,
+                "cached_tokens": item.cache_read_tokens,
+                "cachedTokens": item.cache_read_tokens,
+                "cache_write_tokens": item.cache_write_tokens,
+                "cacheWriteTokens": item.cache_write_tokens,
+                "billed_cost": billed_cost,
+                "billedCost": billed_cost,
+                "billed_cost_usd": billed_cost,
+                "billedCostUsd": billed_cost,
+                "cost_source": item.cost_source,
+                "costSource": item.cost_source,
+            }
+        )
+        rows.append(row)
+    return rows
 
 
 def _subagent_usage_breakdown_rows(usage: SubagentUsage) -> list[dict[str, Any]]:
@@ -881,12 +658,8 @@ def _add_subagent_usage_to_tracker(
             )
             tracker.add(
                 session_key,
-                input_tokens=_usage_int(
-                    row.get("input_tokens", row.get("inputTokens", 0))
-                ),
-                output_tokens=_usage_int(
-                    row.get("output_tokens", row.get("outputTokens", 0))
-                ),
+                input_tokens=_usage_int(row.get("input_tokens", row.get("inputTokens", 0))),
+                output_tokens=_usage_int(row.get("output_tokens", row.get("outputTokens", 0))),
                 model_id=str(row.get("model") or usage.model or ""),
                 cache_read_tokens=_usage_int(cache_read or 0),
                 cache_write_tokens=_usage_int(
@@ -903,9 +676,7 @@ def _add_subagent_usage_to_tracker(
                 ),
                 provider=str(row.get("provider") or usage.provider or ""),
                 cost_source=str(
-                    row.get("cost_source")
-                    or row.get("costSource")
-                    or usage.cost_source
+                    row.get("cost_source") or row.get("costSource") or usage.cost_source
                 ),
             )
     current_session_usage = tracker.get(session_key)
@@ -943,9 +714,7 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                     model_id=model_id,
                     provider=str(item.get("provider") or ""),
                     input_tokens=_usage_int(item.get("input_tokens") or item.get("inputTokens")),
-                    output_tokens=_usage_int(
-                        item.get("output_tokens") or item.get("outputTokens")
-                    ),
+                    output_tokens=_usage_int(item.get("output_tokens") or item.get("outputTokens")),
                     billed_cost=_usage_float(
                         item.get("billed_cost")
                         or item.get("billedCost")
@@ -960,9 +729,9 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                     cache_write_tokens=_usage_int(item.get("cache_write_tokens") or 0),
                     has_billed_receipt=(
                         True
-                        if str(
-                            item.get("cost_source") or item.get("costSource") or ""
-                        ).strip().lower()
+                        if str(item.get("cost_source") or item.get("costSource") or "")
+                        .strip()
+                        .lower()
                         in {"provider_billed", "openrouter_usage"}
                         else None
                     ),
@@ -1031,9 +800,7 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
         target["request_count"] += max(1, _usage_int(row.get("request_count") or 1))
         components_by_key[key].append(
             _cost_component_flags(
-                cost_source=str(
-                    row.get("cost_source") or row.get("costSource") or "none"
-                ),
+                cost_source=str(row.get("cost_source") or row.get("costSource") or "none"),
                 cost_usd=_usage_float(row.get("cost_usd") or row.get("costUsd")),
                 billed_cost=_usage_float(
                     row.get("billed_cost")
@@ -1043,12 +810,7 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
                 ),
                 missing_cost_entries=row_missing_cost_entries,
                 estimate_basis=(
-                    str(
-                        row.get("estimate_basis")
-                        or row.get("estimateBasis")
-                        or ""
-                    )
-                    or None
+                    str(row.get("estimate_basis") or row.get("estimateBasis") or "") or None
                 ),
             )
         )
@@ -1099,11 +861,6 @@ def _is_deepseek_model_id(model_id: str | None) -> bool:
     return normalized.startswith("deepseek") or "/deepseek" in normalized
 
 
-def _is_direct_deepseek_v4_model_id(model_id: str | None) -> bool:
-    normalized = (model_id or "").strip().lower()
-    return normalized in {"deepseek-v4-flash", "deepseek-v4-pro"}
-
-
 _LARGE_JSON_TOOL_FIELD_KEYS: frozenset[str] = frozenset({"body", "body_base64"})
 _LARGE_JSON_TOOL_FIELD_CHARS = 20_000
 _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
@@ -1111,9 +868,6 @@ _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted
 _INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX = "[invalid_provider_context_projection:"
 _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY = "_invalid_provider_context_arguments"
 _AGGREGATE_TOOL_RESULT_MAX_SHARE = 0.25
-# Below this size a duplicate tool result is not worth eliding: the dedup stub
-# itself costs ~200 chars, so tiny repeated payloads would grow, not shrink.
-_PROVIDER_HISTORY_DEDUP_MIN_CHARS = 400
 _TOOL_ARGUMENT_HEARTBEAT_CHARS = 4096
 _PROVIDER_CONTEXT_PROJECTION_REUSED_REASON = "provider_context_projection_reused"
 _SEMANTIC_TOOL_RESULT_PROJECTION_SKIP_TOOLS = frozenset({"read_file", "git_diff"})
@@ -1131,6 +885,11 @@ _TOOL_RESULT_HINT_LINE_MAX_CHARS = 180
 _TOOL_RESULT_HINT_MAX_LINES = 8
 _TOOL_RESULT_HINT_MAX_CHARS = 900
 _TOOL_RESULT_HINT_SCAN_MAX_CHARS = 2048
+# Historical verification reads and hashes raw Store payloads so that a lossy
+# projection is only compacted when recovery is genuinely available. Bound the
+# number of unique handles per turn; references beyond this limit stay visible
+# in their original envelope (fail open) instead of causing unbounded Store I/O.
+_MAX_HISTORICAL_TOOL_RESULT_REFERENCE_PROBES = 256
 _TOOL_PROJECTION_EVENT_ARGUMENT_KEYS = frozenset(
     {"command", "cmd", "workdir", "cwd", "path", "paths"}
 )
@@ -1148,123 +907,34 @@ _TOOL_RESULT_HINT_PATTERN = re.compile(
 _TOOL_RESULT_HINT_PATH_PATTERN = re.compile(
     r"(?:[A-Za-z]:)?[./\\]?[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)+(?::\d+)?"
 )
-_PROJECTION_SIGNAL_HINTS_ENV = "OPENSQUILLA_PROJECTION_SIGNAL_HINTS"
-_PROJECTION_SIGNAL_PATTERNS_ENV = "OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS"
-_PROJECTION_SIGNAL_HINTS_ON = frozenset({"on", "1", "true", "yes"})
-_PROJECTION_SIGNAL_HINTS_OFF = frozenset({"off", "0", "false", "no"})
-# Default failure-signal pattern for the projection signal scan. Kept separate
-# from _TOOL_RESULT_HINT_PATTERN so the env override below can never perturb
-# search_hints selection. Case-sensitive on purpose: the anchors target the
-# capitalized/tool-emitted forms (FAILED, Traceback, AssertionError, ...).
-_PROJECTION_SIGNAL_DEFAULT_PATTERN = re.compile(
-    r"(?:\bFAILED\b|\bFAIL:|\bError\b|\bException\b|\bTraceback\b"
-    r"|\bAssertionError\b|\berror:|\bwarnings? summary\b"
-    r"|\bpanic(?:ked)?\b|\bfatal\b)"
-)
-_PROJECTION_SIGNAL_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
 
 
-def _projection_signal_hints_enabled(config_value: bool = False) -> bool:
-    """Resolve the projection signal-scan gate.
-
-    Unset defers to ``config_value`` (the AgentConfig field threaded from the
-    same env by the bootstrap stage; off by default). Recognized on/off values
-    override it; unrecognized values raise instead of being silently ignored
-    so a run manifest cannot record an override the run did not actually
-    apply.
-    """
-    raw = os.environ.get(_PROJECTION_SIGNAL_HINTS_ENV, "").strip().lower()
-    if not raw:
-        return bool(config_value)
-    if raw in _PROJECTION_SIGNAL_HINTS_ON:
-        return True
-    if raw in _PROJECTION_SIGNAL_HINTS_OFF:
-        return False
-    raise ValueError(
-        f"{_PROJECTION_SIGNAL_HINTS_ENV} must be one of: "
-        + ", ".join(sorted(_PROJECTION_SIGNAL_HINTS_ON | _PROJECTION_SIGNAL_HINTS_OFF))
-    )
-
-
-def _projection_signal_pattern() -> re.Pattern[str]:
-    """Return the failure-signal regex, honoring the env override.
-
-    A non-blank ``OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS`` value replaces the
-    default pattern wholesale (write alternations into one regex). Compiled
-    overrides are cached by raw string; invalid regexes raise ValueError per
-    the manifest-honesty convention rather than silently falling back.
-    """
-    raw = os.environ.get(_PROJECTION_SIGNAL_PATTERNS_ENV, "").strip()
-    if not raw:
-        return _PROJECTION_SIGNAL_DEFAULT_PATTERN
-    cached = _PROJECTION_SIGNAL_PATTERN_CACHE.get(raw)
-    if cached is not None:
-        return cached
-    try:
-        compiled = re.compile(raw)
-    except re.error as exc:
-        raise ValueError(
-            f"{_PROJECTION_SIGNAL_PATTERNS_ENV} must be a valid regular "
-            f"expression: {exc}"
-        ) from exc
-    _PROJECTION_SIGNAL_PATTERN_CACHE[raw] = compiled
-    return compiled
-_PROVIDER_CONTEXT_REPAIR_PROMPT = (
-    "A previous tool call was rejected because it reused provider-only compacted "
-    "tool arguments. Regenerate the complete tool arguments from the available "
-    "source context and retry the tool call. Do not copy compacted placeholders."
+# Read-only recognition of complete retired directives in existing histories.
+# Prefixes alone can also occur in real user messages and must not hide them.
+_RETIRED_RUNTIME_NUDGE_PATTERNS = (
+    re.compile(
+        r"Progress check: about [0-9]+% of the wall-clock budget for this task "
+        r"is spent and the workspace has no source change yet\. If you already "
+        r"know the fix, start implementing it now and verify it against the "
+        r"existing tests\. If you are still investigating, pick the most likely "
+        r"file and make the smallest reasonable edit now, then refine it with the "
+        r"remaining time instead of leaving the whole budget to analysis\."
+    ),
+    re.compile(
+        r"Time check: about [0-9]+ minute\(s\) remain and the workspace contains "
+        r"no source fix yet beyond diagnostic instrumentation\. Stop investigating "
+        r"now\. Decide on the most likely root cause from the evidence you already "
+        r"have, remove leftover debug output, apply your best-supported fix to "
+        r"the source code, and verify it directly\. An imperfect fix you can "
+        r"defend beats no fix\."
+    ),
 )
-_IDENTICAL_REQUEST_LOOP_NUDGE = (
-    "The last several requests were identical: the conversation is stuck "
-    "repeating the same rejected or failed action. Do not repeat the previous "
-    "tool call. Change approach now: re-read the relevant files or re-run the "
-    "command to rebuild tool arguments from real content, try a different tool "
-    "or target, or finalize with your best current answer."
-)
-_PLACEHOLDER_ESCALATION_DIRECTIVE = (
-    "STOP: multiple tool calls this turn reused compacted placeholder text and "
-    "were rejected without running. Reissuing that call will never work. Before "
-    "your next tool call, re-open the target file or re-run the underlying "
-    "command to get its real current content, then rebuild the tool arguments "
-    "from that fresh output. Never retype or paraphrase placeholder text."
-)
-_DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE = (
-    "Time check: roughly {minutes} minute(s) of wall-clock budget remain for "
-    "this task. Stop exploring and converge now: apply your best current "
-    "changes, verify them quickly if you can, and finish with a complete "
-    "final answer. Finishing your best-supported work now is better than "
-    "further investigation that the clock will cut off."
-)
-_MID_BUDGET_NO_DIFF_NUDGE_FRACTIONS: tuple[float, ...] = (0.5, 0.75)
-_MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE = (
-    "Progress check: about {percent}% of the wall-clock budget for this task "
-    "is spent and the workspace has no source change yet. If you already "
-    "know the fix, start implementing it now and verify it against the "
-    "existing tests. If you are still investigating, pick the most likely "
-    "file and make the smallest reasonable edit now, then refine it with the "
-    "remaining time instead of leaving the whole budget to analysis."
-)
-_MID_BUDGET_NO_DIFF_NUDGE_PREFIX = _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.split(
-    "{percent}", 1
-)[0]
 _REASONING_ONLY_ACT_NOW_DIRECTIVE = (
     "Your previous response was internal reasoning only, so nothing was "
     "delivered or executed. Act now: issue the tool call that carries out "
     "your current best next step, or state your final answer directly. "
     "Decide with the analysis you already have instead of reasoning further."
 )
-# One-shot endgame fix directive (OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_
-# SECONDS). The prefix is distinct from the wrap-up's "Time check: roughly "
-# so the nudge-identity predicates can tell them apart.
-_ENDGAME_FIX_DIRECTIVE_TEMPLATE = (
-    "Time check: about {minutes} minute(s) remain and the workspace contains "
-    "no source fix yet beyond diagnostic instrumentation. Stop investigating "
-    "now. Decide on the most likely root cause from the evidence you already "
-    "have, remove leftover debug output, apply your best-supported fix to "
-    "the source code, and verify it directly. An imperfect fix you can "
-    "defend beats no fix."
-)
-_ENDGAME_FIX_DIRECTIVE_PREFIX = "Time check: about "
 _LARGE_CONTEXT_INVALID_RESPONSE_INPUT_TOKENS = 30_000
 _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
     {
@@ -1308,95 +978,6 @@ def _tool_result_search_hints(content: str) -> str:
     if not lines:
         return ""
     return "search_hints:\n" + "\n".join(lines) + "\n"
-
-
-def _tool_result_signal_scan(
-    content: str,
-    *,
-    handle: str | None,
-    head_chars: int | None = None,
-    tail_chars: int | None = None,
-    preview_lines: frozenset[str] | None = None,
-) -> tuple[str, int, int | None]:
-    """Scan the omitted region of a projected tool result for failure signals.
-
-    Returns ``(rendered_lines, match_count, first_line_number)``. Line numbers
-    are 1-based over the FULL original ``content`` (the same coordinates
-    search_hints renders and retrieve_tool_result's ``L<num>`` query resolves
-    against the byte-identical stored record).
-
-    Omission model: with ``head_chars``/``tail_chars`` the omitted region is
-    the contiguous char span between the preserved head and tail; otherwise a
-    line counts as omitted when its exact text is absent from
-    ``preview_lines`` (the reducer-summarized preview). The membership check
-    is an approximation — a reducer that rewrites a matching line makes it
-    count as omitted even though a variant survives — but the rendered line
-    number still points at a real failure line in the original.
-
-    Returns ``("", 0, None)`` when there is nothing to report or no handle
-    exists to retrieve against.
-    """
-    if handle is None or not content:
-        return "", 0, None
-    pattern = _projection_signal_pattern()
-    omitted_start: int | None = None
-    omitted_end: int | None = None
-    if head_chars is not None:
-        omitted_start = max(0, int(head_chars))
-        omitted_end = len(content) - max(0, int(tail_chars or 0))
-        if omitted_end <= omitted_start:
-            return "", 0, None
-    match_count = 0
-    first_line_number: int | None = None
-    offset = 0
-    for line_number, line in enumerate(content.splitlines(), start=1):
-        line_start = offset
-        offset += len(line) + 1
-        if omitted_start is not None and omitted_end is not None:
-            if line_start + len(line) <= omitted_start or line_start >= omitted_end:
-                continue
-        elif preview_lines is not None and line in preview_lines:
-            continue
-        if not pattern.search(line[:_TOOL_RESULT_HINT_SCAN_MAX_CHARS]):
-            continue
-        match_count += 1
-        if first_line_number is None:
-            first_line_number = line_number
-    if match_count == 0 or first_line_number is None:
-        return "", 0, None
-    rendered = _render_projection_signal_lines(
-        handle=handle,
-        match_count=match_count,
-        first_line_number=first_line_number,
-    )
-    return rendered, match_count, first_line_number
-
-
-def _render_projection_signal_lines(
-    *,
-    handle: str | None,
-    match_count: int,
-    first_line_number: int | None,
-) -> str:
-    """Render the signal_scan notice lines for an already-computed scan.
-
-    Kept separate from the scan so the fresh-result path can scan once with
-    the size-gate probe's placeholder handle and re-render with the real
-    stored handle (both handle forms have identical length, so the probe
-    measures the true envelope size).
-    """
-    if handle is None or match_count <= 0 or first_line_number is None:
-        return ""
-    next_call_arguments = json.dumps(
-        {"handle": handle, "mode": "query", "query": f"L{first_line_number}"},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return (
-        f"signal_scan: {match_count} lines matching failure patterns in the "
-        f"omitted region (first at L{first_line_number})\n"
-        f"signal_next_call: retrieve_tool_result {next_call_arguments}\n"
-    )
 
 
 def _projection_event_argument_value(value: Any, *, key: str) -> Any:
@@ -1609,6 +1190,7 @@ async def _review_pending_elevation_if_configured(
         return None
 
     from opensquilla.gateway.approval_queue import get_approval_queue
+
     queue = get_approval_queue()
     try:
         entry = queue.get(approval_id)
@@ -1636,9 +1218,7 @@ async def _review_pending_elevation_if_configured(
                 "humanActionable": True,
                 "reviewStatus": "human_confirmation_required",
                 "reviewSource": "standard_mode_policy",
-                "reviewRationale": (
-                    "Standard mode requires explicit user approval for elevation."
-                ),
+                "reviewRationale": ("Standard mode requires explicit user approval for elevation."),
             }
         )
         try:
@@ -1665,9 +1245,7 @@ async def _review_pending_elevation_if_configured(
             "fingerprint": fingerprint,
             "humanActionable": False,
             "reviewer": "deterministic_rules",
-            "action": (
-                suspended_action.audit_payload() if suspended_action is not None else None
-            ),
+            "action": (suspended_action.audit_payload() if suspended_action is not None else None),
         },
     )
 
@@ -1859,9 +1437,7 @@ async def _review_pending_elevation_if_configured(
         outcome=assessment.outcome,
         source=review_source,
         status=(
-            "human_confirmation_required"
-            if requires_human_confirmation
-            else assessment.status
+            "human_confirmation_required" if requires_human_confirmation else assessment.status
         ),
     )
     return None if requires_human_confirmation else assessment
@@ -1917,6 +1493,8 @@ def _artifact_event_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     kwargs["has_thumbnail"] = bool(
         payload.get("has_thumbnail") or normalized.get("thumbnail_url")
     )
+    if isinstance(payload.get("publication_id"), str):
+        kwargs["publication_id"] = payload["publication_id"]
     return kwargs
 
 
@@ -1953,28 +1531,58 @@ def _tail_has_tool_result(messages: list[Message], *, lookback: int = 2) -> bool
     return any(_message_has_tool_result(message) for message in messages[-lookback:])
 
 
-def _is_mid_budget_nudge_message(message: Message) -> bool:
-    return (
-        message.role == "user"
-        and isinstance(message.content, str)
-        and message.content.startswith(_MID_BUDGET_NO_DIFF_NUDGE_PREFIX)
-    )
+_SYNTHETIC_USER_CONTEXT_PREFIXES = (
+    "[Available skills for this turn]",
+    "[Context summary]",
+    "[Request context for this turn]",
+    "[Runtime context for this turn]",
+    "[Current user request reminder]",
+    "[Current Goal objective reminder]",
+    "Runtime state capsule:",
+)
+
+
+def _active_user_message_index_for_request(
+    messages: list[Message],
+    *,
+    current_user_text: str = "",
+) -> int | None:
+    """Locate the real user request before provider wrappers add synthetic users."""
+
+    normalized_current = current_user_text.strip()
+    if normalized_current:
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.role != "user" or _message_has_tool_result(message):
+                continue
+            content = (
+                message.content
+                if isinstance(message.content, str)
+                else _flatten_content_blocks(message.content)
+            )
+            if content.strip() == normalized_current:
+                return index
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.role != "user" or _message_has_tool_result(message):
+            continue
+        content = (
+            message.content
+            if isinstance(message.content, str)
+            else _flatten_content_blocks(message.content)
+        )
+        if not content.lstrip().startswith(_SYNTHETIC_USER_CONTEXT_PREFIXES):
+            return index
+    return None
 
 
 def _is_runtime_nudge_message(message: Message) -> bool:
-    """Whether a message is a runtime-injected nudge, not conversation history.
-
-    Covers the mid-budget progress nudge and the endgame fix directive —
-    everything the engine appends after tool results that the post-tool shape
-    predicates must see through.
-    """
+    """Recognize complete historical nudges without hiding same-prefix user text."""
 
     if message.role != "user" or not isinstance(message.content, str):
         return False
-    return (
-        message.content.startswith(_MID_BUDGET_NO_DIFF_NUDGE_PREFIX)
-        or message.content.startswith(_ENDGAME_FIX_DIRECTIVE_PREFIX)
-    )
+    return any(pattern.fullmatch(message.content) for pattern in _RETIRED_RUNTIME_NUDGE_PATTERNS)
 
 
 def _tail_has_tool_result_ignoring_nudges(messages: list[Message]) -> bool:
@@ -2007,13 +1615,83 @@ def _message_has_tool_use(message: Message) -> bool:
     return any(isinstance(block, ContentBlockToolUse) for block in message.content)
 
 
+def _assistant_replay_tail(messages: list[Message], start: int) -> list[Message]:
+    """Return accepted assistant messages and their subsequent current-turn results."""
+    tail = messages[start:]
+    first = next((i for i, item in enumerate(tail) if item.role == "assistant"), len(tail))
+    return tail[first:]
+
+
+def _serialize_assistant_replay(messages: list[Message]) -> dict[str, Any]:
+    """Persist image provenance without adding it to provider wire messages."""
+    serialized = []
+    for message in messages:
+        payload = message.model_dump(mode="json")
+        if isinstance(message.content, list):
+            for block, stored in zip(message.content, payload["content"], strict=True):
+                if isinstance(block, ContentBlockImage):
+                    for key in ("name", "local_path", "source_url", "durable_retained"):
+                        value = getattr(block, key)
+                        if value is not None:
+                            stored[key] = value
+        serialized.append(payload)
+    return {"version": 1, "messages": serialized}
+
+
+def _native_assistant_content(
+    provider_replay: ProviderReplayState | None,
+    *,
+    response_text: str,
+    tool_calls: list[ToolCall],
+) -> list[Any] | None:
+    """Retain captured block order only for the response the engine accepted."""
+    if (
+        provider_replay is None
+        or provider_replay.protocol != "anthropic_messages"
+        or provider_replay.native_content is None
+    ):
+        return None
+    try:
+        content = Message.model_validate(
+            {"role": "assistant", "content": provider_replay.native_content},
+        ).content
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(content, list):
+        return None
+    # Recovery can replace visible text or remove unexecuted tools. Raw state
+    # must not restore either; the adapter also checks the eventual request view.
+    if "".join(block.text for block in content if isinstance(block, ContentBlockText)) != (
+        response_text
+    ):
+        return None
+    captured_tools = [block for block in content if isinstance(block, ContentBlockToolUse)]
+    accepted_tools = [
+        ContentBlockToolUse(id=tc.tool_use_id, name=tc.tool_name, input=tc.arguments)
+        for tc in tool_calls
+    ]
+    captured_json = json.dumps(
+        [block.model_dump(mode="json") for block in captured_tools], sort_keys=True,
+    )
+    accepted_json = json.dumps(
+        [block.model_dump(mode="json") for block in accepted_tools], sort_keys=True,
+    )
+    return content if captured_json == accepted_json else None
+
+
 def _build_reasoning_prefill_message(
     *,
     reasoning_content: str,
     thinking_signature: str | None,
+    provider_replay: ProviderReplayState | None = None,
 ) -> Message:
+    native_content = _native_assistant_content(
+        provider_replay, response_text="", tool_calls=[],
+    )
     content: list[Any] = []
-    if thinking_signature:
+    if native_content is not None:
+        content = native_content
+    elif thinking_signature:
         content.append(
             ContentBlockThinking(
                 thinking=reasoning_content,
@@ -2026,6 +1704,7 @@ def _build_reasoning_prefill_message(
         role="assistant",
         content=content,
         reasoning_content=reasoning_content,
+        provider_replay=provider_replay,
     )
 
 
@@ -2065,11 +1744,23 @@ def _append_length_capped_continuation(
     *,
     response_text: str,
     tool_calls: list[ToolCall],
+    reasoning_content: str | None = None,
+    provider_replay: ProviderReplayState | None = None,
 ) -> str:
     visible_text = response_text
     if visible_text:
+        native_content = _native_assistant_content(
+            provider_replay, response_text=visible_text, tool_calls=[],
+        )
         turn_messages.append(
-            Message(role="assistant", content=[ContentBlockText(text=visible_text)])
+            Message(
+                role="assistant",
+                content=(
+                    native_content if native_content is not None
+                    else [ContentBlockText(text=visible_text)]
+                ),
+                reasoning_content=reasoning_content, provider_replay=provider_replay,
+            )
         )
     turn_messages.append(Message(role="user", content=_PROVIDER_OUTPUT_CONTINUE_PROMPT))
     return visible_text
@@ -2084,8 +1775,191 @@ class _ProviderAttemptKind(StrEnum):
     LENGTH_CAPPED = "length_capped"
 
 
-class _IterationStreamTimeoutError(TimeoutError):
-    """Raised when provider streaming exceeds the active Agent iteration budget."""
+_PROVIDER_REASONING_PULSE_INTERVAL_SECONDS = 5.0
+_MAX_PROVIDER_RETRY_WAIT_SECONDS = 900.0
+
+_ProviderActivityPhase = Literal[
+    "requesting",
+    "reasoning",
+    "retry_wait",
+    "retrying",
+    "fallback",
+]
+_ProviderActivityReason = Literal[
+    "initial",
+    "rate_limited",
+    "provider_overloaded",
+    "transport_transient",
+    "reasoning_only",
+    "empty_response",
+    "stream_incomplete",
+    "invalid_response",
+    "context_overflow",
+    "unknown",
+]
+
+_PROVIDER_ACTIVITY_PHASES: dict[str, _ProviderActivityPhase] = {
+    "requesting": "requesting",
+    "reasoning": "reasoning",
+    "retry_wait": "retry_wait",
+    "retrying": "retrying",
+    "fallback": "fallback",
+}
+_PROVIDER_ACTIVITY_REASONS: dict[str, _ProviderActivityReason] = {
+    "initial": "initial",
+    "rate_limited": "rate_limited",
+    "provider_overloaded": "provider_overloaded",
+    "transport_transient": "transport_transient",
+    "reasoning_only": "reasoning_only",
+    "empty_response": "empty_response",
+    "stream_incomplete": "stream_incomplete",
+    "invalid_response": "invalid_response",
+    "context_overflow": "context_overflow",
+    "unknown": "unknown",
+}
+
+
+def _normalize_provider_activity_phase(value: object) -> _ProviderActivityPhase:
+    if not isinstance(value, str):
+        return "requesting"
+    return _PROVIDER_ACTIVITY_PHASES.get(value, "requesting")
+
+
+def _normalize_provider_activity_reason(value: object) -> _ProviderActivityReason:
+    if not isinstance(value, str):
+        return "unknown"
+    return _PROVIDER_ACTIVITY_REASONS.get(value, "unknown")
+
+
+def _provider_activity_reason_for_failure(
+    kind: ProviderFailureKind,
+) -> _ProviderActivityReason:
+    if kind is ProviderFailureKind.RATE_LIMITED:
+        return "rate_limited"
+    if kind is ProviderFailureKind.PROVIDER_OVERLOADED:
+        return "provider_overloaded"
+    if kind is ProviderFailureKind.TRANSPORT_TRANSIENT:
+        return "transport_transient"
+    if kind is ProviderFailureKind.EMPTY_RESPONSE:
+        return "empty_response"
+    if kind is ProviderFailureKind.CONTEXT_OVERFLOW:
+        return "context_overflow"
+    if kind is ProviderFailureKind.MALFORMED_RESPONSE:
+        return "invalid_response"
+    return "unknown"
+
+
+def _safe_provider_terminal_message(
+    kind: ProviderFailureKind,
+    raw_code: str | None = None,
+) -> str:
+    """Return an actionable terminal message without upstream error prose."""
+
+    stable_code = safe_provider_failure_code(raw_code, kind.value)
+    if stable_code == "incomplete_tool_stream":
+        return "Provider stream ended with an incomplete tool call"
+    if stable_code == "provider_protocol_error":
+        return "The model provider returned an invalid tool stream."
+
+    messages = {
+        ProviderFailureKind.RATE_LIMITED: (
+            "The model provider is rate-limiting requests. Try again later."
+        ),
+        ProviderFailureKind.PROVIDER_OVERLOADED: (
+            "The model provider is temporarily overloaded. Try again later."
+        ),
+        ProviderFailureKind.AUTH_INVALID: (
+            "The model provider rejected the configured credentials."
+        ),
+        ProviderFailureKind.CONTEXT_OVERFLOW: (
+            "The request exceeds the model provider's context window."
+        ),
+        ProviderFailureKind.UNSUPPORTED_FEATURE: (
+            "The model provider does not support this request."
+        ),
+        ProviderFailureKind.INSUFFICIENT_CREDITS: (
+            "The model provider account has insufficient credits."
+        ),
+        ProviderFailureKind.MODEL_NOT_FOUND: (
+            "The configured model is unavailable from the provider."
+        ),
+        ProviderFailureKind.TRANSPORT_TRANSIENT: (
+            "The connection to the model provider was interrupted. Try again."
+        ),
+        ProviderFailureKind.POLICY_REFUSAL: (
+            "The model provider refused this request under its policy."
+        ),
+        ProviderFailureKind.EMPTY_RESPONSE: ("The model provider returned an empty response."),
+        ProviderFailureKind.MALFORMED_RESPONSE: (
+            "The model provider returned an invalid response."
+        ),
+        ProviderFailureKind.BAD_REQUEST: "The model provider rejected the request.",
+    }
+    return messages.get(kind, "The model provider request failed.")
+
+
+def _provider_activity_reason_for_attempt(
+    kind: _ProviderAttemptKind,
+) -> _ProviderActivityReason:
+    if kind is _ProviderAttemptKind.REASONING_ONLY:
+        return "reasoning_only"
+    if kind is _ProviderAttemptKind.STREAM_INCOMPLETE:
+        return "stream_incomplete"
+    if kind is _ProviderAttemptKind.MALFORMED_EMPTY:
+        return "invalid_response"
+    return "unknown"
+
+
+def _provider_retry_delay_seconds(
+    *,
+    local_delay_s: float,
+    provider_retry_after_s: float | None,
+) -> float | None:
+    """Resolve a policy-safe wait, or ``None`` when the hint is too long.
+
+    A provider hint over the 15-minute automatic wait ceiling must not be
+    clamped and retried early.  The caller may select a fallback; otherwise it
+    surfaces a retryable terminal outcome.
+    """
+
+    local = max(0.0, float(local_delay_s))
+    hint = 0.0
+    if provider_retry_after_s is not None:
+        try:
+            parsed_hint = float(provider_retry_after_s)
+        except (TypeError, ValueError):
+            parsed_hint = 0.0
+        if parsed_hint == math.inf:
+            return None
+        if math.isfinite(parsed_hint) and parsed_hint > 0:
+            hint = parsed_hint
+    if hint > _MAX_PROVIDER_RETRY_WAIT_SECONDS:
+        return None
+    return min(max(local, hint), _MAX_PROVIDER_RETRY_WAIT_SECONDS)
+
+
+class _RaisedProviderBoundaryError(RuntimeError):
+    """Content-free marker for an exception raised by provider call/iteration."""
+
+    def __init__(self, *, timeout: bool, connection_failed: bool = False) -> None:
+        super().__init__("provider boundary failed")
+        self.timeout = timeout
+        self.connection_failed = connection_failed
+
+
+_STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
+
+
+def _provider_stream_deadline_timeout(
+    *,
+    timeout_seconds: float,
+    deadline_at_monotonic: float,
+) -> TimeoutError:
+    """Tag a plain TimeoutError with the deadline enforced by the stream wrapper."""
+
+    error = TimeoutError(f"Agent total timeout after {timeout_seconds}s")
+    setattr(error, _STREAM_DEADLINE_ATTRIBUTE, deadline_at_monotonic)
+    return error
 
 
 def _is_large_context_invalid_response(
@@ -2216,9 +2090,7 @@ class _MessageCountRequestView:
         materialized = self.materialize(canonical_before)
         if removed_count > len(materialized):
             raise ValueError("canonical cleanup exceeds the request view")
-        rebased_messages = (
-            materialized[:-removed_count] if removed_count else materialized
-        )
+        rebased_messages = materialized[:-removed_count] if removed_count else materialized
         return _MessageCountRequestView(
             messages=rebased_messages,
             canonical_tail_start=len(canonical_after),
@@ -2289,65 +2161,157 @@ def _classify_provider_attempt(
     )
 
 
-def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
-    return ChatConfig(
-        max_tokens=chat_cfg.max_tokens,
-        temperature=chat_cfg.temperature,
-        top_p=chat_cfg.top_p,
-        system=chat_cfg.system,
-        thinking=False,
-        thinking_budget_tokens=0,
-        thinking_budget_explicit=False,
-        timeout=chat_cfg.timeout,
-        stop_sequences=chat_cfg.stop_sequences,
-        cache_breakpoints=chat_cfg.cache_breakpoints,
-        cache_mode=chat_cfg.cache_mode,
-        output_json_schema=chat_cfg.output_json_schema,
-        output_json_schema_strict=chat_cfg.output_json_schema_strict,
-        model_capabilities=chat_cfg.model_capabilities,
-        thinking_level=None,
-        provider_request_max_chars=chat_cfg.provider_request_max_chars,
-        tool_choice=chat_cfg.tool_choice,
-    )
-
-
 def _strip_historical_image_blocks(
     messages: list[Message],
     *,
     preserve_images: bool = False,
 ) -> list[Message]:
-    """Remove image payload blocks from history before provider calls.
+    """Project history according to the configured image retention policy.
 
-    Current-turn uploads are passed through ``extra_messages`` and are not part
-    of the history list sanitized here. This prevents a later text follow-up
-    from replaying stale image input to a text-only route.
+    Current-turn uploads arrive through ``extra_messages``. Model capability
+    is checked separately on each physical request, including tool-loaded images.
     """
     if preserve_images:
+        # Keep the historical object graph intact for a vision-capable route.
+        # The outbound projection below still deep-copies it before a physical
+        # provider call, so callers cannot mutate the canonical transcript.
         return messages
 
-    sanitized: list[Message] = []
-    for msg in messages:
-        content = msg.content
-        if not isinstance(content, list):
-            sanitized.append(msg)
+    # Historical images are not silently deleted.  Project them into a
+    # truthful marker, recursively (including images nested in tool results),
+    # while keeping the original transcript available for a later vision turn.
+    return project_messages(
+        messages,
+        mode=ImageProjectionMode.MARKER,
+        marker_state=ImageMarkerState.NOT_REREAD,
+    ).messages
+
+
+def _trusted_meta_replay_seed_outputs(
+    *,
+    plan: Any,
+    persisted_steps: Any,
+    failed_step_id: str,
+    replay_failover_aliases: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return only complete outputs that are safe to reuse in a live replay.
+
+    Persistence is deliberately fail-open during a live run, so a historical
+    row can be absent or incomplete even when the in-memory step progressed.
+    Replay must make the opposite choice: ambiguous evidence is not a cache
+    hit and the scheduler reruns that step.
+
+    Failover rows need paired handling.  The primary row records only a
+    ``substitute_step_id``; the actual output lives on the successful
+    substitute row.  Reuse that output under both ids so dependencies on the
+    primary alias and dependencies on the explicit substitute remain
+    satisfied.  If either side of the pair cannot be proven, seed neither.
+    """
+
+    plan_steps = tuple(getattr(plan, "steps", ()) or ())
+    plan_steps_by_id = {
+        step_id: step
+        for step in plan_steps
+        if isinstance((step_id := getattr(step, "id", None)), str) and step_id
+    }
+    substitute_owner_by_id = {
+        substitute_id: step.id
+        for step in plan_steps
+        if isinstance((substitute_id := getattr(step, "on_failure", None)), str)
+        and substitute_id
+        and isinstance(getattr(step, "id", None), str)
+    }
+
+    try:
+        persisted = tuple(persisted_steps or ())
+    except TypeError:
+        persisted = ()
+
+    records_by_id: dict[str, Any] = {}
+    duplicate_ids: set[str] = set()
+    for record in persisted:
+        step_id = getattr(record, "step_id", None)
+        if not isinstance(step_id, str) or step_id not in plan_steps_by_id:
             continue
-
-        kept: list[Any] = []
-        omitted: list[str] = []
-        for block in content:
-            if isinstance(block, ContentBlockImage):
-                media_type = block.media_type or "image"
-                omitted.append(f"[historical image omitted: {media_type}]")
-                continue
-            kept.append(block)
-
-        if not omitted:
-            sanitized.append(msg)
+        if step_id in records_by_id:
+            duplicate_ids.add(step_id)
             continue
+        records_by_id[step_id] = record
+    for step_id in duplicate_ids:
+        records_by_id.pop(step_id, None)
 
-        kept.extend(ContentBlockText(text=marker) for marker in omitted)
-        sanitized.append(Message(role=msg.role, content=kept))
-    return sanitized
+    def complete_ok_output(record: Any) -> str | None:
+        if record is None or getattr(record, "status", None) != "ok":
+            return None
+        truncated_fields = getattr(record, "truncated_fields", None)
+        if not isinstance(truncated_fields, (tuple, list, set, frozenset)):
+            return None
+        if not all(isinstance(field, str) for field in truncated_fields):
+            return None
+        if "output_text" in truncated_fields:
+            return None
+        output_text = getattr(record, "output_text", None)
+        return output_text if isinstance(output_text, str) else None
+
+    seeds: dict[str, str] = {}
+    trusted_pair_ids: set[str] = set()
+
+    # Validate each primary/fallback pair from the immutable plan rather than
+    # accepting an arbitrary pointer from a persistence row.
+    for primary in plan_steps:
+        primary_id = getattr(primary, "id", None)
+        substitute_id = getattr(primary, "on_failure", None)
+        if not isinstance(primary_id, str) or not isinstance(substitute_id, str):
+            continue
+        if not primary_id or not substitute_id:
+            continue
+        if failed_step_id == substitute_id:
+            # "Retry failed step" for a failed fallback must retry that
+            # fallback, not rerun its primary. This is critical when the
+            # primary is a non-idempotent paid submit whose response was lost.
+            primary_record = records_by_id.get(primary_id)
+            if (
+                primary_record is not None
+                and getattr(primary_record, "status", None) == "substituted"
+                and getattr(primary_record, "substitute_step_id", None) == substitute_id
+            ):
+                # The placeholder is scheduler-internal; the forced fallback
+                # overwrites the alias before any dependency on the pair can
+                # complete.
+                seeds[primary_id] = ""
+                trusted_pair_ids.add(primary_id)
+                if replay_failover_aliases is not None:
+                    replay_failover_aliases[substitute_id] = primary_id
+            continue
+        if failed_step_id == primary_id:
+            continue
+        primary_record = records_by_id.get(primary_id)
+        if (
+            primary_record is None
+            or getattr(primary_record, "status", None) != "substituted"
+            or getattr(primary_record, "substitute_step_id", None) != substitute_id
+        ):
+            continue
+        output_text = complete_ok_output(records_by_id.get(substitute_id))
+        if output_text is None:
+            continue
+        seeds[primary_id] = output_text
+        seeds[substitute_id] = output_text
+        trusted_pair_ids.update((primary_id, substitute_id))
+
+    for step_id in plan_steps_by_id:
+        if step_id == failed_step_id or step_id in trusted_pair_ids:
+            continue
+        # A substitute-only row is meaningful only together with its primary
+        # failover record.  Seeding it alone can leak stale output into a run
+        # where the primary is about to execute again.
+        if step_id in substitute_owner_by_id:
+            continue
+        output_text = complete_ok_output(records_by_id.get(step_id))
+        if output_text is not None:
+            seeds[step_id] = output_text
+
+    return seeds
 
 
 @dataclass
@@ -2366,6 +2330,18 @@ class _StreamAccumulator:
     synthetic_from_text: bool = False
     json_buf: list[str] = field(default_factory=list)
     json_chars: int = 0
+
+
+@dataclass(slots=True)
+class _ToolReliabilityState:
+    """Ephemeral correlation state; only its closed facts leave the Agent."""
+
+    category: ToolCategory
+    attempt_count: int = 0
+    active_duration_ms: int = 0
+    active_started_at: float | None = None
+    terminal: tuple[ToolOutcome, ToolErrorCode | None] | None = None
+    emitted: bool = False
 
 
 class Agent:
@@ -2387,25 +2363,37 @@ class Agent:
         session_key: str | None = None,
         turn_call_logger: TurnCallLogger | None = None,
         memory_sync_manager: Any | None = None,
-        session_flush_service: Any | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_context: ToolContext | None = None,
         failure_injector: FailureInjector | None = None,
         usage_event_sink: UsageEventSink | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        execution_context: TurnExecutionContext | None = None,
     ) -> None:
         self.provider = provider
         self.config = config or AgentConfig()
+        configure_retry_policy = getattr(provider, "configure_retry_policy", None)
+        if callable(configure_retry_policy):
+            configure_retry_policy(FallbackPolicy(
+                max_retries=self.config.max_provider_retries,
+                base_backoff_ms=self.config.retry_base_backoff_ms,
+                max_backoff_ms=self.config.retry_max_backoff_ms,
+            ))
         self.tool_definitions = tool_definitions or []
         self._tool_definition_by_name = {tool.name: tool for tool in self.tool_definitions}
         self._raw_tool_handler = tool_handler
+        self._provider_call_tool_result_retrieval_available: bool | None = None
         self.tool_handler = tool_handler
         self.subagent_manager = subagent_manager or SubagentManager()
         self._usage_tracker = usage_tracker
         self._session_key = session_key
         self._turn_call_logger = turn_call_logger
         self._tool_registry: ToolRegistry | None = tool_registry
+        # Some handlers retain the ingress context even when budget setup
+        # replaces our copy. Bind turn-local image authority on both objects.
+        self._ingress_tool_context = tool_context
+        self._image_analysis_provider_wrapper: Callable[[Any], Any] | None = None
         if (
             tool_context is not None
             and self.config.runtime_events_path
@@ -2415,32 +2403,35 @@ class Agent:
             # before Agent construction. Preserve object identity so tool
             # internals that read current_tool_context can emit events.
             tool_context.on_runtime_event = self._record_tool_context_runtime_event
-        if tool_context is not None and self.config.tool_result_store_dir:
-            tool_context = replace(
-                tool_context,
-                tool_result_store_dir=self.config.tool_result_store_dir,
-                tool_result_store_session_id=(
+        if tool_context is not None:
+            # Dispatch handlers can retain the ingress object. Share output
+            # storage limits before any later request-local context copies.
+            tool_context.tool_result_store_max_bytes = self.config.tool_result_store_max_bytes
+            tool_context.tool_result_store_disk_budget_bytes = (
+                self.config.tool_result_store_disk_budget_bytes
+            )
+            tool_context.tool_result_store_retention_seconds = (
+                self.config.tool_result_store_retention_seconds
+            )
+            if self.config.tool_result_store_dir:
+                tool_context.tool_result_store_dir = self.config.tool_result_store_dir
+                tool_context.tool_result_store_session_id = (
                     self.config.tool_result_store_session_id
                     or tool_context.tool_result_store_session_id
                     or tool_context.artifact_session_id
                     or self._session_key
-                ),
-            )
-        if tool_context is not None and (
-            tool_context.source_diff_preservation_mode
-            != self.config.source_diff_preservation_mode
-            or tool_context.source_diff_candidate_mode
-            != self.config.source_diff_candidate_mode
-        ):
-            tool_context = replace(
-                tool_context,
-                source_diff_preservation_mode=self.config.source_diff_preservation_mode,
-                source_diff_candidate_mode=self.config.source_diff_candidate_mode,
-            )
+                )
         if tool_context is not None:
             tool_context = self._apply_configured_tool_result_budget(tool_context)
+            tool_context.tool_result_retrieval_available = bool(
+                tool_context.tool_result_store_dir and self._tool_result_recovery_available()
+            )
             tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
+        self._current_request_execution: dict[str, str] = {}
+        for context in (self._ingress_tool_context, self._tool_context):
+            if context is not None:
+                context.execution_status_snapshot = self._execution_status_snapshot
         # Test-only offline failure seam. ``None`` on every production path,
         # so the provider chat call below stays byte-identical to before when
         # it is unset; a test passes an explicit FailureInjector to script the
@@ -2453,73 +2444,272 @@ class Agent:
         self._usage_event_sink = usage_event_sink
         self._usage_execution_context = usage_execution_context
         self._provider_request_correlation = provider_request_correlation
+        self._execution_context = execution_context
+        self._tool_reliability_sink: ToolReliabilitySink | None = None
+        self._tool_reliability_states: dict[str, _ToolReliabilityState] = {}
+        # Populated only by a successful real provider stream.  TurnRunner
+        # publishes it after durable finalization, so failed/cancelled turns
+        # can never arm a gateway keepalive probe.
+        self._prompt_cache_keepalive_candidate: PromptCacheKeepaliveCandidate | None = None
+        self._prompt_cache_keepalive_capture_enabled = False
         if self.tool_handler is not None and self._tool_context is not None:
             self.tool_handler = self._bind_tool_handler_context(
                 self.tool_handler,
                 self._tool_context,
             )
         self._meta_run_writer = (self.config.metadata or {}).get("meta_run_writer")
+        # The runtime injects this narrow callback into metadata so nested
+        # MetaSkill agents inherit the same growth sink without carrying the
+        # sink object or any user content through persistence.
+        self._metaskill_usage_recorder = (self.config.metadata or {}).get(
+            "metaskill_usage_recorder"
+        )
         self._pending_warnings: list[WarningEvent] = []
-        (
-            self._turn_objective_reminder_enabled,
-            self._turn_objective_reminder_max_chars,
-        ) = _resolve_turn_objective_reminder()
 
         self._state: AgentState = AgentState.IDLE
         self._history: list[Message] = []
+        self._active_replay_view: Callable[[], tuple[list[Message], int]] | None = None
+        self._request_image_context: list[Message] = []
         self._context: ContextAssembly | None = None
         # Typed dependency surface. Either constructor injection or legacy
         # attribute assignment from the runtime is accepted; both reach the same
         # internal slot.
         self._memory_sync_manager: Any | None = memory_sync_manager
 
-        # Memory flush state (sub-agent based, re-entrant per compaction cycle)
-        self._flush_done_this_cycle: bool = False
-        self._active_flush_task: asyncio.Task | None = None
-        self._flush_wait_timed_out_task: asyncio.Task | None = None
-        self._flush_backoff_until: float = 0.0
-        self._flush_backoff_seconds: float = 0.0
-        self._session_flush_service = session_flush_service
         self._last_compaction_refusal_reason: str | None = None
-        self._tool_failure_loop_counts: dict[tuple[str, str], int] = {}
-        self._identical_request_last_sha: str | None = None
-        self._identical_request_streak: int = 0
+        self._compaction_failed_this_turn = False
+        self._pending_durable_compaction_event: CompactionEvent | None = None
+        self._compaction_request_context: CompactionRequestContext | None = None
+        # Stable session/base consumer identity. Turn routing and ensemble
+        # wrapping may replace ``self.provider`` with a narrower physical leg,
+        # but that one-call choice must never redefine the window that owns
+        # durable history.
+        self._durable_consumer_provider: Any = self.provider
+        self._durable_consumer_model_id = self.config.model_id
+        self._durable_consumer_window_tokens = self.config.context_window_tokens
+        self._durable_consumer_window_known = self.config.context_window_known
+        self._durable_consumer_max_output_tokens = self.config.max_tokens
+        self._durable_consumer_model_capabilities = self.config.model_capabilities
+        self._durable_consumer_provider_request_max_chars = (
+            self.config.provider_request_proof_max_chars
+        )
+        # Frozen before durable admission and consumed by the ensuing turn.
+        # Compaction can take long enough to cross a minute boundary; reusing
+        # the same runtime message keeps the admitted and sent envelopes equal.
+        self._preflight_runtime_context_message: Message | None = None
         self._provider_tool_result_overrides: dict[str, ContentBlockToolResult] = {}
         self._provider_tool_result_frozen_overrides: dict[str, ContentBlockToolResult] = {}
         self._provider_tool_result_frozen_full_ids: set[str] = set()
-        self._provider_history_dedup_survivor_ids: set[str] = set()
-        self._projected_diagnostic_evidence: dict[str, dict[str, Any]] = {}
-        self._focused_retrieved_tool_result_handles: set[str] = set()
         self._tool_result_snapshot_cache: dict[
             tuple[str, str, str, str, str, str], ToolResultRecord
         ] = {}
-        self._patch_evidence_ledger: PatchEvidenceLedger | None = None
-        if self.config.patch_evidence_ledger_path:
-            self._patch_evidence_ledger = PatchEvidenceLedger(
-                path=self.config.patch_evidence_ledger_path,
-                workspace_dir=self.config.workspace_dir,
-                session_key=session_key,
-                agent_id=getattr(tool_context, "agent_id", None) if tool_context else None,
+        self._runtime_git_state = GitRunState.OK
+        self._runtime_git_skip_states_recorded: set[GitRunState] = set()
+
+    def tool_presentation_payload(self, tool_name: str) -> dict[str, Any]:
+        """Resolve public display metadata from the active tool surface."""
+
+        from opensquilla.tools.presentation import resolve_tool_presentation
+        from opensquilla.tools.types import ToolSpec
+
+        registered = self._tool_registry.get(tool_name) if self._tool_registry else None
+        if registered is not None:
+            spec = registered.spec
+        else:
+            definition = self._tool_definition_by_name.get(tool_name)
+            spec = ToolSpec(
+                name=tool_name,
+                description=(definition.description if definition else ""),
+                parameters=(
+                    dict(definition.input_schema.properties)
+                    if definition is not None
+                    else {}
+                ),
             )
+        return resolve_tool_presentation(spec).to_payload()
+
+    def set_tool_reliability_sink(self, sink: ToolReliabilitySink | None) -> None:
+        """Install the optional synchronous, content-free result observer."""
+
+        self._tool_reliability_sink = sink
+
+    def settle_pending_tool_reliability_on_stream_close(self) -> None:
+        """Cancel admitted calls when an owning public stream closes early."""
+
+        self._flush_pending_tool_reliability(
+            terminal=(ToolOutcome.CANCEL, ToolErrorCode.CANCELLED),
+        )
+
+    def _begin_tool_reliability_attempt(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> float | None:
+        if self._tool_reliability_sink is None:
+            return None
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None:
+            state = _ToolReliabilityState(category=tool_category_for_name(tool_name))
+            self._tool_reliability_states[tool_use_id] = state
+        if state.emitted or state.active_started_at is not None:
+            return None
+        state.attempt_count += 1
+        state.active_started_at = time.monotonic()
+        return state.active_started_at
+
+    def _admit_tool_reliability_call(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> None:
+        """Register a logical call once it enters the dispatch scheduler."""
+
+        if self._tool_reliability_sink is None:
+            return
+        self._tool_reliability_states.setdefault(
+            tool_use_id,
+            _ToolReliabilityState(category=tool_category_for_name(tool_name)),
+        )
+
+    def _end_tool_reliability_attempt(
+        self,
+        *,
+        tool_use_id: str,
+        started_at: float | None,
+    ) -> None:
+        if started_at is None:
+            return
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None or state.emitted:
+            return
+        if state.active_started_at is not None:
+            state.active_duration_ms += max(
+                0,
+                int((time.monotonic() - state.active_started_at) * 1000),
+            )
+            state.active_started_at = None
+
+    def _set_tool_reliability_terminal(
+        self,
+        *,
+        tool_use_id: str,
+        outcome: ToolOutcome,
+        error_code: ToolErrorCode,
+    ) -> None:
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is not None and not state.emitted:
+            state.attempt_count = max(1, state.attempt_count)
+            state.terminal = (outcome, error_code)
+
+    def _settle_tool_reliability(
+        self,
+        *,
+        tool_use_id: str,
+        result: ToolResult,
+    ) -> None:
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None or state.emitted:
+            return
+        state.attempt_count = max(1, state.attempt_count)
+        self._end_tool_reliability_attempt(
+            tool_use_id=tool_use_id,
+            started_at=state.active_started_at,
+        )
+        terminal = state.terminal
+        if terminal is None:
+            terminal = classify_tool_result(
+                status=(
+                    result.execution_status.get("status")
+                    if result.execution_status is not None
+                    else None
+                ),
+                reason=(
+                    result.execution_status.get("reason")
+                    if result.execution_status is not None
+                    else None
+                ),
+                is_error=result.is_error,
+            )
+        self._publish_tool_reliability(state, terminal=terminal)
+
+    def _flush_pending_tool_reliability(
+        self,
+        *,
+        terminal: tuple[ToolOutcome, ToolErrorCode],
+    ) -> None:
+        for state in tuple(self._tool_reliability_states.values()):
+            if state.emitted:
+                continue
+            state.attempt_count = max(1, state.attempt_count)
+            if state.active_started_at is not None:
+                state.active_duration_ms += max(
+                    0,
+                    int((time.monotonic() - state.active_started_at) * 1000),
+                )
+                state.active_started_at = None
+            self._publish_tool_reliability(
+                state,
+                terminal=state.terminal or terminal,
+            )
+        self._tool_reliability_states.clear()
+
+    def _publish_tool_reliability(
+        self,
+        state: _ToolReliabilityState,
+        *,
+        terminal: tuple[ToolOutcome, ToolErrorCode | None],
+    ) -> None:
+        if state.emitted:
+            return
+        state.emitted = True
+        facts = ToolCallReliabilityFacts(
+            tool_category=state.category,
+            outcome=terminal[0],
+            error_code=terminal[1],
+            duration_ms=state.active_duration_ms,
+            retry_count=max(0, state.attempt_count - 1),
+        )
+        sink = self._tool_reliability_sink
+        if sink is None:
+            return
+        try:
+            sink_result = sink(facts)
+            if inspect.isawaitable(sink_result):
+                close = getattr(sink_result, "close", None)
+                if callable(close):
+                    close()
+                logger.warning("agent.tool_reliability_sink_must_be_synchronous")
+        except BaseException as exc:  # observer must never change tool behavior
+            logger.warning(
+                "agent.tool_reliability_sink_failed",
+                error_type=type(exc).__name__,
+            )
+
+    def _context_capacity_details(self) -> dict[str, Any] | None:
+        from opensquilla.provider.model_catalog import (
+            resolve_effective_context_window,
+            shared_catalog,
+        )
+
+        provider = str(self.config.provider_id or "").strip()
+        model = str(self.config.model_id or "").strip()
+        if not provider or not model:
+            return None
+        window, source = resolve_effective_context_window(
+            shared_catalog(), model, provider,
+            self.config.context_window_tokens_global_override,
+        )
+        # Only attach a model setting when its resolved window is the actual
+        # window that rejected this request. A wrapper's different physical
+        # member must not be misidentified as the outer model.
+        if window != self.config.context_window_tokens:
+            return None
+        return {"provider": provider, "model": model, "contextWindow": window, "source": source}
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
-        if reason == "memory_flush_timeout_before_compaction":
-            return ErrorEvent(
-                message=(
-                    "Context compaction could not run because the pre-compaction "
-                    "memory flush timed out."
-                ),
-                code="compaction_refused_flush_timeout",
-            )
-        if reason == "memory_flush_degraded_before_compaction":
-            return ErrorEvent(
-                message=(
-                    "Context compaction could not run because the pre-compaction "
-                    "memory flush did not produce a verified summary."
-                ),
-                code="compaction_refused_memory_flush",
-            )
         if reason == "empty_summary_rejected":
             return ErrorEvent(
                 message="Context compaction produced no replacement summary.",
@@ -2535,29 +2725,96 @@ class Agent:
                 message="Context compaction did not reduce the provider request.",
                 code="compaction_not_smaller",
             )
-        if reason == "provider_recent_tail_too_large":
+        if reason in CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES:
+            return ErrorEvent(
+                message=CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES[reason],
+                code="provider_request_too_large",
+                model_capacity=self._context_capacity_details(),
+            )
+        if reason in {
+            "provider_native_overflow_after_admission",
+            "provider_recent_tail_too_large",
+        }:
             return ErrorEvent(
                 message=(
-                    "The request is too large for the provider context window after "
-                    "automatic context compaction and payload reduction. OpenSquilla "
-                    "preserved the recoverable state; retry with a narrower request "
-                    "or a larger-context model."
+                    "The final provider request is too large after safe request-only "
+                    "reduction. Durable session history was not changed; retry with "
+                    "a narrower current request or a larger-context model."
                 ),
                 code="provider_request_too_large",
+                model_capacity=self._context_capacity_details(),
             )
         if reason == "provider_request_budget_exhausted":
             return ErrorEvent(
                 message=(
-                    "The request is too large for the provider context window after "
-                    "automatic context compaction and payload reduction. OpenSquilla "
-                    "preserved the recoverable state; retry with a narrower request "
-                    "or a larger-context model."
+                    "The final provider request exceeds its request budget. Durable "
+                    "session history was not changed; narrow the current input or "
+                    "tools, or choose a larger-context model."
                 ),
                 code="provider_request_too_large",
+                model_capacity=self._context_capacity_details(),
             )
         return ErrorEvent(
             message="Context overflow persists after compaction",
             code="compaction_exhausted",
+        )
+
+    def _terminalize_pending_durable_compaction(
+        self,
+        *,
+        status: Literal["cancelled", "failed", "stale", "timed_out"],
+        reason: str,
+    ) -> None:
+        """Close a generated-but-uninstalled inline compaction candidate."""
+
+        event = self._pending_durable_compaction_event
+        if event is None:
+            return
+        self._pending_durable_compaction_event = None
+        if not self._session_key:
+            return
+        compaction_id = event.compaction_id or new_compaction_id()
+        notify_compaction(
+            self._session_key,
+            source="automatic",
+            phase="agent_inline_overflow",
+            status=status,
+            reason=reason,
+            removed_count=event.removed_count,
+            kept_count=event.kept_count,
+            **compaction_effect_payload(status=status, reason=reason),
+            **compaction_lifecycle_payload(
+                compaction_id,
+                COMPACTION_TRIGGERED_EVENT,
+            ),
+        )
+
+    def _stage_pending_durable_compaction(
+        self,
+        outcome: CompactionOutcome,
+    ) -> None:
+        """Track a durable candidate before any fallible request rebuilding.
+
+        Inline compaction emits ``started`` while producing the candidate.
+        Registering it immediately after generation ensures every later exit
+        path can emit a terminal event with the same operation id.
+        """
+
+        if outcome.ephemeral_only:
+            return
+        self._pending_durable_compaction_event = CompactionEvent(
+            compaction_id=outcome.compaction_id,
+            compaction_deadline_at_monotonic=(outcome.compaction_deadline_at_monotonic),
+            compaction_timeout_seconds=outcome.compaction_timeout_seconds,
+            summary=outcome.summary,
+            summary_payload=outcome.summary_payload,
+            summary_format=outcome.summary_format,
+            coverage_status=outcome.coverage_status,
+            missing_obligations=outcome.missing_obligations,
+            critical_carry_forward=outcome.critical_carry_forward,
+            kept_entries=outcome.kept_entries,
+            kept_count=len(outcome.messages),
+            removed_count=outcome.removed_count,
         )
 
     def _record_provider_context_overflow_reason(
@@ -2570,6 +2827,10 @@ class Agent:
         if proof is None:
             self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
             return
+        component_reason = self._request_budget_component_refusal(proof)
+        if component_reason is not None:
+            self._last_compaction_refusal_reason = component_reason
+            return
         if proof.get("recent_tail_too_large") is True:
             self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
             return
@@ -2579,6 +2840,25 @@ class Agent:
         fallback_reason = proof.get("fallback_reason")
         if fallback_reason == "provider_request_budget_exhausted":
             self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+
+    @classmethod
+    def _request_budget_component_refusal(
+        cls, proof: dict[str, Any], *, input_budget_chars: int | None = None,
+    ) -> str | None:
+        char_budgets = [
+            value for value in (
+                cls._positive_int(proof.get("effective_proof_budget")), input_budget_chars,
+            ) if value is not None and value > 0
+        ]
+        if not char_budgets:
+            return None
+        for component, refusal in (
+            ("system_chars", "provider_system_prompt_too_large"),
+            ("tools_chars", "provider_tool_schema_too_large"),
+        ):
+            if (cls._positive_int(proof.get(component)) or 0) > min(char_budgets):
+                return refusal
+        return None
 
     @staticmethod
     def _provider_request_budget_proof(
@@ -2601,9 +2881,7 @@ class Agent:
         return parsed if parsed > 0 else None
 
     def _configured_tool_result_budget_policy(self) -> ToolResultBudgetPolicy | None:
-        single_limit = self._positive_int(
-            getattr(self.config, "tool_result_dispatch_max_chars", 0)
-        )
+        single_limit = self._positive_int(getattr(self.config, "tool_result_dispatch_max_chars", 0))
         turn_limit = self._positive_int(
             getattr(self.config, "tool_result_dispatch_turn_max_chars", 0)
         )
@@ -2636,10 +2914,7 @@ class Agent:
                 self._provider_request_correlation,
             ):
                 active = current_tool_context.get()
-                if (
-                    active is not None
-                    and getattr(active, "on_runtime_event", None) is not None
-                ):
+                if active is not None and getattr(active, "on_runtime_event", None) is not None:
                     return await tool_handler(tc)
                 token = current_tool_context.set(tool_context)
                 try:
@@ -2647,41 +2922,757 @@ class Agent:
                 finally:
                     current_tool_context.reset(token)
 
-        return _handler
-
-    def _provider_budget_compaction_window_tokens(
-        self,
-        provider_error: ProviderErrorEvent,
-    ) -> int | None:
-        proof = self._provider_request_budget_proof(provider_error)
-        if proof is None:
-            return None
-        proof_budget = self._positive_int(
-            proof.get("effective_proof_budget") or proof.get("proof_budget")
+        setattr(
+            _handler,
+            "_opensquilla_available_tools",
+            getattr(tool_handler, "_opensquilla_available_tools", frozenset()),
         )
-        if proof_budget is None:
-            return None
-        estimated_chars = self._positive_int(proof.get("estimated_chars"))
-        estimated_tokens = self._positive_int(proof.get("estimated_tokens"))
-        if estimated_chars and estimated_tokens:
-            window_tokens = int(proof_budget * (estimated_tokens / estimated_chars))
-        else:
-            window_tokens = proof_budget // 4
-        if window_tokens <= 0:
-            return None
-        return min(self.config.context_window_tokens, window_tokens)
-
-    def _provider_budget_estimated_tokens(
-        self,
-        provider_error: ProviderErrorEvent,
-    ) -> int | None:
-        proof = self._provider_request_budget_proof(provider_error)
-        if proof is None:
-            return None
-        return self._positive_int(proof.get("estimated_tokens"))
+        return _handler
 
     def _provider_request_proof_max_chars(self) -> int:
         return self._context_budget_governor().snapshot().provider_request_max_chars
+
+    def bind_durable_consumer(
+        self,
+        *,
+        provider: Any,
+        model_id: str | None,
+        context_window_tokens: int,
+        max_output_tokens: int,
+        context_window_known: bool = True,
+        model_capabilities: ModelCapabilities | None = None,
+        provider_request_proof_max_chars: int = 0,
+    ) -> None:
+        """Freeze the deployment that owns durable session-history pressure."""
+
+        self._durable_consumer_provider = provider
+        self._durable_consumer_model_id = model_id
+        self._durable_consumer_window_known = context_window_known
+        self._durable_consumer_window_tokens = max(
+            1,
+            int(context_window_tokens or 0),
+        )
+        self._durable_consumer_max_output_tokens = max(
+            1,
+            int(max_output_tokens or 0),
+        )
+        self._durable_consumer_model_capabilities = model_capabilities
+        self._durable_consumer_provider_request_max_chars = max(
+            0,
+            int(provider_request_proof_max_chars or 0),
+        )
+
+    def _freeze_preflight_runtime_context_message(self) -> Message:
+        message = self._preflight_runtime_context_message
+        if message is None:
+            message = self._runtime_context_message(self._runtime_context_block())
+            self._preflight_runtime_context_message = message
+        return message
+
+    def _provider_admission_chat_config(
+        self,
+        active_user_message: str,
+        *,
+        context_window_tokens: int,
+        context_window_known: bool | None = None,
+        max_output_tokens: int | None = None,
+        model_capabilities: ModelCapabilities | None = None,
+        provider_request_proof_max_chars: int | None = None,
+    ) -> ChatConfig:
+        """Build the same baseline request config used by the physical turn."""
+
+        resolved_capabilities = (
+            model_capabilities if model_capabilities is not None else self.config.model_capabilities
+        )
+        if resolved_capabilities is not None and not isinstance(
+            resolved_capabilities, ModelCapabilities
+        ):
+            # Catalog extensions and older test doubles may expose a
+            # capability-shaped object rather than the concrete dataclass.
+            # Exact admission must remain compatible without passing an
+            # unvalidated object through the ChatConfig protocol boundary.
+            try:
+                resolved_capabilities = ModelCapabilities(
+                    supports_reasoning=bool(
+                        getattr(resolved_capabilities, "supports_reasoning", False)
+                    ),
+                    # Capability metadata is advisory.  Unknown/unverified
+                    # values must keep the authorized tool surface; only an
+                    # explicit false is a denial.
+                    supports_tools=(
+                        getattr(resolved_capabilities, "supports_tools", None) is not False
+                    ),
+                    supports_streaming=bool(
+                        getattr(resolved_capabilities, "supports_streaming", True)
+                    ),
+                    supports_vision=bool(getattr(resolved_capabilities, "supports_vision", False)),
+                    reasoning_format=str(
+                        getattr(resolved_capabilities, "reasoning_format", "none") or "none"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - admission can omit unknown hints
+                resolved_capabilities = None
+        thinking_enabled, thinking_budget = self.config.resolve_thinking(active_user_message)
+        output_tokens = max(
+            1,
+            int(max_output_tokens or self.config.max_tokens or 1),
+        )
+        explicit_proof_budget = max(
+            0,
+            int(provider_request_proof_max_chars or 0),
+        )
+        if (
+            int(context_window_tokens) == int(self.config.context_window_tokens)
+            and output_tokens == int(self.config.max_tokens)
+            and model_capabilities is None
+            and provider_request_proof_max_chars is None
+        ):
+            proof_budget = self._provider_request_proof_max_chars()
+        else:
+            proof_budget = (
+                ContextBudgetGovernor.from_values(
+                    context_window_tokens=max(1, int(context_window_tokens)),
+                    max_output_tokens=output_tokens,
+                    thinking_budget_tokens=(thinking_budget if thinking_enabled else 0),
+                    context_overflow_threshold=(self.config.context_overflow_threshold),
+                    provider_request_proof_max_chars=explicit_proof_budget,
+                )
+                .snapshot()
+                .provider_request_max_chars
+            )
+        return ChatConfig(
+            execution_identity=self._active_execution_identity(),
+            max_tokens=output_tokens,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            system=self.config.system_prompt or "",
+            thinking=thinking_enabled,
+            thinking_budget_tokens=thinking_budget,
+            thinking_budget_explicit=(
+                self.config.thinking_budget_tokens != _THINKING_BUDGET_DEFAULT
+            ),
+            timeout=self.config.request_timeout,
+            stop_sequences=self.config.stop_sequences,
+            cache_breakpoints=self._cache_breakpoints_without_runtime_context(
+                self.config.cache_breakpoints
+            ),
+            cache_mode=self.config.cache_mode,
+            output_json_schema=self.config.output_json_schema,
+            output_json_schema_strict=self.config.output_json_schema_strict,
+            model_capabilities=(resolved_capabilities),
+            model_vision_support=self.config.model_vision_support,
+            thinking_level=(
+                self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
+            ),
+            provider_request_max_chars=proof_budget,
+            provider_context_window_tokens=(
+                max(0, int(context_window_tokens))
+                if (self.config.context_window_known
+                    if context_window_known is None else context_window_known)
+                else 0
+            ),
+            context_window_tokens_global_override=(
+                self.config.context_window_tokens_global_override
+            ),
+            provider_request_max_chars_explicit_cap=(
+                max(0, int(provider_request_proof_max_chars or 0))
+                if provider_request_proof_max_chars is not None
+                else (
+                    max(0, int(self.config.provider_request_proof_max_chars or 0))
+                    if self.config.provider_request_proof_max_chars_explicit
+                    else 0
+                )
+            ),
+            tool_choice=None,
+            provider_request_correlation=self._provider_request_correlation,
+        )
+
+    def build_compaction_request_context(
+        self, active_user_message: str = ""
+    ) -> CompactionRequestContext:
+        """Freeze current request settings for one compaction operation."""
+        current = self._compaction_request_context
+        if current is not None:
+            chat_config = current.chat_config
+            tools = current.tools
+        else:
+            chat_config = self._provider_admission_chat_config(
+                active_user_message,
+                context_window_tokens=self.config.context_window_tokens,
+                max_output_tokens=self.config.max_tokens,
+            )
+            tools = tuple(self.tool_definitions) or None
+            if getattr(self.config.model_capabilities, "supports_tools", None) is False:
+                tools = None
+        resolve_config = getattr(self.provider, "compaction_chat_config", None)
+        if callable(resolve_config):
+            chat_config = resolve_config(chat_config)
+        if getattr(chat_config.model_capabilities, "supports_tools", None) is False:
+            tools = None
+        return CompactionRequestContext(
+            chat_config=chat_config.model_copy(deep=True),
+            tools=tuple(tool.model_copy(deep=True) for tool in tools) if tools else None,
+        )
+
+    def _project_durable_consumer_final_request(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None,
+        active_config: ChatConfig,
+    ) -> ProviderFinalRequestProjection | None:
+        """Re-prove one live logical request against the stable session consumer."""
+
+        provider = self._durable_consumer_provider
+        if provider is None:
+            return None
+        max_output_tokens = max(
+            1,
+            int(self._durable_consumer_max_output_tokens or 0),
+        )
+        proof_budget = max(
+            0,
+            int(self._durable_consumer_provider_request_max_chars or 0),
+        )
+        if proof_budget <= 0:
+            proof_budget = (
+                ContextBudgetGovernor.from_values(
+                    context_window_tokens=max(
+                        1,
+                        int(self._durable_consumer_window_tokens or 0),
+                    ),
+                    max_output_tokens=max_output_tokens,
+                    thinking_budget_tokens=(
+                        max(
+                            0,
+                            int(active_config.thinking_budget_tokens or 0),
+                        )
+                        if active_config.thinking
+                        else 0
+                    ),
+                    context_overflow_threshold=self.config.context_overflow_threshold,
+                )
+                .snapshot()
+                .provider_request_max_chars
+            )
+        stable_config = active_config.model_copy(
+            update={
+                "max_tokens": max_output_tokens,
+                "model_capabilities": self._durable_consumer_model_capabilities,
+                "provider_request_max_chars": proof_budget,
+                "provider_request_max_chars_explicit_cap": (
+                    self._durable_consumer_provider_request_max_chars
+                ),
+                "provider_context_window_tokens": (
+                    self._durable_consumer_window_tokens
+                    if self._durable_consumer_window_known else 0
+                ),
+            }
+        )
+        return project_provider_final_request(
+            provider,
+            messages,
+            tools,
+            stable_config,
+        )
+
+    def _history_messages_for_compaction_admission(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        active_user_message: str,
+    ) -> list[Message] | None:
+        """Rebuild the candidate's provider-visible durable history."""
+
+        skip_indexes: set[int] = set()
+        if active_user_in_history and entries:
+            if bound_user_message_id:
+                bound_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(entries)
+                        if str(entry.get("message_id") or "") == bound_user_message_id
+                    ),
+                    None,
+                )
+                if bound_index is None:
+                    # A bound active prompt must never be guessed from position.
+                    return None
+                skip_indexes = {
+                    index
+                    for index, entry in enumerate(entries)
+                    if index >= bound_index and str(entry.get("role") or "") == "user"
+                }
+            else:
+                for index in range(len(entries) - 1, -1, -1):
+                    if str(entries[index].get("role") or "") == "user":
+                        skip_indexes.add(index)
+                        break
+
+        history: list[Message] = []
+        for index, entry in enumerate(entries):
+            if index in skip_indexes:
+                continue
+            history.extend(
+                reconstruct_messages_from_entry(
+                    str(entry.get("role") or ""),
+                    entry.get("content") or "",
+                    entry.get("tool_calls"),
+                    entry.get("reasoning_content"),
+                    assistant_replay=entry.get("assistant_replay"),
+                    turn_context=(
+                        entry.get("turn_context")
+                        if isinstance(entry.get("turn_context"), dict)
+                        else None
+                    ),
+                )
+            )
+
+        thinking_enabled, _thinking_budget = self.config.resolve_thinking(active_user_message)
+        preserve_reasoning_content = True
+        history, _sanitize_result = sanitize_session_messages(history)
+        history, _projection_result = project_historical_tool_payloads(
+            history,
+            preserve_reasoning_content=preserve_reasoning_content,
+        )
+        history = repair_tool_pairing(history)
+        history = drop_reasoning(
+            history,
+            preserve_tool_call_reasoning=thinking_enabled,
+            preserve_reasoning_content=preserve_reasoning_content,
+        )
+        history = _strip_historical_image_blocks(
+            history,
+            preserve_images=self.config.preserve_historical_images,
+        )
+        return repair_tool_pairing(limit_turns(history, self.config.max_history_turns))
+
+    def _assemble_compaction_consumer_request(
+        self,
+        *,
+        replay_summary: str,
+        kept_entries: list[dict[str, Any]],
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        runtime_context_message: Message,
+    ) -> list[Message] | None:
+        history = self._history_messages_for_compaction_admission(
+            kept_entries,
+            active_user_in_history=active_user_in_history,
+            bound_user_message_id=bound_user_message_id,
+            active_user_message=active_user_message,
+        )
+        if history is None:
+            return None
+
+        turn_messages = list(history)
+        skills_message = self._skills_context_message()
+        if skills_message is not None:
+            turn_messages.append(skills_message)
+        request_context_insert_index = len(turn_messages)
+        runtime_context_insert_index = len(turn_messages)
+        turn_messages.extend(self._request_image_context)
+        if attachment_messages:
+            turn_messages.extend(attachment_messages)
+        elif active_user_message:
+            turn_messages.append(Message(role="user", content=active_user_message))
+
+        summary_context = (
+            format_compaction_summary_context([replay_summary]) if replay_summary.strip() else None
+        )
+        existing_context: str | None = self.config.request_context_prompt
+        request_context: str | None
+        if summary_context and existing_context and existing_context.strip():
+            request_context = f"{summary_context.strip()}\n\n{existing_context.strip()}"
+        elif summary_context:
+            request_context = summary_context.strip()
+        else:
+            request_context = existing_context
+        request_context_message = self._request_context_message(request_context)
+        return self._provider_request_messages_for_count_projection(
+            turn_messages,
+            request_context_message=request_context_message,
+            request_context_insert_index=request_context_insert_index,
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=runtime_context_insert_index,
+        )
+
+    def _project_compaction_consumer_request(
+        self,
+        *,
+        consumer_provider: Any,
+        replay_summary: str,
+        kept_entries: list[dict[str, Any]],
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        runtime_context_message: Message,
+        context_window_tokens: int,
+        max_output_tokens: int | None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> Any | None:
+        request_messages = self._assemble_compaction_consumer_request(
+            replay_summary=replay_summary,
+            kept_entries=kept_entries,
+            active_user_message=active_user_message,
+            active_user_in_history=active_user_in_history,
+            bound_user_message_id=bound_user_message_id,
+            attachment_messages=attachment_messages,
+            runtime_context_message=runtime_context_message,
+        )
+        if request_messages is None:
+            return None
+        chat_config = self._provider_admission_chat_config(
+            active_user_message,
+            context_window_tokens=context_window_tokens,
+            context_window_known=(
+                self._durable_consumer_window_known
+                if consumer_provider is self._durable_consumer_provider
+                else self.config.context_window_known
+            ),
+            max_output_tokens=max_output_tokens,
+            model_capabilities=consumer_model_capabilities,
+            provider_request_proof_max_chars=(consumer_provider_request_max_chars),
+        )
+        active_user_index = _active_user_message_index_for_request(
+            request_messages,
+            current_user_text=active_user_message,
+        )
+        if active_user_message and active_user_index is None:
+            return None
+        if active_user_index is not None:
+            chat_config = chat_config.model_copy(
+                update={"active_user_message_index": active_user_index}
+            )
+        return project_provider_final_request(
+            consumer_provider,
+            request_messages,
+            self.tool_definitions,
+            chat_config,
+        )
+
+    def build_compaction_consumer_admission(
+        self,
+        *,
+        consumer_provider: Any,
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        context_window_tokens: int,
+        max_output_tokens: int | None = None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> tuple[
+        Callable[[str, list[dict[str, Any]]], bool],
+        str,
+    ]:
+        """Freeze a pure final-envelope gate and its singleflight identity."""
+
+        runtime_context_message = self._freeze_preflight_runtime_context_message()
+        template_summary = "[candidate checkpoint]"
+        template_projection = self._project_compaction_consumer_request(
+            consumer_provider=consumer_provider,
+            replay_summary=template_summary,
+            kept_entries=[],
+            active_user_message=active_user_message,
+            active_user_in_history=False,
+            bound_user_message_id=None,
+            attachment_messages=attachment_messages,
+            runtime_context_message=runtime_context_message,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            consumer_model_id=consumer_model_id,
+            consumer_model_capabilities=consumer_model_capabilities,
+            consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
+        )
+        metadata = provider_metadata(consumer_provider)
+        fingerprint_payload = {
+            "provider": metadata.provider_id or metadata.provider_kind,
+            "model": metadata.model,
+            "consumer_model_id": consumer_model_id or metadata.model,
+            "context_window_tokens": int(context_window_tokens),
+            "max_output_tokens": int(max_output_tokens or self.config.max_tokens or 0),
+            "system_sha256": hashlib.sha256(
+                (self.config.system_prompt or "").encode("utf-8")
+            ).hexdigest(),
+            "tools_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(self.tool_definitions),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "active_user_sha256": hashlib.sha256(active_user_message.encode("utf-8")).hexdigest(),
+            "attachments_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(attachment_messages or []),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "request_context_sha256": hashlib.sha256(
+                (self.config.request_context_prompt or "").encode("utf-8")
+            ).hexdigest(),
+            "runtime_context_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(runtime_context_message),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "template_payload_sha256": (
+                hashlib.sha256(
+                    json.dumps(
+                        template_projection.payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if template_projection is not None
+                else "projection_unavailable"
+            ),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        def _consumer_admission(
+            replay_summary: str,
+            kept_entries: list[dict[str, Any]],
+        ) -> bool:
+            current_template = self._project_compaction_consumer_request(
+                consumer_provider=consumer_provider,
+                replay_summary=template_summary,
+                kept_entries=[],
+                active_user_message=active_user_message,
+                active_user_in_history=False,
+                bound_user_message_id=None,
+                attachment_messages=attachment_messages,
+                runtime_context_message=runtime_context_message,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
+            )
+            current_template_hash = (
+                hashlib.sha256(json.dumps(
+                    current_template.payload, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                if current_template is not None else "projection_unavailable"
+            )
+            if current_template_hash != fingerprint_payload["template_payload_sha256"]:
+                raise ConsumerAdmissionStaleError("compaction consumer request changed")
+            projection = self._project_compaction_consumer_request(
+                consumer_provider=consumer_provider,
+                replay_summary=replay_summary,
+                kept_entries=kept_entries,
+                active_user_message=active_user_message,
+                active_user_in_history=active_user_in_history,
+                bound_user_message_id=bound_user_message_id,
+                attachment_messages=attachment_messages,
+                runtime_context_message=runtime_context_message,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
+            )
+            return bool(projection is not None and projection.fits)
+
+        return _consumer_admission, fingerprint
+
+    def preflight_history_capacity(
+        self,
+        *,
+        active_user_message: str,
+        active_user_in_history: bool,
+        attachments: list[dict[str, Any]] | None = None,
+        attachment_messages: list[Message] | None = None,
+        context_window_tokens: int | None = None,
+        consumer_provider: Any | None = None,
+        consumer_max_output_tokens: int | None = None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> tuple[int, int]:
+        """Return token/character budgets left for checkpoint + raw history.
+
+        This is deliberately conservative. It uses the same proof budget and
+        media-aware serializer as provider adapters, but includes only the
+        fixed/current-turn components that preflight compaction cannot remove.
+        The protected persisted user prompt remains part of the durable
+        candidate and is therefore not double-counted here.
+        """
+
+        effective_window = int(context_window_tokens or self.config.context_window_tokens)
+        exact_provider = consumer_provider if consumer_provider is not None else self.provider
+        if exact_provider is not None and (attachment_messages or not attachments):
+            projection = self._project_compaction_consumer_request(
+                consumer_provider=exact_provider,
+                replay_summary="[candidate checkpoint]",
+                kept_entries=[],
+                active_user_message=active_user_message,
+                active_user_in_history=False,
+                bound_user_message_id=None,
+                attachment_messages=attachment_messages,
+                runtime_context_message=(self._freeze_preflight_runtime_context_message()),
+                context_window_tokens=effective_window,
+                max_output_tokens=consumer_max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
+            )
+            if projection is not None:
+                proof = projection.proof
+                required_budget_fields = {
+                    "effective_proof_token_budget",
+                    "estimated_tokens",
+                    "effective_proof_budget",
+                    "estimated_chars",
+                }
+                if required_budget_fields.issubset(proof):
+                    return (
+                        max(
+                            0,
+                            int(proof["effective_proof_token_budget"] or 0)
+                            - int(proof["estimated_tokens"] or 0),
+                        ),
+                        max(
+                            0,
+                            int(proof["effective_proof_budget"] or 0)
+                            - int(proof["estimated_chars"] or 0),
+                        ),
+                    )
+
+        fixed_messages: list[Message] = []
+        skills_message = self._skills_context_message()
+        if skills_message is not None:
+            fixed_messages.append(skills_message)
+        request_context_message = self._request_context_message(self.config.request_context_prompt)
+        if request_context_message is None:
+            # Durable compaction creates this request-scoped wrapper even when
+            # the turn had no pre-existing request context. Reserve the
+            # message/framing now; the candidate gate counts its summary text.
+            request_context_message = self._request_context_message(
+                "[Compaction summary candidate]"
+            )
+        if request_context_message is not None:
+            fixed_messages.append(request_context_message)
+        fixed_messages.append(self._runtime_context_message(self._runtime_context_block()))
+        if attachment_messages:
+            # AttachmentStage has already produced the exact typed message
+            # that the provider call will consume. It also carries the active
+            # user text, so the plain user message must not be counted again.
+            fixed_messages.extend(attachment_messages)
+        elif active_user_message and not active_user_in_history:
+            fixed_messages.append(Message(role="user", content=active_user_message))
+        fixed_message_payload = self._live_request_jsonable(fixed_messages)
+        if attachments and not attachment_messages:
+            # These are ingress records before AttachmentStage has converted
+            # them to typed provider content blocks. Keep them JSON-shaped so
+            # the proof can conservatively count bytes/media without asking
+            # Message validation to accept a not-yet-canonical protocol.
+            fixed_message_payload.append(
+                {
+                    "role": "user",
+                    "content": self._live_request_jsonable(attachments),
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "model": self.config.model_id or "",
+            "system": self.config.system_prompt or "",
+            "messages": fixed_message_payload,
+            "tools": self._live_request_jsonable(self.tool_definitions),
+            "max_tokens": self.config.max_tokens,
+        }
+        if self.config.output_json_schema is not None:
+            payload["response_format"] = self._live_request_jsonable(self.config.output_json_schema)
+        fallback_config = self._provider_admission_chat_config(
+            active_user_message,
+            context_window_tokens=effective_window,
+            context_window_known=(
+                self._durable_consumer_window_known
+                if exact_provider is self._durable_consumer_provider
+                else self.config.context_window_known
+            ),
+            max_output_tokens=consumer_max_output_tokens,
+            model_capabilities=consumer_model_capabilities,
+            provider_request_proof_max_chars=consumer_provider_request_max_chars,
+        )
+        # Raw ingress attachments cannot enter an exact wire projection yet.
+        # The typed envelope can still reveal the adapter's actual generation
+        # cap, including provider-specific reasoning reserves, without I/O.
+        generation_projection = project_provider_final_request(
+            exact_provider, fixed_messages, self.tool_definitions, fallback_config
+        )
+        payload["max_tokens"] = (
+            projected_generation_budget(generation_projection.payload, fallback_config.max_tokens)
+            if generation_projection is not None
+            else fallback_config.max_tokens + (
+                fallback_config.thinking_budget_tokens if fallback_config.thinking else 0
+            )
+        )
+        try:
+            proof = prove_provider_payload(
+                payload,
+                projection_adapter="preflight_history_capacity",
+                proof_budget=provider_request_character_budget(payload, fallback_config),
+                token_budget=provider_request_token_budget(payload, fallback_config),
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            proof = exc.proof
+        effective_token_budget = max(
+            0,
+            int(proof.get("effective_proof_token_budget", 0) or 0),
+        )
+        fixed_tokens = max(0, int(proof.get("estimated_tokens", 0) or 0))
+        effective_char_budget = max(
+            0,
+            int(proof.get("effective_proof_budget", 0) or 0),
+        )
+        fixed_chars = max(0, int(proof.get("estimated_chars", 0) or 0))
+        return (
+            max(0, effective_token_budget - fixed_tokens),
+            max(0, effective_char_budget - fixed_chars),
+        )
+
+    def preflight_history_capacity_tokens(
+        self,
+        *,
+        active_user_message: str,
+        active_user_in_history: bool,
+        attachments: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
+    ) -> int:
+        """Compatibility projection of the token side of preflight capacity."""
+
+        tokens, _chars = self.preflight_history_capacity(
+            active_user_message=active_user_message,
+            active_user_in_history=active_user_in_history,
+            attachments=attachments,
+            context_window_tokens=context_window_tokens,
+        )
+        return tokens
 
     def _context_budget_governor(self) -> ContextBudgetGovernor:
         return ContextBudgetGovernor.from_config(self.config)
@@ -2712,35 +3703,52 @@ class Agent:
             self._context_budget_class(budget_class)
         )
 
-    def _tool_execution_timeout(self, tool_call: ToolCall) -> float:
-        timeout = float(self.config.tool_timeout)
-        tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
-        if tool_def is None:
-            return timeout
-        static_timeout = getattr(tool_def, "execution_timeout_seconds", None)
-        if static_timeout is not None:
+    def _tool_execution_timeout(self, tool_call: ToolCall) -> float | None:
+        """Resolve the tool's declared execution budget, if any."""
+        budgets: list[float] = []
+
+        def add_budget(value: Any) -> None:
             try:
-                timeout = max(timeout, float(static_timeout))
+                seconds = float(value)
             except (TypeError, ValueError):
-                pass
-        argument_name = getattr(tool_def, "execution_timeout_argument", None)
-        if not argument_name:
-            return timeout
-        raw_value = tool_call.arguments.get(str(argument_name))
-        if raw_value is None:
-            return timeout
-        try:
-            argument_timeout = float(raw_value)
-        except (TypeError, ValueError):
-            return timeout
-        if argument_timeout < 0:
-            return timeout
-        padding = getattr(tool_def, "execution_timeout_padding", 0.0) or 0.0
-        try:
-            timeout = max(timeout, argument_timeout + float(padding))
-        except (TypeError, ValueError):
-            timeout = max(timeout, argument_timeout)
-        return timeout
+                return
+            if math.isfinite(seconds) and seconds > 0:
+                budgets.append(seconds)
+
+        tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
+        if tool_def is not None:
+            add_budget(tool_def.execution_timeout_seconds)
+            argument_name = tool_def.execution_timeout_argument
+            if argument_name:
+                raw = tool_call.arguments.get(argument_name)
+                try:
+                    seconds = float(raw) if raw is not None else -1.0
+                    padding = float(tool_def.execution_timeout_padding or 0)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if math.isfinite(seconds) and seconds >= 0:
+                        add_budget(seconds + max(0.0, padding))
+        return max(budgets) if budgets else None
+
+    def _tool_cancellation_policy(self, tool_call: ToolCall) -> CancellationPolicy:
+        tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
+        policy = getattr(tool_def, "cancellation_policy", "bounded")
+        return "must_settle" if policy == "must_settle" else "bounded"
+
+    def _workspace_mutation_receipts(self) -> list[dict[str, Any]]:
+        ctx = self._tool_context or current_tool_context.get()
+        if ctx is None:
+            return []
+        records = getattr(ctx, "workspace_mutation_receipts", []) or []
+        return [record for record in records if isinstance(record, dict)]
+
+    def _tool_effect_observation(self) -> tuple[int, int, int]:
+        return (
+            len(self._workspace_mutation_receipts()),
+            len(self._workspace_write_records()),
+            len(self._scratch_write_records()),
+        )
 
     def _tool_activity_heartbeat_interval(self) -> float:
         raw_interval = self.config.metadata.get("tool_activity_heartbeat_interval", 15.0)
@@ -2808,7 +3816,225 @@ class Agent:
             **payload,
         )
 
-    def _switch_to_invalid_response_fallback(self, reason: str) -> bool:
+    @staticmethod
+    def _image_attachment_ids_from_metadata(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+        """Read optional attachment IDs without making them part of ChatConfig.
+
+        Attachment IDs are session/runtime metadata, not provider wire data. A
+        few callers already use slightly different spellings, so accept the
+        known aliases while keeping the value bounded and deterministic.
+        """
+
+        values: list[str] = []
+        seen: set[str] = set()
+        for key in (
+            "image_attachment_ids",
+            "image_intent_attachment_ids",
+            "attachment_ids",
+        ):
+            raw = metadata.get(key)
+            if isinstance(raw, str):
+                raw_values: Sequence[Any] = (raw,)
+            elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray)):
+                raw_values = raw
+            else:
+                continue
+            for value in raw_values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                normalized = value.strip()[:164]
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                values.append(normalized)
+        return tuple(values)
+
+    def _image_analysis_target(self) -> tuple[Any, ChatConfig] | None:
+        """Resolve one tool request without granting any new routing authority."""
+
+        config = ChatConfig(
+            max_tokens=min(self.config.max_tokens, 4096),
+            timeout=self.config.request_timeout,
+            model_capabilities=self.config.model_capabilities,
+            model_vision_support=self.config.model_vision_support,
+            physical_attempt_limit=1,
+            provider_request_max_chars=self._provider_request_proof_max_chars(),
+            provider_context_window_tokens=(
+                self.config.context_window_tokens if self.config.context_window_known else 0
+            ),
+            context_window_tokens_global_override=(
+                self.config.context_window_tokens_global_override
+            ),
+            provider_request_max_chars_explicit_cap=(
+                max(0, int(self.config.provider_request_proof_max_chars or 0))
+                if self.config.provider_request_proof_max_chars_explicit else 0
+            ),
+        )
+        support: Any = config.model_vision_support
+        resolver = getattr(self.provider, "active_model_vision_support", None)
+        if callable(resolver):
+            try:
+                support = resolver(config)
+            except Exception:  # noqa: BLE001 - strict tool authority gate
+                return None
+        if str(support or "unknown").strip().lower() != "supported":
+            return None
+        identity = provider_metadata(self.provider)
+        if "ensemble" in {identity.provider_kind, identity.provider_name}:
+            return None
+        resolve_target = getattr(self.provider, "image_analysis_target", None)
+        if callable(resolve_target):
+            target: tuple[Any, ChatConfig] | None = resolve_target(config)
+            if target is None:
+                return None
+            provider, config = target
+        else:
+            provider = self.provider
+        if self._image_analysis_provider_wrapper is not None:
+            provider = self._image_analysis_provider_wrapper(provider)
+        return provider, config
+
+    def _active_model_vision_support_for_call(self, config: Any) -> str:
+        """Resolve tri-state evidence for the exact physical selector leg."""
+
+        support: Any = getattr(config, "model_vision_support", "unknown")
+        resolver = getattr(self.provider, "active_model_vision_support", None)
+        if callable(resolver):
+            try:
+                support = resolver(config)
+            except Exception:  # noqa: BLE001 - optional selector refinement
+                support = getattr(config, "model_vision_support", "unknown")
+        normalized = str(support or "unknown").strip().lower()
+        return (
+            normalized
+            if normalized in {"supported", "unsupported", "unknown"}
+            else "unknown"
+        )
+
+    def _project_image_input_for_provider(
+        self,
+        messages: list[Message],
+        *,
+        chat_config: ChatConfig | None = None,
+        force_marker: bool = False,
+        marker_state: ImageMarkerState | str = ImageMarkerState.NOT_ANALYZED,
+        stage: str = "primary",
+        reason_override: str | None = None,
+    ) -> tuple[list[Message], Any]:
+        """Build one physical request view without mutating canonical messages.
+
+        ``Agent`` owns the logical transcript while providers consume a
+        request-local view.  Explicitly unsupported deployments and the
+        Ensemble contract receive markers; unknown deployments remain native so
+        the exact configured provider gets one capability probe.  A subsequent
+        precise image rejection can call this helper again with ``force_marker``
+        to retry the same configured model.
+        """
+
+        config = chat_config or self.config
+        support = self._active_model_vision_support_for_call(config)
+        try:
+            identity = provider_metadata(self.provider)
+        except Exception:  # noqa: BLE001 - metadata is advisory at this boundary
+            identity = None
+        provider_name = str(
+            getattr(identity, "provider_name", "")
+            or getattr(self.provider, "provider_name", "")
+            or ""
+        ).strip().casefold()
+        provider_kind = str(
+            getattr(identity, "provider_kind", "")
+            or getattr(self.provider, "provider_kind", "")
+            or ""
+        ).strip().casefold()
+        is_ensemble = provider_name == "ensemble" or provider_kind == "ensemble"
+        mode = (
+            ImageProjectionMode.MARKER
+            if force_marker or is_ensemble or support == "unsupported"
+            else ImageProjectionMode.NATIVE
+        )
+        result = project_messages(
+            messages,
+            mode=mode,
+            marker_state=marker_state,
+            attachment_ids=self._image_attachment_ids_from_metadata(
+                self.config.metadata
+            ),
+        )
+        if result.input_image_count or force_marker or is_ensemble:
+            reason = (
+                "ensemble_text_only"
+                if is_ensemble
+                else reason_override
+                or str(
+                    self.config.metadata.get("image_input_forced_rejection_reason")
+                    or (
+                        "model_vision_unsupported"
+                        if support == "unsupported"
+                        else "image_capability_probe_failed"
+                    )
+                )
+            )
+            self.config.metadata["image_input_mode"] = mode.value
+            self.config.metadata["image_input_reason"] = reason
+            self.config.metadata["image_input_count"] = result.input_image_count
+            self.config.metadata["image_input_output_count"] = result.output_image_count
+            self.config.metadata["image_input_marker_count"] = result.marker_count
+            self.config.metadata["image_input_stage"] = stage
+            self._write_turn_call_log(
+                "image_input_projection",
+                action=("project" if result.marker_count else "preserve"),
+                mode=mode.value,
+                reason=reason,
+                stage=stage,
+                image_count=result.input_image_count,
+                marker_count=result.marker_count,
+            )
+        if mode is ImageProjectionMode.MARKER:
+            # Keep this assertion close to the physical boundary. It catches a
+            # future nested content shape that the pure projector forgot while
+            # guaranteeing text-only providers never receive an image block.
+            assert_text_only_messages(result.messages)
+        return result.messages, result
+
+    def _switch_to_invalid_response_fallback(
+        self,
+        reason: str,
+        *,
+        requires_vision: bool = False,
+        requires_tools: bool = False,
+        exclude_current_authority: bool = False,
+    ) -> bool:
+        if requires_vision or requires_tools or exclude_current_authority:
+            constrained_fallback = getattr(
+                self.provider,
+                "fallback_after_invalid_response_with_capabilities",
+                None,
+            )
+            if not callable(constrained_fallback):
+                return False
+            try:
+                return bool(
+                    constrained_fallback(
+                        reason,
+                        requires_vision=requires_vision,
+                        requires_tools=requires_tools,
+                        **(
+                            {"exclude_current_authority": True}
+                            if exclude_current_authority else {}
+                        ),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - fallback support is optional
+                logger.warning(
+                    "provider.invalid_response_fallback_failed",
+                    session_key=self._session_key,
+                    reason=reason,
+                    requires_vision=requires_vision,
+                    requires_tools=requires_tools,
+                    error=str(exc),
+                )
+                return False
         fallback = getattr(self.provider, "fallback_after_invalid_response", None)
         if not callable(fallback):
             return False
@@ -2822,6 +4048,79 @@ class Agent:
                 error=str(exc),
             )
             return False
+
+    def _new_reasoning_only_act_now_message(
+        self,
+        *,
+        iteration: int,
+        attempt: int,
+        reasoning_content: str | None,
+        provider_default_reasoning: bool,
+    ) -> Message:
+        message = Message(
+            role="user",
+            content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+        )
+        append_runtime_event(
+            self.config.runtime_events_path,
+            {
+                "feature": "reasoning_only_act_now",
+                "name": "reasoning_only_act_now.injected",
+                "action": "retry_with_act_now_directive",
+                "reason": "provider_reasoning_only",
+                "provider_default_reasoning": provider_default_reasoning,
+                "iteration": iteration,
+                "attempt": attempt,
+                "reasoning_chars": len(reasoning_content or ""),
+                "session_key": self._session_key,
+                "agent_id": (
+                    self.config.tool_result_store_agent_id or self.config.metadata.get("agent_id")
+                ),
+            },
+        )
+        return message
+
+    def _provider_log_identity(self, observed_provider: str = "") -> str:
+        return (
+            str(getattr(self.provider, "active_provider_id", "") or "").strip()
+            or str(observed_provider or "").strip()
+            or str(self.config.provider_id or "").strip()
+            or str(getattr(self.provider, "provider_name", "") or "").strip()
+            or type(self.provider).__name__
+        )
+
+    def _provider_activity_model(self, observed_model: str = "") -> str:
+        """Resolve the current physical model without mutating the route plan."""
+
+        if str(observed_model or "").strip():
+            return str(observed_model).strip()
+        active_model = getattr(self.provider, "active_model_id", None)
+        if active_model is not None:
+            # A composite can explicitly have no single physical model while
+            # its members run. Its configured fallback is not an observation.
+            return str(active_model or "").strip()
+        return str(self.config.model_id or "").strip()
+
+    def _log_reasoning_output_budget_exhausted(
+        self,
+        *,
+        model: str,
+        observed_provider: str,
+        configured_max_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int,
+        reasoning_content: str | None,
+    ) -> None:
+        logger.warning(
+            "provider.reasoning_output_budget_exhausted",
+            session_key=self._session_key,
+            model=model,
+            provider=self._provider_log_identity(observed_provider),
+            configured_max_tokens=configured_max_tokens,
+            iter_output_tokens=output_tokens,
+            iter_reasoning_tokens=reasoning_tokens,
+            reasoning_chars=len(reasoning_content or ""),
+        )
 
     @staticmethod
     def _tool_call_string_arg(
@@ -2841,247 +4140,200 @@ class Agent:
             return max(1, int(fallback))
         return max(1, int(self.config.tool_result_projection_max_inline_chars))
 
-    def _fresh_diagnostic_policy_enabled(self) -> bool:
-        return bool(
-            getattr(
-                self.config,
-                "tool_result_fresh_diagnostic_policy_enabled",
-                False,
-            )
-        )
+    def _tool_result_recovery_available(self) -> bool:
+        """Return whether a lossy projection can be recovered by this model."""
 
-    def _diagnostic_retrieval_gate_enabled(self) -> bool:
-        return bool(
-            getattr(
-                self.config,
-                "tool_result_diagnostic_retrieval_gate_enabled",
-                False,
-            )
-        )
-
-    def _fresh_diagnostic_inline_max_chars(self) -> int:
-        if not self._fresh_diagnostic_policy_enabled():
-            return 0
-        return max(
-            0,
-            int(
-                getattr(
-                    self.config,
-                    "tool_result_fresh_diagnostic_inline_max_chars",
-                    64_000,
-                )
-                or 0
-            ),
-        )
-
-    @staticmethod
-    def _tool_result_diagnostic_reason(result: ToolResult, content: str) -> str | None:
-        if result.is_error:
-            return "is_error"
-        status: Mapping[str, Any] = result.execution_status or {}
-        if isinstance(status, Mapping):
-            preservation_class = str(status.get("preservation_class") or "")
-            if preservation_class == "diagnostic":
-                return "diagnostic_preservation_class"
-            if str(status.get("status") or "") in {"error", "timeout", "cancelled"}:
-                return "diagnostic_execution_status"
-        scan = content[:_TOOL_RESULT_HINT_SCAN_MAX_CHARS]
-        if (
-            _TOOL_RESULT_HINT_PATTERN.search(scan)
-            and not _CLEAN_TEST_SUMMARY_RE.search(scan)
-            and not _CLEAN_PASSED_FAILED_SUMMARY_RE.search(scan)
-            and not _CLEAN_ERROR_COUNT_RE.search(scan)
-        ):
-            return "failure_anchor"
-        return None
-
-    def _record_fresh_diagnostic_result(
-        self,
-        *,
-        reason: str,
-        tool_name: str,
-        tool_use_id: str,
-        original_chars: int,
-    ) -> None:
-        self.config.metadata["tool_projection_fresh_diagnostic_results"] = (
-            self.config.metadata.get("tool_projection_fresh_diagnostic_results", 0) + 1
-        )
-        self._write_turn_call_log(
-            "tool_projection_fresh_diagnostic",
-            tool_use_id=tool_use_id,
-            name=tool_name,
-            reason=reason,
-            original_chars=original_chars,
-        )
-
-    def _record_projected_diagnostic_evidence(
-        self,
-        *,
-        handle: str | None,
-        tool_name: str,
-        tool_use_id: str,
-        reason: str,
-        original_chars: int,
-        projected_chars: int,
-    ) -> None:
-        self.config.metadata["tool_projection_fresh_diagnostic_projections"] = (
-            self.config.metadata.get("tool_projection_fresh_diagnostic_projections", 0) + 1
-        )
-        append_runtime_event(
-            self.config.runtime_events_path,
-            {
-                "feature": "tool_result_projection",
-                "name": "tool_projection_fresh_diagnostic",
-                "action": "projected",
-                "reason": reason,
-                "session_key": self._session_key,
-                "agent_id": self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id"),
-                "tool_name": tool_name,
-                "tool_use_id": tool_use_id,
-                "tool_result_handle": handle,
-                "tool_result_handle_present": bool(handle),
-                "original_chars": original_chars,
-                "projected_chars": projected_chars,
-            },
-        )
-        if not self._diagnostic_retrieval_gate_enabled():
-            return
-        if not handle:
-            return
-        self._projected_diagnostic_evidence[handle] = {
-            "tool_name": tool_name,
-            "tool_use_id": tool_use_id,
-            "reason": reason,
-            "original_chars": original_chars,
-            "projected_chars": projected_chars,
-        }
-
-    @staticmethod
-    def _retrieval_tool_call_handle(tc: ToolCall) -> str | None:
-        if tc.tool_name != "retrieve_tool_result":
-            return None
-        raw_handle = tc.arguments.get("handle")
-        if not isinstance(raw_handle, str):
-            return None
-        handle = raw_handle.strip()
-        return handle or None
-
-    @staticmethod
-    def _retrieval_tool_call_is_focused(tc: ToolCall) -> bool:
-        if tc.tool_name != "retrieve_tool_result":
+        if self._provider_call_tool_result_retrieval_available is False:
             return False
-        raw_mode = tc.arguments.get("mode")
-        mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else ""
-        if mode in {"query", "grep", "slice", "head_tail", "raw_slice"}:
-            return True
-        return any(
-            isinstance(tc.arguments.get(key), str) and str(tc.arguments.get(key)).strip()
-            for key in ("query", "pattern")
-        ) or any(tc.arguments.get(key) is not None for key in ("start_line", "end_line", "offset"))
-
-    def _record_focused_diagnostic_retrieval(
-        self,
-        tc: ToolCall,
-        result: ToolResult,
-    ) -> None:
-        if result.is_error or not self._retrieval_tool_call_is_focused(tc):
-            return
-        handle = self._retrieval_tool_call_handle(tc)
-        if handle is None or handle not in self._projected_diagnostic_evidence:
-            return
-        self._focused_retrieved_tool_result_handles.add(handle)
-        self.config.metadata["tool_projection_diagnostic_retrievals"] = (
-            self.config.metadata.get("tool_projection_diagnostic_retrievals", 0) + 1
+        capabilities = self.config.model_capabilities
+        supports_tools = (
+            getattr(capabilities, "supports_tools", None) if capabilities is not None else None
         )
-        append_runtime_event(
-            self.config.runtime_events_path,
-            {
-                "feature": "tool_result_retrieval",
-                "name": "tool_projection_diagnostic_retrieval",
-                "session_key": self._session_key,
-                "agent_id": self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id"),
-                "tool_use_id": tc.tool_use_id,
-                "tool_name": tc.tool_name,
-                "tool_result_handle": handle,
-                "mode": tc.arguments.get("mode"),
-                "query": tc.arguments.get("query"),
-            },
+        handler_tools: frozenset[str] = getattr(
+            self._raw_tool_handler,
+            "_opensquilla_available_tools",
+            frozenset(),
         )
-        self._write_turn_call_log(
-            "tool_projection_diagnostic_retrieval",
-            tool_use_id=tc.tool_use_id,
-            name=tc.tool_name,
-            tool_result_handle=handle,
-            mode=tc.arguments.get("mode"),
-            query=tc.arguments.get("query"),
+        return bool(
+            self.config.tool_result_store_dir
+            and "retrieve_tool_result" in self._tool_definition_by_name
+            and "retrieve_tool_result" in handler_tools
+            and supports_tools is not False
         )
 
-    def _projected_diagnostic_retrieval_gate_tool_result(self, tc: ToolCall) -> ToolResult | None:
-        if not self._diagnostic_retrieval_gate_enabled():
-            return None
-        if tc.tool_name not in _DIAGNOSTIC_RETRIEVAL_GATED_TOOL_NAMES:
-            return None
-        pending = [
-            (handle, details)
-            for handle, details in self._projected_diagnostic_evidence.items()
-            if handle not in self._focused_retrieved_tool_result_handles
-        ]
-        if not pending:
-            return None
-        handle, details = pending[-1]
-        self.config.metadata["tool_projection_diagnostic_retrieval_gate_blocks"] = (
-            self.config.metadata.get("tool_projection_diagnostic_retrieval_gate_blocks", 0) + 1
-        )
-        tool_name = str(details.get("tool_name") or "tool")
-        reason = str(details.get("reason") or "diagnostic")
-        return ToolResult(
-            tool_use_id=tc.tool_use_id,
-            tool_name=tc.tool_name,
-            content=(
-                "Runtime guard: this action depends on incomplete diagnostic evidence. "
-                f"The recent {tool_name} result was projected with preview_complete=false "
-                f"for reason {reason!r}. Before calling {tc.tool_name}, use "
-                "retrieve_tool_result with the projected tool_result_handle and a focused "
-                "query, grep, line slice, or raw_slice for the failing test, traceback, "
-                f"line reference, or error phrase. tool_result_handle: {handle}"
-            ),
-            is_error=True,
-            execution_status=runtime_execution_status(
-                "error",
-                reason="projected_diagnostic_requires_retrieval",
-            ),
-        )
+    def _tool_result_store_session_id(self) -> str | None:
+        """Resolve the session bucket used by Store reads and retrieval."""
 
-    def _tokenjuice_tool_reduction(
-        self,
+        ctx = getattr(self, "_tool_context", None)
+        session_id = (
+            self.config.tool_result_store_session_id
+            or getattr(ctx, "tool_result_store_session_id", None)
+            or getattr(ctx, "artifact_session_id", None)
+            or self._session_key
+        )
+        return str(session_id) if session_id else None
+
+    def _tool_result_store_scope(self) -> tuple[str, str, str] | None:
+        """Resolve the Store session bucket and write provenance."""
+
+        ctx = getattr(self, "_tool_context", None)
+        session_id = self._tool_result_store_session_id()
+        session_key = (
+            self.config.tool_result_store_session_key
+            or getattr(ctx, "session_key", None)
+            or self._session_key
+        )
+        agent_id = (
+            self.config.tool_result_store_agent_id
+            or getattr(ctx, "agent_id", None)
+            or self.config.metadata.get("agent_id")
+        )
+        if not agent_id and session_key:
+            from opensquilla.session.keys import parse_agent_id
+
+            agent_id = parse_agent_id(session_key)
+        if not session_id or not session_key or not agent_id:
+            return None
+        return str(session_id), str(session_key), str(agent_id)
+
+    @staticmethod
+    def _tool_result_record_matches_reference(
+        record: ToolResultRecord,
         *,
-        tool_name: str,
-        content: str,
-        is_error: bool,
-        tool_use_id: str,
-        arguments: dict[str, Any] | None = None,
-        command: str | None = None,
-        cwd: str | None = None,
-        max_inline_chars: int | None = None,
-    ) -> str | None:
-        reduction = reduce_tool_result_with_tokenjuice(
-            tool_name=tool_name,
-            content=content,
-            is_error=is_error,
-            tool_use_id=tool_use_id,
-            arguments=arguments,
-            command=command,
-            cwd=cwd,
-            max_inline_chars=self._tokenjuice_max_inline_chars(max_inline_chars),
-        )
-        if reduction is None:
-            return None
-        self.config.metadata["tool_projection_backend"] = "tokenjuice"
-        if reduction.reducer:
-            self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
-        return reduction.inline_text
+        session_id: str,
+        sha256: str,
+    ) -> bool:
+        """Verify a projection reference inside the active session bucket.
+
+        ``session_key`` and ``agent_id`` on a Store record describe the writer;
+        they are not a second authorization boundary. Direct children share the
+        parent's session bucket intentionally while using a distinct session key,
+        and ``retrieve_tool_result`` addresses the same bucket by ``session_id``.
+        """
+
+        return bool(record.session_id == session_id and record.sha256 == sha256)
+
+    @staticmethod
+    def _provider_schema_has_tool_result_retrieval(
+        tools: list[ToolDefinition] | None,
+    ) -> bool:
+        return bool(tools and any(tool.name == "retrieve_tool_result" for tool in tools))
+
+    def _verified_tool_result_references(
+        self,
+        messages: list[Message],
+    ) -> frozenset[tuple[str, str]]:
+        """Return references readable in this Agent's session with the claimed SHA."""
+
+        session_id = self._tool_result_store_session_id()
+        if not self._tool_result_recovery_available() or session_id is None:
+            return frozenset()
+        store_dir = self.config.tool_result_store_dir
+        if not store_dir:
+            return frozenset()
+        store = ToolResultStore(store_dir)
+        verified: set[tuple[str, str]] = set()
+        records_by_handle: dict[str, ToolResultRecord | None] = {}
+        for message in reversed(messages):
+            if not isinstance(message.content, list):
+                continue
+            for block in reversed(message.content):
+                if not isinstance(block, ContentBlockToolResult):
+                    continue
+                if not isinstance(block.content, str):
+                    continue
+                reference = recoverable_tool_result_reference(block.content)
+                if reference is None or reference in verified:
+                    continue
+                handle, sha256 = reference
+                if handle in records_by_handle:
+                    record = records_by_handle[handle]
+                else:
+                    if len(records_by_handle) >= _MAX_HISTORICAL_TOOL_RESULT_REFERENCE_PROBES:
+                        return frozenset(verified)
+                    try:
+                        record = store.read(handle, session_id=session_id)
+                    except Exception:  # noqa: BLE001 - stale references remain visible
+                        record = None
+                    records_by_handle[handle] = record
+                if record is None:
+                    continue
+                if self._tool_result_record_matches_reference(
+                    record,
+                    session_id=session_id,
+                    sha256=sha256,
+                ):
+                    verified.add(reference)
+        return frozenset(verified)
+
+    def _restore_tool_results_without_retrieval_schema(
+        self,
+        messages: list[Message],
+    ) -> list[Message]:
+        """Restore session-scoped raw content when this call hides retrieval."""
+
+        store_dir = self.config.tool_result_store_dir
+        session_id = self._tool_result_store_session_id()
+        if not store_dir or session_id is None:
+            return messages
+        store = ToolResultStore(store_dir)
+        restored: list[Message] = []
+        changed = False
+        for message in messages:
+            if not isinstance(message.content, list):
+                restored.append(message)
+                continue
+            next_content: list[Any] = []
+            message_changed = False
+            for block in message.content:
+                if not isinstance(block, ContentBlockToolResult):
+                    next_content.append(block)
+                    continue
+                content = block.content if isinstance(block.content, str) else str(block.content)
+                reference = recoverable_tool_result_reference(content)
+                if reference is None:
+                    next_content.append(block)
+                    continue
+                handle, sha256 = reference
+                try:
+                    record = store.read(handle, session_id=session_id)
+                except Exception as exc:  # noqa: BLE001 - stale handles fail open
+                    logger.warning(
+                        "tool_result_projection.restore_failed",
+                        tool_use_id=block.tool_use_id,
+                        handle=handle,
+                        error_type=type(exc).__name__,
+                    )
+                    next_content.append(block)
+                    continue
+                if not self._tool_result_record_matches_reference(
+                    record,
+                    session_id=session_id,
+                    sha256=sha256,
+                ):
+                    logger.warning(
+                        "tool_result_projection.restore_reference_mismatch",
+                        tool_use_id=block.tool_use_id,
+                        handle=handle,
+                    )
+                    next_content.append(block)
+                    continue
+                next_content.append(
+                    ContentBlockToolResult(
+                        tool_use_id=block.tool_use_id,
+                        content=record.content,
+                        is_error=block.is_error,
+                        execution_status=block.execution_status,
+                    )
+                )
+                message_changed = True
+                changed = True
+            restored.append(
+                message.model_copy(update={"content": next_content})
+                if message_changed
+                else message
+            )
+        return restored if changed else messages
 
     def _semantic_tool_result_projection_skip_reason(
         self,
@@ -3141,9 +4393,7 @@ class Agent:
             if tool.name in target_names:
                 input_schema = payload.get("input_schema") or {}
                 properties = (
-                    input_schema.get("properties")
-                    if isinstance(input_schema, dict)
-                    else {}
+                    input_schema.get("properties") if isinstance(input_schema, dict) else {}
                 )
                 target_schemas[tool.name] = {
                     "schema_hash": schema_hashes[tool.name],
@@ -3171,9 +4421,7 @@ class Agent:
                 "sent_to_provider": bool(tools),
                 "tool_count": len(tool_names),
                 "tool_names": tool_names,
-                "target_tool_visible": {
-                    name: name in set(tool_names) for name in target_names
-                },
+                "target_tool_visible": {name: name in set(tool_names) for name in target_names},
                 "target_schemas": target_schemas,
                 "schema_hashes": schema_hashes,
             },
@@ -3198,7 +4446,9 @@ class Agent:
             return
         event: dict[str, Any] = {
             "feature": "tool_result_projection",
-            "mechanism": "tokenjuice",
+            "mechanism": (
+                SEARCH_PREVIEW_REDUCER if reducer == SEARCH_PREVIEW_REDUCER else "tokenjuice"
+            ),
             "mode": "log",
             "reason": reason or outcome,
             "session_key": self._session_key,
@@ -3225,183 +4475,11 @@ class Agent:
             event["saved_chars"] = max(0, original_chars - projected_chars)
         append_runtime_event(self.config.runtime_events_path, event)
 
-    def _projection_signal_hints_active(self) -> bool:
-        return _projection_signal_hints_enabled(
-            bool(getattr(self.config, "projection_signal_hints", False))
-        )
-
-    def _record_projection_signal_hint_event(
-        self,
-        *,
-        builder: str,
-        tool_name: str,
-        tool_use_id: str,
-        tool_result_handle: str | None,
-        original_chars: int,
-        signal_match_lines: int,
-        signal_first_line: int | None,
-    ) -> None:
-        self.config.metadata["tool_projection_signal_hints"] = (
-            self.config.metadata.get("tool_projection_signal_hints", 0) + 1
-        )
-        append_runtime_event(
-            self.config.runtime_events_path,
-            {
-                "feature": "tool_result_projection",
-                "name": "projection_signal_hints",
-                "action": "hint_appended",
-                "mechanism": "signal_scan",
-                "mode": "log",
-                "session_key": self._session_key,
-                "agent_id": self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id"),
-                "tool_name": tool_name,
-                "tool_use_id": tool_use_id,
-                "tool_result_handle": tool_result_handle,
-                "original_chars": original_chars,
-                "signal_match_lines": signal_match_lines,
-                "signal_first_line": signal_first_line,
-                "builder": builder,
-            },
-        )
-
     @staticmethod
     def _count_image_blocks(messages: list[Message]) -> int:
-        count = 0
-        for message in messages:
-            if not isinstance(message.content, list):
-                continue
-            count += sum(1 for block in message.content if isinstance(block, ContentBlockImage))
-        return count
-
-    def _dedup_repeated_tool_results_for_provider(
-        self,
-        messages: list[Message],
-    ) -> list[Message]:
-        """Elide older byte-identical tool results in the provider view only.
-
-        Long single-turn episodes re-run the same read/grep/diff commands many
-        times, and full-history replay resends every identical payload on every
-        iteration. When ``provider_history_dedup_enabled`` is on, the newest
-        occurrence of each repeated result stays full and older duplicates are
-        replaced by a short stub naming the surviving ``tool_use_id``. The pass
-        never mutates persisted history; error results, artifact results, the
-        two most recent results, frozen-full results, and existing provider
-        projections are left untouched.
-        """
-        self._provider_history_dedup_survivor_ids = set()
-        if not getattr(self.config, "provider_history_dedup_enabled", False):
-            return messages
-        min_repeats = max(
-            2, int(getattr(self.config, "provider_history_dedup_min_repeats", 2) or 2)
-        )
-
-        tool_result_refs: list[tuple[int, int, ContentBlockToolResult]] = []
-        for message_index, message in enumerate(messages):
-            if not isinstance(message.content, list):
-                continue
-            for block_index, block in enumerate(message.content):
-                if isinstance(block, ContentBlockToolResult):
-                    tool_result_refs.append((message_index, block_index, block))
-        if len(tool_result_refs) < min_repeats:
-            return messages
-
-        recent_ids = {id(block) for _m, _b, block in tool_result_refs[-2:]}
-        by_digest: dict[str, list[tuple[int, int, ContentBlockToolResult, str]]] = {}
-        for message_index, block_index, block in tool_result_refs:
-            if not isinstance(block.content, str):
-                continue
-            content = block.content
-            if (
-                len(content) < _PROVIDER_HISTORY_DEDUP_MIN_CHARS
-                or block.is_error
-                or _tool_result_content_has_artifact(content)
-                or _tool_result_content_is_provider_projection(content)
-            ):
-                continue
-            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            by_digest.setdefault(digest, []).append(
-                (message_index, block_index, block, content)
-            )
-
-        replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
-        survivor_ids: set[str] = set()
-        chars_saved = 0
-        for digest, occurrences in by_digest.items():
-            if len(occurrences) < min_repeats:
-                continue
-            survivor = occurrences[-1][2]
-            for message_index, block_index, block, content in occurrences[:-1]:
-                if id(block) in recent_ids:
-                    continue
-                if block.tool_use_id in self._provider_tool_result_frozen_full_ids:
-                    # Already shown to the model as final full content on a
-                    # prior request — never retroactively downgrade it, but
-                    # still counted above so newer duplicates get elided.
-                    continue
-                stub = (
-                    "[duplicate_tool_result_elided]\n"
-                    f"tool_use_id: {block.tool_use_id}\n"
-                    f"original_chars: {len(content)}\n"
-                    f"sha256: {digest}\n"
-                    f"identical_to_tool_use_id: {survivor.tool_use_id}\n"
-                    "reason: byte-identical content appears again at the newer "
-                    "tool result above; read it there instead of re-running the "
-                    "same command.\n"
-                )
-                replacements[(message_index, block_index)] = ContentBlockToolResult(
-                    tool_use_id=block.tool_use_id,
-                    content=stub,
-                    is_error=block.is_error,
-                )
-                chars_saved += max(0, len(content) - len(stub))
-                survivor_ids.add(survivor.tool_use_id)
-
-        if not replacements:
-            return messages
-
-        self._provider_history_dedup_survivor_ids = survivor_ids
-
-        projected: list[Message] = []
-        for message_index, message in enumerate(messages):
-            if not isinstance(message.content, list):
-                projected.append(message)
-                continue
-            next_content: list[Any] = []
-            message_changed = False
-            for block_index, block in enumerate(message.content):
-                replacement = replacements.get((message_index, block_index))
-                if replacement is None:
-                    next_content.append(block)
-                    continue
-                next_content.append(replacement)
-                message_changed = True
-            if not message_changed:
-                projected.append(message)
-                continue
-            projected.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
-            )
-
-        self.config.metadata["provider_history_dedup_applied"] = True
-        self.config.metadata["provider_history_dedup_elided"] = (
-            self.config.metadata.get("provider_history_dedup_elided", 0)
-            + len(replacements)
-        )
-        self.config.metadata["provider_history_dedup_chars_saved"] = (
-            self.config.metadata.get("provider_history_dedup_chars_saved", 0)
-            + chars_saved
-        )
-        self._write_turn_call_log(
-            "provider_history_dedup",
-            elided_tool_results=len(replacements),
-            chars_saved=chars_saved,
-        )
-        return projected
+        # Use the same recursive accounting as request projection so images
+        # nested in tool-result content cannot bypass a text-only boundary.
+        return count_projected_image_blocks(messages)
 
     def _compact_aggregate_tool_results_for_provider(
         self,
@@ -3415,6 +4493,9 @@ class Agent:
         artifact-producing results unless a successful single result alone
         exceeds the provider request cap.
         """
+
+        if not self._tool_result_recovery_available():
+            return messages
 
         tool_name_by_use_id: dict[str, str] = {}
         tool_input_by_use_id: dict[str, dict[str, Any]] = {}
@@ -3471,7 +4552,6 @@ class Agent:
                 or _tool_result_content_is_provider_projection(content)
                 or semantic_skip_reason is not None
                 or block.tool_use_id in self._provider_tool_result_frozen_full_ids
-                or block.tool_use_id in self._provider_history_dedup_survivor_ids
             ):
                 if semantic_skip_reason is not None:
                     semantic_preserve_refs.append(
@@ -3515,24 +4595,6 @@ class Agent:
             handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
             retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
             search_hints = _tool_result_search_hints(content) if stored is not None else ""
-            signal_lines = ""
-            if stored is not None and self._projection_signal_hints_active():
-                signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
-                    content,
-                    handle=stored.handle,
-                    head_chars=len(head),
-                    tail_chars=len(tail),
-                )
-                if signal_lines:
-                    self._record_projection_signal_hint_event(
-                        builder="aggregate",
-                        tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
-                        tool_use_id=block.tool_use_id,
-                        tool_result_handle=stored.handle,
-                        original_chars=len(content),
-                        signal_match_lines=signal_matches,
-                        signal_first_line=signal_first_line,
-                    )
             compacted = (
                 "[aggregate_tool_result_compacted]\n"
                 f"tool_use_id: {block.tool_use_id}\n"
@@ -3542,7 +4604,6 @@ class Agent:
                 f"{handle_line}"
                 f"{retrieve_hint}"
                 f"{search_hints}"
-                f"{signal_lines}"
                 f"omitted_chars: {omitted}\n"
                 f"preview_complete: {str(omitted == 0).lower()}\n"
                 "reason: older non-error tool result compacted for provider context budget.\n"
@@ -3582,11 +4643,7 @@ class Agent:
                 compacted_messages.append(message)
                 continue
             compacted_messages.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
+                message.model_copy(update={"content": next_content})
             )
 
         before_tokens = sum(
@@ -3710,12 +4767,12 @@ class Agent:
             single_over_budget = result_cap > 0 and len(content) > result_cap
             replacement_content: str | None = None
             if budget_class is ToolResultBudgetClass.CONTROL:
-                replacement_content = compact_tool_result_content(
-                    tool_name=tool_name,
-                    content=content,
+                replacement_content = self._tool_result_projection_for_provider(
+                    content,
+                    tool_use_id=block.tool_use_id,
+                    tool_name=tool_name or "tool",
+                    reason="control tool result compacted for provider request context",
                     max_preview_chars=160,
-                    budget_class=budget_class,
-                    is_error=block.is_error,
                 )
             elif (
                 budget_class is ToolResultBudgetClass.EXTERNAL
@@ -3782,11 +4839,7 @@ class Agent:
                 compacted_messages.append(message)
                 continue
             compacted_messages.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
+                message.model_copy(update={"content": next_content})
             )
 
         self.config.metadata["tool_provider_guard_projection_applied"] = True
@@ -3857,6 +4910,8 @@ class Agent:
         reason: str,
         max_preview_chars: int,
     ) -> str | None:
+        if not self._tool_result_recovery_available():
+            return None
         max_preview_chars = max(0, int(max_preview_chars))
         if max_preview_chars > 0:
             max_preview_chars = max(1, min(max_preview_chars, 4_000))
@@ -3866,11 +4921,11 @@ class Agent:
             tool_use_id=tool_use_id,
             tool_name=tool_name,
         )
-        if stored is None and self.config.tool_result_store_dir:
+        if stored is None:
             return None
-        handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
-        retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
-        search_hints = _tool_result_search_hints(content) if stored is not None else ""
+        handle_line = f"tool_result_handle: {stored.handle}\n"
+        retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT
+        search_hints = _tool_result_search_hints(content)
         if max_preview_chars <= 0:
             head = ""
             tail = ""
@@ -3883,24 +4938,6 @@ class Agent:
             head = content[:head_chars]
             tail = content[-tail_chars:] if tail_chars else ""
         omitted = max(0, len(content) - len(head) - len(tail))
-        signal_lines = ""
-        if stored is not None and self._projection_signal_hints_active():
-            signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
-                content,
-                handle=stored.handle,
-                head_chars=len(head),
-                tail_chars=len(tail),
-            )
-            if signal_lines:
-                self._record_projection_signal_hint_event(
-                    builder="provider_single",
-                    tool_name=tool_name,
-                    tool_use_id=tool_use_id,
-                    tool_result_handle=stored.handle,
-                    original_chars=len(content),
-                    signal_match_lines=signal_matches,
-                    signal_first_line=signal_first_line,
-                )
         projection = (
             "[tool_result_projection]\n"
             f"tool: {tool_name}\n"
@@ -3910,7 +4947,6 @@ class Agent:
             f"{handle_line}"
             f"{retrieve_hint}"
             f"{search_hints}"
-            f"{signal_lines}"
             f"omitted_chars: {omitted}\n"
             f"preview_complete: {str(omitted == 0).lower()}\n"
             f"reason: {reason}.\n"
@@ -3992,25 +5028,44 @@ class Agent:
             if not next_content:
                 continue
             sanitized_messages.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
+                message.model_copy(update={"content": next_content})
             )
 
         if record:
             self.config.metadata["tool_argument_provider_view_summaries_applied"] = True
             metadata_key = "tool_argument_provider_view_summaries"
-            self.config.metadata[metadata_key] = self.config.metadata.get(
-                metadata_key, 0
-            ) + len(replacements)
+            self.config.metadata[metadata_key] = self.config.metadata.get(metadata_key, 0) + len(
+                replacements
+            )
             self._write_turn_call_log(
                 "tool_argument_provider_view_summary",
                 sanitized_tool_uses=len(replacements),
                 max_chars=cap,
             )
         return sanitized_messages
+
+    async def _write_tool_body_snapshot(
+        self, content: str, tool_name: str, tool_use_id: str
+    ) -> ToolResultSnapshotReference | None:
+        context = current_tool_context.get()
+        if (
+            not tool_use_id.strip()
+            or context is None
+            or not context.tool_result_retrieval_available
+            or not self._tool_result_recovery_available()
+            or self._tool_result_store_scope() is None
+            or (context is not self._tool_context and context is not self._ingress_tool_context)
+        ):
+            return None
+        record = await asyncio.to_thread(
+            self._store_tool_result_snapshot,
+            content,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+        )
+        if record is None:
+            return None
+        return {"handle": record.handle, "sha256": record.sha256}
 
     def _store_tool_result_snapshot(
         self,
@@ -4021,18 +5076,13 @@ class Agent:
     ) -> ToolResultRecord | None:
         if not self.config.tool_result_store_dir:
             return None
-        session_id = self.config.tool_result_store_session_id or self._session_key
-        session_key = self.config.tool_result_store_session_key or self._session_key
-        agent_id = self.config.tool_result_store_agent_id
-        if not agent_id and session_key:
-            from opensquilla.session.keys import parse_agent_id
-
-            agent_id = parse_agent_id(session_key)
-        if not session_id or not session_key or not agent_id:
+        scope = self._tool_result_store_scope()
+        if scope is None:
             self.config.metadata["tool_result_store_skips"] = (
                 self.config.metadata.get("tool_result_store_skips", 0) + 1
             )
             return None
+        session_id, session_key, agent_id = scope
         sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         cache_key = (session_id, session_key, agent_id, tool_use_id, tool_name, sha)
         store = ToolResultStore(self.config.tool_result_store_dir)
@@ -4040,8 +5090,7 @@ class Agent:
         if cached is not None:
             try:
                 meta_path = (
-                    store._record_dir(cached.handle, session_id=session_id)
-                    / TOOL_RESULT_META_NAME
+                    store._record_dir(cached.handle, session_id=session_id) / TOOL_RESULT_META_NAME
                 )
             except ValueError:
                 meta_path = None
@@ -4051,6 +5100,15 @@ class Agent:
                 )
                 return cached
             self._tool_result_snapshot_cache.pop(cache_key, None)
+        # Synchronous projection and child-handoff callers may run on the
+        # gateway loop. They must not wait for a concurrent output-spool writer;
+        # a busy store keeps the original content through the existing no-op.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            lock_timeout_seconds = 5.0
+        else:
+            lock_timeout_seconds = 0.0
         try:
             record = store.write(
                 content,
@@ -4062,6 +5120,7 @@ class Agent:
                 max_bytes=self.config.tool_result_store_max_bytes,
                 disk_budget_bytes=self.config.tool_result_store_disk_budget_bytes,
                 retention_seconds=self.config.tool_result_store_retention_seconds,
+                lock_timeout_seconds=lock_timeout_seconds,
             )
         except ToolResultStoreBudgetError as exc:
             self.config.metadata["tool_result_store_skips"] = (
@@ -4094,7 +5153,6 @@ class Agent:
         *,
         raw_content: str,
         projected_content: str,
-        signal_lines: str = "",
     ) -> str:
         return (
             "[tool_result_projection]\n"
@@ -4104,7 +5162,6 @@ class Agent:
             "preview_complete: false\n"
             f"{_TOOL_RESULT_RETRIEVE_HINT}"
             f"{_tool_result_search_hints(raw_content)}"
-            f"{signal_lines}"
             f"{projected_content}"
         )
 
@@ -4153,20 +5210,10 @@ class Agent:
         raw_content: str,
         arguments: dict[str, Any] | None = None,
     ) -> ToolResult:
-        signal_lines = ""
-        signal_matches = 0
-        signal_first_line: int | None = None
-        if self._projection_signal_hints_active():
-            signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
-                raw_content,
-                handle=stored.handle,
-                preview_lines=frozenset(guarded_result.content.splitlines()),
-            )
         projected_content = self._tool_result_projection_payload(
             stored,
             raw_content=raw_content,
             projected_content=guarded_result.content,
-            signal_lines=signal_lines,
         )
         if len(projected_content) >= len(raw_content):
             return self._tool_result_projection_store_unavailable_noop(
@@ -4175,16 +5222,6 @@ class Agent:
                 arguments=arguments,
                 projected_chars=len(projected_content),
                 json_guard_applied=True,
-            )
-        if signal_lines:
-            self._record_projection_signal_hint_event(
-                builder="json_guard",
-                tool_name=guarded_result.tool_name,
-                tool_use_id=guarded_result.tool_use_id,
-                tool_result_handle=stored.handle,
-                original_chars=len(raw_content),
-                signal_match_lines=signal_matches,
-                signal_first_line=signal_first_line,
             )
 
         tokens_before = get_approx_tokens(raw_content)
@@ -4232,6 +5269,8 @@ class Agent:
             artifacts=list(guarded_result.artifacts),
             execution_status=guarded_result.execution_status,
             terminates_turn=guarded_result.terminates_turn,
+            effect_outcome=guarded_result.effect_outcome,
+            terminal_response_text=guarded_result.terminal_response_text,
         )
 
     async def _project_tool_result_for_llm(
@@ -4240,6 +5279,9 @@ class Agent:
         *,
         tool_call: ToolCall | None = None,
     ) -> ToolResult:
+        search_reduction = None
+        if result.tool_name == "web_search" and not result.is_error:
+            search_reduction = reduce_canonical_search(result.content)
         original_result = result
         projection_arguments = (
             dict(tool_call.arguments)
@@ -4260,9 +5302,27 @@ class Agent:
                 tool_use_id=result.tool_use_id,
                 tool_name=result.tool_name,
             )
+        if result.tool_name == "web_search" and search_reduction is None:
+            return result
+        self.config.metadata["tool_projection_attempts"] = (
+            self.config.metadata.get("tool_projection_attempts", 0) + 1
+        )
+        recovery_available = self._tool_result_recovery_available()
         json_guard_record: ToolResultRecord | None = None
-        guarded_content, guarded = _omit_large_json_tool_fields(result.content)
+        guarded_content, guarded = (
+            (result.content, False)
+            if search_reduction is not None
+            else _omit_large_json_tool_fields(result.content)
+        )
         if guarded:
+            if not recovery_available:
+                return self._tool_result_projection_store_unavailable_noop(
+                    original_result,
+                    reason="tool_result_retrieval_unavailable",
+                    arguments=projection_arguments,
+                    projected_chars=len(guarded_content),
+                    json_guard_applied=True,
+                )
             if self.config.tool_result_store_dir:
                 json_guard_record = raw_snapshot_record
                 if json_guard_record is None and not raw_snapshot_store_attempted:
@@ -4292,6 +5352,8 @@ class Agent:
                     else None
                 ),
                 terminates_turn=result.terminates_turn,
+                effect_outcome=result.effect_outcome,
+                terminal_response_text=result.terminal_response_text,
             )
             self.config.metadata["tool_json_guard_applied"] = True
             self.config.metadata["tool_json_guard_calls"] = (
@@ -4299,17 +5361,6 @@ class Agent:
             )
         json_guard_applied = guarded
 
-        self.config.metadata["tool_projection_attempts"] = (
-            self.config.metadata.get("tool_projection_attempts", 0) + 1
-        )
-        diagnostic_reason = self._tool_result_diagnostic_reason(result, raw_snapshot_content)
-        if diagnostic_reason is not None:
-            self._record_fresh_diagnostic_result(
-                reason=diagnostic_reason,
-                tool_name=result.tool_name,
-                tool_use_id=result.tool_use_id,
-                original_chars=len(raw_snapshot_content),
-            )
         semantic_skip_reason = self._semantic_tool_result_projection_skip_reason(
             result,
             tool_call=tool_call,
@@ -4347,58 +5398,7 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return result
-        fresh_diagnostic_cap = self._fresh_diagnostic_inline_max_chars()
-        if (
-            diagnostic_reason is not None
-            and fresh_diagnostic_cap > 0
-            and len(raw_snapshot_content) <= fresh_diagnostic_cap
-            and not json_guard_applied
-        ):
-            self.config.metadata["tool_projection_noops"] = (
-                self.config.metadata.get("tool_projection_noops", 0) + 1
-            )
-            self.config.metadata["tool_projection_fresh_diagnostic_one_hop_preserves"] = (
-                self.config.metadata.get(
-                    "tool_projection_fresh_diagnostic_one_hop_preserves",
-                    0,
-                )
-                + 1
-            )
-            append_runtime_event(
-                self.config.runtime_events_path,
-                {
-                    "feature": "tool_result_projection",
-                    "name": "tool_projection_fresh_diagnostic",
-                    "action": "one_hop_preserved",
-                    "reason": diagnostic_reason,
-                    "session_key": self._session_key,
-                    "agent_id": self.config.tool_result_store_agent_id
-                    or self.config.metadata.get("agent_id"),
-                    "tool_name": result.tool_name,
-                    "tool_use_id": result.tool_use_id,
-                    "original_chars": len(raw_snapshot_content),
-                },
-            )
-            self._write_turn_call_log(
-                "tool_projection_noop",
-                tool_use_id=result.tool_use_id,
-                name=result.tool_name,
-                original_chars=len(raw_snapshot_content),
-                reason="fresh_diagnostic_one_hop_preserved",
-                diagnostic_reason=diagnostic_reason,
-            )
-            self._record_tool_projection_runtime_event(
-                outcome="noop",
-                reason="fresh_diagnostic_one_hop_preserved",
-                tool_name=result.tool_name,
-                tool_use_id=result.tool_use_id,
-                original_chars=len(raw_snapshot_content),
-                arguments=projection_arguments,
-                is_error=result.is_error,
-                json_guard_applied=json_guard_applied,
-            )
-            return original_result
-        reduction = reduce_tool_result_with_tokenjuice(
+        reduction = search_reduction or reduce_tool_result_with_tokenjuice(
             tool_name=result.tool_name,
             content=result.content,
             is_error=result.is_error,
@@ -4437,31 +5437,32 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return result
-        self.config.metadata["tool_projection_backend"] = "tokenjuice"
+        if not recovery_available:
+            return self._tool_result_projection_store_unavailable_noop(
+                original_result,
+                reason="tool_result_retrieval_unavailable",
+                arguments=projection_arguments,
+                projected_chars=len(reduction.inline_text),
+                reducer=reduction.reducer,
+                json_guard_applied=json_guard_applied,
+            )
+        self.config.metadata["tool_projection_backend"] = (
+            SEARCH_PREVIEW_REDUCER if search_reduction is not None else "tokenjuice"
+        )
         if reduction.reducer:
-            self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
+            self.config.metadata["tool_projection_reducer"] = reduction.reducer
+            if search_reduction is None:
+                self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
+            else:
+                self.config.metadata.pop("tool_projection_tokenjuice_reducer", None)
         projected_content = reduction.inline_text
 
         stored: ToolResultRecord | None = None
         stored_handle: str | None = None
-        signal_matches = 0
-        signal_first_line: int | None = None
         if self.config.tool_result_store_dir:
             placeholder_handle = "tr-" + ("0" * 32)
-            # Scan once here and re-render with the real handle after the
-            # store write: placeholder and stored handles have identical
-            # length, so the probe below measures the true envelope size.
-            probe_signal_lines = ""
-            if self._projection_signal_hints_active():
-                (
-                    probe_signal_lines,
-                    signal_matches,
-                    signal_first_line,
-                ) = _tool_result_signal_scan(
-                    raw_snapshot_content,
-                    handle=placeholder_handle,
-                    preview_lines=frozenset(projected_content.splitlines()),
-                )
+            # Placeholder and stored handles have identical length, so this
+            # probe measures the envelope before committing a Store write.
             candidate_with_envelope = (
                 "[tool_result_projection]\n"
                 f"tool_result_handle: {placeholder_handle}\n"
@@ -4469,7 +5470,6 @@ class Agent:
                 f"original_chars: {len(raw_snapshot_content)}\n"
                 f"{_TOOL_RESULT_RETRIEVE_HINT}"
                 f"{_tool_result_search_hints(raw_snapshot_content)}"
-                f"{probe_signal_lines}"
                 f"{projected_content}"
             )
             if len(candidate_with_envelope) >= len(raw_snapshot_content):
@@ -4518,18 +5518,11 @@ class Agent:
                     reducer=reduction.reducer,
                     json_guard_applied=json_guard_applied,
                 )
-        signal_lines = ""
         if stored is not None:
-            signal_lines = _render_projection_signal_lines(
-                handle=stored.handle,
-                match_count=signal_matches,
-                first_line_number=signal_first_line,
-            )
             projected_content = self._tool_result_projection_payload(
                 stored,
                 raw_content=raw_snapshot_content,
                 projected_content=projected_content,
-                signal_lines=signal_lines,
             )
 
         if len(projected_content) >= len(raw_snapshot_content):
@@ -4558,17 +5551,6 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return original_result
-
-        if signal_lines and stored is not None:
-            self._record_projection_signal_hint_event(
-                builder="fresh",
-                tool_name=result.tool_name,
-                tool_use_id=result.tool_use_id,
-                tool_result_handle=stored.handle,
-                original_chars=len(raw_snapshot_content),
-                signal_match_lines=signal_matches,
-                signal_first_line=signal_first_line,
-            )
 
         tokens_before = get_approx_tokens(raw_snapshot_content)
         tokens_after = get_approx_tokens(projected_content)
@@ -4606,15 +5588,6 @@ class Agent:
             is_error=result.is_error,
             json_guard_applied=json_guard_applied,
         )
-        if diagnostic_reason is not None:
-            self._record_projected_diagnostic_evidence(
-                handle=stored_handle,
-                tool_name=result.tool_name,
-                tool_use_id=result.tool_use_id,
-                reason=diagnostic_reason,
-                original_chars=len(raw_snapshot_content),
-                projected_chars=len(projected_content),
-            )
         return ToolResult(
             tool_use_id=result.tool_use_id,
             tool_name=result.tool_name,
@@ -4623,15 +5596,9 @@ class Agent:
             artifacts=list(result.artifacts),
             execution_status=result.execution_status,
             terminates_turn=result.terminates_turn,
+            effect_outcome=result.effect_outcome,
+            terminal_response_text=result.terminal_response_text,
         )
-
-    async def _canonicalize_tool_result(
-        self,
-        result: ToolResult,
-        *,
-        tool_call: ToolCall | None = None,
-    ) -> ToolResult:
-        return await self._project_tool_result_for_llm(result, tool_call=tool_call)
 
     def _record_provider_tool_result_projection(
         self,
@@ -4676,9 +5643,8 @@ class Agent:
                     continue
                 content = block.content if isinstance(block.content, str) else str(block.content)
                 if content.startswith("[duplicate_tool_result_elided]\n"):
-                    # Dedup elision depends on another block's current state
-                    # (its survivor), not solely on this block's own content —
-                    # never freeze it; let dedup recompute it every request.
+                    # Historical dedup markers refer to another result; do not
+                    # freeze them as self-contained projection evidence.
                     continue
                 if _tool_result_content_is_provider_projection(content):
                     self._freeze_provider_tool_result_projection(
@@ -4705,7 +5671,20 @@ class Agent:
             result,
             tool_call=tool_call,
         )
+        projected_result.execution_log_handle = result.execution_log_handle
+        if (
+            result.execution_log_handle
+            and projected_result.content != result.content
+            and result.execution_log_handle not in projected_result.content
+        ):
+            # The projection snapshot contains the tool preview, not the full
+            # execution output. Keep the original log address available too.
+            projected_result.content += (
+                f"\nexecution_log_handle: {result.execution_log_handle}"
+            )
         self._record_provider_tool_result_projection(result, projected_result)
+        if result.tool_name == "web_search":
+            return result
         return projected_result
 
     def _tool_result_compression_mode(self) -> str:
@@ -4741,6 +5720,8 @@ class Agent:
                     else None
                 ),
                 terminates_turn=result.terminates_turn,
+                effect_outcome=result.effect_outcome,
+                terminal_response_text=result.terminal_response_text,
             )
         mode = self._tool_result_compression_mode()
         if mode == "off" or not self._tool_result_over_budget(result.content):
@@ -4769,6 +5750,8 @@ class Agent:
                 else None
             ),
             terminates_turn=result.terminates_turn,
+            effect_outcome=result.effect_outcome,
+            terminal_response_text=result.terminal_response_text,
         )
 
     # ------------------------------------------------------------------
@@ -4804,14 +5787,59 @@ class Agent:
 
     def clear_history(self) -> None:
         self._history = []
+        self._request_image_context = []
 
     def set_history(self, messages: list[Message]) -> None:
         self._history = list(messages)
+
+    def set_request_image_context(self, messages: list[Message]) -> None:
+        """Bind recovered attachments to the next request's protected input.
+
+        These messages are selected from the canonical transcript by the
+        runner. They share current-upload budgeting and projection, rather
+        than competing with ordinary history for the recent-turn window.
+        """
+
+        self._request_image_context = [message.model_copy(deep=True) for message in messages]
 
     def history_snapshot(self) -> list[Message]:
         """Return a detached history list for read-only session forks."""
 
         return list(self._history)
+
+    def current_assistant_replay(self) -> dict[str, Any] | None:
+        """Snapshot accepted current-turn messages for cancellation persistence."""
+        view: Callable[[], tuple[list[Message], int]] | None = getattr(
+            self, "_active_replay_view", None
+        )
+        if view is None:
+            return None
+        messages, start = view()
+        tail = _assistant_replay_tail(messages, start)
+        if not tail:
+            return None
+        return _serialize_assistant_replay(tail)
+
+    def _freeze_current_replay_view(self) -> None:
+        """Release the live turn's history cells while keeping its accepted tail."""
+        view: Callable[[], tuple[list[Message], int]] | None = getattr(
+            self, "_active_replay_view", None
+        )
+        if view is None:
+            return
+        messages, start = view()
+        tail = _assistant_replay_tail(messages, start)
+        self._active_replay_view = (lambda: (tail, 0)) if tail else None
+
+    def prompt_cache_keepalive_candidate(self) -> PromptCacheKeepaliveCandidate | None:
+        """Return the last successful call's stable-prefix candidate, if any."""
+
+        return self._prompt_cache_keepalive_candidate
+
+    def set_prompt_cache_keepalive_capture_enabled(self, enabled: bool) -> None:
+        """Arm stable-prefix copying for an explicitly enabled session only."""
+
+        self._prompt_cache_keepalive_capture_enabled = bool(enabled)
 
     def _usage_context_for_turn(self) -> UsageExecutionContext:
         """Return the injected execution identity or a safe direct-Agent fallback."""
@@ -4837,9 +5865,7 @@ class Agent:
         return await start_usage_call(
             scope,
             provider=str(
-                self.config.provider_id
-                or getattr(self.provider, "provider_name", "")
-                or ""
+                self.config.provider_id or getattr(self.provider, "provider_name", "") or ""
             ),
             model=str(self.config.model_id or ""),
         )
@@ -4848,17 +5874,21 @@ class Agent:
         self,
         call: UsageCallStart,
         provider_done: object,
+        *,
+        normalized_result: UsageCallResult | None = None,
     ) -> None:
         scope = current_usage_accounting_scope()
         sink = scope.sink if scope is not None else self._usage_event_sink
         if sink is None:
             return
-        result = normalize_provider_usage(
-            provider_done,
-            default_provider=call.provider,
-            default_model=call.model,
-            completed_at_ms=time.time_ns() // 1_000_000,
-        )
+        result = normalized_result
+        if result is None:
+            result = normalize_provider_usage(
+                provider_done,
+                default_provider=call.provider,
+                default_model=call.model,
+                completed_at_ms=time.time_ns() // 1_000_000,
+            )
         finalize_task = asyncio.create_task(sink.finalize(call, result))
         try:
             await asyncio.shield(finalize_task)
@@ -4917,7 +5947,32 @@ class Agent:
             clear_sandbox_approval_denials,
             prune_once_mount_grants,
         )
+        self._tool_reliability_states.clear()
+        self._compaction_request_context = None
+        pending_tool_terminal = (ToolOutcome.FAIL, ToolErrorCode.INTERNAL_ERROR)
 
+        self._prompt_cache_keepalive_candidate = None
+
+        snapshot_context_bindings: list[
+            tuple[ToolContext, ToolResultSnapshotWriter | None]
+        ] = []
+        for snapshot_context in (self._ingress_tool_context, self._tool_context):
+            if snapshot_context is not None and not any(
+                snapshot_context is bound for bound, _previous in snapshot_context_bindings
+            ):
+                snapshot_context_bindings.append(
+                    (snapshot_context, snapshot_context.tool_result_snapshot_writer)
+                )
+                snapshot_context.tool_result_snapshot_writer = self._write_tool_body_snapshot
+        image_context_bindings: list[
+            tuple[ToolContext, Callable[[], tuple[Any, Any] | None] | None]
+        ] = []
+        for image_context in (self._ingress_tool_context, self._tool_context):
+            if image_context is not None and not any(
+                image_context is bound for bound, _previous in image_context_bindings
+            ):
+                image_context_bindings.append((image_context, image_context.image_analysis_target))
+                image_context.image_analysis_target = self._image_analysis_target
         try:
             if self._session_key:
                 clear_sandbox_approval_denials(self._session_key)
@@ -4940,12 +5995,65 @@ class Agent:
             with bind_usage_accounting_scope(scope):
                 async for event in self._turn_generator(
                     message,
-                    extra_messages,
+                    [*self._request_image_context, *(extra_messages or [])] or None,
                     semantic_message,
                     pending_input_provider=pending_input_provider,
                 ):
                     yield event
+        except asyncio.CancelledError:
+            pending_tool_terminal = (ToolOutcome.CANCEL, ToolErrorCode.CANCELLED)
+            raise
+        except GeneratorExit:
+            pending_tool_terminal = (ToolOutcome.CANCEL, ToolErrorCode.CANCELLED)
+            raise
+        except BaseException:
+            pending_tool_terminal = (ToolOutcome.FAIL, ToolErrorCode.INTERNAL_ERROR)
+            raise
         finally:
+            self._flush_pending_tool_reliability(terminal=pending_tool_terminal)
+            self._freeze_current_replay_view()
+            self._compaction_request_context = None
+            self._compaction_failed_this_turn = False
+            self._image_analysis_provider_wrapper = None
+            for snapshot_context, previous_writer in snapshot_context_bindings:
+                snapshot_context.tool_result_snapshot_writer = previous_writer
+            for image_context, previous in image_context_bindings:
+                image_context.image_analysis_target = previous
+            self._request_image_context = []
+            self._terminalize_pending_durable_compaction(
+                status="cancelled",
+                reason="turn_closed_before_compaction_install",
+            )
+            # Process-local resources are cleared only after the turn
+            # generator has persisted/streamed its final tool result, but on
+            # every terminal path (including cancellation and provider abort)
+            # before this ToolContext can be reused or discarded.
+            if self._tool_context is not None:
+                # Screenshot bytes are request-scoped evidence.  Drop any
+                # attachment left behind by a cancelled/failed dispatch so a
+                # reused context cannot retain binary data across turns.
+                self._tool_context.tool_result_media.clear()
+                callbacks = tuple(self._tool_context.turn_cleanup_callbacks)
+                self._tool_context.turn_cleanup_callbacks.clear()
+                for callback in callbacks:
+                    try:
+                        result = callback()
+                        if inspect.isawaitable(result):
+                            cleanup_task = asyncio.ensure_future(result)
+                            cleanup_cancelled = False
+                            while not cleanup_task.done():
+                                try:
+                                    await asyncio.shield(cleanup_task)
+                                except asyncio.CancelledError:
+                                    cleanup_cancelled = True
+                            cleanup_task.result()
+                            if cleanup_cancelled:
+                                logger.debug("agent.turn_cleanup_completed_after_cancel")
+                    except Exception:  # noqa: BLE001 - cleanup must not mask turn outcome
+                        logger.warning(
+                            "agent.turn_cleanup_failed",
+                            exc_info=True,
+                        )
             approval_cleanup = asyncio.create_task(
                 clear_approval_run_context_deltas_for_tool_context(
                     self._tool_context,
@@ -4970,13 +6078,26 @@ class Agent:
         pending_input_provider: PendingInputProvider | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Async generator that drives the state machine."""
+        self._active_replay_view = None
+        self.config.metadata.pop("reasoning_replay_context_rebuilt", None)
         self._provider_tool_result_overrides = {}
-        self._projected_diagnostic_evidence = {}
-        self._focused_retrieved_tool_result_handles = set()
         self._current_turn_message = message
+        from opensquilla.skills.install_turn import SkillInstallTurn
+
+        install_turn = SkillInstallTurn(semantic_message or message)
+        if self._tool_context is not None:
+            self._tool_context.skill_install_turn = install_turn
+            install_turn.finalization_allowed = not (
+                self._tool_context.goal_context or self._tool_context.plan_run_id
+            )
         _meta_invoke_turn_count.set(0)
         usage_scope = current_usage_accounting_scope()
+        reasoning_block_index = 0
         reasoning_started_at_ms = 0
+        generation_epoch = (
+            self._execution_context.generation_epoch if self._execution_context is not None else 0
+        )
+        last_provider_sequence = -1
 
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
@@ -4995,13 +6116,44 @@ class Agent:
             async for ev in self._run_meta_resume(meta_resume):
                 yield ev
             return
+        meta_replay_error = metadata.pop("meta_replay_error", None)
+        if meta_replay_error is not None:
+            async for ev in self._emit_terminal_text(str(meta_replay_error), iterations=0):
+                yield ev
+            return
+        meta_replay = metadata.get("meta_replay")
+        if isinstance(meta_replay, dict):
+            replay_name = str(meta_replay.get("name") or "")
+            replay_run_id = str(meta_replay.get("run_id") or "")
+            replay_mode = str(meta_replay.get("mode") or "")
+            if replay_name and replay_run_id and replay_mode:
+                async for ev in self._run_meta_launch(
+                    replay_name,
+                    replay_run_id=replay_run_id,
+                    replay_mode=replay_mode,
+                ):
+                    yield ev
+                return
+            metadata.pop("meta_replay", None)
+            async for ev in self._emit_terminal_text(
+                "This replay request is invalid. Choose Retry failed step again.",
+                iterations=0,
+            ):
+                yield ev
+            return
         meta_launch = metadata.get("meta_launch")
         if meta_launch is not None:
-            launch_name = (
-                meta_launch.get("name") if isinstance(meta_launch, dict) else None
-            )
+            launch_name = meta_launch.get("name") if isinstance(meta_launch, dict) else None
             if launch_name:
-                async for ev in self._run_meta_launch(launch_name):
+                launch_request = (
+                    meta_launch.get("request") if isinstance(meta_launch, dict) else None
+                )
+                launch_events = (
+                    self._run_meta_launch(launch_name, user_request=launch_request)
+                    if isinstance(launch_request, str)
+                    else self._run_meta_launch(launch_name)
+                )
+                async for ev in launch_events:
                     yield ev
                 return
         clarify_outcome = self._read_clarify_outcome(metadata)
@@ -5011,6 +6163,64 @@ class Agent:
                 yield ev
             _ = terminates  # always terminates today; reserved for future
             return
+
+        current_turn_image_count = count_projected_image_blocks(extra_messages or [])
+        forced_image_rejection = str(
+            self.config.metadata.get("image_input_forced_rejection_reason") or ""
+        ).strip()
+        # Unsupported capability is a request-shaping decision, not a terminal
+        # turn error. Keep the image in the canonical turn and project a
+        # marker into the physical request below. Unknown deployments remain
+        # native so the configured provider can be probed once.
+        try:
+            provider_identity = provider_metadata(self.provider)
+        except Exception:  # noqa: BLE001 - provider identity is advisory here
+            provider_identity = None
+        provider_is_ensemble = (
+            str(getattr(provider_identity, "provider_name", "") or "")
+            .strip()
+            .casefold()
+            == "ensemble"
+            or str(getattr(provider_identity, "provider_kind", "") or "")
+            .strip()
+            .casefold()
+            == "ensemble"
+        )
+        selector_projects_images = (
+            getattr(self.provider, "projects_image_input_per_leg", False) is True
+        )
+        selector_image_provider: Any = self.provider if selector_projects_images else None
+        image_projection_forced = bool(
+            forced_image_rejection
+            or self.config.metadata.get("image_input_projection_required") is True
+        )
+        image_projection_forced_deployment = (
+            selector_image_provider.active_deployment_config()
+            if selector_projects_images
+            else None
+        )
+        image_projection_marker_state: ImageMarkerState = ImageMarkerState.NOT_ANALYZED
+        if (
+            image_projection_forced
+            or self.config.model_vision_support == "unsupported"
+            or provider_is_ensemble
+        ):
+            image_input_reason = (
+                "ensemble_text_only"
+                if provider_is_ensemble and not forced_image_rejection
+                else forced_image_rejection or "model_vision_unsupported"
+            )
+            self.config.metadata["image_input_mode"] = ImageProjectionMode.MARKER.value
+            self.config.metadata["image_input_reason"] = image_input_reason
+            self.config.metadata["image_input_count"] = current_turn_image_count
+            self.config.metadata["image_input_stage"] = "primary"
+            self._write_turn_call_log(
+                "image_input_preflight",
+                action="project",
+                reason=image_input_reason,
+                model=self.config.model_id or "",
+                image_count=current_turn_image_count,
+            )
 
         # Use the system prompt from config (wired by gateway via identity.prompt)
         if self._context is None:
@@ -5024,29 +6234,24 @@ class Agent:
 
         # Preprocess history for the provider request view. This does not
         # mutate persisted transcript rows or tool result content.
-        # Some reasoning tool-call providers require the prior assistant
-        # tool-call message to carry its reasoning_content while reasoning is
-        # enabled, so keep that narrow field only for tool-call history.
-        caps_reasoning_format = (
-            getattr(self.config.model_capabilities, "reasoning_format", "")
-            if self.config.model_capabilities is not None
-            else ""
-        )
-        preserve_reasoning_content = bool(
-            _is_direct_deepseek_v4_model_id(self.config.model_id)
-            or (
-                thinking_enabled
-                and caps_reasoning_format == "deepseek"
-                and _is_deepseek_model_id(self.config.model_id)
-            )
-            or (thinking_enabled and caps_reasoning_format == "dashscope")
-        )
+        # Preserve source reasoning and opaque continuation state in canonical
+        # history. The target provider owns request-specific replay projection.
+        preserve_reasoning_content = True
         loaded_history = list(self._history)
         self._write_context_stage("session:loaded", loaded_history)
         sanitized_history, sanitize_result = sanitize_session_messages(loaded_history)
+        verification_history = limit_turns(
+            sanitized_history,
+            self.config.max_history_turns,
+        )
+        recoverable_references = await asyncio.to_thread(
+            self._verified_tool_result_references,
+            verification_history,
+        )
         sanitized_history, historical_projection_result = project_historical_tool_payloads(
             sanitized_history,
             preserve_reasoning_content=preserve_reasoning_content,
+            recoverable_references=recoverable_references,
         )
         sanitized_history = repair_tool_pairing(sanitized_history)
         sanitized_history = drop_reasoning(
@@ -5054,15 +6259,15 @@ class Agent:
             preserve_tool_call_reasoning=thinking_enabled,
             preserve_reasoning_content=preserve_reasoning_content,
         )
-        preserve_historical_images = bool(
-            self.config.preserve_historical_images
-            and getattr(self.config.model_capabilities, "supports_vision", False)
-            if self.config.model_capabilities is not None
-            else False
-        )
+        # Preserve the sanitized-but-still-image-bearing history separately
+        # from the physical text-model view.  The marker projection below is
+        # request-local; it must not become the Agent's canonical in-memory
+        # history and make a later vision-capable turn unable to recover the
+        # original attachment.
+        canonical_sanitized_history = list(sanitized_history)
         sanitized_history = _strip_historical_image_blocks(
             sanitized_history,
-            preserve_images=preserve_historical_images,
+            preserve_images=self.config.preserve_historical_images,
         )
         self._write_context_stage(
             "session:sanitized",
@@ -5072,18 +6277,41 @@ class Agent:
         )
         history = limit_turns(sanitized_history, self.config.max_history_turns)
         history = repair_tool_pairing(history)
+        initial_provider_history = tuple(history)
+        canonical_history = repair_tool_pairing(
+            limit_turns(
+                canonical_sanitized_history,
+                self.config.max_history_turns,
+            )
+        )
         self._write_context_stage(
             "session:limited",
             history,
             removed_messages=max(len(sanitized_history) - len(history), 0),
         )
 
+        self._current_request_execution = {}
         # Build initial message list
         turn_messages: list[Message] = list(history)
         # Count-aware recovery may summarize only content before this boundary.
         # Skills context, multimodal inputs, and the active user request all
         # belong to the protected current turn.
         current_turn_start_index = len(turn_messages)
+        # Capture the cells, not a particular list: compaction can replace the
+        # canonical list and its protected boundary inside a provider retry.
+        self._active_replay_view = lambda: (turn_messages, current_turn_start_index)
+        # A one-turn-lag prefix is intentional: every message in this slice was
+        # already provider input before this turn.  The newly generated
+        # assistant response was not, so including it would claim a cache
+        # identity the provider has never seen.
+        keepalive_stable_history = (
+            tuple(
+                message.model_copy(deep=True)
+                for message in turn_messages[:current_turn_start_index]
+            )
+            if self._prompt_cache_keepalive_capture_enabled
+            else ()
+        )
         message_count_request_view: _MessageCountRequestView | None = None
         # Insert this turn's skills context BEFORE the user content so it
         # joins turn_messages permanently (persists into self._history at
@@ -5115,47 +6343,27 @@ class Agent:
             turn_messages,
             image_blocks=self._count_image_blocks(turn_messages),
         )
-        runtime_context = self._runtime_context_block()
-        runtime_context_message = self._runtime_context_message(runtime_context)
-        request_context_message = self._request_context_message(self.config.request_context_prompt)
-        turn_objective_message = self._turn_objective_message(
-            semantic_message if semantic_message is not None else message,
-            enabled=self._turn_objective_reminder_enabled,
-            max_chars=self._turn_objective_reminder_max_chars,
+        runtime_context_message = (
+            self._preflight_runtime_context_message
+            or self._runtime_context_message(self._runtime_context_block())
         )
+        self._preflight_runtime_context_message = None
+        runtime_context = (
+            runtime_context_message.content
+            if isinstance(runtime_context_message.content, str)
+            else self._runtime_context_block()
+        )
+        request_context_message = self._request_context_message(self.config.request_context_prompt)
         runtime_context_hash = hashlib.sha256(runtime_context.encode("utf-8")).hexdigest()[:16]
 
-        chat_cfg = ChatConfig(
-            max_tokens=self.config.max_tokens,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            system=self._context.system_prompt,
-            thinking=thinking_enabled,
-            thinking_budget_tokens=thinking_budget,
-            thinking_budget_explicit=(
-                self.config.thinking_budget_tokens != _THINKING_BUDGET_DEFAULT
-            ),
-            timeout=self.config.request_timeout,
-            stop_sequences=self.config.stop_sequences,
-            cache_breakpoints=self._cache_breakpoints_without_runtime_context(
-                self.config.cache_breakpoints
-            ),
-            cache_mode=self.config.cache_mode,
-            output_json_schema=self.config.output_json_schema,
-            output_json_schema_strict=self.config.output_json_schema_strict,
-            model_capabilities=self.config.model_capabilities,
-            thinking_level=(
-                self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
-            ),
-            provider_request_max_chars=self._provider_request_proof_max_chars(),
-            tool_choice=None,
+        chat_cfg = self._provider_admission_chat_config(
+            thinking_prompt,
+            context_window_tokens=self.config.context_window_tokens,
+            max_output_tokens=self.config.max_tokens,
         )
-        _thinking_fallback_done = False
-        _disable_thinking_for_next_provider_call = False
-        _reasoning_stream_char_cap = max(
-            0, int(getattr(self.config, "reasoning_stream_char_cap", 0) or 0)
+        self._compaction_request_context = self.build_compaction_request_context(
+            thinking_prompt
         )
-
         _log = structlog.get_logger("opensquilla.engine.agent")
 
         def _positive_float(value: Any) -> float | None:
@@ -5166,6 +6374,7 @@ class Agent:
             return parsed if parsed > 0 else None
 
         iterations = 0
+        tool_images_pending_admission = False
         overflow_retries = 0
         # Keep lifetime usage separate from the live context-window gauge.
         # Compaction shrinks what the model sees next; it must not erase the
@@ -5179,6 +6388,7 @@ class Agent:
         total_provider_billed_entries = 0
         total_unbilled_entries = 0
         total_missing_cost_entries = 0
+        turn_has_error_usage_receipt = False
         # Estimate-backed accumulator for max_turn_cost_usd: billed cost when a
         # call reported one, otherwise the layered-resolver estimate — unlike
         # total_billed_cost, this never sits at 0.0 for a cost-blind provider.
@@ -5231,6 +6441,23 @@ class Agent:
         )
         turn_llm_calls = 0
         turn_tool_errors = 0
+        tool_failure_recovery = ToolFailureRecovery()
+        tool_failure_finalization_pending = False
+        # Whole-turn replay is safe only while no provider admission has
+        # completed and no tool execution has crossed an external-effect
+        # boundary. The usage call index supplies the durable half of this
+        # proof; this flag supplies the live turn half.
+        turn_irreversible_effect_started = False
+        # Image capability recovery has a stricter whole-turn boundary than
+        # ordinary provider retry accounting: once any model output becomes
+        # visible or any tool starts executing, replaying the image request
+        # (or replacing it with a marker request) could duplicate observable
+        # work.  Keep this latch across provider iterations and attempts.
+        turn_image_retry_barrier_crossed = False
+        # A durable inline candidate is installed only after the rebuilt
+        # request crosses the provider adapter's final admission boundary.
+        self._pending_durable_compaction_event = None
+
         async def _review_inflight_sandbox_request(
             payload: dict[str, object],
         ) -> RuleAssessment | None:
@@ -5247,171 +6474,56 @@ class Agent:
         turn_model_usage_breakdown: list[dict[str, Any]] = []
         last_ensemble_trace: dict[str, Any] | None = None
         turn_ensemble_request_count = 0
+        ensemble_continuation_request_count: int | None = None
+        ensemble_continuation_provider: object | None = None
+
+        def _merge_ensemble_request_count(
+            trace: dict[str, Any],
+            continuation_baseline: int | None,
+        ) -> int:
+            nonlocal last_ensemble_trace, turn_ensemble_request_count
+
+            last_ensemble_trace = dict(trace)
+            reported_count = _usage_int(trace.get("llm_request_count") or 0)
+            if continuation_baseline is None:
+                turn_ensemble_request_count += reported_count
+            else:
+                turn_ensemble_request_count += max(
+                    0,
+                    reported_count - continuation_baseline,
+                )
+            return reported_count
+
         terminal_error: ErrorEvent | None = None
+        terminal_generation_reset_event: AnswerGenerationResetEvent | None = None
         final_text_parts: list[str] = []
         applied_model_call_boundaries: list[dict[str, Any]] = []
+        router_model_call_id = ""
+        router_iteration = 0
         final_reasoning_parts: list[str] = []
-        artifact_delivery_final_response_pending = False
-        artifact_delivery_degraded_final_response = False
-        artifact_delivery_final_response_artifacts: list[dict[str, Any]] = []
+        replay_boundary_notified = False
+        goal_terminal_final_response_pending = False
+        goal_terminal_final_status: str | None = None
         max_iterations_finalization_attempted = False
         max_iterations_finalization_pending = False
         max_iterations_finalization_message: Message | None = None
-        max_iterations_deadline_extension_logged = False
-        post_write_convergence_finalization_pending = False
-        post_write_convergence_finalization_message: Message | None = None
-        placeholder_offense_iterations = 0
-        deadline_wrapup_armed = False
-        deadline_wrapup_message: Message | None = None
-        deadline_thinking_off_armed = False
-        endgame_git_freeze_armed = False
-        endgame_fix_directive_fired = False
         reasoning_only_act_now_message: Message | None = None
-        mid_budget_nudge_fired_fractions: set[float] = set()
-        workspace_diff_recovery_attempted = False
-        failed_tool_finalization_recovery_keys: set[str] = set()
         post_tool_empty_recovery_attempted = False
-        text_only_tool_recovery_injections = 0
-        text_only_tool_recovery_pending = False
         plan_run_reconciliation_attempts = 0
-        attached_plan_run_id = str(
-            getattr(self._tool_context, "plan_run_id", "") or ""
-        ).strip()
+        attached_plan_run_id = str(getattr(self._tool_context, "plan_run_id", "") or "").strip()
         plan_run_delivery_only = _plan_run_steps_ready_for_delivery(
             getattr(self._tool_context, "plan_run", None)
         )
         reasoning_prefill_recovery_attempted = False
-        final_diff_contract_recovery_attempted = False
-        source_loop_recovery_attempted_keys: set[str] = set()
-        workspace_edit_gate_details: dict[str, Any] | None = None
-        workspace_edit_gate_recovery_read_paths: set[str] = set()
-        workspace_edit_gate_recovery_reads_remaining = 0
         runtime_recovery_scaffolding_pending = False
-        repeated_tool_call_key: tuple[str, str] | None = None
-        repeated_tool_call_count = 0
-        repeated_tool_call_workspace_write_count = len(self._effective_workspace_write_records())
-        repeated_tool_call_last_result_is_error = False
-        last_executed_results: list[ToolResult] = []
-        last_post_write_progress_count = self._post_write_progress_count()
-        post_write_focused_verification_observed = False
-        post_write_focused_verification_success_observed = False
-        last_post_write_failed_verification: dict[str, Any] | None = None
-        finalize_evidence_strict = bool(
-            getattr(self.config, "finalize_evidence_strict", False)
-        )
-        finalize_evidence_tracker = (
-            FinalizeEvidenceTracker(strict=finalize_evidence_strict)
-            if (
-                bool(getattr(self.config, "finalize_evidence_gate_enabled", False))
-                or finalize_evidence_strict
-            )
-            else None
-        )
-        finalize_evidence_gate_keys: set[str] = set()
-        submit_review_enabled = bool(
-            getattr(self.config, "submit_review_enabled", False)
-        ) and not attached_plan_run_id
-        submit_review_state = SubmitReviewState()
-        submit_review_diff_max_chars = int(
-            getattr(self.config, "submit_review_diff_max_chars", 20000)
-        )
-        patch_hygiene_block_mode = str(
-            getattr(self.config, "patch_hygiene_block_mode", "off") or "off"
-        )
-        patch_hygiene_block_keys: set[str] = set()
-        scratch_verify_mirror_enabled = bool(
-            getattr(self.config, "scratch_verify_mirror", False)
-        )
-        if self._tool_context is not None:
-            # Rides the ToolContext in place (endgame_git_freeze precedent):
-            # deny messages append the verify-mirror guidance only while on,
-            # and the flag is reset each turn because the context outlives it.
-            self._tool_context.scratch_verify_mirror_active = (
-                scratch_verify_mirror_enabled
-            )
-        finalize_variant_challenge_enabled = bool(
-            getattr(self.config, "finalize_variant_challenge", False)
-        )
-        finalize_variant_challenge_fired = False
-        recent_failure_anchor_summaries: list[str] = []
-        progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
-        progress_watchdog = ProgressWatchdog(
-            repeated_tool_error_threshold=max(
-                1,
-                int(
-                    getattr(
-                        self.config,
-                        "progress_watchdog_repeated_tool_error_threshold",
-                        3,
-                    )
-                    or 3
-                ),
-            ),
-            repeated_provider_failure_threshold=max(
-                1,
-                int(
-                    getattr(
-                        self.config,
-                        "progress_watchdog_repeated_provider_failure_threshold",
-                        2,
-                    )
-                    or 2
-                ),
-            ),
-            repeated_failure_anchor_threshold=max(
-                1,
-                int(
-                    getattr(
-                        self.config,
-                        "progress_watchdog_repeated_failure_anchor_threshold",
-                        3,
-                    )
-                    or 3
-                ),
-            ),
-            observe_only=progress_watchdog_mode != "block",
-        )
-        post_write_convergence_tracker = (
-            PostWriteConvergenceTracker(
-                warn_threshold=max(
-                    1,
-                    int(
-                        getattr(
-                            self.config,
-                            "post_write_convergence_warn_threshold",
-                            3,
-                        )
-                        or 3
-                    ),
-                ),
-                finalize_after_warning=max(
-                    1,
-                    int(
-                        getattr(
-                            self.config,
-                            "post_write_convergence_finalize_after_warning",
-                            3,
-                        )
-                        or 3
-                    ),
-                ),
-            )
-            if bool(getattr(self.config, "post_write_convergence_enabled", False))
-            else None
-        )
         runtime_recovery_mode: RuntimeRecoveryMode = getattr(
             self.config, "runtime_recovery_mode", "log"
-        )
-        runtime_recovery_source_loop_max_nudges = max(
-            1,
-            int(getattr(self.config, "runtime_recovery_source_loop_max_nudges", 1) or 1),
         )
         runtime_diagnostics = (
             RuntimeDiagnosticsObserver(
                 session_key=self._session_key,
                 agent_id=(
-                    self.config.tool_result_store_agent_id
-                    or self.config.metadata.get("agent_id")
+                    self.config.tool_result_store_agent_id or self.config.metadata.get("agent_id")
                 ),
             )
             if self.config.runtime_events_path or runtime_recovery_mode == "warn_model"
@@ -5423,107 +6535,15 @@ class Agent:
             max_backoff_ms=self.config.retry_max_backoff_ms,
         )
 
-        # Timeout budgets: optional total turn budget, idle LLM stream budget,
-        # and per-tool execution budget.
+        # The loop owns the total task deadline and per-tool deadlines.
+        # Provider adapters own transport inactivity limits.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
-
-        # Endgame git freeze: once remaining wall clock drops below the margin,
-        # the shell tools block workspace-reverting git commands outright so
-        # the current diff survives runner-side collection. The armed flag
-        # rides the ToolContext in place (router_control precedent); it is
-        # reset here because the context outlives the turn.
-        endgame_git_freeze_margin_seconds = max(
-            0,
-            int(getattr(self.config, "endgame_git_freeze_margin_seconds", 0) or 0),
+        configured_capabilities = self.config.model_capabilities
+        tools_supported = bool(
+            configured_capabilities is None
+            or getattr(configured_capabilities, "supports_tools", None) is not False
         )
-        if endgame_git_freeze_margin_seconds > 0 and self._tool_context is not None:
-            self._tool_context.endgame_git_freeze_active = False
-            self._tool_context.endgame_git_freeze_instrumentation_exempt = bool(
-                getattr(self.config, "endgame_git_freeze_instrumentation_exempt", False)
-            )
-
-        def _arm_endgame_git_freeze_if_due() -> None:
-            nonlocal endgame_git_freeze_armed
-            if (
-                endgame_git_freeze_armed
-                or endgame_git_freeze_margin_seconds <= 0
-                or _total_deadline is None
-                or _loop.time() <= _total_deadline - endgame_git_freeze_margin_seconds
-            ):
-                return
-            endgame_git_freeze_armed = True
-            if self._tool_context is not None:
-                self._tool_context.endgame_git_freeze_active = True
-            self._write_turn_call_log(
-                "turn_policy_decision",
-                action="endgame_git_freeze",
-                reason="deadline_margin",
-                code="endgame_git_freeze",
-                iteration=iterations,
-                remaining_seconds=int(max(0.0, _total_deadline - _loop.time())),
-                margin_seconds=endgame_git_freeze_margin_seconds,
-            )
-
-        def _defer_max_iterations_cap() -> bool:
-            """Whether the iteration cap yields to remaining wall-clock time.
-
-            True keeps the loop running normal iterations past the cap while
-            more than the extension margin remains before the total deadline;
-            the cap re-applies once the margin is reached. A finalization
-            attempt that already happened is never reopened.
-            """
-            nonlocal max_iterations_deadline_extension_logged
-            extend_seconds = max(
-                0,
-                int(
-                    getattr(self.config, "max_iterations_deadline_extend_seconds", 0)
-                    or 0
-                ),
-            )
-            if (
-                extend_seconds <= 0
-                or _total_deadline is None
-                or max_iterations_finalization_attempted
-                or _loop.time() >= _total_deadline - extend_seconds
-            ):
-                return False
-            if not max_iterations_deadline_extension_logged:
-                max_iterations_deadline_extension_logged = True
-                remaining_seconds = int(max(0.0, _total_deadline - _loop.time()))
-                self._write_turn_call_log(
-                    "turn_policy_decision",
-                    action="max_iterations_deadline_extension",
-                    reason="deadline_headroom",
-                    code="max_iterations_deadline_extension",
-                    iteration=iterations,
-                    max_iterations=self.config.max_iterations,
-                    remaining_seconds=remaining_seconds,
-                    extend_margin_seconds=extend_seconds,
-                )
-                append_runtime_event(
-                    self.config.runtime_events_path,
-                    {
-                        "feature": "max_iterations_deadline_extension",
-                        "name": "max_iterations_deadline_extension.active",
-                        "action": "defer_finalization",
-                        "reason": "deadline_headroom",
-                        "iteration": iterations,
-                        "max_iterations": self.config.max_iterations,
-                        "remaining_seconds": remaining_seconds,
-                        "extend_margin_seconds": extend_seconds,
-                        "session_key": self._session_key,
-                        "agent_id": (
-                            self.config.tool_result_store_agent_id
-                            or self.config.metadata.get("agent_id")
-                        ),
-                    },
-                )
-            return True
-
-        tools_supported = True
-        if self.config.model_capabilities is not None:
-            tools_supported = bool(getattr(self.config.model_capabilities, "supports_tools", True))
         provider_tool_definitions = self.tool_definitions or None
         if not tools_supported:
             provider_tool_definitions = None
@@ -5604,8 +6624,107 @@ class Agent:
                 code="turn_llm_call_budget_exceeded",
             )
 
+        agent = self
+
+        class _ImageAnalysisProvider:
+            """Charge one auxiliary request to this turn's existing budget."""
+
+            def __init__(self, physical_provider: Any) -> None:
+                self.physical_provider = physical_provider
+                self.admitted = False
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.physical_provider, name)
+
+            def _admit_auxiliary_request(self) -> None:
+                nonlocal turn_llm_calls
+                if image_projection_forced and (
+                    not selector_projects_images
+                    or selector_image_provider.active_deployment_config()
+                    == image_projection_forced_deployment
+                ):
+                    raise RuntimeError("image_capability_rejected")
+                error = _turn_budget_error() or _turn_llm_call_budget_error(turn_llm_calls + 1)
+                if error is not None:
+                    raise RuntimeError(error.code)
+                # No await between checking and reserving: parallel tools
+                # share the same call counter, just like primary requests.
+                turn_llm_calls += 1
+                self.admitted = True
+
+            async def chat(self, messages: Any, config: Any) -> AsyncIterator[Any]:
+                nonlocal total_input_tokens, total_output_tokens, total_reasoning_tokens
+                nonlocal total_cached_tokens, total_cache_write_tokens, total_billed_cost
+                nonlocal total_provider_billed_entries, total_unbilled_entries
+                nonlocal total_missing_cost_entries, turn_has_error_usage_receipt
+                nonlocal image_projection_forced, image_projection_forced_deployment
+                nonlocal image_projection_marker_state
+                if not self.admitted:
+                    self._admit_auxiliary_request()
+                metadata = provider_metadata(self.physical_provider)
+                provider_id = metadata.provider_id or metadata.provider_name
+                receipt_seen = False
+                stream = self.physical_provider.chat(messages=messages, config=config)
+                try:
+                    async for event in stream:
+                        if isinstance(event, ProviderErrorEvent) and classify_image_failure(
+                            event, provider_name=metadata.provider_name,
+                        ).is_unsupported:
+                            image_projection_forced = True
+                            image_projection_marker_state = ImageMarkerState.ANALYSIS_FAILED
+                            image_projection_forced_deployment = (
+                                selector_image_provider.active_deployment_config()
+                                if selector_projects_images else None
+                            )
+                        if not receipt_seen and (
+                            isinstance(event, ProviderDoneEvent)
+                            or isinstance(event, ProviderErrorEvent)
+                            and has_known_provider_usage_receipt(event)
+                        ):
+                            receipt_seen = True
+                            usage = normalize_provider_usage(
+                                event, default_provider=provider_id, default_model=metadata.model,
+                                completed_at_ms=0, resolve_estimates=False,
+                            )
+                            total_input_tokens += usage.input_tokens
+                            total_output_tokens += usage.output_tokens
+                            total_reasoning_tokens += usage.reasoning_tokens
+                            total_cached_tokens += usage.cache_read_tokens
+                            total_cache_write_tokens += usage.cache_write_tokens
+                            total_billed_cost += usage.billed_cost_nanos / 1_000_000_000
+                            total_missing_cost_entries += usage.missing_usage_entries
+                            turn_has_error_usage_receipt |= isinstance(event, ProviderErrorEvent)
+                            turn_model_usage_breakdown.extend(
+                                _normalized_usage_breakdown_rows(event, usage)
+                            )
+                            for item in usage.items:
+                                total_provider_billed_entries += int(
+                                    item.cost_source in {"provider_billed", "mixed"}
+                                )
+                                total_unbilled_entries += int(item.cost_source != "provider_billed")
+                                if agent._usage_tracker and agent._session_key:
+                                    agent._usage_tracker.add(
+                                        agent._session_key, input_tokens=item.input_tokens,
+                                        output_tokens=item.output_tokens, model_id=item.model,
+                                        cache_read_tokens=item.cache_read_tokens,
+                                        cache_write_tokens=item.cache_write_tokens,
+                                        billed_cost=item.billed_cost_nanos / 1_000_000_000,
+                                        provider=item.provider, cost_source=item.cost_source,
+                                    )
+                            _accumulate_turn_cost(
+                                event, default_provider=provider_id, default_model=metadata.model,
+                            )
+                        yield event
+                finally:
+                    close = getattr(stream, "aclose", None)
+                    if callable(close):
+                        await close()
+
+        self._image_analysis_provider_wrapper = _ImageAnalysisProvider
+
         pending_input_batch_staged = False
         staged_pending_input_message: Message | None = None
+        staged_claimed_goal_context: dict[str, Any] | None = None
 
         def _continuation_capabilities() -> tuple[int, bool, bool, str] | None:
             """Resolve capabilities for the physical leg that just completed."""
@@ -5615,8 +6734,8 @@ class Agent:
                 capabilities = self.config.model_capabilities
                 return (
                     max(0, int(self.config.context_window_tokens or 0)),
-                    bool(
-                        getattr(capabilities, "supports_tools", True)
+                    (
+                        getattr(capabilities, "supports_tools", None) is not False
                         if capabilities is not None
                         else True
                     ),
@@ -5669,7 +6788,11 @@ class Agent:
                 context_window = 0
             return (
                 context_window,
-                capabilities.get("supports_tools") is True,
+                # Capability discovery is advisory.  Unknown/unverified
+                # candidates must retain the tool surface; only an explicit
+                # ``False`` is a safe reason to steer a continuation away
+                # from tools.
+                capabilities.get("supports_tools") is not False,
                 capabilities.get("supports_vision") is True,
                 leg_kind,
             )
@@ -5704,23 +6827,16 @@ class Agent:
                     execution_leg=leg_kind,
                 )
                 return False
-            if self._count_image_blocks(turn_messages) > 0 and not supports_vision:
-                self._write_turn_call_log(
-                    "same_turn_steer_admission",
-                    action="defer_to_follow_up",
-                    reason="vision_unsupported",
-                    execution_leg=leg_kind,
-                )
-                return False
+            # Image capability never blocks a same-turn continuation.  The
+            # next physical request is independently projected: supported
+            # deployments receive the canonical image, unknown deployments
+            # receive one probe, and text-only deployments receive a marker.
+            del supports_vision
 
             if message_count_request_view is not None:
                 base_messages = message_count_request_view.materialize(turn_messages)
-                request_context_index = (
-                    message_count_request_view.request_context_insert_index
-                )
-                runtime_context_index = (
-                    message_count_request_view.runtime_context_insert_index
-                )
+                request_context_index = message_count_request_view.request_context_insert_index
+                runtime_context_index = message_count_request_view.runtime_context_insert_index
             else:
                 base_messages = turn_messages
                 request_context_index = request_context_insert_index
@@ -5731,7 +6847,6 @@ class Agent:
                 request_context_insert_index=request_context_index,
                 runtime_context_message=runtime_context_message,
                 runtime_context_insert_index=runtime_context_index,
-                turn_objective_message=turn_objective_message,
             )
             estimated_tokens = self._estimate_live_request_tokens(
                 prospective_request,
@@ -5755,11 +6870,12 @@ class Agent:
                 return False
             return True
 
-        def _claim_pending_inputs_for_next_call() -> bool:
+        async def _claim_pending_inputs_for_next_call() -> bool:
             """Claim one FIFO steer batch when another model call has headroom."""
 
             nonlocal pending_input_batch_staged
             nonlocal staged_pending_input_message
+            nonlocal staged_claimed_goal_context
             if pending_input_provider is None or pending_input_batch_staged:
                 return False
             if _turn_budget_error() is not None:
@@ -5778,19 +6894,64 @@ class Agent:
                 return False
             pending_message = Message(
                 role="user",
-                content=[
-                    ContentBlockText(text=pending_input)
-                    for pending_input in pending_preview
-                ],
+                content=[ContentBlockText(text=pending_input) for pending_input in pending_preview],
             )
             if not _continuation_request_fits(pending_message):
                 return False
-            pending_inputs = pending_input_provider.drain_pending()
+            claim_pending = getattr(pending_input_provider, "claim_pending", None)
+            if callable(claim_pending):
+                prepared_claim = claim_pending()
+                if inspect.isawaitable(prepared_claim):
+                    prepared_claim = await prepared_claim
+                pending_inputs = list(getattr(prepared_claim, "texts", ()) or ())
+                claimed_goal_context = getattr(prepared_claim, "goal_context", None)
+            else:
+                pending_inputs = pending_input_provider.drain_pending()
+                claimed_goal_context = None
+            goal_context_accepted = claimed_goal_context is None
+            if isinstance(claimed_goal_context, Mapping):
+                from opensquilla.session.goals import GoalTurnContext
+
+                current_goal_context = GoalTurnContext.from_task_detail(
+                    getattr(self._tool_context, "goal_context", None)
+                )
+                next_goal_context = GoalTurnContext.from_task_detail(claimed_goal_context)
+                if (
+                    self._tool_context is not None
+                    and current_goal_context is not None
+                    and next_goal_context is not None
+                    and next_goal_context.session_id == current_goal_context.session_id
+                    and next_goal_context.epoch == current_goal_context.epoch
+                    and next_goal_context.goal_id == current_goal_context.goal_id
+                    and next_goal_context.task_id == current_goal_context.task_id
+                    and next_goal_context.objective_revision
+                    >= current_goal_context.objective_revision
+                ):
+                    staged_claimed_goal_context = dict(claimed_goal_context)
+                    goal_context_accepted = True
+            if claimed_goal_context is not None and not goal_context_accepted:
+                # The internal Goal control is always the first claimed text.
+                # Drop it fail-closed if the Agent's own immutable task
+                # identity cannot adopt the validated durable context.
+                pending_inputs = pending_inputs[1:]
+                reject_goal_context = getattr(
+                    pending_input_provider,
+                    "reject_claimed_goal_context",
+                    None,
+                )
+                if callable(reject_goal_context):
+                    rejected = reject_goal_context()
+                    if inspect.isawaitable(rejected):
+                        _ = await rejected
             if not pending_inputs:
                 return False
-            staged_pending_input_message = pending_message
+            staged_pending_input_message = Message(
+                role="user",
+                content=[ContentBlockText(text=pending_input) for pending_input in pending_inputs],
+            )
             turn_messages.append(staged_pending_input_message)
             pending_input_batch_staged = True
+            install_turn.accept_user_input()
             return True
 
         async def _mark_staged_pending_inputs_applied(
@@ -5802,6 +6963,7 @@ class Agent:
 
             nonlocal pending_input_batch_staged
             nonlocal staged_pending_input_message
+            nonlocal staged_claimed_goal_context
             if not pending_input_batch_staged or pending_input_provider is None:
                 return
             mark_applied = getattr(pending_input_provider, "mark_applied", None)
@@ -5812,6 +6974,36 @@ class Agent:
                 )
                 if inspect.isawaitable(result):
                     await result
+            take_applied_goal_context = getattr(
+                pending_input_provider,
+                "take_applied_goal_context",
+                None,
+            )
+            applied_goal_context = (
+                take_applied_goal_context() if callable(take_applied_goal_context) else None
+            )
+            if staged_claimed_goal_context is not None and isinstance(
+                applied_goal_context, Mapping
+            ):
+                from opensquilla.session.goals import GoalTurnContext
+
+                staged_context = GoalTurnContext.from_task_detail(staged_claimed_goal_context)
+                applied_context = GoalTurnContext.from_task_detail(applied_goal_context)
+                current_context = GoalTurnContext.from_task_detail(
+                    getattr(self._tool_context, "goal_context", None)
+                )
+                if (
+                    self._tool_context is not None
+                    and staged_context is not None
+                    and applied_context == staged_context
+                    and current_context is not None
+                    and applied_context.session_id == current_context.session_id
+                    and applied_context.epoch == current_context.epoch
+                    and applied_context.goal_id == current_context.goal_id
+                    and applied_context.task_id == current_context.task_id
+                    and applied_context.objective_revision >= current_context.objective_revision
+                ):
+                    self._tool_context.goal_context = dict(applied_goal_context)
             applied_model_call_boundaries.append(
                 {
                     "model_call_id": model_call_id,
@@ -5824,57 +7016,68 @@ class Agent:
             )
             pending_input_batch_staged = False
             staged_pending_input_message = None
+            staged_claimed_goal_context = None
 
-        def _finish_artifact_delivery_degraded(
+        def _goal_terminal_final_response_text() -> str:
+            return (
+                "The Goal is complete."
+                if goal_terminal_final_status == "complete"
+                else "The Goal is blocked."
+            )
+
+        def _record_goal_terminal_synthesized_response(
             *,
             reason: str,
             code: str,
-        ) -> WarningEvent:
-            nonlocal artifact_delivery_degraded_final_response
-            nonlocal artifact_delivery_final_response_pending
-            if not "".join(final_text_parts).strip():
-                final_text_parts.append(
-                    self._artifact_delivery_final_response_text(
-                        artifact_delivery_final_response_artifacts
-                    )
-                )
-            artifact_delivery_degraded_final_response = True
-            artifact_delivery_final_response_pending = False
+        ) -> str:
+            final_response_text = _goal_terminal_final_response_text()
             self._write_turn_call_log(
-                "artifact_final_response_degraded",
+                "goal_terminal_final_response_synthesized",
                 reason=reason,
                 code=code,
-                artifact_count=len(artifact_delivery_final_response_artifacts),
+                status=goal_terminal_final_status,
             )
-            return WarningEvent(
-                code="artifact_delivery_final_response_degraded",
-                message=(
-                    "Artifact delivery completed, but the model could not generate "
-                    "the final explanatory response. Returning a deterministic "
-                    "completion message instead."
-                ),
-            )
+            return final_response_text
 
-        def _finish_artifact_delivery_without_provider() -> None:
-            final_response_text = self._artifact_delivery_final_response_text(
-                artifact_delivery_final_response_artifacts
+        def _finish_goal_terminal_without_provider(*, reason: str, code: str) -> None:
+            """Finish an already-durable Goal when no summary call has headroom."""
+
+            nonlocal goal_terminal_final_response_pending
+            nonlocal goal_terminal_final_status
+            final_response_text = _record_goal_terminal_synthesized_response(
+                reason=reason,
+                code=code,
             )
             current_text = "".join(final_text_parts)
             if final_response_text not in current_text:
                 prefix = "\n\n" if current_text.strip() else ""
                 final_text_parts.append(prefix + final_response_text)
-            self._write_turn_call_log(
-                "artifact_final_response_synthesized",
-                reason="publish_artifact_completed",
-                artifact_count=len(artifact_delivery_final_response_artifacts),
-            )
+            goal_terminal_final_response_pending = False
+            goal_terminal_final_status = None
 
         try:
             while True:
+                if goal_terminal_final_response_pending:
+                    terminal_headroom_error = _turn_budget_error()
+                    if terminal_headroom_error is None:
+                        terminal_headroom_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
+                    if terminal_headroom_error is not None:
+                        _finish_goal_terminal_without_provider(
+                            reason=terminal_headroom_error.message,
+                            code=terminal_headroom_error.code,
+                        )
+                        break
+                    if _total_deadline is not None and _loop.time() > _total_deadline:
+                        _finish_goal_terminal_without_provider(
+                            reason="The total turn deadline expired after Goal terminalization.",
+                            code="total_timeout",
+                        )
+                        break
                 if (
                     self.config.max_iterations > 0
                     and iterations >= self.config.max_iterations
-                    and not _defer_max_iterations_cap()
+                    and not goal_terminal_final_response_pending
+                    and not tool_failure_finalization_pending
                 ):
                     max_iterations_source = str(
                         self.config.metadata.get("agent_max_iterations_source", "agent_config")
@@ -5944,102 +7147,6 @@ class Agent:
                 if _total_deadline is not None and _loop.time() > _total_deadline:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
 
-                # Pre-deadline wrap-up: arm once when remaining wall clock drops
-                # below the configured margin. The directive is spliced into
-                # every subsequent provider request and rebuilt each iteration
-                # so the remaining-time figure stays current; tools stay
-                # available so the model can still apply and verify a final fix.
-                wrapup_margin_seconds = max(
-                    0,
-                    int(getattr(self.config, "deadline_wrapup_margin_seconds", 0) or 0),
-                )
-                if (
-                    wrapup_margin_seconds > 0
-                    and _total_deadline is not None
-                    and (
-                        deadline_wrapup_armed
-                        or _loop.time() > _total_deadline - wrapup_margin_seconds
-                    )
-                ):
-                    remaining_seconds = max(0.0, _total_deadline - _loop.time())
-                    deadline_wrapup_message = Message(
-                        role="user",
-                        content=_DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE.format(
-                            minutes=max(1, int(remaining_seconds // 60)),
-                        ),
-                    )
-                    if not deadline_wrapup_armed:
-                        deadline_wrapup_armed = True
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="deadline_wrapup",
-                            reason="deadline_margin",
-                            code="deadline_wrapup",
-                            iteration=iterations,
-                            remaining_seconds=int(remaining_seconds),
-                            margin_seconds=wrapup_margin_seconds,
-                        )
-
-                # Pre-deadline thinking cutoff: once remaining wall clock drops
-                # below the configured margin, thinking stays off for every
-                # remaining provider call so the final stretch is spent on tool
-                # calls rather than a single long reasoning stream.
-                thinking_off_margin_seconds = max(
-                    0,
-                    int(
-                        getattr(self.config, "deadline_thinking_off_margin_seconds", 0)
-                        or 0
-                    ),
-                )
-                if (
-                    thinking_off_margin_seconds > 0
-                    and _total_deadline is not None
-                    and not deadline_thinking_off_armed
-                    and _loop.time() > _total_deadline - thinking_off_margin_seconds
-                ):
-                    deadline_thinking_off_armed = True
-                    self._write_turn_call_log(
-                        "turn_policy_decision",
-                        action="deadline_thinking_off",
-                        reason="deadline_margin",
-                        code="deadline_thinking_off",
-                        iteration=iterations,
-                        remaining_seconds=int(
-                            max(0.0, _total_deadline - _loop.time())
-                        ),
-                        margin_seconds=thinking_off_margin_seconds,
-                    )
-                    # The turn-call log is a raw debug stream that run
-                    # harnesses do not collect; the runtime event is what
-                    # lets delivery gates tell this designed endgame
-                    # thinking cutoff (every later call runs
-                    # thinking-disabled) apart from a treatment delivery
-                    # failure.
-                    append_runtime_event(
-                        self.config.runtime_events_path,
-                        {
-                            "feature": "deadline_thinking_off",
-                            "name": "deadline_thinking_off.armed",
-                            "action": "disable_thinking_until_deadline",
-                            "reason": "deadline_margin",
-                            "iteration": iterations,
-                            "remaining_seconds": int(
-                                max(0.0, _total_deadline - _loop.time())
-                            ),
-                            "margin_seconds": thinking_off_margin_seconds,
-                            "session_key": self._session_key,
-                            "agent_id": (
-                                self.config.tool_result_store_agent_id
-                                or self.config.metadata.get("agent_id")
-                            ),
-                        },
-                    )
-
-                # Endgame git freeze arming; re-checked before tool execution
-                # because a long provider stream can cross the margin
-                # mid-iteration.
-                _arm_endgame_git_freeze_if_due()
-
                 iterations += 1
                 # The act-now message answers one reasoning-only failure; a
                 # fresh iteration starts from a clean request.
@@ -6052,18 +7159,21 @@ class Agent:
                 assistant_text_parts: list[str] = []
                 tool_calls: list[ToolCall] = []
                 pending_tools: dict[str, _StreamAccumulator] = {}
+                pending_tool_events: list[
+                    ToolUseStartEvent | ToolUseDeltaEvent | EngineToolUseEndEvent
+                ] = []
                 tool_argument_heartbeat_chars: dict[str, int] = {}
                 iter_input_tokens = 0
                 iter_output_tokens = 0
                 iter_reasoning_tokens = 0
                 iter_reasoning_content: str | None = None
                 iter_thinking_signature: str | None = None
+                iter_provider_replay = None
                 provider_error: ProviderErrorEvent | None = None
 
                 _retry_attempt = 0
+                _connection_wait_attempt = 0
                 _call_attempt = 0
-                _reasoning_cap_preempt_done = False
-                attempt_reasoning_stream_chars = 0
                 _retry_policy = _ProviderRetryPolicy.from_provider_budget(
                     _fallback.max_retries,
                     length_capped_continuations=self.config.length_capped_continuations,
@@ -6071,19 +7181,28 @@ class Agent:
                     # reasoning-only retry; the second budgeted retry gives the
                     # directive one delivery attempt of its own.
                     reasoning_only_retries=(
-                        2
-                        if bool(getattr(self.config, "reasoning_only_act_now", False))
-                        else 1
+                        2 if bool(getattr(self.config, "reasoning_only_act_now", False)) else 1
                     ),
                 )
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
                 _message_limit_recovery_done = False
+                # A precise provider image-capability rejection gets one
+                # request-local marker retry on the same configured model. It
+                # must not consume the generic retry budget or select an
+                # unconfigured model.
+                _image_marker_retry_done = False
+                image_marker_retry_deployments: list[Any] = []
+                provider_activity_id = uuid.uuid4().hex
+                next_provider_activity_reason: _ProviderActivityReason = "initial"
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
                     tool_calls = []
                     pending_tools = {}
+                    pending_tool_events = []
+                    if self._execution_context is not None:
+                        self._execution_context.drop_pending_tool_buffers("provider_retry")
                     seen_tool_use_ids: set[str] = set()
                     # Plain assistant text streams live as the answer the moment it
                     # arrives. text_presentation_decided flips to True once a tool
@@ -6096,43 +7215,33 @@ class Agent:
                     iter_reasoning_tokens = 0
                     iter_reasoning_content = None
                     iter_thinking_signature = None
+                    iter_provider_replay = None
                     _got_error = False
-                    _stream_policy_preempt = False
-                    attempt_reasoning_stream_chars = 0
                     provider_done_for_log: ProviderDoneEvent | None = None
                     provider_error_for_log: ProviderErrorEvent | None = None
                     cost_receipt_counted = False
                     call_id = f"{iterations}.{_call_attempt}"
+                    reasoning_block_id = ""
+                    reasoning_started_at_ms = 0
+                    active_reasoning_block_index = -1
+
+                    def _finish_reasoning_block(
+                        status: Literal["completed", "interrupted", "error"],
+                    ) -> ThinkingEndEvent | None:
+                        nonlocal reasoning_block_id
+                        if not reasoning_block_id:
+                            return None
+                        event = ThinkingEndEvent(
+                            block_id=reasoning_block_id,
+                            block_index=active_reasoning_block_index,
+                            status=status,
+                            ended_at=time.time_ns() // 1_000_000,
+                            generation_epoch=generation_epoch,
+                        )
+                        reasoning_block_id = ""
+                        return event
+
                     call_started_at = time.monotonic()
-                    provider_tools_for_call = (
-                        None
-                        if (
-                            artifact_delivery_final_response_pending
-                            or max_iterations_finalization_pending
-                            or post_write_convergence_finalization_pending
-                        )
-                        else provider_tool_definitions
-                    )
-                    provider_tools_for_call = self._workspace_edit_gate_tool_definitions(
-                        provider_tools_for_call,
-                        workspace_edit_gate_details,
-                        recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
-                    )
-                    if plan_run_delivery_only:
-                        provider_tools_for_call = (
-                            self._plan_run_delivery_tool_definitions(
-                                provider_tools_for_call
-                            )
-                        )
-                    tools_supported_for_call = (
-                        tools_supported
-                        and not artifact_delivery_final_response_pending
-                        and not max_iterations_finalization_pending
-                        and not post_write_convergence_finalization_pending
-                    )
                     ignored_post_delivery_tool_use = False
                     if message_count_request_view is not None:
                         base_request_turn_messages = message_count_request_view.materialize(
@@ -6154,11 +7263,16 @@ class Agent:
                         active_protected_turn_start_index = current_turn_start_index
 
                     request_suffix_messages: list[Message] = []
-                    if (
-                        post_write_convergence_finalization_pending
-                        and post_write_convergence_finalization_message is not None
-                    ):
-                        request_suffix_messages = [post_write_convergence_finalization_message]
+                    reasoning_only_act_now_for_call: Message | None = None
+                    if goal_terminal_final_response_pending:
+                        # The terminal Goal ToolResult is sufficient context for
+                        # one ordinary summary. Do not splice work/recovery
+                        # directives after the durable terminal decision.
+                        request_suffix_messages = []
+                    elif tool_failure_finalization_pending:
+                        request_suffix_messages = [
+                            Message(role="user", content=FAILURE_RECOVERY_INSTRUCTION)
+                        ]
                     elif (
                         max_iterations_finalization_pending
                         and max_iterations_finalization_message is not None
@@ -6167,110 +7281,345 @@ class Agent:
                     elif reasoning_only_act_now_message is not None and (
                         not turn_messages or turn_messages[-1].role != "assistant"
                     ):
-                        # Act-now beats the wrap-up directive for this retry:
-                        # it answers the reasoning-only failure that just
-                        # happened, and the wrap-up splice resumes on the next
-                        # request. Withheld on an assistant tail for the same
-                        # reasoning-prefill reason as below.
+                        # Answer the preceding reasoning-only failure. Preserve
+                        # an assistant tail when it carries a reasoning prefill.
                         request_suffix_messages = [reasoning_only_act_now_message]
-                    elif deadline_wrapup_message is not None and (
-                        not turn_messages or turn_messages[-1].role != "assistant"
-                    ):
-                        # Wrap-up defers to the finalization messages above,
-                        # which already demand a final answer, and is withheld
-                        # while the turn ends on an assistant message: the
-                        # reasoning-prefill continuation requires the assistant
-                        # tail to stay the last request message.
-                        request_suffix_messages = [deadline_wrapup_message]
+                        reasoning_only_act_now_for_call = reasoning_only_act_now_message
                     request_turn_messages = [
                         *base_request_turn_messages,
                         *request_suffix_messages,
                     ]
-                    (
-                        request_messages,
-                        request_sanitize_result,
-                    ) = await self._provider_request_messages_with_sanitize_async(
-                        request_turn_messages,
-                        request_context_message=request_context_message,
-                        request_context_insert_index=active_request_context_insert_index,
-                        runtime_context_message=runtime_context_message,
-                        runtime_context_insert_index=active_runtime_context_insert_index,
-                        turn_objective_message=turn_objective_message,
+                    if tool_images_pending_admission:
+                        tool_images_pending_admission = False
+                        if (
+                            count_provider_image_blocks(request_turn_messages) > 0
+                            and self._active_model_vision_support_for_call(chat_cfg) != "supported"
+                        ):
+                            prepare_continuation = getattr(
+                                self.provider, "prepare_image_continuation", None
+                            )
+                            rebound_config = None
+                            if callable(prepare_continuation):
+                                rebound_config = prepare_continuation(
+                                    request_turn_messages, chat_cfg
+                                )
+                                if inspect.isawaitable(rebound_config):
+                                    rebound_config = await rebound_config
+                            if isinstance(rebound_config, ChatConfig):
+                                chat_cfg = rebound_config
+                                identity = provider_metadata(self.provider)
+                                self.config.model_id = identity.model or self.config.model_id
+                                self.config.provider_id = (
+                                    identity.provider_id or identity.provider_name
+                                )
+                                self.config.model_capabilities = chat_cfg.model_capabilities
+                                tools_supported = (
+                                    getattr(chat_cfg.model_capabilities, "supports_tools", None)
+                                    is not False
+                                )
+                                provider_tool_definitions = (
+                                    (self.tool_definitions or None) if tools_supported else None
+                                )
+                                self.config.model_vision_support = chat_cfg.model_vision_support
+                                self.config.context_window_known = (
+                                    chat_cfg.provider_context_window_tokens > 0
+                                )
+                                self.config.max_tokens = chat_cfg.max_tokens
+                                self.config.provider_request_proof_max_chars = (
+                                    chat_cfg.provider_request_max_chars
+                                )
+                                active_window = getattr(
+                                    self.provider, "active_context_window_tokens", None
+                                )
+                                if callable(active_window):
+                                    context_window = active_window()
+                                    if isinstance(context_window, int) and context_window > 0:
+                                        self.config.context_window_tokens = context_window
+                                image_projection_forced = False
+                                image_projection_forced_deployment = None
+                                image_projection_marker_state = ImageMarkerState.NOT_ANALYZED
+                                for key in (
+                                    "image_input_forced_rejection_reason",
+                                    "image_input_rejection_reason",
+                                    "image_input_projection_required",
+                                    "image_input_reason",
+                                ):
+                                    self.config.metadata.pop(key, None)
+                                self._write_turn_call_log(
+                                    "image_continuation_route",
+                                    action="rebind",
+                                    model=self.config.model_id,
+                                    provider=self.config.provider_id,
+                                    image_count=count_provider_image_blocks(request_turn_messages),
+                                    iteration=iterations,
+                                )
+                    provider_tools_for_call = (
+                        None
+                        if goal_terminal_final_response_pending
+                        or max_iterations_finalization_pending
+                        or tool_failure_finalization_pending
+                        else provider_tool_definitions
                     )
-                    validation_error = validate_provider_chat_request(
+                    if plan_run_delivery_only:
+                        provider_tools_for_call = self._plan_run_delivery_tool_definitions(
+                            provider_tools_for_call
+                        )
+                    tools_supported_for_call = (
+                        tools_supported
+                        and not goal_terminal_final_response_pending
+                        and not max_iterations_finalization_pending
+                        and not tool_failure_finalization_pending
+                    )
+                    base_recovery_available = self._tool_result_recovery_available()
+                    call_retrieval_available = bool(
+                        self._provider_schema_has_tool_result_retrieval(provider_tools_for_call)
+                        and base_recovery_available
+                    )
+                    call_recovery_downgraded = False
+                    if not call_retrieval_available:
+                        # Restore before provider-view assembly.  The physical
+                        # call's admission/sanitization must see the true byte
+                        # pressure; restoring after those passes can turn an
+                        # admitted bounded request into an unbounded one.
+                        restored_request_turn_messages = (
+                            self._restore_tool_results_without_retrieval_schema(
+                                request_turn_messages
+                            )
+                        )
+                        # A tool-less/finalization call may hide retrieval even
+                        # when history contains no projected Store references.
+                        # Only the actual raw restoration expands the request and
+                        # therefore needs the custom-provider admission gate.
+                        call_recovery_downgraded = (
+                            restored_request_turn_messages is not request_turn_messages
+                        )
+                        request_turn_messages = restored_request_turn_messages
+                    previous_call_retrieval = self._provider_call_tool_result_retrieval_available
+                    self._provider_call_tool_result_retrieval_available = call_retrieval_available
+                    try:
+                        (
+                            request_messages,
+                            request_sanitize_result,
+                        ) = await self._provider_request_messages_with_sanitize_async(
+                            request_turn_messages,
+                            request_context_message=request_context_message,
+                            request_context_insert_index=active_request_context_insert_index,
+                            runtime_context_message=runtime_context_message,
+                            runtime_context_insert_index=active_runtime_context_insert_index,
+                        )
+                    except Exception as exc:
+                        if not goal_terminal_final_response_pending:
+                            raise
+                        response_text = _record_goal_terminal_synthesized_response(
+                            reason=(
+                                "Goal terminal summary request assembly failed after "
+                                f"terminalization ({type(exc).__name__})."
+                            ),
+                            code="goal_terminal_summary_request_assembly_failed",
+                        )
+                        assistant_text_parts.append(response_text)
+                        provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                        _got_done_event = True
+                        _got_error = False
+                        terminal_error = None
+                        yield TextDeltaEvent(text=response_text)
+                        break
+                    finally:
+                        self._provider_call_tool_result_retrieval_available = (
+                            previous_call_retrieval
+                        )
+                    # Project only this physical request. ``turn_messages`` and
+                    # ``request_turn_messages`` remain image-bearing canonical
+                    # views so a later vision-capable turn can recover the
+                    # original attachment. The projection runs after all
+                    # provider-view sanitizers because tool-result adapters may
+                    # introduce nested image blocks of their own.
+                    active_vision_support = (
+                        self._active_model_vision_support_for_call(chat_cfg)
+                    )
+                    barrier_requires_image_marker = bool(
+                        turn_image_retry_barrier_crossed
+                        and active_vision_support == "unknown"
+                        and count_projected_image_blocks(request_messages) > 0
+                    )
+                    if barrier_requires_image_marker:
+                        # Once a tool has executed (or output has escaped), an
+                        # unknown-capability native probe cannot be retried
+                        # safely. Shape this request as text up front so the
+                        # same configured model can still finish the turn.
+                        self.config.metadata["image_input_mode"] = (
+                            ImageProjectionMode.MARKER.value
+                        )
+                        self.config.metadata["image_input_reason"] = (
+                            "image_probe_unsafe_after_irreversible_effect"
+                        )
+                        self.config.metadata["image_input_stage"] = "primary"
+                    # Selector fallback must retain the image-bearing input;
+                    # this projected view is only for the active leg's local
+                    # admission, loop detection, and diagnostics.
+                    canonical_request_messages = request_messages
+                    force_current_image_marker = image_projection_forced and (
+                        not selector_projects_images
+                        or selector_image_provider.active_deployment_config()
+                        == image_projection_forced_deployment
+                    )
+                    if selector_projects_images:
+                        selector_image_provider.configure_image_request_projection(
+                            force_marker=force_current_image_marker,
+                            marker_state=image_projection_marker_state,
+                            forbid_unknown_probe=turn_image_retry_barrier_crossed,
+                            reason=(
+                                str(self.config.metadata.get("image_input_reason") or "")
+                                or None
+                            ),
+                        )
+                    request_messages, image_projection_result = (
+                        self._project_image_input_for_provider(
+                            request_messages,
+                            chat_config=chat_cfg,
+                            force_marker=(
+                                force_current_image_marker
+                                or barrier_requires_image_marker
+                            ),
+                            marker_state=image_projection_marker_state,
+                            stage="primary",
+                            reason_override=(
+                                "image_probe_unsafe_after_irreversible_effect"
+                                if barrier_requires_image_marker
+                                else None
+                            ),
+                        )
+                    )
+                    validation_error = validate_provider_chat_admission(
                         self.provider,
                         request_messages,
+                        chat_cfg,
                     )
                     if validation_error is not None:
+                        validation_image_failure = classify_image_failure(
+                            validation_error,
+                            provider_name=getattr(
+                                self.provider,
+                                "provider_name",
+                                "",
+                            ),
+                        )
+                        if (
+                            validation_image_failure.is_unsupported
+                            and (
+                                not _image_marker_retry_done
+                                or selector_projects_images
+                                and selector_image_provider.active_deployment_config()
+                                not in image_marker_retry_deployments
+                            )
+                            and not turn_image_retry_barrier_crossed
+                        ):
+                            image_fallback = getattr(
+                                self.provider,
+                                "fallback_after_image_rejection",
+                                None,
+                            )
+                            if callable(image_fallback) and image_fallback(
+                                "provider preflight rejected image input"
+                            ):
+                                # Router owns an explicit c0-c3 probe chain.
+                                # Keep the canonical request image-bearing for
+                                # the next configured leg; the wrapper rebinds
+                                # capability and request budgets per call.
+                                image_projection_forced = False
+                                image_projection_marker_state = (
+                                    ImageMarkerState.NOT_ANALYZED
+                                )
+                                _call_attempt += 1
+                                continue
+                            # A provider-side preflight can know more than the
+                            # catalog (for example an unlisted deployment).
+                            # Retry once with a truthful marker before any
+                            # visible output or side effect is emitted.
+                            _image_marker_retry_done = True
+                            image_projection_forced = True
+                            if selector_projects_images:
+                                image_projection_forced_deployment = (
+                                    selector_image_provider.active_deployment_config()
+                                )
+                                image_marker_retry_deployments.append(
+                                    image_projection_forced_deployment
+                                )
+                            self.config.metadata["image_input_mode"] = (
+                                ImageProjectionMode.MARKER.value
+                            )
+                            self.config.metadata["image_input_reason"] = (
+                                "image_capability_probe_failed"
+                            )
+                            self.config.metadata["image_input_stage"] = "preflight"
+                            self._write_turn_call_log(
+                                "image_input_projection",
+                                action="retry_marker",
+                                reason="provider_preflight_rejected_image",
+                                stage="preflight",
+                                image_count=count_projected_image_blocks(
+                                    request_messages
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
                         terminal_error = ErrorEvent(
                             message=validation_error.message,
                             code=validation_error.code,
                         )
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="stop",
-                            reason=terminal_error.message,
-                            code=terminal_error.code,
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        yield self._transition(AgentState.ERROR)
-                        yield terminal_error
-                        break
-                    identical_request_action = self._identical_request_loop_break_action(
-                        request_messages,
-                        first_attempt=_call_attempt == 0,
-                    )
-                    if identical_request_action == "abort":
-                        terminal_error = ErrorEvent(
-                            message=(
-                                "Turn stopped after "
-                                f"{self._identical_request_streak} consecutive "
-                                "byte-identical provider requests "
-                                "(identical_request_loop_break_threshold="
-                                f"{self.config.identical_request_loop_break_threshold})."
-                            ),
-                            code="identical_request_loop_abort",
-                        )
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action=(
-                                "artifact_degraded_finish"
-                                if artifact_delivery_final_response_pending
-                                else "stop"
-                            ),
-                            reason=terminal_error.message,
-                            code=terminal_error.code,
-                            identical_request_streak=self._identical_request_streak,
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        if artifact_delivery_final_response_pending:
-                            yield _finish_artifact_delivery_degraded(
+                        if goal_terminal_final_response_pending:
+                            response_text = _record_goal_terminal_synthesized_response(
                                 reason=terminal_error.message,
                                 code=terminal_error.code,
                             )
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
                             terminal_error = None
+                            yield TextDeltaEvent(text=response_text)
                         else:
+                            if validation_image_failure.is_unsupported:
+                                exact_image_count = count_provider_image_blocks(
+                                    request_messages
+                                )
+                                self.config.metadata["image_input_mode"] = "rejected"
+                                self.config.metadata.setdefault(
+                                    "image_input_reason",
+                                    "model_vision_unsupported",
+                                )
+                                self.config.metadata["image_input_count"] = exact_image_count
+                                self.config.metadata.setdefault(
+                                    "image_input_stage",
+                                    "primary",
+                                )
+                                self._write_turn_call_log(
+                                    "image_input_preflight",
+                                    action="reject",
+                                    reason=str(
+                                        self.config.metadata.get("image_input_reason")
+                                        or "model_vision_unsupported"
+                                    ),
+                                    stage=str(
+                                        self.config.metadata.get("image_input_stage") or "primary"
+                                    ),
+                                    image_count=int(
+                                        self.config.metadata.get("image_input_count") or 0
+                                    ),
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="stop",
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
                             yield self._transition(AgentState.ERROR)
                             yield terminal_error
                         break
-                    if identical_request_action == "perturb":
-                        request_messages = self._append_identical_request_loop_nudge(
-                            request_messages
-                        )
-                        if _call_attempt == 0:
-                            self.config.metadata["identical_request_loop_perturbations"] = (
-                                self.config.metadata.get(
-                                    "identical_request_loop_perturbations", 0
-                                )
-                                + 1
-                            )
-                            self._write_turn_call_log(
-                                "identical_request_loop_perturbed",
-                                identical_request_streak=self._identical_request_streak,
-                                iteration=iterations,
-                            )
                     self._write_context_stage(
                         "stream:context",
                         request_messages,
@@ -6280,15 +7629,12 @@ class Agent:
                         sanitize=request_sanitize_result,
                     )
 
-                    terminal_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
+                    next_call_budget_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
+                    terminal_error = next_call_budget_error
                     if terminal_error is not None:
                         self._write_turn_call_log(
                             "turn_policy_decision",
-                            action=(
-                                "artifact_degraded_finish"
-                                if artifact_delivery_final_response_pending
-                                else "stop"
-                            ),
+                            action=("stop"),
                             reason=terminal_error.message,
                             code=terminal_error.code,
                             sent_llm_calls=turn_llm_calls,
@@ -6296,30 +7642,35 @@ class Agent:
                             iteration=iterations,
                             attempt=_call_attempt,
                         )
-                        if artifact_delivery_final_response_pending:
-                            yield _finish_artifact_delivery_degraded(
-                                reason=terminal_error.message,
-                                code=terminal_error.code,
-                            )
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
                             terminal_error = None
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_without_summary_retry_headroom",
+                                reason="goal_terminal",
+                                code="turn_llm_call_budget_exceeded",
+                            )
+                            yield TextDeltaEvent(text=response_text)
                         else:
                             yield self._transition(AgentState.ERROR)
                             yield terminal_error
                         break
 
-                    call_chat_cfg = self._workspace_edit_gate_chat_config(
-                        chat_cfg,
-                        workspace_edit_gate_details,
-                        provider_tools_for_call,
-                        recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
-                    )
+                    call_chat_cfg = chat_cfg
+                    if tool_failure_finalization_pending:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"tool_choice": None, "physical_attempt_limit": 1}
+                        )
+                    if goal_terminal_final_response_pending:
+                        call_chat_cfg = call_chat_cfg.model_copy(update={"tool_choice": None})
                     forced_tool_choice = self.config.metadata.get("meta_match_tool_choice")
                     if (
                         forced_tool_choice is not None
-                        and workspace_edit_gate_details is None
                         and provider_tools_for_call
                         and request_messages
                         and not _tail_has_tool_result(request_messages)
@@ -6327,23 +7678,146 @@ class Agent:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={"tool_choice": forced_tool_choice}
                         )
-                    _attempt_thinking_disabled = False
-                    if _disable_thinking_for_next_provider_call:
-                        call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
-                        _disable_thinking_for_next_provider_call = False
-                        _attempt_thinking_disabled = True
-                    if deadline_thinking_off_armed:
-                        call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
-                        _attempt_thinking_disabled = True
+                    if _total_deadline is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "turn_deadline_at_monotonic": _total_deadline,
+                            }
+                        )
                     if self._provider_request_correlation is not None:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={
-                                "provider_request_correlation": (
-                                    self._provider_request_correlation
-                                )
+                                "provider_request_correlation": (self._provider_request_correlation)
                             }
                         )
+                    requires_replay = getattr(
+                        self.provider, "requires_complete_reasoning_history", None
+                    )
+                    replay_compatible = getattr(self.provider, "can_replay_reasoning", None)
+                    if (
+                        callable(requires_replay)
+                        and callable(replay_compatible)
+                        and requires_replay(
+                            tools=provider_tools_for_call, thinking=call_chat_cfg.thinking
+                        ) is True
+                    ):
+                        request_messages, replay_rebased = rebase_incomplete_reasoning_history(
+                            request_messages, compatible=replay_compatible
+                        )
+                        # Preserve canonical replay for selector fallbacks: each physical
+                        # provider leg projects its own compatible request view.
+                        if replay_rebased and not replay_boundary_notified:
+                            replay_boundary_notified = True
+                            yield WarningEvent(
+                                code="reasoning_replay_context_rebuilt",
+                                message=(
+                                    "Historical reasoning is unavailable for this interface. "
+                                    "Continuing with recorded conversation and tool results "
+                                    "in a new model context."
+                                ),
+                            )
+                    active_user_message_index = _active_user_message_index_for_request(
+                        request_messages,
+                        current_user_text=self._current_turn_message or "",
+                    )
+                    if active_user_message_index is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"active_user_message_index": (active_user_message_index)}
+                        )
 
+                    active_identity = self._active_execution_identity()
+                    if active_identity is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"execution_identity": active_identity}
+                        )
+                        request_messages = project_execution_identity(
+                            request_messages, call_chat_cfg,
+                        )
+
+                    if call_recovery_downgraded and not bool(
+                        getattr(
+                            self.provider,
+                            "final_request_admission_guaranteed",
+                            False,
+                        )
+                    ):
+                        # Built-in adapters perform exact admission before
+                        # network I/O. A custom/plugin provider may not. When
+                        # this physical call hid retrieval and therefore
+                        # restored raw tool results, require either its exact
+                        # projector or conservative local token+character
+                        # bounds before handing it the expanded envelope.
+                        exact_projection = project_provider_final_request(
+                            self.provider,
+                            request_messages,
+                            provider_tools_for_call,
+                            call_chat_cfg,
+                        )
+                        if exact_projection is not None:
+                            restored_request_fits = exact_projection.fits
+                            admission_source = "provider_exact_projection"
+                        else:
+                            estimated_tokens = self._estimate_live_request_tokens(
+                                request_messages,
+                                tools=provider_tools_for_call,
+                                config=call_chat_cfg,
+                            )
+                            estimated_chars = self._estimate_live_request_chars(
+                                request_messages,
+                                tools=provider_tools_for_call,
+                                config=call_chat_cfg,
+                            )
+                            budget = self._context_budget_governor().snapshot()
+                            token_limit, _ = effective_proof_token_budget(
+                                budget.usable_tokens,
+                            )
+                            char_limit = budget.provider_request_max_chars
+                            restored_request_fits = bool(
+                                estimated_tokens <= token_limit and estimated_chars <= char_limit
+                            )
+                            admission_source = "conservative_local_projection"
+                        if not restored_request_fits:
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "The provider request cannot safely include raw "
+                                    "tool results while retrieval is unavailable."
+                                ),
+                                code="provider_request_budget_exhausted",
+                            )
+                            if goal_terminal_final_response_pending:
+                                response_text = _record_goal_terminal_synthesized_response(
+                                    reason=terminal_error.message,
+                                    code=terminal_error.code,
+                                )
+                                assistant_text_parts.append(response_text)
+                                provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                                _got_done_event = True
+                                _got_error = False
+                                terminal_error = None
+                                yield TextDeltaEvent(text=response_text)
+                            else:
+                                self._write_turn_call_log(
+                                    "turn_policy_decision",
+                                    action="stop",
+                                    reason=terminal_error.message,
+                                    code=terminal_error.code,
+                                    admission_source=admission_source,
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                yield terminal_error
+                            break
+
+                    self._compaction_request_context = CompactionRequestContext(
+                        chat_config=call_chat_cfg.model_copy(deep=True),
+                        tools=(
+                            tuple(
+                                tool.model_copy(deep=True) for tool in provider_tools_for_call
+                            )
+                            if provider_tools_for_call else None
+                        ),
+                    )
                     self._write_turn_call_log(
                         "llm_request",
                         call_id=call_id,
@@ -6360,6 +7834,26 @@ class Agent:
                         call_id=call_id,
                         tools_supported=tools_supported_for_call,
                     )
+                    ensemble_request_count_baseline: int | None = None
+                    if ensemble_continuation_provider is self.provider:
+                        ensemble_request_count_baseline = ensemble_continuation_request_count
+                    ensemble_continuation_request_count = None
+                    ensemble_continuation_provider = None
+                    if (
+                        ensemble_request_count_baseline is None
+                        and self._execution_context is not None
+                        and getattr(self.provider, "execution_context_aware", False)
+                    ):
+                        continuation_snapshot = (
+                            self._execution_context.ensemble_continuation_snapshot
+                        )
+                        if (
+                            continuation_snapshot is not None
+                            and continuation_snapshot.request_started
+                        ):
+                            ensemble_request_count_baseline = (
+                                continuation_snapshot.physical_request_count
+                            )
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
                     if self._session_key:
@@ -6372,11 +7866,19 @@ class Agent:
 
                     _got_done_event = False
                     attempt_user_visible_emitted = False
+                    attempt_irreversible_output_emitted = False
+                    reasoning_activity_started_at_ms = 0
+                    last_reasoning_activity_pulse_at = 0.0
                     # Time-to-first-event for this provider call, stamped once
                     # at the first streamed event (diagnostics only).
                     first_event_at: float | None = None
+                    call_outcome_notified = False
 
                     def _notify_call_outcome(*, ok: bool, failure_kind: str = "") -> None:
+                        nonlocal call_outcome_notified
+                        if call_outcome_notified:
+                            return
+                        call_outcome_notified = True
                         self._notify_provider_call_observer(
                             ttft_ms=(
                                 int((first_event_at - call_started_at) * 1000)
@@ -6394,30 +7896,328 @@ class Agent:
                     if usage_scope is not None and not provider_accounts_physical_usage(
                         self.provider
                     ):
-                        usage_call = await self._usage_call_start(usage_scope)
+                        try:
+                            usage_call = await self._usage_call_start(usage_scope)
+                        except UsageAccountingUnavailableError as exc:
+                            exc.bind_replay_safety(
+                                no_prior_irreversible_effect=(
+                                    turn_llm_calls == 1 and not turn_irreversible_effect_started
+                                )
+                            )
+                            raise
+                        turn_irreversible_effect_started = True
+
+                    yield ProviderActivityEvent(
+                        activity_id=provider_activity_id,
+                        model=self._provider_activity_model(),
+                        phase="requesting",
+                        reason=next_provider_activity_reason,
+                        retry_attempt=_connection_wait_attempt or _retry_attempt,
+                        retry_limit=0 if _connection_wait_attempt else _fallback.max_retries,
+                        started_at=time.time_ns() // 1_000_000,
+                    )
 
                     try:
-                        if self._failure_injector is None:
-                            raw_stream = self.provider.chat(
-                                request_messages,
-                                tools=provider_tools_for_call,
-                                config=call_chat_cfg,
+                        try:
+                            if self._failure_injector is None:
+                                provider_chat: Any = getattr(self.provider, "chat")
+                                provider_chat_kwargs: dict[str, Any] = {
+                                    "tools": provider_tools_for_call,
+                                    "config": call_chat_cfg,
+                                }
+                                if getattr(
+                                    self.provider,
+                                    "execution_context_aware",
+                                    False,
+                                ):
+                                    provider_chat_kwargs["execution_context"] = (
+                                        self._execution_context
+                                    )
+                                raw_stream = provider_chat(
+                                    canonical_request_messages
+                                    if selector_projects_images
+                                    else request_messages,
+                                    **provider_chat_kwargs,
+                                )
+                            else:
+                                # Test-only seam: the injector either delegates this
+                                # exact call to self.provider or replaces it with one
+                                # scripted synthetic failure (see provider/types.py).
+                                raw_stream = self._failure_injector.chat(
+                                    self.provider,
+                                    canonical_request_messages
+                                    if selector_projects_images
+                                    else request_messages,
+                                    tools=provider_tools_for_call,
+                                    config=call_chat_cfg,
+                                    execution_context=self._execution_context,
+                                )
+                        except (asyncio.CancelledError, UsageAccountingUnavailableError):
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - provider boundary
+                            # Never retain upstream prose on the exception that
+                            # crosses into the agent loop.  The original
+                            # exception is deliberately not chained because SDK
+                            # messages may contain response bodies or secrets.
+                            raise _RaisedProviderBoundaryError(
+                                timeout=isinstance(exc, TimeoutError),
+                                connection_failed=is_connection_failure(exc),
+                            ) from None
+                        raw_stream = guard_provider_text_stream(raw_stream)
+                        pending_install_deadline: float | None = (
+                            self._pending_durable_compaction_event.compaction_deadline_at_monotonic
+                            if self._pending_durable_compaction_event is not None
+                            else None
+                        )
+
+                        def _active_stream_deadline() -> float | None:
+                            pending_event = self._pending_durable_compaction_event
+                            pending_deadline = (
+                                pending_event.compaction_deadline_at_monotonic
+                                if pending_event is not None
+                                else None
                             )
-                        else:
-                            # Test-only seam: the injector either delegates this
-                            # exact call to self.provider or replaces it with one
-                            # scripted synthetic failure (see provider/types.py).
-                            raw_stream = self._failure_injector.chat(
-                                self.provider,
-                                request_messages,
-                                tools=provider_tools_for_call,
-                                config=call_chat_cfg,
-                            )
+                            return pending_deadline
+
+                        provider_stream_deadline = _total_deadline
                         async for raw_ev in self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
-                            total_deadline=_total_deadline,
+                            total_deadline=provider_stream_deadline,
+                            deadline_provider=_active_stream_deadline,
                         ):
+                            if isinstance(raw_ev, ProviderGenerationResetEvent):
+                                if (
+                                    self._execution_context is not None
+                                    and self._execution_context.terminal
+                                ):
+                                    # A terminal reset closes the generation
+                                    # authority.  A provider that emits a late
+                                    # reset cannot create a second terminal.
+                                    continue
+                                terminal_error_message = ""
+                                terminal_error_code = ""
+                                terminal_failure_kind = ""
+                                if raw_ev.terminal:
+                                    terminal_provider = str(
+                                        self.config.provider_id
+                                        or getattr(self.provider, "provider_id", "")
+                                        or getattr(self.provider, "provider_name", "")
+                                        or ""
+                                    )
+                                    raw_terminal_code = str(
+                                        raw_ev.terminal_error_code or "ensemble_fixed_error"
+                                    )
+                                    terminal_status_code = (
+                                        int(raw_terminal_code)
+                                        if raw_terminal_code.isdigit()
+                                        else None
+                                    )
+                                    classified_terminal_failure = classify_provider_error(
+                                        provider_name=terminal_provider,
+                                        status_code=terminal_status_code,
+                                        raw_code=raw_terminal_code,
+                                        message=raw_ev.terminal_error_message,
+                                    )
+                                    terminal_failure_kind = classified_terminal_failure.value
+                                    terminal_error_code = safe_provider_failure_code(
+                                        raw_terminal_code,
+                                        terminal_failure_kind,
+                                    )
+                                    terminal_error_message = _safe_provider_terminal_message(
+                                        classified_terminal_failure,
+                                        raw_terminal_code,
+                                    )
+                                if self._execution_context is not None:
+                                    reset_event = self._execution_context.begin_generation_reset(
+                                        raw_ev.from_role,
+                                        raw_ev.to_role,
+                                        raw_ev.safe_reason,
+                                        terminal=raw_ev.terminal,
+                                        terminal_text_snapshot=(raw_ev.terminal_text_snapshot),
+                                        terminal_error_message=terminal_error_message,
+                                        terminal_error_code=terminal_error_code,
+                                        terminal_failure_kind=terminal_failure_kind,
+                                    )
+                                else:
+                                    reset_event = AnswerGenerationResetEvent(
+                                        old_generation_epoch=generation_epoch,
+                                        new_generation_epoch=generation_epoch + 1,
+                                        from_role=raw_ev.from_role,
+                                        to_role=raw_ev.to_role,
+                                        safe_reason=raw_ev.safe_reason,
+                                        sequence=last_provider_sequence + 1,
+                                        terminal=raw_ev.terminal,
+                                        terminal_text_snapshot=(raw_ev.terminal_text_snapshot),
+                                        terminal_error_message=terminal_error_message,
+                                        terminal_error_code=terminal_error_code,
+                                        terminal_failure_kind=terminal_failure_kind,
+                                    )
+                                generation_epoch = reset_event.new_generation_epoch
+                                last_provider_sequence = reset_event.sequence
+                                assistant_text_parts.clear()
+                                final_text_parts.clear()
+                                tool_calls.clear()
+                                pending_tools.clear()
+                                pending_tool_events.clear()
+                                seen_tool_use_ids.clear()
+                                tool_argument_heartbeat_chars.clear()
+                                final_reasoning_parts.clear()
+                                iter_reasoning_content = None
+                                iter_reasoning_tokens = 0
+                                iter_thinking_signature = None
+                                iter_provider_replay = None
+                                reasoning_started_at_ms = 0
+                                attempt_user_visible_emitted = False
+                                text_presentation_decided = False
+                                _got_done_event = False
+                                provider_done_for_log = None
+                                provider_error = None
+                                provider_error_for_log = None
+                                yield reset_event
+                                if raw_ev.terminal:
+                                    terminal_generation_reset_event = reset_event
+                                    terminal_model = str(self.config.model_id or "")
+                                    terminal_usage = normalize_provider_usage(
+                                        raw_ev,
+                                        default_provider=terminal_provider,
+                                        default_model=terminal_model,
+                                        completed_at_ms=0,
+                                    )
+                                    total_input_tokens += terminal_usage.input_tokens
+                                    total_output_tokens += terminal_usage.output_tokens
+                                    total_reasoning_tokens += terminal_usage.reasoning_tokens
+                                    total_cached_tokens += terminal_usage.cache_read_tokens
+                                    total_cache_write_tokens += terminal_usage.cache_write_tokens
+                                    total_billed_cost += (
+                                        terminal_usage.billed_cost_nanos / 1_000_000_000
+                                    )
+                                    total_missing_cost_entries += (
+                                        terminal_usage.missing_usage_entries
+                                    )
+                                    terminal_rows = [
+                                        dict(row)
+                                        for row in raw_ev.model_usage_breakdown
+                                        if isinstance(row, dict)
+                                    ]
+                                    turn_model_usage_breakdown.extend(terminal_rows)
+                                    for item in terminal_usage.items:
+                                        if (
+                                            item.cost_source == "provider_billed"
+                                            or item.billed_cost_nanos > 0
+                                        ):
+                                            total_provider_billed_entries += 1
+                                        else:
+                                            total_unbilled_entries += 1
+                                        if self._usage_tracker and self._session_key:
+                                            self._usage_tracker.add(
+                                                self._session_key,
+                                                input_tokens=item.input_tokens,
+                                                output_tokens=item.output_tokens,
+                                                model_id=item.model,
+                                                cache_read_tokens=item.cache_read_tokens,
+                                                cache_write_tokens=item.cache_write_tokens,
+                                                billed_cost=(
+                                                    item.billed_cost_nanos / 1_000_000_000
+                                                ),
+                                                provider=item.provider,
+                                                cost_source=item.cost_source,
+                                            )
+                                    _accumulate_turn_cost(
+                                        raw_ev,
+                                        default_provider=terminal_provider,
+                                        default_model=terminal_model,
+                                    )
+                                    cost_receipt_counted = True
+                                    if terminal_usage.items:
+                                        last_item = terminal_usage.items[-1]
+                                        last_actual_provider = last_item.provider
+                                        last_actual_model = last_item.model
+                                    if isinstance(raw_ev.ensemble_trace, dict):
+                                        ensemble_request_count_baseline = (
+                                            _merge_ensemble_request_count(
+                                                raw_ev.ensemble_trace,
+                                                ensemble_request_count_baseline,
+                                            )
+                                        )
+                                    provider_error_for_log = ProviderErrorEvent(
+                                        message=(
+                                            raw_ev.terminal_error_message
+                                            or "fixed provider final failure"
+                                        ),
+                                        code=(raw_ev.terminal_error_code or "ensemble_fixed_error"),
+                                        model_usage_breakdown=terminal_rows,
+                                        usage_missing_count=(raw_ev.usage_missing_count),
+                                    )
+                                    usage_unknown_reason = provider_error_usage_reason(
+                                        provider_error_for_log.code
+                                    )
+                                    if usage_call is not None and not usage_call_terminal:
+                                        usage_call_terminal = True
+                                        await self._usage_call_finalize(
+                                            usage_call,
+                                            raw_ev,
+                                        )
+                                continue
+
+                            raw_generation_epoch = getattr(raw_ev, "generation_epoch", None)
+                            if raw_generation_epoch is not None:
+                                try:
+                                    raw_generation_epoch = int(raw_generation_epoch)
+                                except (TypeError, ValueError):
+                                    continue
+                                if raw_generation_epoch != generation_epoch:
+                                    # A late event from a replaced provider
+                                    # generation must never repopulate the
+                                    # current answer or tool transaction.
+                                    continue
+
+                            raw_sequence = getattr(
+                                raw_ev,
+                                "_turn_execution_sequence",
+                                getattr(raw_ev, "sequence", None),
+                            )
+                            if raw_sequence is None:
+                                if self._execution_context is not None:
+                                    event_sequence = self._execution_context.next_sequence()
+                                else:
+                                    last_provider_sequence += 1
+                                    event_sequence = last_provider_sequence
+                            else:
+                                try:
+                                    event_sequence = int(raw_sequence)
+                                except (TypeError, ValueError):
+                                    continue
+                                if event_sequence <= last_provider_sequence:
+                                    continue
+                                last_provider_sequence = event_sequence
+                            if self._execution_context is not None and not bool(
+                                getattr(
+                                    raw_ev,
+                                    "_turn_execution_accepted",
+                                    False,
+                                )
+                            ):
+                                if isinstance(raw_ev, ProviderHeartbeatEvent):
+                                    meaningful = bool(raw_ev.upstream_activity)
+                                    provenance: Any = {
+                                        "upstream_activity": meaningful,
+                                        "synthetic": not meaningful,
+                                    }
+                                elif isinstance(raw_ev, ProviderEnsembleProgressEvent):
+                                    meaningful = False
+                                    provenance = {"synthetic": True}
+                                else:
+                                    meaningful = True
+                                    provenance = "upstream"
+                                if not self._execution_context.accept_event(
+                                    generation_epoch,
+                                    event_sequence,
+                                    meaningful,
+                                    provenance,
+                                ):
+                                    continue
+
                             if not isinstance(raw_ev, ProviderErrorEvent):
                                 # Provider.chat commonly returns an async
                                 # generator before it performs network I/O.
@@ -6428,17 +8228,60 @@ class Agent:
                                     iteration=iterations,
                                     model_call_id=call_id,
                                 )
+                                if self._pending_durable_compaction_event is not None:
+                                    pending_event = self._pending_durable_compaction_event
+                                    # Clear before yielding: if the consumer closes
+                                    # immediately after persisting this event, the
+                                    # wrapper must not emit a second terminal state.
+                                    self._pending_durable_compaction_event = None
+                                    yield pending_event
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
-                            if isinstance(raw_ev, ProviderTextDelta):
+                            if isinstance(raw_ev, ProviderDomainActivityEvent):
+                                activity_phase = _normalize_provider_activity_phase(raw_ev.phase)
+                                if activity_phase == "reasoning":
+                                    if reasoning_activity_started_at_ms == 0:
+                                        reasoning_activity_started_at_ms = (
+                                            max(0, raw_ev.started_at) or time.time_ns() // 1_000_000
+                                        )
+                                    last_reasoning_activity_pulse_at = time.monotonic()
+                                yield ProviderActivityEvent(
+                                    schema_version=1,
+                                    activity_id=provider_activity_id,
+                                    model=self._provider_activity_model(
+                                        getattr(raw_ev, "model", "")
+                                    ),
+                                    phase=activity_phase,
+                                    reason=_normalize_provider_activity_reason(raw_ev.reason),
+                                    retry_attempt=max(0, raw_ev.retry_attempt),
+                                    retry_limit=max(0, raw_ev.retry_limit),
+                                    retry_after_ms=max(0, raw_ev.retry_after_ms),
+                                    started_at=max(0, raw_ev.started_at),
+                                    heartbeat=bool(raw_ev.heartbeat),
+                                )
+
+                            elif isinstance(raw_ev, ProviderTextDelta):
+                                if raw_ev.text and not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
+                                if raw_ev.text:
+                                    reasoning_end = _finish_reasoning_block("completed")
+                                    if reasoning_end is not None:
+                                        yield reasoning_end
                                 assistant_text_parts.append(raw_ev.text)
                                 if raw_ev.text:
                                     attempt_user_visible_emitted = True
+                                    attempt_irreversible_output_emitted = True
+                                    turn_image_retry_barrier_crossed = True
                                 if text_presentation_decided:
                                     # A tool already appeared this call, so all
                                     # text here is intermediate narration.
                                     yield TextDeltaEvent(
-                                        text=raw_ev.text, presentation="intermediate"
+                                        text=raw_ev.text,
+                                        presentation="intermediate",
+                                        generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
                                 else:
                                     # No tool has appeared yet. Stream the text live,
@@ -6452,7 +8295,11 @@ class Agent:
                                     # already shown as answer are a deliberate,
                                     # harmless trade for live output.
                                     yield TextDeltaEvent(
-                                        text=raw_ev.text, presentation="answer"
+                                        text=raw_ev.text,
+                                        presentation="answer",
+                                        generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
 
                             elif isinstance(raw_ev, ProviderReasoningDelta):
@@ -6460,204 +8307,71 @@ class Agent:
                                 # answer: re-emit as ThinkingEvent and keep it
                                 # out of assistant_text_parts. The joined text
                                 # still arrives via DoneEvent.reasoning_content.
-                                if raw_ev.text and reasoning_started_at_ms == 0:
+                                if not raw_ev.text:
+                                    continue
+                                if not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
+                                if not reasoning_block_id:
                                     reasoning_started_at_ms = time.time_ns() // 1_000_000
+                                    active_reasoning_block_index = reasoning_block_index
+                                    reasoning_block_index += 1
+                                    reasoning_block_id = (
+                                        f"reasoning-{iterations}-{_call_attempt}-"
+                                        f"{active_reasoning_block_index}"
+                                    )
+                                    yield ThinkingStartEvent(
+                                        block_id=reasoning_block_id,
+                                        block_index=active_reasoning_block_index,
+                                        started_at=reasoning_started_at_ms,
+                                        generation_epoch=generation_epoch,
+                                    )
+                                # Bare providers reach Agent without the
+                                # selector's pre-text buffer. This thinking
+                                # delta therefore crosses the live-client
+                                # boundary immediately and cannot later be
+                                # discarded in favour of another attempt.
+                                attempt_irreversible_output_emitted = True
+                                turn_image_retry_barrier_crossed = True
+                                now_monotonic = time.monotonic()
+                                first_reasoning_activity = reasoning_activity_started_at_ms == 0
+                                if first_reasoning_activity:
+                                    reasoning_activity_started_at_ms = time.time_ns() // 1_000_000
+                                if (
+                                    first_reasoning_activity
+                                    or now_monotonic - last_reasoning_activity_pulse_at
+                                    >= _PROVIDER_REASONING_PULSE_INTERVAL_SECONDS
+                                ):
+                                    yield ProviderActivityEvent(
+                                        activity_id=provider_activity_id,
+                                        model=self._provider_activity_model(),
+                                        phase="reasoning",
+                                        reason="initial",
+                                        retry_attempt=_retry_attempt,
+                                        retry_limit=_fallback.max_retries,
+                                        started_at=reasoning_activity_started_at_ms,
+                                        heartbeat=not first_reasoning_activity,
+                                    )
+                                    last_reasoning_activity_pulse_at = now_monotonic
                                 yield ThinkingEvent(
                                     text=raw_ev.text,
                                     started_at=reasoning_started_at_ms,
+                                    block_id=reasoning_block_id,
+                                    block_index=active_reasoning_block_index,
+                                    generation_epoch=generation_epoch,
+                                    model_call_id=call_id,
+                                    iteration=iterations,
                                 )
-                                if (
-                                    wrapup_margin_seconds > 0
-                                    and _total_deadline is not None
-                                    and not deadline_wrapup_armed
-                                    and not attempt_user_visible_emitted
-                                    and not pending_tools
-                                    and not tool_calls
-                                    # Mirror the request-splice gates: the
-                                    # finalization messages take precedence
-                                    # over the directive, and the splice is
-                                    # withheld on an assistant tail. Preempting
-                                    # a stream the retry cannot splice into
-                                    # discards reasoning for a directive-free,
-                                    # otherwise identical request.
-                                    and not artifact_delivery_final_response_pending
-                                    and not max_iterations_finalization_pending
-                                    and not post_write_convergence_finalization_pending
-                                    and (
-                                        not turn_messages
-                                        or turn_messages[-1].role != "assistant"
-                                    )
-                                    and _loop.time()
-                                    > _total_deadline - wrapup_margin_seconds
-                                ):
-                                    # The wrap-up directive arms only at
-                                    # iteration boundaries, so a reasoning-only
-                                    # stream that consumes the whole margin ends
-                                    # at the hard deadline without the directive
-                                    # ever being delivered. Preempt while margin
-                                    # remains and retry the call with the
-                                    # directive spliced in; the discarded
-                                    # reasoning prefix was running into the hard
-                                    # kill anyway. One-shot: arming makes this
-                                    # branch unreachable afterwards.
-                                    remaining_seconds = max(
-                                        0.0, _total_deadline - _loop.time()
-                                    )
-                                    deadline_wrapup_message = Message(
-                                        role="user",
-                                        content=_DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE.format(
-                                            minutes=max(
-                                                1, int(remaining_seconds // 60)
-                                            ),
-                                        ),
-                                    )
-                                    deadline_wrapup_armed = True
-                                    # The retry runs thinking-disabled: the
-                                    # margin exists to spend the last stretch
-                                    # answering, and a thinking-on retry can
-                                    # burn the entire remainder on another
-                                    # reasoning mega-stream that the hard
-                                    # deadline then kills with nothing
-                                    # delivered.
-                                    _disable_thinking_for_next_provider_call = True
-                                    if bool(
-                                        getattr(
-                                            self.config,
-                                            "deadline_wrapup_sticky_thinking_off",
-                                            False,
-                                        )
-                                    ):
-                                        # Sticky variant: the one-shot above
-                                        # covers only the retry; the next
-                                        # iteration re-enables thinking and can
-                                        # spend the rest of the margin on
-                                        # another mega-stream. Arming the
-                                        # deadline cutoff keeps every remaining
-                                        # call thinking-disabled.
-                                        deadline_thinking_off_armed = True
-                                        append_runtime_event(
-                                            self.config.runtime_events_path,
-                                            {
-                                                "feature": "deadline_wrapup",
-                                                "name": (
-                                                    "deadline_wrapup"
-                                                    ".sticky_thinking_off"
-                                                ),
-                                                "action": (
-                                                    "disable_thinking"
-                                                    "_until_deadline"
-                                                ),
-                                                "reason": (
-                                                    "reasoning_stream_preempt"
-                                                ),
-                                                "iteration": iterations,
-                                                "attempt": _call_attempt,
-                                                "session_key": self._session_key,
-                                                "agent_id": (
-                                                    self.config.tool_result_store_agent_id
-                                                    or self.config.metadata.get(
-                                                        "agent_id"
-                                                    )
-                                                ),
-                                            },
-                                        )
-                                    self._write_turn_call_log(
-                                        "turn_policy_decision",
-                                        action="deadline_wrapup",
-                                        reason="reasoning_stream_preempt",
-                                        code="deadline_wrapup_preempt",
-                                        iteration=iterations,
-                                        attempt=_call_attempt,
-                                        remaining_seconds=int(remaining_seconds),
-                                        margin_seconds=wrapup_margin_seconds,
-                                    )
-                                    _got_error = True
-                                    _stream_policy_preempt = True
-                                    break  # break stream, retry with directive
-                                if (
-                                    _reasoning_stream_char_cap > 0
-                                    and not _reasoning_cap_preempt_done
-                                ):
-                                    attempt_reasoning_stream_chars += len(
-                                        raw_ev.text or ""
-                                    )
-                                    if (
-                                        attempt_reasoning_stream_chars
-                                        > _reasoning_stream_char_cap
-                                        and not attempt_user_visible_emitted
-                                        and not pending_tools
-                                        and not tool_calls
-                                        # Thinking already off for this call:
-                                        # a retry sans thinking changes
-                                        # nothing, so let the stream run.
-                                        and not _attempt_thinking_disabled
-                                    ):
-                                        # Runaway reasoning-only stream: discard
-                                        # the partial reasoning and retry the
-                                        # call with thinking disabled for that
-                                        # retry only, so the budget goes to
-                                        # tool calls instead of one unbounded
-                                        # reasoning stream. One preempt per
-                                        # iteration: if the provider keeps
-                                        # streaming reasoning on the retry, it
-                                        # runs to completion.
-                                        _reasoning_cap_preempt_done = True
-                                        _disable_thinking_for_next_provider_call = True
-                                        self._write_turn_call_log(
-                                            "turn_policy_decision",
-                                            action="reasoning_cap",
-                                            reason="reasoning_stream_char_cap",
-                                            code="reasoning_cap_preempt",
-                                            iteration=iterations,
-                                            attempt=_call_attempt,
-                                            reasoning_chars=(
-                                                attempt_reasoning_stream_chars
-                                            ),
-                                            cap_chars=_reasoning_stream_char_cap,
-                                        )
-                                        # The turn-call log is a raw debug
-                                        # stream that run harnesses do not
-                                        # collect; the runtime event is what
-                                        # lets delivery gates tell a designed
-                                        # cap preempt (whose retry runs
-                                        # thinking-disabled) apart from a
-                                        # treatment delivery failure.
-                                        append_runtime_event(
-                                            self.config.runtime_events_path,
-                                            {
-                                                "feature": "reasoning_cap",
-                                                "name": "reasoning_cap.preempt",
-                                                "action": "retry_without_thinking",
-                                                "reason": (
-                                                    "reasoning_stream_char_cap"
-                                                ),
-                                                "iteration": iterations,
-                                                "attempt": _call_attempt,
-                                                "reasoning_chars": (
-                                                    attempt_reasoning_stream_chars
-                                                ),
-                                                "cap_chars": (
-                                                    _reasoning_stream_char_cap
-                                                ),
-                                                "session_key": self._session_key,
-                                                "agent_id": (
-                                                    self.config.tool_result_store_agent_id
-                                                    or self.config.metadata.get(
-                                                        "agent_id"
-                                                    )
-                                                ),
-                                            },
-                                        )
-                                        _got_error = True
-                                        _stream_policy_preempt = True
-                                        break  # break stream, retry sans thinking
 
                             elif isinstance(raw_ev, ProviderToolUseStart):
+                                reasoning_end = _finish_reasoning_block("completed")
+                                if reasoning_end is not None:
+                                    yield reasoning_end
                                 if not tools_supported_for_call:
                                     if (
-                                        artifact_delivery_final_response_pending
+                                        goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
-                                        or post_write_convergence_finalization_pending
+                                        or tool_failure_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
@@ -6679,6 +8393,7 @@ class Agent:
                                     _got_error = True
                                     pending_tools.clear()
                                     tool_calls.clear()
+                                    pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 seen_tool_use_ids.add(raw_ev.tool_use_id)
@@ -6691,15 +8406,24 @@ class Agent:
                                     synthetic_from_text=raw_ev.synthetic_from_text,
                                 )
                                 tool_argument_heartbeat_chars[raw_ev.tool_use_id] = 0
-                                attempt_user_visible_emitted = True
-                                yield ToolUseStartEvent(
-                                    tool_use_id=raw_ev.tool_use_id,
-                                    tool_name=raw_ev.tool_name,
-                                    synthetic_from_text=raw_ev.synthetic_from_text,
-                                    started_at=int(time.time() * 1000),
+                                pending_tool_events.append(
+                                    ToolUseStartEvent(
+                                        tool_use_id=raw_ev.tool_use_id,
+                                        tool_name=raw_ev.tool_name,
+                                        synthetic_from_text=raw_ev.synthetic_from_text,
+                                        started_at=int(time.time() * 1000),
+                                        generation_epoch=generation_epoch,
+                                    )
                                 )
+                                if self._execution_context is not None:
+                                    self._execution_context.open_tool_buffer(
+                                        raw_ev.tool_use_id
+                                    ).append(pending_tool_events[-1])
 
                             elif isinstance(raw_ev, ProviderToolUseDelta):
+                                reasoning_end = _finish_reasoning_block("completed")
+                                if reasoning_end is not None:
+                                    yield reasoning_end
                                 if not tools_supported_for_call:
                                     continue
                                 delta_tool_use_id = raw_ev.tool_use_id
@@ -6721,16 +8445,24 @@ class Agent:
                                     _got_error = True
                                     pending_tools.clear()
                                     tool_calls.clear()
+                                    pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 json_fragment = raw_ev.json_fragment
                                 acc.json_buf.append(json_fragment)
                                 acc.json_chars += len(json_fragment)
                                 if json_fragment:
-                                    yield ToolUseDeltaEvent(
-                                        tool_use_id=raw_ev.tool_use_id,
-                                        json_fragment=json_fragment,
+                                    pending_tool_events.append(
+                                        ToolUseDeltaEvent(
+                                            tool_use_id=raw_ev.tool_use_id,
+                                            json_fragment=json_fragment,
+                                            generation_epoch=generation_epoch,
+                                        )
                                     )
+                                    if self._execution_context is not None:
+                                        self._execution_context.open_tool_buffer(
+                                            raw_ev.tool_use_id
+                                        ).append(pending_tool_events[-1])
                                 last_heartbeat_chars = tool_argument_heartbeat_chars.get(
                                     raw_ev.tool_use_id, 0
                                 )
@@ -6743,27 +8475,30 @@ class Agent:
                                     )
                                     yield RunHeartbeatEvent(
                                         phase="llm_tool_arguments",
-                                        elapsed_ms=int(
-                                            (time.monotonic() - call_started_at) * 1000
-                                        ),
+                                        elapsed_ms=int((time.monotonic() - call_started_at) * 1000),
                                         idle_ms=0,
-                                        message=(f"Receiving {acc.tool_name} arguments"),
+                                        # Keep the pending tool identity private
+                                        # until a legal DoneEvent commits the
+                                        # generation. This remains a transport
+                                        # liveness signal only.
+                                        message="Receiving tool arguments",
+                                        generation_epoch=generation_epoch,
                                     )
 
                             elif isinstance(raw_ev, ToolUseEndEvent):
+                                reasoning_end = _finish_reasoning_block("completed")
+                                if reasoning_end is not None:
+                                    yield reasoning_end
                                 if not tools_supported_for_call:
                                     if (
-                                        artifact_delivery_final_response_pending
+                                        goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
-                                        or post_write_convergence_finalization_pending
+                                        or tool_failure_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
                                 end_tool_use_id = raw_ev.tool_use_id
-                                if (
-                                    isinstance(end_tool_use_id, str)
-                                    and end_tool_use_id.strip()
-                                ):
+                                if isinstance(end_tool_use_id, str) and end_tool_use_id.strip():
                                     acc = pending_tools.pop(end_tool_use_id, None)
                                     tool_argument_heartbeat_chars.pop(end_tool_use_id, None)
                                 else:
@@ -6780,6 +8515,7 @@ class Agent:
                                     _got_error = True
                                     pending_tools.clear()
                                     tool_calls.clear()
+                                    pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 invalid_arguments = not isinstance(raw_ev.arguments, dict)
@@ -6805,6 +8541,7 @@ class Agent:
                                     _got_error = True
                                     pending_tools.clear()
                                     tool_calls.clear()
+                                    pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 # ToolUseEndEvent is the provider boundary's
@@ -6827,6 +8564,19 @@ class Agent:
                                         synthetic_from_text=synthetic_from_text,
                                     )
                                 )
+                                pending_tool_events.append(
+                                    EngineToolUseEndEvent(
+                                        tool_use_id=raw_ev.tool_use_id,
+                                        tool_name=raw_ev.tool_name,
+                                        arguments=dict(arguments),
+                                        synthetic_from_text=synthetic_from_text,
+                                        generation_epoch=generation_epoch,
+                                    )
+                                )
+                                if self._execution_context is not None:
+                                    self._execution_context.open_tool_buffer(
+                                        raw_ev.tool_use_id
+                                    ).append(pending_tool_events[-1])
 
                             elif isinstance(raw_ev, ProviderDoneEvent):
                                 # Call ended. All text was already streamed live as
@@ -6837,7 +8587,57 @@ class Agent:
                                     # duplicate either legacy or ledger totals.
                                     continue
                                 provider_done_for_log = raw_ev
+                                self._current_request_execution = execution_from_evidence(
+                                    {
+                                        "model": raw_ev.model,
+                                        "provider": raw_ev.provider,
+                                        "ensemble_trace": raw_ev.ensemble_trace,
+                                        "execution_legs": self.config.metadata.get(
+                                            "execution_legs"
+                                        ),
+                                    },
+                                    request_identity=self._active_execution_identity(),
+                                )
                                 _got_done_event = True
+                                if keepalive_stable_history and self._session_key:
+                                    try:
+                                        self._prompt_cache_keepalive_candidate = (
+                                            PromptCacheKeepaliveCandidate(
+                                                session_key=self._session_key,
+                                                provider=self.provider,
+                                                provider_id=str(
+                                                    getattr(
+                                                        self.provider,
+                                                        "active_provider_id",
+                                                        "",
+                                                    )
+                                                    or self.config.provider_id
+                                                    or getattr(
+                                                        self.provider,
+                                                        "provider_id",
+                                                        "",
+                                                    )
+                                                    or getattr(
+                                                        self.provider,
+                                                        "provider_name",
+                                                        "",
+                                                    )
+                                                    or ""
+                                                ),
+                                                model=str(
+                                                    raw_ev.model or self.config.model_id or ""
+                                                ),
+                                                messages=keepalive_stable_history,
+                                                tools=tuple(
+                                                    copy.deepcopy(provider_tools_for_call or [])
+                                                ),
+                                                config=call_chat_cfg.model_copy(deep=True),
+                                            )
+                                        )
+                                    except Exception:
+                                        # Snapshotting is strictly optional and
+                                        # must never change a real user turn.
+                                        self._prompt_cache_keepalive_candidate = None
                                 physical_usage_provider = str(
                                     getattr(
                                         raw_ev,
@@ -6871,6 +8671,21 @@ class Agent:
                                 iter_reasoning_tokens = raw_ev.reasoning_tokens
                                 iter_reasoning_content = raw_ev.reasoning_content
                                 iter_thinking_signature = raw_ev.thinking_signature
+                                iter_provider_replay = raw_ev.provider_replay
+                                if (
+                                    self.config.metadata.get("reasoning_replay_context_rebuilt")
+                                    and not replay_boundary_notified
+                                ):
+                                    replay_boundary_notified = True
+                                    yield WarningEvent(
+                                        code="reasoning_replay_context_rebuilt",
+                                        message=(
+                                            "Historical reasoning is unavailable for this "
+                                            "interface. Continuing with recorded conversation "
+                                            "and tool results "
+                                            "in a new model context."
+                                        ),
+                                    )
                                 total_billed_cost += raw_ev.billed_cost
                                 total_input_tokens += raw_ev.input_tokens
                                 total_output_tokens += raw_ev.output_tokens
@@ -6914,23 +8729,29 @@ class Agent:
                                     ]
                                 )
                                 for usage_source_row in usage_source_rows:
-                                    usage_source = str(
-                                        usage_source_row.get("cost_source")
-                                        or usage_source_row.get("costSource")
-                                        or "none"
-                                    ).strip().lower()
+                                    usage_source = (
+                                        str(
+                                            usage_source_row.get("cost_source")
+                                            or usage_source_row.get("costSource")
+                                            or "none"
+                                        )
+                                        .strip()
+                                        .lower()
+                                    )
                                     usage_receipt = usage_source_row.get(
                                         "billing_receipt",
                                         usage_source_row.get("billingReceipt"),
                                     )
                                     if isinstance(usage_receipt, dict):
-                                        receipt_status = str(
-                                            usage_receipt.get("status") or ""
-                                        ).strip().lower()
+                                        receipt_status = (
+                                            str(usage_receipt.get("status") or "").strip().lower()
+                                        )
                                     else:
-                                        receipt_status = str(
-                                            getattr(usage_receipt, "status", "") or ""
-                                        ).strip().lower()
+                                        receipt_status = (
+                                            str(getattr(usage_receipt, "status", "") or "")
+                                            .strip()
+                                            .lower()
+                                        )
                                     legacy_billed_cost = _usage_float(
                                         usage_source_row.get(
                                             "billed_cost",
@@ -6941,7 +8762,8 @@ class Agent:
                                         total_provider_billed_entries += 1
                                         total_unbilled_entries += 1
                                     elif (
-                                        usage_source in {
+                                        usage_source
+                                        in {
                                             "provider_billed",
                                             "openrouter_usage",
                                         }
@@ -6970,6 +8792,22 @@ class Agent:
                                 # live context-window gauge below.
                                 if valid_usage_breakdown:
                                     turn_model_usage_breakdown.extend(valid_usage_breakdown)
+                                else:
+                                    # Auxiliary image receipts can share this
+                                    # turn. Retain the primary contribution too,
+                                    # instead of reporting only auxiliary rows.
+                                    turn_model_usage_breakdown.extend(
+                                        _normalized_usage_breakdown_rows(
+                                            raw_ev,
+                                            normalize_provider_usage(
+                                                raw_ev,
+                                                default_provider=executed_provider_id,
+                                                default_model=physical_usage_model,
+                                                completed_at_ms=0,
+                                                resolve_estimates=False,
+                                            ),
+                                        )
+                                    )
                                 if self._usage_tracker and self._session_key:
                                     # Forward the provider's real per-call billed_cost so
                                     # the per-model breakdown can show actual numbers
@@ -7030,59 +8868,114 @@ class Agent:
                                         )
                                 ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
                                 if isinstance(ensemble_trace, dict):
-                                    last_ensemble_trace = dict(ensemble_trace)
-                                    turn_ensemble_request_count += _usage_int(
-                                        ensemble_trace.get("llm_request_count") or 0
+                                    ensemble_request_count_baseline = _merge_ensemble_request_count(
+                                        ensemble_trace,
+                                        ensemble_request_count_baseline,
                                     )
+                                    if tool_calls:
+                                        ensemble_continuation_request_count = (
+                                            ensemble_request_count_baseline
+                                        )
+                                        ensemble_continuation_provider = self.provider
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
-                                usage_unknown_reason = provider_error_usage_reason(
-                                    raw_ev.code
-                                )
+                                ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
+                                if isinstance(ensemble_trace, dict):
+                                    ensemble_request_count_baseline = _merge_ensemble_request_count(
+                                        ensemble_trace,
+                                        ensemble_request_count_baseline,
+                                    )
+                                pending_tool_events.clear()
+                                usage_unknown_reason = provider_error_usage_reason(raw_ev.code)
                                 known_usage_receipt = has_known_provider_usage_receipt(raw_ev)
+                                error_usage: UsageCallResult | None = None
+                                if known_usage_receipt and not cost_receipt_counted:
+                                    usage_default_provider = (
+                                        usage_call.provider
+                                        if usage_call is not None
+                                        else str(
+                                            self.config.provider_id
+                                            or getattr(
+                                                self.provider,
+                                                "provider_name",
+                                                "",
+                                            )
+                                            or ""
+                                        )
+                                    )
+                                    usage_default_model = (
+                                        usage_call.model
+                                        if usage_call is not None
+                                        else str(self.config.model_id or "")
+                                    )
+                                    error_usage = normalize_provider_usage(
+                                        raw_ev,
+                                        default_provider=usage_default_provider,
+                                        default_model=usage_default_model,
+                                        completed_at_ms=time.time_ns() // 1_000_000,
+                                        resolve_estimates=False,
+                                    )
                                 if (
                                     usage_call is not None
                                     and not usage_call_terminal
                                     and known_usage_receipt
                                 ):
                                     usage_call_terminal = True
-                                    await self._usage_call_finalize(usage_call, raw_ev)
-                                if known_usage_receipt and not cost_receipt_counted:
+                                    await self._usage_call_finalize(
+                                        usage_call,
+                                        raw_ev,
+                                        normalized_result=error_usage,
+                                    )
+                                if error_usage is not None:
+                                    total_billed_cost += (
+                                        error_usage.billed_cost_nanos / 1_000_000_000
+                                    )
+                                    total_input_tokens += error_usage.input_tokens
+                                    total_output_tokens += error_usage.output_tokens
+                                    total_reasoning_tokens += error_usage.reasoning_tokens
+                                    total_cached_tokens += error_usage.cache_read_tokens
+                                    total_cache_write_tokens += error_usage.cache_write_tokens
+                                    total_missing_cost_entries += error_usage.missing_usage_entries
+                                    canonical_error_rows = _normalized_usage_breakdown_rows(
+                                        raw_ev,
+                                        error_usage,
+                                    )
+                                    turn_model_usage_breakdown.extend(canonical_error_rows)
+                                    for usage_item in error_usage.items:
+                                        usage_model = usage_item.model or "unknown"
+                                        if usage_item.cost_source == "mixed":
+                                            total_provider_billed_entries += 1
+                                            total_unbilled_entries += 1
+                                        elif usage_item.cost_source == "provider_billed":
+                                            total_provider_billed_entries += 1
+                                        else:
+                                            total_unbilled_entries += 1
+                                        if self._usage_tracker and self._session_key:
+                                            self._usage_tracker.add(
+                                                self._session_key,
+                                                input_tokens=usage_item.input_tokens,
+                                                output_tokens=usage_item.output_tokens,
+                                                model_id=usage_model,
+                                                cache_read_tokens=(usage_item.cache_read_tokens),
+                                                cache_write_tokens=(usage_item.cache_write_tokens),
+                                                billed_cost=(
+                                                    usage_item.billed_cost_nanos / 1_000_000_000
+                                                ),
+                                                provider=usage_item.provider,
+                                                cost_source=usage_item.cost_source,
+                                            )
                                     _accumulate_turn_cost(
                                         raw_ev,
-                                        default_provider=(
-                                            usage_call.provider
-                                            if usage_call is not None
-                                            else str(
-                                                self.config.provider_id
-                                                or getattr(
-                                                    self.provider,
-                                                    "provider_name",
-                                                    "",
-                                                )
-                                                or ""
-                                            )
-                                        ),
-                                        default_model=(
-                                            usage_call.model
-                                            if usage_call is not None
-                                            else str(self.config.model_id or "")
-                                        ),
+                                        default_provider=usage_default_provider,
+                                        default_model=usage_default_model,
                                     )
+                                    if usage_default_model:
+                                        last_actual_model = usage_default_model
+                                    if usage_default_provider:
+                                        last_actual_provider = usage_default_provider
                                     cost_receipt_counted = True
-                                # One-shot thinking/reasoning fallback
-                                _err_lower = raw_ev.message.lower()
-                                if (
-                                    thinking_enabled
-                                    and not _thinking_fallback_done
-                                    and ("thinking" in _err_lower or "reasoning" in _err_lower)
-                                ):
-                                    _thinking_fallback_done = True
-                                    _disable_thinking_for_next_provider_call = True
-                                    _got_error = True
-                                    break  # break stream, retry
-
+                                    turn_has_error_usage_receipt = True
                                 provider_error = raw_ev
                                 _got_error = True
                                 break  # break stream loop
@@ -7091,6 +8984,7 @@ class Agent:
                                 yield RunHeartbeatEvent(
                                     phase=raw_ev.phase,
                                     message=raw_ev.message,
+                                    generation_epoch=generation_epoch,
                                 )
                             elif isinstance(raw_ev, ProviderEnsembleProgressEvent):
                                 yield EnsembleProgressEvent(
@@ -7105,52 +8999,180 @@ class Agent:
                                     output_tokens=raw_ev.output_tokens,
                                     cost_usd=raw_ev.cost_usd,
                                     error=raw_ev.error,
+                                    generation_epoch=generation_epoch,
                                 )
-                    except _IterationStreamTimeoutError:
-                        usage_unknown_reason = "iteration_timeout"
-                        _notify_call_outcome(ok=False, failure_kind="iteration_timeout")
-                        if artifact_delivery_final_response_pending:
-                            yield _finish_artifact_delivery_degraded(
-                                reason=(
-                                    f"Iteration {iterations} exceeded "
-                                    f"iteration_timeout ({self.config.iteration_timeout}s) "
-                                    "during final artifact response generation"
-                                ),
-                                code="iteration_timeout",
-                            )
-                            break
-                        yield self._transition(AgentState.ERROR)
-                        terminal_error = ErrorEvent(
-                            message=(
-                                f"Iteration {iterations} exceeded iteration_timeout"
-                                f" ({self.config.iteration_timeout}s) during LLM streaming"
-                            ),
-                            code="iteration_timeout",
+                        reasoning_end = _finish_reasoning_block(
+                            "completed"
+                            if _got_done_event
+                            else "error"
+                            if provider_error is not None
+                            else "interrupted"
                         )
-                        yield terminal_error
-                        break
+                        if reasoning_end is not None:
+                            yield reasoning_end
                     except asyncio.CancelledError:
                         usage_unknown_reason = "cancelled"
                         raise
-                    except TimeoutError:
+                    except TimeoutError as exc:
+                        reasoning_end = _finish_reasoning_block("error")
+                        if reasoning_end is not None:
+                            yield reasoning_end
+                        enforced_stream_deadline = getattr(
+                            exc,
+                            _STREAM_DEADLINE_ATTRIBUTE,
+                            None,
+                        )
+                        pending_install_timeout = (
+                            enforced_stream_deadline == pending_install_deadline
+                            if enforced_stream_deadline is not None
+                            else (
+                                pending_install_deadline is not None
+                                and _loop.time() >= pending_install_deadline
+                            )
+                        )
+                        if (
+                            pending_install_deadline is not None
+                            and self._pending_durable_compaction_event is not None
+                            and pending_install_timeout
+                        ):
+                            usage_unknown_reason = "compaction_install_timeout"
+                            _notify_call_outcome(
+                                ok=False,
+                                failure_kind="compaction_install_timeout",
+                            )
+                            self._terminalize_pending_durable_compaction(
+                                status="timed_out",
+                                reason="compaction_deadline_exceeded",
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "Context compaction could not be installed "
+                                    "before its absolute deadline."
+                                ),
+                                code="compaction_deadline_exceeded",
+                            )
+                            yield terminal_error
+                            break
                         # Total-deadline timeout raised by the stream wrapper:
                         # record the failed call, then propagate unchanged.
                         usage_unknown_reason = "total_timeout"
                         _notify_call_outcome(ok=False, failure_kind="total_timeout")
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_timeout",
+                                reason="goal_terminal",
+                                code="total_timeout",
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
                         raise
-                    except Exception:
-                        # A provider stream that raises (instead of yielding a
-                        # ProviderErrorEvent) must still enter the stats before
-                        # the exception propagates unchanged.
+                    except ModelRepetitionLoopError as exc:
+                        usage_unknown_reason = MODEL_REPETITION_LOOP_CODE
+                        _notify_call_outcome(
+                            ok=False,
+                            failure_kind=MODEL_REPETITION_LOOP_CODE,
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="stop",
+                            reason=MODEL_REPETITION_LOOP_CODE,
+                            code=MODEL_REPETITION_LOOP_CODE,
+                            **exc.detection.log_fields(),
+                        )
+                        yield self._transition(AgentState.ERROR)
+                        terminal_error = ErrorEvent(
+                            message=MODEL_REPETITION_LOOP_MESSAGE,
+                            code=MODEL_REPETITION_LOOP_CODE,
+                        )
+                        yield terminal_error
+                        break
+                    except UsageAccountingUnavailableError as exc:
+                        # Usage-ledger admission is an engine control-plane
+                        # failure, not an upstream provider exception. Preserve
+                        # its stable retryable code for TurnRunner/Gateway.
+                        usage_unknown_reason = str(
+                            getattr(exc, "code", "usage_accounting_unavailable")
+                        )
+                        _notify_call_outcome(
+                            ok=False,
+                            failure_kind=usage_unknown_reason,
+                        )
+                        reasoning_end = _finish_reasoning_block("error")
+                        if reasoning_end is not None:
+                            yield reasoning_end
+                        exc.bind_replay_safety(
+                            no_prior_irreversible_effect=(
+                                turn_llm_calls == 1 and not turn_irreversible_effect_started
+                            )
+                        )
+                        raise
+                    except _RaisedProviderBoundaryError as exc:
+                        # Some SDKs raise from call creation or async iteration
+                        # instead of yielding a ProviderErrorEvent.  Only those
+                        # two provider-boundary operations are wrapped in this
+                        # content-free marker.  Exceptions raised while the
+                        # engine applies pending input or processes events stay
+                        # internal and propagate unchanged.
+                        reasoning_end = _finish_reasoning_block("error")
+                        if reasoning_end is not None:
+                            yield reasoning_end
                         usage_unknown_reason = "provider_exception"
-                        _notify_call_outcome(ok=False, failure_kind="raised")
-                        raise
+                        _notify_call_outcome(
+                            ok=False,
+                            failure_kind=ProviderFailureKind.TRANSPORT_TRANSIENT.value,
+                        )
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_provider_error",
+                                reason="goal_terminal",
+                                code="provider_exception",
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
+                        provider_error = ProviderErrorEvent(
+                            message=(
+                                "The connection to the model provider ended before "
+                                "the response completed."
+                                if attempt_irreversible_output_emitted
+                                else ("The connection to the model provider was interrupted.")
+                            ),
+                            code=(
+                                "response_incomplete"
+                                if attempt_irreversible_output_emitted
+                                else CONNECTION_FAILED_CODE
+                                if exc.connection_failed
+                                else "request_error"
+                            ),
+                        )
+                        provider_error_for_log = provider_error
+                        _got_error = True
                     finally:
                         if usage_call is not None and not usage_call_terminal:
                             await self._usage_call_unknown(
                                 usage_call,
                                 usage_unknown_reason,
                             )
+                        if reasoning_only_act_now_for_call is not None and not bool(
+                            getattr(
+                                self.config,
+                                "reasoning_only_act_now",
+                                False,
+                            )
+                        ):
+                            reasoning_only_act_now_message = None
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
                     _notify_call_outcome(
@@ -7210,70 +9232,95 @@ class Agent:
                             response_payload["ensemble_trace"] = ensemble_trace
                     if provider_error_for_log is not None:
                         response_payload["error"] = {
-                            "message": provider_error_for_log.message,
-                            "code": provider_error_for_log.code,
+                            "code": safe_provider_failure_code(
+                                provider_error_for_log.code,
+                                None,
+                            ),
+                            "code_chars": len(provider_error_for_log.code),
+                            "message_chars": len(provider_error_for_log.message),
                         }
                         self._write_turn_call_log("llm_error", **response_payload)
                     else:
                         self._write_turn_call_log("llm_response", **response_payload)
 
                     # -- after async for (retry loop level) --
-                    terminal_error = _turn_budget_error()
+                    if provider_error_for_log is not None and self._execution_context is not None:
+                        # A provider/protocol failure invalidates every tool
+                        # fragment from this attempt, including the terminal
+                        # attempt where no retry will run.
+                        self._execution_context.drop_pending_tool_buffers("provider_error")
+                    elif not _got_done_event and self._execution_context is not None:
+                        self._execution_context.drop_pending_tool_buffers("stream_without_done")
+                    if terminal_generation_reset_event is not None:
+                        terminal_error = ErrorEvent(
+                            message=(
+                                terminal_generation_reset_event.terminal_error_message
+                                or "The model provider request failed."
+                            ),
+                            code=(
+                                terminal_generation_reset_event.terminal_error_code
+                                or "ensemble_fixed_error"
+                            ),
+                            failure_kind=(
+                                terminal_generation_reset_event.terminal_failure_kind
+                                or ProviderFailureKind.UNKNOWN.value
+                            ),
+                            generation_epoch=(terminal_generation_reset_event.new_generation_epoch),
+                        )
+                        break
+                    terminal_error = (
+                        None if goal_terminal_final_response_pending else _turn_budget_error()
+                    )
                     if terminal_error is not None:
-                        if artifact_delivery_final_response_pending:
-                            yield _finish_artifact_delivery_degraded(
-                                reason=terminal_error.message,
-                                code=terminal_error.code,
-                            )
-                            terminal_error = None
-                        else:
-                            yield self._transition(AgentState.ERROR)
-                            yield terminal_error
+                        yield self._transition(AgentState.ERROR)
+                        yield terminal_error
                         break
                     response_text = "".join(assistant_text_parts)
+                    if tool_failure_finalization_pending and (
+                        _got_error or not _got_done_event or not response_text.strip()
+                    ):
+                        terminal_error = ErrorEvent(
+                            message=tool_failure_recovery.terminal_message,
+                            code=FAILURE_RECOVERY_CODE,
+                        )
+                        yield self._transition(AgentState.ERROR)
+                        yield terminal_error
+                        break
                     if (
                         ignored_post_delivery_tool_use
                         and not response_text.strip()
                         # A policy preempt retries this call; emitting the
                         # canned finalization text first would surface it
                         # before the retried attempt's real answer.
-                        and not _stream_policy_preempt
                     ):
-                        if artifact_delivery_final_response_pending:
-                            response_text = self._artifact_delivery_final_response_text(
-                                artifact_delivery_final_response_artifacts
+                        if goal_terminal_final_response_pending:
+                            response_text = (
+                                "The Goal is complete."
+                                if goal_terminal_final_status == "complete"
+                                else "The Goal is blocked."
                             )
                         elif max_iterations_finalization_pending:
                             response_text = (
                                 "I reached the configured iteration limit after completing "
                                 "the available tool step. Here is the best partial result so far."
                             )
-                        elif post_write_convergence_finalization_pending:
-                            response_text = (
-                                "The workspace diff stayed stable after clean validation. "
-                                "Here is the current validated patch state."
-                            )
                         if response_text:
                             assistant_text_parts.append(response_text)
                             attempt_user_visible_emitted = True
-                            yield TextDeltaEvent(text=response_text)
+                            attempt_irreversible_output_emitted = True
+                            turn_image_retry_barrier_crossed = True
+                            yield TextDeltaEvent(
+                                text=response_text,
+                                generation_epoch=generation_epoch,
+                            )
                     post_tool_turn = _tail_has_tool_result(request_messages)
                     if (
                         not post_tool_turn
                         and request_turn_messages
-                        and (
-                            (
-                                deadline_wrapup_message is not None
-                                and request_turn_messages[-1] is deadline_wrapup_message
-                            )
-                            or (
-                                reasoning_only_act_now_message is not None
-                                and request_turn_messages[-1]
-                                is reasoning_only_act_now_message
-                            )
-                        )
+                        and reasoning_only_act_now_for_call is not None
+                        and request_turn_messages[-1] is reasoning_only_act_now_for_call
                     ):
-                        # The spliced wrap-up or act-now directive is not
+                        # The reasoning-recovery directive is not
                         # conversation history; empty-response recovery must
                         # still see the post-tool shape of the underlying
                         # turn. A nudge stacked after the tool results is
@@ -7287,24 +9334,11 @@ class Agent:
                         post_tool_turn = tail_index >= 0 and _message_has_tool_result(
                             turn_messages[tail_index]
                         )
-                    if not post_tool_turn and (
-                        bool(getattr(self.config, "mid_budget_no_diff_nudge", False))
-                        or int(
-                            getattr(
-                                self.config,
-                                "endgame_fix_directive_margin_seconds",
-                                0,
-                            )
-                            or 0
-                        )
-                        > 0
+                    if not post_tool_turn and any(
+                        _is_runtime_nudge_message(item) for item in turn_messages[-4:]
                     ):
-                        # A nudge stacked after watchdog or recovery guidance
-                        # pushes the tool results out of the lookback window,
-                        # which would disable empty-response retry/recovery on
-                        # exactly the stalled turns the lever targets. The
-                        # nudge is runtime-injected, not conversation history:
-                        # recompute the turn shape as if it were absent.
+                        # Retired directives can remain in existing histories.
+                        # They must not hide the post-tool shape from recovery.
                         post_tool_turn = _tail_has_tool_result_ignoring_nudges(turn_messages)
                     stop_reason = (
                         getattr(provider_done_for_log, "stop_reason", None)
@@ -7322,35 +9356,39 @@ class Agent:
                         user_visible_emitted=attempt_user_visible_emitted,
                     )
                     if (
-                        attempt_classification.kind != _ProviderAttemptKind.OK
-                        # An engine-chosen preempt truncated the stream; the
-                        # incomplete attempt is self-inflicted, not a provider
-                        # failure signal for the tool-loop observer.
-                        and not _stream_policy_preempt
+                        tool_failure_finalization_pending
+                        and attempt_classification.kind != _ProviderAttemptKind.OK
                     ):
-                        self._record_tool_loop_runtime_event(
-                            reason=attempt_classification.kind.value,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            call_attempt=_call_attempt,
-                            provider_retry_attempt=_retry_attempt,
-                            post_tool_turn=post_tool_turn,
-                            got_done_event=_got_done_event,
-                            stop_reason=stop_reason,
-                            tool_call_count=len(tool_calls),
-                            pending_tool_count=len(pending_tools),
-                            visible_text_chars=len(response_text.strip()),
-                            reasoning_chars=len(iter_reasoning_content or ""),
-                            reasoning_tokens=iter_reasoning_tokens,
-                            input_tokens=iter_input_tokens,
-                            output_tokens=iter_output_tokens,
+                        terminal_error = ErrorEvent(
+                            message=tool_failure_recovery.terminal_message,
+                            code=FAILURE_RECOVERY_CODE,
                         )
+                        yield self._transition(AgentState.ERROR)
+                        yield terminal_error
+                        break
                     if not _got_error and attempt_classification.kind != _ProviderAttemptKind.OK:
+                        if goal_terminal_final_response_pending:
+                            fallback_text = _goal_terminal_final_response_text()
+                            if fallback_text not in response_text:
+                                prefix = "\n\n" if response_text.strip() else ""
+                                appended_text = prefix + fallback_text
+                                assistant_text_parts.append(appended_text)
+                                yield TextDeltaEvent(text=appended_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_invalid_summary_response",
+                                reason="goal_terminal",
+                                code=attempt_classification.kind.value,
+                            )
+                            break
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
                             model=last_actual_model or self.config.model_id or "",
-                            provider=type(self.provider).__name__,
+                            provider=self._provider_log_identity(last_actual_provider),
                             classification=attempt_classification.kind.value,
                             iteration=iterations,
                             call_attempt=_call_attempt,
@@ -7363,7 +9401,6 @@ class Agent:
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
                         )
-
                         large_context_invalid = _is_large_context_invalid_response(
                             attempt_classification.kind,
                             input_tokens=iter_input_tokens,
@@ -7390,49 +9427,44 @@ class Agent:
                             reasoning_chars=len(iter_reasoning_content or ""),
                             reasoning_tokens=iter_reasoning_tokens,
                         )
-                        if reasoning_prefill is not None:
-                            self._record_runtime_recovery_event(
-                                reasoning_prefill,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                call_attempt=_call_attempt,
-                                stop_reason=stop_reason,
-                                input_tokens=iter_input_tokens,
-                                output_tokens=iter_output_tokens,
+                        if (
+                            reasoning_prefill is not None
+                            and reasoning_prefill.action == "prefill"
+                            and iter_reasoning_content
+                        ):
+                            turn_messages.append(
+                                _build_reasoning_prefill_message(
+                                    reasoning_content=iter_reasoning_content,
+                                    thinking_signature=iter_thinking_signature,
+                                    provider_replay=iter_provider_replay,
+                                )
                             )
-                            if reasoning_prefill.action == "prefill" and iter_reasoning_content:
-                                turn_messages.append(
-                                    _build_reasoning_prefill_message(
-                                        reasoning_content=iter_reasoning_content,
-                                        thinking_signature=iter_thinking_signature,
-                                    )
+                            runtime_recovery_scaffolding_pending = True
+                            reasoning_prefill_recovery_attempted = True
+                            self.config.metadata["reasoning_prefill_recoveries"] = (
+                                self.config.metadata.get(
+                                    "reasoning_prefill_recoveries",
+                                    0,
                                 )
-                                runtime_recovery_scaffolding_pending = True
-                                reasoning_prefill_recovery_attempted = True
-                                self.config.metadata["reasoning_prefill_recoveries"] = (
-                                    self.config.metadata.get(
-                                        "reasoning_prefill_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "runtime_recovery",
-                                    action="prefill",
-                                    mode=reasoning_prefill.mode,
-                                    reason=reasoning_prefill.reason,
-                                    details=reasoning_prefill.details,
-                                )
-                                yield WarningEvent(
-                                    code="provider_reasoning_prefill_continue",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content; continuing once with the reasoning "
-                                        "prefilled."
-                                    ),
-                                )
-                                _call_attempt += 1
-                                continue
+                                + 1
+                            )
+                            self._write_turn_call_log(
+                                "runtime_recovery",
+                                action="prefill",
+                                mode=reasoning_prefill.mode,
+                                reason=reasoning_prefill.reason,
+                                details=reasoning_prefill.details,
+                            )
+                            yield WarningEvent(
+                                code="provider_reasoning_prefill_continue",
+                                message=(
+                                    "The provider returned reasoning without visible "
+                                    "content; continuing once with the reasoning "
+                                    "prefilled."
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
 
                         reasoning_continuation = reasoning_continuation_decision(
                             global_mode=getattr(
@@ -7456,58 +9488,49 @@ class Agent:
                             reasoning_chars=len(iter_reasoning_content or ""),
                             reasoning_tokens=iter_reasoning_tokens,
                         )
-                        if reasoning_continuation is not None:
-                            self._record_runtime_recovery_event(
-                                reasoning_continuation,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                call_attempt=_call_attempt,
-                                stop_reason=stop_reason,
-                                input_tokens=iter_input_tokens,
-                                output_tokens=iter_output_tokens,
+                        if (
+                            reasoning_continuation is not None
+                            and reasoning_continuation.action == "nudge"
+                            and reasoning_continuation.message
+                        ):
+                            turn_messages.append(
+                                Message(
+                                    role="assistant",
+                                    content=[ContentBlockText(text="")],
+                                )
                             )
-                            if (
-                                reasoning_continuation.action == "nudge"
-                                and reasoning_continuation.message
-                            ):
-                                turn_messages.append(
-                                    Message(
-                                        role="assistant",
-                                        content=[ContentBlockText(text="")],
-                                    )
+                            turn_messages.append(
+                                Message(
+                                    role="user",
+                                    content=reasoning_continuation.message,
                                 )
-                                turn_messages.append(
-                                    Message(
-                                        role="user",
-                                        content=reasoning_continuation.message,
-                                    )
+                            )
+                            runtime_recovery_scaffolding_pending = True
+                            reasoning_prefill_recovery_attempted = True
+                            self.config.metadata["reasoning_continuation_recoveries"] = (
+                                self.config.metadata.get(
+                                    "reasoning_continuation_recoveries",
+                                    0,
                                 )
-                                runtime_recovery_scaffolding_pending = True
-                                reasoning_prefill_recovery_attempted = True
-                                self.config.metadata["reasoning_continuation_recoveries"] = (
-                                    self.config.metadata.get(
-                                        "reasoning_continuation_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "runtime_recovery",
-                                    action="nudge",
-                                    mode=reasoning_continuation.mode,
-                                    reason=reasoning_continuation.reason,
-                                    details=reasoning_continuation.details,
-                                )
-                                yield WarningEvent(
-                                    code="provider_reasoning_continuation",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content; asking it to continue once without "
-                                        "replaying hidden reasoning."
-                                    ),
-                                )
-                                _call_attempt += 1
-                                continue
+                                + 1
+                            )
+                            self._write_turn_call_log(
+                                "runtime_recovery",
+                                action="nudge",
+                                mode=reasoning_continuation.mode,
+                                reason=reasoning_continuation.reason,
+                                details=reasoning_continuation.details,
+                            )
+                            yield WarningEvent(
+                                code="provider_reasoning_continuation",
+                                message=(
+                                    "The provider returned reasoning without visible "
+                                    "content; asking it to continue once without "
+                                    "replaying hidden reasoning."
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
 
                         post_tool_empty = post_tool_empty_decision(
                             global_mode=getattr(
@@ -7528,56 +9551,68 @@ class Agent:
                                 or iter_reasoning_tokens > 0
                             ),
                         )
-                        if post_tool_empty is not None:
-                            self._record_runtime_recovery_event(
-                                post_tool_empty,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                call_attempt=_call_attempt,
-                                stop_reason=stop_reason,
-                                input_tokens=iter_input_tokens,
-                                output_tokens=iter_output_tokens,
+                        if (
+                            post_tool_empty is not None
+                            and post_tool_empty.action == "nudge"
+                            and post_tool_empty.message
+                        ):
+                            turn_messages.append(
+                                Message(
+                                    role="assistant",
+                                    content=[ContentBlockText(text="")],
+                                )
                             )
-                            if post_tool_empty.action == "nudge" and post_tool_empty.message:
-                                turn_messages.append(
-                                    Message(
-                                        role="assistant",
-                                        content=[ContentBlockText(text="")],
-                                    )
-                                )
-                                turn_messages.append(
-                                    Message(role="user", content=post_tool_empty.message)
-                                )
-                                runtime_recovery_scaffolding_pending = True
-                                post_tool_empty_recovery_attempted = True
-                                self.config.metadata["post_tool_empty_recoveries"] = (
-                                    self.config.metadata.get("post_tool_empty_recoveries", 0) + 1
-                                )
-                                self._write_turn_call_log(
-                                    "runtime_recovery",
-                                    action="nudge",
-                                    mode=post_tool_empty.mode,
-                                    reason=post_tool_empty.reason,
-                                    details=post_tool_empty.details,
-                                )
-                                yield WarningEvent(
-                                    code="post_tool_empty_recovery",
-                                    message=(
-                                        "The provider returned an empty response after "
-                                        "tool results; asking it to continue once."
-                                    ),
-                                )
-                                _call_attempt += 1
-                                continue
+                            turn_messages.append(
+                                Message(role="user", content=post_tool_empty.message)
+                            )
+                            runtime_recovery_scaffolding_pending = True
+                            post_tool_empty_recovery_attempted = True
+                            self.config.metadata["post_tool_empty_recoveries"] = (
+                                self.config.metadata.get("post_tool_empty_recoveries", 0) + 1
+                            )
+                            self._write_turn_call_log(
+                                "runtime_recovery",
+                                action="nudge",
+                                mode=post_tool_empty.mode,
+                                reason=post_tool_empty.reason,
+                                details=post_tool_empty.details,
+                            )
+                            yield WarningEvent(
+                                code="post_tool_empty_recovery",
+                                message=(
+                                    "The provider returned an empty response after "
+                                    "tool results; asking it to continue once."
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
 
                         if large_context_invalid:
                             if (
                                 not _invalid_response_fallback_done
                                 and self._switch_to_invalid_response_fallback(
-                                    attempt_classification.kind.value
+                                    attempt_classification.kind.value,
+                                    requires_vision=(
+                                        self._count_image_blocks(request_messages) > 0
+                                    ),
+                                    requires_tools=bool(provider_tools_for_call),
                                 )
                             ):
                                 _invalid_response_fallback_done = True
+                                reasoning_only_act_now_message = None
+                                fallback_reason = _provider_activity_reason_for_attempt(
+                                    attempt_classification.kind
+                                )
+                                next_provider_activity_reason = fallback_reason
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    model=self._provider_activity_model(),
+                                    phase="fallback",
+                                    reason=fallback_reason,
+                                    retry_attempt=_call_attempt + 1,
+                                    retry_limit=_fallback.max_retries,
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
                                 yield WarningEvent(
                                     code="provider_large_context_fallback",
                                     message=(
@@ -7590,20 +9625,35 @@ class Agent:
 
                             if (
                                 attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                                and thinking_enabled
                                 and _retry_policy.can_retry_attempt(
                                     _ProviderAttemptKind.REASONING_ONLY,
                                     _attempt_retries_used,
                                 )
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
-                                _thinking_fallback_done = True
-                                _disable_thinking_for_next_provider_call = True
+                                if (
+                                    not thinking_enabled
+                                    or bool(
+                                        getattr(
+                                            self.config,
+                                            "reasoning_only_act_now",
+                                            False,
+                                        )
+                                    )
+                                ) and reasoning_only_act_now_message is None:
+                                    reasoning_only_act_now_message = (
+                                        self._new_reasoning_only_act_now_message(
+                                            iteration=iterations,
+                                            attempt=_call_attempt,
+                                            reasoning_content=iter_reasoning_content,
+                                            provider_default_reasoning=not thinking_enabled,
+                                        )
+                                    )
                                 logger.warning(
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
                                     model=last_actual_model or self.config.model_id or "",
-                                    provider=type(self.provider).__name__,
+                                    provider=self._provider_log_identity(last_actual_provider),
                                     classification=attempt_classification.kind.value,
                                     iteration=iterations,
                                     call_attempt=_call_attempt,
@@ -7617,25 +9667,100 @@ class Agent:
                                     iter_output_tokens=iter_output_tokens,
                                     iter_reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_chars=len(iter_reasoning_content or ""),
-                                )
-                                yield WarningEvent(
-                                    code="provider_large_context_visible_retry",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content for a large input; retrying once with "
-                                        "thinking disabled."
+                                    configured_max_tokens=max(
+                                        0,
+                                        int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
                                     ),
+                                )
+                                reasoning_output_budget_exhausted = (
+                                    attempt_classification.stop_reason or ""
+                                ).lower() == "length"
+                                if reasoning_output_budget_exhausted:
+                                    self._log_reasoning_output_budget_exhausted(
+                                        model=(last_actual_model or self.config.model_id or ""),
+                                        observed_provider=last_actual_provider,
+                                        configured_max_tokens=max(
+                                            0,
+                                            int(
+                                                getattr(
+                                                    call_chat_cfg,
+                                                    "max_tokens",
+                                                    0,
+                                                )
+                                                or 0
+                                            ),
+                                        ),
+                                        output_tokens=iter_output_tokens,
+                                        reasoning_tokens=iter_reasoning_tokens,
+                                        reasoning_content=iter_reasoning_content,
+                                    )
+                                    yield WarningEvent(
+                                        code="provider_reasoning_only_retry",
+                                        message=(
+                                            "The provider used the configured output budget "
+                                            "for reasoning without returning visible content; "
+                                            "retrying once without changing max_tokens."
+                                        ),
+                                    )
+                                else:
+                                    yield WarningEvent(
+                                        code="provider_large_context_visible_retry",
+                                        message=(
+                                            "The provider returned reasoning without visible "
+                                            "content for a large input; retrying once to "
+                                            "request visible content."
+                                        ),
+                                    )
+                                next_provider_activity_reason = "reasoning_only"
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    model=self._provider_activity_model(),
+                                    phase="retrying",
+                                    reason="reasoning_only",
+                                    retry_attempt=_attempt_retries_used[
+                                        _ProviderAttemptKind.REASONING_ONLY
+                                    ],
+                                    retry_limit=_retry_policy.attempt_budgets[
+                                        _ProviderAttemptKind.REASONING_ONLY
+                                    ],
+                                    started_at=time.time_ns() // 1_000_000,
                                 )
                                 _call_attempt += 1
                                 continue
 
                             yield self._transition(AgentState.ERROR)
-                            terminal_error = ErrorEvent(
-                                message=(
+                            if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
+                                if (attempt_classification.stop_reason or "").lower() == "length":
+                                    large_context_message = (
+                                        "The provider used the configured output budget for "
+                                        "reasoning without returning a visible answer. Increase "
+                                        "llm.max_tokens or choose another model or provider."
+                                    )
+                                else:
+                                    large_context_message = (
+                                        "The provider returned reasoning without a visible "
+                                        "answer. Try again or choose another model or provider."
+                                    )
+                            elif self.config.metadata.get("had_attachments"):
+                                recovery_guidance = (
+                                    "Split, summarize, or shorten the attached material, "
+                                    "or use a stronger model."
+                                )
+                                large_context_message = (
                                     "Provider returned no visible response for a large input. "
-                                    "Send the material as an attachment, summarize or shorten "
-                                    "the prompt, or use a stronger model."
-                                ),
+                                    + recovery_guidance
+                                )
+                            else:
+                                recovery_guidance = (
+                                    "Send the material as an attachment, summarize or "
+                                    "shorten the prompt, or use a stronger model."
+                                )
+                                large_context_message = (
+                                    "Provider returned no visible response for a large input. "
+                                    + recovery_guidance
+                                )
+                            terminal_error = ErrorEvent(
+                                message=large_context_message,
                                 code="empty_response",
                             )
                             yield terminal_error
@@ -7643,7 +9768,6 @@ class Agent:
 
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                            and thinking_enabled
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.REASONING_ONLY,
                                 _attempt_retries_used,
@@ -7651,51 +9775,46 @@ class Agent:
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
                             if (
-                                bool(
+                                not thinking_enabled
+                                or bool(
                                     getattr(
-                                        self.config, "reasoning_only_act_now", False
+                                        self.config,
+                                        "reasoning_only_act_now",
+                                        False,
                                     )
                                 )
-                                and reasoning_only_act_now_message is None
-                            ):
-                                # Today's bare retry re-sends the identical
-                                # request; the model that just answered it with
-                                # reasoning only usually does so again. Splice
-                                # in an explicit act-now instruction so the
-                                # retry differs where it matters.
-                                reasoning_only_act_now_message = Message(
-                                    role="user",
-                                    content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+                            ) and reasoning_only_act_now_message is None:
+                                reasoning_only_act_now_message = (
+                                    self._new_reasoning_only_act_now_message(
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                        reasoning_content=iter_reasoning_content,
+                                        provider_default_reasoning=not thinking_enabled,
+                                    )
                                 )
-                                append_runtime_event(
-                                    self.config.runtime_events_path,
-                                    {
-                                        "feature": "reasoning_only_act_now",
-                                        "name": "reasoning_only_act_now.injected",
-                                        "action": "retry_with_act_now_directive",
-                                        "reason": "provider_reasoning_only",
-                                        "iteration": iterations,
-                                        "attempt": _call_attempt,
-                                        "reasoning_chars": len(
-                                            iter_reasoning_content or ""
-                                        ),
-                                        "session_key": self._session_key,
-                                        "agent_id": (
-                                            self.config.tool_result_store_agent_id
-                                            or self.config.metadata.get("agent_id")
-                                        ),
-                                    },
+                            reasoning_output_budget_exhausted = (
+                                attempt_classification.stop_reason or ""
+                            ).lower() == "length"
+                            if reasoning_output_budget_exhausted:
+                                configured_max_tokens = max(
+                                    0,
+                                    int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
                                 )
-                            if getattr(
-                                self.config, "reasoning_only_thinking_fallback", False
-                            ):
-                                _thinking_fallback_done = True
-                                _disable_thinking_for_next_provider_call = True
+                                self._log_reasoning_output_budget_exhausted(
+                                    model=last_actual_model or self.config.model_id or "",
+                                    observed_provider=last_actual_provider,
+                                    configured_max_tokens=configured_max_tokens,
+                                    output_tokens=iter_output_tokens,
+                                    reasoning_tokens=iter_reasoning_tokens,
+                                    reasoning_content=iter_reasoning_content,
+                                )
+                            if reasoning_output_budget_exhausted:
                                 yield WarningEvent(
                                     code="provider_reasoning_only_retry",
                                     message=(
-                                        "The provider returned reasoning without visible "
-                                        "content; retrying once with thinking disabled."
+                                        "The provider used the configured output budget for "
+                                        "reasoning without returning visible content; retrying "
+                                        "once without changing max_tokens."
                                     ),
                                 )
                             else:
@@ -7706,6 +9825,20 @@ class Agent:
                                         "retrying once to request visible content."
                                     ),
                                 )
+                            next_provider_activity_reason = "reasoning_only"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retrying",
+                                reason="reasoning_only",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.REASONING_ONLY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.REASONING_ONLY
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -7727,7 +9860,35 @@ class Agent:
                                 code="provider_empty_retry",
                                 message="The provider returned an empty response; retrying once.",
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retry_wait",
+                                reason="invalid_response",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
+                            next_provider_activity_reason = "invalid_response"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retrying",
+                                reason="invalid_response",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -7752,7 +9913,35 @@ class Agent:
                                     "The provider stream ended before completion; retrying once."
                                 ),
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retry_wait",
+                                reason="stream_incomplete",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
+                            next_provider_activity_reason = "stream_incomplete"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retrying",
+                                reason="stream_incomplete",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -7768,6 +9957,8 @@ class Agent:
                                 turn_messages,
                                 response_text=response_text,
                                 tool_calls=tool_calls,
+                                reasoning_content=iter_reasoning_content,
+                                provider_replay=iter_provider_replay,
                             )
                             if visible_text:
                                 final_text_parts.append(visible_text)
@@ -7808,10 +9999,26 @@ class Agent:
                             }
                             and not _invalid_response_fallback_done
                             and self._switch_to_invalid_response_fallback(
-                                attempt_classification.kind.value
+                                attempt_classification.kind.value,
+                                requires_vision=(self._count_image_blocks(request_messages) > 0),
+                                requires_tools=bool(provider_tools_for_call),
                             )
                         ):
                             _invalid_response_fallback_done = True
+                            reasoning_only_act_now_message = None
+                            fallback_reason = _provider_activity_reason_for_attempt(
+                                attempt_classification.kind
+                            )
+                            next_provider_activity_reason = fallback_reason
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="fallback",
+                                reason=fallback_reason,
+                                retry_attempt=_call_attempt + 1,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             yield WarningEvent(
                                 code="provider_empty_retry",
                                 message=(
@@ -7872,7 +10079,7 @@ class Agent:
                             "provider.empty_response",
                             session_key=self._session_key,
                             model=last_actual_model or self.config.model_id or "",
-                            provider=type(self.provider).__name__,
+                            provider=self._provider_log_identity(last_actual_provider),
                             iteration=iterations,
                             retry_attempt=_call_attempt,
                             post_tool_turn=post_tool_turn,
@@ -7882,24 +10089,29 @@ class Agent:
                             iter_output_tokens=iter_output_tokens,
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
+                            configured_max_tokens=max(
+                                0,
+                                int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
+                            ),
                         )
-                        self._record_tool_loop_runtime_event(
-                            reason="provider_empty_response_terminal",
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            call_attempt=_call_attempt,
-                            provider_retry_attempt=_retry_attempt,
-                            post_tool_turn=post_tool_turn,
-                            got_done_event=_got_done_event,
-                            stop_reason=stop_reason,
-                            input_tokens=iter_input_tokens,
-                            output_tokens=iter_output_tokens,
-                            reasoning_tokens=iter_reasoning_tokens,
-                            reasoning_chars=len(iter_reasoning_content or ""),
-                        )
+                        if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
+                            if (attempt_classification.stop_reason or "").lower() == "length":
+                                terminal_message = (
+                                    "The provider used the configured output budget for "
+                                    "reasoning without returning a visible answer. Increase "
+                                    "llm.max_tokens or choose another model or provider."
+                                )
+                            else:
+                                terminal_message = (
+                                    "The provider returned reasoning without a visible answer. "
+                                    "Try again or choose another model or provider."
+                                )
+                        else:
+                            terminal_message = "Provider returned an empty response"
                         terminal_error = ErrorEvent(
-                            message="Provider returned an empty response",
+                            message=terminal_message,
                             code="empty_response",
+                            failure_kind=ProviderFailureKind.EMPTY_RESPONSE.value,
                         )
                         yield terminal_error
                         break
@@ -7933,6 +10145,29 @@ class Agent:
                             )
 
                     if not _got_error:
+                        if (
+                            _got_done_event
+                            and (
+                                selector_image_provider.last_image_request_had_native_images
+                                if selector_projects_images
+                                else image_projection_result.output_image_count > 0
+                            )
+                        ):
+                            # A completed native image request is exact runtime
+                            # evidence for this deployment. Preserve it across
+                            # later tool iterations so the no-retry barrier
+                            # does not unnecessarily downgrade a proven leg.
+                            self.config.model_vision_support = "supported"
+                            chat_cfg = chat_cfg.model_copy(
+                                update={"model_vision_support": "supported"}
+                            )
+                            mark_vision_supported = getattr(
+                                self.provider,
+                                "mark_active_model_vision_supported",
+                                None,
+                            )
+                            if callable(mark_vision_supported):
+                                mark_vision_supported()
                         break  # stream OK, exit retry loop
 
                     if provider_error is None:
@@ -7949,24 +10184,171 @@ class Agent:
                             raw_code=provider_error.code,
                             message=provider_error.message,
                         )
-                        kind = _fallback.classify_error(
-                            provider_error.message,
+                        image_failure = classify_image_failure(
+                            provider_error,
                             provider_name=getattr(self.provider, "provider_name", ""),
-                            status_code=provider_error_status_code,
-                            raw_code=provider_error.code,
                         )
+                        safe_provider_error_code = safe_provider_failure_code(
+                            provider_error.code,
+                            failure_kind.value,
+                        )
+                        kind = failure_kind
+                        if (
+                            image_failure.is_unsupported
+                            and (
+                                not _image_marker_retry_done
+                                or selector_projects_images
+                                and selector_image_provider.active_deployment_config()
+                                not in image_marker_retry_deployments
+                            )
+                            and not attempt_irreversible_output_emitted
+                            and not turn_image_retry_barrier_crossed
+                        ):
+                            image_fallback = getattr(
+                                self.provider,
+                                "fallback_after_image_rejection",
+                                None,
+                            )
+                            if callable(image_fallback) and image_fallback(
+                                "provider rejected image input"
+                            ):
+                                image_projection_forced = False
+                                image_projection_marker_state = (
+                                    ImageMarkerState.NOT_ANALYZED
+                                )
+                                self.config.metadata["image_input_mode"] = (
+                                    ImageProjectionMode.NATIVE.value
+                                )
+                                self.config.metadata["image_input_reason"] = (
+                                    "router_next_configured_image_probe"
+                                )
+                                self.config.metadata["image_input_stage"] = "fallback"
+                                _got_error = False
+                                provider_error = None
+                                _call_attempt += 1
+                                continue
+                            # The model was not known to be text-only until the
+                            # physical request proved it. Keep the configured
+                            # deployment, preserve the canonical image, and
+                            # retry once with an analysis-failed marker. This
+                            # branch intentionally precedes generic fallback so
+                            # no unconfigured model is introduced.
+                            _image_marker_retry_done = True
+                            image_projection_forced = True
+                            if selector_projects_images:
+                                image_projection_forced_deployment = (
+                                    selector_image_provider.active_deployment_config()
+                                )
+                                image_marker_retry_deployments.append(
+                                    image_projection_forced_deployment
+                                )
+                            image_projection_marker_state = (
+                                ImageMarkerState.ANALYSIS_FAILED
+                            )
+                            self.config.metadata["image_input_mode"] = (
+                                ImageProjectionMode.MARKER.value
+                            )
+                            self.config.metadata["image_input_reason"] = (
+                                "provider_image_capability_rejection"
+                            )
+                            self.config.metadata["image_input_stage"] = "provider"
+                            self.config.metadata["image_input_failure_code"] = str(
+                                provider_error.code or ""
+                            )[:128]
+                            self._write_turn_call_log(
+                                "image_input_projection",
+                                action="retry_marker",
+                                reason="provider_image_capability_rejection",
+                                stage="provider",
+                                image_count=count_projected_image_blocks(
+                                    request_messages
+                                ),
+                                provider_error_code=safe_provider_error_code,
+                            )
+                            _got_error = False
+                            provider_error = None
+                            _call_attempt += 1
+                            continue
+                        if image_failure.is_unsupported:
+                            # A precise image rejection is owned exclusively
+                            # by the image policy. Once its safe same-turn
+                            # recovery is unavailable, never let a coincident
+                            # generic classification (for example
+                            # ``empty_response``) replay the request after a
+                            # visible output or tool side effect.
+                            _log.warning(
+                                "provider.image_retry_suppressed",
+                                reason=(
+                                    "image_retry_barrier_crossed"
+                                    if turn_image_retry_barrier_crossed
+                                    or attempt_irreversible_output_emitted
+                                    else "image_marker_retry_exhausted"
+                                ),
+                                provider=getattr(
+                                    self.provider,
+                                    "provider_name",
+                                    "",
+                                ),
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_error_code,
+                                failure_kind=failure_kind.value,
+                            )
+                            yield terminal_error
+                            break
+                        if attempt_irreversible_output_emitted:
+                            # Text, reasoning, and tool lifecycle frames are
+                            # streamed to the client immediately and cannot be
+                            # rolled back. A retry or fallback after that commit
+                            # would replay or mix attempts, while the terminal
+                            # transcript would retain only the later attempt.
+                            # Selector-buffered failed-leg reasoning remains
+                            # retryable because it never reaches this boundary.
+                            _log.warning(
+                                "provider.retry_suppressed",
+                                reason="user_visible_output_committed",
+                                kind=kind.value,
+                                provider=getattr(self.provider, "provider_name", ""),
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_error_code,
+                                failure_kind=failure_kind.value,
+                            )
+                            yield terminal_error
+                            break
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_provider_error",
+                                reason="goal_terminal",
+                                code=goal_terminal_final_status or "goal_terminal",
+                                provider_error_code=safe_provider_error_code,
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
                         message_limit_proof = provider_error.message_limit_proof
                         if message_limit_proof is not None:
                             proof_log = {
-                                "actual_wire_messages": (
-                                    message_limit_proof.actual_wire_messages
-                                ),
+                                "actual_wire_messages": (message_limit_proof.actual_wire_messages),
                                 "limit": message_limit_proof.limit,
                                 "logical_messages": message_limit_proof.logical_messages,
                                 "system_messages": message_limit_proof.system_messages,
-                                "tool_result_messages": (
-                                    message_limit_proof.tool_result_messages
-                                ),
+                                "tool_result_messages": (message_limit_proof.tool_result_messages),
                                 "provider_kind": message_limit_proof.provider_kind,
                                 "model": message_limit_proof.model,
                                 "base_host": message_limit_proof.base_host,
@@ -8002,28 +10384,19 @@ class Agent:
                                 break
 
                             _message_limit_recovery_done = True
-                            recovery_outcome, recovery_reason = (
-                                await self._recover_provider_message_count_limit(
-                                    base_request_turn_messages,
-                                    request_suffix_messages=request_suffix_messages,
-                                    proof=message_limit_proof,
-                                    config=call_chat_cfg,
-                                    identical_request_perturbed=(
-                                        identical_request_action == "perturb"
-                                    ),
-                                    request_context_message=request_context_message,
-                                    request_context_insert_index=(
-                                        active_request_context_insert_index
-                                    ),
-                                    runtime_context_message=runtime_context_message,
-                                    runtime_context_insert_index=(
-                                        active_runtime_context_insert_index
-                                    ),
-                                    turn_objective_message=turn_objective_message,
-                                    protected_turn_start_index=(
-                                        active_protected_turn_start_index
-                                    ),
-                                )
+                            (
+                                recovery_outcome,
+                                recovery_reason,
+                            ) = await self._recover_provider_message_count_limit(
+                                base_request_turn_messages,
+                                request_suffix_messages=request_suffix_messages,
+                                proof=message_limit_proof,
+                                config=call_chat_cfg,
+                                request_context_message=request_context_message,
+                                request_context_insert_index=(active_request_context_insert_index),
+                                runtime_context_message=runtime_context_message,
+                                runtime_context_insert_index=(active_runtime_context_insert_index),
+                                protected_turn_start_index=(active_protected_turn_start_index),
                             )
                             if recovery_outcome is None:
                                 _log.warning(
@@ -8065,16 +10438,12 @@ class Agent:
                                 **proof_log,
                                 "target_wire_messages": (
                                     message_limit_proof.limit
-                                    - self._message_count_headroom(
-                                        message_limit_proof.limit
-                                    )
+                                    - self._message_count_headroom(message_limit_proof.limit)
                                 ),
                                 "projected_wire_messages": (
                                     recovery_outcome.projected_wire_messages
                                 ),
-                                "removed_logical_messages": (
-                                    recovery_outcome.removed_count
-                                ),
+                                "removed_logical_messages": (recovery_outcome.removed_count),
                             }
                             _log.info(
                                 "provider_request_message_limit_recovery_success",
@@ -8093,12 +10462,6 @@ class Agent:
                             )
                             _call_attempt += 1
                             continue
-                        if artifact_delivery_final_response_pending:
-                            yield _finish_artifact_delivery_degraded(
-                                reason=provider_error.message,
-                                code=provider_error.code,
-                            )
-                            break
                         if max_iterations_finalization_pending:
                             response_text = (
                                 "I reached the configured iteration limit, and the "
@@ -8115,29 +10478,12 @@ class Agent:
                                 action="partial_after_finalization_provider_error",
                                 reason="max_iterations",
                                 code="max_iterations",
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                             )
-                            yield TextDeltaEvent(text=response_text)
-                            break
-                        if post_write_convergence_finalization_pending:
-                            response_text = (
-                                "The workspace diff was stable after clean validation, "
-                                "and the provider could not generate an additional wrap-up. "
-                                "Returning the current validated patch state."
+                            yield TextDeltaEvent(
+                                text=response_text,
+                                generation_epoch=generation_epoch,
                             )
-                            assistant_text_parts.append(response_text)
-                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
-                            _got_done_event = True
-                            _got_error = False
-                            post_write_convergence_finalization_pending = False
-                            self._write_turn_call_log(
-                                "turn_policy_decision",
-                                action="partial_after_finalization_provider_error",
-                                reason="post_write_convergence",
-                                code="post_write_convergence",
-                                provider_error_code=provider_error.code,
-                            )
-                            yield TextDeltaEvent(text=response_text)
                             break
                         if (
                             failure_kind == ProviderFailureKind.EMPTY_RESPONSE
@@ -8147,16 +10493,6 @@ class Agent:
                                 provider_retry_attempt=_retry_attempt,
                             )
                         ):
-                            self._record_tool_loop_runtime_event(
-                                reason="provider_empty_response_after_tool",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                call_attempt=_call_attempt,
-                                provider_retry_attempt=_retry_attempt,
-                                post_tool_turn=post_tool_turn,
-                                provider_error_code=provider_error.code,
-                                retrying=True,
-                            )
                             delay = backoff_sleep(
                                 _retry_attempt,
                                 _fallback.base_backoff_ms,
@@ -8176,17 +10512,139 @@ class Agent:
                                     "execution; retrying once."
                                 ),
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retry_wait",
+                                reason="empty_response",
+                                retry_attempt=_retry_attempt + 1,
+                                retry_limit=_fallback.max_retries,
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
                             _retry_attempt += 1
+                            next_provider_activity_reason = "empty_response"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retrying",
+                                reason="empty_response",
+                                retry_attempt=_retry_attempt,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
                             self._record_provider_context_overflow_reason(provider_error)
-                            provider_compaction_window_tokens = (
-                                self._provider_budget_compaction_window_tokens(provider_error)
-                            )
-                            provider_estimated_tokens = self._provider_budget_estimated_tokens(
+                            provider_budget_proof = self._provider_request_budget_proof(
                                 provider_error
+                            )
+                            durable_projection = None
+                            durable_consumer_overflow_proven: bool | None = None
+                            if provider_error.code == "provider_request_budget_exhausted":
+                                durable_projection = self._project_durable_consumer_final_request(
+                                    request_messages,
+                                    tools=provider_tools_for_call,
+                                    active_config=call_chat_cfg,
+                                )
+                                durable_consumer_overflow_proven = bool(
+                                    durable_projection is not None and not durable_projection.fits
+                                )
+                                live_turn_recovery_possible = (
+                                    self._live_turn_compaction_boundary(
+                                        turn_messages,
+                                        protected_turn_start_index=(current_turn_start_index),
+                                    )
+                                    is not None
+                                )
+                                if durable_consumer_overflow_proven:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_durable_pressure_proven",
+                                        durable_consumer_fits=False,
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                elif live_turn_recovery_possible:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_live_turn_recovery",
+                                        durable_consumer_fits=(
+                                            durable_projection.fits
+                                            if durable_projection is not None
+                                            else None
+                                        ),
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                else:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_recovery_refused",
+                                        reason="request_envelope_source_ambiguous",
+                                        durable_consumer_fits=(
+                                            durable_projection.fits
+                                            if durable_projection is not None
+                                            else None
+                                        ),
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                    yield self._transition(AgentState.ERROR)
+                                    terminal_error = self._context_overflow_error()
+                                    yield terminal_error
+                                    break
+                            elif bool(
+                                getattr(
+                                    self.provider,
+                                    "final_request_admission_guaranteed",
+                                    False,
+                                )
+                            ):
+                                self._last_compaction_refusal_reason = (
+                                    "provider_native_overflow_after_admission"
+                                )
+                                self._write_turn_call_log(
+                                    "provider_request_budget_recovery_refused",
+                                    reason=("provider_native_overflow_after_final_admission"),
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = self._context_overflow_error()
+                                yield terminal_error
+                                break
+                            compaction_budget_proof = provider_budget_proof
+                            if (
+                                durable_consumer_overflow_proven is True
+                                and durable_projection is not None
+                            ):
+                                # Durable pressure must be recovered against the
+                                # stable consumer's exact final-envelope budget,
+                                # including output/thinking reserve.  Using the
+                                # model's total context window here can make a
+                                # request that already exceeded the provider's
+                                # admissible input look "within budget" and turn
+                                # automatic compaction into a no-op.
+                                compaction_budget_proof = durable_projection.proof
+                            provider_request_window_tokens = self._positive_int(
+                                (compaction_budget_proof or {}).get("effective_proof_token_budget")
+                            )
+                            provider_compaction_window_tokens = (
+                                max(
+                                    1,
+                                    int(self._durable_consumer_window_tokens or 0),
+                                )
+                                if durable_consumer_overflow_proven is True
+                                else None
+                            )
+                            provider_request_window_chars = self._positive_int(
+                                (compaction_budget_proof or {}).get("effective_proof_budget")
+                            )
+                            provider_estimated_tokens = self._positive_int(
+                                (compaction_budget_proof or {}).get("estimated_tokens")
+                            )
+                            provider_estimated_chars = self._positive_int(
+                                (compaction_budget_proof or {}).get("estimated_chars")
                             )
                             provider_compaction_refusal_reason = (
                                 self._last_compaction_refusal_reason
@@ -8197,7 +10655,11 @@ class Agent:
                                     provider_compaction_window_tokens
                                     or self.config.context_window_tokens
                                 ) + 1
-                            if overflow_retries >= self.config.max_overflow_retries:
+                            effective_overflow_retries = min(
+                                1,
+                                max(0, int(self.config.max_overflow_retries or 0)),
+                            )
+                            if overflow_retries >= effective_overflow_retries:
                                 yield self._transition(AgentState.ERROR)
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
@@ -8217,6 +10679,11 @@ class Agent:
                                 runtime_context_insert_index=runtime_context_insert_index,
                                 protected_turn_start_index=current_turn_start_index,
                                 compaction_window_tokens=provider_compaction_window_tokens,
+                                request_window_tokens=provider_request_window_tokens,
+                                request_window_chars=provider_request_window_chars,
+                                estimated_context_chars=provider_estimated_chars,
+                                durable_consumer_overflow_proven=(durable_consumer_overflow_proven),
+                                provider_overflow=True,
                             )
                             if overflow_outcome is None:
                                 yield self._transition(AgentState.ERROR)
@@ -8230,6 +10697,7 @@ class Agent:
                                 self._last_compaction_refusal_reason = (
                                     provider_compaction_refusal_reason
                                 )
+                            self._stage_pending_durable_compaction(overflow_outcome)
                             next_request_context_insert_index = (
                                 overflow_outcome.request_context_insert_index
                                 if overflow_outcome.request_context_insert_index is not None
@@ -8240,14 +10708,68 @@ class Agent:
                                 if overflow_outcome.runtime_context_insert_index is not None
                                 else runtime_context_insert_index
                             )
-                            next_request_messages = await self._provider_request_messages_async(
-                                overflow_outcome.messages,
-                                request_context_message=request_context_message,
-                                request_context_insert_index=next_request_context_insert_index,
-                                runtime_context_message=runtime_context_message,
-                                runtime_context_insert_index=next_runtime_context_insert_index,
-                                turn_objective_message=turn_objective_message,
-                            )
+                            try:
+                                rebuild_deadline = (
+                                    overflow_outcome.compaction_deadline_at_monotonic
+                                    if not overflow_outcome.ephemeral_only
+                                    else None
+                                )
+                                if rebuild_deadline is None:
+                                    next_request_messages = (
+                                        await self._provider_request_messages_async(
+                                            overflow_outcome.messages,
+                                            request_context_message=(request_context_message),
+                                            request_context_insert_index=(
+                                                next_request_context_insert_index
+                                            ),
+                                            runtime_context_message=(runtime_context_message),
+                                            runtime_context_insert_index=(
+                                                next_runtime_context_insert_index
+                                            ),
+                                        )
+                                    )
+                                else:
+                                    async with asyncio.timeout_at(rebuild_deadline):
+                                        next_request_messages = (
+                                            await self._provider_request_messages_async(
+                                                overflow_outcome.messages,
+                                                request_context_message=(request_context_message),
+                                                request_context_insert_index=(
+                                                    next_request_context_insert_index
+                                                ),
+                                                runtime_context_message=(runtime_context_message),
+                                                runtime_context_insert_index=(
+                                                    next_runtime_context_insert_index
+                                                ),
+                                            )
+                                        )
+                            except asyncio.CancelledError:
+                                self._terminalize_pending_durable_compaction(
+                                    status="cancelled",
+                                    reason="request_rebuild_cancelled",
+                                )
+                                raise
+                            except TimeoutError:
+                                self._terminalize_pending_durable_compaction(
+                                    status="timed_out",
+                                    reason="compaction_deadline_exceeded",
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=(
+                                        "Context compaction could not rebuild the "
+                                        "provider request before its absolute deadline."
+                                    ),
+                                    code="compaction_deadline_exceeded",
+                                )
+                                yield terminal_error
+                                break
+                            except Exception:
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason="request_rebuild_failed",
+                                )
+                                raise
                             if not self._provider_request_is_smaller(
                                 request_messages,
                                 next_request_messages,
@@ -8258,38 +10780,512 @@ class Agent:
                                     != "provider_recent_tail_too_large"
                                 ):
                                     self._last_compaction_refusal_reason = "compaction_not_smaller"
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason="compaction_not_smaller",
+                                )
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
-                            turn_messages = overflow_outcome.messages
-                            request_context_insert_index = next_request_context_insert_index
-                            runtime_context_insert_index = next_runtime_context_insert_index
-                            if overflow_outcome.protected_turn_start_index is not None:
-                                current_turn_start_index = (
-                                    overflow_outcome.protected_turn_start_index
-                                )
-                            message_count_request_view = None
-                            yield WarningEvent(
-                                code="context_auto_compaction_retry",
-                                message="Context compacted; retrying the provider request.",
+                            next_active_user_index = _active_user_message_index_for_request(
+                                next_request_messages,
+                                current_user_text=(self._current_turn_message or ""),
                             )
-                            yield CompactionEvent(
-                                compaction_id=overflow_outcome.compaction_id,
-                                summary=overflow_outcome.summary,
-                                kept_entries=overflow_outcome.kept_entries,
-                                kept_count=len(overflow_outcome.messages),
-                                removed_count=overflow_outcome.removed_count,
+                            next_chat_cfg = call_chat_cfg.model_copy(
+                                update={"active_user_message_index": (next_active_user_index)}
+                            )
+                            stable_live_recovery: CompactionOutcome | None = None
+                            if durable_consumer_overflow_proven is True:
+                                durable_next_projection = (
+                                    self._project_durable_consumer_final_request(
+                                        next_request_messages,
+                                        tools=provider_tools_for_call,
+                                        active_config=next_chat_cfg,
+                                    )
+                                )
+                                admission_proof = (
+                                    durable_next_projection.proof
+                                    if durable_next_projection is not None
+                                    else {}
+                                )
+                                logger.debug(
+                                    "compaction.consumer_admission_projection",
+                                    consumer="durable",
+                                    ephemeral_only=overflow_outcome.ephemeral_only,
+                                    active_user_found=next_active_user_index is not None,
+                                    fits=(
+                                        durable_next_projection.fits
+                                        if durable_next_projection is not None
+                                        else None
+                                    ),
+                                    estimated_tokens=admission_proof.get("estimated_tokens"),
+                                    effective_token_budget=admission_proof.get(
+                                        "effective_proof_token_budget"
+                                    ),
+                                    estimated_chars=admission_proof.get("estimated_chars"),
+                                    effective_char_budget=admission_proof.get(
+                                        "effective_proof_budget"
+                                    ),
+                                )
+                                if (
+                                    next_active_user_index is None
+                                    or durable_next_projection is None
+                                    or not durable_next_projection.fits
+                                ):
+                                    stable_protected_start = (
+                                        overflow_outcome.protected_turn_start_index
+                                        if (overflow_outcome.protected_turn_start_index is not None)
+                                        else current_turn_start_index
+                                    )
+                                    stable_source_messages = overflow_outcome.messages
+                                    stable_source_request_index = next_request_context_insert_index
+                                    stable_source_runtime_index = next_runtime_context_insert_index
+                                    stable_keep_recent_rounds = 2
+                                    if overflow_outcome.ephemeral_only:
+                                        # The first request-scoped summary keeps
+                                        # two raw rounds. If exact final-envelope
+                                        # admission still fails, retry within the
+                                        # same compaction deadline/call budget by
+                                        # summarizing one more completed round.
+                                        stable_source_messages = turn_messages
+                                        stable_protected_start = current_turn_start_index
+                                        stable_source_request_index = request_context_insert_index
+                                        stable_source_runtime_index = runtime_context_insert_index
+                                        stable_keep_recent_rounds = 1
+                                    if (
+                                        next_active_user_index is not None
+                                        and durable_next_projection is not None
+                                        and self._live_turn_compaction_boundary(
+                                            stable_source_messages,
+                                            protected_turn_start_index=(stable_protected_start),
+                                            keep_recent_rounds=(stable_keep_recent_rounds),
+                                        )
+                                        is not None
+                                    ):
+                                        try:
+                                            stable_live_recovery = (
+                                                await self._recover_live_turn_request_overflow(
+                                                    stable_source_messages,
+                                                    protected_turn_start_index=(
+                                                        stable_protected_start
+                                                    ),
+                                                    context_window_tokens=(
+                                                        provider_request_window_tokens
+                                                        or max(
+                                                            1,
+                                                            int(
+                                                                self._durable_consumer_window_tokens
+                                                                or self.config.context_window_tokens
+                                                            ),
+                                                        )
+                                                    ),
+                                                    context_window_chars=(
+                                                        provider_request_window_chars
+                                                    ),
+                                                    keep_recent_rounds=(stable_keep_recent_rounds),
+                                                    request_context_insert_index=(
+                                                        stable_source_request_index
+                                                    ),
+                                                    runtime_context_insert_index=(
+                                                        stable_source_runtime_index
+                                                    ),
+                                                    shared_compaction_config=(
+                                                        overflow_outcome.runtime_compaction_config
+                                                    ),
+                                                )
+                                            )
+                                        except asyncio.CancelledError:
+                                            raise
+                                        except Exception as exc:  # noqa: BLE001
+                                            logger.warning(
+                                                "compaction.stable_live_turn_projection_failed",
+                                                error_type=type(exc).__name__,
+                                                error=str(exc),
+                                            )
+                                    if stable_live_recovery is not None:
+                                        stable_live_request_index = (
+                                            stable_live_recovery.request_context_insert_index
+                                            if (
+                                                stable_live_recovery.request_context_insert_index
+                                                is not None
+                                            )
+                                            else next_request_context_insert_index
+                                        )
+                                        stable_live_runtime_index = (
+                                            stable_live_recovery.runtime_context_insert_index
+                                            if (
+                                                stable_live_recovery.runtime_context_insert_index
+                                                is not None
+                                            )
+                                            else next_runtime_context_insert_index
+                                        )
+                                        stable_live_request_messages = (
+                                            await self._provider_request_messages_async(
+                                                stable_live_recovery.messages,
+                                                request_context_message=(request_context_message),
+                                                request_context_insert_index=(
+                                                    stable_live_request_index
+                                                ),
+                                                runtime_context_message=(runtime_context_message),
+                                                runtime_context_insert_index=(
+                                                    stable_live_runtime_index
+                                                ),
+                                            )
+                                        )
+                                        stable_live_active_user_index = (
+                                            _active_user_message_index_for_request(
+                                                stable_live_request_messages,
+                                                current_user_text=(
+                                                    self._current_turn_message or ""
+                                                ),
+                                            )
+                                        )
+                                        stable_live_chat_cfg = call_chat_cfg.model_copy(
+                                            update={
+                                                "active_user_message_index": (
+                                                    stable_live_active_user_index
+                                                )
+                                            }
+                                        )
+                                        stable_live_projection = (
+                                            self._project_durable_consumer_final_request(
+                                                stable_live_request_messages,
+                                                tools=provider_tools_for_call,
+                                                active_config=(stable_live_chat_cfg),
+                                            )
+                                        )
+                                        if (
+                                            stable_live_active_user_index is not None
+                                            and stable_live_projection is not None
+                                            and stable_live_projection.fits
+                                        ):
+                                            next_request_messages = stable_live_request_messages
+                                            next_active_user_index = stable_live_active_user_index
+                                            next_chat_cfg = stable_live_chat_cfg
+                                            durable_next_projection = stable_live_projection
+                                        else:
+                                            stable_live_recovery = None
+                                    if (
+                                        next_active_user_index is None
+                                        or durable_next_projection is None
+                                        or not durable_next_projection.fits
+                                    ):
+                                        self._last_compaction_refusal_reason = (
+                                            "compaction_consumer_admission_failed"
+                                        )
+                                        self._terminalize_pending_durable_compaction(
+                                            status="failed",
+                                            reason=("compaction_consumer_admission_failed"),
+                                        )
+                                        yield self._transition(AgentState.ERROR)
+                                        terminal_error = self._context_overflow_error()
+                                        yield terminal_error
+                                        break
+                                if not overflow_outcome.ephemeral_only:
+                                    pending_event = self._pending_durable_compaction_event
+                                    if pending_event is None:
+                                        self._last_compaction_refusal_reason = (
+                                            "compaction_consumer_admission_failed"
+                                        )
+                                        yield self._transition(AgentState.ERROR)
+                                        terminal_error = self._context_overflow_error()
+                                        yield terminal_error
+                                        break
+                                    # Stable consumer admission, rather than the
+                                    # temporary routed leg, owns installation.
+                                    # Clear before yielding so cancellation after
+                                    # persistence cannot produce a second
+                                    # terminal lifecycle event.
+                                    self._pending_durable_compaction_event = None
+                                    yield pending_event
+                                    turn_messages = overflow_outcome.messages
+                                    request_context_insert_index = next_request_context_insert_index
+                                    runtime_context_insert_index = next_runtime_context_insert_index
+                                    if overflow_outcome.protected_turn_start_index is not None:
+                                        current_turn_start_index = (
+                                            overflow_outcome.protected_turn_start_index
+                                        )
+                                    message_count_request_view = None
+                            next_projection = project_provider_final_request(
+                                self.provider,
+                                next_request_messages,
+                                provider_tools_for_call,
+                                next_chat_cfg,
+                            )
+                            if (
+                                stable_live_recovery is not None
+                                and next_active_user_index is not None
+                                and next_projection is not None
+                                and next_projection.fits
+                            ):
+                                message_count_request_view = _MessageCountRequestView(
+                                    messages=stable_live_recovery.messages,
+                                    canonical_tail_start=len(turn_messages),
+                                    request_context_insert_index=(
+                                        stable_live_recovery.request_context_insert_index
+                                        if (
+                                            stable_live_recovery.request_context_insert_index
+                                            is not None
+                                        )
+                                        else next_request_context_insert_index
+                                    ),
+                                    runtime_context_insert_index=(
+                                        stable_live_recovery.runtime_context_insert_index
+                                        if (
+                                            stable_live_recovery.runtime_context_insert_index
+                                            is not None
+                                        )
+                                        else next_runtime_context_insert_index
+                                    ),
+                                    protected_turn_start_index=(
+                                        stable_live_recovery.protected_turn_start_index
+                                        if (
+                                            stable_live_recovery.protected_turn_start_index
+                                            is not None
+                                        )
+                                        else current_turn_start_index
+                                    ),
+                                )
+                                self._last_compaction_refusal_reason = None
+                                _call_attempt += 1
+                                continue
+                            if (
+                                next_active_user_index is None
+                                or next_projection is None
+                                or not next_projection.fits
+                            ):
+                                routed_recovery = stable_live_recovery
+                                routed_protected_start = (
+                                    overflow_outcome.protected_turn_start_index
+                                    if overflow_outcome.protected_turn_start_index is not None
+                                    else current_turn_start_index
+                                )
+                                routed_source_messages = overflow_outcome.messages
+                                routed_source_request_index = next_request_context_insert_index
+                                routed_source_runtime_index = next_runtime_context_insert_index
+                                routed_keep_recent_rounds = 2
+                                if overflow_outcome.ephemeral_only:
+                                    routed_source_messages = turn_messages
+                                    routed_protected_start = current_turn_start_index
+                                    routed_source_request_index = request_context_insert_index
+                                    routed_source_runtime_index = runtime_context_insert_index
+                                    routed_keep_recent_rounds = 1
+                                if (
+                                    routed_recovery is None
+                                    and next_active_user_index is not None
+                                    and next_projection is not None
+                                    and (
+                                        overflow_outcome.ephemeral_only
+                                        or durable_consumer_overflow_proven is True
+                                    )
+                                    and self._live_turn_compaction_boundary(
+                                        routed_source_messages,
+                                        protected_turn_start_index=(routed_protected_start),
+                                        keep_recent_rounds=(routed_keep_recent_rounds),
+                                    )
+                                    is not None
+                                ):
+                                    try:
+                                        routed_recovery = (
+                                            await self._recover_live_turn_request_overflow(
+                                                routed_source_messages,
+                                                protected_turn_start_index=(routed_protected_start),
+                                                context_window_tokens=(
+                                                    provider_request_window_tokens
+                                                    or self.config.context_window_tokens
+                                                ),
+                                                context_window_chars=(
+                                                    provider_request_window_chars
+                                                ),
+                                                keep_recent_rounds=(routed_keep_recent_rounds),
+                                                request_context_insert_index=(
+                                                    routed_source_request_index
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    routed_source_runtime_index
+                                                ),
+                                                shared_compaction_config=(
+                                                    overflow_outcome.runtime_compaction_config
+                                                ),
+                                            )
+                                        )
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except Exception as exc:  # noqa: BLE001
+                                        logger.warning(
+                                            "compaction.routed_live_turn_projection_failed",
+                                            error_type=type(exc).__name__,
+                                            error=str(exc),
+                                        )
+                                if routed_recovery is not None:
+                                    routed_request_index = (
+                                        routed_recovery.request_context_insert_index
+                                        if (
+                                            routed_recovery.request_context_insert_index is not None
+                                        )
+                                        else next_request_context_insert_index
+                                    )
+                                    routed_runtime_index = (
+                                        routed_recovery.runtime_context_insert_index
+                                        if (
+                                            routed_recovery.runtime_context_insert_index is not None
+                                        )
+                                        else next_runtime_context_insert_index
+                                    )
+                                    routed_request_messages = (
+                                        await self._provider_request_messages_async(
+                                            routed_recovery.messages,
+                                            request_context_message=(request_context_message),
+                                            request_context_insert_index=(routed_request_index),
+                                            runtime_context_message=(runtime_context_message),
+                                            runtime_context_insert_index=(routed_runtime_index),
+                                        )
+                                    )
+                                    routed_active_user_index = (
+                                        _active_user_message_index_for_request(
+                                            routed_request_messages,
+                                            current_user_text=(self._current_turn_message or ""),
+                                        )
+                                    )
+                                    routed_chat_cfg = call_chat_cfg.model_copy(
+                                        update={
+                                            "active_user_message_index": (routed_active_user_index)
+                                        }
+                                    )
+                                    routed_projection = project_provider_final_request(
+                                        self.provider,
+                                        routed_request_messages,
+                                        provider_tools_for_call,
+                                        routed_chat_cfg,
+                                    )
+                                    if (
+                                        routed_active_user_index is not None
+                                        and routed_projection is not None
+                                        and routed_projection.fits
+                                    ):
+                                        message_count_request_view = _MessageCountRequestView(
+                                            messages=(routed_recovery.messages),
+                                            canonical_tail_start=len(turn_messages),
+                                            request_context_insert_index=(routed_request_index),
+                                            runtime_context_insert_index=(routed_runtime_index),
+                                            protected_turn_start_index=(
+                                                routed_recovery.protected_turn_start_index
+                                                if (
+                                                    routed_recovery.protected_turn_start_index
+                                                    is not None
+                                                )
+                                                else current_turn_start_index
+                                            ),
+                                        )
+                                        self._last_compaction_refusal_reason = None
+                                        _call_attempt += 1
+                                        continue
+                                self._last_compaction_refusal_reason = (
+                                    "provider_request_budget_exhausted"
+                                    if durable_consumer_overflow_proven is True
+                                    else "compaction_final_admission_failed"
+                                )
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason=self._last_compaction_refusal_reason,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = self._context_overflow_error()
+                                yield terminal_error
+                                break
+                            if overflow_outcome.ephemeral_only:
+                                message_count_request_view = _MessageCountRequestView(
+                                    messages=overflow_outcome.messages,
+                                    canonical_tail_start=len(turn_messages),
+                                    request_context_insert_index=(
+                                        next_request_context_insert_index
+                                    ),
+                                    runtime_context_insert_index=(
+                                        next_runtime_context_insert_index
+                                    ),
+                                    protected_turn_start_index=(
+                                        overflow_outcome.protected_turn_start_index
+                                        if overflow_outcome.protected_turn_start_index is not None
+                                        else current_turn_start_index
+                                    ),
+                                )
+                            else:
+                                turn_messages = overflow_outcome.messages
+                                request_context_insert_index = next_request_context_insert_index
+                                runtime_context_insert_index = next_runtime_context_insert_index
+                                if overflow_outcome.protected_turn_start_index is not None:
+                                    current_turn_start_index = (
+                                        overflow_outcome.protected_turn_start_index
+                                    )
+                                message_count_request_view = None
+                            _call_attempt += 1
+                            continue
+                        retry_failed_call_safe = (
+                            getattr(self.provider, "retry_failed_call_safe", True) is not False
+                        )
+                        connection_failed = provider_error.code == CONNECTION_FAILED_CODE
+                        if connection_failed and retry_failed_call_safe:
+                            delay = min(60.0, 5.0 * 2 ** min(_connection_wait_attempt, 4))
+                            _connection_wait_attempt += 1
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retry_wait",
+                                reason="transport_transient",
+                                retry_attempt=_connection_wait_attempt,
+                                retry_limit=0,
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
+                            async with asyncio.timeout_at(_total_deadline):
+                                await asyncio.sleep(delay)
+                            next_provider_activity_reason = "transport_transient"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retrying",
+                                reason="transport_transient",
+                                retry_attempt=_connection_wait_attempt,
+                                retry_limit=0,
+                                started_at=time.time_ns() // 1_000_000,
                             )
                             _call_attempt += 1
                             continue
-                        should_retry = _fallback.should_retry(kind, _retry_attempt)
-                        retry_failed_call_safe = (
-                            getattr(
-                                self.provider,
-                                "retry_failed_call_safe",
-                                True,
+                        _connection_wait_attempt = 0
+
+                        if (
+                            provider_error.code == "provider_retry_after_deadline"
+                            and retry_failed_call_safe
+                            and self._switch_to_invalid_response_fallback(
+                                provider_error.code,
+                                requires_tools=bool(provider_tools_for_call),
+                                exclude_current_authority=True,
                             )
-                            is not False
+                        ):
+                            next_provider_activity_reason = "rate_limited"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="fallback",
+                                reason="rate_limited",
+                                retry_attempt=_call_attempt + 1,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
+                            _call_attempt += 1
+                            continue
+
+                        # A wait that cannot fit may only move to a different
+                        # authority above. Never replay the rate-limited leg.
+                        should_retry = (
+                            provider_error.code not in {
+                                "provider_retry_after_deadline", "rate_limit_retry_exhausted"
+                            }
+                            and (
+                                _fallback.should_retry(kind, _retry_attempt)
+                                or failure_kind is ProviderFailureKind.RATE_LIMITED
+                                and _retry_attempt < _fallback.max_retries
+                            )
                         )
                         if should_retry and not retry_failed_call_safe:
                             _log.warning(
@@ -8302,30 +11298,99 @@ class Agent:
                         if not should_retry:
                             yield self._transition(AgentState.ERROR)
                             terminal_error = ErrorEvent(
-                                message=provider_error.message,
-                                code=provider_error.code,
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_failure_code(
+                                    provider_error.code,
+                                    failure_kind.value,
+                                ),
+                                failure_kind=failure_kind.value,
                             )
                             yield terminal_error
                             break
-                        delay = backoff_sleep(
+                        local_delay = backoff_sleep(
                             _retry_attempt,
                             _fallback.base_backoff_ms,
                             _fallback.max_backoff_ms,
                             _fake=True,
                         )
+                        resolved_retry_delay = _provider_retry_delay_seconds(
+                            local_delay_s=local_delay,
+                            provider_retry_after_s=provider_error.retry_after_s,
+                        )
+                        reason = _provider_activity_reason_for_failure(failure_kind)
+                        retry_exceeds_deadline = bool(
+                            resolved_retry_delay is not None
+                            and _total_deadline is not None
+                            and _loop.time() + resolved_retry_delay >= _total_deadline
+                        )
+                        if resolved_retry_delay is None or retry_exceeds_deadline:
+                            fallback_selected = self._switch_to_invalid_response_fallback(
+                                failure_kind.value,
+                                requires_tools=bool(provider_tools_for_call),
+                            )
+                            if fallback_selected:
+                                next_provider_activity_reason = reason
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    model=self._provider_activity_model(),
+                                    phase="fallback",
+                                    reason=reason,
+                                    retry_attempt=_retry_attempt + 1,
+                                    retry_limit=_fallback.max_retries,
+                                    retry_after_ms=0,
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
+                                _call_attempt += 1
+                                continue
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_failure_code(
+                                    provider_error.code,
+                                    failure_kind.value,
+                                ),
+                                failure_kind=failure_kind.value,
+                            )
+                            yield terminal_error
+                            break
                         _log.warning(
                             "provider.retry",
                             attempt=_retry_attempt + 1,
                             kind=kind.value,
-                            delay_s=round(delay, 2),
+                            delay_s=round(resolved_retry_delay, 2),
                         )
-                        await asyncio.sleep(delay)
+                        yield ProviderActivityEvent(
+                            activity_id=provider_activity_id,
+                            model=self._provider_activity_model(),
+                            phase="retry_wait",
+                            reason=reason,
+                            retry_attempt=_retry_attempt + 1,
+                            retry_limit=_fallback.max_retries,
+                            retry_after_ms=math.ceil(resolved_retry_delay * 1000),
+                            started_at=time.time_ns() // 1_000_000,
+                        )
+                        async with asyncio.timeout_at(_total_deadline):
+                            await sleep_before_retry(resolved_retry_delay)
                         _retry_attempt += 1
+                        next_provider_activity_reason = reason
+                        yield ProviderActivityEvent(
+                            activity_id=provider_activity_id,
+                            model=self._provider_activity_model(),
+                            phase="retrying",
+                            reason=reason,
+                            retry_attempt=_retry_attempt,
+                            retry_limit=_fallback.max_retries,
+                            started_at=time.time_ns() // 1_000_000,
+                        )
                         _call_attempt += 1
 
                 if terminal_error is not None:
-                    break
-                if artifact_delivery_degraded_final_response:
                     break
 
                 response_text = "".join(assistant_text_parts)
@@ -8345,45 +11410,10 @@ class Agent:
                     user_visible_emitted=attempt_user_visible_emitted,
                 )
                 if final_classification.kind != _ProviderAttemptKind.OK:
-                    if text_only_tool_recovery_pending:
-                        text_only_mode = getattr(
-                            self.config,
-                            "text_only_tool_recovery_mode",
-                            "off",
+                    if self._execution_context is not None:
+                        self._execution_context.drop_pending_tool_buffers(
+                            "invalid_provider_attempt"
                         )
-                        self.config.metadata[
-                            "text_only_tool_recovery_next_action_errors"
-                        ] = (
-                            self.config.metadata.get(
-                                "text_only_tool_recovery_next_action_errors",
-                                0,
-                            )
-                            + 1
-                        )
-                        decision = RuntimeRecoveryDecision(
-                            action="observe",
-                            mechanism="text_only_tool_recovery",
-                            reason="next_action_after_recovery",
-                            mode=str(text_only_mode),
-                            injected_to_model=False,
-                            details={
-                                "next_action": "error",
-                                "provider_attempt_kind": final_classification.kind.value,
-                            },
-                        )
-                        self._record_runtime_recovery_event(
-                            decision,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                        )
-                        self._write_turn_call_log(
-                            "runtime_recovery",
-                            action="observe",
-                            mode=text_only_mode,
-                            reason="text_only_next_action",
-                            details=decision.details,
-                        )
-                        text_only_tool_recovery_pending = False
                     logger.warning(
                         "provider.invalid_response_unhandled",
                         session_key=self._session_key,
@@ -8428,133 +11458,27 @@ class Agent:
                     yield terminal_error
                     break
 
+                # Tool events are transactional with the provider attempt. The
+                # final classification has already established that a DoneEvent
+                # was received and that every tool sequence was closed and
+                # validated. Only now can the buffered public events be
+                # committed; any retry/error path above discards them.
+                if self._execution_context is not None and provider_done_for_log is not None:
+                    for tool_call in tool_calls:
+                        await self._execution_context.commit_tool_round(
+                            tool_call.tool_use_id,
+                            provider_done_for_log,
+                        )
+                for pending_tool_event in pending_tool_events:
+                    turn_image_retry_barrier_crossed = True
+                    yield pending_tool_event
+                pending_tool_events.clear()
+
                 if iter_reasoning_content:
                     final_reasoning_parts.append(iter_reasoning_content)
 
-                # Check overflow against the live provider request, not
-                # cumulative billable usage for the whole turn.
-                estimated_context_tokens = self._estimate_live_request_tokens(
-                    request_messages,
-                    tools=provider_tools_for_call,
-                    config=call_chat_cfg,
-                )
-                overflow_outcome = await self._check_context_overflow(
-                    turn_messages,
-                    estimated_context_tokens,
-                    request_context_insert_index=request_context_insert_index,
-                    runtime_context_insert_index=runtime_context_insert_index,
-                    protected_turn_start_index=current_turn_start_index,
-                )
-                if overflow_outcome is None:
-                    if overflow_retries >= self.config.max_overflow_retries:
-                        yield self._transition(AgentState.ERROR)
-                        terminal_error = self._context_overflow_error()
-                        yield terminal_error
-                        break
-                    overflow_retries += 1
-                    _log.warning(
-                        "compaction.retry",
-                        attempt=overflow_retries,
-                        max=self.config.max_overflow_retries,
-                    )
-                    continue  # retry the tool loop iteration
-                if overflow_outcome.compacted:
-                    # Compaction happened — replace message list. Lifetime
-                    # counters keep feeding DoneEvent usage/cost accounting for
-                    # this turn.
-                    turn_messages = overflow_outcome.messages
-                    if overflow_outcome.request_context_insert_index is not None:
-                        request_context_insert_index = overflow_outcome.request_context_insert_index
-                    if overflow_outcome.runtime_context_insert_index is not None:
-                        runtime_context_insert_index = overflow_outcome.runtime_context_insert_index
-                    if overflow_outcome.protected_turn_start_index is not None:
-                        current_turn_start_index = overflow_outcome.protected_turn_start_index
-                    message_count_request_view = None
-                    yield CompactionEvent(
-                        compaction_id=overflow_outcome.compaction_id,
-                        summary=overflow_outcome.summary,
-                        kept_entries=overflow_outcome.kept_entries,
-                        kept_count=len(overflow_outcome.messages),
-                        removed_count=overflow_outcome.removed_count,
-                    )
-                    overflow_retries = 0  # reset on success
-                    # Rebuild chat_cfg so next LLM call uses refreshed system
-                    # prompt. Read cache_breakpoints from the
-                    # refreshed self.config (re-anchored by
-                    # refresh_system_prompt) — chat_cfg.cache_breakpoints
-                    # would still hold pre-compaction base text and miss the
-                    # cache on the next provider call.
-                    chat_cfg = ChatConfig(
-                        max_tokens=chat_cfg.max_tokens,
-                        temperature=chat_cfg.temperature,
-                        top_p=chat_cfg.top_p,
-                        system=self._context.system_prompt,
-                        thinking=thinking_enabled,
-                        thinking_budget_tokens=thinking_budget,
-                        thinking_budget_explicit=chat_cfg.thinking_budget_explicit,
-                        timeout=chat_cfg.timeout,
-                        stop_sequences=chat_cfg.stop_sequences,
-                        cache_breakpoints=self._cache_breakpoints_without_runtime_context(
-                            self.config.cache_breakpoints
-                        ),
-                        cache_mode=chat_cfg.cache_mode,
-                        output_json_schema=chat_cfg.output_json_schema,
-                        output_json_schema_strict=chat_cfg.output_json_schema_strict,
-                        model_capabilities=self.config.model_capabilities,
-                        thinking_level=(
-                            self.config.thinking
-                            if isinstance(self.config.thinking, ThinkingLevel)
-                            else None
-                        ),
-                        provider_request_max_chars=(self._provider_request_proof_max_chars()),
-                        tool_choice=chat_cfg.tool_choice,
-                    )
-
                 assembled_text = "".join(assistant_text_parts)
                 visible_text = assembled_text
-                if text_only_tool_recovery_pending:
-                    text_only_mode = getattr(
-                        self.config,
-                        "text_only_tool_recovery_mode",
-                        "off",
-                    )
-                    next_action = (
-                        "tool_call"
-                        if tool_calls
-                        else "text"
-                        if visible_text.strip()
-                        else "empty"
-                    )
-                    metadata_key: str | None
-                    metadata_key = f"text_only_tool_recovery_next_action_{next_action}s"
-                    self.config.metadata[metadata_key] = (
-                        self.config.metadata.get(metadata_key, 0) + 1
-                    )
-                    decision = RuntimeRecoveryDecision(
-                        action="observe",
-                        mechanism="text_only_tool_recovery",
-                        reason="next_action_after_recovery",
-                        mode=str(text_only_mode),
-                        injected_to_model=False,
-                        details={
-                            "next_action": next_action,
-                            "tool_call_count": len(tool_calls),
-                            "visible_text_chars": len(visible_text),
-                        },
-                    )
-                    self._record_runtime_recovery_event(
-                        decision,
-                        iteration=iterations,
-                        provider_call_count=turn_llm_calls,
-                    )
-                    self._write_turn_call_log(
-                        "runtime_recovery",
-                        action="observe",
-                        mode=text_only_mode,
-                        reason="text_only_next_action",
-                        details=decision.details,
-                    )
-                    text_only_tool_recovery_pending = False
                 if visible_text:
                     final_text_parts.append(visible_text)
 
@@ -8562,6 +11486,9 @@ class Agent:
                 terminal_projection_preflight_error = False
                 resolved_tool_calls: list[ToolCall] = []
                 for tc in tool_calls:
+                    if tc.tool_use_id in preflight_tool_results:
+                        resolved_tool_calls.append(tc)
+                        continue
                     resolved = self._rehydrate_projected_tool_arguments(tc)
                     if isinstance(resolved, ToolResult):
                         preflight_tool_results[tc.tool_use_id] = resolved
@@ -8584,127 +11511,9 @@ class Agent:
                     turn_messages = cleaned_turn_messages
                     runtime_recovery_scaffolding_pending = False
 
-                repeated_tool_call_recovery_message: str | None = None
-                repeated_tool_call_recovery_details: dict[str, Any] | None = None
-                repeat_threshold = max(
-                    0,
-                    int(
-                        getattr(
-                            self.config,
-                            "repeated_tool_call_recovery_threshold",
-                            3,
-                        )
-                        or 0
-                    ),
-                )
-                if (
-                    len(tool_calls) == 1
-                    and repeat_threshold > 0
-                    and tool_calls[0].tool_name
-                    in self._repeated_tool_call_recovery_tool_names()
-                ):
-                    current_repeat_key = self._tool_call_repeat_key(tool_calls[0])
-                    current_workspace_write_count = len(self._effective_workspace_write_records())
-                    if (
-                        current_repeat_key == repeated_tool_call_key
-                        and current_workspace_write_count
-                        == repeated_tool_call_workspace_write_count
-                    ):
-                        repeated_tool_call_count += 1
-                    else:
-                        repeated_tool_call_key = current_repeat_key
-                        repeated_tool_call_count = 1
-                        repeated_tool_call_workspace_write_count = current_workspace_write_count
-                        repeated_tool_call_last_result_is_error = False
-                    if repeated_tool_call_count >= repeat_threshold:
-                        # Repeated failed tools already have a separate recovery path
-                        # that returns a ToolResult to the model. This guard is for
-                        # successful no-new-information loops that can trigger provider
-                        # rejection before the model gets another turn.
-                        if not repeated_tool_call_last_result_is_error:
-                            repeated_tool_call_recovery_message = (
-                                self._repeated_tool_call_recovery_message(
-                                    tool_calls[0],
-                                    repeat_count=repeated_tool_call_count,
-                                )
-                            )
-                            repeated_tool_call_recovery_details = {
-                                "tool_name": tool_calls[0].tool_name,
-                                "tool_use_id": tool_calls[0].tool_use_id,
-                                "arguments_hash": current_repeat_key[1],
-                                "arguments_preview": self._tool_call_arguments_preview(
-                                    tool_calls[0]
-                                ),
-                                "repeat_count": repeated_tool_call_count,
-                                "repeat_threshold": repeat_threshold,
-                                "workspace_write_count": current_workspace_write_count,
-                            }
-                elif tool_calls:
-                    repeated_tool_call_key = None
-                    repeated_tool_call_count = 0
-                    repeated_tool_call_workspace_write_count = len(
-                        self._effective_workspace_write_records()
-                    )
-                    repeated_tool_call_last_result_is_error = False
-
-                if repeated_tool_call_recovery_message is not None:
-                    assistant_content: list[Any] = []
-                    if iter_reasoning_content and iter_thinking_signature:
-                        assistant_content.append(
-                            ContentBlockThinking(
-                                thinking=iter_reasoning_content,
-                                signature=iter_thinking_signature,
-                            )
-                        )
-                    if visible_text:
-                        assistant_content.append(ContentBlockText(text=visible_text))
-                    if assistant_content:
-                        turn_messages.append(
-                            Message(
-                                role="assistant",
-                                content=assistant_content,
-                                reasoning_content=iter_reasoning_content,
-                            )
-                        )
-                    turn_messages.append(
-                        Message(role="user", content=repeated_tool_call_recovery_message)
-                    )
-                    runtime_recovery_scaffolding_pending = True
-                    self.config.metadata["repeated_tool_call_recoveries"] = (
-                        self.config.metadata.get("repeated_tool_call_recoveries", 0) + 1
-                    )
-                    recovery_decision = RuntimeRecoveryDecision(
-                        action="nudge",
-                        mechanism="repeated_tool_call_recovery",
-                        reason="repeated_identical_tool_call",
-                        mode="warn_model",
-                        injected_to_model=True,
-                        message=repeated_tool_call_recovery_message,
-                        details=repeated_tool_call_recovery_details or {},
-                    )
-                    self._record_runtime_recovery_event(
-                        recovery_decision,
-                        iteration=iterations,
-                        provider_call_count=turn_llm_calls,
-                    )
-                    self._write_turn_call_log(
-                        "runtime_recovery",
-                        action="nudge",
-                        mode="warn_model",
-                        reason="repeated_identical_tool_call",
-                        details=repeated_tool_call_recovery_details or {},
-                    )
-                    yield WarningEvent(
-                        code="repeated_tool_call_recovery",
-                        message=(
-                            "Runtime skipped a repeated identical tool call and "
-                            "asked the model to change approach."
-                        ),
-                    )
-                    continue
 
                 # Build assistant message for history
-                assistant_content = []
+                assistant_content: list[Any] = []
                 if iter_thinking_signature:
                     assistant_content.append(
                         ContentBlockThinking(
@@ -8722,12 +11531,18 @@ class Agent:
                             input=tc.arguments,
                         )
                     )
+                native_content = _native_assistant_content(
+                    iter_provider_replay, response_text=visible_text, tool_calls=tool_calls,
+                )
+                if native_content is not None:
+                    assistant_content = native_content
                 if assistant_content:
                     turn_messages.append(
                         Message(
                             role="assistant",
                             content=assistant_content,
                             reasoning_content=iter_reasoning_content,
+                            provider_replay=iter_provider_replay,
                         )
                     )
 
@@ -8753,7 +11568,23 @@ class Agent:
 
                 # No tool calls → we're done
                 if not tool_calls:
-                    if _claim_pending_inputs_for_next_call():
+                    if tool_failure_finalization_pending:
+                        if await self._unfinished_plan_run_reconciliation_message() is not None:
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "Tool recovery ended before the attached PlanRun reached "
+                                    "a terminal checkpoint. The plan is still incomplete."
+                                ),
+                                code="plan_run_checkpoint_required",
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                        break
+                    if goal_terminal_final_response_pending:
+                        goal_terminal_final_response_pending = False
+                        goal_terminal_final_status = None
+                        break
+                    if await _claim_pending_inputs_for_next_call():
                         # A plain response is also a safe same-turn boundary.
                         # Keep the assistant output already emitted above, then
                         # continue with the claimed steer in this turn.
@@ -8765,17 +11596,13 @@ class Agent:
                     if plan_run_reconciliation is not None:
                         if visible_text and final_text_parts:
                             final_text_parts.pop()
-                        if (
-                            plan_run_reconciliation_attempts
-                            < _PLAN_RUN_RECONCILIATION_LIMIT
-                        ):
+                        if plan_run_reconciliation_attempts < _PLAN_RUN_RECONCILIATION_LIMIT:
                             plan_run_reconciliation_attempts += 1
                             turn_messages.append(
                                 Message(role="user", content=plan_run_reconciliation)
                             )
                             self.config.metadata["plan_run_reconciliations"] = (
-                                self.config.metadata.get("plan_run_reconciliations", 0)
-                                + 1
+                                self.config.metadata.get("plan_run_reconciliations", 0) + 1
                             )
                             self._write_turn_call_log(
                                 "plan_run_reconciliation",
@@ -8803,644 +11630,11 @@ class Agent:
                         )
                         yield terminal_error
                         break
-                    text_only_mode = getattr(
-                        self.config,
-                        "text_only_tool_recovery_mode",
-                        "off",
-                    )
-                    tool_choice_none = (
-                        isinstance(call_chat_cfg.tool_choice, str)
-                        and call_chat_cfg.tool_choice.strip().lower() == "none"
-                    )
-                    text_only_candidate = (
-                        text_only_mode != "off"
-                        and bool(visible_text.strip())
-                        and bool(provider_tools_for_call)
-                        and not tool_choice_none
-                        and not last_executed_results
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
-                    )
-                    if text_only_candidate:
-                        self.config.metadata["text_only_tool_recovery_detections"] = (
-                            self.config.metadata.get(
-                                "text_only_tool_recovery_detections",
-                                0,
-                            )
-                            + 1
-                        )
-                        should_inject_text_only = (
-                            text_only_mode == "warn_model"
-                            and text_only_tool_recovery_injections
-                            < _TEXT_ONLY_TOOL_RECOVERY_LIMIT
-                        )
-                        decision = RuntimeRecoveryDecision(
-                            action="nudge" if should_inject_text_only else "observe",
-                            mechanism="text_only_tool_recovery",
-                            reason="text_only_no_tool_call",
-                            mode=str(text_only_mode),
-                            injected_to_model=should_inject_text_only,
-                            message=(
-                                _TEXT_ONLY_TOOL_RECOVERY_MESSAGE
-                                if should_inject_text_only
-                                else None
-                            ),
-                            details={
-                                "visible_text_chars": len(visible_text),
-                                "available_tool_count": len(provider_tools_for_call or []),
-                                "recovery_injections": text_only_tool_recovery_injections,
-                                "limit": _TEXT_ONLY_TOOL_RECOVERY_LIMIT,
-                            },
-                        )
-                        self._record_runtime_recovery_event(
-                            decision,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                        )
-                        self._write_turn_call_log(
-                            "runtime_recovery",
-                            action=decision.action,
-                            mode=text_only_mode,
-                            reason=decision.reason,
-                            details=decision.details,
-                        )
-                        if should_inject_text_only:
-                            if visible_text and final_text_parts:
-                                final_text_parts.pop()
-                            turn_messages.append(
-                                Message(role="user", content=_TEXT_ONLY_TOOL_RECOVERY_MESSAGE)
-                            )
-                            runtime_recovery_scaffolding_pending = True
-                            text_only_tool_recovery_pending = True
-                            text_only_tool_recovery_injections += 1
-                            self.config.metadata["text_only_tool_recovery_injections"] = (
-                                self.config.metadata.get(
-                                    "text_only_tool_recovery_injections",
-                                    0,
-                                )
-                                + 1
-                            )
-                            yield WarningEvent(
-                                code="text_only_tool_recovery",
-                                message=(
-                                    "The model returned text without a tool call; "
-                                    "asking it to call tools if the task is not complete."
-                                ),
-                            )
-                            continue
-                    if (
-                        progress_watchdog_mode == "warn_model"
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                    ):
-                        failed_tool_finalization = (
-                            await self._failed_tool_finalization_recovery_details(
-                                last_executed_results,
-                                post_write_verification_failure=(
-                                    last_post_write_failed_verification
-                                ),
-                                post_write_verification_success_observed=(
-                                    post_write_focused_verification_success_observed
-                                ),
-                                final_text=visible_text,
-                            )
-                        )
-                        if failed_tool_finalization is not None:
-                            recovery_key = self._failed_tool_finalization_recovery_key(
-                                failed_tool_finalization
-                            )
-                            if (
-                                recovery_key in failed_tool_finalization_recovery_keys
-                                or len(failed_tool_finalization_recovery_keys)
-                                >= _FAILED_FINALIZATION_RECOVERY_LIMIT
-                            ):
-                                failed_tool_finalization = None
-                            else:
-                                failed_tool_finalization_recovery_keys.add(recovery_key)
-                                failed_tool_finalization["recovery_key"] = recovery_key
-                        if failed_tool_finalization is not None:
-                            recovery_message: str | None
-                            recovery_message = (
-                                self._failed_tool_finalization_recovery_message(
-                                    failed_tool_finalization
-                                )
-                            )
-                            self._record_tool_loop_runtime_event(
-                                reason=str(failed_tool_finalization["reason"]),
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                workspace_write_count=len(
-                                    self._effective_workspace_write_records()
-                                ),
-                                injected_to_model=True,
-                                hint_text_sha256=hashlib.sha256(
-                                    recovery_message.encode("utf-8")
-                                ).hexdigest(),
-                                details=failed_tool_finalization,
-                            )
-                            if visible_text and final_text_parts:
-                                final_text_parts.pop()
-                            turn_messages.append(Message(role="user", content=recovery_message))
-                            self.config.metadata["failed_tool_finalization_recoveries"] = (
-                                self.config.metadata.get(
-                                    "failed_tool_finalization_recoveries",
-                                    0,
-                                )
-                                + 1
-                            )
-                            self._write_turn_call_log(
-                                "progress_watchdog",
-                                action="warn",
-                                mode=progress_watchdog_mode,
-                                reason=str(failed_tool_finalization["reason"]),
-                                details=failed_tool_finalization,
-                            )
-                            yield WarningEvent(
-                                code="failed_tool_finalization_recovery",
-                                message=(
-                                    "The model attempted to finish after a failed "
-                                    "tool result with a workspace diff; asking it "
-                                    "to fix or re-validate once."
-                                ),
-                            )
-                            continue
-                    submit_review_red_detected = False
-                    if (
-                        finalize_evidence_tracker is not None
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
-                    ):
-                        gate_status = await self._workspace_git_status_porcelain()
-                        gate_observation = finalize_evidence_tracker.build_observation(
-                            has_workspace_diff=bool(gate_status and gate_status.strip()),
-                        )
-                        if gate_observation.should_challenge:
-                            submit_review_red_detected = True
-                            gate_key = finalize_evidence_gate_key(gate_observation)
-                            # Never spend the run's last LLM call or deadline
-                            # slack on a challenge: with no headroom for a
-                            # follow-up call the injection would discard the
-                            # model's final answer and end the turn in a hard
-                            # budget/timeout error instead of a submission.
-                            gate_headroom = _turn_llm_call_budget_error(
-                                turn_llm_calls + 1
-                            ) is None and (
-                                _total_deadline is None or _loop.time() < _total_deadline
-                            )
-                            gate_suppressed = (
-                                gate_key in finalize_evidence_gate_keys
-                                or len(finalize_evidence_gate_keys)
-                                >= FINALIZE_EVIDENCE_GATE_CHALLENGE_LIMIT
-                                or not gate_headroom
-                            )
-                            self.config.metadata["finalize_evidence_gate_detections"] = (
-                                self.config.metadata.get(
-                                    "finalize_evidence_gate_detections",
-                                    0,
-                                )
-                                + 1
-                            )
-                            gate_message = (
-                                None
-                                if gate_suppressed
-                                else finalize_evidence_challenge_message(gate_observation)
-                            )
-                            self._record_runtime_event(
-                                "finalize_evidence_gate.challenge",
-                                feature="finalize_evidence_gate",
-                                reason=gate_observation.primary_reason,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=bool(gate_message),
-                                recovery_key=gate_key,
-                                details=gate_observation.to_event_details(),
-                            )
-                            if gate_message is not None:
-                                finalize_evidence_gate_keys.add(gate_key)
-                                if visible_text and final_text_parts:
-                                    final_text_parts.pop()
-                                turn_messages.append(
-                                    Message(role="user", content=gate_message)
-                                )
-                                self.config.metadata[
-                                    "finalize_evidence_gate_recoveries"
-                                ] = (
-                                    self.config.metadata.get(
-                                        "finalize_evidence_gate_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "finalize_evidence_gate",
-                                    action="warn",
-                                    mode="on",
-                                    reason=gate_observation.primary_reason,
-                                    details=gate_observation.to_event_details(),
-                                )
-                                yield WarningEvent(
-                                    code="finalize_evidence_gate_recovery",
-                                    message=(
-                                        "The model attempted to finish with "
-                                        "unresolved red execution evidence; asking "
-                                        "it to re-verify once."
-                                    ),
-                                )
-                                continue
-                    if (
-                        patch_hygiene_block_mode in ("test_paths", "protected_paths")
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
-                    ):
-                        hygiene_status = await self._workspace_git_status_porcelain()
-                        if patch_hygiene_block_mode == "protected_paths":
-                            hygiene_offending_paths = (
-                                self._porcelain_status_protected_paths(hygiene_status)
-                            )
-                            hygiene_reason = "protected_paths_in_final_diff"
-                        else:
-                            hygiene_offending_paths = self._porcelain_status_test_paths(
-                                hygiene_status
-                            )
-                            hygiene_reason = "test_paths_in_final_diff"
-                        if hygiene_offending_paths:
-                            hygiene_key = _patch_hygiene_block_key(
-                                hygiene_offending_paths
-                            )
-                            # Same headroom rule as the evidence gate: never
-                            # spend the run's last LLM call or deadline slack
-                            # on a challenge.
-                            hygiene_headroom = _turn_llm_call_budget_error(
-                                turn_llm_calls + 1
-                            ) is None and (
-                                _total_deadline is None or _loop.time() < _total_deadline
-                            )
-                            hygiene_suppressed = (
-                                hygiene_key in patch_hygiene_block_keys
-                                or len(patch_hygiene_block_keys)
-                                >= _PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT
-                                or not hygiene_headroom
-                            )
-                            self.config.metadata["patch_hygiene_block_detections"] = (
-                                self.config.metadata.get(
-                                    "patch_hygiene_block_detections",
-                                    0,
-                                )
-                                + 1
-                            )
-                            if hygiene_suppressed:
-                                hygiene_message = None
-                            elif patch_hygiene_block_mode == "protected_paths":
-                                hygiene_message = (
-                                    _patch_hygiene_block_protected_message(
-                                        hygiene_offending_paths
-                                    )
-                                )
-                            else:
-                                hygiene_message = _patch_hygiene_block_message(
-                                    hygiene_offending_paths
-                                )
-                            self._record_runtime_event(
-                                "patch_hygiene_block.challenge",
-                                feature="patch_hygiene_block",
-                                reason=hygiene_reason,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=bool(hygiene_message),
-                                recovery_key=hygiene_key,
-                                details={
-                                    "offending_paths": hygiene_offending_paths[:20],
-                                    "offending_path_count": len(
-                                        hygiene_offending_paths
-                                    ),
-                                },
-                            )
-                            if hygiene_message is not None:
-                                patch_hygiene_block_keys.add(hygiene_key)
-                                if visible_text and final_text_parts:
-                                    final_text_parts.pop()
-                                turn_messages.append(
-                                    Message(role="user", content=hygiene_message)
-                                )
-                                self.config.metadata[
-                                    "patch_hygiene_block_recoveries"
-                                ] = (
-                                    self.config.metadata.get(
-                                        "patch_hygiene_block_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "patch_hygiene_block",
-                                    action="warn",
-                                    mode=patch_hygiene_block_mode,
-                                    reason=hygiene_reason,
-                                    details={
-                                        "offending_paths": hygiene_offending_paths[
-                                            :20
-                                        ],
-                                        "offending_path_count": len(
-                                            hygiene_offending_paths
-                                        ),
-                                    },
-                                )
-                                if patch_hygiene_block_mode == "protected_paths":
-                                    hygiene_warning = (
-                                        "The model attempted to finish with "
-                                        "write-policy-protected files still "
-                                        "changed in the workspace diff; asking "
-                                        "it to revert them once."
-                                    )
-                                else:
-                                    hygiene_warning = (
-                                        "The model attempted to finish with test "
-                                        "files still changed in the workspace "
-                                        "diff; asking it to revert them once."
-                                    )
-                                yield WarningEvent(
-                                    code="patch_hygiene_block_recovery",
-                                    message=hygiene_warning,
-                                )
-                                continue
-                    if (
-                        finalize_variant_challenge_enabled
-                        and not finalize_variant_challenge_fired
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
-                    ):
-                        variant_status = await self._workspace_git_status_porcelain()
-                        if variant_status and variant_status.strip():
-                            # Same headroom rule as the evidence gate: never
-                            # spend the run's last LLM call or deadline slack
-                            # on a challenge.
-                            variant_headroom = _turn_llm_call_budget_error(
-                                turn_llm_calls + 1
-                            ) is None and (
-                                _total_deadline is None or _loop.time() < _total_deadline
-                            )
-                            variant_message = (
-                                _finalize_variant_challenge_message()
-                                if variant_headroom
-                                else None
-                            )
-                            self.config.metadata[
-                                "finalize_variant_challenge_detections"
-                            ] = (
-                                self.config.metadata.get(
-                                    "finalize_variant_challenge_detections",
-                                    0,
-                                )
-                                + 1
-                            )
-                            self._record_runtime_event(
-                                "finalize_variant_challenge.challenge",
-                                feature="finalize_variant_challenge",
-                                reason="finalize_with_workspace_diff",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=bool(variant_message),
-                            )
-                            if variant_message is not None:
-                                # One challenge per turn, fired or not again:
-                                # the sweep is uniform and non-escalating, so
-                                # a second injection would only burn budget.
-                                finalize_variant_challenge_fired = True
-                                if visible_text and final_text_parts:
-                                    final_text_parts.pop()
-                                turn_messages.append(
-                                    Message(role="user", content=variant_message)
-                                )
-                                self.config.metadata[
-                                    "finalize_variant_challenge_recoveries"
-                                ] = (
-                                    self.config.metadata.get(
-                                        "finalize_variant_challenge_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "finalize_variant_challenge",
-                                    action="warn",
-                                    mode="on",
-                                    reason="finalize_with_workspace_diff",
-                                    details={
-                                        "iteration": iterations,
-                                        "provider_call_count": turn_llm_calls,
-                                    },
-                                )
-                                yield WarningEvent(
-                                    code="finalize_variant_challenge_recovery",
-                                    message=(
-                                        "The model attempted to finish; asking it "
-                                        "once to sweep the input classes reachable "
-                                        "by its change."
-                                    ),
-                                )
-                                continue
-                    if (
-                        progress_watchdog_mode == "warn_model"
-                        and not workspace_diff_recovery_attempted
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                    ):
-                        empty_diff_reason = await self._empty_diff_finalization_reason(visible_text)
-                        if empty_diff_reason is not None:
-                            recovery_message = self._empty_diff_recovery_message(empty_diff_reason)
-                            self._record_tool_loop_runtime_event(
-                                reason=empty_diff_reason,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                workspace_write_count=len(
-                                    self._effective_workspace_write_records()
-                                ),
-                                injected_to_model=True,
-                                hint_text_sha256=hashlib.sha256(
-                                    recovery_message.encode("utf-8")
-                                ).hexdigest(),
-                            )
-                            workspace_diff_recovery_attempted = True
-                            if visible_text and final_text_parts:
-                                final_text_parts.pop()
-                            turn_messages.append(
-                                Message(
-                                    role="user",
-                                    content=recovery_message,
-                                )
-                            )
-                            self.config.metadata["workspace_diff_recoveries"] = (
-                                self.config.metadata.get("workspace_diff_recoveries", 0) + 1
-                            )
-                            self._write_turn_call_log(
-                                "progress_watchdog",
-                                action="warn",
-                                mode=progress_watchdog_mode,
-                                reason=empty_diff_reason,
-                                details={
-                                    "iteration": iterations,
-                                    "provider_call_count": turn_llm_calls,
-                                    "workspace_write_count": len(
-                                        self._effective_workspace_write_records()
-                                    ),
-                                },
-                            )
-                            yield WarningEvent(
-                                code="workspace_diff_recovery",
-                                message=(
-                                    "The model attempted to finish without a clear "
-                                    "workspace diff; asking it to reassess once."
-                                ),
-                            )
-                            continue
-                    if (
-                        submit_review_enabled
-                        and submit_review_state.stage == 0
-                        and not submit_review_red_detected
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
-                    ):
-                        submit_implicit_headroom_ok = _turn_llm_call_budget_error(
-                            turn_llm_calls + 1
-                        ) is None and (
-                            _total_deadline is None or _loop.time() < _total_deadline
-                        )
-                        (
-                            implicit_file_index,
-                            implicit_diff_text,
-                        ) = await self._workspace_submit_review_capture()
-                        implicit_diff_empty = not (
-                            implicit_file_index.strip() or implicit_diff_text.strip()
-                        )
-                        if submit_review_should_fire_implicit(
-                            submit_review_state,
-                            enabled=submit_review_enabled,
-                            diff_empty=implicit_diff_empty,
-                            headroom_ok=submit_implicit_headroom_ok,
-                            other_gate_injected=False,
-                            red_detected=submit_review_red_detected,
-                            pending_flags_clear=True,
-                        ):
-                            submit_review_message = build_submit_review_message(
-                                implicit_file_index,
-                                implicit_diff_text,
-                                implicit=True,
-                                max_chars=submit_review_diff_max_chars,
-                            )
-                            submit_review_state.mark_reviewed("implicit")
-                            if visible_text and final_text_parts:
-                                final_text_parts.pop()
-                            turn_messages.append(
-                                Message(role="user", content=submit_review_message)
-                            )
-                            self.config.metadata["submit_review_implicit_recoveries"] = (
-                                self.config.metadata.get(
-                                    "submit_review_implicit_recoveries",
-                                    0,
-                                )
-                                + 1
-                            )
-                            self._record_runtime_event(
-                                "submit_review.implicit",
-                                feature="submit_review",
-                                reason="finalize_on_green_diff",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=True,
-                                details={
-                                    "diff_truncated": submit_review_diff_is_truncated(
-                                        implicit_diff_text,
-                                        submit_review_diff_max_chars,
-                                    ),
-                                },
-                            )
-                            self._write_turn_call_log(
-                                "submit_review",
-                                action="warn",
-                                mode="implicit",
-                                reason="finalize_on_green_diff",
-                            )
-                            yield WarningEvent(
-                                code="submit_review_implicit",
-                                message=(
-                                    "The model finished with unreviewed workspace "
-                                    "changes; showing it a review of its own diff "
-                                    "once before finalizing."
-                                ),
-                            )
-                            continue
-                    final_diff_contract_mode = getattr(
-                        self.config,
-                        "final_diff_contract_mode",
-                        "log",
-                    )
-                    if (
-                        final_diff_contract_mode != "off"
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                    ):
-                        final_diff_observation = self._final_diff_contract_observation()
-                        if final_diff_observation is not None and (
-                            final_diff_observation.diff_paths or final_diff_observation.suspicious
-                        ):
-                            should_warn_model = (
-                                final_diff_contract_mode == "warn_model"
-                                and final_diff_observation.suspicious
-                                and not final_diff_contract_recovery_attempted
-                            )
-                            recovery_message = (
-                                final_diff_contract_recovery_message(final_diff_observation)
-                                if should_warn_model
-                                else None
-                            )
-                            self._record_final_diff_contract_event(
-                                final_diff_observation,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                mode=str(final_diff_contract_mode),
-                                injected_to_model=bool(recovery_message),
-                                hint_text=recovery_message,
-                            )
-                            if recovery_message:
-                                final_diff_contract_recovery_attempted = True
-                                if visible_text and final_text_parts:
-                                    final_text_parts.pop()
-                                turn_messages.append(Message(role="user", content=recovery_message))
-                                self.config.metadata["final_diff_contract_recoveries"] = (
-                                    self.config.metadata.get(
-                                        "final_diff_contract_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "final_diff_contract",
-                                    action="warn",
-                                    mode=final_diff_contract_mode,
-                                    reason=final_diff_observation.primary_reason,
-                                    details=final_diff_observation.to_event_details(),
-                                )
-                                yield WarningEvent(
-                                    code="final_diff_contract_recovery",
-                                    message=(
-                                        "Runtime detected a suspicious final diff; "
-                                        "asking the model to reconcile it once."
-                                    ),
-                                )
-                                continue
                     max_iterations_finalization_pending = False
-                    post_write_convergence_finalization_pending = False
                     break
                 tool_calls = [self._coerce_meta_tool_call(tc) for tc in tool_calls]
                 tool_calls = self._force_matched_meta_invoke_tool_calls(tool_calls)
 
-                tool_deadline = _loop.time() + self.config.iteration_timeout
-                _arm_endgame_git_freeze_if_due()
 
                 # ------ STREAMING → TOOL_CALLING ------
                 yield self._transition(AgentState.TOOL_CALLING)
@@ -9453,7 +11647,12 @@ class Agent:
                     _get_tool_concurrency_policy,
                 )
 
-                tool_result_blocks: list[ContentBlockToolResult] = []
+                # Attach a live result container before dispatch. A completed
+                # tool must survive cancellation or a budget exit before the
+                # whole batch reaches its public delivery loop.
+                replay_result_message = Message(role="user", content=[])
+                turn_messages.append(replay_result_message)
+                recorded_result_blocks: dict[str, list[Any]] = {}
                 executed_results: list[ToolResult] = []
                 turn_yielded = False
 
@@ -9461,18 +11660,111 @@ class Agent:
                 results_by_id: dict[str, ToolResult] = {}
                 executed_tool_calls_by_id: dict[str, ToolCall] = {}
                 path_patch_snapshots_by_id: dict[str, ToolCall] = {}
+                tool_effect_observations_by_id: dict[str, tuple[int, int, int]] = {}
+                tool_cancellation_grace_by_id: dict[str, float] = {}
 
-                def _cap_timeout_by_deadlines(timeout: float) -> float:
-                    remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
-                    if _total_deadline is not None:
-                        remaining = min(remaining, max(0.0, _total_deadline - _loop.time()))
-                    return max(0.001, remaining)
+                def _tool_result_images(
+                    tool_use_id: str, *, consume: bool = False
+                ) -> list[ContentBlockImage | ContentBlockText]:
+                    media_context = self._tool_context or current_tool_context.get()
+                    media_by_call = getattr(media_context, "tool_result_media", None)
+                    if not isinstance(media_by_call, dict):
+                        return []
+                    raw_media = (
+                        media_by_call.pop(tool_use_id, []) if consume
+                        else media_by_call.get(tool_use_id, [])
+                    )
+                    images: list[ContentBlockImage | ContentBlockText] = []
+                    if isinstance(raw_media, list):
+                        for image_index, item in enumerate(raw_media, start=1):
+                            try:
+                                if not isinstance(item, dict):
+                                    raise ValueError("invalid image entry")
+                                data = item.get("data")
+                                mime = normalize_attachment_mime(item.get("mime"))
+                                if mime is None or mime not in IMAGE_ATTACHMENT_MIMES:
+                                    raise ValueError("unsupported image media type")
+                                if not isinstance(data, str) or not (
+                                    1 <= len(data) <= 16 * 1024 * 1024
+                                ):
+                                    raise ValueError("image is empty or exceeds the size limit")
+                                validate_image_bytes(base64.b64decode(data, validate=True), mime)
+                                attachment_id = item.get("attachment_id")
+                                retained_metadata = {
+                                    key: value for key in ("name", "local_path", "source_url")
+                                    if isinstance(value := item.get(key), str) and value
+                                }
+                                images.append(
+                                    ContentBlockImage(
+                                        media_type=mime,
+                                        data=data,
+                                        attachment_id=(
+                                            attachment_id
+                                            if isinstance(attachment_id, str) and attachment_id
+                                            else None
+                                        ),
+                                        durable_retained=(
+                                            True
+                                            if retained_metadata.get("local_path")
+                                            or isinstance(attachment_id, str) and attachment_id
+                                            else None
+                                        ),
+                                        name=retained_metadata.get("name"),
+                                        local_path=retained_metadata.get("local_path"),
+                                        source_url=retained_metadata.get("source_url"),
+                                    )
+                                )
+                            except ValueError:
+                                images.append(
+                                    ContentBlockText(
+                                        text=(
+                                            f"[Tool image {image_index} could not be loaded: "
+                                            "invalid, unsupported, or oversized image data. "
+                                            "This image was not analyzed.]"
+                                        )
+                                    )
+                                )
+                    return images
+
+                def _record_completed_tool_result(
+                    result: ToolResult,
+                    *,
+                    images: list[ContentBlockImage | ContentBlockText] | None = None,
+                ) -> None:
+                    nonlocal tool_images_pending_admission
+                    image_blocks = (
+                        _tool_result_images(result.tool_use_id) if images is None else images
+                    )
+                    if any(isinstance(block, ContentBlockImage) for block in image_blocks):
+                        tool_images_pending_admission = True
+                    recorded_result_blocks[result.tool_use_id] = [
+                        ContentBlockToolResult(
+                            tool_use_id=result.tool_use_id, content=result.content,
+                            is_error=result.is_error, execution_status=result.execution_status,
+                        ),
+                        *image_blocks,
+                    ]
+                    # Completion order may differ from provider call order.
+                    # Only recorded results appear; missing outcomes stay absent.
+                    replay_result_message.content = [
+                        block for call in tool_calls
+                        for block in recorded_result_blocks.get(call.tool_use_id, ())
+                    ]
+
+                def _cap_timeout_by_deadlines(timeout: float | None) -> float | None:
+                    if _total_deadline is None:
+                        return timeout
+                    remaining = max(0.0, _total_deadline - _loop.time())
+                    return min(timeout, remaining) if timeout is not None else remaining
 
                 async def _run_one(tc: ToolCall) -> ToolResult:
-                    nonlocal workspace_edit_gate_details
-                    nonlocal workspace_edit_gate_recovery_read_paths
-                    nonlocal workspace_edit_gate_recovery_reads_remaining
+                    nonlocal turn_irreversible_effect_started
+                    nonlocal turn_image_retry_barrier_crossed
                     started = time.monotonic()
+                    reliability_started = self._begin_tool_reliability_attempt(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name=tc.tool_name,
+                    )
                     self._write_turn_call_log(
                         "tool_request",
                         iteration=iterations,
@@ -9494,6 +11786,12 @@ class Agent:
                             arguments=execution_arguments,
                         )
                     executed_tool_calls_by_id[tc.tool_use_id] = execution_tc
+                    cancellation_policy = self._tool_cancellation_policy(execution_tc)
+                    tool_cancellation_grace_by_id.setdefault(
+                        tc.tool_use_id,
+                        STOP_CANCEL_GRACE_SECONDS,
+                    )
+                    tool_effect_observations_by_id[tc.tool_use_id] = self._tool_effect_observation()
                     tool_timeout = _cap_timeout_by_deadlines(
                         self._tool_execution_timeout(execution_tc)
                     )
@@ -9501,9 +11799,7 @@ class Agent:
                     if (
                         tc.tool_name == "apply_patch"
                         and self._tool_call_string_arg(tc, "path") is not None
-                        and not (
-                            self._tool_call_string_arg(tc, "patch") or ""
-                        ).strip()
+                        and not (self._tool_call_string_arg(tc, "patch") or "").strip()
                         and execution_tc is tc
                     ):
                         snapshot_failure = ToolResult(
@@ -9524,58 +11820,116 @@ class Agent:
                     preflight_result = (
                         preflight_tool_results.get(tc.tool_use_id) or snapshot_failure
                     )
-                    gate_recovery_read = self._workspace_edit_gate_allows_recovery_read(
-                        execution_tc,
-                        workspace_edit_gate_recovery_read_paths,
-                    )
-                    gate_result = self._workspace_edit_gate_tool_result(
-                        execution_tc,
-                        workspace_edit_gate_details,
-                        recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
-                    )
-                    diagnostic_retrieval_gate_result = (
-                        self._projected_diagnostic_retrieval_gate_tool_result(execution_tc)
-                    )
-                    if gate_result is not None:
-                        self._record_tool_loop_runtime_event(
-                            reason="workspace_edit_gate_blocked_tool_call",
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
+                    if preflight_result is None:
+                        preflight_result = tool_failure_recovery.before_call(execution_tc)
+                    if tool_timeout is not None and tool_timeout <= 0:
+                        preflight_result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
                             tool_name=tc.tool_name,
-                            gate_details=dict(workspace_edit_gate_details or {}),
-                            workspace_write_count=len(
-                                self._effective_workspace_write_records()
+                            content="The task deadline expired before this tool could start.",
+                            is_error=True,
+                            execution_status=runtime_execution_status(
+                                "timeout", reason="runtime_timeout", timed_out=True,
                             ),
-                            injected_to_model=True,
                         )
-                        res = gate_result
-                    elif diagnostic_retrieval_gate_result is not None:
-                        self._record_tool_loop_runtime_event(
-                            reason="projected_diagnostic_requires_retrieval",
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            tool_name=tc.tool_name,
-                            workspace_write_count=len(
-                                self._effective_workspace_write_records()
-                            ),
-                            injected_to_model=True,
-                        )
-                        res = diagnostic_retrieval_gate_result
-                    elif preflight_result is not None:
+                    if preflight_result is not None:
                         res = preflight_result
                     else:
+                        execution_task: asyncio.Task[ToolResult] | None = None
+                        cancellation_started = False
                         try:
-                            res = await asyncio.wait_for(
-                                self._execute_tool(execution_tc), timeout=tool_timeout
+                            turn_irreversible_effect_started = True
+                            turn_image_retry_barrier_crossed = True
+                            execution_task = asyncio.create_task(
+                                self._execute_tool(execution_tc)
                             )
+                            done, _pending = await asyncio.wait(
+                                {execution_task},
+                                timeout=tool_timeout,
+                            )
+                            if done:
+                                res = execution_task.result()
+                            else:
+                                cancellation_started = True
+                                settled = await cancel_task(
+                                    execution_task,
+                                    policy=cancellation_policy,
+                                    operation=f"tool:{tc.tool_name}",
+                                    grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS,
+                                )
+                                settlement_note = (
+                                    " Cancellation has not finished; execution effects are unknown."
+                                    if not settled else
+                                    " The local call ended; this does not confirm remote effects."
+                                )
+                                if (
+                                    cancellation_policy == "must_settle"
+                                    and self._tool_effect_observation()
+                                    != tool_effect_observations_by_id[tc.tool_use_id]
+                                ):
+                                    settlement_note = (
+                                        " The filesystem operation exceeded its deadline, "
+                                        "but its effects settled and were recorded before "
+                                        "the turn ended."
+                                    )
+                                res = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=(
+                                        f"Tool '{tc.tool_name}' timed out after "
+                                        f"{tool_timeout}s.{settlement_note}"
+                                    ),
+                                    is_error=True,
+                                    execution_status=runtime_execution_status(
+                                        "timeout",
+                                        reason="runtime_timeout",
+                                        timed_out=True,
+                                    ),
+                                )
+                                if (
+                                    tc.tool_name == "skill_install_community"
+                                    and cancellation_policy == "must_settle"
+                                    and execution_task.done()
+                                    and not execution_task.cancelled()
+                                    and execution_task.exception() is None
+                                ):
+                                    # The installer settles cancellation against its durable
+                                    # commit receipt before returning. Preserve that result.
+                                    res = execution_task.result()
+                        except asyncio.CancelledError:
+                            if (
+                                execution_task is not None
+                                and not execution_task.done()
+                                and not cancellation_started
+                            ):
+                                await cancel_task(
+                                    execution_task,
+                                    policy=cancellation_policy,
+                                    operation=f"tool:{tc.tool_name}",
+                                    grace_seconds=tool_cancellation_grace_by_id.get(
+                                        tc.tool_use_id,
+                                        STOP_CANCEL_GRACE_SECONDS,
+                                    ),
+                                )
+                            self._end_tool_reliability_attempt(
+                                tool_use_id=tc.tool_use_id,
+                                started_at=reliability_started,
+                            )
+                            if execution_task is not None and execution_task.done():
+                                try:
+                                    settled_result = execution_task.result()
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                                else:
+                                    _record_completed_tool_result(settled_result)
+                            raise
                         except TimeoutError:
+                            # A TimeoutError raised by the tool itself remains a
+                            # runtime timeout, matching the historical boundary.
                             res = ToolResult(
                                 tool_use_id=tc.tool_use_id,
                                 tool_name=tc.tool_name,
-                                content=(f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"),
+                                content=f"Tool '{tc.tool_name}' timed out after {tool_timeout}s",
                                 is_error=True,
                                 execution_status=runtime_execution_status(
                                     "timeout",
@@ -9583,56 +11937,17 @@ class Agent:
                                     timed_out=True,
                                 ),
                             )
+                    tool_failure_recovery.observe(
+                        execution_tc, res,
+                        repair_observed=(
+                            self._tool_effect_observation()
+                            != tool_effect_observations_by_id[tc.tool_use_id]
+                        ),
+                    )
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    self._record_focused_diagnostic_retrieval(execution_tc, res)
-                    if len(self._effective_workspace_write_records()) > 0:
-                        workspace_edit_gate_details = None
-                        workspace_edit_gate_recovery_read_paths.clear()
-                        workspace_edit_gate_recovery_reads_remaining = 0
-                    elif (
-                        workspace_edit_gate_details is not None
-                        and tc.tool_name in {"apply_patch", "edit_file"}
-                        and res.is_error
-                        and self._workspace_edit_gate_edit_error_allows_read(res)
-                    ):
-                        target_paths = self._workspace_edit_gate_target_paths(execution_tc)
-                        if target_paths:
-                            workspace_edit_gate_recovery_read_paths = {
-                                str(path) for path in target_paths
-                            }
-                            workspace_edit_gate_recovery_reads_remaining = min(
-                                2,
-                                len(workspace_edit_gate_recovery_read_paths),
-                            )
-                            self.config.metadata["workspace_edit_gate_patch_recoveries"] = (
-                                self.config.metadata.get(
-                                    "workspace_edit_gate_patch_recoveries",
-                                    0,
-                                )
-                                + 1
-                            )
-                            self._record_tool_loop_runtime_event(
-                                reason="workspace_edit_gate_patch_recovery_enabled",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                tool_name=tc.tool_name,
-                                target_paths=sorted(
-                                    workspace_edit_gate_recovery_read_paths
-                                ),
-                                injected_to_model=False,
-                            )
-                    elif gate_recovery_read:
-                        workspace_edit_gate_recovery_reads_remaining = max(
-                            0,
-                            workspace_edit_gate_recovery_reads_remaining - 1,
-                        )
-                        if workspace_edit_gate_recovery_reads_remaining <= 0:
-                            workspace_edit_gate_recovery_read_paths.clear()
-                    self._record_patch_evidence_tool_result(
-                        iteration=iterations,
-                        tool_call=execution_tc,
-                        result=res,
-                        duration_ms=duration_ms,
+                    self._end_tool_reliability_attempt(
+                        tool_use_id=tc.tool_use_id,
+                        started_at=reliability_started,
                     )
                     self._write_turn_call_log(
                         "tool_response",
@@ -9644,6 +11959,7 @@ class Agent:
                         is_error=res.is_error,
                         duration_ms=duration_ms,
                     )
+                    _record_completed_tool_result(res)
                     return res
 
                 async def _collect_tool_tasks(
@@ -9656,67 +11972,23 @@ class Agent:
                     interval = self._tool_activity_heartbeat_interval()
                     started = time.monotonic()
                     last_event_at = started
+                    cleanup_grace_seconds = TIMEOUT_CANCEL_GRACE_SECONDS
                     try:
                         while pending:
-                            remaining = max(0.0, tool_deadline - _loop.time())
-                            if _total_deadline is not None:
-                                remaining = min(
-                                    remaining,
-                                    max(0.0, _total_deadline - _loop.time()),
-                                )
-                            if remaining <= 0:
-                                for task, tc in list(task_to_tool_call.items()):
-                                    if task in pending:
-                                        task.cancel()
-                                        results_by_id[tc.tool_use_id] = ToolResult(
-                                            tool_use_id=tc.tool_use_id,
-                                            tool_name=tc.tool_name,
-                                            content=(
-                                                f"Tool '{tc.tool_name}' timed out after "
-                                                f"{self.config.iteration_timeout}s"
-                                            ),
-                                            is_error=True,
-                                            execution_status=runtime_execution_status(
-                                                "timeout",
-                                                reason="runtime_timeout",
-                                                timed_out=True,
-                                            ),
-                                        )
-                                return
-                            wait_timeout = remaining if interval <= 0 else min(interval, remaining)
+                            wait_timeout = interval if interval > 0 else None
                             done, pending = await asyncio.wait(
                                 pending,
-                                timeout=max(0.001, wait_timeout),
+                                timeout=wait_timeout,
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
                             if not done:
-                                if _loop.time() >= tool_deadline or (
-                                    _total_deadline is not None and _loop.time() >= _total_deadline
-                                ):
-                                    for task, tc in list(task_to_tool_call.items()):
-                                        if task in pending:
-                                            task.cancel()
-                                            results_by_id[tc.tool_use_id] = ToolResult(
-                                                tool_use_id=tc.tool_use_id,
-                                                tool_name=tc.tool_name,
-                                                content=(
-                                                    f"Tool '{tc.tool_name}' timed out after "
-                                                    f"{self.config.iteration_timeout}s"
-                                                ),
-                                                is_error=True,
-                                                execution_status=runtime_execution_status(
-                                                    "timeout",
-                                                    reason="runtime_timeout",
-                                                    timed_out=True,
-                                                ),
-                                            )
-                                    return
                                 now = time.monotonic()
                                 yield RunHeartbeatEvent(
                                     phase="tool",
                                     elapsed_ms=int((now - started) * 1000),
                                     idle_ms=int((now - last_event_at) * 1000),
                                     message="Tool still running",
+                                    generation_epoch=generation_epoch,
                                 )
                                 continue
 
@@ -9748,13 +12020,65 @@ class Agent:
                                         ),
                                     )
                                 results_by_id[tc.tool_use_id] = outcome
+                                _record_completed_tool_result(outcome)
+                    except (asyncio.CancelledError, GeneratorExit):
+                        cleanup_grace_seconds = STOP_CANCEL_GRACE_SECONDS
+                        raise
                     finally:
-                        for task in pending:
-                            if not task.done():
-                                task.cancel()
-                        for task in pending:
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await task
+                        cleanup_tasks = {
+                            task: self._tool_cancellation_policy(task_to_tool_call[task])
+                            for task in pending
+                        }
+                        try:
+                            await cancel_tasks(
+                                cleanup_tasks,
+                                operation="agent_tool_batch",
+                                grace_seconds=cleanup_grace_seconds,
+                            )
+                        finally:
+                            for task in pending:
+                                tc = task_to_tool_call[task]
+                                if tc.tool_name == "skill_install_community":
+                                    from opensquilla.skills.install_source import (
+                                        resolve_install_source,
+                                    )
+
+                                    identifier = str(tc.arguments.get("identifier", ""))
+                                    source = resolve_install_source(
+                                        identifier, tc.arguments.get("source"),
+                                    )
+                                    receipt = install_turn.previous(identifier, source)
+                                    if receipt is not None:
+                                        results_by_id[tc.tool_use_id] = ToolResult(
+                                            tool_use_id=tc.tool_use_id,
+                                            tool_name=tc.tool_name,
+                                            content=json.dumps(receipt),
+                                        )
+                                result = results_by_id.get(tc.tool_use_id)
+                                if (
+                                    result is None
+                                    or self._tool_cancellation_policy(tc) != "must_settle"
+                                    or result.execution_status is None
+                                    or result.execution_status.get("status") != "timeout"
+                                ):
+                                    continue
+                                before = tool_effect_observations_by_id.get(tc.tool_use_id)
+                                if (
+                                    before is not None
+                                    and self._tool_effect_observation() != before
+                                    and "effects settled" not in result.content
+                                ):
+                                    results_by_id[tc.tool_use_id] = replace(
+                                        result,
+                                        content=(
+                                            f"{result.content}. The filesystem operation "
+                                            "exceeded its deadline, but its effects "
+                                            "settled and were recorded before the turn "
+                                            "ended."
+                                        ),
+                                    )
+                            for result in results_by_id.values():
+                                _record_completed_tool_result(result)
 
                 # Dispatch preserving original order: accumulate consecutive
                 # concurrent/keyed tools into a batch and flush before each
@@ -9804,7 +12128,7 @@ class Agent:
                             {
                                 "status": "not_executed",
                                 "reason": "plan_run_delivery_only",
-                                "allowed_tools": ["publish_artifact"],
+                                "allowed_tools": sorted(PLAN_RUN_DELIVERY_TOOLS),
                             },
                             ensure_ascii=False,
                         ),
@@ -9820,6 +12144,11 @@ class Agent:
                 ) -> AsyncIterator[RunHeartbeatEvent]:
                     if not batch:
                         return
+                    for admitted_call in batch:
+                        self._admit_tool_reliability_call(
+                            tool_use_id=admitted_call.tool_use_id,
+                            tool_name=admitted_call.tool_name,
+                        )
                     semaphore = asyncio.Semaphore(self._max_safe_tool_concurrency())
                     keyed_locks: dict[Any, asyncio.Lock] = {}
                     limiters: dict[Any, asyncio.Semaphore] = {}
@@ -9844,7 +12173,7 @@ class Agent:
                             )
 
                         async def _run_after_policy_locks() -> ToolResult:
-                            async with semaphore:
+                            async with tool_failure_recovery.dispatch_slot(tc), semaphore:
                                 return await _run_one(tc)
 
                         async def _run_after_key_lock() -> ToolResult:
@@ -9863,18 +12192,19 @@ class Agent:
                         yield event
 
                 for tc in tool_calls:
+                    peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                    if callable(peek_installs) and peek_installs():
+                        install_turn.finalization_allowed = False
                     if dispatch_boundary is not None:
-                        results_by_id[tc.tool_use_id] = (
-                            _not_executed_after_dispatch_boundary(
-                                tc,
-                                dispatch_boundary,
-                            )
+                        results_by_id[tc.tool_use_id] = _not_executed_after_dispatch_boundary(
+                            tc,
+                            dispatch_boundary,
                         )
+                        _record_completed_tool_result(results_by_id[tc.tool_use_id])
                         continue
-                    if plan_run_delivery_only and tc.tool_name != "publish_artifact":
-                        results_by_id[tc.tool_use_id] = (
-                            _not_executed_during_plan_delivery(tc)
-                        )
+                    if plan_run_delivery_only and tc.tool_name not in PLAN_RUN_DELIVERY_TOOLS:
+                        results_by_id[tc.tool_use_id] = _not_executed_during_plan_delivery(tc)
+                        _record_completed_tool_result(results_by_id[tc.tool_use_id])
                         continue
                     if attached_plan_run_id and tc.tool_name == "submit":
                         results_by_id[tc.tool_use_id] = ToolResult(
@@ -9893,116 +12223,47 @@ class Agent:
                                 reason="plan_run_checkpoint_required",
                             ),
                         )
-                        continue
-                    if (
-                        submit_review_enabled
-                        and tc.tool_name == "submit"
-                        and str(
-                            getattr(
-                                self._tool_context,
-                                "collaboration_mode",
-                                "default",
-                            )
-                        )
-                        != "plan"
-                    ):
-                        # Control-only tool: never dispatched to the registry
-                        # (its body raises). Flush prior work so the captured
-                        # diff reflects every edit in this batch, then answer
-                        # the submit with the review/confirm text directly.
-                        async for event in _flush_parallel_batch(parallel_batch):
-                            yield event
-                        parallel_batch = []
-                        (
-                            submit_file_index,
-                            submit_diff_text,
-                        ) = await self._workspace_submit_review_capture()
-                        submit_diff_empty = not (
-                            submit_file_index.strip() or submit_diff_text.strip()
-                        )
-                        submit_headroom_ok = _turn_llm_call_budget_error(
-                            turn_llm_calls + 1
-                        ) is None and (
-                            _total_deadline is None or _loop.time() < _total_deadline
-                        )
-                        submit_action = evaluate_explicit_submit(
-                            submit_review_state,
-                            diff_empty=submit_diff_empty,
-                            headroom_ok=submit_headroom_ok,
-                        )
-                        if submit_action is SubmitAction.SHOW_CHECKLIST:
-                            submit_content = build_submit_review_message(
-                                submit_file_index,
-                                submit_diff_text,
-                                implicit=False,
-                                max_chars=submit_review_diff_max_chars,
-                            )
-                        elif submit_action is SubmitAction.NUDGE:
-                            submit_content = submit_review_nudge_message()
-                        elif submit_action is SubmitAction.EMPTY_DIFF_NOTE:
-                            submit_content = submit_review_empty_diff_note()
-                        else:
-                            submit_content = submit_review_confirmation_message()
-                        # A confirming submit finalizes the turn: the model has
-                        # cleared the review handshake and asked to submit, so its
-                        # current workspace changes become the final answer and the
-                        # loop ends here — the same outcome as the model going quiet
-                        # with a non-empty diff. Ending on confirm (rather than
-                        # replying and looping) is what makes a repeated submit
-                        # unable to re-enter this branch, so the confirmed state can
-                        # never re-fire. The checklist/nudge/empty-diff replies keep
-                        # the turn open so the model can act on them.
-                        submit_terminates_turn = submit_action is SubmitAction.CONFIRM
-                        self._record_runtime_event(
-                            "submit_review.explicit",
-                            feature="submit_review",
-                            reason=submit_action.value,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            injected_to_model=True,
-                            details={
-                                "stage": submit_review_state.stage,
-                                "nudges": submit_review_state.nudges,
-                                "diff_empty": submit_diff_empty,
-                                "diff_truncated": submit_review_diff_is_truncated(
-                                    submit_diff_text,
-                                    submit_review_diff_max_chars,
-                                ),
-                                "terminates_turn": submit_terminates_turn,
-                            },
-                        )
-                        submit_result = ToolResult(
-                            tool_use_id=tc.tool_use_id,
-                            tool_name="submit",
-                            content=submit_content,
-                            is_error=False,
-                            terminates_turn=submit_terminates_turn,
-                        )
-                        results_by_id[tc.tool_use_id] = submit_result
-                        if submit_result.terminates_turn:
-                            dispatch_boundary = submit_result
+                        _record_completed_tool_result(results_by_id[tc.tool_use_id])
                         continue
                     if tc.tool_name == "meta_invoke":
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
                         parallel_batch = []
+                        recovery_denial = tool_failure_recovery.before_call(tc)
+                        if recovery_denial is not None:
+                            results_by_id[tc.tool_use_id] = recovery_denial
+                            _record_completed_tool_result(recovery_denial)
+                            continue
                         active_ctx = (
                             current_tool_context.get() or self._tool_context or ToolContext()
                         )
-                        async for ev in self._run_one_streaming(tc, active_ctx):
-                            if isinstance(ev, ToolResult):
-                                results_by_id[tc.tool_use_id] = ev
-                            else:
-                                yield ev
+                        meta_effects_before = self._tool_effect_observation()
+                        meta_reliability_started = self._begin_tool_reliability_attempt(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                        )
+                        try:
+                            async for ev in self._run_one_streaming(tc, active_ctx):
+                                if isinstance(ev, ToolResult):
+                                    tool_failure_recovery.observe(
+                                        tc, ev,
+                                        repair_observed=(
+                                            self._tool_effect_observation() != meta_effects_before
+                                        ),
+                                    )
+                                    results_by_id[tc.tool_use_id] = ev
+                                    _record_completed_tool_result(ev)
+                                else:
+                                    yield ev
+                        finally:
+                            self._end_tool_reliability_attempt(
+                                tool_use_id=tc.tool_use_id,
+                                started_at=meta_reliability_started,
+                            )
                         meta_result = results_by_id.get(tc.tool_use_id)
                         if meta_result is not None and meta_result.terminates_turn:
                             dispatch_boundary = meta_result
                         continue
-                    if submit_review_enabled:
-                        # Any real (non-submit) tool counts as work after a
-                        # review was shown; distinguishes continued work from an
-                        # immediate rubber-stamp re-submit.
-                        submit_review_observe_tool_activity(submit_review_state)
                     policy = _get_tool_concurrency_policy(
                         tc.tool_name,
                         tc.arguments,
@@ -10014,12 +12275,45 @@ class Agent:
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
                         parallel_batch = []
+                        self._admit_tool_reliability_call(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                        )
                         async for event in _collect_tool_tasks(
                             {asyncio.create_task(_run_one(tc)): tc}
                         ):
                             yield event
                         mutex_result = results_by_id.get(tc.tool_use_id)
-                        if mutex_result is not None and mutex_result.terminates_turn:
+                        # A structured-input attempt owns the remainder of the
+                        # provider response even when its arguments are invalid.
+                        # Keep the error non-terminal so the next provider
+                        # iteration can correct it, but never let a tail call in
+                        # the same response (notably submit_plan) race past it.
+                        if mutex_result is not None and (
+                            mutex_result.terminates_turn
+                            or self._is_turn_yield_result(mutex_result)
+                            or tc.tool_name == "request_user_input"
+                            or _pending_approval_payload(mutex_result.content) is not None
+                        ):
+                            dispatch_boundary = mutex_result
+                        if (
+                            mutex_result is not None
+                            and tc.tool_name == "update_goal"
+                            and is_goal_owned_main_default_turn(
+                                self._tool_context or current_tool_context.get()
+                            )
+                            and self._accepted_goal_terminal_status(
+                                [tc],
+                                [mutex_result],
+                            )
+                            is not None
+                        ):
+                            # A durable Goal terminal decision owns the rest of
+                            # this provider batch. Pair every later tool call
+                            # with a not-executed result, then perform exactly
+                            # one tool-free final-summary model call.
+                            dispatch_boundary = mutex_result
+                        if mutex_result is not None and install_turn.complete:
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
                             plan_run_delivery_only = True
@@ -10030,6 +12324,7 @@ class Agent:
                 # Emit results in original tool_calls order.
                 for tc in tool_calls:
                     result = results_by_id[tc.tool_use_id]
+                    _record_completed_tool_result(result)
                     result_tool_call = tc
                     for artifact in result.artifacts:
                         yield ArtifactEvent(**_artifact_event_kwargs(artifact))
@@ -10037,6 +12332,7 @@ class Agent:
                         result,
                         tool_call=result_tool_call,
                     )
+                    _record_completed_tool_result(projected_result)
                     deferred_user_input_handled = False
                     pending_user_input = (
                         _pending_user_input_payload(result.content)
@@ -10048,9 +12344,7 @@ class Agent:
                         "user_input_provider",
                         None,
                     )
-                    task_id = str(
-                        getattr(self._tool_context, "task_id", "") or ""
-                    ).strip()
+                    task_id = str(getattr(self._tool_context, "task_id", "") or "").strip()
                     if (
                         pending_user_input is not None
                         and user_input_provider is not None
@@ -10064,31 +12358,42 @@ class Agent:
                             payload=pending_user_input,
                         )
                         request_id = str(public_request["request_id"])
-                        pending_result = ToolResult(
-                            tool_use_id=tc.tool_use_id,
-                            tool_name=tc.tool_name,
-                            content=json.dumps(public_request, ensure_ascii=False),
-                            is_error=False,
-                        )
-                        projected_pending = await self._project_tool_result_for_delivery(
-                            pending_result,
-                            tool_call=tc,
-                        )
-                        yield ToolResultEvent(
-                            tool_use_id=projected_pending.tool_use_id,
-                            tool_name=projected_pending.tool_name,
-                            result=projected_pending.content,
-                            is_error=projected_pending.is_error,
-                            arguments=tc.arguments,
-                            execution_status=projected_pending.execution_status,
-                        )
+                        user_input_wait_started = _loop.time()
                         try:
-                            answers = await user_input_provider.wait_for_response(
-                                request_id
+                            pending_result = ToolResult(
+                                tool_use_id=tc.tool_use_id,
+                                tool_name=tc.tool_name,
+                                content=json.dumps(public_request, ensure_ascii=False),
+                                is_error=False,
                             )
-                        except asyncio.CancelledError:
+                            projected_pending = await self._project_tool_result_for_delivery(
+                                pending_result,
+                                tool_call=tc,
+                            )
+                            yield ToolResultEvent(
+                                tool_use_id=projected_pending.tool_use_id,
+                                tool_name=projected_pending.tool_name,
+                                result=projected_pending.content,
+                                execution_log_handle=projected_pending.execution_log_handle,
+                                is_error=projected_pending.is_error,
+                                arguments=tc.arguments,
+                                execution_status=projected_pending.execution_status,
+                                effect_outcome=projected_pending.effect_outcome,
+                                generation_epoch=generation_epoch,
+                            )
+                            answers = await user_input_provider.wait_for_response(request_id)
+                        finally:
+                            # Human input suspends execution, including time the
+                            # consumer spends showing the yielded questionnaire.
+                            user_input_wait_duration = max(
+                                0.0,
+                                _loop.time() - user_input_wait_started,
+                            )
+                            if _total_deadline is not None:
+                                _total_deadline += user_input_wait_duration
+                            # Also close requests when projection, waiting, or
+                            # the event consumer fails or cancels the turn.
                             user_input_provider.cancel_request(request_id)
-                            raise
                         result = ToolResult(
                             tool_use_id=tc.tool_use_id,
                             tool_name=tc.tool_name,
@@ -10104,17 +12409,26 @@ class Agent:
                             ),
                             is_error=False,
                         )
+                        _record_completed_tool_result(result)
                         projected_result = await self._project_tool_result_for_delivery(
                             result,
                             tool_call=tc,
                         )
+                        self._settle_tool_reliability(
+                            tool_use_id=tc.tool_use_id,
+                            result=result,
+                        )
+                        _record_completed_tool_result(projected_result)
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,
                             result=projected_result.content,
+                            execution_log_handle=projected_result.execution_log_handle,
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
+                            effect_outcome=projected_result.effect_outcome,
+                            generation_epoch=generation_epoch,
                         )
                         deferred_user_input_handled = True
                     pending_approval = (
@@ -10122,304 +12436,262 @@ class Agent:
                         if deferred_user_input_handled
                         else _pending_approval_payload(result.content)
                     )
-                    if pending_approval is not None and not tc.arguments.get("approval_id"):
-                        suspended = _suspend_tool_request(tc, pending_approval)
-                        assessment = await _review_pending_elevation_if_configured(
-                            pending_approval,
-                            transcript=turn_messages,
-                            runtime_events_path=self.config.runtime_events_path,
-                            suspended_action=suspended.action,
-                        )
-                        # Human-owned approvals need a lifecycle event so the UI can
-                        # render its card. Automatic rule reviews remain internal.
-                        if assessment is None:
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
+                    if pending_approval is not None:
+                        # One logical tool execution may intentionally have more
+                        # than one approval boundary (for example, a second
+                        # explicit confirmation after backup becomes unavailable).
+                        # Keep waiting and resuming the original tool call until it
+                        # completes, or until the user denies any step.
+                        while pending_approval is not None:
+                            suspended = _suspend_tool_request(tc, pending_approval)
+                            assessment = await _review_pending_elevation_if_configured(
+                                pending_approval,
+                                transcript=turn_messages,
+                                runtime_events_path=self.config.runtime_events_path,
+                                suspended_action=suspended.action,
                             )
-                        approval_wait_started = _loop.time()
-                        await _wait_for_pending_approval_resolution(pending_approval)
-                        approval_wait_duration = max(
-                            0.0,
-                            _loop.time() - approval_wait_started,
-                        )
-                        # Human review is a suspended state, not execution time.
-                        # Shift both active deadlines so an approval that arrives
-                        # much later still resumes with the same tool/turn budget.
-                        tool_deadline += approval_wait_duration
-                        if _total_deadline is not None:
-                            _total_deadline += approval_wait_duration
-                        approval_entry = None
-                        from opensquilla.gateway.approval_queue import get_approval_queue
-
-                        try:
-                            approval_entry = get_approval_queue().get(
-                                str(pending_approval["approval_id"])
+                            # Human-owned approvals need a lifecycle event so the UI
+                            # can render its card. Automatic reviews remain internal.
+                            if assessment is None:
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    execution_log_handle=projected_result.execution_log_handle,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
+                                    generation_epoch=generation_epoch,
+                                )
+                            approval_wait_started = _loop.time()
+                            await _wait_for_pending_approval_resolution(pending_approval)
+                            approval_wait_duration = max(
+                                0.0,
+                                _loop.time() - approval_wait_started,
                             )
-                        except KeyError:
+                            # Human review is suspended state, not execution time.
+                            if _total_deadline is not None:
+                                _total_deadline += approval_wait_duration
                             approval_entry = None
-                        if approval_entry is None or not approval_entry.resolved:
-                            turn_yielded = True
-                        elif not approval_entry.approved:
-                            suspended.deny(str(pending_approval["approval_id"]))
-                            rationale = str(
-                                approval_entry.params.get("reviewRationale") or ""
-                            ).strip()
-                            result = ToolResult(
-                                tool_use_id=tc.tool_use_id,
-                                tool_name=tc.tool_name,
-                                content=json.dumps(
-                                    {
-                                        "status": "approval_denied",
-                                        "approval_id": pending_approval["approval_id"],
-                                        "message": rationale
-                                        or "The exact elevated action was not approved.",
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                is_error=False,
+                            from opensquilla.gateway.approval_queue import (
+                                get_approval_queue,
                             )
-                            projected_result = await self._project_tool_result_for_delivery(
-                                result,
-                                tool_call=tc,
-                            )
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
-                            )
-                            if approval_entry.resolution == "expired":
+
+                            try:
+                                approval_entry = get_approval_queue().get(
+                                    str(pending_approval["approval_id"])
+                                )
+                            except KeyError:
+                                approval_entry = None
+                            if approval_entry is None or not approval_entry.resolved:
+                                self._set_tool_reliability_terminal(
+                                    tool_use_id=tc.tool_use_id,
+                                    outcome=ToolOutcome.CANCEL,
+                                    error_code=ToolErrorCode.CANCELLED,
+                                )
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
+                                )
                                 turn_yielded = True
-                        else:
-                            resumed_call = suspended.approve(
-                                str(pending_approval["approval_id"])
-                            )
+                                break
+                            if not approval_entry.approved:
+                                suspended.deny(str(pending_approval["approval_id"]))
+                                resolution = str(approval_entry.resolution or "")
+                                reviewer = str(approval_entry.params.get("reviewer") or "user")
+                                resolution_source = str(
+                                    approval_entry.params.get("resolutionSource") or ""
+                                )
+                                explicit_human_denial = (
+                                    resolution == "denied"
+                                    and reviewer == "user"
+                                    and resolution_source
+                                    in {"", "user", "user_web", "user_channel"}
+                                    and approval_entry.params.get("humanActionable") is not False
+                                )
+                                rationale = str(
+                                    approval_entry.params.get("reviewRationale") or ""
+                                ).strip()
+                                result_status = (
+                                    "approval_expired"
+                                    if resolution == "expired"
+                                    else "approval_denied"
+                                )
+                                if explicit_human_denial:
+                                    self._set_tool_reliability_terminal(
+                                        tool_use_id=tc.tool_use_id,
+                                        outcome=ToolOutcome.DENIED,
+                                        error_code=ToolErrorCode.POLICY_DENIED,
+                                    )
+                                else:
+                                    self._set_tool_reliability_terminal(
+                                        tool_use_id=tc.tool_use_id,
+                                        outcome=ToolOutcome.CANCEL,
+                                        error_code=ToolErrorCode.CANCELLED,
+                                    )
+                                result = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=json.dumps(
+                                        {
+                                            "status": result_status,
+                                            "approval_id": pending_approval["approval_id"],
+                                            "message": rationale
+                                            or (
+                                                "The approval expired before the exact "
+                                                "action was authorized."
+                                                if resolution == "expired"
+                                                else "The exact elevated action was not approved."
+                                            ),
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    is_error=False,
+                                    terminates_turn=explicit_human_denial,
+                                )
+                                _record_completed_tool_result(result)
+                                projected_result = await self._project_tool_result_for_delivery(
+                                    result,
+                                    tool_call=tc,
+                                )
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
+                                )
+                                _record_completed_tool_result(projected_result)
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    execution_log_handle=projected_result.execution_log_handle,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
+                                    generation_epoch=generation_epoch,
+                                )
+                                # Only a deliberate human refusal is terminal. An
+                                # expired record or an internal rule decision must
+                                # still reach the model as a non-terminal tool result.
+                                if explicit_human_denial:
+                                    turn_yielded = True
+                                break
+
+                            resumed_call = suspended.approve(str(pending_approval["approval_id"]))
                             result = await _run_one(suspended.begin_execution())
                             suspended.complete()
                             result_tool_call = resumed_call
                             for artifact in result.artifacts:
                                 yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                            _record_completed_tool_result(result)
                             projected_result = await self._project_tool_result_for_delivery(
                                 result,
                                 tool_call=result_tool_call,
                             )
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
-                            )
-                            replay_event = router_control_replay_event_from_payload(
-                                result.content
-                            )
-                            if replay_event is not None:
-                                yield replay_event
-                            if _pending_approval_payload(result.content) is not None:
-                                turn_yielded = True
+                            _record_completed_tool_result(projected_result)
+                            pending_approval = _pending_approval_payload(result.content)
+                            if pending_approval is None:
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
+                                )
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    execution_log_handle=projected_result.execution_log_handle,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                    effect_outcome=projected_result.effect_outcome,
+                                    generation_epoch=generation_epoch,
+                                )
+                                replay_event = router_control_replay_event_from_payload(
+                                    result.content
+                                )
+                                if replay_event is not None:
+                                    yield replay_event
                     elif not deferred_user_input_handled:
+                        self._settle_tool_reliability(
+                            tool_use_id=tc.tool_use_id,
+                            result=result,
+                        )
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,
                             result=projected_result.content,
+                            execution_log_handle=projected_result.execution_log_handle,
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
+                            effect_outcome=projected_result.effect_outcome,
+                            generation_epoch=generation_epoch,
                         )
-                        replay_event = router_control_replay_event_from_payload(
-                            result.content
-                        )
+                        replay_event = router_control_replay_event_from_payload(result.content)
                         if replay_event is not None:
                             yield replay_event
                     executed_results.append(result)
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
-                    if self._is_turn_yield_result(result) or result.terminates_turn:
-                        turn_yielded = True
-                    tool_result_blocks.append(
-                        ContentBlockToolResult(
-                            tool_use_id=projected_result.tool_use_id,
-                            content=projected_result.content,
-                            is_error=projected_result.is_error,
-                            execution_status=projected_result.execution_status,
+                    if (
+                        (
+                            result.effect_outcome is not None
+                            and result.effect_outcome.loop_action == "stop"
                         )
+                        or self._is_turn_yield_result(result)
+                        or result.terminates_turn
+                    ):
+                        turn_yielded = True
+                    # Preserve authenticated media as typed blocks. Physical
+                    # provider projection decides whether to send bytes or markers.
+                    _record_completed_tool_result(
+                        projected_result, images=_tool_result_images(tc.tool_use_id, consume=True)
                     )
 
-                terminal_artifacts = self._terminal_artifact_delivery_artifacts(executed_results)
-                if terminal_artifacts:
-                    artifact_delivery_final_response_artifacts = terminal_artifacts
+                accepted_goal_terminal_status = (
+                    self._accepted_goal_terminal_status(tool_calls, executed_results)
+                    if is_goal_owned_main_default_turn(
+                        self._tool_context or current_tool_context.get()
+                    )
+                    else None
+                )
 
-                turn_tool_errors += sum(1 for result in executed_results if result.is_error)
-                first_tool_error = next(
-                    (result for result in executed_results if result.is_error),
-                    None,
-                )
-                workspace_write_count = len(self._effective_workspace_write_records())
-                mutation_receipt_counts = self._workspace_mutation_receipt_counts()
-                post_write_progress_count = self._post_write_progress_count(
-                    workspace_write_count=workspace_write_count,
-                    mutation_receipt_counts=mutation_receipt_counts,
-                )
-                if len(tool_calls) == 1:
-                    current_repeat_key = self._tool_call_repeat_key(tool_calls[0])
-                    if current_repeat_key == repeated_tool_call_key:
-                        repeated_tool_call_last_result_is_error = any(
-                            result.is_error for result in executed_results
-                        )
-                        repeated_tool_call_workspace_write_count = workspace_write_count
-                if post_write_progress_count > last_post_write_progress_count:
-                    last_post_write_progress_count = post_write_progress_count
-                    post_write_focused_verification_observed = False
-                    post_write_focused_verification_success_observed = False
-                    last_post_write_failed_verification = None
-                if finalize_evidence_tracker is not None:
-                    for tc, result in zip(tool_calls, executed_results, strict=False):
-                        executed_tc = executed_tool_calls_by_id.get(tc.tool_use_id, tc)
-                        if tc.tool_name in _GATE_WRITE_TOOL_NAMES:
-                            for write_path, is_scratch in (
-                                self._finalize_evidence_write_targets(executed_tc)
-                            ):
-                                finalize_evidence_tracker.observe_write(
-                                    write_path,
-                                    is_error=bool(result.is_error),
-                                    iteration=iterations,
-                                    scratch=is_scratch,
-                                )
-                            continue
-                        if tc.tool_name not in _GATE_EXECUTION_TOOL_NAMES:
-                            continue
-                        gate_command = self._execution_command_for_progress(executed_tc)
-                        if not gate_command:
-                            continue
-                        gate_result_text = self._tool_result_text_for_anchor(result.content)
-                        gate_red, gate_exit_code, gate_timed_out, gate_status_reason = (
-                            execution_signals_from_result(
-                                tool_name=result.tool_name,
-                                content_text=gate_result_text,
-                                execution_status=result.execution_status,
-                                is_error=bool(result.is_error),
-                            )
-                        )
-                        gate_evidence_credit = True
-                        if scratch_verify_mirror_enabled:
-                            gate_evidence_credit = (
-                                self._scratch_verify_mirror_evidence_credit(
-                                    gate_command
-                                )
-                            )
-                            if not gate_evidence_credit:
-                                self._record_runtime_event(
-                                    "scratch_verify_mirror.credit_withheld",
-                                    feature="scratch_verify_mirror",
-                                    reason="mirror_diverged_from_workspace",
-                                    iteration=iterations,
-                                    command=gate_command[:500],
-                                )
-                        finalize_evidence_tracker.observe_execution(
-                            gate_command,
-                            red=gate_red,
-                            exit_code=gate_exit_code,
-                            timed_out=gate_timed_out,
-                            status_reason=gate_status_reason,
-                            failure_anchors=(
-                                self._failure_anchor_lines(gate_result_text)
-                                if gate_red
-                                else []
-                            ),
-                            iteration=iterations,
-                            evidence_credit=gate_evidence_credit,
-                        )
-                focused_verification_success_before_results = (
-                    post_write_focused_verification_success_observed
-                )
-                source_context_signature = self._source_context_signature(
-                    tool_calls,
-                    executed_results,
-                )
-                successful_source_context_tool_result = source_context_signature is not None
-                successful_execution_tool_result = any(
-                    not result.is_error and result.tool_name in _EXECUTION_TOOL_NAMES
+                actual_tool_errors = [
+                    result
                     for result in executed_results
-                )
-                current_focused_verification_observed = False
-                if post_write_progress_count > 0:
-                    for tc, result in zip(tool_calls, executed_results, strict=False):
-                        if result.tool_name not in _EXECUTION_TOOL_NAMES:
-                            continue
-                        command = self._execution_command_for_progress(tc)
-                        if command and self._command_looks_like_focused_verification(command):
-                            current_focused_verification_observed = True
-                            post_write_focused_verification_observed = True
-                            result_text = self._tool_result_text_for_anchor(result.content)
-                            verification_state = (
-                                self._classify_focused_verification_result(result)
-                            )
-                            self._record_runtime_event(
-                                "focused_verification.classified",
-                                feature="verification",
-                                tool_name=result.tool_name,
-                                command=command[:500],
-                                state=verification_state,
-                                is_error=bool(result.is_error),
-                            )
-                            clean_validation_success = (
-                                self._tool_result_has_validation_success_signal(result_text)
-                                and not self._tool_result_has_failure_signal(result_text)
-                            )
-                            if clean_validation_success:
-                                post_write_focused_verification_success_observed = True
-                                last_post_write_failed_verification = None
-                            elif result.is_error or self._tool_result_has_failure_signal(
-                                result_text
-                            ):
-                                execution_status: Mapping[str, Any] = (
-                                    result.execution_status or {}
-                                )
-                                status_reason = ""
-                                if isinstance(execution_status, Mapping):
-                                    status_reason = str(execution_status.get("reason") or "")
-                                post_write_focused_verification_success_observed = False
-                                last_post_write_failed_verification = {
-                                    "reason": (
-                                        "final_response_after_failed_focused_"
-                                        "verification_with_diff"
-                                    ),
-                                    "tool_name": result.tool_name,
-                                    "command": command[:500],
-                                    "execution_status_reason": status_reason or None,
-                                    "failure_anchors": self._failure_anchor_lines(result_text)[:3],
-                                    "workspace_write_count": workspace_write_count,
-                                    "changed_receipt_count": mutation_receipt_counts[
-                                        "changed_receipt_count"
-                                    ],
-                                }
-                            else:
-                                post_write_focused_verification_success_observed = True
-                                last_post_write_failed_verification = None
+                    if result.is_error and not self._is_not_executed_after_dispatch_boundary(result)
+                ]
+                turn_tool_errors += len(actual_tool_errors)
                 failure_anchor_summary = self._failure_anchor_summary_from_tool_results(
                     tool_calls,
                     executed_results,
                 )
-                if (
-                    failure_anchor_summary
-                    and failure_anchor_summary not in recent_failure_anchor_summaries
-                ):
-                    recent_failure_anchor_summaries.append(failure_anchor_summary)
-                    recent_failure_anchor_summaries[:] = recent_failure_anchor_summaries[-3:]
-                runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-                runtime_diff_fingerprint = (
-                    self._workspace_diff_fingerprint_for_runtime_event()
-                )
-                runtime_diagnostic_events: list[dict[str, Any]] = []
+                runtime_diff_paths: list[str] | None = None
+                runtime_diff_fingerprint: str | None = None
                 if runtime_diagnostics is not None:
+                    self._runtime_git_state = GitRunState.OK
+                    runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
+                    if runtime_diff_paths is not None:
+                        runtime_diff_fingerprint = (
+                            self._workspace_diff_fingerprint_for_runtime_event()
+                        )
+                runtime_git_observed = bool(
+                    runtime_diff_paths is not None and self._runtime_git_state is GitRunState.OK
+                )
+                if (
+                    runtime_diagnostics is not None
+                ) and not runtime_git_observed:
+                    self._record_runtime_git_observation_skip(
+                        consumers=(
+                            "runtime_diagnostics",
+                        )
+                    )
+                if (
+                    runtime_diagnostics is not None
+                    and runtime_git_observed
+                    and runtime_diff_paths is not None
+                ):
                     for runtime_event in runtime_diagnostics.observe_tool_results(
                         iteration=iterations,
                         provider_call_count=turn_llm_calls,
@@ -10432,272 +12704,34 @@ class Agent:
                         diff_fingerprint=runtime_diff_fingerprint,
                         failure_anchor_summary=failure_anchor_summary,
                     ):
-                        runtime_diagnostic_events.append(runtime_event)
                         append_runtime_event(self.config.runtime_events_path, runtime_event)
-                post_write_convergence_guidance: str | None = None
-                if post_write_convergence_tracker is not None:
-                    continued_activity_after_verification = bool(
-                        (
-                            focused_verification_success_before_results
-                            or (
-                                post_write_focused_verification_success_observed
-                                and not current_focused_verification_observed
-                            )
-                        )
-                        and (
-                            successful_execution_tool_result
-                            or successful_source_context_tool_result
-                        )
+                if install_turn.complete:
+                    await _claim_pending_inputs_for_next_call()
+                    peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                    if callable(peek_installs) and peek_installs():
+                        install_turn.finalization_allowed = False
+                if install_turn.complete:
+                    final_response_text = install_turn.final_text()
+                    final_text_parts[:] = [final_response_text]
+                    applied_model_call_boundaries.clear()
+                    yield TextDeltaEvent(
+                        text=final_response_text, presentation="answer",
+                        generation_epoch=generation_epoch,
                     )
-                    post_write_convergence_decision = (
-                        post_write_convergence_tracker.observe(
-                            PostWriteConvergenceObservation(
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                workspace_write_count=workspace_write_count,
-                                changed_receipt_count=mutation_receipt_counts[
-                                    "changed_receipt_count"
-                                ],
-                                diff_fingerprint=runtime_diff_fingerprint,
-                                diff_paths=runtime_diff_paths,
-                                focused_verification_success_observed=(
-                                    post_write_focused_verification_success_observed
-                                ),
-                                continued_activity_after_verification=(
-                                    continued_activity_after_verification
-                                ),
-                            )
-                        )
-                    )
-                    if (
-                        post_write_convergence_decision.action == "finalize"
-                        and progress_watchdog_mode == "warn_model"
-                    ):
-                        post_write_convergence_finalization_pending = True
-                        post_write_convergence_finalization_message = Message(
-                            role="user",
-                            content=_post_write_convergence_message(
-                                post_write_convergence_decision
-                            ),
-                        )
-                        post_write_convergence_guidance = (
-                            post_write_convergence_finalization_message.content
-                            if isinstance(
-                                post_write_convergence_finalization_message.content,
-                                str,
-                            )
-                            else None
-                        )
-                    elif (
-                        post_write_convergence_decision.action == "warn"
-                        and progress_watchdog_mode == "warn_model"
-                    ):
-                        post_write_convergence_guidance = _post_write_convergence_message(
-                            post_write_convergence_decision
-                        )
-                    if post_write_convergence_decision.action != "observe":
-                        self._record_post_write_convergence_event(
-                            post_write_convergence_decision,
-                            mode=progress_watchdog_mode,
-                            injected_to_model=bool(post_write_convergence_guidance),
-                            hint_text=post_write_convergence_guidance,
-                        )
-                        metadata_key = {
-                            "warn": "post_write_convergence_warnings",
-                            "finalize": "post_write_convergence_finalizations",
-                            "reset": "post_write_convergence_resets",
-                        }.get(post_write_convergence_decision.action)
-                        if metadata_key:
-                            self.config.metadata[metadata_key] = (
-                                self.config.metadata.get(metadata_key, 0) + 1
-                            )
-                        self._write_turn_call_log(
-                            "post_write_convergence",
-                            action=post_write_convergence_decision.action,
-                            mode=progress_watchdog_mode,
-                            reason=post_write_convergence_decision.reason,
-                            details=post_write_convergence_decision.details,
-                        )
-                        if post_write_convergence_guidance:
-                            yield WarningEvent(
-                                code=(
-                                    "post_write_convergence_finalization"
-                                    if post_write_convergence_decision.action == "finalize"
-                                    else "post_write_convergence_warning"
-                                ),
-                                message=(
-                                    "Runtime detected stable post-verification diff "
-                                    "activity and asked the model to converge."
-                                ),
-                            )
-                progress_watchdog_guidance: str | None = None
-                watchdog_decision = None
-                if progress_watchdog_mode != "off" and post_write_convergence_guidance is None:
-                    watchdog_decision = progress_watchdog.observe(
-                        ProgressObservation(
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            successful_tool_result=any(
-                                not result.is_error for result in executed_results
-                            ),
-                            successful_source_context_tool_result=(
-                                successful_source_context_tool_result
-                            ),
-                            successful_execution_tool_result=successful_execution_tool_result,
-                            source_context_signature=source_context_signature,
-                            user_visible_output=bool("".join(final_text_parts).strip()),
-                            artifact_completed=bool(terminal_artifacts),
-                            workspace_write_count=workspace_write_count,
-                            changed_receipt_count=mutation_receipt_counts[
-                                "changed_receipt_count"
-                            ],
-                            noop_receipt_count=mutation_receipt_counts[
-                                "noop_receipt_count"
-                            ],
-                            partial_receipt_count=mutation_receipt_counts[
-                                "partial_receipt_count"
-                            ],
-                            workspace_change_likely_required=(
-                                self._turn_likely_requires_workspace_change("")
-                            ),
-                            scratch_write_count=len(self._scratch_write_records()),
-                            post_write_focused_verification_observed=(
-                                post_write_focused_verification_observed
-                            ),
-                            tool_error_signature=(
-                                None
-                                if first_tool_error is None
-                                else self._tool_error_signature(first_tool_error)
-                            ),
-                            failure_anchor_signature=(
-                                self._failure_anchor_signature(failure_anchor_summary)
-                            ),
-                            failure_anchor_summary=failure_anchor_summary,
-                        )
-                    )
-                if watchdog_decision is not None and watchdog_decision.action != "observe":
-                    watchdog_hint_text: str | None = None
-                    if (
-                        watchdog_decision.action == "warn"
-                        and progress_watchdog_mode == "warn_model"
-                    ):
-                        watchdog_hint_text = _progress_watchdog_guidance_message(
-                            watchdog_decision.reason,
-                            watchdog_decision.details,
-                        )
-                    self._record_tool_loop_runtime_event(
-                        reason=watchdog_decision.reason,
-                        iteration=iterations,
-                        provider_call_count=turn_llm_calls,
-                        watchdog_action=watchdog_decision.action,
-                        watchdog_mode=progress_watchdog_mode,
-                        details=watchdog_decision.details,
-                        workspace_write_count=workspace_write_count,
-                        source_context_signature=source_context_signature,
-                        injected_to_model=bool(watchdog_hint_text),
-                        hint_text_sha256=(
-                            hashlib.sha256(watchdog_hint_text.encode("utf-8")).hexdigest()
-                            if watchdog_hint_text
-                            else None
-                        ),
-                    )
-                    self._write_turn_call_log(
-                        "progress_watchdog",
-                        action=watchdog_decision.action,
-                        mode=progress_watchdog_mode,
-                        reason=watchdog_decision.reason,
-                        details=watchdog_decision.details,
-                    )
-                    if watchdog_hint_text:
-                        progress_watchdog_guidance = watchdog_hint_text
-                        gate_details = self._workspace_edit_gate_details(
-                            watchdog_decision.reason,
-                            watchdog_decision.details,
-                        )
-                        if gate_details is not None:
-                            workspace_edit_gate_details = gate_details
-                            workspace_edit_gate_recovery_read_paths.clear()
-                            workspace_edit_gate_recovery_reads_remaining = 0
-                            self.config.metadata["workspace_edit_gate_activations"] = (
-                                self.config.metadata.get(
-                                    "workspace_edit_gate_activations",
-                                    0,
-                                )
-                                + 1
-                            )
-                    elif watchdog_decision.action == "block":
-                        terminal_error = ErrorEvent(
-                            message=(
-                                "Runtime progress watchdog stopped the turn after "
-                                "repeated activity without clear progress."
-                            ),
-                            code="progress_watchdog_blocked",
-                        )
-                source_loop_recovery_guidance: str | None = None
-                if progress_watchdog_guidance is None:
-                    source_loop_recovery = source_loop_recovery_decision(
-                        global_mode=runtime_recovery_mode,
-                        diagnostic_events=runtime_diagnostic_events,
-                        attempted=bool(source_loop_recovery_attempted_keys),
-                        attempted_event_keys=source_loop_recovery_attempted_keys,
-                        max_nudges=runtime_recovery_source_loop_max_nudges,
-                    )
-                    if source_loop_recovery is not None:
-                        self._record_runtime_recovery_event(
-                            source_loop_recovery,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            workspace_write_count=workspace_write_count,
-                            source_context_signature=source_context_signature,
-                        )
-                        recovery_event_key = source_loop_recovery.details.get(
-                            "recovery_event_key"
-                        )
-                        if isinstance(recovery_event_key, str) and recovery_event_key:
-                            source_loop_recovery_attempted_keys.add(recovery_event_key)
-                        else:
-                            source_loop_recovery_attempted_keys.add(
-                                f"legacy:{len(source_loop_recovery_attempted_keys) + 1}"
-                            )
-                        self._write_turn_call_log(
-                            "runtime_recovery",
-                            action=source_loop_recovery.action,
-                            mode=source_loop_recovery.mode,
-                            reason=source_loop_recovery.reason,
-                            details=source_loop_recovery.details,
-                        )
-                        if (
-                            source_loop_recovery.action == "nudge"
-                            and source_loop_recovery.message
-                        ):
-                            source_loop_recovery_guidance = source_loop_recovery.message
-                            runtime_recovery_scaffolding_pending = True
-                            self.config.metadata["source_loop_recoveries"] = (
-                                self.config.metadata.get("source_loop_recoveries", 0) + 1
-                            )
-                            yield WarningEvent(
-                                code="source_loop_recovery",
-                                message=(
-                                    "Runtime detected repeated source-loop evidence; "
-                                    "asking the model to reassess the current patch once."
-                                ),
-                            )
-                budget_error = _turn_budget_error()
+                    break
+                budget_error = (
+                    None if accepted_goal_terminal_status is not None else _turn_budget_error()
+                )
                 if terminal_error is None:
                     terminal_error = budget_error
                 if terminal_error is not None:
-                    if artifact_delivery_final_response_pending:
-                        yield _finish_artifact_delivery_degraded(
-                            reason=terminal_error.message,
-                            code=terminal_error.code,
-                        )
-                        terminal_error = None
-                    else:
-                        yield self._transition(AgentState.ERROR)
-                        yield terminal_error
+                    yield self._transition(AgentState.ERROR)
+                    yield terminal_error
                     break
 
-                if any(_is_threshold_denial(result) for result in executed_results):
+                if accepted_goal_terminal_status is None and any(
+                    _is_threshold_denial(result) for result in executed_results
+                ):
                     yield self._transition(AgentState.ERROR)
                     terminal_error = ErrorEvent(
                         message=(
@@ -10709,236 +12743,47 @@ class Agent:
                     yield terminal_error
                     break
 
-                # Per-iteration deadline check after tool execution
-                if _loop.time() > tool_deadline:
-                    yield self._transition(AgentState.ERROR)
-                    terminal_error = ErrorEvent(
-                        message=(
-                            f"Iteration {iterations} exceeded iteration_timeout"
-                            f" ({self.config.iteration_timeout}s) during tool execution"
-                        ),
-                        code="iteration_timeout",
-                    )
-                    yield terminal_error
-                    break
-
-                # Feed tool results back as user message
-                turn_messages.append(
-                    Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
-                )
-                _claim_pending_inputs_for_next_call()
-                if progress_watchdog_guidance is not None:
-                    turn_messages.append(Message(role="user", content=progress_watchdog_guidance))
-                if (
-                    post_write_convergence_guidance is not None
-                    and not post_write_convergence_finalization_pending
-                ):
-                    turn_messages.append(
-                        Message(role="user", content=post_write_convergence_guidance)
-                    )
-                if (
-                    bool(getattr(self.config, "mid_budget_no_diff_nudge", False))
-                    and _total_deadline is not None
-                    and self.config.timeout > 0
-                ):
-                    elapsed_fraction = 1.0 - (
-                        max(0.0, _total_deadline - _loop.time()) / self.config.timeout
-                    )
-                    due_fractions = [
-                        fraction
-                        for fraction in _MID_BUDGET_NO_DIFF_NUDGE_FRACTIONS
-                        if fraction not in mid_budget_nudge_fired_fractions
-                        and elapsed_fraction >= fraction
-                    ]
-                    if due_fractions:
-                        # Checkpoints are consumed when crossed whether or not
-                        # a nudge fires: one crossed while a diff existed must
-                        # not fire late if that diff is reverted, and crossing
-                        # several at once yields a single nudge.
-                        mid_budget_nudge_fired_fractions.update(due_fractions)
-                        nudge_fraction = max(due_fractions)
-                        # The evidence probe shells out to git; keep it off
-                        # the event loop.
-                        has_change_evidence = await asyncio.to_thread(
-                            self._workspace_has_source_change_evidence
-                        )
-                        if not has_change_evidence:
-                            turn_messages.append(
-                                Message(
-                                    role="user",
-                                    # Report real elapsed time, not the
-                                    # checkpoint constant: one long stream can
-                                    # carry the turn far past the checkpoint
-                                    # before it is noticed.
-                                    content=_MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.format(
-                                        percent=int(elapsed_fraction * 100),
-                                    ),
-                                )
-                            )
-                            self._write_turn_call_log(
-                                "turn_policy_decision",
-                                action="mid_budget_no_diff_nudge",
-                                reason="budget_fraction",
-                                code="mid_budget_no_diff_nudge",
-                                iteration=iterations,
-                                budget_fraction=nudge_fraction,
-                                elapsed_fraction=round(elapsed_fraction, 3),
-                            )
-                # One-shot endgame fix directive: inside the margin with no
-                # source fix beyond diagnostic instrumentation, direct the
-                # model to commit to its best-supported fix now. The margin
-                # crossing is consumed whether or not the directive fires —
-                # a fix present at crossing time that is reverted later must
-                # not trigger a late directive.
-                endgame_fix_margin_seconds = max(
-                    0,
-                    int(
-                        getattr(self.config, "endgame_fix_directive_margin_seconds", 0)
-                        or 0
-                    ),
-                )
-                if (
-                    endgame_fix_margin_seconds > 0
-                    and _total_deadline is not None
-                    and not endgame_fix_directive_fired
-                    and _loop.time() > _total_deadline - endgame_fix_margin_seconds
-                ):
-                    endgame_fix_directive_fired = True
-                    # The probe shells out to git; keep it off the event loop.
-                    has_source_fix = await asyncio.to_thread(
-                        self._workspace_source_fix_beyond_instrumentation
-                    )
-                    if not has_source_fix:
-                        remaining_seconds = max(0.0, _total_deadline - _loop.time())
-                        turn_messages.append(
-                            Message(
-                                role="user",
-                                content=_ENDGAME_FIX_DIRECTIVE_TEMPLATE.format(
-                                    minutes=max(1, int(remaining_seconds // 60)),
-                                ),
-                            )
-                        )
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="endgame_fix_directive",
-                            reason="deadline_margin_no_fix",
-                            code="endgame_fix_directive",
-                            iteration=iterations,
-                            remaining_seconds=int(remaining_seconds),
-                            margin_seconds=endgame_fix_margin_seconds,
-                        )
-                        append_runtime_event(
-                            self.config.runtime_events_path,
-                            {
-                                "feature": "endgame_fix_directive",
-                                "name": "endgame_fix_directive.injected",
-                                "action": "append_fix_directive",
-                                "reason": "deadline_margin_no_fix",
-                                "iteration": iterations,
-                                "remaining_seconds": int(remaining_seconds),
-                                "margin_seconds": endgame_fix_margin_seconds,
-                                "session_key": self._session_key,
-                                "agent_id": (
-                                    self.config.tool_result_store_agent_id
-                                    or self.config.metadata.get("agent_id")
-                                ),
-                            },
-                        )
-                # Count iterations that blocked a compacted-placeholder reuse
-                # (preflight or dispatch path) and escalate the recovery
-                # directive once the configured threshold is reached. This
-                # runs before the source-loop recovery guidance append below:
-                # that guidance must stay the final runtime-injected message
-                # of the turn so _drop_runtime_recovery_scaffolding can pop it
-                # from the end.
-                if terminal_projection_preflight_error or any(
-                    self._is_provider_context_projection_reuse_result(result)
-                    for result in executed_results
-                ):
-                    placeholder_offense_iterations += 1
-                    placeholder_escalation_threshold = max(
-                        0,
-                        int(
-                            getattr(self.config, "placeholder_escalation_threshold", 0)
-                            or 0
-                        ),
-                    )
-                    if (
-                        placeholder_escalation_threshold > 0
-                        and placeholder_offense_iterations
-                        >= placeholder_escalation_threshold
-                    ):
-                        turn_messages.append(
-                            Message(
-                                role="user",
-                                content=_PLACEHOLDER_ESCALATION_DIRECTIVE,
-                            )
-                        )
-                        self._write_turn_call_log(
-                            "placeholder_offense_escalation",
-                            iteration=iterations,
-                            offense_iterations=placeholder_offense_iterations,
-                            threshold=placeholder_escalation_threshold,
-                        )
-                        # The turn-call log is a raw debug stream that run
-                        # harnesses do not collect; the runtime event is what
-                        # lets delivery gates tell this designed escalation
-                        # apart from a treatment delivery failure.
-                        append_runtime_event(
-                            self.config.runtime_events_path,
-                            {
-                                "feature": "placeholder_escalation",
-                                "name": "placeholder_escalation.injected",
-                                "action": "append_escalation_directive",
-                                "reason": "placeholder_offense_threshold",
-                                "iteration": iterations,
-                                "offense_iterations": placeholder_offense_iterations,
-                                "threshold": placeholder_escalation_threshold,
-                                "session_key": self._session_key,
-                                "agent_id": (
-                                    self.config.tool_result_store_agent_id
-                                    or self.config.metadata.get("agent_id")
-                                ),
-                            },
-                        )
-                if source_loop_recovery_guidance is not None:
-                    # Appended last: _drop_runtime_recovery_scaffolding pops
-                    # the one-shot directive from the end of the turn, so no
-                    # other runtime-injected message may follow it.
-                    turn_messages.append(
-                        Message(role="user", content=source_loop_recovery_guidance)
-                    )
+                # Completed results are already in the canonical user message.
+                if accepted_goal_terminal_status is not None:
+                    if turn_yielded:
+                        break
+                    goal_terminal_final_response_pending = True
+                    goal_terminal_final_status = accepted_goal_terminal_status
+                    yield self._transition(AgentState.THINKING)
+                    continue
+                await _claim_pending_inputs_for_next_call()
+                peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                if callable(peek_installs) and peek_installs():
+                    install_turn.finalization_allowed = False
                 if terminal_projection_preflight_error:
                     self._write_turn_call_log(
                         "tool_argument_projection_rehydrate_recovery",
                         iteration=iterations,
                         tool_use_ids=sorted(preflight_tool_results),
                     )
-                if terminal_artifacts:
-                    _finish_artifact_delivery_without_provider()
-                    break
-                last_executed_results = list(executed_results)
                 if turn_yielded:
                     break
-
+                if tool_failure_recovery.exhausted:
+                    tool_failure_finalization_pending = True
+                    self._write_turn_call_log(
+                        "turn_policy_decision", action="finalize_without_tools",
+                        reason=FAILURE_RECOVERY_CODE, iteration=iterations,
+                    )
                 # ------ TOOL_CALLING → THINKING ------
                 yield self._transition(AgentState.THINKING)
                 # Loop continues
 
         except TimeoutError:
-            if artifact_delivery_final_response_pending:
-                yield _finish_artifact_delivery_degraded(
-                    reason=f"Agent turn timed out after {self.config.timeout}s",
-                    code="agent_runtime_timeout",
-                )
+            yield self._transition(AgentState.ERROR)
+            if self.config.timeout > 0:
+                timeout_message = f"Agent turn timed out after {self.config.timeout}s"
             else:
-                # Total turn deadline exceeded (raised by manual check above)
-                yield self._transition(AgentState.ERROR)
-                terminal_error = ErrorEvent(
-                    message=f"Agent turn timed out after {self.config.timeout}s",
-                    code="agent_runtime_timeout",
-                )
-                yield terminal_error
+                timeout_message = "Agent turn timed out"
+            terminal_error = ErrorEvent(
+                message=timeout_message,
+                code="agent_runtime_timeout",
+            )
+            yield terminal_error
 
         if pending_input_batch_staged and staged_pending_input_message is not None:
             # The turn ended after claim but before a provider call could
@@ -10952,7 +12797,19 @@ class Agent:
             # Persist successful turns into in-memory history. Error turns are
             # persisted by TurnRunner as system errors, while their usage still
             # flows through the final DoneEvent below when provider usage exists.
-            self._history = list(turn_messages)
+            # Restore only the unchanged historical prefix from its canonical,
+            # sanitized image-bearing view.  This is deliberately conservative:
+            # compaction or recovery may replace a prefix, in which case its
+            # authoritative rebuilt form wins instead of being overwritten.
+            if len(turn_messages) >= len(initial_provider_history) and all(
+                turn_messages[index] is projected_message
+                for index, projected_message in enumerate(initial_provider_history)
+            ):
+                turn_messages[: len(history)] = canonical_history
+            self._history = [
+                *turn_messages[:current_turn_start_index],
+                *project_incomplete_tool_history(turn_messages[current_turn_start_index:]),
+            ]
             self._write_context_stage("session:after", self._history)
 
         # ------ → DONE ------
@@ -10964,6 +12821,15 @@ class Agent:
                 done_model = su.model_id
         if not done_model:
             done_model = self.config.model_id or ""
+        if not done_model and turn_has_error_usage_receipt:
+            done_model = next(
+                (
+                    str(row.get("model") or "")
+                    for row in turn_model_usage_breakdown
+                    if isinstance(row, dict) and row.get("model")
+                ),
+                "",
+            )
         done_provider = (
             last_actual_provider
             or self.config.provider_id
@@ -11008,6 +12874,15 @@ class Agent:
             )
             estimate_basis = "free" if turn_estimate.basis == "free" and has_turn_tokens else None
 
+        error_usage_report_rows: list[dict[str, Any]] = []
+        if turn_has_error_usage_receipt and turn_model_usage_breakdown:
+            error_usage_report_rows = _with_model_usage_cost_fields(turn_model_usage_breakdown)
+            # Reuse the per-member price resolution below instead of resolving
+            # the same rows again during final summarization.
+            turn_model_usage_breakdown = [
+                {**row, "_opensquilla_reported_cost": True} for row in error_usage_report_rows
+            ]
+
         turn_usage_delta = (
             self._usage_tracker.session_delta_snapshot(self._session_key, usage_turn_baseline)
             if self._usage_tracker and self._session_key
@@ -11046,6 +12921,49 @@ class Agent:
             elif estimate_basis != "free":
                 # "unavailable": no estimated dollars in the reported cost.
                 estimate_basis = None
+        elif error_usage_report_rows:
+            # UsageTracker is optional.  Error receipts still retain their
+            # member deployment identities, so estimate any unbilled rows with
+            # those models instead of pricing the whole turn as the outer
+            # ensemble/default model.
+            report_components: list[tuple[bool, bool, int]] = []
+            report_estimated_cost = 0.0
+            report_estimate_bases: set[str] = set()
+            for row in error_usage_report_rows:
+                row_cost = _usage_float(row.get("cost_usd") or row.get("costUsd"))
+                row_billed = _usage_float(
+                    row.get("billed_cost_usd")
+                    or row.get("billedCostUsd")
+                    or row.get("billed_cost")
+                    or row.get("billedCost")
+                )
+                report_estimated_cost += max(0.0, row_cost - row_billed)
+                row_basis = str(row.get("estimate_basis") or row.get("estimateBasis") or "").strip()
+                if row_basis:
+                    report_estimate_bases.add(row_basis)
+                report_components.append(
+                    _cost_component_flags(
+                        cost_source=str(row.get("cost_source") or row.get("costSource") or "none"),
+                        cost_usd=row_cost,
+                        billed_cost=row_billed,
+                        missing_cost_entries=_usage_int(row.get("missing_cost_entries") or 0),
+                        estimate_basis=row_basis or None,
+                    )
+                )
+            if total_missing_cost_entries:
+                report_components.append((False, False, total_missing_cost_entries))
+            done_cost = total_billed_cost + report_estimated_cost
+            done_billed_cost = total_billed_cost
+            cost_source = _model_usage_row_cost_source(report_components)
+            estimate_basis = (
+                "cache_blind"
+                if "cache_blind" in report_estimate_bases
+                else "cache_aware"
+                if "cache_aware" in report_estimate_bases
+                else "free"
+                if "free" in report_estimate_bases
+                else None
+            )
 
         # Freeze the parent delta before any completed child usage is added to
         # the shared tracker. This keeps the current turn from counting its own
@@ -11062,15 +12980,13 @@ class Agent:
             or done_billed_cost
             or total_provider_billed_entries
         )
-        has_billed_component, has_estimated_component, missing_cost_entries = (
-            _cost_component_flags(
-                cost_source=cost_source,
-                cost_usd=done_cost,
-                billed_cost=done_billed_cost,
-                missing_cost_entries=total_missing_cost_entries,
-                estimate_basis=estimate_basis,
-                infer_missing=parent_has_usage,
-            )
+        has_billed_component, has_estimated_component, missing_cost_entries = _cost_component_flags(
+            cost_source=cost_source,
+            cost_usd=done_cost,
+            billed_cost=done_billed_cost,
+            missing_cost_entries=total_missing_cost_entries,
+            estimate_basis=estimate_basis,
+            infer_missing=parent_has_usage,
         )
         estimate_bases = (
             [estimate_basis]
@@ -11084,9 +13000,7 @@ class Agent:
             and not has_estimated_component
         )
         estimate_source = (
-            cost_source
-            if cost_source in _ESTIMATE_COST_SOURCES
-            else "opensquilla_estimate"
+            cost_source if cost_source in _ESTIMATE_COST_SOURCES else "opensquilla_estimate"
         )
         parent_breakdown_rows: list[dict[str, Any]] = []
         if parent_has_usage and not turn_model_usage_breakdown and done_model:
@@ -11118,55 +13032,32 @@ class Agent:
         )
         if final_ensemble_trace is not None and turn_ensemble_request_count > 0:
             final_ensemble_trace["llm_request_count"] = turn_ensemble_request_count
-        await self._write_patch_evidence_ledger(
-            final_status=(
-                "ok"
-                if terminal_error is None
-                else (terminal_error.code or "agent_error")
-            ),
-            iterations=iterations,
-            provider_call_count=turn_llm_calls,
+        self._terminalize_pending_durable_compaction(
+            status="failed",
+            reason="rebuilt_request_not_admitted",
         )
         if runtime_diagnostics is not None and terminal_error is not None:
+            self._runtime_git_state = GitRunState.OK
             runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-            for runtime_event in runtime_diagnostics.observe_finish_error(
-                iteration=iterations,
-                provider_call_count=turn_llm_calls,
-                error_code=terminal_error.code,
-                changed_files=self._relative_paths_from_records(self._workspace_write_records()),
-                diff_paths=runtime_diff_paths,
-                diff_fingerprint=self._workspace_diff_fingerprint_for_runtime_event(),
-            ):
-                append_runtime_event(self.config.runtime_events_path, runtime_event)
-        if bool(getattr(self.config, "final_diff_salvage", False)):
-            # Last engine-controlled moment before the runner collects the
-            # patch from the worktree: if prior source writes ended in an
-            # empty workspace diff, re-apply the newest captured candidate per
-            # path. Runs for normal finalization and terminal errors alike;
-            # the contract observation below then reflects the salvaged state.
-            self._attempt_final_diff_salvage(
-                trigger="terminal_error" if terminal_error is not None else "finalize",
-                iteration=iterations,
+            runtime_diff_fingerprint = (
+                self._workspace_diff_fingerprint_for_runtime_event()
+                if runtime_diff_paths is not None
+                else None
             )
-        if terminal_error is not None:
-            final_diff_contract_mode = getattr(
-                self.config,
-                "final_diff_contract_mode",
-                "log",
-            )
-            if final_diff_contract_mode != "off":
-                final_diff_observation = self._final_diff_contract_observation()
-                if final_diff_observation is not None and (
-                    final_diff_observation.diff_paths or final_diff_observation.suspicious
+            if runtime_diff_paths is not None and self._runtime_git_state is GitRunState.OK:
+                for runtime_event in runtime_diagnostics.observe_finish_error(
+                    iteration=iterations,
+                    provider_call_count=turn_llm_calls,
+                    error_code=terminal_error.code,
+                    changed_files=self._relative_paths_from_records(
+                        self._workspace_write_records()
+                    ),
+                    diff_paths=runtime_diff_paths,
+                    diff_fingerprint=runtime_diff_fingerprint,
                 ):
-                    self._record_final_diff_contract_event(
-                        final_diff_observation,
-                        iteration=iterations,
-                        provider_call_count=turn_llm_calls,
-                        mode=str(final_diff_contract_mode),
-                        injected_to_model=False,
-                        hint_text=None,
-                    )
+                    append_runtime_event(self.config.runtime_events_path, runtime_event)
+            else:
+                self._record_runtime_git_observation_skip(consumers=("runtime_diagnostics_finish",))
         if terminal_error is None:
             # This is the final suspension point before child usage is
             # consumed. Cancellation while the DONE state event is being
@@ -11199,10 +13090,7 @@ class Agent:
             has_billed_component |= child_billed
             has_estimated_component |= child_estimated
             missing_cost_entries += child_missing
-            if (
-                child_estimated
-                and child_usage.estimate_basis not in {None, "free"}
-            ):
+            if child_estimated and child_usage.estimate_basis not in {None, "free"}:
                 estimate_bases.append(child_usage.estimate_basis)
             has_free_cost_component |= bool(
                 child_usage.has_usage
@@ -11257,7 +13145,8 @@ class Agent:
             or missing_cost_entries
             or total_provider_billed_entries
         )
-        if terminal_error is None or has_usage:
+        replay_messages = _assistant_replay_tail(turn_messages, current_turn_start_index)
+        if terminal_error is None or has_usage or replay_messages:
             final_text = "".join(final_text_parts)
             total_codepoints = len(final_text)
             model_call_segments = [
@@ -11273,6 +13162,10 @@ class Agent:
             ]
             done_event = DoneEvent(
                 text=final_text,
+                assistant_replay=(
+                    _serialize_assistant_replay(replay_messages)
+                    if replay_messages else None
+                ),
                 input_tokens=done_input_tokens,
                 output_tokens=done_output_tokens,
                 reasoning_tokens=done_reasoning_tokens,
@@ -11297,6 +13190,9 @@ class Agent:
                 message_output_tokens=message_output_tokens,
                 missing_cost_entries=missing_cost_entries,
                 model_call_segments=model_call_segments,
+                generation_epoch=generation_epoch,
+                router_model_call_id=router_model_call_id,
+                router_iteration=router_iteration,
             )
             yield done_event
         # Reset for next turn
@@ -11365,123 +13261,6 @@ class Agent:
         records = getattr(ctx, "workspace_file_writes", []) or []
         return [record for record in records if isinstance(record, dict)]
 
-    def _workspace_has_source_change_evidence(self) -> bool:
-        """Best-effort check that this agent's run produced a source change.
-
-        Used by the mid-budget nudge: write receipts and captured diff
-        candidates cover tool-mediated edits, and the live tracked diff
-        covers shell-made edits that leave no receipts. Only this agent's
-        own ToolContext counts — the contextvar fallback inside a child
-        agent resolves to the parent's context — and untracked files do
-        not: scratch artifacts from merely running the code (caches,
-        coverage files, logs) are not source progress.
-        """
-
-        ctx = self._tool_context
-        if ctx is not None:
-            records = getattr(ctx, "workspace_file_writes", []) or []
-            if any(
-                isinstance(record, dict)
-                and not self._workspace_write_record_looks_synthetic(record)
-                and not self._workspace_write_record_targets_configured_scratch(record)
-                for record in records
-            ):
-                return True
-            if getattr(ctx, "source_diff_candidates", []) or []:
-                return True
-        return bool(self._workspace_tracked_diff_paths_for_nudge())
-
-    def _workspace_source_fix_beyond_instrumentation(self) -> bool:
-        """Whether the tracked diff contains more than diagnostic output.
-
-        Used by the endgame fix directive: an instrumentation-only diff
-        (added print/log lines, nothing removed) means the model has been
-        investigating, not fixing. Probe failures count as a fix existing —
-        the conservative direction, since the directive tells the model to
-        stop investigating and a misfire on a real fix wastes the message.
-        """
-
-        paths = self._workspace_tracked_diff_paths_for_nudge()
-        if not paths:
-            return False
-        ctx = self._tool_context
-        raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
-        if not raw_workspace:
-            raw_workspace = self.config.workspace_dir
-        if not raw_workspace:
-            return True
-        workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace_dir), "diff", "HEAD", "--", *paths],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return True
-        if result.returncode != 0:
-            return True
-        patch = result.stdout or ""
-        if not patch.strip():
-            return False
-        return not is_instrumentation_only_patch(patch)
-
-    def _workspace_tracked_diff_paths_for_nudge(self) -> list[str]:
-        ctx = self._tool_context
-        raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
-        if not raw_workspace:
-            raw_workspace = self.config.workspace_dir
-        if not raw_workspace:
-            return []
-        workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
-        if not workspace_dir.exists():
-            return []
-        ignored_paths = self._workspace_gitlink_paths(workspace_dir) | (
-            self._workspace_internal_diagnostic_paths(workspace_dir)
-        )
-        paths: set[str] = set()
-        for args in (("diff", "--name-only"), ("diff", "--cached", "--name-only")):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
-                text = line.strip()
-                if text:
-                    normalized = _normalize_workspace_relative_path(text)
-                    if normalized in ignored_paths:
-                        continue
-                    if self._workspace_relative_path_targets_scratch(normalized):
-                        continue
-                    paths.add(normalized)
-        return sorted(paths)
-
-    def _effective_workspace_write_records(self) -> list[dict[str, Any]]:
-        return [
-            record
-            for record in self._workspace_write_records()
-            if not self._workspace_write_record_looks_synthetic(record)
-            and not self._workspace_write_record_targets_configured_scratch(record)
-        ]
-
-    def _workspace_write_record_targets_configured_scratch(
-        self,
-        record: Mapping[str, Any],
-    ) -> bool:
-        raw_path = str(record.get("path") or record.get("relative_path") or "")
-        return self._workspace_relative_path_targets_scratch(raw_path)
 
     def _workspace_relative_path_targets_scratch(self, raw_path: str) -> bool:
         resolved, _ = self._configured_scratch_path_candidate(
@@ -11490,21 +13269,6 @@ class Agent:
         )
         return resolved is not None
 
-    @staticmethod
-    def _workspace_write_record_looks_synthetic(record: Mapping[str, Any]) -> bool:
-        if not bool(record.get("created")):
-            return False
-        raw_path = str(record.get("relative_path") or record.get("path") or "")
-        normalized = _normalize_workspace_relative_path(raw_path)
-        if not normalized:
-            return False
-        name = Path(normalized).name.lower()
-        return any(
-            name == prefix
-            or name.startswith(f"{prefix}.")
-            or name.startswith(f"{prefix}_")
-            for prefix in _SUSPICIOUS_NEW_WORKSPACE_WRITE_PREFIXES
-        )
 
     def _workspace_read_records(self) -> list[dict[str, Any]]:
         ctx = self._tool_context or current_tool_context.get()
@@ -11520,364 +13284,6 @@ class Agent:
         records = getattr(ctx, "scratch_file_writes", []) or []
         return [record for record in records if isinstance(record, dict)]
 
-    def _workspace_mutation_records(self) -> list[dict[str, Any]]:
-        ctx = self._tool_context or current_tool_context.get()
-        if ctx is None:
-            return []
-        records = getattr(ctx, "workspace_mutation_records", []) or []
-        return [record for record in records if isinstance(record, dict)]
-
-    def _workspace_mutation_receipts(self) -> list[dict[str, Any]]:
-        ctx = self._tool_context or current_tool_context.get()
-        if ctx is None:
-            return []
-        records = getattr(ctx, "workspace_mutation_receipts", []) or []
-        return [record for record in records if isinstance(record, dict)]
-
-    def _changed_workspace_mutation_receipts(self) -> list[dict[str, Any]]:
-        return [
-            receipt
-            for receipt in self._workspace_mutation_receipts()
-            if receipt.get("changed") is True
-            and receipt.get("classification") != "scratch"
-        ]
-
-    def _workspace_mutation_receipt_counts(self) -> dict[str, int]:
-        receipts = [
-            receipt
-            for receipt in self._workspace_mutation_receipts()
-            if receipt.get("classification") != "scratch"
-        ]
-        return {
-            "changed_receipt_count": len(self._changed_workspace_mutation_receipts()),
-            "noop_receipt_count": sum(
-                1 for receipt in receipts if receipt.get("changed") is False
-            ),
-            "partial_receipt_count": sum(
-                1 for receipt in receipts if receipt.get("partial") is True
-            ),
-        }
-
-    def _post_write_progress_count(
-        self,
-        *,
-        workspace_write_count: int | None = None,
-        mutation_receipt_counts: Mapping[str, int] | None = None,
-    ) -> int:
-        if workspace_write_count is None:
-            workspace_write_count = len(self._effective_workspace_write_records())
-        if mutation_receipt_counts is None:
-            mutation_receipt_counts = self._workspace_mutation_receipt_counts()
-        changed_receipts = max(
-            0,
-            int(mutation_receipt_counts.get("changed_receipt_count", 0) or 0),
-        )
-        receipt_count = (
-            changed_receipts
-            + max(0, int(mutation_receipt_counts.get("noop_receipt_count", 0) or 0))
-            + max(0, int(mutation_receipt_counts.get("partial_receipt_count", 0) or 0))
-        )
-        if receipt_count > 0:
-            return changed_receipts
-        return max(0, int(workspace_write_count or 0))
-
-    def _workspace_mutation_receipt_summary(self) -> dict[str, int]:
-        receipts = self._workspace_mutation_receipts()
-        counts = self._workspace_mutation_receipt_counts()
-        return {
-            "workspace_mutation_receipt_count": len(receipts),
-            **counts,
-        }
-
-    def _final_diff_contract_observation(self) -> FinalDiffContractObservation | None:
-        diff_paths = self._workspace_diff_paths_for_final_diff_contract()
-        known_scratch_paths = [
-            path for path in diff_paths if self._workspace_relative_path_targets_scratch(path)
-        ]
-        write_records = self._effective_workspace_write_records()
-        mutation_receipts = self._workspace_mutation_receipts()
-        source_diff_candidates = []
-        if self.config.source_diff_candidate_mode != "off" and self._tool_context:
-            source_diff_candidates = list(
-                getattr(self._tool_context, "source_diff_candidates", []) or []
-            )
-        if not diff_paths and not write_records and not mutation_receipts:
-            return None
-        return build_final_diff_contract_observation(
-            diff_paths=diff_paths,
-            read_records=self._workspace_read_records(),
-            write_records=write_records,
-            mutation_records=self._workspace_mutation_records(),
-            mutation_receipts=mutation_receipts,
-            source_diff_candidates=source_diff_candidates,
-            known_scratch_paths=known_scratch_paths,
-        )
-
-    def _record_final_diff_contract_event(
-        self,
-        observation: FinalDiffContractObservation,
-        *,
-        iteration: int,
-        provider_call_count: int,
-        mode: str,
-        injected_to_model: bool,
-        hint_text: str | None = None,
-    ) -> None:
-        details = observation.to_event_details()
-        details.update(self._workspace_mutation_receipt_summary())
-        event = {
-            "feature": "final_diff_contract",
-            "name": "final_diff_contract.observed",
-            "mode": mode,
-            "reason": observation.primary_reason,
-            "action": "nudge" if injected_to_model else "observe",
-            "iteration": iteration,
-            "provider_call_count": provider_call_count,
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-            "injected_to_model": injected_to_model,
-            "evidence": details,
-            "details": details,
-            "diff_paths": observation.diff_paths,
-            "read_files": self._relative_paths_from_records(self._workspace_read_records()),
-            "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "mutation_records": self._workspace_mutation_records(),
-            "hint_text_sha256": (
-                hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
-                if hint_text
-                else None
-            ),
-            "trigger_confidence": "final_diff_contract_gate",
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
-
-    # Cap on blocking `git apply` churn per salvage pass: the calls run on the
-    # event loop thread, so a pathological candidate list must not be able to
-    # stall the turn for the whole wrap-up window.
-    _FINAL_DIFF_SALVAGE_TIME_BUDGET_SECONDS = 20.0
-
-    def _attempt_final_diff_salvage(
-        self,
-        *,
-        trigger: str,
-        iteration: int,
-    ) -> list[dict[str, Any]]:
-        """Re-apply captured source-diff candidates whose paths lost their diff.
-
-        Opt-in via final_diff_salvage (OPENSQUILLA_FINAL_DIFF_SALVAGE). Fires
-        only when no tracked path carries a live diff: a healthy non-empty
-        tracked diff means the agent finished with work it chose to keep, and
-        re-applying a candidate the agent deliberately reverted would append
-        abandoned edits to a scoring patch. With the tracked diff empty the
-        collection is losing that path's earlier work anyway, so applying a
-        stale candidate can only help. Untracked files (scratch repros and
-        the like) never veto. Applies the newest candidate per path whose
-        path shows no live diff, oldest-fallback on conflict,
-        each guarded by `git apply --check`; applied candidates are marked
-        restored, and a stale marker from an earlier turn is cleared once the
-        path's diff is gone again so a later revert stays salvageable. The
-        pass stops once its time budget is spent.
-        """
-
-        if not bool(getattr(self.config, "final_diff_salvage", False)):
-            return []
-        ctx = self._tool_context
-        candidates = (
-            list(getattr(ctx, "source_diff_candidates", []) or []) if ctx is not None else []
-        )
-        if not candidates:
-            return []
-        workspace = self._workspace_dir_for_status()
-        if workspace is None:
-            return []
-        if self._workspace_diff_paths_for_final_diff_contract(include_untracked=False):
-            # A tracked path still carries a live diff: the run ends with a
-            # non-empty scored patch the agent chose to keep, and candidates
-            # for clean paths are exactly the edits it deliberately reverted.
-            # Resurrecting those here would corrupt a healthy final diff.
-            return []
-        live_diff_paths = set(self._workspace_diff_paths_for_final_diff_contract())
-        deadline = time.monotonic() + self._FINAL_DIFF_SALVAGE_TIME_BUDGET_SECONDS
-        applied: list[dict[str, Any]] = []
-        handled_paths: set[str] = set()
-        for candidate in reversed(candidates):
-            paths = [
-                path for path in candidate.get("paths", []) if isinstance(path, str) and path
-            ]
-            if not paths or paths[0] in handled_paths:
-                continue
-            path = paths[0]
-            if path in live_diff_paths:
-                # The path already carries a live diff; there is nothing to
-                # salvage and stacking a stale candidate on top would clobber
-                # newer in-worktree work.
-                handled_paths.add(path)
-                continue
-            if candidate.get("restored") is True:
-                # An earlier pass applied this candidate but its diff is gone
-                # again, so the restore was undone; clear the stale marker
-                # instead of skipping the path forever.
-                candidate["restored"] = False
-            patch = candidate.get("patch")
-            if not isinstance(patch, str) or not patch.strip():
-                continue
-            if bool(getattr(self.config, "final_diff_salvage_veto", False)):
-                # Vetoed candidates stay out of handled_paths on purpose: an
-                # older, non-vetoed candidate for the same path may still be
-                # worth salvaging.
-                if candidate.get("lost") is True:
-                    # The agent explicitly reverted this patch; resurrecting
-                    # it would score edits the agent chose to abandon.
-                    self._record_final_diff_salvage_event(
-                        candidate,
-                        trigger=trigger,
-                        iteration=iteration,
-                        action="vetoed_lost",
-                    )
-                    continue
-                if is_instrumentation_only_patch(patch):
-                    self._record_final_diff_salvage_event(
-                        candidate,
-                        trigger=trigger,
-                        iteration=iteration,
-                        action="vetoed_instrumentation",
-                    )
-                    continue
-            if time.monotonic() >= deadline:
-                self._record_final_diff_salvage_event(
-                    candidate,
-                    trigger=trigger,
-                    iteration=iteration,
-                    action="time_budget_exhausted",
-                )
-                break
-            if not self._apply_final_diff_salvage_patch(workspace, patch, check_only=True):
-                self._record_final_diff_salvage_event(
-                    candidate, trigger=trigger, iteration=iteration, action="check_failed"
-                )
-                continue
-            if not self._apply_final_diff_salvage_patch(workspace, patch, check_only=False):
-                self._record_final_diff_salvage_event(
-                    candidate, trigger=trigger, iteration=iteration, action="apply_failed"
-                )
-                continue
-            candidate["restored"] = True
-            handled_paths.add(path)
-            applied.append(candidate)
-            self._record_final_diff_salvage_event(
-                candidate, trigger=trigger, iteration=iteration, action="applied"
-            )
-        if applied:
-            self._write_turn_call_log(
-                "turn_policy_decision",
-                action="final_diff_salvage",
-                reason=trigger,
-                code="final_diff_salvage",
-                iteration=iteration,
-                candidate_ids=[candidate.get("candidate_id") for candidate in applied],
-                paths=sorted(handled_paths),
-            )
-        return applied
-
-    def _apply_final_diff_salvage_patch(
-        self,
-        workspace: Path,
-        patch: str,
-        *,
-        check_only: bool,
-    ) -> bool:
-        args = ["git", "-C", str(workspace), "apply"]
-        if check_only:
-            args.append("--check")
-        args.append("-")
-        try:
-            result = subprocess.run(
-                args,
-                input=patch,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return result.returncode == 0
-
-    def _record_final_diff_salvage_event(
-        self,
-        candidate: dict[str, Any],
-        *,
-        trigger: str,
-        iteration: int,
-        action: str,
-    ) -> None:
-        event = {
-            "feature": "final_diff_salvage",
-            "name": f"final_diff_salvage.{action}",
-            "action": action,
-            "trigger": trigger,
-            "iteration": iteration,
-            "candidate_id": candidate.get("candidate_id"),
-            "paths": list(candidate.get("paths", []) or []),
-            "patch_sha256": candidate.get("patch_sha256"),
-            "patch_chars": len(candidate.get("patch") or ""),
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
-
-    def _record_patch_evidence_tool_result(
-        self,
-        *,
-        iteration: int,
-        tool_call: ToolCall,
-        result: ToolResult,
-        duration_ms: int,
-    ) -> None:
-        if self._patch_evidence_ledger is None:
-            return
-        result_text = self._tool_result_text_for_anchor(result.content)
-        command = self._execution_command_for_progress(tool_call) or ""
-        self._patch_evidence_ledger.record_tool_result(
-            iteration=iteration,
-            tool_name=tool_call.tool_name,
-            arguments=tool_call.arguments,
-            result_text=result_text,
-            is_error=result.is_error,
-            duration_ms=duration_ms,
-            failure_anchors=self._failure_anchor_lines(result_text)
-            if result.is_error or self._tool_result_has_failure_signal(result_text)
-            else [],
-            focused_verification=bool(
-                command and self._command_looks_like_focused_verification(command)
-            ),
-        )
-
-    async def _write_patch_evidence_ledger(
-        self,
-        *,
-        final_status: str,
-        iterations: int,
-        provider_call_count: int,
-    ) -> None:
-        if self._patch_evidence_ledger is None:
-            return
-        try:
-            await asyncio.to_thread(
-                self._patch_evidence_ledger.write_final,
-                read_records=self._workspace_read_records(),
-                write_records=self._workspace_write_records(),
-                scratch_records=self._scratch_write_records(),
-                final_status=final_status,
-                iterations=iterations,
-                provider_call_count=provider_call_count,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.config.metadata["patch_evidence_ledger_write_error"] = str(exc)[:300]
 
     def _workspace_dir_for_status(self) -> Path | None:
         ctx = self._tool_context or current_tool_context.get()
@@ -11889,157 +13295,6 @@ class Agent:
             return None
         return workspace
 
-    def _scratch_verify_mirror_root(self) -> Path | None:
-        ctx = self._tool_context or current_tool_context.get()
-        scratch_dir = getattr(ctx, "scratch_dir", None) if ctx is not None else None
-        if not scratch_dir:
-            return None
-        return (
-            Path(scratch_dir).expanduser().resolve(strict=False)
-            / _VERIFY_MIRROR_DIR_NAME
-        )
-
-    @staticmethod
-    def _command_references_verify_mirror(command: str, mirror_root: Path) -> bool:
-        if not command:
-            return False
-        if f"{_VERIFY_MIRROR_DIR_NAME}/" in command:
-            return True
-        return mirror_root.as_posix() in command
-
-    @staticmethod
-    def _git_head_blob(workspace: Path, relative_path: str) -> bytes | None:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace), "show", f"HEAD:{relative_path}"],
-                capture_output=True,
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if result.returncode != 0:
-            return None
-        return result.stdout
-
-    def _scratch_verify_mirror_evidence_credit(self, command: str) -> bool:
-        """Anti-weakening hash guard for scratch verify-mirror runs.
-
-        A command that references the verify-mirror tree earns verification
-        credit ONLY while every mirror file that shadows a workspace path is
-        byte-identical to that workspace file (or to its HEAD blob when the
-        workspace copy is gone). Mirror files with no counterpart in either
-        place are the model's own new checks and stay allowed — they shadow
-        nothing. Any unreadable or unverifiable state withholds credit: the
-        guard must fail closed, not open.
-        """
-
-        mirror_root = self._scratch_verify_mirror_root()
-        if mirror_root is None or not self._command_references_verify_mirror(
-            command, mirror_root
-        ):
-            return True
-        if not mirror_root.is_dir():
-            return True
-        workspace = self._workspace_dir_for_status()
-        if workspace is None:
-            return False
-        checked = 0
-        for mirror_file in sorted(mirror_root.rglob("*")):
-            if not mirror_file.is_file():
-                continue
-            checked += 1
-            if checked > _VERIFY_MIRROR_MAX_FILES:
-                return False
-            try:
-                relative = mirror_file.relative_to(mirror_root)
-            except ValueError:
-                continue
-            try:
-                mirror_digest = hashlib.sha256(mirror_file.read_bytes()).digest()
-            except OSError:
-                return False
-            original = workspace / relative
-            if original.is_file():
-                try:
-                    original_digest = hashlib.sha256(original.read_bytes()).digest()
-                except OSError:
-                    return False
-                if mirror_digest != original_digest:
-                    return False
-                continue
-            head_blob = self._git_head_blob(workspace, relative.as_posix())
-            if head_blob is None:
-                # Tracked nowhere: a new check file, not a shadowed original.
-                continue
-            if mirror_digest != hashlib.sha256(head_blob).digest():
-                return False
-        return True
-
-    async def _workspace_git_status_porcelain(self) -> str | None:
-        workspace = self._workspace_dir_for_status()
-        if workspace is None:
-            return None
-
-        def _run_status() -> str | None:
-            try:
-                result = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(workspace),
-                        "status",
-                        "--porcelain=v1",
-                        "--untracked-files=all",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return None
-            if result.returncode != 0:
-                return None
-            gitlink_paths = self._workspace_gitlink_paths(workspace)
-            return self._filter_ignored_porcelain_status(result.stdout, gitlink_paths)
-
-        return await asyncio.to_thread(_run_status)
-
-    async def _workspace_submit_review_capture(self) -> tuple[str, str]:
-        """Capture ``(per-file summary, unified diff)`` for the submit review.
-
-        The per-file summary comes from ``git status`` (so untracked scratch
-        files appear even though they are absent from ``git diff``); the diff
-        body is ``git diff HEAD`` for tracked changes. Best-effort: any failure
-        yields an empty diff and the review degrades to the summary alone.
-        """
-        workspace = self._workspace_dir_for_status()
-        if workspace is None:
-            return "", ""
-
-        def _run_diff() -> str:
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace), "diff", "HEAD"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=4.0,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return ""
-            if result.returncode != 0:
-                return ""
-            return result.stdout
-
-        file_index = await self._workspace_git_status_porcelain() or ""
-        diff_text = await asyncio.to_thread(_run_diff)
-        return file_index, diff_text
 
     @staticmethod
     def _porcelain_status_code(line: str) -> str:
@@ -12052,11 +13307,7 @@ class Agent:
         raw_status_line = line.rstrip()
         if not raw_status_line.strip():
             return None
-        text = (
-            raw_status_line[3:].strip()
-            if len(raw_status_line) > 3
-            else raw_status_line.strip()
-        )
+        text = raw_status_line[3:].strip() if len(raw_status_line) > 3 else raw_status_line.strip()
         if " -> " in text:
             text = text.split(" -> ", 1)[1].strip()
         return _normalize_workspace_relative_path(text) or None
@@ -12065,86 +13316,6 @@ class Agent:
     def _porcelain_status_is_new_file(line: str) -> bool:
         code = Agent._porcelain_status_code(line)
         return code == "??" or "A" in code
-
-    @staticmethod
-    def _porcelain_status_test_paths(status: str | None) -> list[str]:
-        """Test-classified paths with a live diff, per porcelain-v1 status.
-
-        Renames count both sides: moving a test file away still mutates the
-        test tree. Scratch-classified paths never count even when their name
-        looks test-like (classify_workspace_path puts the scratch check first
-        only for the scratch directory; root scratch artifacts are already
-        filtered out of the status upstream).
-        """
-
-        if not status:
-            return []
-        test_paths: list[str] = []
-        for line in status.splitlines():
-            if not line.strip():
-                continue
-            raw = line.rstrip()
-            text = raw[3:].strip() if len(raw) > 3 else raw.strip()
-            sides = (
-                [side.strip() for side in text.split(" -> ", 1)]
-                if " -> " in text
-                else [text]
-            )
-            for side in sides:
-                path = _normalize_workspace_relative_path(side)
-                if not path:
-                    continue
-                if classify_workspace_path(path) != "test-like":
-                    continue
-                if path not in test_paths:
-                    test_paths.append(path)
-        return test_paths
-
-    def _porcelain_status_protected_paths(self, status: str | None) -> list[str]:
-        """Deny-glob-protected paths with a live diff, per porcelain-v1 status.
-
-        The ``protected_paths`` hygiene mode reuses the deployment's
-        workspace write-deny globs verbatim — the engine carries no path
-        taxonomy of its own here, so whatever the configuration protects
-        from writes is also what the final diff must leave untouched.
-        Renames count both sides: moving a protected file away still
-        mutates the protected tree.
-        """
-
-        if not status:
-            return []
-        workspace = self._workspace_dir_for_status()
-        if workspace is None:
-            return []
-        ctx = self._tool_context or current_tool_context.get()
-        if ctx is None or not getattr(ctx, "workspace_write_deny_globs", None):
-            return []
-        protected: list[str] = []
-        for line in status.splitlines():
-            if not line.strip():
-                continue
-            raw = line.rstrip()
-            text = raw[3:].strip() if len(raw) > 3 else raw.strip()
-            sides = (
-                [side.strip() for side in text.split(" -> ", 1)]
-                if " -> " in text
-                else [text]
-            )
-            for side in sides:
-                path = _normalize_workspace_relative_path(side)
-                if not path:
-                    continue
-                match = match_workspace_write_deny(
-                    workspace / path,
-                    original_path=path,
-                    workspace=workspace,
-                    ctx=ctx,
-                )
-                if match is None:
-                    continue
-                if path not in protected:
-                    protected.append(path)
-        return protected
 
     @staticmethod
     def _is_root_scratch_artifact_path(path: str | None) -> bool:
@@ -12186,52 +13357,38 @@ class Agent:
         return Agent._filter_ignored_porcelain_status(status, gitlink_paths)
 
     @staticmethod
-    def _workspace_gitlink_paths(workspace_dir: Path) -> set[str]:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(workspace_dir), "ls-files", "-s"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return set()
-        if result.returncode != 0:
-            return set()
+    def _workspace_gitlink_paths_observed(
+        workspace_dir: Path,
+    ) -> tuple[GitRunState, set[str]]:
+        result = run_git(["ls-files", "-s"], cwd=workspace_dir, timeout=2.0)
+        if not result.ok:
+            return result.state, set()
+        return GitRunState.OK, Agent._gitlink_paths_from_index_output(result.stdout_text)
+
+    @staticmethod
+    def _gitlink_paths_from_index_output(output: str) -> set[str]:
         paths: set[str] = set()
-        for line in (result.stdout or "").splitlines():
+        for line in output.splitlines():
             parts = line.split(None, 3)
             if len(parts) == 4 and parts[0] == "160000":
                 paths.add(_normalize_workspace_relative_path(parts[3]))
         return paths
 
-    def _workspace_ignored_diff_paths(self, workspace_dir: Path) -> set[str]:
-        ignored = self._workspace_gitlink_paths(workspace_dir)
-        try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(workspace_dir),
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=2.0,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ignored
-        if result.returncode != 0:
-            return ignored
-        for line in (result.stdout or "").splitlines():
+    def _workspace_ignored_diff_paths_observed(
+        self,
+        workspace_dir: Path,
+    ) -> tuple[GitRunState, set[str]]:
+        gitlink_state, ignored = self._workspace_gitlink_paths_observed(workspace_dir)
+        if gitlink_state is not GitRunState.OK:
+            return gitlink_state, set()
+        status_result = run_git(
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=workspace_dir,
+            timeout=2.0,
+        )
+        if not status_result.ok:
+            return status_result.state, set()
+        for line in status_result.stdout_text.splitlines():
             path = self._porcelain_status_path(line)
             if (
                 path
@@ -12239,220 +13396,8 @@ class Agent:
                 and self._is_root_scratch_artifact_path(path)
             ):
                 ignored.add(path)
-        return ignored
+        return GitRunState.OK, ignored
 
-    async def _failed_tool_finalization_recovery_details(
-        self,
-        results: list[ToolResult],
-        *,
-        post_write_verification_failure: Mapping[str, Any] | None = None,
-        post_write_verification_success_observed: bool = False,
-        final_text: str = "",
-    ) -> dict[str, Any] | None:
-        status = await self._workspace_git_status_porcelain()
-        if status is None or not status.strip():
-            return None
-        workspace_write_count = len(self._effective_workspace_write_records())
-        mutation_receipt_counts = self._workspace_mutation_receipt_counts()
-        post_write_progress_count = self._post_write_progress_count(
-            workspace_write_count=workspace_write_count,
-            mutation_receipt_counts=mutation_receipt_counts,
-        )
-        base_details: dict[str, Any] = {
-            "workspace_write_count": workspace_write_count,
-            **mutation_receipt_counts,
-            "git_status_porcelain": status[:1000],
-            "diff_fingerprint": self._workspace_diff_fingerprint_for_runtime_event(),
-        }
-        if post_write_verification_failure:
-            details = {
-                **base_details,
-                **dict(post_write_verification_failure),
-            }
-            details["reason"] = "final_response_after_failed_focused_verification_with_diff"
-            return details
-        failed_result = next((result for result in reversed(results) if result.is_error), None)
-        if failed_result is not None:
-            execution_status: Mapping[str, Any] = failed_result.execution_status or {}
-            status_reason = ""
-            if isinstance(execution_status, Mapping):
-                status_reason = str(execution_status.get("reason") or "")
-            reason = (
-                "final_response_after_masked_pipeline_failure_with_diff"
-                if status_reason == "masked_pipeline_failure"
-                else "final_response_after_failed_tool_with_diff"
-            )
-            result_text = self._tool_result_text_for_anchor(failed_result.content)
-            failure_anchors = self._failure_anchor_lines(result_text)
-            return {
-                **base_details,
-                "reason": reason,
-                "tool_name": failed_result.tool_name,
-                "execution_status_reason": status_reason or None,
-                "failure_anchors": failure_anchors[:3],
-            }
-        if (
-            post_write_progress_count > 0
-            and not post_write_verification_success_observed
-            and self._turn_likely_requires_workspace_change(final_text)
-        ):
-            return {
-                **base_details,
-                "reason": "final_response_without_successful_focused_verification",
-                "tool_name": None,
-                "execution_status_reason": None,
-                "failure_anchors": [],
-            }
-        return None
-
-    @staticmethod
-    def _failed_tool_finalization_recovery_key(details: Mapping[str, Any]) -> str:
-        key_payload = {
-            "reason": details.get("reason"),
-            "diff_fingerprint": details.get("diff_fingerprint"),
-            "git_status_porcelain": details.get("git_status_porcelain"),
-            "tool_name": details.get("tool_name"),
-            "command": details.get("command"),
-            "execution_status_reason": details.get("execution_status_reason"),
-            "failure_anchors": details.get("failure_anchors"),
-        }
-        encoded = json.dumps(key_payload, ensure_ascii=False, sort_keys=True, default=str)
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
-
-    def _failed_tool_finalization_recovery_message(self, details: Mapping[str, Any]) -> str:
-        reason = str(details.get("reason") or "")
-        if reason == "final_response_after_failed_focused_verification_with_diff":
-            command = str(details.get("command") or "a focused validation command").strip()
-            command_text = f" Command: {command}." if command else ""
-            status_reason = str(details.get("execution_status_reason") or "").strip()
-            reason_text = f" Reason: {status_reason}." if status_reason else ""
-            anchors = details.get("failure_anchors")
-            anchor_text = ""
-            if isinstance(anchors, list) and anchors:
-                rendered = " | ".join(str(anchor) for anchor in anchors[:3] if anchor)
-                if rendered:
-                    anchor_text = f" Recent failure signal: {rendered}."
-            return (
-                "[Runtime progress warning]\n"
-                "The model is about to finish after repository edits, but the latest "
-                f"focused validation still failed.{command_text}{reason_text}"
-                f"{anchor_text} Do not "
-                "finalize this patch yet. Use the validation failure to revise the "
-                "source diff, then rerun focused validation. If validation is impossible, "
-                "explain the blocker after checking the changed files."
-            )
-        if reason == "final_response_without_successful_focused_verification":
-            return (
-                "[Runtime progress warning]\n"
-                "The model is about to finish with repository edits before any focused "
-                "validation command succeeded. Do not finalize yet. Run a focused "
-                "validation command for the changed behavior, or explicitly explain why "
-                "validation cannot be run after checking the changed files."
-            )
-        tool_name = str(details.get("tool_name") or "a tool")
-        status_reason = str(details.get("execution_status_reason") or "").strip()
-        reason_text = (
-            f" Reason: {status_reason}."
-            if status_reason
-            else ""
-        )
-        anchors = details.get("failure_anchors")
-        anchor_text = ""
-        if isinstance(anchors, list) and anchors:
-            rendered = " | ".join(str(anchor) for anchor in anchors[:3] if anchor)
-            if rendered:
-                anchor_text = f" Recent failure signal: {rendered}."
-        pipeline_text = (
-            " If the command used a shell pipeline, rerun validation with "
-            "`set -o pipefail` or without `| head`/`| tail` before relying on it."
-            if status_reason == "masked_pipeline_failure"
-            else ""
-        )
-        return (
-            "[Runtime progress warning]\n"
-            "The model is about to finish while the latest tool result failed "
-            f"after repository edits. Latest failed tool: {tool_name}.{reason_text}"
-            f"{anchor_text} Do not finalize this patch yet. Fix the source diff or "
-            "rerun a focused validation command that succeeds cleanly."
-            f"{pipeline_text}"
-        )
-
-    async def _empty_diff_finalization_reason(self, final_text: str) -> str | None:
-        status = await self._workspace_git_status_porcelain()
-        if status is None:
-            return None
-        if self._effective_workspace_write_records() and status == "":
-            return "workspace_writes_without_git_status_changes"
-        if status == "" and self._turn_likely_requires_workspace_change(final_text):
-            return "final_response_without_workspace_diff"
-        return None
-
-    def _empty_diff_recovery_message(self, reason: str) -> str:
-        if reason == "workspace_writes_without_git_status_changes":
-            return (
-                "[Runtime progress warning]\n"
-                "The model is about to finish after recording workspace write "
-                "operations, but `git status --porcelain --untracked-files=all` "
-                "currently shows no repository diff. Inspect the current files and "
-                "tool results. If a code change is required, apply it to the real "
-                "workspace source file now. If no diff is required, explicitly explain "
-                "why the repository should remain unchanged."
-            )
-        return (
-            "[Runtime progress warning]\n"
-            "The model is about to finish a code-fix style task while the repository "
-            "has no visible workspace diff. Do not provide another plan only. Inspect "
-            "the relevant project files, make the smallest justified source edit if "
-            "one is available, or explicitly explain the blocker and why an empty diff "
-            "is correct."
-        )
-
-    def _turn_likely_requires_workspace_change(self, final_text: str) -> bool:
-        final_lower = " ".join((final_text or "").lower().split())
-        if any(marker in final_lower for marker in _NO_CHANGE_FINAL_MARKERS):
-            return False
-        turn_lower = " ".join((getattr(self, "_current_turn_message", "") or "").lower().split())
-        combined = f"{turn_lower}\n{final_lower}"
-        return any(marker in combined for marker in _CODE_CHANGE_TASK_MARKERS)
-
-    @staticmethod
-    def _workspace_edit_gate_details(
-        reason: str,
-        details: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        if reason not in _NO_WORKSPACE_WRITE_REASONS:
-            return None
-        if not details.get("workspace_change_likely_required"):
-            return None
-        try:
-            count = int(details.get("count", 0) or 0)
-            threshold = int(details.get("threshold", 0) or 0)
-        except (TypeError, ValueError):
-            return None
-        if threshold <= 0 or count < threshold * 2:
-            return None
-        return {
-            "reason": reason,
-            "count": count,
-            "threshold": threshold,
-            "iteration": details.get("iteration"),
-            "provider_call_count": details.get("provider_call_count"),
-        }
-
-    def _resolve_workspace_path_candidate(self, raw_path: str) -> Path | None:
-        workspace = self._workspace_dir_for_status()
-        try:
-            candidate = Path(raw_path).expanduser()
-            if not candidate.is_absolute() and workspace is not None:
-                candidate = workspace / candidate
-            resolved = candidate.resolve(strict=False)
-        except (OSError, RuntimeError, ValueError):
-            return None
-        if workspace is None:
-            return resolved
-        if resolved == workspace or workspace in resolved.parents:
-            return resolved
-        return None
 
     def _configured_scratch_path_candidate(
         self,
@@ -12524,27 +13469,8 @@ class Agent:
 
         return resolved, True
 
-    def _workspace_edit_gate_external_scratch_repro_target(
-        self,
-        tc: ToolCall,
-    ) -> tuple[Path | None, bool]:
-        """Return an allowed repro target and whether the path claimed scratch."""
 
-        if tc.tool_name not in {"edit_file", "write_file", "write_scratch"}:
-            return None, False
-        resolved, claimed_scratch = self._configured_scratch_path_candidate(
-            self._tool_call_string_arg(tc, "path"),
-            relative_to=("scratch" if tc.tool_name == "write_scratch" else "workspace"),
-        )
-        if resolved is None or not is_repro_script_path(str(resolved)):
-            return None, claimed_scratch
-
-        workspace = self._workspace_dir_for_status()
-        if workspace is not None and (resolved == workspace or workspace in resolved.parents):
-            return None, True
-        return resolved, True
-
-    def _workspace_edit_gate_apply_patch_text(self, tc: ToolCall) -> str | None:
+    def _read_patch_file_snapshot_text(self, tc: ToolCall) -> str | None:
         patch = self._tool_call_string_arg(tc, "patch")
         if patch and patch.strip():
             return patch
@@ -12591,440 +13517,25 @@ class Agent:
             return tc
         if self._tool_call_string_arg(tc, "path") is None:
             return tc
-        patch = self._workspace_edit_gate_apply_patch_text(tc)
+        patch = self._read_patch_file_snapshot_text(tc)
         if patch is None or not patch.strip():
             return tc
         arguments = dict(tc.arguments)
         arguments["patch"] = patch
         return replace(tc, arguments=arguments)
 
-    def _workspace_edit_gate_apply_patch_raw_target_paths(self, tc: ToolCall) -> list[str]:
-        patch = self._workspace_edit_gate_apply_patch_text(tc)
-        if not patch:
-            return []
-        paths: list[str] = []
-        in_patch = False
-        prefixes = (
-            "*** Add File: ",
-            "*** Update File: ",
-            "*** Delete File: ",
-        )
-        for raw_line in patch.splitlines():
-            line = raw_line.rstrip("\r")
-            marker = line.strip()
-            if marker == "*** Begin Patch":
-                in_patch = True
-                continue
-            if marker == "*** End Patch":
-                break
-            if not in_patch:
-                continue
-            for prefix in prefixes:
-                if line.startswith(prefix):
-                    raw_path = line.removeprefix(prefix).strip()
-                    if raw_path:
-                        paths.append(raw_path)
-                    break
-        return paths
-
-    def _finalize_evidence_write_targets(
-        self,
-        tc: ToolCall,
-    ) -> list[tuple[str | None, bool]]:
-        if tc.tool_name == "apply_patch":
-            patch_targets = self._workspace_edit_gate_apply_patch_raw_target_paths(tc)
-            if patch_targets:
-                return [
-                    (
-                        raw_path,
-                        self._configured_scratch_path_candidate(
-                            raw_path,
-                            relative_to="workspace",
-                        )[0]
-                        is not None,
-                    )
-                    for raw_path in patch_targets
-                ]
-            # A successful apply_patch with unknown targets must invalidate prior
-            # verification instead of treating its input patch file as a write.
-            return [(None, False)]
-
-        raw_path = self._tool_call_string_arg(tc, "path", "file_path")
-        configured_scratch_path: Path | None = None
-        if tc.tool_name in {"edit_file", "edit_source", "write_file", "write_scratch"}:
-            configured_scratch_path, _ = self._configured_scratch_path_candidate(
-                raw_path,
-                relative_to=("scratch" if tc.tool_name == "write_scratch" else "workspace"),
-            )
-        return [
-            (
-                raw_path,
-                tc.tool_name == "write_scratch" or configured_scratch_path is not None,
-            )
-        ]
-
-    def _workspace_edit_gate_apply_patch_target_paths(self, tc: ToolCall) -> list[Path]:
-        paths: list[Path] = []
-        seen: set[Path] = set()
-        for raw_path in self._workspace_edit_gate_apply_patch_raw_target_paths(tc):
-            resolved = self._resolve_workspace_path_candidate(raw_path)
-            if resolved is not None and resolved not in seen:
-                seen.add(resolved)
-                paths.append(resolved)
-        return paths
-
-    def _workspace_edit_gate_target_paths(self, tc: ToolCall) -> list[Path]:
-        if tc.tool_name == "apply_patch":
-            return self._workspace_edit_gate_apply_patch_target_paths(tc)
-        if tc.tool_name not in {"edit_file", "write_file"}:
-            return []
-        raw_path = self._tool_call_string_arg(tc, "path")
-        if raw_path is None:
-            return []
-        resolved = self._resolve_workspace_path_candidate(raw_path)
-        return [] if resolved is None else [resolved]
-
-    def _workspace_edit_gate_edit_block_detail(self, tc: ToolCall) -> str | None:
-        if tc.tool_name == "apply_patch":
-            if any(
-                self._configured_scratch_path_candidate(
-                    raw_path,
-                    relative_to="workspace",
-                )[1]
-                for raw_path in self._workspace_edit_gate_apply_patch_raw_target_paths(tc)
-            ):
-                return (
-                    "The apply_patch call targets configured scratch. Scratch files do "
-                    "not count as the requested project source fix."
-                )
-            if self._workspace_edit_gate_apply_patch_target_paths(tc):
-                return None
-            return (
-                "The apply_patch call targets '<missing or non-workspace patch target>'. "
-                "apply_patch must use an exact wrapper line '*** Begin Patch' followed "
-                "by a file operation line such as '*** Update File: path/to/source.ext', "
-                "then '@@' hunks, then '*** End Patch'. Do not put the path on the "
-                "Begin Patch or End Patch line."
-            )
-        if tc.tool_name not in {"edit_file", "write_file", "write_scratch"}:
-            return None
-        scratch_target, claimed_scratch = (
-            self._workspace_edit_gate_external_scratch_repro_target(tc)
-        )
-        if tc.tool_name == "write_scratch":
-            if scratch_target is not None:
-                return None
-            return (
-                "The write_scratch call must target a contained executable reproduction "
-                "script under an external scratch directory before the source fix."
-            )
-        if claimed_scratch:
-            return (
-                f"The {tc.tool_name} call targets configured scratch, but only a "
-                "contained executable reproduction script under an external scratch "
-                "directory may be written before the source fix."
-            )
-        raw_path = self._tool_call_string_arg(tc, "path") or "<missing path>"
-        resolved = self._resolve_workspace_path_candidate(raw_path)
-        if resolved is None:
-            return (
-                f"The {tc.tool_name} call targets {raw_path!r}, which is not a real "
-                "file under the project workspace."
-            )
-        if tc.tool_name == "write_file" and self._workspace_edit_gate_write_looks_synthetic(
-            tc, resolved
-        ):
-            return (
-                f"The write_file call creates {raw_path!r}, which looks like a temporary "
-                "marker or guard-unlock file rather than the requested source fix."
-            )
-        return None
-
-    def _workspace_edit_gate_write_looks_synthetic(
-        self,
-        tc: ToolCall,
-        resolved_path: Path,
-    ) -> bool:
-        if resolved_path.exists():
-            return False
-        name = resolved_path.name.lower()
-        suspicious_name = any(
-            name == prefix
-            or name.startswith(f"{prefix}.")
-            or name.startswith(f"{prefix}_")
-            for prefix in _SUSPICIOUS_NEW_WORKSPACE_WRITE_PREFIXES
-        )
-        content = (self._tool_call_string_arg(tc, "content") or "").lower()
-        suspicious_content = any(
-            marker in content
-            for marker in _SUSPICIOUS_NEW_WORKSPACE_WRITE_CONTENT_MARKERS
-        )
-        return suspicious_name or suspicious_content
-
-    def _tool_call_targets_workspace_path(self, tc: ToolCall) -> bool:
-        if tc.tool_name not in _WORKSPACE_EDIT_TOOL_NAMES:
-            return False
-        return self._workspace_edit_gate_edit_block_detail(tc) is None
-
-    def _workspace_edit_gate_allows_recovery_read(
-        self,
-        tc: ToolCall,
-        recovery_read_paths: set[str],
-    ) -> bool:
-        if tc.tool_name != "read_file" or not recovery_read_paths:
-            return False
-        raw_path = self._tool_call_string_arg(tc, "path")
-        if raw_path is None:
-            return False
-        resolved = self._resolve_workspace_path_candidate(raw_path)
-        return resolved is not None and str(resolved) in recovery_read_paths
-
-    def _workspace_edit_gate_apply_patch_error_allows_read(self, result: ToolResult) -> bool:
-        return self._workspace_edit_gate_edit_error_allows_read(result)
-
-    def _workspace_edit_gate_edit_error_allows_read(self, result: ToolResult) -> bool:
-        if not result.is_error:
-            return False
-        text = self._tool_result_text_for_anchor(result.content).lower()
-        return (
-            "context mismatch" in text
-            or "could not find old_text" in text
-            or "read the current file content" in text
-        )
-
-    def _workspace_edit_gate_tool_result(
-        self,
-        tc: ToolCall,
-        gate_details: Mapping[str, Any] | None,
-        *,
-        recovery_read_paths: set[str],
-        recovery_reads_remaining: int,
-    ) -> ToolResult | None:
-        if gate_details is None:
-            return None
-        if (
-            recovery_reads_remaining > 0
-            and self._workspace_edit_gate_allows_recovery_read(tc, recovery_read_paths)
-        ):
-            return None
-        scratch_target, _ = self._workspace_edit_gate_external_scratch_repro_target(tc)
-        if scratch_target is not None:
-            return None
-        gate_write_tool = (
-            tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES or tc.tool_name == "write_scratch"
-        )
-        edit_block_detail = (
-            self._workspace_edit_gate_edit_block_detail(tc)
-            if gate_write_tool
-            else None
-        )
-        if gate_write_tool and edit_block_detail is None:
-            return None
-
-        if gate_write_tool:
-            detail = edit_block_detail or f"The {tc.tool_name} call is not allowed here."
-        elif tc.tool_name == "read_file" and recovery_reads_remaining > 0:
-            detail = (
-                "Only the file targeted by the failed edit call may be read "
-                "during this recovery step."
-            )
-        else:
-            return None
-        return ToolResult(
-            tool_use_id=tc.tool_use_id,
-            tool_name=tc.tool_name,
-            content=(
-                "Runtime guard: this code-fix task appears to require a repository "
-                "patch, but no tracked workspace source file has changed yet. "
-                f"{detail} Use targeted source reads/searches only when needed to "
-                "identify the exact edit. Do not write scratch notes as a substitute "
-                "for a real source change; once localized, use an available "
-                "source-edit tool on a real project source file allowed by the "
-                "workspace write policy."
-            ),
-            is_error=True,
-            execution_status=runtime_execution_status(
-                "error",
-                reason="workspace_edit_required",
-            ),
-        )
-
-    @staticmethod
-    def _workspace_edit_gate_tool_definitions(
-        tools: list[ToolDefinition] | None,
-        gate_details: Mapping[str, Any] | None,
-        *,
-        recovery_read_paths: set[str],
-        recovery_reads_remaining: int,
-    ) -> list[ToolDefinition] | None:
-        if gate_details is None or not tools:
-            return tools
-        return tools
 
     @staticmethod
     def _plan_run_delivery_tool_definitions(
         tools: list[ToolDefinition] | None,
     ) -> list[ToolDefinition] | None:
-        """Expose only final artifact delivery after all plan steps are done."""
+        """Expose only prepared preview registration or final artifact delivery."""
 
         if not tools:
             return None
-        delivery_tools = [
-            tool for tool in tools if tool.name == "publish_artifact"
-        ]
+        delivery_tools = [tool for tool in tools if tool.name in PLAN_RUN_DELIVERY_TOOLS]
         return delivery_tools or None
 
-    def _workspace_edit_gate_system_prompt(
-        self,
-        system_prompt: str | None,
-        gate_details: Mapping[str, Any] | None,
-        *,
-        recovery_read_paths: set[str],
-        recovery_reads_remaining: int,
-    ) -> str | None:
-        if gate_details is None:
-            return system_prompt
-        workspace = self._workspace_dir_for_status()
-        workspace_text = str(workspace) if workspace is not None else "the project workspace"
-        if recovery_reads_remaining > 0 and recovery_read_paths:
-            allowed_paths = ", ".join(sorted(recovery_read_paths))
-            action_text = (
-                "A previous source edit failed because its file context did not match. "
-                f"Prioritize a targeted source read for the failed edit target path(s): "
-                f"{allowed_paths}. After that targeted read, use an available "
-                "source-edit tool on the real project source file."
-            )
-        else:
-            action_text = (
-                "Avoid more scratch-only work. If you can form a patch from the "
-                "context already present in the conversation, use an available "
-                "source-edit tool now; otherwise use targeted source reads/searches "
-                "to localize the edit."
-            )
-        restriction = (
-            "## Runtime Patch Progress Guidance\n\n"
-            "This request still has no tracked source diff after repeated tool "
-            f"activity. {action_text} Make the "
-            f"smallest edit to a real project source file under {workspace_text} "
-            "that is allowed by the workspace write policy. Do not edit tests unless "
-            "the original user explicitly asked for test changes."
-        )
-        if not system_prompt:
-            return restriction
-        return f"{system_prompt.rstrip()}\n\n{restriction}"
-
-    def _workspace_edit_gate_chat_config(
-        self,
-        chat_cfg: ChatConfig,
-        gate_details: Mapping[str, Any] | None,
-        tools: list[ToolDefinition] | None,
-        *,
-        recovery_read_paths: set[str],
-        recovery_reads_remaining: int,
-    ) -> ChatConfig:
-        if gate_details is None:
-            return chat_cfg
-        update: dict[str, Any] = {
-            "system": self._workspace_edit_gate_system_prompt(
-                chat_cfg.system,
-                gate_details,
-                recovery_read_paths=recovery_read_paths,
-                recovery_reads_remaining=recovery_reads_remaining,
-            )
-        }
-        return chat_cfg.model_copy(update=update)
-
-    def _execution_command_for_progress(self, tc: ToolCall) -> str | None:
-        if tc.tool_name == "execute_code":
-            return self._tool_call_string_arg(tc, "code")
-        return self._tool_call_string_arg(tc, "command", "cmd")
-
-    def _command_looks_like_focused_verification(self, command: str) -> bool:
-        normalized = " " + " ".join((command or "").lower().split())
-        return any(marker in normalized for marker in _FOCUSED_VERIFICATION_MARKERS)
-
-    def _source_context_signature(
-        self,
-        tool_calls: list[ToolCall],
-        results: list[ToolResult],
-    ) -> str | None:
-        signatures: list[str] = []
-        for tc, result in zip(tool_calls, results, strict=False):
-            if result.is_error:
-                continue
-            command = self._tool_call_string_arg(tc, "command", "cmd")
-            is_source_context_tool = tc.tool_name in _SOURCE_CONTEXT_TOOL_NAMES
-            is_exec_source_context = (
-                tc.tool_name == "exec_command"
-                and exec_command_invokes_source_context_read(
-                    command,
-                    content=result.content,
-                )
-            )
-            if not is_source_context_tool and not is_exec_source_context:
-                continue
-            payload = json.dumps(
-                tc.arguments,
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            )
-            signatures.append(f"{tc.tool_name}:{command or ''}:{payload}")
-        if not signatures:
-            return None
-        joined = "\n".join(signatures)
-        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _tool_call_repeat_key(tc: ToolCall) -> tuple[str, str]:
-        payload = json.dumps(
-            tc.arguments,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
-        return (tc.tool_name, hashlib.sha256(payload.encode("utf-8")).hexdigest())
-
-    def _repeated_tool_call_recovery_tool_names(self) -> frozenset[str]:
-        extra_tools = (
-            getattr(self.config, "repeated_tool_call_recovery_extra_tools", None) or ()
-        )
-        if not extra_tools:
-            return _REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES
-        return _REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES | {
-            str(name) for name in extra_tools
-        }
-
-    @staticmethod
-    def _tool_call_arguments_preview(tc: ToolCall, *, max_chars: int = 400) -> str:
-        payload = json.dumps(
-            tc.arguments,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
-        if len(payload) <= max_chars:
-            return payload
-        return payload[: max(0, max_chars - 3)] + "..."
-
-    def _repeated_tool_call_recovery_message(
-        self,
-        tc: ToolCall,
-        *,
-        repeat_count: int,
-    ) -> str:
-        arguments_preview = self._tool_call_arguments_preview(tc)
-        return (
-            "[Runtime recovery]\n"
-            f"The exact same {tc.tool_name} tool call has been requested "
-            f"{repeat_count} times in a row with identical arguments. I skipped "
-            "executing and replaying that duplicate call to avoid provider-side "
-            "rejection for repetitive tool history. Do not call this exact tool "
-            "with the same arguments again. Change the path, pattern, command, or "
-            "arguments; inspect a different source window; use a different tool; "
-            "or move to the patch/final answer if you already have enough evidence.\n"
-            f"Repeated arguments: {arguments_preview}"
-        )
 
     def _record_tool_context_runtime_event(self, event: dict[str, Any]) -> None:
         if not self.config.runtime_events_path:
@@ -13034,8 +13545,7 @@ class Agent:
             payload["session_key"] = self._session_key
         if payload.get("agent_id") is None:
             payload["agent_id"] = (
-                self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id")
+                self.config.tool_result_store_agent_id or self.config.metadata.get("agent_id")
             )
         append_runtime_event(self.config.runtime_events_path, payload)
 
@@ -13051,118 +13561,29 @@ class Agent:
         }
         append_runtime_event(self.config.runtime_events_path, event)
 
-    def _record_tool_loop_runtime_event(self, *, reason: str, **details: Any) -> None:
-        if self.config.tool_loop_observer_mode != "log":
-            return
-        iteration = details.get("iteration")
-        hint_text_sha256 = details.pop("hint_text_sha256", None)
-        trigger_confidence = details.pop("trigger_confidence", "observed_runtime_signal")
-        event = {
-            "feature": "runtime_observer",
-            "mechanism": "tool_loop_observer",
-            "mode": self.config.tool_loop_observer_mode,
-            "reason": reason,
-            "iteration": int(iteration) if isinstance(iteration, int) else iteration,
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-            "injected_to_model": bool(details.pop("injected_to_model", False)),
-            "evidence": details,
-            "read_files": self._relative_paths_from_records(self._workspace_read_records()),
-            "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
-            "verification_commands": self._verification_commands_for_runtime_event(),
-            "hint_text_sha256": hint_text_sha256,
-            "trigger_confidence": trigger_confidence,
-            "details": details,
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
-
-    def _record_runtime_recovery_event(
+    def _record_runtime_git_observation_skip(
         self,
-        decision: RuntimeRecoveryDecision,
         *,
-        iteration: int,
-        provider_call_count: int,
-        call_attempt: int | None = None,
-        **details: Any,
+        consumers: tuple[str, ...],
     ) -> None:
-        hint_text_sha256 = (
-            hashlib.sha256(decision.message.encode("utf-8")).hexdigest()
-            if decision.message
-            else None
+        """Record one internal-only skip for each unavailable Git state."""
+
+        state = self._runtime_git_state
+        if state is GitRunState.OK:
+            state = GitRunState.FAILED
+            self._runtime_git_state = state
+        self.config.metadata["runtime_git_observation_state"] = state.value
+        if state in self._runtime_git_skip_states_recorded:
+            return
+        self._runtime_git_skip_states_recorded.add(state)
+        self._record_runtime_event(
+            "runtime_git_observation.skipped",
+            feature="runtime_git_observation",
+            reason="git_state_unavailable",
+            git_state=state.value,
+            consumers=list(consumers),
+            injected_to_model=False,
         )
-        evidence = {
-            **decision.details,
-            **details,
-        }
-        event = {
-            "feature": "runtime_recovery",
-            "mechanism": decision.mechanism,
-            "mode": decision.mode,
-            "reason": decision.reason,
-            "action": decision.action,
-            "iteration": iteration,
-            "provider_call_count": provider_call_count,
-            "call_attempt": call_attempt,
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-            "injected_to_model": decision.injected_to_model,
-            "evidence": evidence,
-            "read_files": self._relative_paths_from_records(self._workspace_read_records()),
-            "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
-            "verification_commands": self._verification_commands_for_runtime_event(),
-            "hint_text_sha256": hint_text_sha256,
-            "trigger_confidence": "runtime_recovery_gate",
-            "details": evidence,
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
-
-    def _record_post_write_convergence_event(
-        self,
-        decision: PostWriteConvergenceDecision,
-        *,
-        mode: str,
-        injected_to_model: bool,
-        hint_text: str | None = None,
-    ) -> None:
-        event_name = {
-            "warn": "post_write_convergence.warned",
-            "finalize": "post_write_convergence.finalized",
-            "reset": "post_write_convergence.reset_on_diff_change",
-        }.get(decision.action)
-        if event_name is None:
-            return
-        evidence = dict(decision.details)
-        event = {
-            "feature": "post_write_convergence",
-            "mechanism": "stable_verified_workspace_diff",
-            "name": event_name,
-            "mode": mode,
-            "reason": decision.reason,
-            "action": decision.action,
-            "iteration": evidence.get("iteration"),
-            "provider_call_count": evidence.get("provider_call_count"),
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-            "injected_to_model": injected_to_model,
-            "evidence": evidence,
-            "read_files": self._relative_paths_from_records(self._workspace_read_records()),
-            "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": self._workspace_diff_paths_for_runtime_event(),
-            "verification_commands": self._verification_commands_for_runtime_event(),
-            "hint_text_sha256": (
-                hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
-                if hint_text
-                else None
-            ),
-            "trigger_confidence": "post_write_convergence_gate",
-            "details": evidence,
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
 
     @staticmethod
     def _relative_paths_from_records(records: list[dict[str, Any]]) -> list[str]:
@@ -13178,30 +13599,27 @@ class Agent:
                 paths.append(normalized)
         return paths
 
-    def _workspace_diff_paths_for_runtime_event(self) -> list[str]:
+    def _workspace_diff_paths_for_runtime_event(self) -> list[str] | None:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
-            return []
-        ignored_paths = self._workspace_ignored_diff_paths(workspace_dir)
+            self._runtime_git_state = GitRunState.NOT_REPOSITORY
+            return None
+        self._runtime_git_state = GitRunState.OK
+        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(workspace_dir)
+        if ignored_state is not GitRunState.OK:
+            self._runtime_git_state = ignored_state
+            return None
         paths: set[str] = set()
         for args in (
             ("diff", "--name-only"),
             ("diff", "--cached", "--name-only"),
             ("status", "--porcelain=v1", "--untracked-files=all"),
         ):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                self._runtime_git_state = result.state
+                return None
+            for line in result.stdout_text.splitlines():
                 if args[0] == "status":
                     text = self._porcelain_status_path(line) or ""
                 else:
@@ -13213,70 +13631,14 @@ class Agent:
                     paths.add(normalized)
         return sorted(paths)
 
-    def _workspace_diff_paths_for_final_diff_contract(
-        self, *, include_untracked: bool = True
-    ) -> list[str]:
-        workspace_dir = self._workspace_dir_for_status()
-        if workspace_dir is None:
-            return []
-        ignored_paths = self._workspace_gitlink_paths(workspace_dir) | (
-            self._workspace_internal_diagnostic_paths(workspace_dir)
-        )
-        commands: tuple[tuple[str, ...], ...] = (
-            ("diff", "--name-only"),
-            ("diff", "--cached", "--name-only"),
-        )
-        if include_untracked:
-            commands += (("status", "--porcelain=v1", "--untracked-files=all"),)
-        paths: set[str] = set()
-        for args in commands:
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            for line in (result.stdout or "").splitlines():
-                if args[0] == "status":
-                    text = self._porcelain_status_path(line) or ""
-                else:
-                    text = line.strip()
-                if text:
-                    normalized = _normalize_workspace_relative_path(text)
-                    if normalized in ignored_paths:
-                        continue
-                    paths.add(normalized)
-        return sorted(paths)
-
-    def _workspace_internal_diagnostic_paths(self, workspace_dir: Path) -> set[str]:
-        ignored: set[str] = set()
-        for raw_path in (
-            self.config.runtime_events_path,
-            self.config.patch_evidence_ledger_path,
-        ):
-            if not raw_path:
-                continue
-            try:
-                relative = Path(raw_path).expanduser().resolve(strict=False).relative_to(
-                    workspace_dir
-                )
-            except ValueError:
-                continue
-            ignored.add(relative.as_posix())
-        return ignored
 
     def _workspace_diff_fingerprint_for_runtime_event(self) -> str | None:
         workspace_dir = self._workspace_dir_for_status()
         if workspace_dir is None:
+            self._runtime_git_state = GitRunState.NOT_REPOSITORY
             return None
         diff_paths = self._workspace_diff_paths_for_runtime_event()
-        if not diff_paths:
+        if diff_paths is None or not diff_paths:
             return None
         payload_parts: list[str] = []
         for args in (
@@ -13284,40 +13646,31 @@ class Agent:
             ("diff", "--cached", "--no-ext-diff", "--binary", "--", *diff_paths),
             ("status", "--porcelain=v1", "--untracked-files=all"),
         ):
-            try:
-                result = subprocess.run(
-                    ["git", "-C", str(workspace_dir), *args],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2.0,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
+            result = run_git(args, cwd=workspace_dir, timeout=2.0)
+            if not result.ok:
+                self._runtime_git_state = result.state
+                return None
             payload_parts.append(f"$ git {' '.join(args)}\n")
-            stdout = result.stdout or ""
+            stdout = result.stdout_text
             if args[0] == "status":
+                ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(
+                    workspace_dir
+                )
+                if ignored_state is not GitRunState.OK:
+                    self._runtime_git_state = ignored_state
+                    return None
                 stdout = self._filter_gitlink_porcelain_status(
                     stdout,
-                    self._workspace_ignored_diff_paths(workspace_dir),
+                    ignored_paths,
                 )
             payload_parts.append(stdout)
             if result.stderr:
                 payload_parts.append("\n[stderr]\n")
-                payload_parts.append(result.stderr)
+                payload_parts.append(result.stderr_text)
         payload = "\n".join(payload_parts)
         if not payload.strip():
             return None
         return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:16]
-
-    def _verification_commands_for_runtime_event(self) -> list[dict[str, Any]]:
-        ledger = self._patch_evidence_ledger
-        if ledger is None:
-            return []
-        commands = getattr(ledger, "verification_commands", []) or []
-        return [dict(command) for command in commands if isinstance(command, dict)]
 
     @staticmethod
     def _failure_anchor_summary_from_tool_results(
@@ -13361,31 +13714,6 @@ class Agent:
     def _tool_result_has_failure_signal(text: str) -> bool:
         return bool(Agent._failure_anchor_lines(text))
 
-    @staticmethod
-    def _tool_result_has_validation_success_signal(text: str) -> bool:
-        lowered = (text or "").lower()
-        if not lowered:
-            return False
-        if "build failure" in lowered or "failed to execute goal" in lowered:
-            return False
-        return (
-            "build success" in lowered
-            or "all tests passed" in lowered
-            or bool(_CLEAN_TEST_SUMMARY_RE.search(text))
-            or bool(_CLEAN_PASSED_FAILED_SUMMARY_RE.search(text))
-        )
-
-    @staticmethod
-    def _classify_focused_verification_result(result: ToolResult) -> str:
-        text = Agent._tool_result_text_for_anchor(result.content)
-        if result.is_error or Agent._tool_result_has_failure_signal(text):
-            return "failure"
-        if (
-            Agent._tool_result_has_validation_success_signal(text)
-            or _PLAIN_PASSED_SUMMARY_RE.search(text)
-        ):
-            return "success"
-        return "unknown"
 
     @staticmethod
     def _failure_anchor_lines(text: str) -> list[str]:
@@ -13422,29 +13750,6 @@ class Agent:
                 break
         return anchors
 
-    @staticmethod
-    def _failure_anchor_signature(summary: str) -> str | None:
-        normalized = " ".join((summary or "").strip().lower().split())
-        if not normalized:
-            return None
-        for marker in ("/tmp/", "/var/tmp/"):
-            if marker in normalized:
-                normalized = normalized.replace(marker, f"{marker}<path>/")
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _tool_error_signature(result: ToolResult) -> str:
-        tool_name = str(result.tool_name or "tool")
-        status: Mapping[str, Any] = result.execution_status or {}
-        reason = str(status.get("reason") or "")
-        source = str(status.get("source") or "")
-        if tool_name in {"apply_patch", "edit_file", "write_file"} and (
-            reason in {"retryable_tool_input_error", "invalid_arguments"}
-            or "input" in reason
-            or source == "tool_runtime"
-        ):
-            return f"{tool_name}:input_error"
-        return f"{tool_name}:{str(result.content)[:160]}"
 
     async def _stream_provider_events_with_deadline(
         self,
@@ -13452,51 +13757,125 @@ class Agent:
         *,
         loop: asyncio.AbstractEventLoop,
         total_deadline: float | None,
+        deadline_provider: Callable[[], float | None] | None = None,
     ) -> AsyncIterator[Any]:
-        stream_iter = stream.__aiter__()
+        try:
+            stream_iter = stream.__aiter__()
+        except (asyncio.CancelledError, UsageAccountingUnavailableError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            raise _RaisedProviderBoundaryError(
+                timeout=isinstance(exc, TimeoutError),
+                connection_failed=is_connection_failure(exc),
+            ) from None
+        close_state = {"deferred": False}
+        try:
+            async for event in self._stream_provider_events_with_deadline_unclosed(
+                stream_iter,
+                loop=loop,
+                total_deadline=total_deadline,
+                deadline_provider=deadline_provider,
+                close_state=close_state,
+            ):
+                yield event
+        finally:
+            if not close_state["deferred"]:
+                await self._close_provider_stream(stream_iter)
+
+    async def _stream_provider_events_with_deadline_unclosed(
+        self,
+        stream_iter: AsyncIterator[Any],
+        *,
+        loop: asyncio.AbstractEventLoop,
+        total_deadline: float | None,
+        deadline_provider: Callable[[], float | None] | None = None,
+        close_state: dict[str, bool] | None = None,
+    ) -> AsyncIterator[Any]:
         while True:
-            wait_budget = max(0.001, self.config.iteration_timeout)
-            total_deadline_limits_wait = False
-            if total_deadline is not None:
-                remaining_total = total_deadline - loop.time()
-                if remaining_total <= 0:
-                    await self._close_provider_stream(stream_iter)
-                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
-                if remaining_total <= wait_budget:
-                    wait_budget = remaining_total
-                    total_deadline_limits_wait = True
+            dynamic_deadline = deadline_provider() if deadline_provider is not None else None
+            active_deadline = total_deadline
+            if dynamic_deadline is not None:
+                active_deadline = (
+                    min(active_deadline, dynamic_deadline)
+                    if active_deadline is not None
+                    else dynamic_deadline
+                )
+            # Adapters own provider inactivity. This wrapper only enforces the
+            # effective task deadline and closes/cancels outstanding stream pulls.
+            wait_budget: float | None = None
+            if active_deadline is not None:
+                wait_budget = active_deadline - loop.time()
+                if total_deadline is not None:
+                    wait_budget = min(wait_budget, self.config.timeout)
+                if wait_budget <= 0:
+                    raise _provider_stream_deadline_timeout(
+                        timeout_seconds=self.config.timeout,
+                        deadline_at_monotonic=active_deadline,
+                    )
 
             next_event: asyncio.Future[Any] = asyncio.ensure_future(stream_iter.__anext__())
+
+            async def _cancel_provider_pull(*, grace_seconds: float) -> None:
+                settled = False
+                try:
+                    settled = await cancel_task(
+                        next_event,
+                        policy="bounded",
+                        operation="provider_stream_pull",
+                        grace_seconds=grace_seconds,
+                    )
+                finally:
+                    if (
+                        not settled
+                        and not next_event.done()
+                        and close_state is not None
+                        and not close_state["deferred"]
+                    ):
+                        close_state["deferred"] = True
+                        defer_async_cleanup(
+                            next_event,
+                            lambda: self._close_provider_stream(stream_iter),
+                            operation="provider_stream_deferred_close",
+                        )
+
             try:
                 done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
             except (asyncio.CancelledError, GeneratorExit):
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
+                await _cancel_provider_pull(grace_seconds=STOP_CANCEL_GRACE_SECONDS)
                 raise
             if not done:
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
-                if total_deadline_limits_wait or (
-                    total_deadline is not None and loop.time() >= total_deadline
-                ):
-                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
-                raise _IterationStreamTimeoutError
+                await _cancel_provider_pull(grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS)
+                assert active_deadline is not None
+                raise _provider_stream_deadline_timeout(
+                    timeout_seconds=self.config.timeout,
+                    deadline_at_monotonic=active_deadline,
+                )
             try:
-                yield next_event.result()
+                event = next_event.result()
             except StopAsyncIteration:
                 return
+            except (
+                asyncio.CancelledError,
+                UsageAccountingUnavailableError,
+                ModelRepetitionLoopError,
+            ):
+                raise
+            except Exception as exc:  # noqa: BLE001 - provider boundary
+                # TimeoutError raised *by the provider* is different from
+                # the deadline timeouts raised above by this wrapper.
+                raise _RaisedProviderBoundaryError(
+                    timeout=isinstance(exc, TimeoutError),
+                    connection_failed=is_connection_failure(exc),
+                ) from None
+            yield event
 
     @staticmethod
     async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> None:
-        aclose = getattr(stream_iter, "aclose", None)
-        if not callable(aclose):
-            return
-        try:
-            await aclose()
-        except Exception as exc:  # noqa: BLE001 - cleanup must not mask timeout
-            logger.debug("provider_stream.close_failed", error=str(exc))
+        await close_async_iterator_bounded(
+            stream_iter,
+            timeout=0.25,
+            event_prefix="provider_stream",
+        )
 
     def _provider_request_messages(
         self,
@@ -13506,7 +13885,6 @@ class Agent:
         request_context_insert_index: int,
         runtime_context_message: Message,
         runtime_context_insert_index: int,
-        turn_objective_message: Message | None = None,
     ) -> list[Message]:
         request_messages, _ = self._provider_request_messages_with_sanitize(
             messages,
@@ -13514,7 +13892,6 @@ class Agent:
             request_context_insert_index=request_context_insert_index,
             runtime_context_message=runtime_context_message,
             runtime_context_insert_index=runtime_context_insert_index,
-            turn_objective_message=turn_objective_message,
         )
         return request_messages
 
@@ -13526,19 +13903,14 @@ class Agent:
         request_context_insert_index: int,
         runtime_context_message: Message,
         runtime_context_insert_index: int,
-        turn_objective_message: Message | None = None,
         preview: bool = False,
     ) -> tuple[list[Message], SessionSanitizeResult]:
-        capsule_message = self._runtime_state_capsule_provider_message(preview=preview)
-        if capsule_message is not None:
-            messages = [*messages, capsule_message]
         source_messages = self._with_request_context_messages(
             messages,
             request_context_message,
             request_context_insert_index,
             runtime_context_message,
             runtime_context_insert_index,
-            turn_objective_message=turn_objective_message,
         )
         source_messages = self._apply_provider_tool_result_overrides(source_messages)
         source_messages = self._strip_provider_context_marker_replay_for_provider(
@@ -13549,7 +13921,6 @@ class Agent:
         # not affect message cardinality.  Skip them during a count preview:
         # the normal paths update metadata, logs, and snapshot stores.
         if not preview:
-            source_messages = self._dedup_repeated_tool_results_for_provider(source_messages)
             source_messages = self._compact_aggregate_tool_results_for_provider(source_messages)
         source_messages = self._sanitize_projected_tool_use_arguments_for_provider(
             source_messages,
@@ -13561,43 +13932,6 @@ class Agent:
             self._remember_provider_visible_tool_results(request_messages)
         return request_messages, sanitize_result
 
-    def _runtime_state_capsule_provider_message(self, *, preview: bool = False) -> Message | None:
-        mode = str(getattr(self.config, "runtime_state_capsule_mode", "off") or "off")
-        if mode not in {"log", "inject"}:
-            return None
-        if preview:
-            # Count projection needs the exact assembly rule, not capsule
-            # contents.  Avoid filesystem reads, metadata writes, and runtime
-            # events while preserving the one-message injection cardinality.
-            return (
-                Message(role="user", content="[runtime state capsule preview]")
-                if mode == "inject"
-                else None
-            )
-        ctx = self._tool_context or current_tool_context.get()
-        workspace = (
-            getattr(ctx, "workspace_dir", None)
-            if ctx is not None and getattr(ctx, "workspace_dir", None)
-            else self.config.workspace_dir
-        )
-        capsule = build_runtime_state_capsule(workspace=workspace, tool_context=ctx)
-        self.config.metadata["runtime_state_capsule_observed"] = (
-            self.config.metadata.get("runtime_state_capsule_observed", 0) + 1
-        )
-        self._record_runtime_event(
-            "runtime_state_capsule.observed",
-            feature="runtime_state_capsule",
-            mode=mode,
-            injected_to_model=mode == "inject",
-            capsule=capsule,
-        )
-        if mode != "inject":
-            return None
-        self.config.metadata["runtime_state_capsule_injected"] = (
-            self.config.metadata.get("runtime_state_capsule_injected", 0) + 1
-        )
-        return Message(role="user", content=runtime_state_capsule_message(capsule))
-
     async def _provider_request_messages_with_sanitize_async(
         self,
         messages: list[Message],
@@ -13606,7 +13940,6 @@ class Agent:
         request_context_insert_index: int,
         runtime_context_message: Message,
         runtime_context_insert_index: int,
-        turn_objective_message: Message | None = None,
     ) -> tuple[list[Message], SessionSanitizeResult]:
         """Off-loop wrapper for :meth:`_provider_request_messages_with_sanitize`.
 
@@ -13625,7 +13958,6 @@ class Agent:
                 request_context_insert_index=request_context_insert_index,
                 runtime_context_message=runtime_context_message,
                 runtime_context_insert_index=runtime_context_insert_index,
-                turn_objective_message=turn_objective_message,
             )
 
         return await asyncio.to_thread(_run)
@@ -13638,7 +13970,6 @@ class Agent:
         request_context_insert_index: int,
         runtime_context_message: Message,
         runtime_context_insert_index: int,
-        turn_objective_message: Message | None = None,
     ) -> list[Message]:
         request_messages, _ = await self._provider_request_messages_with_sanitize_async(
             messages,
@@ -13646,7 +13977,6 @@ class Agent:
             request_context_insert_index=request_context_insert_index,
             runtime_context_message=runtime_context_message,
             runtime_context_insert_index=runtime_context_insert_index,
-            turn_objective_message=turn_objective_message,
         )
         return request_messages
 
@@ -13658,7 +13988,6 @@ class Agent:
         request_context_insert_index: int,
         runtime_context_message: Message,
         runtime_context_insert_index: int,
-        turn_objective_message: Message | None = None,
     ) -> list[Message]:
         """Assemble the provider view without logs, snapshots, or state writes."""
 
@@ -13668,7 +13997,6 @@ class Agent:
             request_context_insert_index=request_context_insert_index,
             runtime_context_message=runtime_context_message,
             runtime_context_insert_index=runtime_context_insert_index,
-            turn_objective_message=turn_objective_message,
             preview=True,
         )
         return request_messages
@@ -13678,12 +14006,10 @@ class Agent:
         messages: list[Message],
         *,
         config: ChatConfig,
-        identical_request_perturbed: bool,
         request_context_message: Message | None,
         request_context_insert_index: int,
         runtime_context_message: Message,
         runtime_context_insert_index: int,
-        turn_objective_message: Message | None,
     ) -> ProviderMessageCountProjection | None:
         request_messages = self._provider_request_messages_for_count_projection(
             messages,
@@ -13691,12 +14017,7 @@ class Agent:
             request_context_insert_index=request_context_insert_index,
             runtime_context_message=runtime_context_message,
             runtime_context_insert_index=runtime_context_insert_index,
-            turn_objective_message=turn_objective_message,
         )
-        if identical_request_perturbed:
-            request_messages = self._append_identical_request_loop_nudge(
-                request_messages
-            )
         return project_provider_message_count(
             self.provider,
             request_messages,
@@ -13753,10 +14074,15 @@ class Agent:
                 flat = message.content
                 real_tokens = get_approx_tokens(message.content)
             else:
-                flat = _flatten_content_blocks(message.content)
-                real_tokens = get_approx_tokens(
-                    json.dumps(Agent._live_request_jsonable(message.content))
+                flat = "\n".join(
+                    block.text for block in message.content if isinstance(block, ContentBlockText)
                 )
+                budget = project_provider_payload(
+                    {"messages": [Agent._live_request_jsonable(message)]},
+                    projection_adapter="live_compaction_entry",
+                    proof_budget=0,
+                )
+                real_tokens = int(budget["estimated_tokens"])
             entries.append(
                 {
                     "role": message.role,
@@ -13764,7 +14090,621 @@ class Agent:
                     "token_count": real_tokens,
                 }
             )
+            if isinstance(message.content, list):
+                segments: list[dict[str, Any]] = []
+                for block in message.content:
+                    if isinstance(block, ContentBlockToolUse):
+                        segments.append({
+                            "type": "tool_use",
+                            "tool_use_id": block.id,
+                            "name": block.name,
+                            "input": copy.deepcopy(block.input),
+                        })
+                    elif isinstance(block, ContentBlockToolResult):
+                        segments.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.tool_use_id,
+                            "result": copy.deepcopy(block.content),
+                            "is_error": block.is_error,
+                            "execution_status": copy.deepcopy(block.execution_status),
+                        })
+                if segments:
+                    entries[-1]["tool_calls"] = segments
+            if compaction_prompt_layout() == "suffix":
+                entries[-1]["_provider_message"] = message.model_copy(deep=True)
         return entries
+
+    @staticmethod
+    def _tool_result_requires_raw_preservation(message: Message) -> bool:
+        """Keep active protocol state; completed errors may leave a request window."""
+        from opensquilla.session.compaction import _execution_status_is_live
+
+        if not isinstance(message.content, list):
+            return False
+        for block in message.content:
+            if not isinstance(block, ContentBlockToolResult):
+                continue
+            if _execution_status_is_live(block.execution_status):
+                return True
+            if not isinstance(block.content, str):
+                continue
+            try:
+                parsed = json.loads(block.content)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, dict) and _execution_status_is_live(
+                parsed.get("execution_status") or parsed
+            ):
+                return True
+        return False
+
+    def _live_turn_compaction_boundary(
+        self,
+        messages: list[Message],
+        *,
+        protected_turn_start_index: int,
+        keep_recent_rounds: int = 2,
+    ) -> tuple[int, int] | None:
+        """Return the active-user index and raw-tail start for a live tool loop."""
+
+        protected_start = max(
+            0,
+            min(protected_turn_start_index, len(messages)),
+        )
+        active_user_index = _active_user_message_index_for_request(
+            messages[protected_start:],
+            current_user_text=getattr(self, "_current_turn_message", "") or "",
+        )
+        if active_user_index is None:
+            return None
+        active_user_index += protected_start
+
+        assistant_starts = [
+            index
+            for index in range(active_user_index + 1, len(messages))
+            if messages[index].role == "assistant"
+        ]
+        protected_round_count = max(1, int(keep_recent_rounds))
+        # Preserve two complete physical rounds by default. Final-envelope
+        # admission may retry once with one raw round when the first summary is
+        # still too large. At least one older round must exist before a live
+        # summary is worthwhile.
+        if len(assistant_starts) <= protected_round_count:
+            return None
+
+        rounds: list[tuple[int, int, bool]] = []
+        for position, start in enumerate(assistant_starts):
+            end = (
+                assistant_starts[position + 1]
+                if position + 1 < len(assistant_starts)
+                else len(messages)
+            )
+            group = messages[start:end]
+            has_result = any(_message_has_tool_result(message) for message in group)
+            unresolved = _message_has_tool_use(messages[start]) and not has_result
+            critical = unresolved or any(
+                self._tool_result_requires_raw_preservation(message) for message in group
+            )
+            rounds.append((start, end, critical))
+
+        keep_round = max(0, len(rounds) - protected_round_count)
+        critical_rounds = [index for index, (_, _, critical) in enumerate(rounds) if critical]
+        if critical_rounds:
+            keep_round = min(keep_round, min(critical_rounds))
+        if keep_round <= 0:
+            return None
+        return active_user_index, rounds[keep_round][0]
+
+    @staticmethod
+    def _live_turn_mapped_index(
+        original_index: int | None,
+        *,
+        protected_start: int,
+        active_user_index: int,
+        keep_start: int,
+        active_prefix_count: int,
+    ) -> int | None:
+        if original_index is None:
+            return None
+        if original_index <= active_user_index:
+            return 2 + max(0, original_index - protected_start)
+        if original_index >= keep_start:
+            return 2 + active_prefix_count + (original_index - keep_start)
+        return 2 + active_prefix_count
+
+    def _recover_local_request_window(
+        self,
+        messages: list[Message],
+        *,
+        protected_turn_start_index: int,
+        request_context_insert_index: int | None,
+        runtime_context_insert_index: int | None,
+        config: ChatConfig | None = None,
+        request_context_message: Message | None = None,
+        runtime_context_message: Message | None = None,
+        request_suffix_messages: list[Message] | None = None,
+        target_wire_messages: int | None = None,
+        input_budget_tokens: int | None = None,
+        input_budget_chars: int | None = None,
+        allow_unchanged: bool = False,
+        compaction_config: CompactionConfig | None = None,
+        reason: str = "summary_failed",
+    ) -> CompactionOutcome | None:
+        """Admit a temporary raw window without changing canonical history."""
+
+        protected_start = max(0, min(protected_turn_start_index, len(messages)))
+        protected_indexes = {
+            index for index, message in enumerate(messages)
+            if self._tool_result_requires_raw_preservation(message)
+        }
+        assistant_indexes = [
+            index for index, message in enumerate(messages) if message.role == "assistant"
+        ]
+        protected_indexes.update(assistant_indexes[-2:])
+        live_boundary = self._live_turn_compaction_boundary(
+            messages, protected_turn_start_index=protected_start,
+        )
+        chat_config = config or self._provider_admission_chat_config(
+            getattr(self, "_current_turn_message", "") or "",
+            context_window_tokens=self.config.context_window_tokens,
+        )
+        if request_context_message is None:
+            request_context_message = self._request_context_message(
+                self.config.request_context_prompt,
+            )
+        if runtime_context_message is None:
+            runtime_context_message = self._freeze_preflight_runtime_context_message()
+
+        last_proof: dict[str, Any] | None = None
+
+        def _fits(projection: ProviderFinalRequestProjection | None) -> bool:
+            nonlocal last_proof
+            if projection is None:
+                return False
+            proof = projection.proof
+            if "estimated_tokens" not in proof or "estimated_chars" not in proof:
+                proof = project_provider_payload(
+                    projection.payload, projection_adapter="request_window", proof_budget=0,
+                )
+            budget_fits = bool(proof.get("fits", True)) and (
+                input_budget_tokens is None
+                or int(proof["estimated_tokens"]) <= input_budget_tokens
+            ) and (
+                input_budget_chars is None
+                or int(proof["estimated_chars"]) <= input_budget_chars
+            )
+            last_proof = None if budget_fits else proof
+            return projection.fits and budget_fits
+
+        unchanged = self._provider_request_messages_for_count_projection(
+            [*messages, *(request_suffix_messages or [])],
+            request_context_message=request_context_message,
+            request_context_insert_index=(
+                request_context_insert_index
+                if request_context_insert_index is not None else len(messages)
+            ),
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=(
+                runtime_context_insert_index
+                if runtime_context_insert_index is not None else len(messages)
+            ),
+        )
+        unchanged_projection = project_provider_final_request(
+            self.provider, unchanged, self.tool_definitions, chat_config,
+            message_limit=target_wire_messages,
+        )
+        if _fits(unchanged_projection) and allow_unchanged:
+            return CompactionOutcome(
+                messages=messages,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                protected_turn_start_index=protected_start,
+            )
+        pruned_messages = compact_request_window_tools(messages)
+        retained_indexes: set[int] = set()
+        if (
+            len(messages) > 1 and isinstance(messages[0].content, str)
+            and messages[0].content.startswith("[Context summary]\n")
+            and messages[1].role == "assistant"
+            and messages[1].content == "Understood. Continuing from summary."
+        ):
+            summary_body = messages[0].content.removeprefix("[Context summary]\n")
+            replayed = format_compaction_summary_context([summary_body]) or ""
+            if summary_body in replayed:
+                retained_indexes.update((0, 1))
+        candidates = []
+        if pruned_messages is not messages:
+            candidates.append(RequestWindowCandidate(
+                pruned_messages, tuple(range(len(messages))), 0,
+            ))
+        window_candidates = iter_request_window_candidates(
+            pruned_messages,
+            protected_start_index=protected_start,
+            protected_indexes=protected_indexes,
+            retained_indexes=retained_indexes,
+            live_boundary=live_boundary,
+        )
+        without_summary = (
+            iter_request_window_candidates(
+                pruned_messages,
+                protected_start_index=protected_start,
+                protected_indexes=protected_indexes - retained_indexes,
+                live_boundary=live_boundary,
+            ) if retained_indexes else ()
+        )
+        for candidate in chain(candidates, window_candidates, without_summary):
+            request_index = candidate.map_index(request_context_insert_index)
+            runtime_index = candidate.map_index(runtime_context_insert_index)
+            if not candidate.omitted_count:
+                request_index = request_context_insert_index
+                runtime_index = runtime_context_insert_index
+            request_messages = self._provider_request_messages_for_count_projection(
+                [*candidate.messages, *(request_suffix_messages or [])],
+                request_context_message=request_context_message,
+                request_context_insert_index=(
+                    request_index if request_index is not None else len(candidate.messages)
+                ),
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=(
+                    runtime_index if runtime_index is not None else len(candidate.messages)
+                ),
+            )
+            active_index = _active_user_message_index_for_request(
+                request_messages,
+                current_user_text=getattr(self, "_current_turn_message", "") or "",
+            )
+            candidate_config = chat_config.model_copy(
+                update={"active_user_message_index": active_index},
+            )
+            projection = project_provider_final_request(
+                self.provider,
+                request_messages,
+                self.tool_definitions,
+                candidate_config,
+                message_limit=target_wire_messages,
+            )
+            if not _fits(projection):
+                continue
+            compaction_id = (
+                compaction_config.operation_id
+                if compaction_config is not None and compaction_config.operation_id
+                else new_compaction_id()
+            )
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_request_window",
+                    status="emergency_ephemeral",
+                    reason=reason,
+                    removed_count=candidate.omitted_count,
+                    kept_count=len(candidate.kept_indices),
+                    **compaction_effect_payload(status="emergency_ephemeral", reason=reason),
+                    **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+                )
+            return CompactionOutcome(
+                messages=candidate.messages,
+                compacted=True,
+                removed_count=candidate.omitted_count,
+                compaction_id=compaction_id,
+                request_context_insert_index=request_index,
+                runtime_context_insert_index=runtime_index,
+                protected_turn_start_index=(
+                    candidate.map_index(protected_start)
+                    if candidate.omitted_count else protected_start
+                ),
+                ephemeral_only=True,
+                runtime_compaction_config=compaction_config,
+            )
+        if last_proof is not None:
+            self._last_compaction_refusal_reason = (
+                self._request_budget_component_refusal(
+                    last_proof, input_budget_chars=input_budget_chars,
+                ) or "provider_protected_context_too_large"
+            )
+        return None
+
+    async def _recover_live_turn_request_overflow(
+        self,
+        messages: list[Message],
+        *,
+        protected_turn_start_index: int,
+        context_window_tokens: int,
+        context_window_chars: int | None = None,
+        keep_recent_rounds: int = 2,
+        request_context_insert_index: int | None,
+        runtime_context_insert_index: int | None,
+        shared_compaction_config: CompactionConfig | None = None,
+    ) -> CompactionOutcome | None:
+        """Summarize completed live rounds into an ephemeral provider view."""
+
+        if self._compaction_failed_this_turn:
+            return self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                input_budget_tokens=context_window_tokens,
+                input_budget_chars=context_window_chars,
+                reason="already_attempted_this_turn",
+            )
+        boundary = self._live_turn_compaction_boundary(
+            messages,
+            protected_turn_start_index=protected_turn_start_index,
+            keep_recent_rounds=keep_recent_rounds,
+        )
+        if boundary is None:
+            return None
+        active_user_index, keep_start = boundary
+        protected_start = max(
+            0,
+            min(protected_turn_start_index, len(messages)),
+        )
+        active_prefix = messages[protected_start : active_user_index + 1]
+        raw_tail = messages[keep_start:]
+        summary_messages = [
+            *messages[:protected_start],
+            *messages[active_user_index + 1 : keep_start],
+        ]
+        if not summary_messages:
+            return None
+
+        config = shared_compaction_config or self._build_compaction_config()
+        # Keep failures latched until the turn ends; another recovery entry
+        # must not grant the same failed summary a new call budget/deadline.
+        self._compaction_failed_this_turn = True
+        # This request contains only the already-completed prefix. The caller
+        # retains the active user and the verified recent/error raw tail.
+        compaction_id = new_compaction_id()
+        if shared_compaction_config is None:
+            arm_compaction_deadline(config, operation_id=compaction_id)
+        original_protect_semantic_tail = config.protect_semantic_tail
+        original_protected_recent_messages = config.protected_recent_messages
+        config.protect_semantic_tail = False
+        config.protected_recent_messages = 0
+        try:
+            result = await compact_context(
+                CompactionRequest(
+                    session_id="agent-live-turn-request-view",
+                    entries=self._message_count_compaction_entries(summary_messages),
+                    context_window_tokens=context_window_tokens,
+                    context_window_chars=context_window_chars,
+                    config=config,
+                    forced_prefix_cut=len(summary_messages),
+                    trigger="message_count",
+                    reason="live_turn_request_overflow",
+                    provider_request_correlation=(
+                        derive_provider_request_correlation(
+                            self._provider_request_correlation,
+                            execution_id=uuid.uuid4().hex,
+                            call_kind="auxiliary.compaction",
+                        )
+                    ),
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - local recovery needs no working summarizer
+            return self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_start,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                input_budget_tokens=context_window_tokens,
+                input_budget_chars=context_window_chars,
+                compaction_config=config,
+            )
+        finally:
+            if shared_compaction_config is not None:
+                config.protect_semantic_tail = original_protect_semantic_tail
+                config.protected_recent_messages = original_protected_recent_messages
+        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+            self._compaction_failed_this_turn = False
+        replacement_applied = bool(
+            result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
+        )
+        # Rejected candidates intentionally keep their structured payload for
+        # diagnostics. They are not installed state and must never be replayed
+        # ahead of the unchanged raw history.
+        replay_summary = compaction_replay_summary(result) if replacement_applied else ""
+        if result.removed_count != len(summary_messages) or not replay_summary:
+            return self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_start,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                reason=str(getattr(result, "skip_reason", None) or "summary_failed"),
+                input_budget_tokens=context_window_tokens,
+                input_budget_chars=context_window_chars,
+                compaction_config=config,
+            )
+
+        projected = [
+            Message(
+                role="user",
+                content=(
+                    "[Context summary]\n"
+                    "Completed work from this still-active request:\n"
+                    f"{replay_summary}"
+                ),
+            ),
+            Message(
+                role="assistant",
+                content="Understood. Continuing the active request.",
+            ),
+            *active_prefix,
+            *raw_tail,
+        ]
+        if projected[2 : 2 + len(active_prefix)] != active_prefix:
+            return None
+        if projected[-len(raw_tail) :] != raw_tail:
+            return None
+        if repair_tool_pairing(projected) != projected:
+            return None
+
+        mapped_request_index = self._live_turn_mapped_index(
+            request_context_insert_index,
+            protected_start=protected_start,
+            active_user_index=active_user_index,
+            keep_start=keep_start,
+            active_prefix_count=len(active_prefix),
+        )
+        mapped_runtime_index = self._live_turn_mapped_index(
+            runtime_context_insert_index,
+            protected_start=protected_start,
+            active_user_index=active_user_index,
+            keep_start=keep_start,
+            active_prefix_count=len(active_prefix),
+        )
+        if self._session_key:
+            notify_compaction(
+                self._session_key,
+                source="automatic",
+                phase="agent_live_turn",
+                status="emergency_ephemeral",
+                reason="live_turn_request_overflow",
+                removed_count=result.removed_count,
+                kept_count=len(projected),
+                tokens_before=result.tokens_before,
+                tokens_after=result.tokens_after,
+                **compaction_effect_payload(
+                    status="emergency_ephemeral",
+                    reason="live_turn_request_overflow",
+                ),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
+        self._compaction_failed_this_turn = False
+        return CompactionOutcome(
+            messages=projected,
+            compacted=True,
+            summary=replay_summary,
+            removed_count=result.removed_count,
+            compaction_id=compaction_id,
+            compaction_deadline_at_monotonic=config.deadline_at_monotonic,
+            compaction_timeout_seconds=config.total_timeout_seconds,
+            request_context_insert_index=mapped_request_index,
+            runtime_context_insert_index=mapped_runtime_index,
+            protected_turn_start_index=2,
+            ephemeral_only=True,
+            runtime_compaction_config=config,
+        )
+
+    async def _recover_live_turn_message_count_limit(
+        self,
+        messages: list[Message],
+        *,
+        request_suffix_messages: list[Message],
+        target_wire_messages: int,
+        config: ChatConfig,
+        request_context_message: Message | None,
+        request_context_insert_index: int,
+        runtime_context_message: Message,
+        runtime_context_insert_index: int,
+        protected_turn_start_index: int,
+    ) -> tuple[_MessageCountRecoveryOutcome | None, str]:
+        """Project completed live rounds when durable count recovery cannot fit.
+
+        The canonical turn remains untouched.  The shared live-turn projector
+        preserves the active user plus its recent, error, and unresolved tool
+        rounds as raw ``Message`` objects; this adapter only re-runs the exact
+        provider wire-count proof for the resulting request view.
+        """
+
+        try:
+            outcome = await self._recover_live_turn_request_overflow(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                context_window_tokens=self.config.context_window_tokens,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - refusal is surfaced as a stable reason
+            outcome = None
+        if outcome is None or not outcome.ephemeral_only or not outcome.summary:
+            outcome = self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                config=config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target_wire_messages,
+            )
+        if outcome is None:
+            return None, "no_safe_cut_or_live_turn_boundary"
+
+        mapped_request_index = (
+            outcome.request_context_insert_index
+            if outcome.request_context_insert_index is not None
+            else request_context_insert_index
+        )
+        mapped_runtime_index = (
+            outcome.runtime_context_insert_index
+            if outcome.runtime_context_insert_index is not None
+            else runtime_context_insert_index
+        )
+        verified = self._project_provider_request_message_count(
+            [*outcome.messages, *request_suffix_messages],
+            config=config,
+            request_context_message=request_context_message,
+            request_context_insert_index=mapped_request_index,
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=mapped_runtime_index,
+        )
+        if verified is None:
+            return None, "projection_unavailable_after_live_turn_summary"
+        if verified.actual_wire_messages > target_wire_messages:
+            window = self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                config=config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target_wire_messages,
+                compaction_config=outcome.runtime_compaction_config,
+                reason="summary_above_message_target",
+            )
+            if window is None:
+                return None, "projection_above_target_after_live_turn_summary"
+            outcome = window
+            mapped_request_index = int(outcome.request_context_insert_index or 0)
+            mapped_runtime_index = int(outcome.runtime_context_insert_index or 0)
+            verified = self._project_provider_request_message_count(
+                [*outcome.messages, *request_suffix_messages],
+                config=config,
+                request_context_message=request_context_message,
+                request_context_insert_index=mapped_request_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=mapped_runtime_index,
+            )
+            if verified is None or verified.actual_wire_messages > target_wire_messages:
+                return None, "projection_above_target_after_window"
+
+        return (
+            _MessageCountRecoveryOutcome(
+                messages=outcome.messages,
+                request_context_insert_index=mapped_request_index,
+                runtime_context_insert_index=mapped_runtime_index,
+                protected_turn_start_index=(
+                    outcome.protected_turn_start_index
+                    if outcome.protected_turn_start_index is not None
+                    else protected_turn_start_index
+                ),
+                projected_wire_messages=verified.actual_wire_messages,
+                removed_count=outcome.removed_count,
+            ),
+            "recovered_live_turn",
+        )
 
     async def _recover_provider_message_count_limit(
         self,
@@ -13773,12 +14713,10 @@ class Agent:
         request_suffix_messages: list[Message],
         proof: ProviderMessageLimitProof,
         config: ChatConfig,
-        identical_request_perturbed: bool,
         request_context_message: Message | None,
         request_context_insert_index: int,
         runtime_context_message: Message,
         runtime_context_insert_index: int,
-        turn_objective_message: Message | None,
         protected_turn_start_index: int,
     ) -> tuple[_MessageCountRecoveryOutcome | None, str]:
         """Find one safe prefix cut, summarize it once, then re-project.
@@ -13796,17 +14734,28 @@ class Agent:
         projected_current = self._project_provider_request_message_count(
             [*messages, *request_suffix_messages],
             config=config,
-            identical_request_perturbed=identical_request_perturbed,
             request_context_message=request_context_message,
             request_context_insert_index=request_context_insert_index,
             runtime_context_message=runtime_context_message,
             runtime_context_insert_index=runtime_context_insert_index,
-            turn_objective_message=turn_objective_message,
         )
         if projected_current is None:
             return None, "projection_unavailable"
         if projected_current.actual_wire_messages <= limit:
             return None, "local_wire_count_not_over_limit"
+
+        if self._compaction_failed_this_turn:
+            return await self._recover_live_turn_message_count_limit(
+                messages,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target,
+                config=config,
+                request_context_message=request_context_message,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=runtime_context_insert_index,
+                protected_turn_start_index=protected_turn_start_index,
+            )
 
         placeholder_summary = Message(
             role="user",
@@ -13837,12 +14786,10 @@ class Agent:
             projection = self._project_provider_request_message_count(
                 [*candidate, *request_suffix_messages],
                 config=config,
-                identical_request_perturbed=identical_request_perturbed,
                 request_context_message=request_context_message,
                 request_context_insert_index=request_idx,
                 runtime_context_message=runtime_context_message,
                 runtime_context_insert_index=runtime_idx,
-                turn_objective_message=turn_objective_message,
             )
             if projection is None:
                 return None, "projection_unavailable"
@@ -13854,9 +14801,24 @@ class Agent:
                 break
 
         if selected_cut is None or selected_projection is None:
-            return None, "no_safe_cut"
+            return await self._recover_live_turn_message_count_limit(
+                messages,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target,
+                config=config,
+                request_context_message=request_context_message,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=runtime_context_insert_index,
+                protected_turn_start_index=protected_start,
+            )
 
         compaction_config = self._build_compaction_config()
+        self._compaction_failed_this_turn = True
+        arm_compaction_deadline(
+            compaction_config,
+            operation_id=new_compaction_id(),
+        )
         protected_tail_count = len(messages) - protected_start
         compaction_config.protected_recent_messages = max(
             int(compaction_config.protected_recent_messages or 0),
@@ -13878,21 +14840,67 @@ class Agent:
         )
         try:
             result = await compact_context(request)
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable terminal state
-            return None, "summary_failed"
+            result = CompactionResult(
+                summary="", kept_entries=request.entries, removed_count=0,
+                chunks_processed=0, skip_reason="summary_failed",
+            )
+        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+            self._compaction_failed_this_turn = False
+        replacement_applied = bool(
+            result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
+        )
+        # Quality/coverage rejection returns the candidate payload for
+        # diagnostics, but it is not installed state. Replaying that payload
+        # while retaining the full raw history would make the request larger.
+        replay_summary = compaction_replay_summary(result) if replacement_applied else ""
         kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
+            getattr(result, "kept_start_index", result.removed_count) or result.removed_count
         )
         if (
             result.removed_count != selected_cut
             or kept_start_index != selected_cut
-            or not result.summary
+            or not replay_summary
         ):
-            return None, str(result.skip_reason or "summary_failed")
+            window = self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=protected_start,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                config=config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target,
+                reason=str(getattr(result, "skip_reason", None) or "summary_failed"),
+                compaction_config=compaction_config,
+            )
+            if window is not None:
+                request_idx = int(window.request_context_insert_index or 0)
+                runtime_idx = int(window.runtime_context_insert_index or 0)
+                window_projection = self._project_provider_request_message_count(
+                    [*window.messages, *request_suffix_messages],
+                    config=config,
+                    request_context_message=request_context_message,
+                    request_context_insert_index=request_idx,
+                    runtime_context_message=runtime_context_message,
+                    runtime_context_insert_index=runtime_idx,
+                )
+                if window_projection is not None:
+                    return _MessageCountRecoveryOutcome(
+                        messages=window.messages,
+                        request_context_insert_index=request_idx,
+                        runtime_context_insert_index=runtime_idx,
+                        protected_turn_start_index=int(window.protected_turn_start_index or 0),
+                        projected_wire_messages=window_projection.actual_wire_messages,
+                        removed_count=window.removed_count,
+                    ), "recovered_window"
+            return None, str(getattr(result, "skip_reason", None) or "summary_failed")
 
         compacted = [
-            Message(role="user", content=f"[Context summary]\n{result.summary}"),
+            Message(role="user", content=f"[Context summary]\n{replay_summary}"),
             summary_ack,
             *messages[selected_cut:],
         ]
@@ -13910,18 +14918,17 @@ class Agent:
         verified = self._project_provider_request_message_count(
             [*compacted, *request_suffix_messages],
             config=config,
-            identical_request_perturbed=identical_request_perturbed,
             request_context_message=request_context_message,
             request_context_insert_index=selected_request_idx,
             runtime_context_message=runtime_context_message,
             runtime_context_insert_index=selected_runtime_idx,
-            turn_objective_message=turn_objective_message,
         )
         if verified is None:
             return None, "projection_unavailable_after_summary"
         if verified.actual_wire_messages > target:
             return None, "projection_above_target_after_summary"
 
+        self._compaction_failed_this_turn = False
         return (
             _MessageCountRecoveryOutcome(
                 messages=compacted,
@@ -13935,6 +14942,8 @@ class Agent:
         )
 
     def _apply_provider_tool_result_overrides(self, messages: list[Message]) -> list[Message]:
+        if not self._tool_result_recovery_available():
+            return messages
         if (
             not self._provider_tool_result_overrides
             and not self._provider_tool_result_frozen_overrides
@@ -13961,11 +14970,7 @@ class Agent:
                 blocks.append(block)
             if message_changed:
                 projected.append(
-                    Message(
-                        role=message.role,
-                        content=blocks,
-                        reasoning_content=message.reasoning_content,
-                    )
+                    message.model_copy(update={"content": blocks})
                 )
                 changed = True
             else:
@@ -13977,6 +14982,37 @@ class Agent:
         return len(after) < len(before) or session_payload_chars(after) < session_payload_chars(
             before
         )
+
+    def _active_execution_identity(self) -> ExecutionIdentity | None:
+        identity = self.config.execution_identity
+        if identity is None or identity.kind == "multi_model_fusion":
+            return identity
+        metadata = provider_metadata(self.provider)
+        resolver = getattr(self.provider, "active_deployment_config", None)
+        deployment = resolver() if callable(resolver) else metadata
+        return replace(
+            identity,
+            provider=str(
+                getattr(deployment, "provider", "")
+                or metadata.provider_id or identity.provider or metadata.provider_name
+            ),
+            model=str(getattr(deployment, "model", "") or identity.model),
+        )
+
+    def _execution_status_snapshot(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        identity = self.config.execution_identity
+        if identity is not None:
+            selection = {"kind": identity.kind}
+            if identity.kind == "single_model":
+                for name in ("provider", "model"):
+                    value = getattr(identity, name)
+                    if value:
+                        selection[name] = value
+            result["selection"] = selection
+        if self._current_request_execution:
+            result["current_request"] = dict(self._current_request_execution)
+        return result
 
     def _runtime_context_block(self) -> str:
         now = datetime.now().astimezone()
@@ -13991,9 +15027,10 @@ class Agent:
         ]
         return "\n".join(lines)
 
-    @staticmethod
-    def _runtime_context_message(runtime_context: str) -> Message:
-        return Message(role="user", content=runtime_context)
+    def _runtime_context_message(self, runtime_context: str) -> Message:
+        return with_execution_identity(
+            Message(role="user", content=runtime_context), self._active_execution_identity(),
+        )
 
     @staticmethod
     def _request_context_message(request_context: str | None) -> Message | None:
@@ -14007,27 +15044,6 @@ class Agent:
         ]
         return Message(role="user", content="\n".join(lines))
 
-    @staticmethod
-    def _turn_objective_message(
-        turn_objective: str | None,
-        *,
-        enabled: bool = True,
-        max_chars: int = _TURN_OBJECTIVE_REMINDER_MAX_CHARS,
-    ) -> Message | None:
-        if not enabled:
-            return None
-        if not turn_objective or not turn_objective.strip():
-            return None
-        objective = turn_objective.strip()
-        if len(objective) > max_chars:
-            objective = objective[:max_chars].rstrip() + "..."
-        lines = [
-            "[Current user request reminder]",
-            "This is the active user request for this same turn, not a new request.",
-            "Continue using the tool results above to make progress on:",
-            objective,
-        ]
-        return Message(role="user", content="\n".join(lines))
 
     @staticmethod
     def _with_request_context_messages(
@@ -14036,8 +15052,6 @@ class Agent:
         request_context_insert_index: int,
         runtime_context_message: Message,
         runtime_context_insert_index: int,
-        *,
-        turn_objective_message: Message | None = None,
     ) -> list[Message]:
         result = list(messages)
         runtime_idx = max(0, min(runtime_context_insert_index, len(result)))
@@ -14054,12 +15068,6 @@ class Agent:
             )
         else:
             result.insert(runtime_idx, runtime_context_message)
-        if (
-            turn_objective_message is not None
-            and _message_has_tool_result(result[-1] if result else None)
-            and not Agent._has_provider_context_marker_replay(result)
-        ):
-            result.append(turn_objective_message)
         return result
 
     @staticmethod
@@ -14068,10 +15076,9 @@ class Agent:
             if not isinstance(message.content, list):
                 continue
             for block in message.content:
-                if (
-                    isinstance(block, ContentBlockToolUse)
-                    and Agent._has_provider_context_replay_marker(block.input)
-                ):
+                if isinstance(
+                    block, ContentBlockToolUse
+                ) and Agent._has_provider_context_replay_marker(block.input):
                     return True
         return False
 
@@ -14084,19 +15091,23 @@ class Agent:
         if not isinstance(runtime_content, str):
             return runtime_context_message
         if isinstance(message.content, str):
-            return Message(
-                role=message.role,
-                content=f"{message.content}\n\n{runtime_content}",
-                reasoning_content=message.reasoning_content,
+            prefix = message.content + "\n\n"
+            span = runtime_context_message.execution_identity_span
+            return with_execution_span(
+                message,
+                (len(prefix) + span[0], len(prefix) + span[1]) if span is not None else None,
+                content=prefix + runtime_content,
             )
         if isinstance(message.content, list):
-            return Message(
-                role=message.role,
-                content=[
+            span = runtime_context_message.execution_identity_span
+            return message.model_copy(
+                update={"content": [
                     *message.content,
-                    ContentBlockText(text=f"\n\n{runtime_content}"),
-                ],
-                reasoning_content=message.reasoning_content,
+                    with_execution_span(
+                        ContentBlockText(text=f"\n\n{runtime_content}"),
+                        (span[0] + 2, span[1] + 2) if span is not None else None,
+                    ),
+                ]},
             )
         return runtime_context_message
 
@@ -14138,49 +15149,107 @@ class Agent:
         return payload.get("status") == "yielded"
 
     @staticmethod
-    def _terminal_artifact_delivery_artifacts(
+    def _is_not_executed_after_dispatch_boundary(result: ToolResult) -> bool:
+        """Return whether an error-shaped result represents an undispatched tail."""
+
+        if not result.is_error:
+            return False
+        try:
+            payload = json.loads(result.content)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(payload, Mapping)
+            and payload.get("status") == "not_executed"
+            and payload.get("reason") == "prior_tool_dispatch_boundary"
+        )
+
+    @staticmethod
+    def _accepted_goal_terminal_status(
+        tool_calls: list[ToolCall],
         results: list[ToolResult],
-    ) -> list[dict[str, Any]]:
-        artifacts: list[dict[str, Any]] = []
-        for result in results:
-            if result.tool_name != "publish_artifact" or result.is_error:
+    ) -> str | None:
+        """Return the durably accepted Goal terminal status from one tool batch."""
+
+        for tool_call, result in zip(tool_calls, results, strict=False):
+            if (
+                tool_call.tool_name != "update_goal"
+                or result.tool_name != "update_goal"
+                or result.is_error
+            ):
                 continue
-            if result.artifacts:
-                artifacts.extend(result.artifacts)
+            requested_status = str(tool_call.arguments.get("status") or "").strip().lower()
+            if requested_status not in {"complete", "blocked"}:
                 continue
             try:
                 payload = json.loads(result.content)
-            except (TypeError, json.JSONDecodeError):
+            except (TypeError, ValueError):
                 continue
-            if not isinstance(payload, dict):
+            if not isinstance(payload, Mapping) or payload.get("status") != "accepted":
                 continue
-            if payload.get("status") not in {"published", "already_published"}:
+            goal = payload.get("goal")
+            if not isinstance(goal, Mapping):
                 continue
-            artifact = payload.get("artifact")
-            artifacts.append(artifact if isinstance(artifact, dict) else {})
-        return artifacts
-
-    @staticmethod
-    def _artifact_delivery_final_response_text(
-        artifacts: list[dict[str, Any]],
-    ) -> str:
-        names = [
-            str(item.get("name") or item.get("filename") or "").strip()
-            for item in artifacts
-            if isinstance(item, dict)
-        ]
-        named = [name for name in names if name]
-        if named:
-            return "The generated file is ready: " + ", ".join(named) + "."
-        return "The generated file is ready."
+            persisted_status = str(goal.get("status") or "").strip().lower()
+            if persisted_status == requested_status:
+                return requested_status
+        return None
 
     def _build_compaction_config(self) -> CompactionConfig:
+        compaction_plan = self.config.compaction_execution_plan
+        plan_factory = self.config.compaction_execution_plan_factory
+        provider_for_compaction: Any | None = self.provider
+        if plan_factory is not None:
+            # A factory exists specifically because credentials and selector
+            # state must be rebound for each logical compaction operation.
+            # Never fall back to the previously frozen provider objects when
+            # refresh fails or produces no executable deployment.
+            compaction_plan = None
+            try:
+                compaction_plan = plan_factory()
+            except Exception as exc:  # noqa: BLE001 - fail closed to deterministic
+                logger.warning(
+                    "compaction.execution_plan_refresh_failed",
+                    error=type(exc).__name__,
+                )
+            if compaction_plan is None:
+                provider_for_compaction = None
         config = build_compaction_config_from_provider(
-            self.provider,
+            provider_for_compaction,
             default_model=self.config.model_id,
+            compaction_plan=compaction_plan,
+            context_window_tokens=self.config.context_window_tokens,
         )
         config.compaction_profile = self.config.compaction_profile
+        config.request_context = self.build_compaction_request_context()
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
+        config.total_timeout_seconds = self.config.compaction_total_timeout_seconds
+        config.heartbeat_interval_seconds = self.config.compaction_heartbeat_interval_seconds
+        tool_context = self._tool_context or current_tool_context.get()
+        if tool_context is not None:
+            gateway_config = tool_context.sandbox_gateway_config
+            if (
+                tool_context.workspace_dir
+                and tool_context.artifact_media_root
+                and tool_context.artifact_session_id
+                and getattr(
+                    getattr(gateway_config, "attachments", None), "persist_transcripts", True
+                ) is not False
+            ):
+                from opensquilla.tools.write_policy import attachment_workspace_write_authorizer
+
+                materializer = AttachmentWorkspaceMaterializer(
+                    media_root=Path(tool_context.artifact_media_root),
+                    workspace_dir=tool_context.workspace_dir,
+                    disk_budget_bytes=workspace_attachment_budget_from_config(gateway_config),
+                    authorize_write=attachment_workspace_write_authorizer(tool_context),
+                )
+                session_id = tool_context.artifact_session_id
+                config.attachment_path_resolver = (
+                    lambda attachment, _session_id: materializer.materialize_image_path(
+                        attachment, session_id
+                    )
+                )
         return config
 
     @staticmethod
@@ -14214,7 +15283,32 @@ class Agent:
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> int:
-        """Estimate the current provider request size without lifetime usage."""
+        """Estimate text and native media without counting encoded pixels as prose."""
+
+        return max(1, int(self._project_live_request_budget(
+            messages, tools=tools, config=config,
+        )["estimated_tokens"]))
+
+    def _estimate_live_request_chars(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> int:
+        """Return the same media-aware character budget used by wire admission."""
+
+        return int(self._project_live_request_budget(
+            messages, tools=tools, config=config,
+        )["estimated_chars"])
+
+    def _project_live_request_budget(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig | None,
+    ) -> dict[str, Any]:
 
         payload: dict[str, Any] = {
             "messages": [self._live_request_jsonable(message) for message in messages],
@@ -14231,8 +15325,9 @@ class Agent:
             )
             payload.update(config_payload)
 
-        estimated_chars = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
-        return max(1, estimated_chars // 4)
+        return project_provider_payload(
+            payload, projection_adapter="live_request", proof_budget=0,
+        )
 
     async def _check_context_overflow(
         self,
@@ -14243,16 +15338,31 @@ class Agent:
         runtime_context_insert_index: int | None = None,
         protected_turn_start_index: int | None = None,
         compaction_window_tokens: int | None = None,
+        request_window_tokens: int | None = None,
+        request_window_chars: int | None = None,
+        estimated_context_chars: int | None = None,
+        durable_consumer_overflow_proven: bool | None = None,
+        provider_overflow: bool = False,
     ) -> CompactionOutcome | None:
         """Check if estimated live context tokens exceed the overflow threshold.
 
-        Uses sub-agent flush instead of prompt injection.
-        The flush is re-entrant: it can trigger on every approach to threshold.
+        Preserve canonical history while selecting a provider-compatible request view.
         """
         self._last_compaction_refusal_reason = None
         window_tokens = compaction_window_tokens or self.config.context_window_tokens
-        threshold = self.config.context_overflow_threshold * window_tokens
-        if estimated_context_tokens <= threshold:
+        pressure_window_tokens = request_window_tokens or window_tokens
+        threshold = self.config.context_overflow_threshold * pressure_window_tokens
+        char_threshold = (
+            self.config.context_overflow_threshold * request_window_chars
+            if request_window_chars is not None
+            else None
+        )
+        within_character_budget = bool(
+            char_threshold is None
+            or estimated_context_chars is None
+            or estimated_context_chars <= char_threshold
+        )
+        if estimated_context_tokens <= threshold and within_character_budget:
             return CompactionOutcome(
                 messages=messages,
                 request_context_insert_index=request_context_insert_index,
@@ -14260,188 +15370,189 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
-        compaction_id = new_compaction_id()
-        # --- Pre-compaction flush; inline compaction can continue on degraded flush. ---
-        flush_task: asyncio.Task | None = None
-        self._consume_completed_flush_task()
+        recovery_config: CompactionConfig | None = None
 
-        async def _await_flush_task() -> Any | None:
-            # Give flush a grace period to complete instead of cancelling immediately.
-            # Adds up to flush_timeout_seconds (default 15s) of latency, but without
-            # this the flush is effectively dead code (always cancelled before finishing).
-            if flush_task is not None and not flush_task.done():
-                if flush_task is self._flush_wait_timed_out_task:
-                    return None
-                try:
-                    receipt = await asyncio.wait_for(
-                        asyncio.shield(flush_task),
-                        timeout=self.config.flush_timeout_seconds,
-                    )
-                    logger.info("memory_flush.completed_after_compaction")
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return receipt
-                except TimeoutError:
-                    self._flush_wait_timed_out_task = flush_task
-                    next_retry_seconds = self._record_flush_timeout_backoff()
-                    logger.warning(
-                        "memory_flush.timed_out",
-                        timeout_seconds=self.config.flush_timeout_seconds,
-                        next_retry_seconds=next_retry_seconds,
-                    )
-                except Exception as exc:
-                    logger.warning("memory_flush.await_failed", error=str(exc))
-                    self._mark_flush_task_completed(flush_task)
-                    return None
-            if flush_task is not None and flush_task.done():
-                try:
-                    receipt = flush_task.result()
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return receipt
-                except Exception as exc:
-                    logger.warning("memory_flush.await_failed", error=str(exc))
-                    self._flush_wait_timed_out_task = None
-                    self._mark_flush_task_completed(flush_task)
-                    return None
-            return None
-
-        pre_compaction_flush_enabled = flush_trigger_enabled(
-            self.config,
-            "pre_compaction",
-        )
-
-        if not self._flush_done_this_cycle and pre_compaction_flush_enabled:
-            try:
-                from opensquilla.memory.flush import (
-                    resolve_flush_plan,
-                    should_flush,
-                )
-
-                now = time.monotonic()
-                if self._active_flush_task is not None and not self._active_flush_task.done():
-                    logger.debug("memory_flush.skipped", reason="already_running")
-                    flush_task = self._active_flush_task
-                elif now < self._flush_backoff_until:
-                    logger.warning(
-                        "memory_flush.skipped",
-                        reason="backoff",
-                        retry_after_seconds=round(self._flush_backoff_until - now, 3),
-                    )
-                else:
-                    transcript_bytes = sum(
-                        len(m.content.encode("utf-8")) if isinstance(m.content, str) else 0
-                        for m in messages
-                    )
-
-                    if should_flush(
-                        total_tokens=estimated_context_tokens,
-                        threshold_tokens=int(threshold),
-                        transcript_bytes=transcript_bytes,
-                    ):
-                        plan = resolve_flush_plan(
-                            workspace_dir=self.config.flush_workspace_dir,
-                            archive_max_bytes=self.config.flush_archive_max_bytes,
-                        )
-                        logger.info(
-                            "memory_flush.triggered",
-                            path=plan.relative_path,
-                            total_tokens=estimated_context_tokens,
-                            threshold=int(threshold),
-                        )
-                        flush_task = asyncio.create_task(self._run_flush(plan, list(messages)))
-                        flush_task.add_done_callback(self._on_flush_task_done)
-                        self._active_flush_task = flush_task
-                        self._flush_done_this_cycle = True
-            except Exception:
-                logger.debug("memory_flush.skipped", reason="flush module unavailable")
-
-        if pre_compaction_flush_enabled:
-            if (
-                flush_task is not None
-                and not flush_task.done()
-                and time.monotonic() < self._flush_backoff_until
-            ):
-                logger.warning(
-                    "memory_flush.skipped",
-                    reason="backoff",
-                    retry_after_seconds=round(self._flush_backoff_until - time.monotonic(), 3),
-                )
-                self._flush_done_this_cycle = False
-            receipt = await _await_flush_task()
-            if not flush_receipt_allows_destructive_compaction(receipt):
-                reason = "memory_flush_degraded_before_compaction"
-                if flush_task is not None and self._flush_wait_timed_out_task is flush_task:
-                    reason = "memory_flush_timeout_before_compaction"
-                logger.warning(
-                    "memory_flush.degraded_before_compaction",
-                    reason=reason,
-                    mode=getattr(receipt, "mode", None),
-                    integrity_status=getattr(receipt, "integrity_status", None),
-                    indexed_chunk_count=getattr(receipt, "indexed_chunk_count", None),
-                )
-                self._flush_done_this_cycle = False
-                if pre_compaction_flush_requires_safe_receipt(self.config):
-                    self._last_compaction_refusal_reason = reason
-                    if self._session_key:
-                        notify_compaction(
-                            self._session_key,
-                            source="automatic",
-                            phase="agent_inline_overflow",
-                            status="skipped",
-                            reason=reason,
-                            tokens_before=estimated_context_tokens,
-                            context_window_tokens=window_tokens,
-                            **compaction_effect_payload(
-                                status="skipped",
-                                reason=reason,
-                            ),
-                            **compaction_lifecycle_payload(
-                                compaction_id,
-                                COMPACTION_TRIGGERED_EVENT,
-                            ),
-                        )
-                    return None
-
-        # --- Compaction ---
-        # Flatten each message for the compaction LLM's *input* text, but size
-        # the budget/skip/cut decisions on the ORIGINAL structured content.
-        # _flatten_content_blocks clips tool results to 200 chars, so sizing on
-        # the flattened view made a tool-heavy (overflowing) context look tiny,
-        # so compaction always skipped and the CONTEXT_OVERFLOW retry died with
-        # compaction_not_smaller. Attaching a real token_count makes the
-        # compactor's estimator (which prefers a persisted token_count) measure
-        # the true replay size.
-        entries = []
-        for m in messages:
-            if isinstance(m.content, str):
-                flat = m.content
-                real_tokens = get_approx_tokens(m.content)
-            else:
-                flat = _flatten_content_blocks(m.content)
-                real_tokens = get_approx_tokens(
-                    json.dumps(Agent._live_request_jsonable(m.content))
-                )
-            entries.append(
-                {
-                    "role": m.role,
-                    "content": flat,
-                    "token_count": real_tokens,
-                }
+        def _local_after_failure(reason: str) -> CompactionOutcome | None:
+            active_index = _active_user_message_index_for_request(
+                messages,
+                current_user_text=getattr(self, "_current_turn_message", "") or "",
             )
+            boundary = (
+                protected_turn_start_index
+                if protected_turn_start_index is not None else active_index
+            )
+            if boundary is None:
+                return None
+            outcome = self._recover_local_request_window(
+                messages,
+                protected_turn_start_index=boundary,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+                input_budget_tokens=pressure_window_tokens,
+                input_budget_chars=request_window_chars,
+                allow_unchanged=not provider_overflow and not (
+                    request_scoped_only or routed_window_is_narrower
+                ),
+                compaction_config=recovery_config,
+                reason=reason,
+            )
+            if (
+                outcome is not None and not outcome.compacted
+                and recovery_config is not None and self._session_key
+            ):
+                notify_compaction(
+                    self._session_key, source="automatic", phase="agent_inline_overflow",
+                    status="skipped", reason=reason,
+                    **compaction_effect_payload(status="skipped", reason=reason),
+                    **compaction_lifecycle_payload(
+                        recovery_config.operation_id or new_compaction_id(),
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return outcome
 
-        request = CompactionRequest(
-            session_id="agent-turn",
-            entries=entries,
-            context_window_tokens=window_tokens,
-            config=self._build_compaction_config(),
-            provider_request_correlation=derive_provider_request_correlation(
-                self._provider_request_correlation,
-                execution_id=uuid.uuid4().hex,
-                call_kind="auxiliary.compaction",
-            ),
+        durable_window_tokens = max(
+            1,
+            int(self._durable_consumer_window_tokens or 0),
         )
+        request_scoped_only = durable_consumer_overflow_proven is False
+        routed_window_is_narrower = (
+            durable_window_tokens > window_tokens and durable_consumer_overflow_proven is not True
+        )
+        if self._compaction_failed_this_turn:
+            return _local_after_failure("already_attempted_this_turn")
+        if request_scoped_only or routed_window_is_narrower:
+            # A temporary route/member window is request scope. Preflight has
+            # already admitted durable history against the stable session
+            # consumer, so rewriting that history to satisfy a deployment-only
+            # physical budget would permanently over-compact the session.
+            if (
+                protected_turn_start_index is not None
+                and self._live_turn_compaction_boundary(
+                    messages,
+                    protected_turn_start_index=protected_turn_start_index,
+                )
+                is not None
+            ):
+                try:
+                    ephemeral = await self._recover_live_turn_request_overflow(
+                        messages,
+                        protected_turn_start_index=protected_turn_start_index,
+                        context_window_tokens=pressure_window_tokens,
+                        context_window_chars=request_window_chars,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - refusal remains bounded
+                    logger.warning(
+                        "compaction.routed_live_turn_projection_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    ephemeral = None
+                if ephemeral is not None:
+                    return ephemeral
+            self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+            logger.warning(
+                "compaction.durable_rewrite_refused_for_routed_window",
+                routed_context_window_tokens=window_tokens,
+                durable_context_window_tokens=durable_window_tokens,
+                durable_consumer_overflow_proven=(durable_consumer_overflow_proven),
+                protected_turn_start_index=protected_turn_start_index,
+            )
+            return _local_after_failure("provider_request_budget_exhausted")
 
+        if protected_turn_start_index is not None:
+            protected_tail_start = max(
+                0,
+                min(protected_turn_start_index, len(messages)),
+            )
+            protected_tail_tokens = sum(
+                int(entry["token_count"])
+                for entry in self._message_count_compaction_entries(messages[protected_tail_start:])
+            )
+            protected_tail_chars = self._estimate_live_request_chars(
+                messages[protected_tail_start:],
+            )
+            protected_tail_over_character_budget = bool(
+                char_threshold is not None and protected_tail_chars > char_threshold
+            )
+            if protected_tail_tokens > threshold or protected_tail_over_character_budget:
+                try:
+                    ephemeral = await self._recover_live_turn_request_overflow(
+                        messages,
+                        protected_turn_start_index=protected_tail_start,
+                        context_window_tokens=pressure_window_tokens,
+                        context_window_chars=request_window_chars,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - refusal remains bounded
+                    logger.warning(
+                        "compaction.live_turn_projection_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    ephemeral = None
+                if ephemeral is not None:
+                    return ephemeral
+                self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
+                logger.warning(
+                    "compaction.protected_tail_too_large",
+                    protected_tail_tokens=protected_tail_tokens,
+                    protected_tail_chars=protected_tail_chars,
+                    threshold_tokens=int(threshold),
+                    threshold_chars=(int(char_threshold) if char_threshold is not None else None),
+                    context_window_tokens=pressure_window_tokens,
+                    protected_message_count=len(messages) - protected_tail_start,
+                )
+                return _local_after_failure("provider_recent_tail_too_large")
+
+        history_window_tokens = window_tokens
+        history_window_chars: int | None = None
+        if durable_consumer_overflow_proven is True and (
+            request_window_tokens is not None or request_window_chars is not None
+        ):
+            # The core compacts history, whereas the overflow proof includes
+            # the complete request. Reserve the stable consumer's fixed
+            # envelope and generation budget before selecting its history.
+            # A routed member's smaller request cap must not rewrite durable
+            # history. The active user/tool tail already belongs to entries.
+            history_window_tokens, history_window_chars = self.preflight_history_capacity(
+                active_user_message="",
+                active_user_in_history=False,
+                context_window_tokens=self._durable_consumer_window_tokens,
+                consumer_provider=self._durable_consumer_provider,
+                consumer_max_output_tokens=self._durable_consumer_max_output_tokens,
+                consumer_model_id=self._durable_consumer_model_id,
+                consumer_model_capabilities=self._durable_consumer_model_capabilities,
+                consumer_provider_request_max_chars=(
+                    self._durable_consumer_provider_request_max_chars
+                ),
+            )
+            if history_window_tokens <= 0 or history_window_chars <= 0:
+                self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+                return _local_after_failure("provider_request_budget_exhausted")
+
+        protected_start: int | None = None
+        compaction_id = new_compaction_id()
+        compaction_config = self._build_compaction_config()
+        recovery_config = compaction_config
+        self._compaction_failed_this_turn = True
+        if protected_turn_start_index is not None:
+            protected_start = max(
+                0,
+                min(protected_turn_start_index, len(messages)),
+            )
+            compaction_config.protected_recent_messages = max(
+                int(compaction_config.protected_recent_messages or 0),
+                len(messages) - protected_start,
+            )
+        arm_compaction_deadline(compaction_config, operation_id=compaction_id)
         if self._session_key:
             notify_compaction(
                 self._session_key,
@@ -14450,15 +15561,75 @@ class Agent:
                 status="started",
                 tokens_before=estimated_context_tokens,
                 context_window_tokens=window_tokens,
+                request_capacity_tokens=pressure_window_tokens,
+                request_capacity_chars=request_window_chars,
+                request_tokens=estimated_context_tokens,
+                request_chars=estimated_context_chars,
+                threshold=threshold,
+                char_threshold=char_threshold,
+                ratio=self.config.context_overflow_threshold,
+                heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
                 **compaction_effect_payload(status="started"),
                 **compaction_lifecycle_payload(
                     compaction_id,
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
+        # --- Compaction ---
+        # Summaries consume flattened text; retention and cut decisions use
+        # the original structured message's text and native-media estimate.
+        entries = self._message_count_compaction_entries(messages)
+
+        request = CompactionRequest(
+            session_id="agent-turn",
+            entries=entries,
+            context_window_tokens=history_window_tokens,
+            context_window_chars=history_window_chars,
+            config=compaction_config,
+            provider_request_correlation=derive_provider_request_correlation(
+                self._provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.compaction",
+            ),
+        )
 
         try:
             result = await compact_context(request)
+        except asyncio.CancelledError:
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="cancelled",
+                    reason="cancelled",
+                    tokens_before=estimated_context_tokens,
+                    context_window_tokens=window_tokens,
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise
+        except CompactionTimeoutError as exc:
+            self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason=self._last_compaction_refusal_reason,
+                    tokens_before=estimated_context_tokens,
+                    context_window_tokens=window_tokens,
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return _local_after_failure("compaction_deadline_exceeded")
         except Exception as exc:  # noqa: BLE001
             self._last_compaction_refusal_reason = "compaction_failed"
             if self._session_key:
@@ -14477,9 +15648,33 @@ class Agent:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-            return None  # signal failure
+            return _local_after_failure("compaction_failed")
 
-        if self._session_key and result.removed_count > 0 and result.summary:
+        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+            self._compaction_failed_this_turn = False
+        replacement_applied = bool(
+            result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
+        )
+        # Quality/coverage rejection returns the candidate payload for
+        # diagnostics, but it is not installed state. Replaying that payload
+        # while retaining the full raw history would make the request larger.
+        replay_summary = compaction_replay_summary(result) if replacement_applied else ""
+        kept_start_index = int(
+            getattr(result, "kept_start_index", result.removed_count) or result.removed_count
+        )
+        if protected_start is not None and (
+            int(result.removed_count) > protected_start or kept_start_index > protected_start
+        ):
+            logger.warning(
+                "compaction.protected_tail_change_rejected",
+                removed_count=result.removed_count,
+                kept_start_index=kept_start_index,
+                protected_turn_start_index=protected_start,
+            )
+            self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
+            return None
+
+        if self._session_key and result.removed_count > 0 and replay_summary:
             for event in (
                 COMPACTION_CHUNK_SUMMARIZED_EVENT,
                 COMPACTION_SUMMARY_VERIFIED_EVENT,
@@ -14504,7 +15699,7 @@ class Agent:
         # Removing history without a replacement summary is equivalent to
         # bare truncation; reject it so the caller takes the existing
         # compaction failure path instead of silently dropping context.
-        if result.removed_count > 0 and not result.summary:
+        if result.removed_count > 0 and not replay_summary:
             logger.warning(
                 "compaction.empty_summary_rejected",
                 removed_count=result.removed_count,
@@ -14528,17 +15723,42 @@ class Agent:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-            return None
+            return _local_after_failure("empty_summary_rejected")
 
         # A skip (nothing removed, no summary) is a no-op regardless of whether
         # the in-memory history is structured or string-only. Reporting it as
         # compacted=True (the old behavior for string-only history) emits a
         # spurious CompactionEvent that rewrites the durable transcript and
         # corrupts row metadata, so short-circuit every no-op skip here.
-        if result.removed_count == 0 and not result.summary:
+        if not replacement_applied:
+            failure_reason = str(getattr(result, "skip_reason", None) or "summary_failed")
+            local = _local_after_failure(failure_reason)
+            if local is not None:
+                return local
+            if (
+                durable_consumer_overflow_proven is not None
+                or request_window_tokens is not None
+                or self._last_compaction_refusal_reason in {
+                    "provider_system_prompt_too_large",
+                    "provider_tool_schema_too_large",
+                    "provider_protected_context_too_large",
+                }
+            ):
+                if self._last_compaction_refusal_reason is None:
+                    self._last_compaction_refusal_reason = failure_reason
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key, source="automatic", phase="agent_inline_overflow",
+                        status="failed", reason=self._last_compaction_refusal_reason,
+                        **compaction_effect_payload(
+                            status="failed", reason=self._last_compaction_refusal_reason,
+                        ),
+                        **compaction_lifecycle_payload(
+                            compaction_id, COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                return None
             has_structured_content = any(not isinstance(m.content, str) for m in messages)
-            await _await_flush_task()
-            self._flush_done_this_cycle = False
             skip_reason = getattr(result, "skip_reason", None) or (
                 "structured_content_noop" if has_structured_content else "noop"
             )
@@ -14570,122 +15790,69 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
-        # Rebuild message list from compacted entries
+        # ``compact_context`` is prefix-only. Keep the exact original tail in
+        # the live provider view so tool IDs, reasoning signatures, images,
+        # and provider-specific content blocks are not flattened by the text
+        # projection used solely as summarizer input.
         compacted: list[Message] = []
-        if result.summary:
-            compacted.append(Message(role="user", content=f"[Context summary]\n{result.summary}"))
+        if replay_summary:
+            compacted.append(Message(role="user", content=f"[Context summary]\n{replay_summary}"))
             compacted.append(
                 Message(role="assistant", content="Understood. Continuing from summary.")
             )
-        for entry in result.kept_entries:
-            compacted.append(Message(role=entry["role"], content=entry["content"]))
+        compacted.extend(messages[kept_start_index:])
 
-        await _await_flush_task()
-
-        # Reset flush flag so it can trigger again after next compaction
-        self._flush_done_this_cycle = False
 
         # Trigger 6: post-compaction sync
         if self._memory_sync_manager is not None:
-            self._memory_sync_manager.mark_dirty()
+            try:
+                self._memory_sync_manager.mark_dirty()
+            except Exception as exc:  # sync refresh is non-authoritative
+                logger.warning("memory_sync.mark_dirty_failed", error=str(exc))
 
         kept_entries = [{"role": e["role"], "content": e["content"]} for e in result.kept_entries]
-        # compact_context is prefix-only.  Use its exact cut instead of
-        # content matching: duplicate role/content pairs can otherwise match
-        # an older row and move the protected current-turn boundary forward.
-        # ``getattr`` keeps older/custom compactor result stubs compatible;
-        # prefix-only compaction already guarantees that removed_count is the
-        # same boundary when the additive field is absent.
-        kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
-        )
+        # Use the exact cut instead of content matching: duplicate role/content
+        # pairs can otherwise move the protected current-turn boundary.
         adjusted_request_idx = self._adjust_index_after_prefix_compaction(
             request_context_insert_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
         adjusted_runtime_idx = self._adjust_index_after_prefix_compaction(
             runtime_context_insert_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
         adjusted_protected_idx = self._adjust_index_after_prefix_compaction(
             protected_turn_start_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
+        self._compaction_failed_this_turn = False
         return CompactionOutcome(
             messages=compacted,
             compacted=True,
-            summary=result.summary,
+            summary=str(getattr(result, "summary", "") or ""),
+            summary_payload=getattr(result, "summary_payload", None),
+            summary_format=str(getattr(result, "summary_format", "text") or "text"),
+            coverage_status=str(getattr(result, "coverage_status", "unknown") or "unknown"),
+            missing_obligations=getattr(result, "missing_obligations", None),
+            critical_carry_forward=getattr(
+                result,
+                "critical_carry_forward",
+                None,
+            ),
             kept_entries=kept_entries,
             removed_count=result.removed_count,
             compaction_id=compaction_id,
+            compaction_deadline_at_monotonic=compaction_config.deadline_at_monotonic,
+            compaction_timeout_seconds=compaction_config.total_timeout_seconds,
             request_context_insert_index=adjusted_request_idx,
             runtime_context_insert_index=adjusted_runtime_idx,
             protected_turn_start_index=adjusted_protected_idx,
+            runtime_compaction_config=compaction_config,
         )
 
-    def _consume_completed_flush_task(self) -> None:
-        task = self._active_flush_task
-        if task is None or not task.done():
-            return
-        self._mark_flush_task_completed(task)
-
-    def _on_flush_task_done(self, task: asyncio.Task) -> None:
-        self._mark_flush_task_completed(task)
-
-    def _mark_flush_task_completed(self, task: asyncio.Task) -> None:
-        if self._flush_wait_timed_out_task is task:
-            self._flush_wait_timed_out_task = None
-        if self._active_flush_task is not task:
-            return
-        try:
-            receipt = task.result()
-        except asyncio.CancelledError:
-            logger.debug("memory_flush.cancelled")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("memory_flush.background_failed", error=str(exc))
-        else:
-            mode = getattr(receipt, "mode", None)
-            if not flush_receipt_is_successful_flush(receipt):
-                next_retry_seconds = self._ensure_flush_degraded_backoff()
-                logger.warning(
-                    "memory_flush.degraded",
-                    mode=mode,
-                    result_status=getattr(receipt, "result_status", None),
-                    integrity_status=getattr(receipt, "integrity_status", None),
-                    output_coverage_status=getattr(receipt, "output_coverage_status", None),
-                    obligation_status=getattr(receipt, "obligation_status", None),
-                    raw_reason=getattr(receipt, "raw_reason", None),
-                    next_retry_seconds=next_retry_seconds,
-                )
-            else:
-                self._flush_backoff_seconds = 0.0
-                self._flush_backoff_until = 0.0
-        self._active_flush_task = None
-
-    def _record_flush_timeout_backoff(self) -> float:
-        initial = max(0.0, float(self.config.flush_backoff_initial_seconds))
-        maximum = max(initial, float(self.config.flush_backoff_max_seconds))
-        if initial == 0:
-            self._flush_backoff_seconds = 0.0
-            self._flush_backoff_until = 0.0
-            return 0.0
-        if self._flush_backoff_seconds <= 0:
-            next_retry_seconds = initial
-        else:
-            next_retry_seconds = min(self._flush_backoff_seconds * 2, maximum)
-        self._flush_backoff_seconds = next_retry_seconds
-        self._flush_backoff_until = time.monotonic() + next_retry_seconds
-        return next_retry_seconds
-
-    def _ensure_flush_degraded_backoff(self) -> float:
-        remaining = self._flush_backoff_until - time.monotonic()
-        if remaining > 0:
-            return remaining
-        return self._record_flush_timeout_backoff()
 
     @staticmethod
     def _adjust_index_after_prefix_compaction(
@@ -14700,64 +15867,6 @@ class Agent:
         summary_prefix = 2 if summary_present and original_index > 0 else 0
         return summary_prefix + max(0, original_index - kept_start_index)
 
-    async def _run_flush(
-        self,
-        plan: Any,
-        messages: list[Message],
-    ) -> Any | None:
-        """Run memory flush before compaction; delegates to SessionFlushService.
-
-        When a ``SessionFlushService`` is injected, this method forwards the
-        call and returns its receipt. When no service is injected (standalone
-        Agent instances in unit tests or legacy paths), it falls back to an
-        inline raw-dump so we don't silently drop data.
-        """
-        service = getattr(self, "_session_flush_service", None)
-        if service is not None:
-            try:
-                from opensquilla.session.keys import parse_agent_id
-
-                sk = getattr(self, "_session_key", None) or "agent:main:legacy"
-                return await service.execute(
-                    messages,
-                    session_key=sk,
-                    agent_id=parse_agent_id(sk),
-                    timeout=self.config.flush_background_timeout_seconds,
-                    message_window=0,
-                    segment_mode="auto",
-                    provider_request_correlation=derive_provider_request_correlation(
-                        self._provider_request_correlation,
-                        execution_id=uuid.uuid4().hex,
-                        call_kind="auxiliary.session_flush",
-                    ),
-                )
-            except asyncio.CancelledError:
-                logger.debug("memory_flush.cancelled")
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("memory_flush.service_failed", error=str(exc))
-            return None
-
-        # Legacy fallback — only hit when no service is injected.
-        from opensquilla.memory.flush import dump_transcript_excerpt
-
-        if self.provider is None and self.tool_handler is not None:
-            excerpt = dump_transcript_excerpt(messages)
-            if excerpt.strip():
-                from opensquilla.tool_boundary import ToolCall as _FlushToolCall
-
-                await self.tool_handler(
-                    _FlushToolCall(
-                        tool_use_id="flush-fallback",
-                        tool_name="memory_save",
-                        arguments={
-                            "content": excerpt,
-                            "path": plan.relative_path,
-                            "mode": "append",
-                        },
-                    )
-                )
-        return None
 
     @staticmethod
     def _has_provider_context_replay_marker(arguments: dict[str, Any]) -> bool:
@@ -14798,61 +15907,11 @@ class Agent:
         if not blocked_tool_ids:
             return messages
 
-        if getattr(self.config, "provider_context_block_feedback", False):
-            return self._project_blocked_context_replay_with_feedback(
-                messages,
-                blocked_tool_ids,
-                record=record,
-            )
-
-        stripped_messages: list[Message] = []
-        stripped_blocks = 0
-        for message in messages:
-            if not isinstance(message.content, list):
-                stripped_messages.append(message)
-                continue
-            next_content: list[Any] = []
-            changed = False
-            for block in message.content:
-                if isinstance(block, ContentBlockToolUse) and block.id in blocked_tool_ids:
-                    stripped_blocks += 1
-                    changed = True
-                    continue
-                if (
-                    isinstance(block, ContentBlockToolResult)
-                    and block.tool_use_id in blocked_tool_ids
-                ):
-                    stripped_blocks += 1
-                    changed = True
-                    continue
-                next_content.append(block)
-            if not changed:
-                stripped_messages.append(message)
-                continue
-            if not next_content:
-                continue
-            stripped_messages.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
-            )
-
-        if stripped_blocks and stripped_messages and stripped_messages[-1].role == "assistant":
-            stripped_messages.append(Message(role="user", content=_PROVIDER_CONTEXT_REPAIR_PROMPT))
-
-        if record:
-            self.config.metadata["tool_argument_projection_replay_stripped"] = (
-                self.config.metadata.get("tool_argument_projection_replay_stripped", 0)
-                + stripped_blocks
-            )
-            self._write_turn_call_log(
-                "tool_argument_projection_replay_stripped",
-                tool_use_ids=sorted(blocked_tool_ids),
-                stripped_blocks=stripped_blocks,
-            )
-        return stripped_messages
+        return self._project_blocked_context_replay_with_feedback(
+            messages,
+            blocked_tool_ids,
+            record=record,
+        )
 
     def _project_blocked_context_replay_with_feedback(
         self,
@@ -14867,20 +15926,21 @@ class Agent:
         the provider view (which leaves the model with no rejection signal and
         produces byte-identical retry loops), keep the pair: the tool_use input
         becomes the standard compacted-arguments placeholder and the error
-        tool_result carrying the rejection text stays visible. When the
-        rejection is the most recent event, the repair prompt is appended so
-        the model is explicitly told how to recover.
+        tool_result carrying the rejection and recovery guidance stays visible.
         """
         projected_messages: list[Message] = []
         projected_blocks = 0
-        last_blocked_result_index: int | None = None
+        recorded_result_ids = {
+            block.tool_use_id
+            for message in messages if isinstance(message.content, list)
+            for block in message.content if isinstance(block, ContentBlockToolResult)
+        }
         for message in messages:
             if not isinstance(message.content, list):
                 projected_messages.append(message)
                 continue
             next_content: list[Any] = []
             changed = False
-            has_blocked_result = False
             for block in message.content:
                 if isinstance(block, ContentBlockToolUse) and block.id in blocked_tool_ids:
                     projected_blocks += 1
@@ -14896,33 +15956,22 @@ class Agent:
                         )
                     )
                     continue
-                if (
-                    isinstance(block, ContentBlockToolResult)
-                    and block.tool_use_id in blocked_tool_ids
-                ):
-                    has_blocked_result = True
                 next_content.append(block)
             if changed:
-                projected_messages.append(
-                    Message(
-                        role=message.role,
-                        content=next_content,
-                        reasoning_content=getattr(message, "reasoning_content", None),
-                    )
+                projected_message = message.model_copy(update={"content": next_content})
+                missing_batch_results = message.role == "assistant" and not any(
+                    isinstance(block, ContentBlockToolUse) and block.id in recorded_result_ids
+                    for block in next_content
                 )
+                if missing_batch_results:
+                    # Missing results do not prove execution or rejection.
+                    # Preserve facts even with trailing runtime/user context,
+                    # rather than letting pairing repair discard the call.
+                    projected_messages.extend(project_incomplete_tool_history([projected_message]))
+                else:
+                    projected_messages.append(projected_message)
             else:
                 projected_messages.append(message)
-            if has_blocked_result:
-                last_blocked_result_index = len(projected_messages) - 1
-
-        repair_prompt_appended = (
-            last_blocked_result_index is not None
-            and last_blocked_result_index == len(projected_messages) - 1
-        )
-        if repair_prompt_appended:
-            projected_messages.append(
-                Message(role="user", content=_PROVIDER_CONTEXT_REPAIR_PROMPT)
-            )
 
         if record:
             self.config.metadata["tool_argument_projection_replay_feedback"] = (
@@ -14933,103 +15982,9 @@ class Agent:
                 "tool_argument_projection_replay_feedback",
                 tool_use_ids=sorted(blocked_tool_ids),
                 projected_blocks=projected_blocks,
-                repair_prompt_appended=repair_prompt_appended,
             )
         return projected_messages
 
-    def _identical_request_loop_break_action(
-        self,
-        request_messages: list[Message],
-        *,
-        first_attempt: bool,
-    ) -> str | None:
-        """Opt-in breaker for consecutive byte-identical provider projections.
-
-        Hashes the projected request before any perturbation is appended, so a
-        stuck loop keeps the same base sha and the streak keeps growing across
-        iterations: at ``threshold`` the request is perturbed with a loop
-        nudge, at ``2 * threshold`` the turn aborts. Provider retry attempts
-        (``first_attempt=False``) reuse the current streak without advancing
-        it, so retries of one request never count as a loop.
-        """
-        threshold = self._positive_int(
-            getattr(self.config, "identical_request_loop_break_threshold", 0)
-        )
-        if threshold is None:
-            return None
-        if first_attempt:
-            payload_sha = hashlib.sha256(
-                json.dumps(
-                    [message.model_dump(mode="json") for message in request_messages],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                ).encode("utf-8")
-            ).hexdigest()
-            if payload_sha == self._identical_request_last_sha:
-                self._identical_request_streak += 1
-            else:
-                self._identical_request_last_sha = payload_sha
-                self._identical_request_streak = 1
-        if self._identical_request_streak < threshold:
-            return None
-        if self._identical_request_streak >= threshold * 2:
-            return "abort"
-        return "perturb"
-
-    @staticmethod
-    def _append_identical_request_loop_nudge(
-        request_messages: list[Message],
-    ) -> list[Message]:
-        """Append the loop-break nudge without producing back-to-back user turns.
-
-        Most providers require strict user/assistant alternation. The request
-        being perturbed always ends in a user message (the last tool results,
-        or the original prompt), so appending a *new* user message would
-        create two consecutive user turns and get rejected or mishandled by
-        the provider. Merge the nudge into the existing trailing message
-        instead when it is already a user turn.
-        """
-        if request_messages and request_messages[-1].role == "user":
-            last_message = request_messages[-1]
-            if isinstance(last_message.content, list):
-                merged_content: Any = [
-                    *last_message.content,
-                    ContentBlockText(text=_IDENTICAL_REQUEST_LOOP_NUDGE),
-                ]
-            else:
-                existing_text = (
-                    last_message.content
-                    if isinstance(last_message.content, str)
-                    else str(last_message.content)
-                )
-                merged_content = f"{existing_text}\n\n{_IDENTICAL_REQUEST_LOOP_NUDGE}"
-            return [
-                *request_messages[:-1],
-                Message(
-                    role="user",
-                    content=merged_content,
-                    reasoning_content=getattr(last_message, "reasoning_content", None),
-                ),
-            ]
-        return [
-            *request_messages,
-            Message(role="user", content=_IDENTICAL_REQUEST_LOOP_NUDGE),
-        ]
-
-    @staticmethod
-    def _parse_tool_argument_projection(value: str) -> dict[str, str] | None:
-        if not value.startswith(_TOOL_ARGUMENT_PROJECTION_PREFIX):
-            return None
-        metadata: dict[str, str] = {}
-        for line in value.splitlines()[1:]:
-            if line in {"head:", "tail:"}:
-                break
-            key, separator, raw_value = line.partition(":")
-            if not separator:
-                continue
-            metadata[key.strip()] = raw_value.strip()
-        return metadata
 
     @staticmethod
     def _provider_projection_placeholder(tool_name: str, field: str) -> str:
@@ -15194,34 +16149,6 @@ class Agent:
 
     async def _execute_tool(self, tc: ToolCall) -> ToolResult:
         """Dispatch a tool call to the registered handler."""
-        args_hash = hashlib.sha256(
-            json.dumps(tc.arguments, ensure_ascii=False, sort_keys=True, default=str).encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        failure_signature = (tc.tool_name, args_hash)
-        block_threshold = max(
-            0,
-            int(getattr(self.config, "tool_failure_loop_block_threshold", 0) or 0),
-        )
-        if (
-            block_threshold > 0
-            and self._tool_failure_loop_counts.get(failure_signature, 0) >= block_threshold - 1
-        ):
-            return ToolResult(
-                tool_use_id=tc.tool_use_id,
-                tool_name=tc.tool_name,
-                content=(
-                    f"The exact same {tc.tool_name} call has already failed repeatedly. "
-                    "Do not retry this exact call unchanged. Use a different approach, "
-                    "change the arguments, or explain the blocker to the user."
-                ),
-                is_error=True,
-                execution_status=runtime_execution_status(
-                    "error",
-                    reason="tool_failure_loop_exhausted",
-                ),
-            )
         if self.tool_handler is None:
             result = ToolResult(
                 tool_use_id=tc.tool_use_id,
@@ -15252,24 +16179,33 @@ class Agent:
                         reason="runtime_error",
                     ),
                 )
-        if result.is_error:
-            self._tool_failure_loop_counts[failure_signature] = (
-                self._tool_failure_loop_counts.get(failure_signature, 0) + 1
-            )
-        else:
-            self._tool_failure_loop_counts.pop(failure_signature, None)
-            if tc.tool_name in {
-                "apply_patch",
-                "background_process",
-                "edit_file",
-                "execute_code",
-                "exec_command",
-                "git_commit",
-                "install_skill_deps",
-                "write_file",
-            }:
-                self._tool_failure_loop_counts.clear()
+        if not result.is_error and tc.tool_name == "tool_search":
+            self._sync_progressive_tool_definitions()
         return result
+
+    def _sync_progressive_tool_definitions(self) -> None:
+        """Expose successful tool_search matches on the next provider call."""
+
+        ctx = self._tool_context
+        registry = self._tool_registry
+        if ctx is None or registry is None or not ctx.disclosed_tool_names:
+            return
+        authorized = ctx.authorized_tool_names or frozenset()
+        existing = {definition.name for definition in self.tool_definitions}
+        requested = set(ctx.disclosed_tool_names) & set(authorized) - existing
+        if not requested:
+            return
+        definitions = {
+            definition.name: definition
+            for definition in registry.to_tool_definitions(ctx)
+            if definition.name in requested
+        }
+        for name in sorted(requested):
+            definition = definitions.get(name)
+            if definition is None:
+                continue
+            self.tool_definitions.append(definition)
+            self._tool_definition_by_name[name] = definition
 
     def _matched_meta_skill_name_from_metadata(self) -> str | None:
         metadata = self.config.metadata or {}
@@ -15382,9 +16318,11 @@ class Agent:
             logger.warning("agent.meta_skill_view_coerce_failed", skill=name, error=str(exc))
             return tc
 
+        from opensquilla.skills.catalog_policy import is_invokable_meta
+
         if (
             skill_spec is None
-            or getattr(skill_spec, "kind", "skill") != "meta"
+            or not is_invokable_meta(skill_spec)
             or getattr(skill_spec, "disable_model_invocation", False)
         ):
             return tc
@@ -15408,6 +16346,8 @@ class Agent:
         workspace_dir: Any,
         triggered_by: str,
         skill_loader: Any,
+        parent_spec: Any,
+        plan: Any,
     ) -> tuple[Any, Any, Any]:
         """Construct a MetaOrchestrator wired to this agent's provider/tools.
 
@@ -15419,6 +16359,9 @@ class Agent:
             make_agent_runner_from_parent,
             make_llm_chat_from_provider,
             make_tool_invoker_from_handler,
+        )
+        from opensquilla.skills.meta.readiness import (
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
         )
 
         meta_correlation = derive_provider_request_correlation(
@@ -15439,21 +16382,18 @@ class Agent:
             usage_execution_context=self._usage_execution_context,
             provider_request_correlation=meta_correlation,
         )
-        llm_chat = (
-            getattr(self, "_test_llm_chat_override", None)
-            or (
-                make_llm_chat_from_provider(
-                    provider=self.provider,
-                    base_config=self.config,
-                    usage_tracker=self._usage_tracker,
-                    session_key=self._session_key,
-                    usage_event_sink=self._usage_event_sink,
-                    usage_execution_context=self._usage_execution_context,
-                    provider_request_correlation=meta_correlation,
-                )
-                if self.provider is not None
-                else None
+        llm_chat = getattr(self, "_test_llm_chat_override", None) or (
+            make_llm_chat_from_provider(
+                provider=self.provider,
+                base_config=self.config,
+                usage_tracker=self._usage_tracker,
+                session_key=self._session_key,
+                usage_event_sink=self._usage_event_sink,
+                usage_execution_context=self._usage_execution_context,
+                provider_request_correlation=meta_correlation,
             )
+            if self.provider is not None
+            else None
         )
         tool_invoker = (
             make_tool_invoker_from_handler(
@@ -15463,6 +16403,21 @@ class Agent:
             if self._raw_tool_handler is not None
             else None
         )
+        skill_runtime_env: Mapping[str, Mapping[str, str]] = {}
+        runtime_env_provider = (self.config.metadata or {}).get(
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY
+        )
+        if callable(runtime_env_provider) and parent_spec is not None and plan is not None:
+            try:
+                resolved_runtime_env = runtime_env_provider(parent_spec, plan)
+            except Exception as exc:  # noqa: BLE001 - credential resolution fails closed
+                logger.warning(
+                    "agent.meta_skill_runtime_env_resolution_failed",
+                    error_type=type(exc).__name__,
+                )
+            else:
+                if isinstance(resolved_runtime_env, Mapping):
+                    skill_runtime_env = resolved_runtime_env
         orch = MetaOrchestrator(
             agent_runner=runner,
             skill_loader=skill_loader,
@@ -15475,8 +16430,43 @@ class Agent:
             turn_id=getattr(self, "_turn_id", None),
             memory_persist_enabled=True,
             usage_tracker=self._usage_tracker,
+            metaskill_usage_recorder=self._metaskill_usage_recorder
+            if callable(self._metaskill_usage_recorder)
+            else None,
+            skill_runtime_env=skill_runtime_env,
         )
         return orch, llm_chat, tool_invoker
+
+    @staticmethod
+    def _meta_readiness_context_for_plan(
+        metadata: Mapping[str, Any],
+        *,
+        parent_spec: Any,
+        plan: Any,
+    ) -> Any:
+        """Resolve only parent+plan-scoped, non-secret readiness aliases."""
+
+        from opensquilla.skills.meta.readiness import (
+            META_READINESS_ENV_ALIASES_METADATA_KEY,
+            meta_readiness_context,
+        )
+
+        aliases: object = ()
+        alias_provider = metadata.get(META_READINESS_ENV_ALIASES_METADATA_KEY)
+        if callable(alias_provider):
+            try:
+                aliases = alias_provider(parent_spec, plan)
+            except Exception as exc:  # noqa: BLE001 - readiness fails closed
+                logger.warning(
+                    "agent.meta_readiness_alias_resolution_failed",
+                    error_type=type(exc).__name__,
+                )
+        return meta_readiness_context(
+            env_aliases=aliases,
+            parent_spec=parent_spec,
+            plan=plan,
+            skill_resolver=metadata.get("skill_loader"),
+        )
 
     async def _run_one_streaming(
         self,
@@ -15492,13 +16482,11 @@ class Agent:
             make_meta_inputs,
             meta_input_overrides_from_metadata,
         )
-        from opensquilla.skills.meta.orchestrator import (
-            MetaOrchestrator,
-            make_agent_runner_from_parent,
-            make_llm_chat_from_provider,
-            make_tool_invoker_from_handler,
-        )
         from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
+        from opensquilla.skills.meta.readiness import (
+            assess_meta_skill_readiness,
+            format_meta_setup_error,
+        )
         from opensquilla.skills.meta.types import MetaMatch, MetaResult
         from opensquilla.tools.dispatch import preflight_tool_call
         from opensquilla.tools.types import current_tool_context
@@ -15625,7 +16613,9 @@ class Agent:
                     return
 
             skill_spec = skill_loader.get_by_name(name)
-            if skill_spec is None or getattr(skill_spec, "kind", "skill") != "meta":
+            from opensquilla.skills.catalog_policy import is_invokable_meta
+
+            if skill_spec is None or not is_invokable_meta(skill_spec):
                 yield ToolResult(
                     tool_use_id=tc.tool_use_id,
                     tool_name="meta_invoke",
@@ -15665,59 +16655,33 @@ class Agent:
                 )
                 return
 
-            meta_correlation = derive_provider_request_correlation(
-                self._provider_request_correlation,
-                execution_id=uuid.uuid4().hex,
-                call_kind="auxiliary.meta",
+            readiness = await asyncio.to_thread(
+                assess_meta_skill_readiness,
+                skill_spec,
+                loader=skill_loader,
+                ctx=self._meta_readiness_context_for_plan(
+                    metadata,
+                    parent_spec=skill_spec,
+                    plan=plan,
+                ),
+                validated_plan=plan,
             )
-            runner = make_agent_runner_from_parent(
-                provider=self.provider,
-                base_config=self.config,
-                tool_definitions=self.tool_definitions,
-                tool_handler=self._raw_tool_handler,
-                agent_factory=type(self),
-                workspace_dir=str(workspace_dir) if workspace_dir else None,
-                usage_tracker=self._usage_tracker,
-                session_key=self._session_key,
-                usage_event_sink=self._usage_event_sink,
-                usage_execution_context=self._usage_execution_context,
-                provider_request_correlation=meta_correlation,
-            )
-            llm_chat = getattr(self, "_test_llm_chat_override", None) or (
-                make_llm_chat_from_provider(
-                    provider=self.provider,
-                    base_config=self.config,
-                    usage_tracker=self._usage_tracker,
-                    session_key=self._session_key,
-                    usage_event_sink=self._usage_event_sink,
-                    usage_execution_context=self._usage_execution_context,
-                    provider_request_correlation=meta_correlation,
+            if not readiness.ready:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=format_meta_setup_error(name, readiness),
+                    is_error=True,
+                    terminates_turn=False,
                 )
-                if self.provider is not None
-                else None
-            )
-            tool_invoker = (
-                make_tool_invoker_from_handler(
-                    tool_handler=self._raw_tool_handler,
-                    provider_request_correlation=meta_correlation,
-                )
-                if self._raw_tool_handler is not None
-                else None
-            )
+                return
 
-            memory_persist_enabled = True
-            orch = MetaOrchestrator(
-                agent_runner=runner,
-                skill_loader=skill_loader,
-                llm_chat=llm_chat,
-                tool_invoker=tool_invoker,
-                workspace_dir=str(workspace_dir) if workspace_dir else None,
-                run_writer=self._meta_run_writer,
+            orch, llm_chat, tool_invoker = self._build_meta_orchestrator(
+                workspace_dir=workspace_dir,
                 triggered_by="soft_meta_invoke",
-                session_key=getattr(self, "_session_key", None),
-                turn_id=getattr(self, "_turn_id", None),
-                memory_persist_enabled=memory_persist_enabled,
-                usage_tracker=self._usage_tracker,
+                skill_loader=skill_loader,
+                parent_spec=skill_spec,
+                plan=plan,
             )
 
             system_prompt = (
@@ -15870,12 +16834,6 @@ class Agent:
         outer stream pipeline can finalize the turn.
         """
         from opensquilla.engine.types import DoneEvent
-        from opensquilla.skills.meta.orchestrator import (
-            MetaOrchestrator,
-            make_agent_runner_from_parent,
-            make_llm_chat_from_provider,
-            make_tool_invoker_from_handler,
-        )
         from opensquilla.skills.meta.types import MetaResult
         from opensquilla.tools.types import current_tool_context
 
@@ -15901,6 +16859,44 @@ class Agent:
         if isinstance(metadata, dict):
             metadata.pop("meta_resume", None)
 
+        # Capability credentials are re-bound from durable state, never from
+        # the resume marker alone.  Require the claimed snapshot to match its
+        # current run row, then resolve the current parent from the pinned
+        # catalog.  Any missing/mismatched component leaves the orchestrator
+        # with an empty trusted child environment.
+        parent_spec: Any = None
+        resume_plan: Any = None
+        try:
+            claim_run_id = str(getattr(claim, "run_id", "") or "")
+            claim_snapshot = str(getattr(claim, "plan_snapshot_json", "") or "")
+            resume_record = await asyncio.to_thread(
+                self._meta_run_writer.get_run,
+                claim_run_id,
+            )
+            if (
+                claim_run_id
+                and claim_snapshot
+                and self._session_key
+                and resume_record is not None
+                and str(getattr(resume_record, "run_id", "") or "") == claim_run_id
+                and str(getattr(resume_record, "session_key", "") or "") == self._session_key
+                and str(getattr(resume_record, "plan_snapshot_json", "") or "") == claim_snapshot
+            ):
+                from opensquilla.skills.meta.plan_serde import from_jsonable
+
+                resume_plan = from_jsonable(json.loads(claim_snapshot))
+                candidate_parent = skill_loader.get_by_name(resume_record.meta_skill_name)
+                if (
+                    candidate_parent is not None
+                    and getattr(resume_plan, "name", None) == resume_record.meta_skill_name
+                ):
+                    parent_spec = candidate_parent
+        except Exception as exc:  # noqa: BLE001 - capability grant fails closed
+            logger.warning(
+                "agent.meta_resume_capability_binding_failed",
+                error_type=type(exc).__name__,
+            )
+
         effective_ctx = current_tool_context.get() or None
         workspace_dir = (
             (getattr(effective_ctx, "workspace_dir", None) if effective_ctx else None)
@@ -15908,58 +16904,12 @@ class Agent:
             or getattr(self.config, "workspace_dir", None)
         )
 
-        meta_correlation = derive_provider_request_correlation(
-            self._provider_request_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.meta",
-        )
-        runner = make_agent_runner_from_parent(
-            provider=self.provider,
-            base_config=self.config,
-            tool_definitions=self.tool_definitions,
-            tool_handler=self._raw_tool_handler,
-            agent_factory=type(self),
-            workspace_dir=str(workspace_dir) if workspace_dir else None,
-            usage_tracker=self._usage_tracker,
-            session_key=self._session_key,
-            usage_event_sink=self._usage_event_sink,
-            usage_execution_context=self._usage_execution_context,
-            provider_request_correlation=meta_correlation,
-        )
-        llm_chat = getattr(self, "_test_llm_chat_override", None) or (
-            make_llm_chat_from_provider(
-                provider=self.provider,
-                base_config=self.config,
-                usage_tracker=self._usage_tracker,
-                session_key=self._session_key,
-                usage_event_sink=self._usage_event_sink,
-                usage_execution_context=self._usage_execution_context,
-                provider_request_correlation=meta_correlation,
-            )
-            if self.provider is not None
-            else None
-        )
-        tool_invoker = (
-            make_tool_invoker_from_handler(
-                tool_handler=self._raw_tool_handler,
-                provider_request_correlation=meta_correlation,
-            )
-            if self._raw_tool_handler is not None
-            else None
-        )
-
-        orch = MetaOrchestrator(
-            agent_runner=runner,
-            skill_loader=skill_loader,
-            llm_chat=llm_chat,
-            tool_invoker=tool_invoker,
-            workspace_dir=str(workspace_dir) if workspace_dir else None,
-            run_writer=self._meta_run_writer,
+        orch, _llm_chat, _tool_invoker = self._build_meta_orchestrator(
+            workspace_dir=workspace_dir,
             triggered_by="resume",
-            session_key=getattr(self, "_session_key", None),
-            turn_id=getattr(self, "_turn_id", None),
-            memory_persist_enabled=True,
-            usage_tracker=self._usage_tracker,
+            skill_loader=skill_loader,
+            parent_spec=parent_spec,
+            plan=resume_plan,
         )
 
         result: Any = None
@@ -16023,13 +16973,26 @@ class Agent:
             text_snapshot=final_text,
         )
 
-    async def _run_meta_launch(self, name: str) -> AsyncIterator[Any]:
+    async def _run_meta_launch(
+        self,
+        name: str,
+        *,
+        user_request: str | None = None,
+        replay_run_id: str | None = None,
+        replay_mode: str | None = None,
+    ) -> AsyncIterator[Any]:
         """Run a meta-skill by name from the explicit /meta command.
 
         Models its streaming/finalization on ``_run_meta_resume`` and reuses the
         resolution + guards from ``_run_one_streaming`` (enabled gate,
         awaiting-guard, kind/disable validation). Yields nested AgentEvents plus
-        a terminal DoneEvent so the turn pipeline finalizes normally.
+        a terminal DoneEvent so the turn pipeline finalizes normally. When the
+        command includes ``-- <request>``, ``user_request`` is the original
+        request and is passed to the orchestrator instead of the hidden command
+        envelope.  A trusted replay marker additionally supplies a persisted
+        source run and mode; in that path the original plan snapshot and all
+        successful step outputs are rehydrated and only failed/missing steps
+        are dispatched.
         """
         import opensquilla.skills.creator  # noqa: F401  (registers e2e hooks)
         from opensquilla.engine.types import DoneEvent, TextDeltaEvent
@@ -16046,13 +17009,17 @@ class Agent:
             meta_input_overrides_from_metadata,
         )
         from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
-        from opensquilla.skills.meta.types import MetaMatch, MetaResult
+        from opensquilla.skills.meta.readiness import (
+            assess_meta_skill_readiness,
+            format_meta_setup_error,
+        )
+        from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult
         from opensquilla.tools.types import current_tool_context
 
         metadata = self.config.metadata or {}
         # One-shot: drop the marker so a re-enter through this turn cannot re-run.
         if isinstance(metadata, dict):
-            metadata.pop("meta_launch", None)
+            metadata.pop("meta_replay" if replay_run_id else "meta_launch", None)
 
         if not is_meta_skill_enabled(self.config):
             async for ev in self._emit_terminal_text(
@@ -16069,6 +17036,43 @@ class Agent:
             ):
                 yield ev
             return
+
+        replay_record: Any = None
+        if replay_run_id is not None:
+            if replay_mode not in {"failed-step", "partial-context"}:
+                async for ev in self._emit_terminal_text(
+                    "This replay mode is invalid. Choose Retry failed step again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+            replay_record = await asyncio.to_thread(
+                self._meta_run_writer.get_run,
+                replay_run_id,
+            )
+            if (
+                replay_record is None
+                or replay_record.meta_skill_name != name
+                or (replay_record.session_key and replay_record.session_key != self._session_key)
+                or replay_record.status != "failed"
+                or not replay_record.failed_step_id
+            ):
+                async for ev in self._emit_terminal_text(
+                    "This replay is no longer available for this session. "
+                    "Choose Retry failed step again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+            if replay_inputs_are_modified(replay_record):
+                async for ev in self._emit_terminal_text(
+                    "This run cannot safely retry only the failed step because "
+                    "its saved request was redacted or truncated. Start a new "
+                    "meta-skill run and provide the original request again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
 
         # Awaiting-guard parity with _run_one_streaming: refuse a new launch
         # while a prior run is waiting for input (avoids the opaque CAS error).
@@ -16091,37 +17095,99 @@ class Agent:
                 return
 
         skill_spec = skill_loader.get_by_name(name)
-        if skill_spec is None or getattr(skill_spec, "kind", "skill") != "meta":
+        from opensquilla.skills.catalog_policy import is_invokable_meta
+
+        if skill_spec is None or (replay_record is None and not is_invokable_meta(skill_spec)):
             async for ev in self._emit_terminal_text(
-                f"{name!r} is not a meta-skill. Type /meta to list available "
-                "meta-skills.",
+                f"{name!r} is not a meta-skill. Type /meta to list available meta-skills.",
                 iterations=0,
             ):
                 yield ev
             return
-        # Parity with _run_one_streaming and meta.list: skills flagged
-        # disable_model_invocation are neither listed nor runnable via /meta.
-        if getattr(skill_spec, "disable_model_invocation", False):
-            async for ev in self._emit_terminal_text(
-                f"{name!r} is not available for invocation.", iterations=0
-            ):
+        # Fresh launches respect the catalog gate. A trusted failed-run replay
+        # is different: its immutable plan came from the persisted ledger and
+        # may belong to a now-retired compatibility definition. Keeping that
+        # path available lets upgrades finish already-started work without
+        # making the retired skill discoverable or allowing a new run.
+        retired_replay = bool(
+            replay_record is not None and getattr(skill_spec, "disable_model_invocation", False)
+        )
+        if getattr(skill_spec, "disable_model_invocation", False) and not retired_replay:
+            description = str(getattr(skill_spec, "description", "")).strip().lower()
+            unavailable_message = f"{name!r} is not available for invocation."
+            if description.startswith("retired compatibility"):
+                unavailable_message = (
+                    f"{name!r} has been retired and is not available for new runs. "
+                    "Previously saved runs remain available for inspection, resume, or replay."
+                )
+            async for ev in self._emit_terminal_text(unavailable_message, iterations=0):
                 yield ev
             return
 
-        try:
-            plan = parse_meta_plan(skill_spec)
-        except MetaPlanError as exc:
-            async for ev in self._emit_terminal_text(
-                f"meta-skill {name!r} plan invalid: {exc}", iterations=0
-            ):
-                yield ev
-            return
+        plan: MetaPlan | None
+        if replay_record is not None:
+            try:
+                from opensquilla.skills.meta.plan_serde import from_jsonable
+
+                plan = from_jsonable(json.loads(replay_record.plan_snapshot_json))
+            except Exception as exc:  # noqa: BLE001 - persisted legacy snapshot
+                async for ev in self._emit_terminal_text(
+                    f"Cannot replay meta-skill {name!r}: its saved plan is invalid ({exc}).",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+        else:
+            try:
+                plan = parse_meta_plan(skill_spec)
+            except MetaPlanError as exc:
+                async for ev in self._emit_terminal_text(
+                    f"meta-skill {name!r} plan invalid: {exc}", iterations=0
+                ):
+                    yield ev
+                return
         if plan is None:
             async for ev in self._emit_terminal_text(
                 f"meta-skill {name!r} parsed to None", iterations=0
             ):
                 yield ev
             return
+
+        # Current-manifest readiness may have changed after the source run was
+        # persisted. Do not let a retired tombstone redefine that immutable
+        # replay; each saved step still enforces its own runtime/tool gates.
+        if not retired_replay:
+            readiness = await asyncio.to_thread(
+                assess_meta_skill_readiness,
+                skill_spec,
+                loader=skill_loader,
+                ctx=self._meta_readiness_context_for_plan(
+                    metadata,
+                    parent_spec=skill_spec,
+                    plan=plan,
+                ),
+                validated_plan=plan,
+            )
+            if not readiness.ready:
+                async for ev in self._emit_terminal_text(
+                    format_meta_setup_error(name, readiness), iterations=0
+                ):
+                    yield ev
+                return
+        if replay_record is not None:
+            from opensquilla.skills.meta.replay_safety import (
+                paid_live_replay_block_reason,
+            )
+
+            paid_block = paid_live_replay_block_reason(
+                plan=plan,
+                persisted_steps=getattr(replay_record, "steps", ()),
+                failed_step_id=str(replay_record.failed_step_id or ""),
+            )
+            if paid_block:
+                async for ev in self._emit_terminal_text(paid_block, iterations=0):
+                    yield ev
+                return
 
         effective_ctx = current_tool_context.get() or None
         workspace_dir = (
@@ -16139,18 +17205,56 @@ class Agent:
             workspace_dir=workspace_dir,
             triggered_by="manual_command",
             skill_loader=skill_loader,
-        )
-        match = MetaMatch(
+            parent_spec=skill_spec,
             plan=plan,
-            inputs=make_meta_inputs(
-                user_message=(
-                    getattr(self, "_current_turn_message", "")
-                    or metadata.get("user_message", "")
-                ),
-                system_prompt=system_prompt,
-                **meta_input_overrides_from_metadata(metadata),
-            ),
         )
+        seed_outputs: dict[str, str] | None = None
+        trusted_replay_meta_run_id: str | None = None
+        if replay_record is not None:
+            try:
+                replay_inputs = json.loads(replay_record.inputs_json or "{}")
+            except json.JSONDecodeError:
+                replay_inputs = {}
+            if not isinstance(replay_inputs, dict):
+                replay_inputs = {}
+            # The artifact directory is a runtime-owned reserved input. Recover
+            # it only from the validated source row; never accept a value from
+            # the new replay turn. Legacy rows predate this field and map their
+            # persisted run id to the same bounded, path-safe namespace.
+            from opensquilla.skills.meta.orchestrator import _preserve_meta_run_id
+
+            trusted_replay_meta_run_id = _preserve_meta_run_id(
+                replay_inputs,
+                fallback_run_id=replay_record.run_id,
+            )
+            replay_inputs["meta_replay_source_run_id"] = replay_record.run_id
+            replay_inputs["meta_replay_mode"] = replay_mode
+            replay_inputs.setdefault("system_prompt", system_prompt)
+            failed_step_id = str(replay_record.failed_step_id or "")
+            replay_failover_aliases: dict[str, str] = {}
+            seed_outputs = _trusted_meta_replay_seed_outputs(
+                plan=plan,
+                persisted_steps=getattr(replay_record, "steps", ()),
+                failed_step_id=failed_step_id,
+                replay_failover_aliases=replay_failover_aliases,
+            )
+            match = MetaMatch(plan=plan, inputs=replay_inputs)
+        else:
+            match = MetaMatch(
+                plan=plan,
+                inputs=make_meta_inputs(
+                    user_message=(
+                        user_request
+                        if user_request is not None
+                        else (
+                            getattr(self, "_current_turn_message", "")
+                            or metadata.get("user_message", "")
+                        )
+                    ),
+                    system_prompt=system_prompt,
+                    **meta_input_overrides_from_metadata(metadata),
+                ),
+            )
 
         # Mirror _run_one_streaming: wrap iter_events in the runtime-e2e / smoke
         # ContextVars so a manually launched meta-skill that spawns sub-agents
@@ -16178,7 +17282,19 @@ class Agent:
         result: Any = None
         final_text_parts: list[str] = []
         try:
-            async for ev in orch.iter_events(match):
+            replay_kwargs: dict[str, Any] = {}
+            if replay_record is not None:
+                replay_kwargs = {
+                    "seed_outputs": seed_outputs,
+                    "trusted_preflight_replay": True,
+                    "trusted_replay_meta_run_id": trusted_replay_meta_run_id,
+                }
+                # Preserve the established replay call contract when there is
+                # no pending fallback alias.  The alias map is meaningful only
+                # for the narrow "retry failed fallback" recovery path.
+                if replay_failover_aliases:
+                    replay_kwargs["replay_failover_aliases"] = replay_failover_aliases
+            async for ev in orch.iter_events(match, **replay_kwargs):
                 if isinstance(ev, MetaResult):
                     result = ev
                     continue
@@ -16186,9 +17302,7 @@ class Agent:
                     final_text_parts.append(ev.text)
                 yield ev
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "agent.meta_launch_failed", extra={"error": str(exc), "name": name}
-            )
+            logger.warning("agent.meta_launch_failed", extra={"error": str(exc), "name": name})
             yield DoneEvent(text="", input_tokens=0, output_tokens=0, iterations=0)
             return
         finally:
@@ -16262,17 +17376,22 @@ class Agent:
         soft_progress = metadata.pop("meta_clarify_soft_progress", None)
         if proceed_blocked is not None:
             return self._render_clarify_progress(
-                proceed_blocked, proceed_blocked=True,
+                proceed_blocked,
+                proceed_blocked=True,
             ), True
         if soft_progress is not None:
             return self._render_clarify_progress(
-                soft_progress, proceed_blocked=False,
+                soft_progress,
+                proceed_blocked=False,
             ), True
 
         return None
 
     def _render_clarify_progress(
-        self, payload: Any, *, proceed_blocked: bool,
+        self,
+        payload: Any,
+        *,
+        proceed_blocked: bool,
     ) -> str:
         """Render soft-clarify progress without exposing internal state."""
         data = payload if isinstance(payload, dict) else {}
@@ -16286,11 +17405,7 @@ class Agent:
         lines: list[str] = []
         if proceed_blocked:
             if missing:
-                lines.append(
-                    "现在还不能开始，还需要补充："
-                    + "、".join(missing)
-                    + "。"
-                )
+                lines.append("现在还不能开始，还需要补充：" + "、".join(missing) + "。")
             else:
                 lines.append("现在还不能开始，还需要补充必填信息。")
             if filled_summary:
@@ -16476,6 +17591,93 @@ class Agent:
         )
 
     # ------------------------------------------------------------------
+    def _prepare_subagent_execution_task(
+        self,
+        spec: SubagentSpec,
+        *,
+        execution_id: str,
+        child_target: Any,
+        child_context: ToolContext,
+        child_tool_definitions: list[ToolDefinition],
+    ) -> None:
+        """Keep oversized delegated tasks out of the child's initial request."""
+
+        task_bytes = len(spec.task.encode("utf-8"))
+        inline_limit = subagent_task_inline_limit_bytes(child_target)
+        if task_bytes <= inline_limit:
+            spec.execution_task = None
+            return
+        if task_bytes > MAX_REFERENCED_SUBAGENT_TASK_BYTES:
+            raise ValueError(
+                "Subagent task exceeds the safe handoff limit "
+                f"({task_bytes} > {MAX_REFERENCED_SUBAGENT_TASK_BYTES} bytes). "
+                "Publish the material as an artifact or workspace file and pass "
+                "a focused reference instead of copying the full parent context."
+            )
+        reference_slice_limit = subagent_task_reference_slice_limit_chars(child_target)
+        if reference_slice_limit < 1:
+            raise ValueError(
+                "Subagent deployment has no safe capacity for a referenced "
+                "task slice. Choose a larger child model or pass a focused "
+                "workspace-file reference."
+            )
+        if self._raw_tool_handler is None:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), and no retrieval-capable "
+                "tool handler is available. Pass an artifact/workspace reference."
+            )
+
+        has_retrieval_tool = any(
+            definition.name == "retrieve_tool_result" for definition in child_tool_definitions
+        )
+        if not has_retrieval_tool and self._tool_registry is not None:
+            if child_context.surfaced_tools is None:
+                child_context.surfaced_tools = set()
+            child_context.surfaced_tools.add("retrieve_tool_result")
+            retrieval_definition = next(
+                (
+                    definition
+                    for definition in self._tool_registry.to_tool_definitions(child_context)
+                    if definition.name == "retrieve_tool_result"
+                ),
+                None,
+            )
+            if retrieval_definition is not None:
+                child_tool_definitions.append(retrieval_definition)
+                has_retrieval_tool = True
+        if not has_retrieval_tool:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), but retrieve_tool_result "
+                "is not available under the child tool policy. Pass an artifact "
+                "or workspace-file reference."
+            )
+
+        stored = self._store_tool_result_snapshot(
+            spec.task,
+            tool_use_id=f"subagent-task-{execution_id}",
+            tool_name="subagent_task_handoff",
+        )
+        if stored is None:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), and the configured "
+                "reference store could not persist it. Pass an artifact or "
+                "workspace-file reference."
+            )
+        spec.execution_task = render_subagent_task_reference(
+            stored,
+            slice_limit_chars=reference_slice_limit,
+        )
+        logger.info(
+            "subagent.task_externalized",
+            task_bytes=task_bytes,
+            inline_limit_bytes=inline_limit,
+            handle=stored.handle,
+            sha256=stored.sha256,
+        )
+
     # Subagent factory
     # ------------------------------------------------------------------
 
@@ -16502,31 +17704,50 @@ class Agent:
         parent_session_key = self._session_key or "unknown"
         subagent_label = spec.label or "subagent"
         child_execution_id = execution_id or uuid.uuid4().hex
+        child_target = resolve_subagent_execution_target(
+            self.provider,
+            self.config,
+            spec.model_id,
+        )
         child_provider_request_correlation = derive_provider_request_correlation(
             self._provider_request_correlation,
             execution_id=child_execution_id,
             call_kind="subagent.chat",
         )
         parent_ctx = current_tool_context.get() or self._tool_context
+        parent_authorized_tool_names = getattr(
+            parent_ctx,
+            "authorized_tool_names",
+            None,
+        )
+        parent_disclosed_tool_names = set(
+            getattr(parent_ctx, "disclosed_tool_names", set()) or set()
+        )
         parent_run_context = getattr(parent_ctx, "sandbox_run_context", None)
         if isinstance(parent_run_context, RunContext):
             parent_run_context = run_context_for_subagent(parent_run_context)
         parent_sandbox_mounts = [
             dict(item)
             for item in (getattr(parent_ctx, "sandbox_mounts", None) or [])
-            if isinstance(item, dict)
-            and normalize_scope(item.get("scope"), "chat") != "once"
+            if isinstance(item, dict) and normalize_scope(item.get("scope"), "chat") != "once"
         ]
         parent_run_mode = getattr(parent_ctx, "run_mode", None)
         if parent_run_mode is None:
             run_context_mode = getattr(parent_run_context, "run_mode", None)
             parent_run_mode = getattr(run_context_mode, "value", run_context_mode)
         parent_elevated = getattr(parent_ctx, "elevated", None)
-        if parent_run_mode not in {"standard", "trusted", "full"}:
+        if parent_run_mode is not None:
+            from opensquilla.run_mode import normalize_run_mode
+
+            try:
+                parent_run_mode = normalize_run_mode(parent_run_mode).value
+            except ValueError:
+                parent_run_mode = None
+        if parent_run_mode is None:
             if parent_elevated == "full":
                 parent_run_mode = "full"
             elif parent_elevated in {"on", "bypass"}:
-                parent_run_mode = "trusted"
+                parent_run_mode = "safe"
             else:
                 parent_run_mode = None
 
@@ -16543,14 +17764,10 @@ class Agent:
                     else None
                 ),
                 session_id=(
-                    parent_usage_context.session_id
-                    if parent_usage_context is not None
-                    else None
+                    parent_usage_context.session_id if parent_usage_context is not None else None
                 ),
                 session_epoch=(
-                    parent_usage_context.session_epoch
-                    if parent_usage_context is not None
-                    else 0
+                    parent_usage_context.session_epoch if parent_usage_context is not None else 0
                 ),
                 agent_id=(
                     parent_usage_context.agent_id
@@ -16574,6 +17791,12 @@ class Agent:
             channel_id=f"subagent:{parent_session_key}",
             sender_id=parent_session_key,
             denied_tools=set(SUBAGENT_TOOL_DENY),
+            allowed_tools=(
+                set(parent_authorized_tool_names)
+                if parent_authorized_tool_names is not None
+                else None
+            ),
+            disclosed_tool_names=parent_disclosed_tool_names - set(SUBAGENT_TOOL_DENY),
             run_mode=parent_run_mode,
             sandbox_mounts=parent_sandbox_mounts,
             sandbox_run_context=parent_run_context,
@@ -16582,14 +17805,37 @@ class Agent:
             tool_result_store_session_id=(
                 self.config.tool_result_store_session_id or parent_session_key
             ),
-            source_diff_preservation_mode=self.config.source_diff_preservation_mode,
-            source_diff_candidate_mode=self.config.source_diff_candidate_mode,
+            tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
+            tool_result_store_disk_budget_bytes=self.config.tool_result_store_disk_budget_bytes,
+            tool_result_store_retention_seconds=self.config.tool_result_store_retention_seconds,
             tool_run_budget_key=(
                 f"subagent:{parent_session_key}:{subagent_label}:{depth}:{uuid.uuid4().hex}"
             ),
             on_runtime_event=self._record_tool_context_runtime_event
             if self.config.runtime_events_path
             else None,
+            sandbox_policy=(
+                self._tool_context.sandbox_policy if self._tool_context is not None else None
+            ),
+        )
+        if self._tool_registry is not None and parent_authorized_tool_names is not None:
+            from opensquilla.tools.filter import filter_tools
+
+            child_authorized_definitions = filter_tools(
+                self._tool_registry.to_tool_definitions(subagent_ctx),
+                allow=subagent_ctx.allowed_tools,
+                deny=subagent_ctx.denied_tools,
+            )
+            filtered_defs = self._tool_registry.to_model_tool_definitions(
+                child_authorized_definitions,
+                subagent_ctx,
+            )
+        self._prepare_subagent_execution_task(
+            spec,
+            execution_id=child_execution_id,
+            child_target=child_target,
+            child_context=subagent_ctx,
+            child_tool_definitions=filtered_defs,
         )
 
         async def _subagent_tool_handler(tc: ToolCall) -> ToolResult:
@@ -16613,11 +17859,30 @@ class Agent:
                 finally:
                     current_tool_context.reset(token)
 
+        setattr(
+            _subagent_tool_handler,
+            "_opensquilla_available_tools",
+            getattr(self._raw_tool_handler, "_opensquilla_available_tools", frozenset()),
+        )
+        parent_explicit_request_cap = max(
+            0,
+            int(self.config.provider_request_proof_max_chars or 0),
+        )
+        child_provider_request_max_chars = child_target.provider_request_max_chars
+        if (
+            self.config.provider_request_proof_max_chars_explicit
+            and parent_explicit_request_cap > 0
+        ):
+            child_provider_request_max_chars = min(
+                child_provider_request_max_chars,
+                parent_explicit_request_cap,
+            )
         child_cfg = AgentConfig(
             max_iterations=spec.max_iterations,
             timeout=spec.timeout,
-            provider_id=self.config.provider_id,
-            max_tokens=self.config.max_tokens,
+            provider_id=child_target.provider_id,
+            model_id=child_target.model_id or self.config.model_id,
+            max_tokens=child_target.max_output_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
             max_turn_llm_calls=self.config.max_turn_llm_calls,
@@ -16627,133 +17892,63 @@ class Agent:
             max_turn_cost_usd=self.config.max_turn_cost_usd,
             max_turn_tool_errors=self.config.max_turn_tool_errors,
             length_capped_continuations=self.config.length_capped_continuations,
-            context_window_tokens=self.config.context_window_tokens,
+            context_window_tokens=child_target.context_window_tokens,
+            context_window_known=child_target.context_window_known,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
-            flush_enabled=self.config.flush_enabled,
-            flush_triggers=list(self.config.flush_triggers),
-            flush_pre_compaction=self.config.flush_pre_compaction,
-            flush_timeout_seconds=self.config.flush_timeout_seconds,
-            flush_background_timeout_seconds=self.config.flush_background_timeout_seconds,
-            flush_backoff_initial_seconds=self.config.flush_backoff_initial_seconds,
-            flush_backoff_max_seconds=self.config.flush_backoff_max_seconds,
-            flush_archive_max_bytes=self.config.flush_archive_max_bytes,
-            flush_compaction_requires_safe_receipt=(
-                self.config.flush_compaction_requires_safe_receipt
-            ),
-            flush_compaction_safety_mode=self.config.flush_compaction_safety_mode,
             compaction_profile=self.config.compaction_profile,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
+            compaction_total_timeout_seconds=self.config.compaction_total_timeout_seconds,
+            compaction_heartbeat_interval_seconds=(
+                self.config.compaction_heartbeat_interval_seconds
+            ),
             tool_result_projection_max_inline_chars=(
                 self.config.tool_result_projection_max_inline_chars
             ),
-            tool_result_fresh_diagnostic_policy_enabled=(
-                self.config.tool_result_fresh_diagnostic_policy_enabled
-            ),
-            tool_result_diagnostic_retrieval_gate_enabled=(
-                self.config.tool_result_diagnostic_retrieval_gate_enabled
-            ),
-            tool_result_fresh_diagnostic_inline_max_chars=(
-                self.config.tool_result_fresh_diagnostic_inline_max_chars
-            ),
             tool_result_dispatch_max_chars=self.config.tool_result_dispatch_max_chars,
-            tool_result_dispatch_turn_max_chars=(
-                self.config.tool_result_dispatch_turn_max_chars
-            ),
+            tool_result_dispatch_turn_max_chars=(self.config.tool_result_dispatch_turn_max_chars),
             tool_result_provider_request_max_chars=(
                 self.config.tool_result_provider_request_max_chars
             ),
-            provider_request_proof_max_chars=self.config.provider_request_proof_max_chars,
+            provider_request_proof_max_chars=child_provider_request_max_chars,
+            provider_request_proof_max_chars_explicit=(
+                self.config.provider_request_proof_max_chars_explicit
+            ),
+            context_window_tokens_global_override=(
+                self.config.context_window_tokens_global_override
+            ),
             tool_use_argument_provider_request_max_chars=(
                 self.config.tool_use_argument_provider_request_max_chars
             ),
             tool_use_argument_projection_enabled=(self.config.tool_use_argument_projection_enabled),
-            tool_failure_loop_block_threshold=(self.config.tool_failure_loop_block_threshold),
-            provider_context_block_feedback=self.config.provider_context_block_feedback,
-            identical_request_loop_break_threshold=(
-                self.config.identical_request_loop_break_threshold
-            ),
-            placeholder_escalation_threshold=self.config.placeholder_escalation_threshold,
-            deadline_wrapup_margin_seconds=self.config.deadline_wrapup_margin_seconds,
-            reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
-            deadline_thinking_off_margin_seconds=(
-                self.config.deadline_thinking_off_margin_seconds
-            ),
-            reasoning_stream_char_cap=self.config.reasoning_stream_char_cap,
-            patch_hygiene_block_mode=self.config.patch_hygiene_block_mode,
-            final_diff_salvage=self.config.final_diff_salvage,
-            endgame_git_freeze_margin_seconds=(
-                self.config.endgame_git_freeze_margin_seconds
-            ),
-            max_iterations_deadline_extend_seconds=(
-                self.config.max_iterations_deadline_extend_seconds
-            ),
-            final_diff_salvage_veto=self.config.final_diff_salvage_veto,
-            endgame_git_freeze_instrumentation_exempt=(
-                self.config.endgame_git_freeze_instrumentation_exempt
-            ),
-            deadline_wrapup_sticky_thinking_off=(
-                self.config.deadline_wrapup_sticky_thinking_off
-            ),
-            endgame_fix_directive_margin_seconds=(
-                self.config.endgame_fix_directive_margin_seconds
-            ),
             reasoning_only_act_now=self.config.reasoning_only_act_now,
-            mid_budget_no_diff_nudge=self.config.mid_budget_no_diff_nudge,
-            repeated_tool_call_recovery_threshold=(
-                self.config.repeated_tool_call_recovery_threshold
-            ),
-            repeated_tool_call_recovery_extra_tools=(
-                self.config.repeated_tool_call_recovery_extra_tools
-            ),
-            provider_history_dedup_enabled=self.config.provider_history_dedup_enabled,
-            provider_history_dedup_min_repeats=(
-                self.config.provider_history_dedup_min_repeats
-            ),
-            projection_signal_hints=self.config.projection_signal_hints,
-            progress_watchdog_mode=self.config.progress_watchdog_mode,
-            progress_watchdog_repeated_tool_error_threshold=(
-                self.config.progress_watchdog_repeated_tool_error_threshold
-            ),
-            progress_watchdog_repeated_provider_failure_threshold=(
-                self.config.progress_watchdog_repeated_provider_failure_threshold
-            ),
-            progress_watchdog_repeated_failure_anchor_threshold=(
-                self.config.progress_watchdog_repeated_failure_anchor_threshold
-            ),
-            post_write_convergence_enabled=self.config.post_write_convergence_enabled,
-            post_write_convergence_warn_threshold=(
-                self.config.post_write_convergence_warn_threshold
-            ),
-            post_write_convergence_finalize_after_warning=(
-                self.config.post_write_convergence_finalize_after_warning
-            ),
-            tool_loop_observer_mode=self.config.tool_loop_observer_mode,
             runtime_recovery_mode=self.config.runtime_recovery_mode,
-            runtime_recovery_source_loop_max_nudges=(
-                self.config.runtime_recovery_source_loop_max_nudges
-            ),
-            runtime_state_capsule_mode=self.config.runtime_state_capsule_mode,
             post_tool_empty_recovery_mode=self.config.post_tool_empty_recovery_mode,
-            text_only_tool_recovery_mode=self.config.text_only_tool_recovery_mode,
             reasoning_prefill_recovery_mode=self.config.reasoning_prefill_recovery_mode,
             runtime_events_path=self.config.runtime_events_path,
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
             tool_result_external_keep_recent=self.config.tool_result_external_keep_recent,
             tool_result_store_dir=self.config.tool_result_store_dir,
-            tool_result_store_session_id=self.config.tool_result_store_session_id,
-            tool_result_store_session_key=self.config.tool_result_store_session_key,
-            tool_result_store_agent_id=self.config.tool_result_store_agent_id,
+            # Rebind Store identity to the child's live ToolContext. Dispatch
+            # snapshots, Agent projections, verifier scope, and retrieval must
+            # all address the same session bucket and principal.
+            tool_result_store_session_id=subagent_ctx.tool_result_store_session_id,
+            tool_result_store_session_key=subagent_ctx.session_key,
+            tool_result_store_agent_id=subagent_ctx.agent_id,
             tool_result_store_full_trace=self.config.tool_result_store_full_trace,
             tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
             tool_result_store_disk_budget_bytes=(self.config.tool_result_store_disk_budget_bytes),
             tool_result_store_retention_seconds=(self.config.tool_result_store_retention_seconds),
+            model_capabilities=child_target.model_capabilities,
+            model_vision_support=child_target.model_vision_support,
+            compaction_execution_plan=child_target.compaction_plan,
         )
         return Agent(
-            provider=self.provider,
+            provider=child_target.provider,
             config=child_cfg,
             tool_definitions=filtered_defs,
             tool_handler=_subagent_tool_handler,
             subagent_manager=SubagentManager(spawn_depth=depth),
+            tool_registry=self._tool_registry,
             tool_context=subagent_ctx,
             usage_event_sink=self._usage_event_sink,
             usage_execution_context=child_usage_context,

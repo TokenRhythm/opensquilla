@@ -19,7 +19,7 @@ from opensquilla.paths import state_dir
 
 VALID_APPROVAL_MODES = frozenset({"auto-approve", "auto-deny", "prompt"})
 VALID_ELEVATED_MODES = frozenset({"on", "bypass", "full"})
-VALID_RUN_MODES = frozenset({"standard", "trusted", "full"})
+VALID_RUN_MODES = frozenset({"safe", "full"})
 
 
 def _native_db_path(path: str | Path) -> str:
@@ -89,7 +89,16 @@ class PendingApproval:
     _event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
-_DEFAULT_APPROVAL_QUEUE_PATH = state_dir("approval_queue.sqlite")
+_DEFAULT_APPROVAL_QUEUE_PATH: Path | None = None
+
+
+def _default_approval_queue_path() -> Path:
+    """Resolve the default after runtime state configuration is finalized."""
+
+    if _DEFAULT_APPROVAL_QUEUE_PATH is not None:
+        return Path(_DEFAULT_APPROVAL_QUEUE_PATH)
+    return state_dir("approval_queue.sqlite")
+
 
 # Listener signature: (event, info) where event is "requested" or "resolved"
 # and info mirrors ``ApprovalQueue.status()`` for the affected approval.
@@ -118,7 +127,9 @@ class ApprovalQueue:
         self._session_run_modes: dict[str, str] = {}
         self._event_listeners: list[ApprovalEventListener] = []
 
-        self._db_path = Path(db_path or os.fspath(_DEFAULT_APPROVAL_QUEUE_PATH))
+        self._db_path = (
+            Path(db_path) if db_path else _default_approval_queue_path()
+        )
         native_db_path = _native_db_path(self._db_path)
         os.makedirs(os.path.dirname(native_db_path) or os.curdir, exist_ok=True)
         self._conn = sqlite3.connect(
@@ -653,6 +664,7 @@ class ApprovalQueue:
         *,
         elevated_mode: str | None = None,
         allow_idempotent: bool = True,
+        resolution_metadata: dict | None = None,
     ) -> None:
         self._release_stale_claims()
         self._conn.execute("BEGIN IMMEDIATE")
@@ -673,16 +685,31 @@ class ApprovalQueue:
                 return
             raise ValueError(f"Approval already resolved: {approval_id}")
 
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET resolved = 1, approved = ?, resolution = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-            (
-                1 if approved else 0,
-                RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
-                approval_id,
-            ),
-        )
+        if resolution_metadata:
+            merged_params = dict(entry.params)
+            merged_params.update(resolution_metadata)
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = ?, resolution = ?, params = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    1 if approved else 0,
+                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                    self._serialize_params(merged_params),
+                    approval_id,
+                ),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = ?, resolution = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    1 if approved else 0,
+                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                    approval_id,
+                ),
+            )
         if cursor.rowcount != 1:
             self._conn.rollback()
             entry = self.get(approval_id)
@@ -705,7 +732,12 @@ class ApprovalQueue:
 
         del elevated_mode
 
-    def claim_resolution(self, approval_id: str) -> str:
+    def claim_resolution(
+        self,
+        approval_id: str,
+        *,
+        resolution_metadata: dict | None = None,
+    ) -> str:
         self._release_stale_claims()
         token = uuid.uuid4().hex
         now = time.time()
@@ -724,12 +756,27 @@ class ApprovalQueue:
             self._pending[approval_id] = entry
             entry._event.set()
             raise ValueError(f"Approval already resolved: {approval_id}")
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET claim_token = ?, claim_started_at = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-            (token, now, approval_id),
-        )
+        if resolution_metadata:
+            merged_params = dict(entry.params)
+            merged_params.update(resolution_metadata)
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = ?, claim_started_at = ?, params = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    token,
+                    now,
+                    self._serialize_params(merged_params),
+                    approval_id,
+                ),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = ?, claim_started_at = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (token, now, approval_id),
+            )
         if cursor.rowcount != 1:
             self._conn.rollback()
             entry = self.get(approval_id)
@@ -981,7 +1028,7 @@ class ApprovalQueue:
             return
         if mode not in VALID_ELEVATED_MODES:
             raise ValueError("mode must be one of: on, bypass, full, off")
-        self.set_run_mode(key, "full" if mode == "full" else "trusted")
+        self.set_run_mode(key, "full" if mode == "full" else "safe")
 
     def get_elevated_mode(self, session_key: str | None) -> str | None:
         """Legacy compatibility wrapper returning only full host access."""
@@ -995,9 +1042,13 @@ class ApprovalQueue:
         if mode in (None, "", "off"):
             self._session_run_modes.pop(key, None)
             return
-        if mode not in VALID_RUN_MODES:
-            raise ValueError("mode must be one of: full, standard, trusted, off")
-        self._session_run_modes[key] = mode
+        from opensquilla.run_mode import normalize_run_mode
+
+        try:
+            normalized = normalize_run_mode(mode).value
+        except ValueError as exc:
+            raise ValueError("mode must be one of: safe, full, off") from exc
+        self._session_run_modes[key] = normalized
 
     def get_run_mode(self, session_key: str | None) -> str | None:
         key = (session_key or "").strip()
@@ -1088,7 +1139,7 @@ def reset_approval_queue() -> None:
         _queue.close()
         _queue = None
     else:
-        path = _DEFAULT_APPROVAL_QUEUE_PATH
+        path = _default_approval_queue_path()
     if os.fspath(path) == ":memory:":
         return
     try:

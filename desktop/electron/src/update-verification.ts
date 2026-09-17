@@ -149,7 +149,7 @@ export async function streamResponseToVerifiedFile(
   const actual = digest.digest('hex')
   if (actual !== expected) {
     await rm(temporaryPath, { force: true }).catch(() => {})
-    return integrityFailure(`The installer SHA256 did not match the canonical GitHub checksum.`)
+    return integrityFailure(`The installer SHA256 did not match the canonical checksum.`)
   }
 
   try {

@@ -1,17 +1,19 @@
 import { describe, it, expect } from 'vitest'
+import i18n from '@/i18n'
+import zhHans from '@/locales/zh-Hans.json'
 import {
   arrangeSidebarSections,
-  normalizeSessionItem,
   type SessionItem,
   type SidebarSection,
 } from './useSessions'
-import type { RawSessionItem } from '@/types/rpc'
+import { normalizeV4SessionItem } from '@/adapters/gateway/sessionDirectoryV4'
+import type { SessionRow } from '@/contracts/generated/v4/sessionsList'
 
 // Build real SessionItems through the production normalizer so the test
 // exercises the same sessionKind/surface/parent derivation the sidebar sees,
 // rather than hand-rolling the normalized shape.
-function session(raw: RawSessionItem): SessionItem {
-  const item = normalizeSessionItem(raw)
+function session(raw: SessionRow): SessionItem {
+  const item = normalizeV4SessionItem(raw)
   if (!item) throw new Error(`fixture did not normalize: ${JSON.stringify(raw)}`)
   return item
 }
@@ -21,6 +23,37 @@ function sectionFor(sections: SidebarSection[], family: SidebarSection['family']
   if (!found) throw new Error(`missing section: ${family}`)
   return found
 }
+
+describe('normalizeSessionItem subagent titles', () => {
+  it('keeps a durable task title and preserves the legacy grounding-prompt fallback', () => {
+    expect(session({
+      key: 'agent:main:subagent:new',
+      sessionKind: 'task',
+      title: 'Analyze checkout failures',
+    }).title).toBe('Analyze checkout failures')
+
+    expect(session({
+      key: 'agent:main:subagent:legacy',
+      sessionKind: 'task',
+      title: 'You are a subagent. Execute the delegated task',
+    }).title).toBe('Subagent task')
+  })
+
+  it('localizes the generic title returned for legacy task rows', () => {
+    i18n.global.setLocaleMessage('zh-Hans', zhHans)
+    i18n.global.locale.value = 'zh-Hans'
+    try {
+      expect(session({
+        key: 'agent:main:subagent:legacy-generic',
+        sessionKind: 'task',
+        title: 'Subagent task',
+      }).title).toBe('子智能体任务')
+    }
+    finally {
+      i18n.global.locale.value = 'en'
+    }
+  })
+})
 
 describe('arrangeSidebarSections — family bucketing', () => {
   it('buckets chat, channel, and cron sessions into their families', () => {
@@ -126,7 +159,7 @@ describe('arrangeSidebarSections — subagent nesting', () => {
         key: 'agent:main:subagent:child',
         title: 'Subagent task',
         updatedAt: 150,
-        parent: { key: parentKey, title: 'Parent chat', spawnDepth: 1 },
+        parent: { key: parentKey, taskId: 'task-child', spawnDepth: 1 },
       }),
     ])
 
@@ -144,7 +177,7 @@ describe('arrangeSidebarSections — subagent nesting', () => {
         key: 'agent:main:subagent:orphan',
         title: 'Orphan task',
         updatedAt: 120,
-        parent: { key: 'agent:main:webchat:gone', title: 'Gone parent', spawnDepth: 1 },
+        parent: { key: 'agent:main:webchat:gone', taskId: 'task-orphan', spawnDepth: 1 },
       }),
     ])
 
@@ -154,22 +187,31 @@ describe('arrangeSidebarSections — subagent nesting', () => {
     expect(rows[0].depth).toBe(1)
   })
 
-  it('keeps a forked chat flat even when its parent is visible', () => {
+  it('keeps a numbered fork title flat while preserving the parent title', () => {
     const parentKey = 'agent:main:webchat:parent'
+    const parentTitle = 'Release planning notes'
     const sections = arrangeSidebarSections([
-      session({ key: parentKey, title: 'Parent chat', updatedAt: 100 }),
+      session({ key: parentKey, title: parentTitle, updatedAt: 100 }),
       session({
         key: 'agent:main:webchat:fork',
-        title: 'Forked chat',
+        title: `${parentTitle} (2)`,
         updatedAt: 200,
         forked_from_parent: true,
-        parent: { key: parentKey, title: 'Parent chat' },
+        parent: { key: parentKey, spawnDepth: 0 },
+      }),
+      session({
+        key: 'agent:main:webchat:fork-2',
+        title: `${parentTitle} (3)`,
+        updatedAt: 300,
+        forked_from_parent: true,
+        parent: { key: parentKey, spawnDepth: 0 },
       }),
     ])
 
     expect(sectionFor(sections, 'chats').rows.map(row => ({ title: row.title, depth: row.depth }))).toEqual([
-      { title: 'Forked chat', depth: 0 },
-      { title: 'Parent chat', depth: 0 },
+      { title: `${parentTitle} (3)`, depth: 0 },
+      { title: `${parentTitle} (2)`, depth: 0 },
+      { title: parentTitle, depth: 0 },
     ])
   })
 })
@@ -184,7 +226,7 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         workspace: '/repo/project1',
         workspaceLabel: 'project1',
         workspaceDisplayPath: '/repo/project1',
-      } as RawSessionItem),
+      } as SessionRow),
       session({
         key: 'agent:main:webchat:project1-session2',
         title: 'Session 2',
@@ -192,7 +234,7 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         workspace: '/repo/project1',
         workspaceLabel: 'project1',
         workspaceDisplayPath: '/repo/project1',
-      } as RawSessionItem),
+      } as SessionRow),
       session({
         key: 'agent:main:webchat:project2-session3',
         title: 'Session 3',
@@ -200,7 +242,7 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         workspace: '/repo/project2',
         workspaceLabel: 'project2',
         workspaceDisplayPath: '/repo/project2',
-      } as RawSessionItem),
+      } as SessionRow),
       session({
         key: 'agent:main:webchat:session4',
         title: 'Session 4',
@@ -232,15 +274,15 @@ describe('arrangeSidebarSections — workspace grouping', () => {
         updatedAt: 200,
         workspace: '/repo/project',
         workspaceLabel: 'project',
-      } as RawSessionItem),
+      } as SessionRow),
       session({
         key: 'agent:main:subagent:workspace-child',
         title: 'Subagent task',
         updatedAt: 150,
         workspace: '/repo/project',
         workspaceLabel: 'project',
-        parent: { key: parentKey, title: 'Parent chat', spawnDepth: 1 },
-      } as RawSessionItem),
+        parent: { key: parentKey, taskId: 'task-workspace-child', spawnDepth: 1 },
+      } as SessionRow),
     ])
 
     expect(sectionFor(sections, 'chats').rows.map(r => ({

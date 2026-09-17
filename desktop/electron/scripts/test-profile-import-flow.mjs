@@ -1,11 +1,19 @@
 import { strict as assert } from 'node:assert'
 import { spawnSync } from 'node:child_process'
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -17,6 +25,8 @@ const importScreenshotDir = String(
     || (process.env.CI_REPORT_DIR ? join(process.env.CI_REPORT_DIR, 'profile-import-screenshots') : ''),
 ).trim()
 const SOURCE_CHAT = 'synthetic imported chat survives whole-profile transfer'
+const PROFILE_FIXTURE_TIMEOUT_MS = 120_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 async function waitFor(check, label, timeoutMs = 90_000) {
   const startedAt = Date.now()
   let lastError
@@ -32,14 +42,81 @@ async function waitFor(check, label, timeoutMs = 90_000) {
   throw new Error(`Timed out waiting for ${label}: ${lastError?.message || lastError || ''}`)
 }
 
+async function startFakeProvider() {
+  let mode = 'reject'
+  const requests = []
+  const server = createServer((request, response) => {
+    const body = []
+    request.on('data', (chunk) => body.push(chunk))
+    request.on('end', () => {
+      requests.push({
+        method: request.method,
+        url: request.url,
+        authorization: request.headers.authorization || '',
+        body: Buffer.concat(body).toString('utf8'),
+      })
+      if (mode === 'reject') {
+        response.writeHead(401, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          error: {
+            message: 'Synthetic imported credential rejected.',
+            type: 'authentication_error',
+            code: 'invalid_api_key',
+          },
+        }))
+        return
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end([
+        'data: {"id":"chatcmpl-import-test","object":"chat.completion.chunk","created":0,"model":"synthetic-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
+        '',
+        'data: {"id":"chatcmpl-import-test","object":"chat.completion.chunk","created":0,"model":"synthetic-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}',
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'))
+    })
+  })
+  const connections = trackHttpServerConnections(server)
+  await new Promise((resolveListen, rejectListen) => {
+    const onError = (error) => rejectListen(error)
+    server.once('error', onError)
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', onError)
+      resolveListen()
+    })
+  })
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    setMode(nextMode) {
+      mode = nextMode
+    },
+    close: () => closeHttpServerWithDeadline(server, connections, {
+      label: 'profile import fake provider shutdown',
+      timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    }),
+  }
+}
+
 function runPython(source, args) {
   const result = spawnSync('uv', ['run', 'python', '-c', source, ...args], {
     cwd: repoRoot,
     encoding: 'utf8',
     env: { ...process.env, UV_CACHE_DIR: join(tmpdir(), 'opensquilla-profile-import-uv-cache') },
+    timeout: PROFILE_FIXTURE_TIMEOUT_MS,
+    killSignal: 'SIGTERM',
+    maxBuffer: 4 * 1024 * 1024,
   })
-  if (result.status !== 0) {
-    throw new Error(`Python fixture command failed: ${result.stderr || result.stdout}`)
+  if (result.error || result.signal || result.status !== 0) {
+    const outcome = result.error?.code === 'ETIMEDOUT'
+      ? `timed out after ${PROFILE_FIXTURE_TIMEOUT_MS}ms`
+      : `status=${result.status ?? 'null'} signal=${result.signal ?? 'null'}`
+    throw new Error(
+      `Python fixture command failed (${outcome}): ${result.stderr || result.stdout}`,
+    )
   }
   return result.stdout.trim()
 }
@@ -186,6 +263,7 @@ function launchEnvironment(isolatedHome, port) {
     OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
     OPENSQUILLA_DESKTOP_GATEWAY_PORT: String(port),
     OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
+    OPENSQUILLA_TESTING: '1',
     OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
     UV_CACHE_DIR: join(isolatedHome, '.uv-cache'),
     HTTP_PROXY: 'http://127.0.0.1:1',
@@ -221,6 +299,11 @@ async function onboardingPage(app) {
   }, 'Desktop onboarding')
 }
 
+async function assertUnifiedTelemetryNotice(page) {
+  assert.equal(await page.locator('input[name="reliabilityDiagnosticsEnabled"], input[name="productAnalyticsEnabled"]').count(), 0)
+  assert.equal(await page.locator('[data-i18n="onboarding.telemetry.notice"]').count(), 1)
+}
+
 async function captureOnboarding(app, path) {
   const base64 = await app.evaluate(async ({ BrowserWindow }) => {
     const window = BrowserWindow.getAllWindows().find((candidate) => (
@@ -253,11 +336,16 @@ async function controlPage(app) {
       await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
       let pathname = ''
       try { pathname = new URL(page.url()).pathname } catch { pathname = '' }
-      if (!['/control/chat', '/control/chat/new'].includes(pathname)) continue
+      if (!page.url().startsWith('opensquilla-app://desktop/')) continue
+      if (!['/chat', '/chat/new'].includes(pathname)) continue
+      const connection = await page.evaluate(
+        () => window.opensquillaDesktop?.getGatewayConnection?.(),
+      ).catch(() => null)
+      if (connection?.status !== 'ready') continue
       if (await page.locator('.chat-textarea').count().catch(() => 0)) return page
     }
     return null
-  }, 'Desktop Control UI', 120_000)
+  }, 'Desktop renderer', 120_000)
 }
 
 async function selectOllamaAndCompleteOnboarding(page) {
@@ -269,6 +357,7 @@ async function selectOllamaAndCompleteOnboarding(page) {
   if (!(await page.locator('#model').inputValue()).trim()) {
     await page.locator('#model').fill('synthetic-local-model')
   }
+  await assertUnifiedTelemetryNotice(page)
   await page.locator('#finish').click()
 }
 
@@ -284,6 +373,38 @@ with sqlite3.connect(Path(sys.argv[1]) / "state" / "sessions.db") as connection:
 
 const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-profile-import-e2e-')))
 let app = null
+let fakeProvider = null
+let activeAppUserData = null
+
+async function closeActiveApp(phase, { failOnError = true } = {}) {
+  if (!app) return
+  const targetApp = app
+  const profileUserData = activeAppUserData
+  app = null
+  activeAppUserData = null
+  const desktopLogPath = join(profileUserData, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdown = await closeElectronWithDeadline({
+    app: targetApp,
+    phase,
+    timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+  })
+  if (!shutdown.error) return
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+  if (canAcceptWindowsElectronShutdownFallback({
+    shutdown,
+    ...shutdownEvidence,
+  })) {
+    console.warn(JSON.stringify({
+      event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+      phase,
+    }))
+    return
+  }
+  if (failOnError) throw shutdown.error
+}
+
 try {
   if (importScreenshotDir) await mkdir(importScreenshotDir, { recursive: true })
 
@@ -295,13 +416,13 @@ try {
   seedProfile(cliOnlySource, SOURCE_IDENTITY, SOURCE_CHAT)
   const cliOnlySourceBefore = await snapshotTree(cliOnlySource)
   app = await launchDesktop(cliOnlyUserData, cliOnlyHome, 18921)
+  activeAppUserData = cliOnlyUserData
   let page = await onboardingPage(app)
   await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
   assert.equal(await page.locator('[data-screen="0"]').count(), 0)
   assert.equal(await page.locator('[data-screen="5"]').count(), 0)
   assert.deepEqual(await snapshotTree(cliOnlySource), cliOnlySourceBefore)
-  await app.close()
-  app = null
+  await closeActiveApp('cli-only-electron-shutdown')
 
   if (process.platform === 'win32') {
     const portableHome = join(root, 'portable-home')
@@ -328,6 +449,7 @@ try {
     // only after the user opens the Settings migration surface.
     const settingsOnlyUserData = join(root, 'portable-settings-only-user-data')
     app = await launchDesktop(settingsOnlyUserData, portableHome, 18925)
+    activeAppUserData = settingsOnlyUserData
     page = await onboardingPage(app)
     await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
     assert.equal(await page.locator('[data-screen="0"]').count(), 0)
@@ -349,8 +471,7 @@ try {
       portableSources.candidates.some((candidate) => candidate.path === tempPortable),
       true,
     )
-    await app.close()
-    app = null
+    await closeActiveApp('portable-settings-only-electron-shutdown')
     assert.deepEqual(await snapshotTree(localPortable), localPortableBefore)
     assert.deepEqual(await snapshotTree(tempPortable), tempPortableBefore)
 
@@ -368,6 +489,7 @@ try {
   const targetSessionsBefore = await readFile(join(target, 'state', 'sessions.db'))
   const targetConfigBefore = await readFile(join(target, 'config.toml'))
   app = await launchDesktop(userData, importHome, 18922)
+  activeAppUserData = userData
   page = await onboardingPage(app)
   await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
   assert.equal(await page.locator('[data-screen="0"]').count(), 0)
@@ -386,11 +508,11 @@ try {
   assert.deepEqual(await readFile(join(target, 'state', 'sessions.db')), targetSessionsBefore)
   assert.deepEqual(await snapshotTree(join(target, 'workspace')), targetWorkspaceBefore)
   assert.equal((await readdir(userData)).some((name) => name.startsWith('opensquilla.backup.')), false)
-  await app.close()
-  app = null
+  await closeActiveApp('existing-profile-electron-shutdown')
 
   // Settings import with a required key must release exclusive admission before
   // onboarding, preserve source config bytes, and retain the previous credential.
+  fakeProvider = await startFakeProvider()
   const settingsHome = join(root, 'settings-home')
   const settingsSource = join(settingsHome, '.opensquilla')
   const settingsUserData = join(root, 'settings-user-data')
@@ -400,7 +522,7 @@ try {
   await writeProviderProfileConfig(settingsSource, {
     provider: 'openai',
     model: 'gpt-5.4-mini',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: fakeProvider.baseUrl,
     apiKeyEnv: 'OPENAI_API_KEY',
     searchProvider: 'brave',
     searchApiKeyEnv: 'BRAVE_API_KEY',
@@ -415,7 +537,7 @@ try {
   await writeProviderProfileConfig(settingsTarget, {
     provider: 'openai',
     model: 'synthetic-old-target-model',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: fakeProvider.baseUrl,
     apiKeyEnv: 'OPENAI_API_KEY',
     routerEnabled: true,
     disableNetworkObservability: false,
@@ -423,11 +545,12 @@ try {
   const oldCredential = await seedDesktopCredential(settingsUserData, {
     provider: 'openai',
     model: 'synthetic-old-target-model',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: fakeProvider.baseUrl,
     apiKeyEnv: 'OPENAI_API_KEY',
     apiKey: 'synthetic-old-target-key',
   })
   app = await launchDesktop(settingsUserData, settingsHome, 18924)
+  activeAppUserData = settingsUserData
   const settingsControl = await controlPage(app)
   const settingsPreview = await settingsControl.evaluate(async (sourcePath) => (
     await window.opensquillaDesktop.migrationSummary({ source: sourcePath })
@@ -453,6 +576,7 @@ try {
   })
   assert.equal(await requiredKeyOnboarding.locator('#provider').inputValue(), 'openai')
   assert.equal(await requiredKeyOnboarding.locator('#model').inputValue(), 'gpt-5.4-mini')
+  assert.equal(await requiredKeyOnboarding.locator('#baseUrl').inputValue(), fakeProvider.baseUrl)
   const importedConfigBeforeCredential = await readFile(join(settingsTarget, 'config.toml'))
   assert.match(importedConfigBeforeCredential.toString('utf8'), /search_provider = "brave"/)
   assert.match(importedConfigBeforeCredential.toString('utf8'), /confidence_threshold = 0\.77/)
@@ -460,7 +584,40 @@ try {
     importedConfigBeforeCredential.toString('utf8'),
     /disable_network_observability = true/,
   )
+  const credentialBeforeRejectedProbe = await readFile(
+    join(settingsUserData, 'desktop-credential.json'),
+  ).catch(() => null)
+  const pendingBeforeRejectedProbe = await readFile(
+    join(settingsUserData, 'migration-provider-setup.json'),
+  )
   await requiredKeyOnboarding.locator('#apiKey').fill('synthetic-new-imported-key')
+  await assertUnifiedTelemetryNotice(requiredKeyOnboarding)
+  await requiredKeyOnboarding.locator('#finish').click()
+
+  const rejectedProbeError = await waitFor(async () => {
+    const error = (await requiredKeyOnboarding.locator('#error').innerText()).trim()
+    const ready = await requiredKeyOnboarding.locator('#setup-form').getAttribute('aria-busy')
+      === 'false'
+    return error && ready && !await requiredKeyOnboarding.locator('#finish').isDisabled()
+      ? error
+      : null
+  }, 'rejected imported credential probe')
+  assert.match(rejectedProbeError, /401|authentication|credential|API key/i)
+  assert.equal(rejectedProbeError.includes('synthetic-new-imported-key'), false)
+  assert.deepEqual(
+    await readFile(join(settingsUserData, 'desktop-credential.json')).catch(() => null),
+    credentialBeforeRejectedProbe,
+    'rejected provider probe wrote imported credential',
+  )
+  assert.deepEqual(
+    await readFile(join(settingsUserData, 'migration-provider-setup.json')),
+    pendingBeforeRejectedProbe,
+    'rejected provider probe cleared the pending adoption marker',
+  )
+  assert.deepEqual(await readFile(join(settingsTarget, 'config.toml')), importedConfigBeforeCredential)
+  assert.deepEqual(await readFile(join(settingsTarget, '.env')), importedEnvBytes)
+
+  fakeProvider.setMode('success')
   await requiredKeyOnboarding.locator('#finish').click()
 
   const adopted = await waitFor(async () => {
@@ -479,10 +636,26 @@ try {
     Buffer.from(adopted.encryptedApiKey, 'base64').toString('utf8'),
     'synthetic-new-imported-key',
   )
-  assert.deepEqual(
-    await readFile(join(settingsTarget, 'config.toml')),
-    importedConfigBeforeCredential,
-    'provider adoption rewrote imported config.toml',
+  assert.equal(fakeProvider.requests.length, 2)
+  assert.equal(fakeProvider.requests[0].method, 'POST')
+  assert.equal(fakeProvider.requests[0].url, '/v1/chat/completions')
+  assert.equal(
+    fakeProvider.requests[0].authorization,
+    'Bearer synthetic-new-imported-key',
+  )
+  assert.equal(JSON.parse(fakeProvider.requests[0].body).model, 'gpt-5.4-mini')
+  assert.equal(fakeProvider.requests[1].method, 'POST')
+  assert.equal(fakeProvider.requests[1].url, '/v1/chat/completions')
+  assert.equal(
+    fakeProvider.requests[1].authorization,
+    'Bearer synthetic-new-imported-key',
+  )
+  assert.equal(JSON.parse(fakeProvider.requests[1].body).model, 'gpt-5.4-mini')
+  const adoptedConfig = await readFile(join(settingsTarget, 'config.toml'), 'utf8')
+  assert.equal(
+    adoptedConfig,
+    importedConfigBeforeCredential.toString('utf8'),
+    'provider adoption must preserve the imported reporting configuration',
   )
   assert.deepEqual(
     await readFile(join(settingsTarget, '.env')),
@@ -501,6 +674,7 @@ try {
     await readFile(join(settingsUserData, settingsBackups[0], 'workspace', 'IDENTITY.md'), 'utf8'),
     TARGET_IDENTITY,
   )
+  assert.equal(Object.hasOwn(adopted, 'routerPresetBinding'), false)
   const credentialBackup = join(
     settingsUserData,
     `desktop-credential.import-backup.${adopted.importTransactionId}.json`,
@@ -509,8 +683,9 @@ try {
   if (process.platform !== 'win32') {
     assert.equal((await lstat(credentialBackup)).mode & 0o777, 0o600)
   }
-  await app.close()
-  app = null
+  await closeActiveApp('settings-import-electron-shutdown')
+  await fakeProvider.close()
+  fakeProvider = null
 
   console.log(JSON.stringify({
     cliDoesNotTriggerOnboardingTransfer: true,
@@ -524,6 +699,7 @@ try {
     primaryOnly: true,
   }, null, 2))
 } finally {
-  if (app) await app.close().catch(() => {})
+  await closeActiveApp('profile-import-final-shutdown', { failOnError: false })
+  if (fakeProvider) await fakeProvider.close().catch(() => {})
   await rm(root, { recursive: true, force: true })
 }

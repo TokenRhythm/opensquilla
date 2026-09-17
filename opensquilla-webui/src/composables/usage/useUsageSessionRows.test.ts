@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue'
+import { usageSession } from '@/testing/usage.test-helper'
 import { describe, expect, it } from 'vitest'
 import { useUsageSessionRows } from './useUsageSessionRows'
 
@@ -8,12 +9,10 @@ describe('useUsageSessionRows', () => {
       visibleSessions: computed(() => [{
         sessionKey: 'agent:main:webchat:private-id',
         title: 'Inspect the long-running launch readiness checklist and summarize risks',
-      }]),
+      }].map(usageSession)),
       rangeHiddenHint: computed(() => ''),
       sortCol: ref('updated_at'),
       sortAsc: ref(false),
-      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
-      numericRowVal: () => null,
       sessionTimestamp: () => null,
       relTime: () => '-',
       sortVal: () => 0,
@@ -24,5 +23,87 @@ describe('useUsageSessionRows', () => {
       'Inspect the long-running launch readiness checklist and summarize risks',
     )
     expect(sortedRows.value[0].sessionKey).toBe('agent:main:webchat:private-id')
+    expect(sortedRows.value[0].rowIdentity).toBe('agent:main:webchat:private-id')
+  })
+
+  it('keeps rows with multiple models expandable', () => {
+    const { sortedRows } = useUsageSessionRows({
+      visibleSessions: computed(() => [{
+        sessionKey: 'agent:main:webchat:multi-model',
+        modelBreakdown: [
+          { model: 'provider/primary-model' },
+          { model: 'provider/helper-model' },
+        ],
+      }].map(usageSession)),
+      rangeHiddenHint: computed(() => ''),
+      sortCol: ref('updated_at'),
+      sortAsc: ref(false),
+      sessionTimestamp: () => null,
+      relTime: () => '-',
+      sortVal: () => 0,
+      taskName: () => 'Multi-model task',
+    })
+
+    expect(sortedRows.value[0].hasModelBreakdown).toBe(true)
+  })
+
+  it('keeps same-label deleted sessions independently expandable', () => {
+    const { sortedRows } = useUsageSessionRows({
+      visibleSessions: computed(() => [
+        {
+          sessionKey: '',
+          sessionId: 'deleted-session-a',
+          modelBreakdown: [{ model: 'provider/a' }, { model: 'provider/b' }],
+        },
+        {
+          sessionKey: '',
+          sessionId: 'deleted-session-b',
+          modelBreakdown: [{ model: 'provider/a' }, { model: 'provider/b' }],
+        },
+      ].map(usageSession)),
+      rangeHiddenHint: computed(() => ''),
+      sortCol: ref('updated_at'),
+      sortAsc: ref(false),
+      sessionTimestamp: () => null,
+      relTime: () => '-',
+      sortVal: () => 0,
+      taskName: () => 'Untitled task',
+    })
+
+    expect(sortedRows.value.map(row => row.sessionLabel)).toEqual([
+      'Untitled task',
+      'Untitled task',
+    ])
+    expect(sortedRows.value.map(row => row.rowIdentity)).toEqual([
+      'deleted-session-a',
+      'deleted-session-b',
+    ])
+
+    const expandedSessions = new Set([sortedRows.value[0].rowIdentity])
+    expect(sortedRows.value.map(row => expandedSessions.has(row.rowIdentity))).toEqual([
+      true,
+      false,
+    ])
+  })
+
+  it('falls back to legacy non-empty session identities', () => {
+    const { sortedRows } = useUsageSessionRows({
+      visibleSessions: computed(() => [
+        { sessionKey: '', session: 'legacy-session' },
+        { sessionKey: 'legacy-key' },
+      ].map(usageSession)),
+      rangeHiddenHint: computed(() => ''),
+      sortCol: ref('updated_at'),
+      sortAsc: ref(false),
+      sessionTimestamp: () => null,
+      relTime: () => '-',
+      sortVal: () => 0,
+      taskName: () => 'Untitled task',
+    })
+
+    expect(sortedRows.value.map(row => row.rowIdentity)).toEqual([
+      'legacy-session',
+      'legacy-key',
+    ])
   })
 })

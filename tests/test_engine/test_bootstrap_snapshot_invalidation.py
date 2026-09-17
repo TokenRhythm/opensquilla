@@ -109,7 +109,7 @@ def test_unattended_bootstrap_context_skips_only_bootstrap_md(tmp_path) -> None:
     report = metadata["bootstrap_files"]
     filenames = {item.filename for item in report}  # type: ignore[attr-defined]
     assert "BOOTSTRAP.md" not in filenames
-    assert {"AGENTS.md", "SOUL.md", "IDENTITY.md", "TOOLS.md", "USER.md"} <= filenames
+    assert filenames == {"AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md"}
 
 
 def test_prompt_reports_the_effective_execution_workspace(tmp_path) -> None:
@@ -136,6 +136,10 @@ def test_prompt_reports_the_effective_execution_workspace(tmp_path) -> None:
     base_prompt = assembled[0] if isinstance(assembled, tuple) else assembled
     assert f"Working directory: {project_workspace}" in base_prompt
     assert f"Working directory: {default_workspace}" not in base_prompt
+
+
+
+
 
 
 def test_prompt_metadata_uses_effective_memory_retrieval_metadata(tmp_path) -> None:
@@ -327,8 +331,45 @@ def test_stateless_bootstrap_context_skips_persona_memory_and_bootstrap(tmp_path
 
     report = metadata["bootstrap_files"]
     filenames = {item.filename for item in report}  # type: ignore[attr-defined]
-    assert filenames == {"TOOLS.md"}
+    assert filenames == set()
     assert metadata["memory_md_present"] is False
+
+
+def test_guest_webchat_namespace_skips_host_bootstrap_and_private_memory(tmp_path) -> None:
+    for filename in (
+        "AGENTS.md",
+        "SOUL.md",
+        "IDENTITY.md",
+        "TOOLS.md",
+        "USER.md",
+        "MEMORY.md",
+        "HEARTBEAT.md",
+        "BOOTSTRAP.md",
+    ):
+        (tmp_path / filename).write_text(f"host secret from {filename}\n", encoding="utf-8")
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(
+            workspace_dir=str(tmp_path),
+            memory=SimpleNamespace(source="workspace"),
+            tools=SimpleNamespace(profile=None),
+        ),
+    )
+    metadata: dict[str, object] = {}
+    session_key = f"agent:main:webchat:guest:{'a' * 64}:browser-session"
+
+    assembled = runner._assemble_prompt(
+        "main",
+        [],
+        session_key=session_key,
+        prompt_metadata=metadata,
+    )
+
+    full_prompt = "\n".join(assembled) if isinstance(assembled, tuple) else assembled
+    assert "host secret" not in full_prompt
+    assert metadata["bootstrap_files"] == []
+    assert metadata["memory_md_present"] is False
+    assert metadata["memory_prompt_injection_skipped"] == "session-scope"
 
 
 def test_stateless_keep_project_rules_preserves_only_agents_md(tmp_path) -> None:
@@ -363,7 +404,7 @@ def test_stateless_keep_project_rules_preserves_only_agents_md(tmp_path) -> None
 
     report = metadata["bootstrap_files"]
     filenames = {item.filename for item in report}  # type: ignore[attr-defined]
-    assert filenames == {"AGENTS.md", "TOOLS.md"}
+    assert filenames == {"AGENTS.md"}
     assert metadata["memory_md_present"] is False
 
 
@@ -392,8 +433,5 @@ def test_full_and_unattended_bootstrap_snapshots_use_distinct_keys(tmp_path) -> 
     assert ("main", session_key, "unattended") in runner._bootstrap_snapshots
     full_snapshot = runner._bootstrap_snapshots[("main", session_key, "full")]
     unattended_snapshot = runner._bootstrap_snapshots[("main", session_key, "unattended")]
-    assert "BOOTSTRAP.md" in full_snapshot.workspace_files
-    assert (
-        "BOOTSTRAP.md"
-        not in unattended_snapshot.workspace_files
-    )
+    assert "BOOTSTRAP.md" not in full_snapshot.workspace_files
+    assert "BOOTSTRAP.md" not in unattended_snapshot.workspace_files

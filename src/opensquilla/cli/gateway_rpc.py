@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,22 +15,55 @@ from opensquilla.cli.output import emit_error
 from opensquilla.cli.url_utils import normalize_gateway_url
 
 
-def default_gateway_url() -> str:
-    """Return the configured gateway WebSocket URL."""
+@dataclass(frozen=True)
+class GatewayTarget:
+    """A Gateway URL paired with the config used for its credentials."""
+
+    url: str
+    config_path: str | Path | None = None
+    config_owns_target: bool = False
+
+
+def default_gateway_target() -> GatewayTarget:
+    """Resolve the default Gateway target and its configuration provenance."""
 
     if gateway_url := os.environ.get("OPENSQUILLA_GATEWAY_URL"):
-        return normalize_gateway_url(gateway_url)
+        return GatewayTarget(
+            normalize_gateway_url(gateway_url),
+            os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH") or None,
+        )
     if config_path := os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"):
-        return gateway_url_from_config(config_path)
+        return GatewayTarget(
+            gateway_url_from_config(config_path),
+            config_path,
+            config_owns_target=True,
+        )
+    try:
+        from opensquilla.cli.gateway_lifecycle import active_managed_gateway_target
+
+        if managed_target := active_managed_gateway_target():
+            return GatewayTarget(managed_target.url, managed_target.config_path)
+    except Exception:  # noqa: BLE001 - fall back to config-derived target.
+        pass
     try:
         from opensquilla.onboarding.config_store import resolve_config_path
 
         implicit_config_path, _source = resolve_config_path(None)
         if implicit_config_path.is_file():
-            return gateway_url_from_config(implicit_config_path)
+            return GatewayTarget(
+                gateway_url_from_config(implicit_config_path),
+                implicit_config_path,
+                config_owns_target=True,
+            )
     except Exception:  # noqa: BLE001 - fall back to release default.
         pass
-    return normalize_gateway_url("ws://localhost:18791/ws")
+    return GatewayTarget(normalize_gateway_url("ws://localhost:18791/ws"))
+
+
+def default_gateway_url() -> str:
+    """Return the configured gateway WebSocket URL."""
+
+    return default_gateway_target().url
 
 
 def _client_host(host: str) -> str:
@@ -56,19 +90,27 @@ def gateway_url_from_config(config_path: str | Path) -> str:
     return normalize_gateway_url(f"ws://{host}:{int(config.port)}/ws")
 
 
-def _target_gateway_url(
+def _target_gateway(
     *,
     gateway_url: str | None,
     config_path: str | Path | None,
-) -> str:
+) -> GatewayTarget:
     if gateway_url is not None:
-        return normalize_gateway_url(gateway_url)
+        return GatewayTarget(normalize_gateway_url(gateway_url), config_path)
     if config_path is not None:
-        return gateway_url_from_config(config_path)
-    return default_gateway_url()
+        return GatewayTarget(
+            gateway_url_from_config(config_path),
+            config_path,
+            config_owns_target=True,
+        )
+    return default_gateway_target()
 
 
-def default_gateway_token(config_path: str | Path | None = None) -> str | None:
+def default_gateway_token(
+    config_path: str | Path | None = None,
+    *,
+    discover_target: bool = True,
+) -> str | None:
     """Resolve the auth token used to connect to the gateway.
 
     Resolution order (matches the gateway's own config-loading
@@ -91,11 +133,17 @@ def default_gateway_token(config_path: str | Path | None = None) -> str | None:
     try:
         from opensquilla.gateway.config import GatewayConfig
 
-        effective_config_path = (
-            str(config_path)
-            if config_path is not None
-            else os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH", "").strip()
-        )
+        effective_config_path = str(config_path) if config_path is not None else ""
+        if not effective_config_path:
+            effective_config_path = os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH", "").strip()
+        if (
+            discover_target
+            and not effective_config_path
+            and not os.environ.get("OPENSQUILLA_GATEWAY_URL")
+        ):
+            target_config_path = default_gateway_target().config_path
+            if target_config_path is not None:
+                effective_config_path = str(target_config_path)
         cfg = GatewayConfig.load(effective_config_path or None)
         token = getattr(getattr(cfg, "auth", None), "token", None)
         if isinstance(token, str) and token.strip():
@@ -129,8 +177,11 @@ async def run_gateway_call(
 
     client = gateway_client_module.GatewayClient()
     try:
-        target_url = _target_gateway_url(gateway_url=gateway_url, config_path=config_path)
-        await client.connect(target_url, token=default_gateway_token(config_path))
+        target = _target_gateway(gateway_url=gateway_url, config_path=config_path)
+        await client.connect(
+            target.url,
+            token=default_gateway_token(target.config_path, discover_target=False),
+        )
         return await action(client)
     except SystemExit as exc:
         message = str(exc)

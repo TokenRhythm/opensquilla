@@ -1,0 +1,708 @@
+import { describe, expect, it, vi } from 'vitest'
+
+import type { ArtifactPayload } from '@/types/artifacts'
+import {
+  ARTIFACT_DOCUMENT_RPC_METHODS,
+  createRpcArtifactDocumentProvider,
+} from '@/adapters/gateway/artifactDocumentsV4'
+import {
+  createLegacyArtifactWorkspace,
+  isOfficeArtifact,
+  normalizeArtifactChangeSet,
+  normalizeArtifactDocument,
+  normalizeArtifactEditCapabilities,
+  normalizeArtifactRevision,
+} from './artifactDocumentProvider'
+
+type GenericRpcCall = <T = unknown>(
+  method: string,
+  params?: Record<string, unknown>,
+  options?: unknown,
+) => Promise<T>
+
+const officeArtifact: ArtifactPayload = {
+  id: 'artifact-office',
+  name: 'quarterly-plan.pptx',
+  mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  download_url: '/api/v1/artifacts/artifact-office',
+}
+
+describe('artifact document provider', () => {
+  it('uses a restored head included outside the latest hundred revisions', async () => {
+    const revision = (generation: number) => ({
+      id: `revision-${generation}`, documentId: 'document-html', generation,
+      artifactId: `artifact-${generation}`, sha256: 'a'.repeat(64),
+      name: 'page.html', mime: 'text/html', size: generation,
+      source: generation === 1 ? 'initial' : 'agent',
+    })
+    const revisionList = [
+      ...Array.from({ length: 100 }, (_, index) => revision(150 - index)),
+      revision(1),
+    ]
+    const call = vi.fn(async (method: string) => {
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.capabilities) {
+        return { formats: { html: { preview: true } } }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsGet) {
+        return { document: { id: 'document-html', name: 'page.html', format: 'html',
+          headRevisionId: 'revision-1', generation: 150, stateRevision: 151 } }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList) return { revisions: revisionList }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.changesList) return { changeSets: [] }
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod: vi.fn(),
+    })
+    const workspace = await provider.loadWorkspace({
+      id: 'artifact-150', documentId: 'document-html', name: 'page.html', mime: 'text/html',
+      download_url: '/api/v1/artifacts/artifact-150',
+    }, 'session-a')
+
+    expect(workspace.document.headRevisionId).toBe('revision-1')
+    expect(workspace.revisions).toHaveLength(101)
+    expect(workspace.revisions.filter(item => item.revisionId === 'revision-1')).toHaveLength(1)
+    expect(workspace.headArtifact).toMatchObject({
+      id: 'artifact-1', size: 1, documentId: 'document-html',
+      download_url: '/api/v1/artifact-documents/document-html',
+    })
+  })
+
+  it('does not promote a preview-only format into selection or editing', () => {
+    const capabilities = normalizeArtifactEditCapabilities({
+      formats: {
+        docx: { preview: true, publish: false },
+        xlsx: { preview: false, publish: false },
+        pptx: { preview: false, publish: false },
+        html: { preview: true, manualEdit: true, agentEdit: true },
+      },
+    })
+
+    expect(capabilities.office).toMatchObject({
+      preview: true,
+      selectionContext: false,
+      manualEdit: false,
+      agentEdit: false,
+      edit: false,
+      publish: false,
+    })
+  })
+
+  it('preserves explicit false edit axes over legacy edit and enabled summaries', () => {
+    const capabilities = normalizeArtifactEditCapabilities({
+      formats: {
+        html: {
+          enabled: true,
+          preview: true,
+          edit: true,
+          manualEdit: false,
+          agentEdit: false,
+          publish: false,
+        },
+      },
+    })
+    const document = normalizeArtifactDocument({
+      id: 'doc-explicit-false',
+      sessionKey: 'session-a',
+      name: 'page.html',
+      format: 'html',
+      headRevisionId: 'rev-explicit-false',
+      capabilities: {
+        preview: true,
+        edit: true,
+        manualEdit: false,
+        agentEdit: false,
+        publish: false,
+      },
+    }, capabilities)
+
+    expect(capabilities.html).toMatchObject({
+      manualEdit: false,
+      agentEdit: false,
+      edit: false,
+      publish: false,
+    })
+    expect(document?.capabilities).toMatchObject({
+      manualEdit: false,
+      agentEdit: false,
+      edit: false,
+      publish: false,
+    })
+  })
+
+  it('normalizes the stable document, revision, and change-set contracts', () => {
+    const capabilities = normalizeArtifactEditCapabilities({
+      available: true,
+      revisions: true,
+      changeSets: true,
+      comments: true,
+      office: { enabled: false, reason: 'office-disabled' },
+      html: { enabled: true, source: true },
+    })
+    const document = normalizeArtifactDocument({
+      documentId: 'doc-1',
+      sessionKey: 'session-a',
+      name: 'page.html',
+      kind: 'html',
+      headRevisionId: 'rev-2',
+      generation: 2,
+      stateRevision: 4,
+      createdAt: 1,
+      updatedAt: 2,
+      schemaVersion: 1,
+    }, capabilities)
+    const revision = normalizeArtifactRevision({
+      revisionId: 'rev-2',
+      documentId: 'doc-1',
+      parentRevisionId: 'rev-1',
+      generation: 2,
+      artifact: {
+        artifactId: 'artifact-head',
+        sha256: 'a'.repeat(64),
+        filename: 'page.html',
+        mediaType: 'text/html',
+        byteSize: 42,
+        downloadUrl: '/api/v1/artifacts/artifact-head',
+      },
+      source: 'agent',
+      actorKind: 'agent',
+      actorId: 'main',
+      createdAt: 2,
+    })
+    const changeSet = normalizeArtifactChangeSet({
+      id: 'change-1',
+      documentId: 'doc-1',
+      baseRevisionId: 'rev-1',
+      turnId: 'turn-1',
+      summary: 'Replace the title',
+      state: 'ready',
+      operations: [{ op: 'replace', path: '/title' }],
+      candidateArtifact: {
+        id: 'artifact-candidate',
+        sha256: 'c'.repeat(64),
+        name: 'page.html',
+        mime: 'text/html',
+        size: 84,
+      },
+      stateRevision: 1,
+      createdByKind: 'agent',
+      createdById: 'main',
+    })
+    expect(document).toMatchObject({
+      documentId: 'doc-1',
+      capabilities: {
+        preview: true,
+        edit: true,
+        source: true,
+      },
+    })
+    expect(revision).toMatchObject({
+      artifactId: 'artifact-head',
+      downloadUrl: '/api/v1/artifacts/artifact-head',
+    })
+    expect(changeSet).toMatchObject({
+      turnId: 'turn-1',
+      summary: 'Replace the title',
+      operations: [{ op: 'replace', path: '/title' }],
+      candidateArtifact: { id: 'artifact-candidate', sha256: 'c'.repeat(64) },
+    })
+  })
+
+  it('lets a preview-only bundle document override global single-file HTML editing', () => {
+    const capabilities = normalizeArtifactEditCapabilities({
+      formats: {
+        html: {
+          preview: true,
+          manualEdit: true,
+          agentEdit: true,
+          sourceEdit: true,
+          comments: true,
+        },
+      },
+    })
+    const document = normalizeArtifactDocument({
+      id: 'doc-bundle',
+      sessionKey: 'session-a',
+      name: 'site.html',
+      format: 'html',
+      headRevisionId: 'rev-bundle',
+      generation: 1,
+      stateRevision: 1,
+      capabilities: {
+        download: true,
+        preview: true,
+        versionHistory: true,
+        comments: true,
+        manualEdit: false,
+        agentEdit: false,
+        sourceEdit: false,
+        promptAnnotations: false,
+        selection: false,
+        unavailableReason: 'html_bundle_edit_not_supported',
+      },
+    }, capabilities)
+
+    expect(capabilities.html).toMatchObject({ preview: true, edit: true, source: true })
+    expect(document?.capabilities).toEqual({
+      download: true,
+      preview: true,
+      selectionContext: false,
+      manualEdit: false,
+      agentEdit: false,
+      publish: false,
+      edit: false,
+      revisions: true,
+      changeSets: false,
+      comments: true,
+      source: false,
+      promptAnnotations: false,
+      reason: 'html_bundle_edit_not_supported',
+    })
+  })
+
+  it('loads the current head plus version and change side data', async () => {
+    const supported = new Set<string>(
+      Object.values(ARTIFACT_DOCUMENT_RPC_METHODS).filter(
+        method => method !== ARTIFACT_DOCUMENT_RPC_METHODS.documentsOpen,
+      ),
+    )
+    const call = vi.fn(async (method: string) => {
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.capabilities) {
+        return {
+          formats: {
+            docx: { preview: false, manualEdit: false, comments: true },
+            xlsx: { preview: false, manualEdit: false, comments: true },
+            pptx: { preview: false, manualEdit: false, comments: true },
+            html: {
+              preview: true,
+              manualEdit: true,
+              sourceEdit: true,
+              comments: true,
+            },
+          },
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsGet) {
+        return {
+          document: {
+            id: 'doc-1',
+            name: 'page.html',
+            format: 'html',
+            headRevisionId: 'rev-2',
+            generation: 2,
+            stateRevision: 2,
+            capabilities: {
+              download: true,
+              preview: true,
+              versionHistory: true,
+              comments: true,
+              manualEdit: true,
+              agentEdit: true,
+              sourceEdit: true,
+            },
+          },
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList) {
+        return {
+          revisions: [
+            {
+              id: 'rev-2',
+              documentId: 'doc-1',
+              parentRevisionId: 'rev-1',
+              generation: 2,
+              sha256: 'b'.repeat(64),
+              name: 'page.html',
+              mime: 'text/html',
+              size: 84,
+              downloadUrl: '/api/v1/artifacts/artifact-head',
+              source: 'agent',
+              actorKind: 'agent',
+              actorId: 'main',
+            },
+          ],
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.changesList) {
+        return { changeSets: [] }
+      }
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: method => supported.has(method),
+      rememberUnsupportedMethod: vi.fn(),
+    })
+
+    const workspace = await provider.loadWorkspace({
+      id: 'artifact-original',
+      documentId: 'doc-1',
+      name: 'page.html',
+      mime: 'text/html',
+    }, 'session-a')
+
+    expect(workspace.source).toBe('document-api')
+    expect(workspace.document.documentId).toBe('doc-1')
+    expect(workspace.headArtifact).toMatchObject({
+      id: 'rev-2',
+      download_url: '/api/v1/artifact-documents/doc-1',
+    })
+    expect(call).toHaveBeenCalledWith(
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsGet,
+      { documentId: 'doc-1', sessionKey: 'session-a' },
+      expect.objectContaining({ timeoutMs: 10_000 }),
+    )
+    expect(call).toHaveBeenCalledWith(
+      ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList,
+      { documentId: 'doc-1', sessionKey: 'session-a' },
+      expect.any(Object),
+    )
+  })
+
+  it('keeps immutable artifact previews read-only without adopting or matching by name', async () => {
+    const supported = new Set<string>([
+      ARTIFACT_DOCUMENT_RPC_METHODS.capabilities,
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsList,
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsOpen,
+      ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList,
+      ARTIFACT_DOCUMENT_RPC_METHODS.changesList,
+    ])
+    const call = vi.fn(async (method: string) => {
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.capabilities) {
+        return { formats: { html: { preview: true, sourceEdit: true } } }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsList) {
+        return {
+          documents: [{
+            id: 'doc-old',
+            name: 'page.html',
+            format: 'html',
+            headRevisionId: 'rev-old',
+          }],
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsOpen) {
+        return {
+          document: {
+            id: 'doc-new',
+            name: 'page.html',
+            format: 'html',
+            headRevisionId: 'rev-new',
+          },
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList) {
+        return {
+          revisions: [{
+            id: 'rev-new',
+            documentId: 'doc-new',
+            name: 'page.html',
+            mime: 'text/html',
+            downloadUrl: '/api/v1/artifact-documents/doc-new?revisionId=rev-new',
+          }],
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.changesList) return { changeSets: [] }
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: method => supported.has(method),
+      rememberUnsupportedMethod: vi.fn(),
+    })
+
+    const artifact = {
+      id: 'artifact-new',
+      name: 'page.html',
+      mime: 'text/html',
+    }
+    const workspace = await provider.loadWorkspace(artifact, 'session-a')
+
+    expect(workspace.source).toBe('legacy-artifact')
+    expect(workspace.headArtifact).toMatchObject(artifact)
+    expect(call).not.toHaveBeenCalledWith(
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsOpen,
+      expect.anything(),
+      expect.anything(),
+    )
+    expect(call).not.toHaveBeenCalledWith(
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsList,
+      expect.anything(),
+      expect.anything(),
+    )
+  })
+
+  it('normalizes the product-only mutation resolution wire', async () => {
+    const call = vi.fn(async (method: string) => {
+      expect(method).toBe(ARTIFACT_DOCUMENT_RPC_METHODS.mutationResolve)
+      return {
+        status: 'applied',
+        retryAfterMs: null,
+        result: {
+          documentId: 'doc-html',
+          revisionId: 'rev-2',
+          sha256: 'b'.repeat(64),
+          stateRevision: 4,
+        },
+        receipt: { attemptId: 'must-be-ignored' },
+      }
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod: vi.fn(),
+    })
+
+    await expect(provider.resolveMutation?.({
+      sessionKey: 'session-a',
+      operation: 'revision.restore',
+      requestId: 'request-a',
+      documentId: 'doc-html',
+    })).resolves.toEqual({
+      status: 'applied',
+      retryAfterMs: null,
+      result: {
+        documentId: 'doc-html',
+        revisionId: 'rev-2',
+        sha256: 'b'.repeat(64),
+        stateRevision: 4,
+      },
+    })
+  })
+
+  it('uses artifacts.get as a compatibility fallback and keeps Office download-only', async () => {
+    const call = vi.fn(async (method: string) => {
+      if (method !== ARTIFACT_DOCUMENT_RPC_METHODS.legacyGet) {
+        throw new Error(`Unexpected RPC: ${method}`)
+      }
+      return {
+        artifact: {
+          ...officeArtifact,
+          download_url: '/api/v1/artifacts/artifact-office?latest=1',
+          size: 1234,
+        },
+      }
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: method => method === ARTIFACT_DOCUMENT_RPC_METHODS.legacyGet,
+      rememberUnsupportedMethod: vi.fn(),
+    })
+
+    const workspace = await provider.loadWorkspace(officeArtifact, 'session-a')
+
+    expect(isOfficeArtifact(officeArtifact)).toBe(true)
+    expect(workspace.source).toBe('legacy-artifact')
+    expect(workspace.document.kind).toBe('presentation')
+    expect(workspace.document.capabilities).toMatchObject({
+      download: true,
+      preview: false,
+      edit: false,
+      comments: false,
+    })
+    expect(workspace.headArtifact.download_url).toContain('latest=1')
+    expect(call).toHaveBeenCalledWith(
+      ARTIFACT_DOCUMENT_RPC_METHODS.legacyGet,
+      { artifactId: 'artifact-office', sessionKey: 'session-a' },
+      expect.any(Object),
+    )
+  })
+
+  it('does not adopt an immutable Office artifact while previewing it', async () => {
+    const supported = new Set<string>([
+      ARTIFACT_DOCUMENT_RPC_METHODS.capabilities,
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsList,
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsOpen,
+      ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList,
+      ARTIFACT_DOCUMENT_RPC_METHODS.changesList,
+    ])
+    const call = vi.fn(async (method: string) => {
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.capabilities) {
+        return {
+          formats: {
+            docx: { preview: false, comments: true },
+            xlsx: { preview: false, comments: true },
+            pptx: { preview: false, comments: true },
+            html: { preview: true, manualEdit: true, comments: true },
+          },
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsList) {
+        return { documents: [] }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsOpen) {
+        return {
+          document: {
+            id: 'doc-office',
+            name: 'quarterly-plan.pptx',
+            format: 'pptx',
+            headRevisionId: 'rev-office',
+            generation: 1,
+            stateRevision: 1,
+            capabilities: {
+              download: true,
+              preview: false,
+              versionHistory: true,
+              comments: true,
+              manualEdit: false,
+              agentEdit: false,
+              sourceEdit: false,
+              unavailableReason: 'office_sidecar_not_configured',
+            },
+          },
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList) {
+        return {
+          revisions: [{
+            id: 'rev-office',
+            documentId: 'doc-office',
+            generation: 1,
+            sha256: 'c'.repeat(64),
+            name: 'quarterly-plan.pptx',
+            mime: officeArtifact.mime,
+            size: 2048,
+            source: 'initial',
+            downloadUrl: '/api/v1/artifact-documents/doc-office?revisionId=rev-office',
+          }],
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.changesList) return { changeSets: [] }
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: method => supported.has(method),
+      rememberUnsupportedMethod: vi.fn(),
+    })
+
+    const workspace = await provider.loadWorkspace(officeArtifact, 'session-a')
+
+    expect(call).not.toHaveBeenCalledWith(
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsOpen,
+      expect.anything(),
+      expect.anything(),
+    )
+    expect(workspace.source).toBe('legacy-artifact')
+    expect(workspace.document.capabilities).toMatchObject({
+      download: true,
+      preview: false,
+      edit: false,
+      revisions: false,
+      comments: false,
+      source: false,
+    })
+    expect(workspace.headArtifact).toMatchObject(officeArtifact)
+  })
+
+  it('propagates transient document RPC failures instead of returning a legacy head', async () => {
+    const supported = new Set<string>([
+      ARTIFACT_DOCUMENT_RPC_METHODS.capabilities,
+      ARTIFACT_DOCUMENT_RPC_METHODS.documentsGet,
+      ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList,
+      ARTIFACT_DOCUMENT_RPC_METHODS.changesList,
+      ARTIFACT_DOCUMENT_RPC_METHODS.legacyGet,
+    ])
+    const call = vi.fn(async (method: string) => {
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.capabilities) {
+        return { formats: { html: { preview: true, sourceEdit: true } } }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsGet) {
+        return {
+          document: {
+            id: 'doc-html',
+            name: 'page.html',
+            format: 'html',
+            headRevisionId: 'revision-head',
+          },
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList) {
+        throw new Error('revision service timed out')
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.changesList) return { changeSets: [] }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.legacyGet) {
+        return { artifact: { ...officeArtifact, download_url: '/old-original' } }
+      }
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: method => supported.has(method),
+      rememberUnsupportedMethod: vi.fn(),
+    })
+
+    await expect(provider.loadWorkspace({
+      id: 'artifact-html',
+      documentId: 'doc-html',
+      name: 'page.html',
+      mime: 'text/html',
+      download_url: '/api/v1/artifacts/artifact-html',
+    }, 'session-a')).rejects.toThrow('revision service timed out')
+    expect(call).not.toHaveBeenCalledWith(
+      ARTIFACT_DOCUMENT_RPC_METHODS.legacyGet,
+      expect.anything(),
+      expect.anything(),
+    )
+  })
+
+  it('uses the stable latest-head endpoint when revision metadata is unavailable', async () => {
+    const call = vi.fn(async (method: string) => {
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.capabilities) {
+        return { formats: { html: { preview: true, sourceEdit: true } } }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsGet) {
+        return {
+          document: {
+            id: 'doc-html',
+            name: 'page.html',
+            format: 'html',
+            headRevisionId: 'revision-head',
+          },
+        }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList) return { revisions: [] }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.changesList) return { changeSets: [] }
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod: vi.fn(),
+    })
+
+    const workspace = await provider.loadWorkspace({
+      id: 'artifact-html',
+      documentId: 'doc-html',
+      name: 'page.html',
+      mime: 'text/html',
+      download_url: '/api/v1/artifacts/artifact-html',
+    }, 'session-a')
+
+    expect(workspace.source).toBe('document-api')
+    expect(workspace.headArtifact).toMatchObject({
+      id: 'revision-head',
+      download_url: '/api/v1/artifact-documents/doc-html',
+    })
+    expect(workspace.headArtifact.download_url).not.toContain('/api/v1/artifacts/')
+  })
+
+  it('builds a read-only legacy workspace without claiming unsupported editing', () => {
+    const workspace = createLegacyArtifactWorkspace(officeArtifact, 'session-a')
+
+    expect(workspace.revisions).toHaveLength(1)
+    expect(workspace.changeSets).toEqual([])
+    expect(workspace.document.capabilities.reason).toBe('office-editor-unavailable')
+  })
+
+  it('rejects non-object results before legacy projection', async () => {
+    const provider = createRpcArtifactDocumentProvider({
+      call: vi.fn().mockResolvedValue(7) as unknown as GenericRpcCall,
+      hasRpcMethod: () => true,
+    })
+
+    await expect(provider.getCapabilities()).rejects.toThrow('invalid response')
+  })
+})

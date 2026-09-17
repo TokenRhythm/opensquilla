@@ -1,5 +1,6 @@
 """Tests for the verify->fix retry loop in runner.solve."""
 
+import re
 from types import SimpleNamespace
 
 from opensquilla.contrib.codetask import runner
@@ -25,9 +26,20 @@ class _FakeAdapter:
     def __init__(self, **kw):
         _FakeAdapter.last_timeout = kw.get("timeout")
 
-    def run(self, prompt, *, repo, scratch_dir, artifact_dir):
+    def run(
+        self,
+        prompt,
+        *,
+        repo,
+        scratch_dir,
+        artifact_dir,
+        status_callback=None,
+        on_agent_started=None,
+    ):
         _FakeAdapter.runs += 1
         (artifact_dir / "agent_stdout.log").write_text("log", encoding="utf-8")
+        if on_agent_started is not None:
+            on_agent_started()
         return _Outcome()
 
 
@@ -74,7 +86,14 @@ def test_loop_retries_failed_then_verifies(monkeypatch, tmp_path):
     _wire(monkeypatch, tmp_path, [
         _vout(TaskState.FAILED, nf=2), _vout(TaskState.FAILED, nf=1), _vout(TaskState.VERIFIED),
     ])
-    res = runner.solve(repo="/tmp/x", task="do", max_attempts=3, timeout=3600)
+    observed: list[str] = []
+    res = runner.solve(
+        repo="/tmp/x",
+        task="do",
+        max_attempts=3,
+        timeout=3600,
+        coding_mode_usage_recorder=observed.append,
+    )
     assert res.state == TaskState.VERIFIED
     assert res.attempts == 3
     assert _FakeAdapter.runs == 3
@@ -83,6 +102,9 @@ def test_loop_retries_failed_then_verifies(monkeypatch, tmp_path):
     assert (run_dir / "attempts" / "01").is_dir()
     assert (run_dir / "attempts" / "03").is_dir()
     assert res.usage.get("total_tokens") == 30
+    assert len(observed) == 1
+    assert observed[0] != res.run_id
+    assert re.fullmatch(r"coding-use-[0-9a-f]{24}", observed[0])
 
 
 def test_loop_stops_at_max_attempts_and_marks_exhausted(monkeypatch, tmp_path):
@@ -226,14 +248,20 @@ def test_solve_blocks_before_clone_on_preflight_failure(monkeypatch, tmp_path):
         runner, "provider_preflight", lambda *a, **k: (False, "provider X has no usable key")
     )
     cloned = []
+    observed: list[str] = []
     monkeypatch.setattr(runner.workspace, "prepare_repo", lambda *a, **k: cloned.append(1))
 
-    res = runner.solve(repo="/tmp/x", task="do")
+    res = runner.solve(
+        repo="/tmp/x",
+        task="do",
+        coding_mode_usage_recorder=observed.append,
+    )
 
     assert res.state == TaskState.ENVIRONMENT_BLOCKED
     assert res.error == "provider X has no usable key"
     assert res.final_failure_reason == res.error
     assert cloned == []
+    assert observed == []
     run_dir = runner.config.run_dir(res.run_id)
     status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
     assert status["phase"] == "completed"

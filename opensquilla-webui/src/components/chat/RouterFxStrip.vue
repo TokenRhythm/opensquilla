@@ -6,80 +6,12 @@
     :data-static="message.routerStatic ? 'true' : undefined"
     :data-settled="routerDataSettled"
     :data-panel="message.routerPanel || 'real-candidates'"
-    :data-phase="isEnsemblePanel ? undefined : motionPhase"
+    :data-phase="showsRouterStage ? motionPhase : undefined"
     :aria-label="routerAriaLabel"
-    :aria-busy="isEnsemblePanel ? undefined : motionPhase === 'scanning' ? 'true' : 'false'"
-    :role="isEnsemblePanel ? undefined : 'group'"
+    :aria-busy="showsRouterStage ? motionPhase === 'scanning' ? 'true' : 'false' : undefined"
+    :role="showsRouterStage ? 'group' : undefined"
   >
-    <template v-if="isEnsemblePanel">
-      <button
-        class="router-fx-ensemble"
-        type="button"
-        :aria-label="ensembleButtonLabel"
-        :aria-expanded="inspectorOpen ? 'true' : 'false'"
-        :aria-controls="inspectorId"
-        :aria-busy="!isEnsembleDone ? 'true' : 'false'"
-        :disabled="!hasInspector"
-        data-testid="router-ensemble-toggle"
-        @click="toggleInspector"
-      >
-        <span :class="['router-fx-ensemble__dot', { done: isEnsembleDone, pending: !hasEnsembleModels }]" aria-hidden="true"></span>
-        <span class="router-fx-ensemble__label" role="status" aria-live="polite">{{ ensembleStatusLabel }}</span>
-        <span class="router-fx-ensemble__meta">{{ ensembleMetaLabel }}</span>
-        <span v-if="!isEnsembleDone" class="router-fx-ensemble__scan" aria-hidden="true"></span>
-      </button>
-
-      <div
-        v-if="inspectorOpen && hasInspector"
-        :id="inspectorId"
-        class="router-fx-inspector"
-        data-testid="router-ensemble-inspector"
-      >
-        <div class="router-fx-inspector__head">
-          <span class="router-fx-inspector__title">{{ t('chat.routerFx.ensembleTraceTitle') }}</span>
-          <span class="router-fx-inspector__mode">{{ ensembleInspectorMeta }}</span>
-        </div>
-        <div class="router-fx-inspector__rows">
-          <div
-            v-for="model in ensembleModels"
-            :key="`${model.role}:${model.provider}:${model.model}:${model.sampleIndex || 0}`"
-            class="router-fx-inspector__row"
-            :class="{
-              'router-fx-inspector__row--running': model.status === 'running',
-              'router-fx-inspector__row--failed': model.status === 'failed',
-              'router-fx-inspector__row--skipped': model.status === 'skipped',
-            }"
-            :data-status="model.status || undefined"
-          >
-            <span class="router-fx-inspector__role">{{ model.role }}</span>
-            <span class="router-fx-inspector__model" :title="model.model">{{ model.modelShort }}</span>
-            <span class="router-fx-inspector__usage" :title="ensembleModelTitle(model)">
-              <span
-                v-if="model.status === 'running'"
-                class="router-fx-inspector__spin"
-                aria-hidden="true"
-              ></span>
-              <template v-else-if="model.status === 'skipped'">{{ ensembleModelSkipped(model) }}</template>
-              <template v-else-if="model.status === 'failed'">{{ ensembleModelFailure(model) }}</template>
-              <template v-else>{{ ensembleModelUsage(model) }}</template>
-            </span>
-          </div>
-          <div
-            v-if="!hasEnsembleModels"
-            class="router-fx-inspector__row router-fx-inspector__row--empty"
-            data-testid="router-ensemble-detail-unavailable"
-          >
-            <span class="router-fx-inspector__empty">{{ emptyTraceLabel }}</span>
-          </div>
-        </div>
-        <div class="router-fx-inspector__foot">
-          <span>{{ fallbackLabel }}</span>
-          <span>{{ t('chat.routerFx.ensembleRouterPoolHidden') }}</span>
-        </div>
-      </div>
-    </template>
-
-    <template v-else>
+    <template v-if="showsRouterStage">
       <div class="router-fx-header">
         <span class="glyph">&#8592;</span>
         <span class="title">{{ t('chat.aiModelRouter') }}</span>
@@ -87,8 +19,8 @@
       </div>
       <div ref="gridElement" class="router-fx-grid" :style="gridStyle">
         <div
-          v-for="(cell, cellIndex) in gridCells"
-          :key="cell.tiers?.join(':') || `${cell.displayName}-${cellIndex}`"
+          v-for="(cell, cellIndex) in visualGridCells"
+          :key="cell.tiers?.join(':') || `${cell.visualName}-${cellIndex}`"
           class="router-fx-cell"
           :data-cell-idx="cellIndex"
           :data-scan-active="cellIndex === scanIndex ? 'true' : undefined"
@@ -97,9 +29,9 @@
             'scan-active': cellIndex === scanIndex,
           }"
         >
-          <span class="nm" :title="cell.displayName" :aria-label="cell.displayName">
-            <span class="nm-base">{{ cell.displayName }}</span>
-            <span class="nm-win" aria-hidden="true">{{ cell.displayName }}</span>
+          <span class="nm" :title="cell.visualName" :aria-label="cell.visualName">
+            <span class="nm-base">{{ cell.visualName }}</span>
+            <span class="nm-win" aria-hidden="true">{{ cell.visualName }}</span>
           </span>
         </div>
         <span
@@ -110,6 +42,14 @@
           aria-hidden="true"
         ></span>
       </div>
+      <div
+        v-if="executionDiffersFromRoute"
+        class="router-fx-execution"
+        data-testid="router-execution-model"
+        :title="executionModel"
+      >
+        {{ executionModelAnnouncement }}
+      </div>
       <span
         class="router-fx-sr-only"
         role="status"
@@ -117,6 +57,91 @@
         aria-atomic="true"
       >{{ resultAnnouncement }}</span>
     </template>
+
+    <Transition name="router-fx-stage" :css="!prefersReducedMotion">
+      <div
+        v-if="showsEnsembleStage && ensembleStageReady"
+        class="router-fx-ensemble-stage"
+        data-testid="router-ensemble-stage"
+      >
+        <div
+          v-if="isCombinedPanel"
+          class="router-fx-handoff"
+          data-testid="router-ensemble-handoff"
+          aria-hidden="true"
+        >
+          <span></span>
+        </div>
+
+        <button
+          class="router-fx-ensemble"
+          type="button"
+          :aria-label="ensembleButtonLabel"
+          :aria-expanded="inspectorOpen ? 'true' : 'false'"
+          :aria-controls="inspectorId"
+          :aria-busy="!isEnsembleDone ? 'true' : 'false'"
+          :disabled="!hasInspector"
+          data-testid="router-ensemble-toggle"
+          @click="toggleInspector"
+        >
+          <span :class="['router-fx-ensemble__dot', { done: isEnsembleDone, pending: !hasEnsembleModels }]" aria-hidden="true"></span>
+          <span class="router-fx-ensemble__label" role="status" aria-live="polite">{{ ensembleStatusLabel }}</span>
+          <span class="router-fx-ensemble__meta">{{ ensembleMetaLabel }}</span>
+          <span v-if="!isEnsembleDone" class="router-fx-ensemble__scan" aria-hidden="true"></span>
+        </button>
+
+        <div
+          v-if="inspectorOpen && hasInspector"
+          :id="inspectorId"
+          class="router-fx-inspector"
+          data-testid="router-ensemble-inspector"
+        >
+          <div class="router-fx-inspector__head">
+            <span class="router-fx-inspector__title">{{ t('chat.routerFx.ensembleTraceTitle') }}</span>
+            <span class="router-fx-inspector__mode">{{ ensembleInspectorMeta }}</span>
+          </div>
+          <div class="router-fx-inspector__rows">
+            <div
+              v-for="model in ensembleModels"
+              :key="`${model.role}:${model.provider}:${model.model}:${model.sampleIndex || 0}`"
+              class="router-fx-inspector__row"
+              :class="{
+                'router-fx-inspector__row--running': model.status === 'running',
+                'router-fx-inspector__row--failed': model.status === 'failed',
+                'router-fx-inspector__row--skipped': model.status === 'skipped',
+              }"
+              :data-status="model.status || undefined"
+            >
+              <span class="router-fx-inspector__role">
+                {{ ensembleMemberRoleLabel(model.role) }} <span aria-hidden="true">·</span>
+              </span>
+              <span class="router-fx-inspector__model" :title="model.model">{{ model.modelShort }}</span>
+              <span class="router-fx-inspector__usage" :title="ensembleModelTitle(model)">
+                <span
+                  v-if="model.status === 'running'"
+                  class="router-fx-inspector__spin"
+                  aria-hidden="true"
+                ></span>
+                <template v-else-if="model.status === 'skipped'">{{ ensembleModelSkipped(model) }}</template>
+                <template v-else-if="model.status === 'failed'">{{ ensembleModelFailure(model) }}</template>
+                <template v-else>{{ ensembleModelUsage(model) }}</template>
+              </span>
+            </div>
+            <div
+              v-if="!hasEnsembleModels"
+              class="router-fx-inspector__row router-fx-inspector__row--empty"
+              data-testid="router-ensemble-detail-unavailable"
+            >
+              <span class="router-fx-inspector__empty">{{ emptyTraceLabel }}</span>
+            </div>
+          </div>
+          <div class="router-fx-inspector__foot">
+            <span>{{ fallbackLabel }}</span>
+            <span>{{ t('chat.routerFx.ensembleRouterPoolHidden') }}</span>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -125,6 +150,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
 import type { ChatEnsembleMetaModel, ChatRenderedMessage } from '@/types/chat'
+import { ensembleMemberRoleLabel } from '@/utils/ensembleRoles'
 
 const ROUTER_FX_SCAN_STEP_MS = 190
 const ROUTER_FX_SCAN_WINDOW_MS = 600
@@ -145,26 +171,61 @@ const selectorVisible = ref(false)
 const selectorStyle = ref<Record<string, string>>({})
 const gridElement = ref<HTMLElement | null>(null)
 const gridCells = computed(() => props.message.gridCells || [])
+const visualGridCells = computed(() => gridCells.value.map(cell => ({
+  ...cell,
+  visualName: cell.executionKind === 'ensemble'
+    ? t('chat.routerFx.ensembleModel')
+    : cell.displayName,
+})))
 const ensemble = computed(() => props.message.ensemble)
 const ensembleModels = computed(() => ensemble.value?.models || [])
 const isEnsemblePanel = computed(() => props.message.routerPanel === 'llm-ensemble')
+const isCombinedPanel = computed(() => props.message.routerPanel === 'router-ensemble-sequence')
+const showsRouterStage = computed(() => !isEnsemblePanel.value)
+const showsEnsembleStage = computed(() => isEnsemblePanel.value || isCombinedPanel.value)
+const ensembleStageReady = computed(() =>
+  !isCombinedPanel.value || motionPhase.value === 'locked' || motionPhase.value === 'static',
+)
 const prefersReducedMotion = useMediaQuery('(prefers-reduced-motion: reduce)')
 const realCandidateIndices = computed(() => gridCells.value.flatMap((cell, index) => cell.kind === 'real' ? [index] : []))
-const winnerIndex = computed(() => {
+const routeWinnerIndex = computed(() => {
   const index = Number(props.message.winnerIdx ?? -1)
   if (!Number.isInteger(index) || index < 0 || index >= gridCells.value.length) return -1
   return gridCells.value[index]?.kind === 'real' ? index : -1
 })
-const winnerName = computed(() => winnerIndex.value >= 0 ? gridCells.value[winnerIndex.value]?.displayName || '' : '')
+const routeSelectedModel = computed(() => String(props.message.routerSelectedModel || '').trim())
+const executionModel = computed(() => String(props.message.routerExecutionModel || '').trim())
+const executionDiffersFromRoute = computed(() => Boolean(
+  executionModel.value
+  && routeSelectedModel.value
+  && executionModel.value !== routeSelectedModel.value,
+))
+const executionCellIndex = computed(() => {
+  if (!executionDiffersFromRoute.value) return -1
+  return gridCells.value.findIndex(cell => (
+    cell.kind === 'real' && String(cell.model || '').trim() === executionModel.value
+  ))
+})
+const winnerIndex = computed(() => (
+  executionDiffersFromRoute.value ? executionCellIndex.value : routeWinnerIndex.value
+))
+const winnerName = computed(() => winnerIndex.value >= 0 ? visualGridCells.value[winnerIndex.value]?.visualName || '' : '')
+const executionModelAnnouncement = computed(() => t(
+  props.message.routerSettled || props.message.routerStatic
+    ? 'chat.routerFx.executionModelCompleted'
+    : 'chat.routerFx.executionModel',
+  { model: executionModel.value },
+))
 const visibleWinnerIndex = computed(() => {
   return motionPhase.value === 'locked' || motionPhase.value === 'static' ? winnerIndex.value : -1
 })
 const routerDataSettled = computed(() => {
-  if (isEnsemblePanel.value) return props.message.routerSettled ? 'true' : undefined
+  if (!showsRouterStage.value) return props.message.routerSettled ? 'true' : undefined
   return motionPhase.value === 'static' ? 'true' : undefined
 })
 const routerAriaLabel = computed(() => {
-  if (isEnsemblePanel.value) return undefined
+  if (!showsRouterStage.value) return undefined
+  if (executionDiffersFromRoute.value) return executionModelAnnouncement.value
   if (visibleWinnerIndex.value >= 0 && winnerName.value) {
     return t('chat.routerFx.selectedModel', { model: winnerName.value })
   }
@@ -173,7 +234,7 @@ const routerAriaLabel = computed(() => {
 const animationIdentity = computed(() => [
   props.message.messageId || props.message.id || props.message.ts || '',
   props.message.routerPanel || 'real-candidates',
-  gridCells.value.map(cell => `${cell.kind}:${cell.displayName}:${cell.tiers?.join(',') || ''}`).join('|'),
+  gridCells.value.map(cell => `${cell.kind}:${cell.executionKind || 'single_model'}:${cell.displayName}:${cell.tiers?.join(',') || ''}`).join('|'),
 ].join('::'))
 const hasEnsembleModels = computed(() => ensembleModels.value.length > 0)
 const isEnsembleHandoff = computed(() => props.message.routerState === 'handoff' && !hasEnsembleModels.value)
@@ -181,21 +242,13 @@ const isEnsembleHandoff = computed(() => props.message.routerState === 'handoff'
 // even while candidate details are still unknown so the empty/pending state is
 // visible instead of looking broken.
 const hasInspector = computed(() =>
-  isEnsemblePanel.value || hasEnsembleModels.value || (ensemble.value?.modelCount || 0) > 0,
+  showsEnsembleStage.value || hasEnsembleModels.value || (ensemble.value?.modelCount || 0) > 0,
 )
-// A live ensemble is complete only after the aggregator has reached a terminal
-// state. Proposer completion alone is the handoff into synthesis, not the end.
-const hasAggregator = computed(() =>
-  ensembleModels.value.some(member => member.role === 'aggregator'),
-)
-const allMembersTerminal = computed(() =>
-  hasEnsembleModels.value && ensembleModels.value.every(
-    member => member.status === 'done' || member.status === 'failed' || member.status === 'skipped',
-  ),
-)
+// Member terminal states only finish their own physical calls. In particular,
+// a failed aggregator can hand off to a fixed fallback that is still streaming.
+// The turn-level settlement is the only authoritative completion signal.
 const isEnsembleDone = computed(
-  () => (hasAggregator.value && allMembersTerminal.value)
-    || (Boolean(ensemble.value) && props.message.routerSettled === true),
+  () => Boolean(ensemble.value) && props.message.routerSettled === true,
 )
 const isLegacyGrid = computed(() => props.message.routerPanel === 'legacy-grid')
 const gridColumnCount = computed(() => isLegacyGrid.value ? 5 : Math.min(4, Math.max(2, gridCells.value.length)))
@@ -273,13 +326,14 @@ function clearMotionTimers() {
 }
 
 function selectedAnnouncement(): string {
+  if (executionDiffersFromRoute.value) return executionModelAnnouncement.value
   return winnerName.value
     ? t('chat.routerFx.selectedModel', { model: winnerName.value })
     : ''
 }
 
 function shouldAnimate(): boolean {
-  return !isEnsemblePanel.value
+  return showsRouterStage.value
     && winnerIndex.value >= 0
     && realCandidateIndices.value.length > 1
     && props.message.routerStatic !== true
@@ -358,12 +412,12 @@ function startScanning() {
 }
 
 function initializeMotion() {
-  if (isEnsemblePanel.value) return
+  if (!showsRouterStage.value) return
   if (shouldAnimate()) {
     startScanning()
     return
   }
-  const shouldAnnounce = winnerIndex.value >= 0
+  const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value)
     && props.message.routerStatic !== true
     && props.message.routerObserve !== true
   settleStatic(shouldAnnounce)
@@ -373,8 +427,16 @@ watch(animationIdentity, () => {
   if (mounted) initializeMotion()
 })
 
-watch(winnerIndex, (next, previous) => {
-  if (!mounted || next < 0 || next === previous) return
+watch([winnerIndex, executionModel], ([next, nextExecutionModel], [previous, previousExecutionModel]) => {
+  if (
+    !mounted
+    || (next === previous && nextExecutionModel === previousExecutionModel)
+  ) return
+  if (executionDiffersFromRoute.value || nextExecutionModel !== previousExecutionModel) {
+    settleStatic(props.message.routerStatic !== true && props.message.routerObserve !== true)
+    return
+  }
+  if (next < 0) return
   if (motionPhase.value === 'idle') {
     initializeMotion()
     return
@@ -391,7 +453,7 @@ watch(
   ],
   ([routerStatic, routerObserve, routerSettled, reduceMotion]) => {
     if (!mounted || (!routerStatic && !routerObserve && !routerSettled && !reduceMotion)) return
-    const shouldAnnounce = winnerIndex.value >= 0 && !routerStatic && !routerObserve
+    const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value) && !routerStatic && !routerObserve
     settleStatic(shouldAnnounce)
   },
 )
@@ -576,6 +638,46 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   }
 }
 
+.router-fx-ensemble-stage {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.router-fx-handoff {
+  display: flex;
+  justify-content: center;
+  height: 16px;
+}
+
+.router-fx-handoff span {
+  position: relative;
+  width: 1px;
+  height: 12px;
+  background: color-mix(in srgb, var(--router-accent) 52%, var(--router-hairline));
+}
+
+.router-fx-handoff span::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: 50%;
+  width: 5px;
+  height: 5px;
+  border-right: 1px solid var(--router-accent);
+  border-bottom: 1px solid var(--router-accent);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.router-fx-stage-enter-active {
+  transition: opacity var(--dur-enter) var(--ease-out), transform var(--dur-enter) var(--ease-out);
+}
+
+.router-fx-stage-enter-from {
+  opacity: 0;
+  transform: translateY(-5px);
+}
+
 .router-fx-ensemble {
   position: relative;
   display: flex;
@@ -735,7 +837,6 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--router-muted);
-  text-transform: uppercase;
   white-space: nowrap;
 }
 
@@ -806,6 +907,21 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   display: grid;
   max-width: 100%;
   min-width: 0;
+}
+
+.router-fx-execution {
+  align-self: center;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--router-accent) 34%, var(--router-hairline));
+  border-radius: 999px;
+  color: var(--router-text);
+  background: color-mix(in srgb, var(--router-accent) 7%, var(--router-bg));
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .router-fx-sr-only {
@@ -1082,6 +1198,10 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   .router-fx-inspector__spin {
     animation: none !important;
     transition: none !important;
+  }
+
+  .router-fx-stage-enter-active {
+    transition: none;
   }
 }
 

@@ -28,7 +28,7 @@
       "layout_template": "pre-rc3-nested",
       "config_template": "desktop-unpinned.toml",
       "include_nested_roles": true,
-      "expected_inspect": ["recovery_required", "legacy_workspace_reconcile_available"],
+      "expected_inspect": ["attention", "legacy_workspace_reconcile_available"],
       "expected_reconcile": ["ready", "canonical_workspace"],
       "expected_effective_workspace": "workspace"
     },
@@ -40,7 +40,7 @@
       "layout_template": "pre-rc3-nested",
       "config_template": "desktop-unpinned.toml",
       "include_nested_roles": true,
-      "expected_inspect": ["recovery_required", "legacy_workspace_reconcile_available"],
+      "expected_inspect": ["attention", "legacy_workspace_reconcile_available"],
       "expected_reconcile": ["ready", "canonical_workspace"],
       "expected_effective_workspace": "workspace"
     },
@@ -52,7 +52,7 @@
       "layout_template": "pre-rc3-nested",
       "config_template": "desktop-unpinned.toml",
       "include_nested_roles": true,
-      "expected_inspect": ["recovery_required", "legacy_workspace_reconcile_available"],
+      "expected_inspect": ["attention", "legacy_workspace_reconcile_available"],
       "expected_reconcile": ["ready", "canonical_workspace"],
       "expected_effective_workspace": "workspace"
     },
@@ -64,7 +64,7 @@
       "layout_template": "pre-rc3-nested",
       "config_template": "desktop-unpinned.toml",
       "include_nested_roles": true,
-      "expected_inspect": ["recovery_required", "legacy_workspace_reconcile_available"],
+      "expected_inspect": ["attention", "legacy_workspace_reconcile_available"],
       "expected_reconcile": ["ready", "canonical_workspace"],
       "expected_effective_workspace": "workspace"
     },

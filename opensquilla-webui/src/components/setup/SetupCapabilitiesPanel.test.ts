@@ -15,6 +15,7 @@ function panel() {
       imageProvider: 'openrouter',
       imagePrimary: 'google/gemini-image',
       imageApiKey: '',
+      imageEnabled: true,
       imageKeyConfigured: false,
       imageCredentialSource: 'none' as ImageCredentialSource,
       audioApiKey: '',
@@ -33,6 +34,19 @@ function panel() {
         },
       ],
       imageProviders: [{ providerId: 'openrouter', label: 'OpenRouter' }],
+      imageCredentialOptions: [] as Array<{
+        providerId: string
+        available: boolean
+        source: string
+        owner: string
+      }>,
+      imageRecommendation: null as {
+        providerId: string
+        label: string
+        canReuseCredential: boolean
+        actionRequired: boolean
+        registrationUrl: string
+      } | null,
       imageModels: [
         {
           id: 'google/gemini-image',
@@ -80,18 +94,20 @@ function panel() {
 async function mountPanel(panelValue = panel()) {
   const resetCapability = vi.fn()
   const updateField = vi.fn()
+  const useImageRecommendation = vi.fn()
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(SetupCapabilitiesPanel, {
     panel: panelValue,
     onResetCapability: resetCapability,
     onUpdateField: updateField,
+    onUseImageRecommendation: useImageRecommendation,
   })
   app.use(i18n)
   app.mount(el)
   mounted.push(app)
   await nextTick()
-  return { el, resetCapability, updateField }
+  return { el, resetCapability, updateField, useImageRecommendation }
 }
 
 afterEach(() => {
@@ -100,7 +116,7 @@ afterEach(() => {
 })
 
 describe('SetupCapabilitiesPanel', () => {
-  it('renders a single-open accessible accordion without advanced or enable controls', async () => {
+  it('starts fully collapsed and keeps a single-open accessible accordion', async () => {
     i18n.global.locale.value = 'en'
     const { el } = await mountPanel()
     const triggers = el.querySelectorAll<HTMLButtonElement>('.capability-card__trigger')
@@ -110,9 +126,13 @@ describe('SetupCapabilitiesPanel', () => {
     expect(chevrons).toHaveLength(3)
     expect(chevrons[0]?.querySelector('path')?.getAttribute('d')).toBe('m6 8 4 4 4-4')
     expect(el.textContent).not.toContain('⌄')
-    expect(triggers[0]?.getAttribute('aria-expanded')).toBe('true')
+    expect(triggers[0]?.getAttribute('aria-expanded')).toBe('false')
     expect(triggers[1]?.getAttribute('aria-expanded')).toBe('false')
-    expect(el.querySelector('[name="setup_image_enabled"]')).toBeNull()
+    expect(triggers[2]?.getAttribute('aria-expanded')).toBe('false')
+    expect(el.querySelector('#capability-search-panel')?.getAttribute('style')).toContain('display: none')
+    expect(el.querySelector('#capability-image_generation-panel')?.getAttribute('style')).toContain('display: none')
+    expect(el.querySelector('#capability-audio-panel')?.getAttribute('style')).toContain('display: none')
+    expect(el.querySelector('[name="setup_image_enabled"]')).not.toBeNull()
     expect(el.querySelector('[name="setup_audio_enabled"]')).toBeNull()
     expect(el.querySelector('[name="setup_search_proxy"]')).toBeNull()
     expect(el.querySelector('[name="setup_provider_image_model_identifier"]')).not.toBeNull()
@@ -125,6 +145,11 @@ describe('SetupCapabilitiesPanel', () => {
     expect(triggers[1]?.getAttribute('aria-expanded')).toBe('true')
     expect(el.querySelector('#capability-search-panel')?.getAttribute('style')).toContain('display: none')
     expect(el.querySelector('#capability-image_generation-panel')?.getAttribute('role')).toBe('region')
+
+    triggers[1]!.click()
+    await nextTick()
+
+    expect(triggers[1]?.getAttribute('aria-expanded')).toBe('false')
   })
 
   it('labels key-free and key-required search providers before selection', async () => {
@@ -221,6 +246,145 @@ describe('SetupCapabilitiesPanel', () => {
     model!.value = 'custom/image-model'
     model!.dispatchEvent(new Event('input'))
     expect(updateField).toHaveBeenCalledWith('image', 'primary', 'custom/image-model')
+  })
+
+  it('groups the recommendation, configured model providers, and other image providers', async () => {
+    i18n.global.locale.value = 'en'
+    const grouped = panel()
+    grouped.options.imageProviders = [
+      { providerId: 'tokenrhythm', label: 'TokenRhythm Images' },
+      { providerId: 'openrouter', label: 'OpenRouter Images' },
+      { providerId: 'openai', label: 'OpenAI Images' },
+    ]
+    grouped.options.imageRecommendation = {
+      providerId: 'tokenrhythm',
+      label: 'TokenRhythm Images',
+      canReuseCredential: true,
+      actionRequired: false,
+      registrationUrl: '',
+    }
+    grouped.options.imageCredentialOptions = [
+      {
+        providerId: 'openrouter',
+        available: true,
+        source: 'llm_fallback',
+        owner: 'primary',
+      },
+      {
+        providerId: 'openai',
+        available: true,
+        source: 'env',
+        owner: 'image',
+      },
+    ]
+
+    const { el } = await mountPanel(grouped)
+    const groups = Array.from(
+      el.querySelectorAll<HTMLOptGroupElement>('[name="setup_image_provider"] optgroup'),
+    )
+
+    expect(groups.map(group => group.label)).toEqual([
+      'Recommended',
+      'Configured in Model providers',
+      'Other providers',
+    ])
+    expect(groups[1]?.textContent).toContain('OpenRouter Images')
+    expect(groups[2]?.textContent).toContain('OpenAI Images')
+  })
+
+  it('emits the explicit image-generation enable switch', async () => {
+    i18n.global.locale.value = 'en'
+    const { el, updateField } = await mountPanel()
+    const toggle = el.querySelector<HTMLInputElement>('[name="setup_image_enabled"]')
+
+    toggle!.checked = false
+    toggle!.dispatchEvent(new Event('change'))
+
+    expect(updateField).toHaveBeenCalledWith('image', 'enabled', false)
+  })
+
+  it('renders a catalog-backed image recommendation without selecting it', async () => {
+    i18n.global.locale.value = 'en'
+    const recommended = panel()
+    recommended.form.imageProvider = ''
+    recommended.form.imagePrimary = ''
+    recommended.options.imageProviders = [
+      { providerId: 'openrouter', label: 'OpenRouter Images' },
+      { providerId: 'tokenrhythm', label: 'TokenRhythm Images' },
+    ]
+    recommended.options.imageRecommendation = {
+      providerId: 'tokenrhythm',
+      label: 'TokenRhythm Images',
+      canReuseCredential: false,
+      actionRequired: true,
+      registrationUrl: 'https://tokenrhythm.studio/register',
+    }
+    const { el, useImageRecommendation } = await mountPanel(recommended)
+
+    const select = el.querySelector<HTMLSelectElement>('[name="setup_image_provider"]')
+    const card = el.querySelector<HTMLElement>('[data-testid="image-provider-recommendation"]')
+    const groups = Array.from(select?.querySelectorAll('optgroup') || [])
+    const useButton = Array.from(card?.querySelectorAll<HTMLButtonElement>('button') || [])
+      .find(button => button.textContent?.includes('Use TokenRhythm Images'))
+    const registration = card?.querySelector<HTMLAnchorElement>('a')
+
+    expect(select?.value).toBe('')
+    expect(groups.map(group => group.label)).toEqual(['Recommended', 'Other providers'])
+    expect(card?.getAttribute('role')).toBe('note')
+    expect(card?.textContent).toContain('Recommended: TokenRhythm Images')
+    expect(registration?.getAttribute('target')).toBe('_blank')
+    expect(registration?.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(registration?.getAttribute('aria-label')).toContain('opens in a new tab')
+
+    useButton!.click()
+    expect(useImageRecommendation).toHaveBeenCalledWith('tokenrhythm')
+  })
+
+  it('keeps a non-actionable recommendation in the picker without showing a setup card', async () => {
+    i18n.global.locale.value = 'en'
+    const recommended = panel()
+    recommended.options.imageProviders = [
+      { providerId: 'openrouter', label: 'OpenRouter Images' },
+      { providerId: 'tokenrhythm', label: 'TokenRhythm Images' },
+    ]
+    recommended.options.imageRecommendation = {
+      providerId: 'tokenrhythm',
+      label: 'TokenRhythm Images',
+      canReuseCredential: false,
+      actionRequired: false,
+      registrationUrl: 'https://tokenrhythm.studio/register',
+    }
+    const { el } = await mountPanel(recommended)
+
+    const select = el.querySelector<HTMLSelectElement>('[name="setup_image_provider"]')
+    const groups = Array.from(select?.querySelectorAll('optgroup') || [])
+
+    expect(select?.value).toBe('openrouter')
+    expect(groups.map(group => group.label)).toEqual(['Recommended', 'Other providers'])
+    expect(groups[0]?.textContent).toContain('TokenRhythm Images')
+    expect(el.querySelector('[data-testid="image-provider-recommendation"]')).toBeNull()
+  })
+
+  it('does not ask for registration when the recommended provider can reuse the LLM key', async () => {
+    i18n.global.locale.value = 'en'
+    const recommended = panel()
+    recommended.form.imageProvider = ''
+    recommended.form.imagePrimary = ''
+    recommended.options.imageProviders = [
+      { providerId: 'tokenrhythm', label: 'TokenRhythm Images' },
+    ]
+    recommended.options.imageRecommendation = {
+      providerId: 'tokenrhythm',
+      label: 'TokenRhythm Images',
+      canReuseCredential: true,
+      actionRequired: true,
+      registrationUrl: 'https://tokenrhythm.studio/register',
+    }
+    const { el } = await mountPanel(recommended)
+
+    const card = el.querySelector<HTMLElement>('[data-testid="image-provider-recommendation"]')
+    expect(card).not.toBeNull()
+    expect(card?.querySelector('a')).toBeNull()
   })
 
   it('shows a reusable model-provider credential without duplicating the key field', async () => {

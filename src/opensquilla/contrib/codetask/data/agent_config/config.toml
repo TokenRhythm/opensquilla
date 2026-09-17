@@ -2,7 +2,7 @@
 #
 # Loaded by LocalAdapter via OPENSQUILLA_GATEWAY_CONFIG_PATH (which REPLACES
 # the normal config chain) so the code-task agent runs with a focused tool
-# set: coding-irrelevant tools are denied (like the SWE-bench adapter) BUT
+# set: coding-irrelevant tools are denied, but
 # network stays enabled — code-task legitimately reads docs and installs
 # dependencies.
 #
@@ -65,6 +65,3 @@ trusted_fake_ip_cidrs = ["198.18.0.0/15"]
 # whole run on the wrong workflow. The outer gateway keeps its own meta_skill
 # setting; only this isolated subprocess is gated.
 enabled = false
-
-[memory]
-flush_enabled = false

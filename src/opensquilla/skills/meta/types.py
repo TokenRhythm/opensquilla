@@ -76,6 +76,10 @@ class MetaStep:
     # THIS step's id, so downstream depends_on links remain satisfied.
     # Empty string = no substitute (DAG fails normally on error).
     on_failure: str = ""
+    # Optional side-effect contract. ``external_paid_submit`` marks a
+    # non-idempotent provider submission: replay is fail-closed unless the
+    # trusted child proves that it failed before any submit was possible.
+    side_effect: str = ""
     # New in PR1 (design §6): populated only when kind == "user_input".
     # All other step kinds keep this as None and the executor layer
     # ignores it. Frozen at parse time; the orchestrator never mutates.

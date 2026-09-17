@@ -11,7 +11,7 @@ import typer
 from rich.table import Table
 
 from opensquilla.cli.gateway_rpc import confirm_or_exit, run_gateway_sync
-from opensquilla.cli.output import print_json
+from opensquilla.cli.output import exit_invalid_request, print_json
 from opensquilla.cli.ui import ACCENT_HEADER, console
 
 cron_app = typer.Typer(help="Inspect and manage scheduled OpenSquilla runs.")
@@ -255,7 +255,7 @@ def _build_delivery_params(
     webhook_token: str | None,
     failure_destination: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Translate CLI delivery flags into a delivery dict for the cron.add RPC.
+    """Translate CLI delivery flags into a delivery dict for the cron.create RPC.
 
     Returns None when the user did not request any delivery override AND no
     failure_destination was provided — the backend then falls back to its
@@ -666,7 +666,7 @@ def cron_add(
         params["delivery"] = delivery
 
     async def _run(client):
-        return await client.call("cron.add", params)
+        return await client.call("cron.create", params)
 
     payload = run_gateway_sync(_run, json_output=json_output)
     _emit_success(payload, json_output=json_output, title="Cron job added")
@@ -858,6 +858,12 @@ def cron_runs(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """List recent runs for a cron job."""
+    if limit < 1:
+        exit_invalid_request(
+            "--limit must be >= 1",
+            json_output=json_output,
+            details={"parameter": "limit", "minimum": 1},
+        )
 
     async def _run(client):
         return await client.call("cron.runs", {"id": job_id, "limit": limit})

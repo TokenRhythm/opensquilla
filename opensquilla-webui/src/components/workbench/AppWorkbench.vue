@@ -10,6 +10,7 @@
     :close-item-label="t('workbench.closeItem')"
     :resize-label="t('workbench.resize')"
     :pixels-label="t('workbench.pixels')"
+    :before-close-item="beforeCloseItem"
     @collapsed="restoreWorkbenchFocus"
     @emptied="restoreWorkbenchFocus"
     @surface-rect="onSurfaceRect"
@@ -32,6 +33,9 @@
     </template>
 
     <template #actions="{ item }">
+      <ResourceActionsMenu v-if="item && resourceActionArtifact(item)" :key="item.id"
+        :artifact="resourceActionArtifact(item)!" :session-key="sessionKeyFromWorkbenchItem(item)"
+        :previewable="false" trigger />
       <select
         v-if="artifactNavigationItems(item).length > 1"
         class="app-workbench__switcher"
@@ -53,6 +57,21 @@
         v-for="toolbarItem in panelToolbarItems(item)"
         :key="toolbarItem.id"
       >
+        <span
+          v-if="isActiveAnnotationToolbarItem(toolbarItem)"
+          id="workbench-annotation-mode-status"
+          class="app-workbench__annotation-mode-status"
+          :aria-label="t('workbench.artifactAnnotation.selectElement')"
+          :title="t('workbench.artifactAnnotation.selectElement')"
+          aria-atomic="true"
+          aria-live="polite"
+          data-testid="workbench-annotation-mode-status"
+          role="status"
+        >
+          <span class="app-workbench__annotation-mode-status-full" aria-hidden="true">
+            {{ t('workbench.artifactAnnotation.selectElement') }}
+          </span>
+        </span>
         <span
           v-if="toolbarItem.kind === 'status'"
           class="app-workbench__warning"
@@ -103,12 +122,22 @@
           class="app-workbench__action"
           :class="{ 'is-active': toolbarItem.pressed }"
           :aria-label="toolbarItem.label"
+          :aria-describedby="isActiveAnnotationToolbarItem(toolbarItem)
+            ? 'workbench-annotation-mode-status'
+            : undefined"
           :aria-pressed="toolbarItem.pressed"
           :disabled="toolbarItem.disabled"
           :title="toolbarItem.label"
           @click="performPanelAction(item, toolbarItem.id)"
         >
           <Icon :name="toolbarItem.icon" :size="15" aria-hidden="true" />
+          <span
+            v-if="toolbarItem.id === 'toggle-annotation-mode'"
+            class="app-workbench__action-beta"
+            aria-hidden="true"
+          >
+            β
+          </span>
         </button>
       </template>
     </template>
@@ -141,6 +170,7 @@
 <script setup lang="ts">
 import {
   computed,
+  inject,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -148,19 +178,34 @@ import {
 } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useConfirm } from '@/composables/useConfirm'
 import { useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
-import type { ArtifactPayload } from '@/types/rpc'
+import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
+import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
+import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
+import type { ArtifactPayload } from '@/types/artifacts'
+import {
+  ARTIFACT_WORKBENCH_KEY,
+  type ArtifactDocumentChange,
+} from '@/modules/artifactWorkbench'
+import type {
+  WorkbenchPreviewDescriptor,
+  WorkbenchResource,
+} from '@/types/workbenchResources'
+import { workbenchResourceRefId } from '@/types/workbenchResources'
 import { workbenchPanelRegistry } from '@/workbench/registry'
 import {
   artifactWorkbenchItemId,
+  artifactFromWorkbenchItem,
+  fileActionArtifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
+  requestInitialSectionForWorkbenchItem,
   sessionKeyFromWorkbenchItem,
 } from '@/workbench/artifactItems'
 import {
@@ -169,21 +214,42 @@ import {
   normalizeBrowserUrl,
   type BrowserWorkbenchOpenEventDetail,
 } from '@/workbench/browserItems'
-import {
-  artifactCategory,
-  artifactFileTitle,
-} from '@/utils/chat/artifacts'
+import { artifactFileTitle } from '@/utils/chat/artifacts'
+import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import {
   readPreviewPreferences,
   savePreviewPreferences,
 } from '@/utils/workbench/previewPreferences'
+import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
 } from '@/workbench/runtime'
+import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
+import {
+  workbenchResourceActionReasonCode,
+} from '@/workbench/resourceCapabilityPresentation'
+import {
+  artifactPayloadFromWorkbenchResource,
+  createResourceCollectionWorkbenchItem,
+  resourceFromPreparedPreview,
+  resourceUsesNativeHtmlPreview,
+  resourceCollectionWorkbenchItemId,
+  workbenchResourceKey,
+} from '@/workbench/workbenchResourceItems'
+import {
+  ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT,
+  ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT,
+  PAGE_ANNOTATIONS_SENT_EVENT,
+  type ArtifactPromptAnnotationFocusDetail,
+  type ArtifactPromptAnnotationReuseDetail,
+  type PageAnnotationsSentDetail,
+} from '@/workbench/promptAnnotations'
+import { PageAnnotationSendQueue } from '@/workbench/pageAnnotationSendQueue'
 import { useWorkbenchStore } from '@/workbench/store'
 import type {
   NativeSurfaceRect,
+  WorkbenchBeforeCloseOptions,
   WorkbenchComponentEvent,
   WorkbenchItem,
   WorkbenchPanelHeader,
@@ -193,16 +259,22 @@ import type {
 } from '@/workbench/types'
 import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
 import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
+import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
+import { downloadBlob } from '@/utils/browser'
 
 const props = withDefaults(defineProps<{
   enabled?: boolean
   modalBlocked?: boolean
+  workbenchResourcesEnabled?: boolean
+  promptAnnotationsEnabled?: boolean
   routeActive?: boolean
   sessionId?: string
 }>(), {
   enabled: true,
   modalBlocked: false,
+  workbenchResourcesEnabled: false,
+  promptAnnotationsEnabled: false,
   routeActive: false,
   sessionId: '',
 })
@@ -212,10 +284,26 @@ const { confirm } = useConfirm()
 const { pushToast } = useToasts()
 const platform = usePlatform()
 const store = useWorkbenchStore()
-const artifactImageLightbox = useArtifactImageLightbox()
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
+const artifactDocuments = useArtifactDocumentsStore()
+const artifactPromptAnnotations = useArtifactPromptAnnotationsStore()
+const workbenchResources = useWorkbenchResourcesStore()
+const artifactDocumentProvider = artifactWorkbench.documents
+artifactDocuments.setProvider(artifactDocumentProvider)
+const workbenchResourceProvider = artifactWorkbench.resources
+workbenchResources.setProvider(props.workbenchResourcesEnabled ? workbenchResourceProvider : null)
 const nativeSurfaceOccluded = useNativeSurfaceOcclusionState()
 const surfaceBlocked = computed(() => props.modalBlocked || nativeSurfaceOccluded.value)
-const baseOrigin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin
+const baseOrigin = (() => {
+  if (typeof window === 'undefined') return 'http://localhost'
+  if (
+    window.location.protocol === 'opensquilla-app:'
+    && window.location.hostname === 'desktop'
+  ) return 'opensquilla-app://desktop'
+  return window.location.origin
+})()
 const nativeApi = platform.workbench.native
 const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
   nativeWorkbenchApi: nativeApi,
@@ -225,15 +313,17 @@ const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
   },
 })
 let stopSurfaceEvents: (() => void) | null = null
+let stopArtifactEvents: (() => void) | null = null
 let detachRuntime: (() => Promise<void>) | null = null
-
-function readAuthToken(): string {
-  if (typeof sessionStorage === 'undefined') return ''
-  try {
-    return sessionStorage.getItem('opensquilla.wsToken') || ''
-  } catch {
-    return ''
-  }
+let scopeChangeGeneration = 0
+function artifactPreviewItemForExplicitOpen(
+  options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
+): WorkbenchItem {
+  const item = createArtifactPreviewWorkbenchItem(options)
+  return requestInitialSectionForWorkbenchItem(
+    item,
+    store.items.find(candidate => candidate.id === item.id) || null,
+  )
 }
 
 function confirmWorkbenchPermission(request: {
@@ -277,7 +367,27 @@ function onBrowserWorkbenchOpen(event: Event) {
 }
 
 for (const definition of createArtifactWorkbenchDefinitions({
-  authToken: readAuthToken,
+  artifactContent: artifactWorkbench.content,
+  artifactPreviews: artifactWorkbench.previews,
+  artifactDocuments,
+  promptAnnotations: props.promptAnnotationsEnabled ? {
+    create: request => artifactPromptAnnotations.create(request),
+    setScreenshot: (annotationId, attachment) => artifactPromptAnnotations.setScreenshot(annotationId, attachment),
+    update: (annotationId, body) => artifactPromptAnnotations.update(annotationId, body),
+    discard: annotationId => artifactPromptAnnotations.discard(annotationId),
+    beginOverlayEdit: (annotationId, sessionKey) => {
+      artifactPromptAnnotations.beginOverlayEdit(annotationId, sessionKey)
+    },
+    completeOverlayEdit: annotationId => {
+      artifactPromptAnnotations.completeOverlayEdit(annotationId)
+    },
+    releaseOverlayEdit: annotationId => {
+      artifactPromptAnnotations.releaseOverlayEdit(annotationId)
+    },
+    setActiveDocument: (sessionKey, documentId) => {
+      artifactPromptAnnotations.setActiveDocument(sessionKey, documentId)
+    },
+  } : undefined,
   baseOrigin,
   confirmPermission: confirmWorkbenchPermission,
   confirmRemoteResources: () => confirm({
@@ -288,40 +398,33 @@ for (const definition of createArtifactWorkbenchDefinitions({
   }),
   currentSessionId: () => store.activeSessionId || props.sessionId,
   getPreviewPreferences: () => readPreviewPreferences(platform),
-  openArtifact: (artifact, sessionKey, navigationArtifacts) => {
-    if (artifactCategory(artifact) === 'visual') {
-      artifactImageLightbox.open({
-        artifact,
-        navigationArtifacts,
-        sessionKey,
-      })
-      return
-    }
-    const opened = store.openItem(createArtifactPreviewWorkbenchItem({
-      artifact,
-      navigationArtifacts,
-      nativeHtml: Boolean(
-        platform.capabilities.hasNativeWorkbenchSurfaces
-        && platform.workbench.native,
-      ),
-      sessionKey,
-    }))
-    if (!opened) {
-      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-    }
+  publishDocument: async request => {
+    await workbenchResources.publishDocument(
+      request.sessionKey,
+      request.documentId,
+      request.revisionId,
+      request.name,
+    )
+    refreshResourceCollectionItem(request.sessionKey)
+    pushToast(t('workbench.resources.published', { name: request.name }), {
+      tone: 'ok',
+    })
   },
   platform,
   previewLeasesEnabled: true,
   pushToast: (message, options) => pushToast(message, options),
   savePreviewPreferences: preferences => savePreviewPreferences(platform, preferences),
-  showFullPreviewNotice: () => pushToast(
-    t('workbench.artifactPreview.fullModeNotice'),
-    { tone: 'info', duration: 9000 },
-  ),
   t: (key, params) => String(t(key, params || {})),
 })) {
   workbenchPanelRegistry.register(definition, { replace: true })
 }
+workbenchPanelRegistry.register(createWorkbenchResourceCollectionDefinition({
+  download: downloadWorkbenchResource,
+  open: openWorkbenchResource,
+  publish: publishWorkbenchResource,
+  pushError: message => pushToast(message, { tone: 'danger', duration: 9000 }),
+  t: (key, params) => String(t(key, params || {})),
+}), { replace: true })
 workbenchPanelRegistry.register(createBrowserWorkbenchDefinition({
   confirmPermission: confirmWorkbenchPermission,
   openExternal: openExternalUrl,
@@ -329,6 +432,272 @@ workbenchPanelRegistry.register(createBrowserWorkbenchDefinition({
   t: (key, params) => String(t(key, params || {})),
 }), { replace: true })
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
+const pageAnnotationSendQueue = new PageAnnotationSendQueue()
+let pageAnnotationSendFlush: Promise<void> | null = null
+let pageAnnotationSendFlushRequested = false
+let pageAnnotationSendRetryTimer: ReturnType<typeof setTimeout> | null = null
+let pageAnnotationSendRetryDelay = 250
+const stopPromptAnnotationLifecycle = store.onLifecycle(event => {
+  // The acceptance response can arrive before the resource/session descriptor
+  // is mounted. Open and update are the authoritative handoff boundaries;
+  // activation/resume also cover a tab that was already retained but hidden.
+  if (
+    event.type === 'open'
+    || event.type === 'update'
+    || event.type === 'activate'
+    || event.type === 'resume'
+  ) schedulePageAnnotationSendFlush()
+})
+
+function resourceSessionKey(item: WorkbenchItem): string {
+  return item.scope.type === 'session' ? item.scope.id : ''
+}
+
+function openResourceArtifact(
+  resource: WorkbenchResource,
+  artifact: ArtifactPayload,
+  sessionKey: string,
+  preparedPreview?: WorkbenchPreviewDescriptor,
+  initialSection: 'preview' | 'source' = 'preview',
+) {
+  const nativeArtifact = resourceUsesNativeHtmlPreview(resource)
+  const opened = store.openItem(artifactPreviewItemForExplicitOpen({
+    artifact,
+    initialSection,
+    nativeHtml: Boolean(
+      nativeArtifact
+      && platform.capabilities.hasNativeWorkbenchSurfaces
+      && platform.workbench.native,
+    ),
+    ...(preparedPreview ? { preparedPreview } : {}),
+    previewLeaseEligible: nativeArtifact,
+    resourceIdentity: workbenchResourceKey(resource.resource),
+    sessionKey,
+  }))
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+}
+
+async function openWorkbenchResource(resource: WorkbenchResource, item: WorkbenchItem) {
+  const sessionKey = resourceSessionKey(item)
+  if (!sessionKey) return
+  const current = await workbenchResources.openCurrent(sessionKey, resource)
+  if (current?.disposition === 'document') {
+    refreshResourceCollectionItem(sessionKey)
+    const artifact = artifactPayloadFromRevision(current.revision)
+    artifact.documentId = current.document.documentId
+    artifact.revisionId = current.revision.revisionId
+    openResourceArtifact(current.resource, artifact, sessionKey)
+    return
+  }
+  if (!current && resource.resource.type === 'document') {
+    openResourceArtifact(
+      resource,
+      artifactPayloadFromWorkbenchResource(resource),
+      sessionKey,
+    )
+    return
+  }
+  if (
+    !current
+    && resource.resource.type !== 'document'
+    && resource.capabilities.edit
+    && resource.sha256
+  ) {
+    await importWorkbenchResourceForSession(resource, sessionKey)
+    return
+  }
+  const readonlyResource = current?.resource || resource
+  refreshResourceCollectionItem(sessionKey)
+  if (!readonlyResource.capabilities.preview) {
+    const previewKind = artifactWorkbenchPreviewKind(
+      artifactPayloadFromWorkbenchResource(readonlyResource),
+    )
+    if (previewKind !== 'html' && readonlyResource.capabilities.download) {
+      await downloadWorkbenchResource(readonlyResource, item)
+      return
+    }
+    throw artifactProductClientError('RESOURCE_UNSUPPORTED', {
+      reasonCode: current?.reasonCode || workbenchResourceActionReasonCode(
+        readonlyResource.capabilities,
+        'preview',
+      ) || undefined,
+    })
+  }
+  if (
+    resourceUsesNativeHtmlPreview(readonlyResource)
+    && platform.capabilities.hasNativeWorkbenchSurfaces
+    && platform.workbench.native
+  ) {
+    openResourceArtifact(
+      readonlyResource,
+      artifactPayloadFromWorkbenchResource(readonlyResource),
+      sessionKey,
+    )
+    return
+  }
+  const preview = await workbenchResources.preview(sessionKey, readonlyResource.resource)
+  const resolved = preview ? resourceFromPreparedPreview(preview) : readonlyResource
+  openResourceArtifact(
+    resolved,
+    artifactPayloadFromWorkbenchResource(resolved),
+    sessionKey,
+    resolved.resource.type === 'document' ? undefined : preview?.preview,
+  )
+}
+
+async function importWorkbenchResourceForSession(
+  resource: WorkbenchResource,
+  sessionKey: string,
+) {
+  const imported = await workbenchResources.importDocument(sessionKey, resource)
+  refreshResourceCollectionItem(sessionKey)
+  const artifact = artifactPayloadFromRevision(imported.revision)
+  artifact.documentId = imported.document.documentId
+  artifact.revisionId = imported.revision.revisionId
+  openResourceArtifact({
+    ...resource,
+    resource: {
+      type: 'document',
+      documentId: imported.document.documentId,
+      id: imported.document.documentId,
+    },
+    downloadUrl: imported.revision.downloadUrl || imported.document.latestDownloadUrl,
+    capabilities: {
+      preview: imported.document.capabilities.preview,
+      download: imported.document.capabilities.download,
+      selectionContext: imported.document.capabilities.selectionContext,
+      manualEdit: imported.document.capabilities.manualEdit,
+      agentEdit: imported.document.capabilities.agentEdit,
+      edit: imported.document.capabilities.edit,
+      publish: imported.document.capabilities.publish,
+      reasonCode: imported.document.capabilities.reason,
+    },
+    relations: {
+      documentId: imported.document.documentId,
+      headRevisionId: imported.revision.revisionId,
+      headArtifactId: imported.revision.artifactId,
+      source: resource.resource,
+    },
+  }, artifact, sessionKey)
+}
+
+async function publishWorkbenchResource(
+  resource: WorkbenchResource,
+  item: WorkbenchItem,
+) {
+  const sessionKey = resourceSessionKey(item)
+  const documentId = resource.relations.documentId || (
+    resource.resource.type === 'document' ? workbenchResourceRefId(resource.resource) : ''
+  )
+  const revisionId = resource.relations.headRevisionId || ''
+  if (!sessionKey || !documentId || !revisionId) {
+    throw new Error(t('workbench.resources.publishUnavailable'))
+  }
+  await workbenchResources.publishDocument(
+    sessionKey,
+    documentId,
+    revisionId,
+    resource.name,
+  )
+  refreshResourceCollectionItem(sessionKey)
+  pushToast(t('workbench.resources.published', { name: resource.name }), {
+    tone: 'ok',
+  })
+}
+
+async function downloadWorkbenchResource(
+  resource: WorkbenchResource,
+  item: WorkbenchItem,
+) {
+  const sessionKey = resourceSessionKey(item)
+  const resolved = sessionKey
+    ? await workbenchResources.resolve(sessionKey, resource.resource) || resource
+    : resource
+  const inlineAttachment = resolved.resource.type === 'attachment'
+    && typeof resolved.downloadUrl === 'string'
+    && resolved.downloadUrl.startsWith('data:')
+  const artifact = artifactPayloadFromWorkbenchResource(resolved)
+  const result = await artifactWorkbench.content.fetchArtifact(artifact, {
+    sessionKey,
+  })
+  if (!result.ok) throw new Error(result.message)
+  const blob = result.blob
+  if (inlineAttachment) {
+    if (typeof resolved.size === 'number' && blob.size !== resolved.size) {
+      throw new Error(t('workbench.resources.actionFailed'))
+    }
+    if (resolved.sha256) {
+      const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer())
+      const actual = [...new Uint8Array(digest)]
+        .map(value => value.toString(16).padStart(2, '0'))
+        .join('')
+      if (actual !== resolved.sha256.toLowerCase()) {
+        throw new Error(t('workbench.resources.actionFailed'))
+      }
+    }
+  }
+  downloadBlob(blob, resolved.name)
+}
+
+function refreshResourceCollectionItem(sessionKey: string) {
+  const itemId = resourceCollectionWorkbenchItemId(sessionKey)
+  if (!store.items.some(item => item.id === itemId)) return
+  store.updateItem(createResourceCollectionWorkbenchItem({
+    resources: workbenchResources.navigationResources(sessionKey),
+    sessionKey,
+    title: t('workbench.resources.title'),
+  }))
+}
+
+async function refreshArtifactDocumentItem(
+  item: WorkbenchItem,
+) {
+  const artifact = artifactFromWorkbenchItem(item)
+  if (!artifact) return
+  const sessionKey = sessionKeyFromWorkbenchItem(item)
+  if (!sessionKey) return
+  const previousRevisionId = artifactDocuments.snapshot(
+    artifact,
+    sessionKey,
+  ).workspace?.document.headRevisionId
+  const workspace = await artifactDocuments.refresh(artifact, sessionKey)
+  const current = store.items.find(candidate => candidate.id === item.id)
+  if (!current) return
+  // The document snapshot lives in a separate Pinia store. Refresh the
+  // descriptor identity as well so an already-mounted panel recomputes its
+  // Versions/Changes props immediately, even when the state event arrived
+  // during a WebSocket reconnect boundary.
+  const updated = {
+    ...current,
+    payload: { ...current.payload },
+  }
+  store.updateItem(updated)
+  if (
+    workspace.source === 'document-api'
+    && previousRevisionId
+    && previousRevisionId !== workspace.document.headRevisionId
+  ) {
+    // Route the head change with the descriptor that updateItem just made
+    // authoritative. RuntimeManager deliberately rejects the stale descriptor
+    // captured before the asynchronous metadata refresh.
+    runtimeManager.handleComponentEvent(updated, {
+      type: 'artifact-head-changed',
+      payload: { revisionId: workspace.document.headRevisionId },
+    })
+  }
+}
+
+function refreshOpenArtifactDocuments(sessionKey: string) {
+  for (const item of store.items) {
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact || sessionKeyFromWorkbenchItem(item) !== sessionKey) continue
+    const workspace = artifactDocuments.snapshot(artifact, sessionKey).workspace
+    if (workspace?.source !== 'document-api') continue
+    void refreshArtifactDocumentItem(item).catch(() => undefined)
+  }
+}
 
 function panelComponent(item: WorkbenchItem) {
   return workbenchPanelRegistry.resolve(item)?.component || null
@@ -383,7 +752,7 @@ function selectNavigationArtifact(
   if (!artifact || select.value === item.id) return
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
-  const opened = store.openItem(createArtifactPreviewWorkbenchItem({
+  const opened = store.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     navigationArtifacts,
     nativeHtml: Boolean(
@@ -421,6 +790,16 @@ function panelToolbarItems(
       item.hostKind === 'native-webcontents',
     ),
   ) || []
+}
+
+function resourceActionArtifact(item: WorkbenchItem): ArtifactPayload | undefined {
+  return fileActionArtifactFromWorkbenchItem(item, runtimeManager.getRenderState(item.id))
+}
+
+function isActiveAnnotationToolbarItem(toolbarItem: WorkbenchToolbarItem): boolean {
+  return toolbarItem.kind === 'action'
+    && toolbarItem.id === 'toggle-annotation-mode'
+    && toolbarItem.pressed === true
 }
 
 function setPanelHandle(item: WorkbenchItem, value: unknown) {
@@ -466,6 +845,8 @@ function performPanelSelection(
 function restoreWorkbenchFocus() {
   void nextTick(() => {
     const candidates = document.querySelectorAll<HTMLElement>([
+      '[data-testid="chat-session-action-workbench"]',
+      '[data-testid="chat-header-primary-action"][data-action="workbench"]',
       '[data-testid="chat-session-action-deliverables"]',
       '[data-testid="chat-header-primary-action"][data-action="deliverables"]',
       '.chat-textarea',
@@ -480,13 +861,262 @@ function onSurfaceRect(rect: NativeSurfaceRect) {
 }
 
 function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
+  if (event.type === 'browser-opened') {
+    const detail = event.detail
+    if (!detail?.url || detail.sessionKey !== props.sessionId || !nativeApi) return
+    const item = createBrowserWorkbenchItem({ scopeId: detail.sessionKey, url: detail.url })
+    if (!item) return
+    item.id = event.surfaceId
+    item.title = detail.title || item.title
+    item.payload = { ...item.payload, adoptedNativeSurface: true, targetRef: detail.targetRef }
+    store.openItem(item)
+    store.setExpanded(true)
+    return
+  }
   runtimeManager.handleNativeSurfaceEvent(event)
+}
+
+function onArtifactState(event: ArtifactDocumentChange) {
+  const documentId = event.documentId
+  const activeSessionKey = store.activeSessionId || props.sessionId
+  if (props.workbenchResourcesEnabled && activeSessionKey) {
+    void workbenchResources.load(activeSessionKey, true).then(() => {
+      refreshResourceCollectionItem(activeSessionKey)
+    }).catch(() => undefined)
+  }
+  for (const item of store.items) {
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact) continue
+    const itemSessionKey = sessionKeyFromWorkbenchItem(item)
+    const snapshot = artifactDocuments.snapshot(artifact, itemSessionKey)
+    if (snapshot.workspace?.document.documentId !== documentId) continue
+    void refreshArtifactDocumentItem(item).catch(() => undefined)
+  }
+}
+
+function promptAnnotationItem(
+  detail: { documentId: string; sessionKey: string },
+) {
+  if (!detail.documentId || !detail.sessionKey) return null
+  const item = store.items.find((candidate) => {
+    const artifact = artifactFromWorkbenchItem(candidate)
+    if (!artifact || sessionKeyFromWorkbenchItem(candidate) !== detail.sessionKey) return false
+    return artifactDocuments.snapshot(artifact, detail.sessionKey)
+      .workspace?.document.documentId === detail.documentId
+  })
+  return item || null
+}
+
+async function activatePromptAnnotationItem(
+  detail: ArtifactPromptAnnotationFocusDetail | ArtifactPromptAnnotationReuseDetail,
+) {
+  detail.acknowledge?.()
+  const item = promptAnnotationItem(detail)
+  if (!item) return null
+  artifactPromptAnnotations.setActiveDocument(detail.sessionKey, detail.documentId)
+  store.activateItem(item.id)
+  store.setExpanded(true)
+  await nextTick()
+  await runtimeManager.flush(item.id)
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const state = runtimeManager.getRenderState(item.id)
+    if (
+      state.annotationAvailable === true
+      && state.nativeSurfaceState === 'ready'
+    ) return item
+    if (
+      state.nativeSurfaceState === 'error'
+      || state.nativeSurfaceState === 'crashed'
+      || state.previewBlocked === true
+    ) return null
+    await new Promise(resolve => window.setTimeout(resolve, 50))
+  }
+  return null
+}
+
+async function onPromptAnnotationFocus(event: Event) {
+  const detail = (event as CustomEvent<ArtifactPromptAnnotationFocusDetail>).detail
+  if (!detail?.annotationId || !detail.documentId || !detail.sessionKey) {
+    detail?.complete?.(false)
+    return
+  }
+  const item = await activatePromptAnnotationItem(detail)
+  if (!item) {
+    detail.complete?.(false)
+    return
+  }
+  const draft = artifactPromptAnnotations.annotations[detail.annotationId]
+  if (!draft?.targetRef || !draft.locatorHint || !nativeApi?.focusWorkbenchAnnotation) {
+    detail.complete?.(false)
+    return
+  }
+  try {
+    const result = await nativeApi.focusWorkbenchAnnotation({
+      surfaceId: item.id, targetRef: draft.targetRef, locatorHint: draft.locatorHint,
+      ...(draft.pagePath ? { pagePath: draft.pagePath } : {}),
+    })
+    detail.complete?.(result.ok)
+  } catch {
+    detail.complete?.(false)
+  }
+}
+
+async function onPromptAnnotationReuse(event: Event) {
+  const detail = (event as CustomEvent<ArtifactPromptAnnotationReuseDetail>).detail
+  if (
+    !detail?.documentId
+    || !detail.sessionKey
+    || !detail.body.trim()
+    || detail.body.length > 16 * 1024
+  ) {
+    detail?.complete?.(false)
+    return
+  }
+  const item = await activatePromptAnnotationItem(detail)
+  if (!item) {
+    detail.complete?.(false)
+    return
+  }
+  runtimeManager.handleComponentEvent(item, {
+    type: 'artifact-prompt-annotation-reuse',
+    payload: { body: detail.body },
+  })
+  await runtimeManager.flush(item.id)
+  detail.complete?.(true)
+}
+
+async function deliverPageAnnotationSend(
+  item: WorkbenchItem,
+  draftIds: readonly string[],
+): Promise<boolean> {
+  // A descriptor may be replaced while the runtime queue is draining. Keep
+  // the acknowledgement queued in that case; the store's update lifecycle
+  // will retry against the authoritative descriptor.
+  const current = store.items.find(candidate => candidate.id === item.id)
+  if (current !== item || item.kind !== 'artifact-preview') return false
+  runtimeManager.handleComponentEvent(item, {
+    type: 'page-annotations-sent',
+    payload: { draftIds: [...draftIds] },
+  })
+  await runtimeManager.flush(item.id)
+  if (store.items.find(candidate => candidate.id === item.id) !== item) return false
+  // A stale descriptor can pass the identity check while its runtime is still
+  // being disposed/recreated.  In that window handleComponentEvent is a
+  // no-op; consuming the acknowledgement would leave the native picker active
+  // forever because no later event would replay it.  Keep it queued until the
+  // matching runtime exists and has processed the event.
+  if (!runtimeManager.hasRuntime(item.id)) return false
+  const state = runtimeManager.getRenderState(item.id)
+  // A runtime instance may be present before its provider constructor has
+  // published the initial render state. Treat that as an unprocessed event,
+  // rather than consuming the acknowledgement from an empty state object.
+  if (
+    !Object.prototype.hasOwnProperty.call(state, 'annotationMode')
+    || !Object.prototype.hasOwnProperty.call(state, 'annotationModeStopping')
+  ) return false
+  // `setArtifactAnnotationMode(false)` reports failures through render state
+  // rather than throwing. Do not consume the acknowledgement until the native
+  // picker is confirmed inactive; a later lifecycle/retry can then finish the
+  // cleanup instead of leaving the orange picker pressed for the next turn.
+  return state.annotationMode !== true && state.annotationModeStopping !== true
+}
+
+async function flushPageAnnotationSendQueue(): Promise<void> {
+  await nextTick()
+  // A session can also have a resource collection or browser tab open. Only
+  // artifact previews can consume this event; passing other session-scoped
+  // items to the queue would make a no-op look like a failed delivery and
+  // retain an already-applied acknowledgement until TTL expiry.
+  const artifactItems = store.items.filter(item => item.kind === 'artifact-preview')
+  await pageAnnotationSendQueue.flush(
+    artifactItems,
+    sessionKeyFromWorkbenchItem,
+    deliverPageAnnotationSend,
+  )
+  if (pageAnnotationSendQueue.size === 0) {
+    pageAnnotationSendRetryDelay = 250
+    return
+  }
+  if (pageAnnotationSendRetryTimer) return
+  const delay = pageAnnotationSendRetryDelay
+  pageAnnotationSendRetryDelay = Math.min(delay * 2, 4_000)
+  pageAnnotationSendRetryTimer = setTimeout(() => {
+    pageAnnotationSendRetryTimer = null
+    schedulePageAnnotationSendFlush()
+  }, delay)
+}
+
+function schedulePageAnnotationSendFlush(): void {
+  if (pageAnnotationSendRetryTimer) {
+    clearTimeout(pageAnnotationSendRetryTimer)
+    pageAnnotationSendRetryTimer = null
+  }
+  if (pageAnnotationSendFlush) {
+    pageAnnotationSendFlushRequested = true
+    return
+  }
+  pageAnnotationSendFlush = flushPageAnnotationSendQueue()
+    .catch(() => undefined)
+    .finally(() => {
+      pageAnnotationSendFlush = null
+      if (!pageAnnotationSendFlushRequested) return
+      pageAnnotationSendFlushRequested = false
+      schedulePageAnnotationSendFlush()
+    })
+}
+
+async function onPageAnnotationsSent(event: Event) {
+  const detail = (event as CustomEvent<PageAnnotationsSentDetail>).detail
+  if (!detail?.sessionKey || detail.draftIds.length === 0) return
+  // Chat acceptance can update the resource descriptor after this event. Keep
+  // the acknowledgement until an artifact item exists instead of relying on
+  // a fixed number of render ticks.
+  if (pageAnnotationSendQueue.enqueue(detail)) {
+    schedulePageAnnotationSendFlush()
+  }
+}
+
+async function beforeCloseItem(
+  item: WorkbenchItem,
+  options?: WorkbenchBeforeCloseOptions,
+): Promise<boolean> {
+  const accepted = await runtimeManager.beforeClose(item, options)
+  if (!accepted) {
+    pushToast(t('workbench.artifactDocument.sourceUnavailable'), {
+      tone: 'danger',
+      duration: 9000,
+    })
+  }
+  return accepted
+}
+
+async function setSessionScopeSafely(sessionId: string | null) {
+  const generation = ++scopeChangeGeneration
+  const previousSessionId = store.activeSessionId
+  if (previousSessionId === sessionId) return
+  const staleItems = store.items.filter(item =>
+    item.scope.type === 'session' && item.scope.id !== sessionId)
+  for (const item of staleItems) {
+    if (!await beforeCloseItem(item) || generation !== scopeChangeGeneration) return
+  }
+  if (generation !== scopeChangeGeneration) return
+  store.setSessionScope(sessionId)
+  if (previousSessionId) {
+    artifactDocuments.clearSession(previousSessionId)
+    workbenchResources.clearSession(previousSessionId)
+  }
+  if (props.workbenchResourcesEnabled && sessionId) {
+    void workbenchResources.load(sessionId, true).then(() => {
+      refreshResourceCollectionItem(sessionId)
+    }).catch(() => undefined)
+  }
 }
 
 watch(
   () => [props.routeActive, props.sessionId] as const,
   ([routeActive, sessionId]) => {
-    if (routeActive) store.setSessionScope(sessionId || null)
+    if (!routeActive) return
+    void setSessionScopeSafely(sessionId || null)
   },
   { immediate: true },
 )
@@ -498,17 +1128,61 @@ watch(
   },
 )
 
+watch(
+  () => props.workbenchResourcesEnabled,
+  enabled => {
+    workbenchResources.setProvider(enabled ? workbenchResourceProvider : null)
+    const sessionKey = store.activeSessionId || props.sessionId
+    if (!enabled) {
+      workbenchResources.reset()
+      return
+    }
+    if (props.routeActive && sessionKey) {
+      void workbenchResources.load(sessionKey, true).then(() => {
+        refreshResourceCollectionItem(sessionKey)
+      }).catch(() => undefined)
+    }
+  },
+)
+
 onMounted(() => {
   if (nativeApi) stopSurfaceEvents = nativeApi.onSurfaceEvent(onNativeSurfaceEvent)
+  const documentChanges = artifactWorkbench.subscribeDocumentChanges(onArtifactState)
+  stopArtifactEvents = () => documentChanges.close()
+  const sessionKey = store.activeSessionId || props.sessionId
+  if (props.routeActive && sessionKey) {
+    refreshOpenArtifactDocuments(sessionKey)
+  }
   window.addEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
+  window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)
+  window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT, onPromptAnnotationReuse)
+  window.addEventListener(
+    PAGE_ANNOTATIONS_SENT_EVENT,
+    onPageAnnotationsSent,
+  )
 })
 
 onBeforeUnmount(() => {
+  stopPromptAnnotationLifecycle()
+  pageAnnotationSendQueue.clear()
+  if (pageAnnotationSendRetryTimer) clearTimeout(pageAnnotationSendRetryTimer)
+  pageAnnotationSendRetryTimer = null
+  pageAnnotationSendFlushRequested = false
   window.removeEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
+  window.removeEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)
+  window.removeEventListener(ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT, onPromptAnnotationReuse)
+  window.removeEventListener(
+    PAGE_ANNOTATIONS_SENT_EVENT,
+    onPageAnnotationsSent,
+  )
   stopSurfaceEvents?.()
   stopSurfaceEvents = null
+  stopArtifactEvents?.()
+  stopArtifactEvents = null
   if (detachRuntime) void detachRuntime()
   detachRuntime = null
+  artifactDocuments.setProvider(null)
+  workbenchResources.setProvider(null)
 })
 </script>
 
@@ -549,9 +1223,11 @@ onBeforeUnmount(() => {
 }
 
 .app-workbench__action {
+  position: relative;
   display: inline-flex;
   width: 30px;
   height: 30px;
+  flex: 0 0 30px;
   align-items: center;
   justify-content: center;
   padding: 0;
@@ -560,6 +1236,18 @@ onBeforeUnmount(() => {
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
+}
+
+.app-workbench__action-beta {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  color: currentColor;
+  font-size: 7px;
+  font-weight: 600;
+  line-height: 1;
+  opacity: 0.58;
+  pointer-events: none;
 }
 
 .app-workbench__switcher {
@@ -612,6 +1300,28 @@ onBeforeUnmount(() => {
   outline-offset: -2px;
 }
 
+.app-workbench__annotation-mode-status {
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(220px, 30vw);
+  height: 28px;
+  flex: 0 1 220px;
+  align-items: center;
+  padding: 0 var(--sp-2);
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+  color: var(--accent);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.app-workbench__annotation-mode-status-full {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .app-workbench__warning {
   display: inline-flex;
   min-width: 0;
@@ -637,12 +1347,16 @@ onBeforeUnmount(() => {
   font-size: var(--fs-sm);
 }
 
-@media (max-width: 600px) {
+@container (max-width: 520px) {
   .app-workbench__switcher {
-    width: min(128px, 35vw);
+    width: min(128px, 35cqw);
   }
 
   .app-workbench__warning span {
+    display: none;
+  }
+
+  .app-workbench__annotation-mode-status {
     display: none;
   }
 }

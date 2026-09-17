@@ -9,6 +9,7 @@ other test failure. This pins the production wiring.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -50,9 +51,8 @@ async def test_build_services_wires_media_root_into_session_manager(
 
     media = tmp_path / "media"
     config = GatewayConfig(
-        memory={"flush_enabled": False},
+        memory={},
         attachments={"media_root": str(media)},
-        sandbox={"auto_setup": False},
     )
 
     services = await build_services(
@@ -63,5 +63,100 @@ async def test_build_services_wires_media_root_into_session_manager(
         media_root = services.session_manager._media_root
         assert media_root is not None
         assert media_root == media_root_from_config(config)
+    finally:
+        await services.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["exception", "report"])
+async def test_build_services_continues_when_optional_sandbox_migration_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[sandbox]\nrun_mode = "trusted"\n', encoding="utf-8")
+
+    def reject_background_task(coro):
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        raise AssertionError("unit tests must not schedule real sandbox setup")
+
+    def fail_optional_migration(_home: Path):
+        if failure_kind == "exception":
+            raise PermissionError("residual process holds the config")
+        return SimpleNamespace(
+            ok=False,
+            status="retry_required",
+            error="residual process holds the config",
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.boot.create_background_task",
+        reject_background_task,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.upgrade_migration.ensure_sandbox_upgrade_migrated",
+        fail_optional_migration,
+    )
+
+    services = await build_services(
+        config=GatewayConfig(
+            config_path=str(config_path),
+            memory={},
+        ),
+        session_db_path=":memory:",
+        seed_agent_workspaces=False,
+    )
+    try:
+        assert services.session_manager is not None
+        assert 'run_mode = "trusted"' in config_path.read_text(encoding="utf-8")
+    finally:
+        await services.close()
+
+
+@pytest.mark.asyncio
+async def test_build_services_reconciles_artifact_mutations_before_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
+    calls: list[tuple[str, object]] = []
+
+    def reject_background_task(coro):
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        raise AssertionError("unit tests must not schedule real sandbox setup")
+
+    async def retire(service):
+        calls.append(("retire", service))
+
+    async def recover(service, store, **_kwargs):
+        calls.append(("recover", service))
+        return type("Summary", (), {"examined": 0})()
+
+    monkeypatch.setattr("opensquilla.gateway.boot.create_background_task", reject_background_task)
+    monkeypatch.setattr(
+        "opensquilla.artifact_session.ArtifactSessionService.retire_legacy_html_state", retire
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.document_resource_recovery.reconcile_pending_document_resources",
+        recover,
+    )
+    media = tmp_path / "media"
+    services = await build_services(
+        config=GatewayConfig(
+            memory={},
+            attachments={"media_root": str(media)},
+        ),
+        session_db_path=":memory:",
+        seed_agent_workspaces=False,
+    )
+    try:
+        assert [item[0] for item in calls] == ["retire", "recover"]
+        assert calls[0][1] is calls[1][1]
     finally:
         await services.close()

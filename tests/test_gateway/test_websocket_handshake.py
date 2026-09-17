@@ -85,6 +85,20 @@ async def test_websocket_accepts_http_origin_matching_ws_endpoint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_websocket_accepts_exact_desktop_renderer_origin_on_loopback() -> None:
+    desktop_ws = _OriginWebSocket("opensquilla-app://desktop")
+    lookalike_ws = _OriginWebSocket("opensquilla-app://desktop.evil")
+
+    await handle_ws_connection(desktop_ws, GatewayConfig(), dispatcher=object())
+    await handle_ws_connection(lookalike_ws, GatewayConfig(), dispatcher=object())
+
+    assert desktop_ws.accepted is True
+    assert desktop_ws.challenge_attempted is True
+    assert lookalike_ws.accepted is False
+    assert lookalike_ws.close_code == 1008
+
+
+@pytest.mark.asyncio
 async def test_websocket_accepts_exact_configured_origin_but_not_wildcard() -> None:
     allowed_ws = _OriginWebSocket("https://frontend.example")
     wildcard_ws = _OriginWebSocket("https://attacker.example")

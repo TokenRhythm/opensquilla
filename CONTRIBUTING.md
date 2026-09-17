@@ -74,9 +74,10 @@ npm --prefix opensquilla-webui run build
 uv build --wheel
 ```
 
-The Web UI build writes an ignored package artifact that `uv build --wheel`
-validates and embeds. Rebuild it after frontend changes; do not commit the
-generated `src/opensquilla/gateway/static/dist/` tree.
+The Web UI build writes the source-owned artifact under
+`opensquilla-webui/dist/`, then explicitly stages the verified bytes into the
+ignored package copy that `uv build --wheel` validates and embeds. Rebuild it
+after frontend changes; do not commit either generated tree.
 
 Default tests must be offline, deterministic, credential-free, and safe for forks. Do not add network, provider, browser, or channel requirements to the default pull request path.
 

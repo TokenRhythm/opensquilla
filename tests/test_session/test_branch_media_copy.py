@@ -10,12 +10,13 @@ and end-to-end through ``SessionManager.branch``.
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
-from opensquilla.artifacts import ArtifactStore
+from opensquilla.artifacts import ArtifactNotFoundError, ArtifactStore, artifact_payload
 from opensquilla.attachment_refs import (
     copy_transcript_material,
     make_attachment_ref,
@@ -24,7 +25,7 @@ from opensquilla.attachment_refs import (
     write_transcript_material,
 )
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import TranscriptEntry
+from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
 
 
@@ -224,3 +225,135 @@ async def test_branch_survives_material_copy_failure(
     )
     assert child.forked_from_parent is True
     assert await manager.get_session("agent:main:direct:resilient") is not None
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_copies_only_prefix_reachable_material(
+    storage: SessionStorage,
+    tmp_path: Path,
+) -> None:
+    media_root = tmp_path / "media"
+    manager = SessionManager(storage, inject_time_prefix=False, media_root=media_root)
+    parent = await manager.create("agent:main:main")
+    artifact_store = ArtifactStore(media_root)
+    selected_artifact = artifact_store.publish_bytes(
+        _png_bytes(),
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        name="selected.png",
+        mime="image/png",
+        source="publish_artifact",
+    )
+    later_artifact = artifact_store.publish_bytes(
+        b"later artifact bytes",
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        name="later.bin",
+        mime="application/octet-stream",
+        source="publish_artifact",
+    )
+    nested_artifact = artifact_store.publish_bytes(
+        b"nested artifact bytes",
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        name="nested.bin",
+        mime="application/octet-stream",
+        source="publish_artifact",
+    )
+    selected_sha, _selected_path, _ = write_transcript_material(
+        media_root=media_root,
+        session_id=parent.session_id,
+        payload=b"selected attachment",
+    )
+    later_sha, _later_path, _ = write_transcript_material(
+        media_root=media_root,
+        session_id=parent.session_id,
+        payload=b"later attachment",
+    )
+    nested_sha, _nested_path, _ = write_transcript_material(
+        media_root=media_root,
+        session_id=parent.session_id,
+        payload=b"nested attachment",
+    )
+    nested_tool_result: object = {
+        "artifact": artifact_payload(nested_artifact),
+        "attachment": {"sha256_ref": nested_sha},
+    }
+    for level in range(16):
+        nested_tool_result = {f"level_{level}": nested_tool_result}
+    selected_turn_id = "turn-with-selected-material"
+    later_turn_id = "turn-with-later-material"
+    for turn_id, text, sha, artifact in (
+        (
+            selected_turn_id,
+            "selected material",
+            selected_sha,
+            selected_artifact,
+        ),
+        (later_turn_id, "later material", later_sha, later_artifact),
+    ):
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=parent.session_id,
+                session_key=parent.session_key,
+                role="assistant",
+                content=json.dumps(
+                    {
+                        "text": text,
+                        "padding": "x" * 1_000_001 if turn_id == selected_turn_id else "",
+                        "attachments": [
+                            {
+                                "sha256_ref": sha,
+                                "name": f"{text}.bin",
+                                "mime": "application/octet-stream",
+                            }
+                        ],
+                        "artifacts": [artifact_payload(artifact)],
+                    }
+                ),
+                tool_calls=(
+                    [{"id": "nested-call", "result": nested_tool_result}]
+                    if turn_id == selected_turn_id
+                    else None
+                ),
+                turn_context={"turn_id": turn_id},
+            )
+        )
+    await storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=selected_turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:material-prefix",
+        fork_transcript=True,
+        fork_through_turn_id=selected_turn_id,
+    )
+
+    _selected_ref, selected_path = artifact_store.resolve_for_download(
+        selected_artifact.id,
+        session_id=child.session_id,
+    )
+    assert selected_path.exists()
+    _nested_ref, nested_path = artifact_store.resolve_for_download(
+        nested_artifact.id,
+        session_id=child.session_id,
+    )
+    assert nested_path.exists()
+    with pytest.raises(ArtifactNotFoundError):
+        artifact_store.resolve_for_download(later_artifact.id, session_id=child.session_id)
+    assert transcript_material_path(media_root, child.session_id, selected_sha).exists()
+    assert transcript_material_path(media_root, child.session_id, nested_sha).exists()
+    assert not transcript_material_path(media_root, child.session_id, later_sha).exists()
+
+    # Filtering the child does not mutate or hide material owned by the parent.
+    _later_ref, parent_later_path = artifact_store.resolve_for_download(
+        later_artifact.id,
+        session_id=parent.session_id,
+    )
+    assert parent_later_path.exists()
+    assert transcript_material_path(media_root, parent.session_id, later_sha).exists()

@@ -124,6 +124,7 @@ def test_owner_approve_resolves_and_forces_no_elevation() -> None:
     entry = queue.get(approval_id)
     assert entry.resolved is True
     assert entry.approved is True
+    assert entry.params["resolutionSource"] == "user_channel"
     # Channel approval never grants session-wide elevation.
     assert queue.get_elevated_mode("agent:main:chat") is None
     assert "elevatedMode" not in entry.params
@@ -142,6 +143,7 @@ def test_owner_deny_resolves_to_not_approved() -> None:
     entry = get_approval_queue().get(approval_id)
     assert entry.resolved is True
     assert entry.approved is False
+    assert entry.params["resolutionSource"] == "user_channel"
 
 
 def _admin_config(channel_name: str, sender_id: str) -> SimpleNamespace:

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import opensquilla.tools.policy as policy_facade
 from opensquilla.tools import policy_helpers
 from opensquilla.tools.policy_runtime import (
     ToolSurfaceCapabilities,
+    detect_runtime_tool_surface_capabilities,
     resolve_runtime_tool_surface,
     tool_surface_capabilities_from_runtime,
 )
@@ -146,6 +148,33 @@ def test_policy_runtime_preserves_runtime_capability_denylists() -> None:
         "sessions_send",
     } <= result.denied_tools
     assert result.allowed_tools == set()
+
+
+def test_policy_runtime_hides_git_tools_when_git_is_unavailable() -> None:
+    git_tools = {"git_status", "git_diff", "git_log", "git_commit"}
+    ctx = ToolContext(
+        is_owner=True,
+        allowed_tools={"read_file", *git_tools},
+    )
+
+    result = resolve_runtime_tool_surface(
+        ctx,
+        capabilities=ToolSurfaceCapabilities(git_available=False),
+    )
+
+    assert git_tools <= result.denied_tools
+    assert result.allowed_tools == {"read_file"}
+
+
+def test_policy_runtime_detects_git_with_unified_capability_probe(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "opensquilla.git_runtime.resolve_git_capability",
+        lambda: SimpleNamespace(available=False),
+    )
+
+    caps = detect_runtime_tool_surface_capabilities()
+
+    assert caps.git_available is False
 
 
 def test_policy_runtime_builds_capabilities_from_injected_dependencies() -> None:

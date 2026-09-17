@@ -101,8 +101,10 @@ async def test_graceful_shutdown_drains_inflight() -> None:
     await asyncio.wait_for(task_started.wait(), timeout=5.0)
 
     # Graceful shutdown: must wait for the 300 ms task to finish.
-    await runtime.shutdown(graceful=True, graceful_timeout=10.0)
+    result = await runtime.shutdown(graceful=True, graceful_timeout=10.0)
 
+    assert result.clean is True
+    assert result.remaining_driver_count == 0
     assert completed == [h.task_id], (
         f"Task did not complete before shutdown returned: completed={completed}"
     )
@@ -140,4 +142,11 @@ async def test_graceful_shutdown_timeout_fallback_is_clean() -> None:
 
     # Tiny graceful_timeout so we hit the fallback-to-cancel path.
     # Must not raise.
-    await runtime.shutdown(graceful=True, graceful_timeout=0.05, timeout=2.0)
+    result = await runtime.shutdown(
+        graceful=True,
+        graceful_timeout=0.05,
+        timeout=2.0,
+    )
+
+    assert result.clean is True
+    assert result.remaining_driver_count == 0

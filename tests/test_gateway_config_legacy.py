@@ -26,6 +26,20 @@ from opensquilla.gateway.config import GatewayConfig
 # ---------------------------------------------------------------------------
 
 _ALL_DEPRECATED_MEMORY_FIELDS = {
+    "memory.flush_enabled": 'true',
+    "memory.flush_triggers": '["manual", "pre_compaction"]',
+    "memory.flush_pre_compaction": 'true',
+    "memory.flush_timeout_seconds": '10.0',
+    "memory.flush_background_timeout_seconds": '20.0',
+    "memory.flush_backoff_initial_seconds": '1.0',
+    "memory.flush_backoff_max_seconds": '30.0',
+    "memory.flush_archive_max_bytes": '1024',
+    "memory.flush_compaction_requires_safe_receipt": 'true',
+    "memory.flush_compaction_safety_mode": '"protect"',
+    "memory.repair_enabled": 'true',
+    "memory.repair_interval_seconds": '60.0',
+    "memory.repair_max_items_per_tick": '5',
+
     "memory.profile": "legacy_profile_value",
     "memory.cost.embedding_cache": "true",
     "memory.cost.rerank_cache": "false",
@@ -59,10 +73,10 @@ def _build_toml_with_deprecated(tmp_path: Path) -> Path:
         parts = dotted.split(".")
         if parts[1] == "cost":
             leaf = parts[2]
-            cost_lines.append(f'{leaf} = "{val}"\n')
+            cost_lines.append(f"{leaf} = {json.dumps(val)}\n")
         else:
             leaf = parts[1]
-            lines.append(f'{leaf} = "{val}"\n')
+            lines.append(f"{leaf} = {json.dumps(val)}\n")
 
     toml_path = tmp_path / "config.toml"
     toml_path.write_text("".join(lines) + "\n" + "".join(cost_lines))
@@ -348,7 +362,7 @@ def test_aggregate_deprecation_warning_emitted_once_per_process(
     msg = str(deprecation_warnings[0].message)
     assert "memory" in msg.lower()
     assert f"{len(_ALL_DEPRECATED_MEMORY_FIELDS)} legacy memory.* config field(s) ignored" in msg
-    assert "0.2.0" in msg
+    assert "cleaned during config rewrite" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -672,3 +686,92 @@ def test_gateway_config_accepts_text_only_tool_recovery_mode() -> None:
     cfg = GatewayConfig.model_validate({"text_only_tool_recovery_mode": "warn_model"})
 
     assert cfg.text_only_tool_recovery_mode == "warn_model"
+
+
+@pytest.mark.parametrize("loader", ["load", "load_from_toml", "onboarding", "read_only"])
+def test_retired_flush_config_upgrades_without_losing_memory_preferences(tmp_path, loader):
+    from opensquilla.onboarding.config_store import load_config
+
+    target = tmp_path / "config.toml"
+    old_fields = {
+        key.removeprefix("memory."): value
+        for key, value in _ALL_DEPRECATED_MEMORY_FIELDS.items()
+        if key.startswith(("memory.flush_", "memory.repair_"))
+    }
+    original = "config_version = 1\n[memory]\ncapture_assistant = true\nentry_ttl_days = 30\n"
+    original += "\n".join(f"{key} = {value}" for key, value in old_fields.items()) + "\n"
+    target.write_text(original, encoding="utf-8")
+    if loader == "onboarding":
+        config = load_config(target)
+    elif loader == "read_only":
+        config = GatewayConfig.load(target, read_only=True)
+    else:
+        config = getattr(GatewayConfig, loader)(target)
+    assert config.memory.capture_assistant is True
+    assert config.memory.entry_ttl_days == 30
+    assert not set(old_fields).intersection(config.memory.model_dump())
+    if loader == "read_only":
+        assert target.read_text() == original
+        assert not list(tmp_path.glob("config.toml.backup.*"))
+    else:
+        assert all(key not in target.read_text() for key in old_fields)
+        backups = list(tmp_path.glob("config.toml.backup.*"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == original
+        assert GatewayConfig.load(target).memory.capture_assistant is True
+        assert len(list(tmp_path.glob("config.toml.backup.*"))) == 1
+
+
+@pytest.mark.parametrize("field", ["flush_enabled", "repair_enabled", "flush_unknown"])
+def test_new_config_rejects_retired_or_unknown_memory_fields(field):
+    with pytest.raises(ValidationError):
+        GatewayConfig.model_validate({"memory": {field: True}})
+
+
+@pytest.mark.parametrize("source", ["environment", "dotenv", "json_environment", "json_dotenv"])
+@pytest.mark.parametrize("key_case", ["lower", "upper", "title"])
+def test_retired_nested_memory_environment_settings_do_not_block_startup(
+    tmp_path, monkeypatch, source, key_case,
+):
+    retired = {
+        key.removeprefix("memory."): value
+        for key, value in _ALL_DEPRECATED_MEMORY_FIELDS.items()
+        if key.startswith(("memory.flush_", "memory.repair_"))
+    }
+    settings = {
+        **{getattr(key, key_case)(): value for key, value in retired.items()},
+        "capture_assistant": "true",
+        "entry_ttl_days": "21",
+    }
+    if source == "environment":
+        for key, value in settings.items():
+            monkeypatch.setenv(f"OPENSQUILLA_GATEWAY_MEMORY__{key.upper()}", value)
+        config = GatewayConfig()
+    elif source == "json_environment":
+        monkeypatch.setenv("OPENSQUILLA_GATEWAY_MEMORY", json.dumps(settings))
+        config = GatewayConfig()
+    else:
+        dotenv = tmp_path / "legacy.env"
+        dotenv.write_text(
+            f"OPENSQUILLA_GATEWAY_MEMORY='{json.dumps(settings)}'"
+            if source == "json_dotenv"
+            else "\n".join(
+                f"OPENSQUILLA_GATEWAY_MEMORY__{key.upper()}={value}"
+                for key, value in settings.items()
+            )
+        )
+        config = GatewayConfig(_env_file=dotenv)
+    assert config.memory.capture_assistant is True
+    assert config.memory.entry_ttl_days == 21
+    assert not set(retired).intersection(config.memory.model_dump())
+    # Startup filtering must not weaken validation for explicit API payloads.
+    with pytest.raises(ValidationError):
+        GatewayConfig(memory={"flush_enabled": True})
+    with pytest.raises(ValidationError):
+        GatewayConfig(memory={"FLUSH_ENABLED": True})
+
+
+def test_retired_flat_memory_environment_settings_are_ignored(monkeypatch):
+    monkeypatch.setenv("OPENSQUILLA_MEMORY_FLUSH_ENABLED", "true")
+    monkeypatch.setenv("OPENSQUILLA_MEMORY_REPAIR_ENABLED", "true")
+    assert "flush_enabled" not in GatewayConfig().memory.model_dump()

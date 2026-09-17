@@ -6,6 +6,7 @@ import { SUPPORTED_LOCALES, type LocaleCode } from '@/i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 
 // Topbar language switcher. Mirrors the theme menu next to it (reuses the global
 // .theme-menu* classes) so the two controls can never drift in look or
@@ -28,7 +29,8 @@ const localeOptions = SUPPORTED_LOCALES.map((code) => ({ code, label: LOCALE_LAB
 
 const menuOpen = ref(false)
 const buttonRef = ref<HTMLButtonElement | null>(null)
-useDialogLayer(computed(() => menuOpen.value))
+useChatTopbarPopoverCoordination('language', menuOpen)
+const menuIsTopmost = useDialogLayer(computed(() => menuOpen.value))
 
 function pick(code: LocaleCode) {
   void appStore.setLocale(code)
@@ -45,10 +47,11 @@ useDocumentEvent('click', (e) => {
 })
 
 useDocumentEvent('keydown', (e) => {
-  if (e.key === 'Escape' && menuOpen.value) {
-    menuOpen.value = false
-    buttonRef.value?.focus()
-  }
+  if (e.defaultPrevented || e.key !== 'Escape') return
+  if (!menuOpen.value || !menuIsTopmost.value) return
+  e.preventDefault()
+  menuOpen.value = false
+  buttonRef.value?.focus()
 })
 </script>
 
@@ -68,7 +71,13 @@ useDocumentEvent('keydown', (e) => {
       <Icon name="languages" :size="16" />
       <span class="lang-menu-current">{{ LOCALE_LABELS[appStore.locale] }}</span>
     </button>
-    <div v-if="menuOpen" class="theme-menu lang-menu" role="menu" :aria-label="t('chrome.language')">
+    <div
+      v-if="menuOpen"
+      class="theme-menu lang-menu"
+      role="menu"
+      :aria-label="t('chrome.language')"
+      data-chat-topbar-popover="language"
+    >
       <button
         v-for="opt in localeOptions"
         :key="opt.code"

@@ -116,7 +116,7 @@ describe('native Workbench platform bridge', () => {
 
     const listener = vi.fn()
     expect(native!.onSurfaceEvent(listener)).toBe(unsubscribe)
-    emit?.({ version: 3, surfaceId: 'artifact:fixture', type: 'ready' })
+    emit?.({ version: 99, surfaceId: 'artifact:fixture', type: 'ready' })
     emit?.({
       version: 1,
       surfaceId: 'artifact:fixture',
@@ -142,5 +142,122 @@ describe('native Workbench platform bridge', () => {
     const platform = createDesktopPlatform()
     expect(platform.workbench.native).toBeUndefined()
     expect(platform.capabilities.hasNativeWorkbenchSurfaces).toBe(false)
+  })
+
+  it('normalizes the v3 annotation bridge and rejects untrusted event fields', async () => {
+    let emit: ((payload: unknown) => void) | undefined
+    const setMode = vi.fn(async () => ({ ok: true }))
+    const showOverlay = vi.fn(async () => ({ ok: true }))
+    const closeOverlay = vi.fn(async () => ({ ok: true }))
+    const screenshot = vi.fn(async () => ({
+      targetRef: 'target-1', mimeType: 'image/png' as const,
+      dataBase64: 'iVBORw==', width: 320, height: 180,
+    }))
+    setDesktopApi({
+      createWorkbenchSurface: async () => ({ ok: true }),
+      setWorkbenchSurfaceRect: async () => ({ ok: true }),
+      activateWorkbenchSurface: async () => ({ ok: true }),
+      destroyWorkbenchSurface: async () => ({ ok: true }),
+      onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => {
+        emit = callback
+        return () => undefined
+      },
+      getArtifactAnnotationCapabilities: async () => ({
+        version: 3,
+        available: true,
+        picker: true,
+        trustedOverlay: true,
+        overlayCopyVersion: 1,
+        atomicCloseRearm: true,
+      }),
+      setArtifactAnnotationMode: setMode,
+      showArtifactAnnotationOverlay: showOverlay,
+      closeArtifactAnnotationOverlay: closeOverlay,
+      captureWorkbenchScreenshot: screenshot,
+    })
+    const native = createDesktopPlatform().workbench.native!
+
+    await expect(native.getArtifactAnnotationCapabilities?.()).resolves.toEqual({
+      version: 3,
+      available: true,
+      picker: true,
+      trustedOverlay: true,
+      overlayCopyVersion: 1,
+      atomicCloseRearm: true,
+    })
+    await expect(native.captureWorkbenchScreenshot?.({
+      surfaceId: 'artifact:fixture', targetRef: 'target-1',
+    })).resolves.toEqual({
+      targetRef: 'target-1', mimeType: 'image/png', dataBase64: 'iVBORw==', width: 320, height: 180,
+    })
+    expect(screenshot).toHaveBeenCalledWith({ surfaceId: 'artifact:fixture', targetRef: 'target-1' })
+    await expect(native.captureWorkbenchScreenshot?.({
+      surfaceId: 'artifact:fixture', targetRef: 'another-target',
+    })).rejects.toThrow('invalid')
+    const listener = vi.fn()
+    native.onSurfaceEvent(listener)
+    emit?.({
+      version: 2,
+      surfaceId: 'artifact:fixture',
+      type: 'annotation-selected',
+      detail: {},
+    })
+    emit?.({
+      version: 3,
+      surfaceId: 'artifact:fixture',
+      type: 'annotation-selected',
+      detail: {
+        selection: {
+          selectionId: 'selection-1',
+          tagName: 'BUTTON',
+          elementPath: '[["","button",1]]',
+          targetRef: 'target-1', locatorHint: 'button',
+          rect: { x: 1, y: 2, width: 30, height: 40 },
+          sourceSha256: 'must-be-dropped',
+        },
+      },
+    })
+    emit?.({
+      version: 3,
+      surfaceId: 'artifact:fixture',
+      type: 'annotation-draft-change',
+      detail: { annotationId: '../invalid', body: 'x'.repeat(16 * 1024 + 1) },
+    })
+    emit?.({
+      version: 3,
+      surfaceId: 'artifact:fixture',
+      type: 'blocked-action',
+      detail: {
+        action: 'annotation-picker',
+        code: 'ANNOTATION_REARM_FAILED',
+        surfaceInstanceId: 'surface-instance-current',
+      },
+    })
+
+    expect(listener).toHaveBeenCalledTimes(2)
+    expect(listener).toHaveBeenNthCalledWith(1, {
+      version: 3,
+      surfaceId: 'artifact:fixture',
+      type: 'annotation-selected',
+      detail: {
+        selection: {
+          selectionId: 'selection-1',
+          tagName: 'button',
+          elementPath: '[["","button",1]]',
+          targetRef: 'target-1', locatorHint: 'button',
+          rect: { x: 1, y: 2, width: 30, height: 40 },
+        },
+      },
+    })
+    expect(listener).toHaveBeenNthCalledWith(2, {
+      version: 3,
+      surfaceId: 'artifact:fixture',
+      type: 'blocked-action',
+      detail: {
+        action: 'annotation-picker',
+        code: 'ANNOTATION_REARM_FAILED',
+        surfaceInstanceId: 'surface-instance-current',
+      },
+    })
   })
 })

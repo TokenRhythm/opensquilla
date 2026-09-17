@@ -608,6 +608,11 @@ class SandboxOperationRuntime:
         runtime = self.runtime
         if runtime is None:
             raise SandboxBackendError("process operation is missing sandbox runtime")
+        # Import lazily because integration owns the process-wide runtime and
+        # imports this module while it is initialising.
+        from opensquilla.sandbox.integration import reject_windows_guest_process
+
+        reject_windows_guest_process(runtime)
         if not isinstance(operation.request, ProcessOperationRequest):
             raise SandboxBackendError("process operation is missing SandboxRequest")
         if operation.request.request is None:

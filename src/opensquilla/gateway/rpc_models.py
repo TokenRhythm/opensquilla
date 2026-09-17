@@ -2,115 +2,134 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
-from opensquilla.gateway.model_routing import (
-    model_routing_patches,
-    model_routing_snapshot,
-)
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.provider.model_catalog import ModelCatalog
+
+if TYPE_CHECKING:
+    from opensquilla.application.provider_configuration import (
+        ModelRouting as ApplicationModelRouting,
+    )
 
 _d = get_dispatcher()
 
-# Offline layered catalog (corrections + snapshot + synthesized fallback) used
-# only to enrich rows with provenance; ``resolve_entry`` never fails and never
-# touches the network.
-_catalog = ModelCatalog()
+
+async def _handle_models_capacity_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.provider.model_capacity import resolve_model_capacities
+    from opensquilla.provider.model_catalog import shared_catalog
+
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return resolve_model_capacities(shared_catalog(), ctx.config, params["models"])
 
 
-def _model_info_to_wire(m: dict[str, Any]) -> dict[str, Any]:
-    """Convert a ModelInfo.model_dump() dict to the RPC wire format."""
-    capabilities: list[str] = ["chat"]
-    if m.get("supports_tools"):
-        capabilities.append("tools")
-    entry = _catalog.resolve_entry(m.get("model_id", ""), provider=m.get("provider", ""))
-    # Providers can signal vision support via extra fields; keep extensible
-    return {
-        "id": m.get("model_id", ""),
-        "name": m.get("display_name") or m.get("model_id", ""),
-        "provider": m.get("provider", ""),
-        "contextWindow": m.get("context_window", 0),
-        "capabilities": capabilities,
-        "pricing": {
-            "inputPer1k": m.get("input_cost_per_1k", 0.0),
-            "outputPer1k": m.get("output_cost_per_1k", 0.0),
-        },
-        # Catalog provenance; a model unknown to every layer still resolves
-        # (source="synthesized") so the key is always present.
-        "source": entry.source,
-        "reasoningFormat": entry.reasoning_format,
-    }
-
-
-def _list_error_to_wire(err: Any) -> dict[str, Any]:
-    """Convert a selector ProviderListError to the RPC wire format."""
-    return {
-        "provider": str(getattr(err, "provider", "")),
-        "kind": str(getattr(err, "kind", "")),
-        "detail": str(getattr(err, "detail", "")),
-    }
-
-
-@_d.method("models.list", scope="operator.read")
 async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    provider_filter = (params or {}).get("provider")
-    capabilities_filter: list[str] | None = (params or {}).get("capabilities")
+    from opensquilla.application.provider_configuration import ModelCatalog
+    from opensquilla.gateway.adapters.provider_configuration import (
+        GatewayModelCatalogPort,
+    )
 
-    models: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    if ctx.provider_selector is not None and getattr(
-        ctx.provider_selector, "is_configured", True
-    ):
-        try:
-            detailed = await ctx.provider_selector.list_models_detailed()
-            models = [_model_info_to_wire(m) for m in detailed.models]
-            errors = [_list_error_to_wire(e) for e in detailed.errors]
-        except Exception:
-            pass
-
-    if provider_filter:
-        models = [m for m in models if m["provider"] == provider_filter]
-
-    if capabilities_filter:
-        required = set(capabilities_filter)
-        models = [m for m in models if required.issubset(set(m["capabilities"]))]
-
-    return {"models": models, "errors": errors}
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    query = params or {}
+    capabilities = query.get("capabilities")
+    if capabilities is not None and not isinstance(capabilities, list):
+        raise ValueError("params.capabilities must be an array")
+    catalog = ModelCatalog(GatewayModelCatalogPort(ctx.provider_selector, ctx.config))
+    return cast(
+        dict[str, Any],
+        await catalog.query(
+            provider_id=query.get("provider"),
+            capabilities=capabilities,
+        ),
+    )
 
 
-@_d.method("models.routing.get", scope="operator.read")
+def _model_routing(ctx: RpcContext) -> ApplicationModelRouting:
+    from opensquilla.application.provider_configuration import ModelRouting
+    from opensquilla.gateway.adapters.provider_configuration import (
+        GatewayModelRoutingPolicyPort,
+        GatewayModelRoutingRuntimePort,
+    )
+    from opensquilla.gateway.adapters.setup_config import GatewaySetupConfigPort
+
+    if ctx.config is None:
+        raise ValueError("No config available")
+    return ModelRouting(
+        GatewaySetupConfigPort(ctx),
+        GatewayModelRoutingPolicyPort(),
+        GatewayModelRoutingRuntimePort(
+            ctx.provider_selector,
+            ctx.subscription_manager,
+        ),
+    )
+
+
 async def _handle_models_routing_get(
     _params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    if ctx.config is None:
-        raise ValueError("No config available")
-    return model_routing_snapshot(ctx.config)
+    return cast(dict[str, Any], await _model_routing(ctx).read())
 
 
-@_d.method("models.routing.set", scope="operator.write")
 async def _handle_models_routing_set(
     params: dict | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     if not isinstance(params, dict) or not isinstance(params.get("mode"), str):
         raise ValueError("params.mode is required")
-    if ctx.config is None:
-        raise ValueError("No config available")
+    return cast(dict[str, Any], await _model_routing(ctx).set_mode(params["mode"]))
 
-    # Reuse the safe write transaction so persistence, validation, runtime
-    # synchronization, and old config.patch.safe clients keep one contract.
-    from opensquilla.gateway.rpc_config import _handle_config_patch_safe
 
-    patch_result = await _handle_config_patch_safe(
-        {"patches": model_routing_patches(ctx.config, params["mode"])},
-        ctx,
+async def _handle_models_routing_reset_recommended(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    from opensquilla.gateway.adapters.platform_configuration_contract import (
+        validate_reset_recommended_params,
     )
-    return {
-        **model_routing_snapshot(ctx.config),
-        "patched": list(patch_result.get("patched") or []),
-        "restart_required": bool(
-            patch_result.get("restartRequired", patch_result.get("restart_required", False))
+
+    params = validate_reset_recommended_params(params)
+    if not isinstance(params, dict) or not isinstance(params.get("providerId"), str):
+        raise ValueError("params.providerId is required")
+    if not params["providerId"].strip():
+        raise ValueError("params.providerId is required")
+    if not isinstance(params.get("activateRouter", False), bool):
+        raise ValueError("params.activateRouter must be a boolean")
+    return cast(
+        dict[str, Any],
+        await _model_routing(ctx).reset_recommended(
+            params["providerId"],
+            activate_router=params.get("activateRouter", False),
         ),
-    }
+    )
+
+
+# Generated descriptors own identity/scope/validation for the contracted
+# Platform configuration methods.
+from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
+    register_platform_configuration_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import (  # noqa: E402
+    is_guest_rpc_method_allowed,
+)
+from opensquilla.gateway.rpc import RpcHandlerError  # noqa: E402
+
+_PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
+    "models.capacity.resolve": _handle_models_capacity_resolve,
+    "models.list": _handle_models_list,
+    "models.routing.get": _handle_models_routing_get,
+    "models.routing.set": _handle_models_routing_set,
+    "models.routing.resetRecommended": _handle_models_routing_reset_recommended,
+}
+
+_PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {
+    method: register_platform_configuration_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _PLATFORM_CONFIGURATION_IMPLEMENTATIONS.items()
+}

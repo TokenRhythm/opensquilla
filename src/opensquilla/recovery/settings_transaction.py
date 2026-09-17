@@ -21,11 +21,16 @@ from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
     _native_io_path,
+    is_path_redirecting_stat,
     native_move_no_replace,
 )
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.errors import AtomicStateUnknownError, RecoveryError
-from opensquilla.recovery.locking import LegacyGatewayLock, ProfileOperationLock
+from opensquilla.recovery.locking import (
+    LegacyGatewayLock,
+    ProfileOperationLock,
+    resolve_home_link,
+)
 from opensquilla.recovery.models import RecoveryReport
 
 SETTINGS_TRANSACTION_SCHEMA_VERSION = 1
@@ -46,7 +51,7 @@ def _normalized(path: str | Path) -> str:
 
 
 def settings_transaction_journal(home: str | Path) -> Path:
-    home_path = Path(home).expanduser().absolute()
+    home_path = resolve_home_link(Path(home).expanduser().absolute())
     return home_path.parent / f".{home_path.name}.desktop-settings-transaction.json"
 
 
@@ -181,8 +186,7 @@ def _identity_matches(path: Path, expected: object) -> bool:
         value = _native_lstat(path)
     except OSError:
         return False
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    if stat.S_ISLNK(value.st_mode) or attributes & 0x400 or not stat.S_ISREG(value.st_mode):
+    if is_path_redirecting_stat(value) or not stat.S_ISREG(value.st_mode):
         return False
     identity = PathIdentity.from_stat(value)
     current = _identity_payload(identity)
@@ -202,8 +206,7 @@ def _plain_directory(path: Path, *, create: bool = False) -> None:
             "Desktop settings parent is unavailable",
             stable_code="settings_parent_unavailable",
         ) from exc
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    if stat.S_ISLNK(value.st_mode) or attributes & 0x400 or not stat.S_ISDIR(value.st_mode):
+    if is_path_redirecting_stat(value) or not stat.S_ISDIR(value.st_mode):
         raise RecoveryError(
             "Desktop settings parent is unsafe",
             stable_code="settings_parent_unsafe",
@@ -671,7 +674,7 @@ def recover_desktop_settings(
     """Finish an identity-proven interrupted pair publication."""
 
     _require_desktop_profile_kind()
-    home_path = Path(home).expanduser().absolute()
+    home_path = resolve_home_link(Path(home).expanduser().absolute())
     with ProfileOperationLock(home_path, timeout=lock_timeout):
         with LegacyGatewayLock(home_path, timeout=lock_timeout):
             journal, payload, paths = _load_journal(home_path)
@@ -756,7 +759,7 @@ def apply_desktop_settings(
     else:
         import_transaction_id = ""
     _assert_imported_credential_matches_config(config_text, candidate_credential)
-    home_path = Path(home).expanduser().absolute()
+    home_path = resolve_home_link(Path(home).expanduser().absolute())
     journal = settings_transaction_journal(home_path)
     callback = _failpoint or (lambda _phase: None)
 

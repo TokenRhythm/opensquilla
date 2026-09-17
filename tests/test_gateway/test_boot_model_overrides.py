@@ -16,13 +16,14 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.engine.pricing import PriceEntry, resolve_model_price
+from opensquilla.gateway.adapters.app_settings import _sync_model_catalog_overrides
 from opensquilla.gateway.boot import (
     apply_model_catalog_overrides,
     build_services,
     model_override_entries,
 )
 from opensquilla.gateway.config import GatewayConfig, ModelOverrideConfig
-from opensquilla.gateway.rpc_config import _sync_model_catalog_overrides
 from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog, shared_catalog
 from opensquilla.sandbox.integration import reset_runtime
 
@@ -115,6 +116,27 @@ def test_apply_model_catalog_overrides_installs_onto_catalog() -> None:
     assert entry.cache_read_cost_per_mtok == pytest.approx(0.002)
 
 
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+def test_apply_model_catalog_overrides_enables_custom_price_estimate(provider: str) -> None:
+    config = GatewayConfig()
+    config.models = {
+        provider: {
+            "vendor/priced-model": ModelOverrideConfig(
+                input_cost_per_mtok=0.5,
+                output_cost_per_mtok=2.0,
+            )
+        }
+    }
+    catalog = ModelCatalog()
+    apply_model_catalog_overrides(catalog, config)
+    set_shared_catalog(catalog)
+
+    resolved = resolve_model_price("vendor/priced-model", provider=provider)
+
+    assert resolved.source == "user_override"
+    assert resolved.entry == PriceEntry(0.5, 2.0)
+
+
 def test_apply_model_catalog_overrides_survives_bad_value_and_warns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -176,8 +198,7 @@ async def test_build_services_wires_model_overrides_into_shared_catalog(
     )
 
     config = GatewayConfig(
-        memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
+        memory={},
     )
     config.models = {
         "deepseek": {

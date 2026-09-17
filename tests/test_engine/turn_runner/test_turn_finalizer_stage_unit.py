@@ -13,6 +13,7 @@ the runtime wrapper.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,6 +53,7 @@ class _RecordingTranscriptAppend:
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        assistant_replay: dict[str, Any] | None = None,
     ) -> TranscriptAppendResult | bool:
         self.calls.append(
             {
@@ -62,6 +64,7 @@ class _RecordingTranscriptAppend:
                 "reasoning_content": reasoning_content,
                 "turn_usage": turn_usage,
                 "token_count": token_count,
+                "assistant_replay": assistant_replay,
             }
         )
         if self.raises is not None:
@@ -138,11 +141,15 @@ class _RecordingTurnErrorPersist:
         *,
         session_key: str,
         event: ErrorEvent | None,
+        append_transcript: bool = True,
+        **context: Any,
     ) -> None:
         self.calls.append(
             {
                 "session_key": session_key,
                 "event": event,
+                "append_transcript": append_transcript,
+                **context,
             }
         )
 
@@ -195,6 +202,7 @@ def _make_input(
     run_kind: str = "default",
     heartbeat_ack_max_chars: int = 300,
     no_memory_capture: bool = False,
+    terminal_generation_reset: bool = False,
 ) -> TurnFinalizerStageInput:
     return TurnFinalizerStageInput(
         final_text_parts=final_text_parts if final_text_parts is not None else [],
@@ -213,6 +221,7 @@ def _make_input(
         run_kind=run_kind,
         heartbeat_ack_max_chars=heartbeat_ack_max_chars,
         no_memory_capture=no_memory_capture,
+        terminal_generation_reset=terminal_generation_reset,
     )
 
 
@@ -363,6 +372,8 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
         routed_tier="c2",
         routing_applied=False,
         rollout_phase="observe",
+        router_model_call_id="1.0",
+        router_iteration=1,
         model_call_segments=[
             {
                 "model_call_id": "2.0",
@@ -387,6 +398,8 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
     assert recs["transcript_append"].calls[0]["turn_usage"]["routed_tier"] == "c2"
     assert recs["transcript_append"].calls[0]["turn_usage"]["routing_applied"] is False
     assert recs["transcript_append"].calls[0]["turn_usage"]["rollout_phase"] == "observe"
+    assert recs["transcript_append"].calls[0]["turn_usage"]["router_model_call_id"] == "1.0"
+    assert recs["transcript_append"].calls[0]["turn_usage"]["router_iteration"] == 1
     assert recs["transcript_append"].calls[0]["turn_usage"]["model_call_segments"] == [
         {
             "model_call_id": "2.0",
@@ -472,6 +485,130 @@ async def test_turn_usage_persists_ensemble_breakdown_and_trace() -> None:
     assert usage["model_usage_breakdown"][1]["role"] == "aggregator"
     assert usage["ensemble_trace"]["profile"] == "default"
     assert usage["ensemble_trace"]["llm_request_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_timeout_fallback_persists_one_completed_turn_without_error_record() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="fallback answer",
+        input_tokens=18,
+        output_tokens=8,
+        model="fallback-model",
+        model_usage_breakdown=[
+            {
+                "role": "proposer",
+                "provider": "openrouter",
+                "model": "draft-model",
+                "input_tokens": 7,
+                "output_tokens": 3,
+            },
+            {
+                "role": "fallback_single",
+                "provider": "openrouter",
+                "model": "fallback-model",
+                "input_tokens": 11,
+                "output_tokens": 5,
+            },
+        ],
+        ensemble_trace={
+            "profile": "static_openrouter_b5",
+            "fallback_used": True,
+            "fallback_code": "ensemble_aggregator_timeout",
+            "aggregator_timeout_mode": "idle",
+            "llm_request_count": 3,
+            "prior_final_request": {
+                "role": "aggregator",
+                "terminal_code": "ensemble_aggregator_timeout",
+            },
+        },
+    )
+
+    await stage.run(
+        _make_input(final_text_parts=["fallback answer"], done_event=done)
+    )
+
+    assert len(recs["transcript_append"].calls) == 1
+    assert len(recs["session_totals"].calls) == 1
+    assert recs["turn_error_persist"].calls == []
+    usage = recs["transcript_append"].calls[0]["turn_usage"]
+    assert [row["role"] for row in usage["model_usage_breakdown"]] == [
+        "proposer",
+        "fallback_single",
+    ]
+    assert usage["ensemble_trace"]["fallback_code"] == "ensemble_aggregator_timeout"
+    assert usage["ensemble_trace"]["llm_request_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_partial_aggregator_timeout_persists_output_and_error_once() -> None:
+    stage, recs = _make_stage()
+    error = ErrorEvent(
+        message="ensemble aggregator stalled: no stream events for 480s",
+        code="ensemble_aggregator_timeout",
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=["partial answer"],
+            error_message=error.message,
+            pending_error_event=error,
+        )
+    )
+
+    assert len(recs["transcript_append"].calls) == 1
+    assert recs["transcript_append"].calls[0]["content"] == "partial answer"
+    assert len(recs["turn_error_persist"].calls) == 1
+    assert recs["turn_error_persist"].calls[0]["event"] is error
+    assert recs["session_totals"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_reset_persists_failure_snapshot_and_accounting() -> None:
+    stage, recs = _make_stage()
+    terminal_text = "The fixed model could not complete this answer."
+    error = ErrorEvent(
+        message="The model provider rejected the configured credentials.",
+        code="401",
+        failure_kind="auth_invalid",
+        generation_epoch=2,
+    )
+    done = DoneEvent(
+        text=terminal_text,
+        text_snapshot=terminal_text,
+        input_tokens=9,
+        output_tokens=3,
+        model="fixed-model",
+        provider="openrouter",
+        generation_epoch=2,
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=[terminal_text],
+            turn_segments=[{"type": "text", "text": terminal_text}],
+            error_message=error.message,
+            pending_error_event=error,
+            done_event=done,
+            terminal_generation_reset=True,
+        )
+    )
+
+    assert recs["transcript_append"].calls[0]["content"] == terminal_text
+    usage = recs["transcript_append"].calls[0]["turn_usage"]
+    assert usage["input_tokens"] == 9
+    assert usage["output_tokens"] == 3
+    assert usage["provider"] == "openrouter"
+    assert recs["turn_error_persist"].calls == [
+        {
+            "session_key": "agent:main:s1",
+            "event": error,
+            "append_transcript": False,
+            "surface": "user",
+            "fallback_hops": 0,
+        }
+    ]
+    assert recs["session_totals"].calls[0]["done_event"] is done
 
 
 @pytest.mark.asyncio
@@ -596,6 +733,43 @@ async def test_unknown_background_tool_status_adds_confirmation_guard() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_background_process_does_not_persist_stale_notice(returncode: int) -> None:
+    stage, recs = _make_stage()
+    final_text = "Process completed." if returncode == 0 else "Process exited unsuccessfully."
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=[final_text],
+            turn_segments=[
+                {
+                    "type": "tool_result",
+                    "name": "background_process",
+                    "result": "session_id=process-a\ncommand: synthetic-job\nstatus: running",
+                    "execution_status": {"status": "unknown", "reason": "background_running"},
+                },
+                {
+                    "type": "tool_result",
+                    "name": "process",
+                    "result": json.dumps({
+                        "status": "ok",
+                        "action": "wait",
+                        "exited": True,
+                        "session": {"session_id": "process-a", "returncode": returncode},
+                    }),
+                    "execution_status": {"status": "success" if returncode == 0 else "error"},
+                },
+            ],
+            done_event=DoneEvent(text=final_text, text_snapshot=final_text),
+        )
+    )
+
+    assert outcome.output.final_text == final_text
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.text == final_text
+    assert recs["transcript_append"].calls[0]["content"] == final_text
+
+
+@pytest.mark.asyncio
 async def test_successful_background_tool_status_does_not_add_confirmation_guard() -> None:
     segments: list[dict[str, Any]] = [
         {
@@ -665,6 +839,161 @@ async def test_heartbeat_empty_clears_text_and_segments() -> None:
     assert out.memory_captured is False
     assert recs["transcript_append"].calls == []
     assert recs["turn_memory_capture"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_goal_mixed_sentinel_is_removed_from_text_segments_and_done_event() -> None:
+    stage, recs = _make_stage()
+    model_output = "NO_REPLY\nStill waiting for the external operation."
+    done = DoneEvent(text=model_output, text_snapshot=model_output)
+    inp = _make_input(
+        final_text_parts=[model_output],
+        turn_segments=[{"type": "text", "text": model_output}],
+        done_event=done,
+        input_mode="system_event",
+        run_kind="goal",
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.final_text == "Still waiting for the external operation."
+    assert outcome.output.turn_segments == [
+        {"type": "text", "text": "Still waiting for the external operation."}
+    ]
+    assert recs["transcript_append"].calls[0]["content"] == outcome.output.final_text
+    assert "NO_REPLY" not in str(recs["transcript_append"].calls[0])
+    assert outcome.output.done_event is not done
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.text == outcome.output.final_text
+    assert outcome.output.done_event.text_snapshot == outcome.output.final_text
+    assert outcome.output.done_event.delivery == "visible"
+    assert outcome.output.done_event.suppression_reason is None
+    assert done.text == model_output
+
+
+@pytest.mark.asyncio
+async def test_goal_exact_sentinel_done_event_is_suppressed_without_persistence() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="**NO_REPLY**", text_snapshot="**NO_REPLY**",
+        assistant_replay={
+            "version": 1, "messages": [{"role": "assistant", "content": "**NO_REPLY**"}],
+        },
+    )
+    inp = _make_input(
+        final_text_parts=["**NO_REPLY**"],
+        turn_segments=[{"type": "text", "text": "**NO_REPLY**"}],
+        done_event=done,
+        input_mode="system_event",
+        run_kind="goal",
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.final_text == ""
+    assert outcome.output.turn_segments == []
+    assert outcome.output.transcript_appended is False
+    assert recs["transcript_append"].calls == []
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.text == ""
+    assert outcome.output.done_event.text_snapshot == ""
+    assert outcome.output.done_event.delivery == "suppressed"
+    assert outcome.output.done_event.suppression_reason == "no_reply"
+    assert recs["session_totals"].calls[0]["done_event"] is outcome.output.done_event
+
+
+@pytest.mark.asyncio
+async def test_suppressed_text_keeps_tool_lifecycle_segments_for_audit() -> None:
+    stage, recs = _make_stage()
+    tools = [
+        {"type": "tool_use", "tool_use_id": "call-1", "name": "status"},
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "name": "status",
+            "result": "waiting",
+        },
+    ]
+    done = DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY")
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["NO_REPLY"],
+            turn_segments=[{"type": "text", "text": "NO_REPLY"}, *tools],
+            done_event=done,
+            input_mode="system_event",
+            run_kind="goal",
+            no_memory_capture=True,
+        )
+    )
+
+    assert outcome.output.final_text == ""
+    assert outcome.output.turn_segments == tools
+    assert recs["transcript_append"].calls[0]["content"] == ""
+    assert recs["transcript_append"].calls[0]["tool_calls"] == tools
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.delivery == "suppressed"
+    assert outcome.output.done_event.suppression_reason == "no_reply"
+
+
+@pytest.mark.asyncio
+async def test_suppressed_text_keeps_artifact_envelope_without_text() -> None:
+    stage, recs = _make_stage()
+    artifact = {
+        "artifact_id": "artifact-1",
+        "name": "report.txt",
+        "mime": "text/plain",
+    }
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["NO_REPLY"],
+            turn_segments=[{"type": "text", "text": "NO_REPLY"}],
+            turn_artifacts=[artifact],
+            done_event=DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY"),
+            input_mode="system_event",
+            run_kind="goal",
+            no_memory_capture=True,
+        )
+    )
+
+    assert outcome.output.final_text == ""
+    assert outcome.output.turn_segments == []
+    persisted = json.loads(recs["transcript_append"].calls[0]["content"])
+    assert persisted == {"text": "", "artifacts": [artifact]}
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.delivery == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_runtime_confirmation_notice_makes_suppressed_model_payload_visible() -> None:
+    stage, _ = _make_stage()
+    background_result = {
+        "type": "tool_result",
+        "tool_use_id": "call-1",
+        "name": "background_process",
+        "result": "status: running",
+        "execution_status": {
+            "status": "unknown",
+            "reason": "background_running",
+        },
+    }
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["NO_REPLY"],
+            turn_segments=[
+                {"type": "text", "text": "NO_REPLY"},
+                background_result,
+            ],
+            done_event=DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY"),
+            input_mode="system_event",
+            run_kind="goal",
+        )
+    )
+
+    assert "could not confirm" in outcome.output.final_text
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.text == outcome.output.final_text
+    assert outcome.output.done_event.delivery == "visible"
+    assert outcome.output.done_event.suppression_reason is None
 
 
 @pytest.mark.asyncio
@@ -749,7 +1078,7 @@ async def test_reasoning_content_included_for_deepseek_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reasoning_content_excluded_for_non_deepseek_model() -> None:
+async def test_reasoning_content_included_for_non_deepseek_model() -> None:
     stage, recs = _make_stage()
     done = DoneEvent(
         text="hi",
@@ -764,7 +1093,43 @@ async def test_reasoning_content_excluded_for_non_deepseek_model() -> None:
         resolved_model="synthetic-long-model-4",
     )
     await stage.run(inp)
-    assert recs["transcript_append"].calls[0]["reasoning_content"] is None
+    assert recs["transcript_append"].calls[0]["reasoning_content"] == "thinking..."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("display", ["visible answer", ""])
+async def test_accepted_replay_persists_independently_of_display(display: str) -> None:
+    stage, recs = _make_stage()
+    replay = {"version": 1, "messages": [{"role": "assistant", "content": "accepted"}]}
+    done = DoneEvent(text=display, assistant_replay=replay)
+    await stage.run(_make_input(final_text_parts=[display], done_event=done))
+    assert recs["transcript_append"].calls[0]["assistant_replay"] == replay
+    assert len(recs["turn_memory_capture"].calls) == bool(display)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["", "accepted content", [{
+    "type": "tool_use", "id": "call-1", "name": "lookup", "input": {},
+}]])
+async def test_suppressed_display_preserves_substantive_native_replay_without_ui_segments(content):
+    stage, recs = _make_stage()
+    replay = {"version": 1, "messages": [{
+        "role": "assistant", "content": content,
+        "provider_replay": {
+            "protocol": "openai_chat_completions", "source": "synthetic-silent-origin",
+            "model": "test/model", "reasoning_details": [
+                {"type": "reasoning.encrypted", "data": "synthetic-native-state"}
+            ],
+        },
+    }]}
+    done = DoneEvent(
+        text="", delivery="suppressed", suppression_reason="no_reply", assistant_replay=replay,
+    )
+    await stage.run(_make_input(
+        final_text_parts=[], done_event=done, input_mode="system_event", run_kind="goal",
+    ))
+    assert recs["transcript_append"].calls[0]["assistant_replay"] == replay
+    assert recs["turn_memory_capture"].calls == []
 
 
 @pytest.mark.asyncio
@@ -793,6 +1158,23 @@ async def test_no_session_manager_skips_all_writes() -> None:
     assert len(recs["turn_error_persist"].calls) == 1
     # Totals rollup still fires (adapter guards internally).
     assert len(recs["session_totals"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_memory_capture_skips_capture_port_entirely() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(text="hi", input_tokens=1, output_tokens=1)
+    inp = _make_input(
+        final_text_parts=["hi"],
+        done_event=done,
+        no_memory_capture=True,
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.transcript_appended is True
+    assert outcome.output.memory_captured is False
+    assert recs["turn_memory_capture"].calls == []
 
 
 @pytest.mark.asyncio

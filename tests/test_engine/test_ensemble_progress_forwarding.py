@@ -24,6 +24,7 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     TextDeltaEvent as ProviderText,
 )
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
 )
@@ -73,10 +74,10 @@ async def _tool_handler(call: ToolCall) -> ToolResult:
     return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="ok")
 
 
-def _agent(provider: Any) -> Agent:
+def _agent(provider: Any, **config_overrides: Any) -> Agent:
     return Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=2),
+        config=AgentConfig(max_iterations=2, **config_overrides),
         tool_definitions=[
             ToolDefinition(
                 name="echo",
@@ -142,13 +143,18 @@ async def test_selector_wrapper_and_agent_preserve_live_control_event_order() ->
 
 
 @pytest.mark.asyncio
-async def test_selector_fallback_control_events_remain_live_and_do_not_block_fallback() -> None:
+@pytest.mark.parametrize(("error_code", "primary_attempts"), [("503", 1), ("429", 4)])
+async def test_selector_fallback_control_events_remain_live_and_do_not_block_fallback(
+    monkeypatch: pytest.MonkeyPatch, error_code: str, primary_attempts: int
+) -> None:
     from opensquilla.engine.runtime import _SelectorFallbackProvider
 
     class _Primary:
         provider_name = "openrouter"
+        calls = 0
 
         async def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            self.calls += 1
             yield ProviderEnsembleProgressEvent(
                 event_type="proposer_start",
                 proposer_label="primary",
@@ -156,30 +162,52 @@ async def test_selector_fallback_control_events_remain_live_and_do_not_block_fal
                 proposer_model="primary/model",
             )
             yield ProviderHeartbeatEvent(phase="ensemble_proposers_wait")
-            yield ProviderErrorEvent(message="rate limited", code="429")
+            yield ProviderErrorEvent(message="temporarily unavailable", code=error_code)
 
     class _Fallback(_EnsembleLikeProvider):
         provider_name = "anthropic"
+        calls = 0
 
-    class _Selector:
-        current_config = type("Config", (), {"model": "primary/model"})()
+        def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            self.calls += 1
+            return super().chat(messages, tools=tools, config=config)
 
-        def next_fallback_after_failure(self, exc: Exception) -> Any:
-            del exc
-            self.current_config = type("Config", (), {"model": "fallback/model"})()
-            return _Fallback()
-
-    agent = _agent(_SelectorFallbackProvider(_Primary(), _Selector()))
+    primary = _Primary()
+    fallback = _Fallback()
+    monkeypatch.setattr(
+        "opensquilla.provider.selector._build_provider",
+        lambda config: primary if config.provider == "openrouter" else fallback,
+    )
+    selector = ModelSelector(SelectorConfig(
+        primary=ProviderConfig("openrouter", "primary/model", api_key="dummy"),
+        fallbacks=[ProviderConfig("anthropic", "fallback/model", api_key="other-dummy")],
+    ))
+    agent = _agent(
+        _SelectorFallbackProvider(selector.resolve(), selector),
+        retry_base_backoff_ms=0,
+        retry_max_backoff_ms=0,
+    )
     events = [event async for event in agent.run_turn("hi")]
 
     progress = [event for event in events if isinstance(event, EngineEnsembleProgressEvent)]
     heartbeats = [event for event in events if isinstance(event, RunHeartbeatEvent)]
+    assert primary.calls == primary_attempts
+    assert fallback.calls == 1
     assert [(event.event_type, event.proposer_label) for event in progress] == [
-        ("proposer_start", "primary"),
+        *[("proposer_start", "primary")] * primary_attempts,
         ("proposer_start", "anchor"),
         ("proposer_finish", "anchor"),
     ]
-    assert len(heartbeats) == 2
+    assert len(heartbeats) == primary_attempts + 1
+    live_events = [
+        event for event in events
+        if isinstance(event, EngineEnsembleProgressEvent | RunHeartbeatEvent)
+        or event.kind == "text_delta"
+    ]
+    assert [event.kind for event in live_events] == [
+        *["ensemble_progress", "run_heartbeat"] * primary_attempts,
+        "ensemble_progress", "run_heartbeat", "ensemble_progress", "text_delta",
+    ]
     assert not any(event.kind == "error" for event in events)
     assert any(
         event.kind == "text_delta" and event.text == "synthesized answer"

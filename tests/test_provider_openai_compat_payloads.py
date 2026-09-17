@@ -11,6 +11,7 @@ import structlog.testing
 
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.provider.compat_policy import compat_policy_for_kind
+from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.openai import (
     OpenAIProvider,
     _build_openai_tool,
@@ -18,6 +19,9 @@ from opensquilla.provider.openai import (
     _tool_schema_accepts_arguments,
 )
 from opensquilla.provider.selector import build_provider
+from opensquilla.provider.tokenrhythm_correlation import (
+    is_tokenrhythm_correlation_target,
+)
 from opensquilla.provider.types import (
     ChatConfig,
     ContentBlockToolResult,
@@ -28,6 +32,7 @@ from opensquilla.provider.types import (
     ModelCapabilities,
     ProviderHeartbeatEvent,
     ProviderRequestCorrelation,
+    ReasoningDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
     ToolUseEndEvent,
@@ -183,6 +188,67 @@ def _assistant_tool_call_messages(messages: list[dict[str, Any]]) -> list[dict[s
 
 def _tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [message for message in messages if message.get("role") == "tool"]
+
+
+def test_openrouter_receives_only_opaque_session_affinity_header(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        model="synthetic/model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="opaque-session-id",
+        turn_id="turn-id",
+        execution_id="execution-id",
+        call_kind="prompt_cache_keepalive",
+    )
+
+    async def run() -> None:
+        async for _ in provider.chat(
+            [Message(role="user", content="hello")],
+            config=ChatConfig(provider_request_correlation=correlation),
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert captured["headers"]["X-Session-Id"] == "opaque-session-id"
+    assert "agent:" not in captured["headers"]["X-Session-Id"]
+
+
+def test_openrouter_normal_request_omits_keepalive_affinity_header(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        model="synthetic/model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="opaque-session-id",
+        turn_id="turn-id",
+        execution_id="execution-id",
+        call_kind="agent.chat",
+    )
+
+    async def run() -> None:
+        async for _ in provider.chat(
+            [Message(role="user", content="hello")],
+            config=ChatConfig(provider_request_correlation=correlation),
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert "X-Session-Id" not in captured["headers"]
 
 
 def _payload_tool_descriptions(payload: dict[str, Any]) -> str:
@@ -396,6 +462,12 @@ def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
             yield DoneEvent(model="deepseek-v4-flash")
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = CapturingFallbackProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -426,6 +498,78 @@ def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
     }
     assert {name: stream_headers[name] for name in expected} == expected
     assert {name: fallback_headers[name] for name in expected} == expected
+    assert stream_headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
+    assert fallback_headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
+
+
+def test_stream_timeout_fallback_drops_stale_install_id_after_hot_disable(
+    monkeypatch: Any,
+) -> None:
+    captured_headers: dict[str, str] = {}
+    install_header_checks = 0
+
+    class FailingResponse:
+        status_code = 503
+        text = "synthetic fallback failure"
+        headers: dict[str, str] = {}
+
+    class CapturingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> CapturingClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        async def post(self, _url: str, *, headers: dict[str, str], json: Any):
+            captured_headers.update(headers)
+            return FailingResponse()
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", CapturingClient)
+    def install_headers(
+        _provider_kind: str,
+        _base_url: str,
+        **_kwargs: Any,
+    ) -> dict[str, str]:
+        nonlocal install_header_checks
+        install_header_checks += 1
+        if install_header_checks == 1:
+            return {"X-OpenSquilla-Install-Id": "stale-install-id"}
+        return {}
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        install_headers,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    async def collect_fallback() -> list[Any]:
+        return [
+            event
+            async for event in provider._complete_non_stream(
+                payload={"model": "deepseek-v4-flash", "messages": [], "stream": True},
+                headers={
+                    "Authorization": "Bearer test",
+                    "X-OpenSquilla-Install-Id": "stale-install-id",
+                },
+                cfg=ChatConfig(timeout=1.0),
+                tools=None,
+                timeout_exc=httpx.ReadTimeout("synthetic timeout"),
+            )
+        ]
+
+    events = asyncio.run(collect_fallback())
+
+    assert install_header_checks == 2
+    assert "X-OpenSquilla-Install-Id" not in captured_headers
+    assert any(isinstance(event, ErrorEvent) for event in events)
 
 
 def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
@@ -481,21 +625,201 @@ def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     )
 
 
-def test_tokenrhythm_chat_adds_app_attribution_headers(monkeypatch: Any) -> None:
+def test_dashscope_stream_timeout_strict_off_does_not_fallback(
+    monkeypatch: Any,
+) -> None:
+    class TimeoutStream:
+        async def __aenter__(self) -> Any:
+            raise httpx.ReadTimeout("stream idle")
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class TimeoutClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> TimeoutClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
+            return TimeoutStream()
+
+    class NoFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            pytest.fail("strict DashScope streaming must not call non-stream fallback")
+            yield  # pragma: no cover
+
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK", "off")
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    provider = NoFallbackProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    events = _collect_events(provider, ChatConfig(timeout=1.0))
+
+    assert not any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "timeout"
+
+
+def test_dashscope_empty_stream_strict_off_does_not_fallback(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport_body(monkeypatch, captured, b"data: [DONE]\n\n")
+
+    class NoFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            pytest.fail("strict DashScope streaming must not call non-stream fallback")
+            yield  # pragma: no cover
+
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK", "off")
+    provider = NoFallbackProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    events = _collect_events(provider, ChatConfig(timeout=1.0))
+
+    assert not any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "incomplete_stream"
+
+
+def test_dashscope_non_stream_fallback_invalid_value_fails_closed(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK", "of")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK",
+    ):
+        _collect_events(provider, ChatConfig())
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_url", "expects_install_id"),
+    [
+        (
+            "https://tokenrhythm.studio/v1",
+            "https://tokenrhythm.studio/v1/chat/completions",
+            True,
+        ),
+        (
+            "https://api-tokenrhythm.example/v1",
+            "https://api-tokenrhythm.example/v1/chat/completions",
+            False,
+        ),
+    ],
+)
+def test_tokenrhythm_chat_adds_app_attribution_headers(
+    monkeypatch: Any,
+    base_url: str,
+    expected_url: str,
+    expects_install_id: bool,
+) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda provider_kind, request_base_url, **_kwargs: (
+            {"X-OpenSquilla-Install-Id": "synthetic-install-id"}
+            if is_tokenrhythm_correlation_target(provider_kind, request_base_url)
+            else {}
+        ),
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
-        base_url="https://tokenrhythm.studio/v1",
+        base_url=base_url,
         provider_kind="tokenrhythm",
     )
 
     _collect(provider, ChatConfig())
 
-    assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
+    assert captured["url"] == expected_url
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
+    if expects_install_id:
+        assert (
+            captured["headers"].get("X-OpenSquilla-Install-Id")
+            == "synthetic-install-id"
+        )
+    else:
+        assert "X-OpenSquilla-Install-Id" not in captured["headers"]
+    assert "synthetic-install-id" not in json.dumps(captured["payload"], sort_keys=True)
+
+
+def test_tokenrhythm_chat_omits_install_id_with_explicit_proxy(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    helper_proxies: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_body(),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        captured["client_proxy"] = kwargs.pop("proxy", None)
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    def install_headers(
+        _provider_kind: str,
+        _base_url: str,
+        *,
+        proxy: str | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, str]:
+        helper_proxies.append(proxy)
+        return {} if proxy else {"X-OpenSquilla-Install-Id": "must-not-send"}
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        install_headers,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+        proxy="http://company-proxy.example:8080",
+    )
+
+    _collect(provider, ChatConfig())
+
+    assert captured["client_proxy"] == "http://company-proxy.example:8080"
+    assert helper_proxies
+    assert set(helper_proxies) == {"http://company-proxy.example:8080"}
+    assert "X-OpenSquilla-Install-Id" not in captured["headers"]
 
 
 def test_tokenrhythm_chat_adds_session_correlation_headers_only(
@@ -564,6 +888,12 @@ def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
         "opensquilla.provider.openai.httpx.AsyncClient",
         patched_async_client,
     )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -594,6 +924,7 @@ def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
     assert client_options["follow_redirects"] is False
     assert len(requests) == 1
     assert requests[0].url.host == "tokenrhythm.studio"
+    assert requests[0].headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
     assert requests[0].headers["X-OpenSquilla-Session-Id"] == "session-1"
     assert any(isinstance(event, ErrorEvent) for event in events)
 
@@ -650,6 +981,12 @@ def test_tokenrhythm_list_models_adds_app_attribution_headers(
             request=httpx.Request("GET", "https://tokenrhythm.studio/v1/models"),
         ),
     )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -662,6 +999,10 @@ def test_tokenrhythm_list_models_adds_app_attribution_headers(
     assert captured["url"] == "https://tokenrhythm.studio/v1/models"
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
+    assert (
+        captured["headers"].get("X-OpenSquilla-Install-Id")
+        == "synthetic-install-id"
+    )
 
 
 def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) -> None:
@@ -678,6 +1019,7 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
                         "name": "DeepSeek V4 Flash",
                         "context_length": 128000,
                         "top_provider": {"max_completion_tokens": 8192},
+                        "architecture": {"input_modalities": ["text", "image"]},
                     }
                 ]
             },
@@ -696,6 +1038,7 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
     assert captured["url"] == "https://openrouter.ai/api/v1/models"
     assert rows[0].provider == "openrouter"
     assert rows[0].model_id == "deepseek/deepseek-v4-flash"
+    assert rows[0].supports_vision is True
 
 
 def test_openrouter_http_error_names_provider_request(monkeypatch: Any) -> None:
@@ -721,6 +1064,245 @@ def test_openrouter_http_error_names_provider_request(monkeypatch: Any) -> None:
     error = next(event for event in events if isinstance(event, ErrorEvent))
     assert error.code == "500"
     assert error.message == "OpenRouter chat request failed (HTTP 500): Internal Server Error"
+
+
+def test_openrouter_stream_header_generation_id_is_traced_and_joined_to_response(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    trace_path = tmp_path / "llm_calls.jsonl"
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+    _patch_transport_response(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-generation-id": "gen-stream-header-1",
+                "x-debug-secret": "must-not-be-traced",
+            },
+            content=_sse_body("deepseek/deepseek-v4-flash"),
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    events = _collect_events(provider, ChatConfig())
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    header_row = next(row for row in rows if row["event"] == "llm.response_headers")
+    assert header_row["response_ids"] == ["gen-stream-header-1"]
+    assert next(row for row in rows if row["event"] == "llm.response")[
+        "response_ids"
+    ] == ["gen-stream-header-1"]
+    assert "x-debug-secret" not in json.dumps(rows, sort_keys=True).lower()
+    assert "must-not-be-traced" not in json.dumps(rows, sort_keys=True)
+
+
+def test_openrouter_http_error_header_generation_id_is_traced_without_other_headers(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    trace_path = tmp_path / "llm_calls.jsonl"
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+    _patch_transport_response(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            503,
+            headers={
+                "x-generation-id": "gen-http-error-1",
+                "x-debug-secret": "must-not-be-traced",
+            },
+            content=b"provider unavailable",
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    events = _collect_events(provider, ChatConfig())
+
+    assert next(event for event in events if isinstance(event, ErrorEvent)).code == "503"
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == [
+        "llm.request",
+        "llm.response_headers",
+        "llm.error",
+    ]
+    assert rows[1]["response_ids"] == ["gen-http-error-1"]
+    serialized = json.dumps(rows, sort_keys=True)
+    assert "x-debug-secret" not in serialized.lower()
+    assert "must-not-be-traced" not in serialized
+
+
+def test_openrouter_header_generation_id_survives_local_stream_cancellation(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    class BlockingStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.started = False
+
+        async def __aiter__(self):
+            self.started = True
+            await asyncio.Future()
+            yield b""  # pragma: no cover - cancellation is the test terminal
+
+        async def aclose(self) -> None:
+            return None
+
+    stream = BlockingStream()
+    trace_path = tmp_path / "llm_calls.jsonl"
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-generation-id": "gen-cancelled-stream-1",
+            },
+            stream=stream,
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient", patched_async_client
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    async def run_and_cancel() -> None:
+        async def consume() -> None:
+            async for _event in provider.chat(
+                [Message(role="user", content="hi")],
+                config=ChatConfig(timeout=60.0),
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        for _ in range(100):
+            if stream.started:
+                break
+            await asyncio.sleep(0.001)
+        assert stream.started
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_and_cancel())
+
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == [
+        "llm.request",
+        "llm.response_headers",
+        "llm.error",
+    ]
+    assert rows[1]["response_ids"] == ["gen-cancelled-stream-1"]
+    assert rows[2]["code"] == "cancelled"
+
+
+def test_openrouter_non_stream_header_generation_id_is_joined_to_response(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    trace_path = tmp_path / "llm_calls.jsonl"
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+    _patch_transport_response(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            headers={"x-generation-id": "gen-non-stream-1"},
+            json={
+                "model": "deepseek/deepseek-v4-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            },
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    async def collect_fallback() -> list[Any]:
+        return [
+            event
+            async for event in provider._complete_non_stream(
+                payload={
+                    "model": "deepseek/deepseek-v4-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer test"},
+                cfg=ChatConfig(timeout=60.0),
+                tools=None,
+                timeout_exc=httpx.ReadTimeout("empty stream"),
+            )
+        ]
+
+    events = asyncio.run(collect_fallback())
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == [
+        "llm.request",
+        "llm.response_headers",
+        "llm.response",
+    ]
+    assert rows[1]["response_ids"] == ["gen-non-stream-1"]
+    assert rows[2]["response_ids"] == ["gen-non-stream-1"]
 
 
 def test_openai_compatible_provider_writes_llm_trace(monkeypatch: Any, tmp_path: Any) -> None:
@@ -753,6 +1335,81 @@ def test_openai_compatible_provider_writes_llm_trace(monkeypatch: Any, tmp_path:
     assert rows[-1]["assistant_text"] == "ok"
 
 
+def test_openai_compatible_provider_terminalizes_cancelled_stream_trace(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    trace_path = tmp_path / "cancelled-llm-calls.jsonl"
+    stream_started = asyncio.Event()
+
+    class BlockingResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        async def aiter_lines(self):
+            stream_started.set()
+            await asyncio.Event().wait()
+            yield ""  # pragma: no cover
+
+    class BlockingStream:
+        async def __aenter__(self) -> BlockingResponse:
+            return BlockingResponse()
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class BlockingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> BlockingClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def stream(self, *args: Any, **kwargs: Any) -> BlockingStream:
+            return BlockingStream()
+
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        BlockingClient,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    async def _run() -> None:
+        consume_task = asyncio.create_task(
+            anext(
+                provider.chat(
+                    [Message(role="user", content="hi")],
+                    config=ChatConfig(),
+                )
+            )
+        )
+        await asyncio.wait_for(stream_started.wait(), timeout=1.0)
+        consume_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consume_task
+
+    asyncio.run(_run())
+
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == ["llm.request", "llm.error"]
+    assert rows[0]["call_id"] == rows[1]["call_id"]
+    assert rows[1]["code"] == "cancelled"
+    assert rows[1]["metadata"]["phase"] == "stream"
+
+
 def test_llm_trace_request_metadata_carries_compaction_proof(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
@@ -775,7 +1432,7 @@ def test_llm_trace_request_metadata_carries_compaction_proof(
     request_proof = rows[0]["metadata"]["request_proof"]
     assert request_proof["compaction_tier"] == 0
     assert request_proof["retry_count"] == 0
-    assert "compaction_tiny_guard_chars" in request_proof
+    assert "compaction_tiny_guard_chars" not in request_proof
     assert "compaction_protect_recent_assistant" in request_proof
 
 
@@ -835,6 +1492,89 @@ def test_openrouter_deepseek_v4_returns_reasoning_content_from_details(
     }
     assert captured["payload"]["reasoning"] == {"effort": "high"}
     assert done.reasoning_content == "I considered the request."
+
+
+def test_tokenrhythm_stream_normalizes_reasoning_alias_but_withholds_text_replay(
+    monkeypatch: Any,
+) -> None:
+    captured_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_payloads.append(json.loads(request.content.decode("utf-8")))
+        chunks = [
+            {
+                "model": "deepseek-v4-flash-0731",
+                "choices": [
+                    {
+                        "delta": {"reasoning": "supplier-specific reasoning"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "model": "deepseek-v4-flash-0731",
+                "choices": [{"delta": {"content": "ok"}, "finish_reason": None}],
+            },
+            {
+                "model": "deepseek-v4-flash-0731",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            },
+        ]
+        body = b"".join(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body + b"data: [DONE]\n\n",
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash-0731",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    first_events = _collect_events(provider, ChatConfig())
+    reasoning = "".join(
+        event.text for event in first_events if isinstance(event, ReasoningDeltaEvent)
+    )
+    first_done = next(event for event in first_events if isinstance(event, DoneEvent))
+    assert reasoning == "supplier-specific reasoning"
+    assert first_done.reasoning_content == reasoning
+
+    async def replay() -> None:
+        async for _ in provider.chat(
+            [
+                Message(
+                    role="assistant",
+                    content="ok",
+                    reasoning_content=first_done.reasoning_content,
+                ),
+                Message(role="user", content="continue"),
+            ],
+            config=ChatConfig(),
+        ):
+            pass
+
+    asyncio.run(replay())
+
+    assert captured_payloads[1]["messages"][0] == {
+        "role": "assistant",
+        "content": "ok",
+        "reasoning_content": "",
+    }
 
 
 def _collect_events(
@@ -1117,6 +1857,250 @@ def test_tool_input_schema_supports_explicit_additional_properties_false() -> No
     assert not _tool_schema_accepts_arguments(tool, {"q": "hi", "extra": "rejected"})
 
 
+def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
+    monkeypatch: Any,
+) -> None:
+    create_csv = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+    original_definition = create_csv.model_copy(deep=True)
+    assert create_csv.allow_string_item_schema_projection is True
+    assert "allow_string_item_schema_projection" not in create_csv.model_dump()
+    assert (
+        "allow_string_item_schema_projection"
+        not in ToolDefinition.model_json_schema()["properties"]
+    )
+    assert create_csv.model_copy(deep=True).allow_string_item_schema_projection is True
+    assert (
+        ToolDefinition.model_validate(create_csv.model_dump())
+        .allow_string_item_schema_projection
+        is False
+    )
+    assert create_csv.input_schema.properties["rows"]["items"] == {"type": "array"}
+    assert _tool_schema_accepts_arguments(
+        create_csv,
+        {"rows": [["text", 1, True, None, {"x": 1}, ["nested"]]]},
+    )
+
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        provider_kind="gemini",
+    )
+    _collect_events(provider, ChatConfig(), tools=[create_csv])
+
+    wire_rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert wire_rows["items"] == {"type": "array", "items": {"type": "string"}}
+    assert create_csv == original_definition
+
+
+@pytest.mark.parametrize(
+    ("base_url", "tool_name"),
+    [
+        ("https://relay.example/v1", "create_csv"),
+        ("https://openrouter.ai/api/v1", "create_csv"),
+        ("https://generativelanguage.googleapis.com/v1beta/openai", "mcp_csv"),
+    ],
+)
+def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
+    monkeypatch: Any,
+    base_url: str,
+    tool_name: str,
+) -> None:
+    tool = ToolDefinition(
+        name=tool_name,
+        description="Create a CSV-like artifact.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
+    )
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url=base_url,
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[tool])
+
+    rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert rows["items"] == {"type": "array"}
+
+
+def test_gemini_does_not_project_an_untrusted_same_named_tool(monkeypatch: Any) -> None:
+    tool = ToolDefinition.model_validate(
+        {
+            "name": "create_csv",
+            "description": "Third-party tool with unrelated row semantics.",
+            "input_schema": {
+                "properties": {
+                    "rows": {"type": "array", "items": {"type": "array"}}
+                },
+                "required": ["rows"],
+            },
+            "allow_string_item_schema_projection": True,
+            "_string_item_schema_projection_capability": True,
+        }
+    )
+    injected_copy = tool.model_copy(
+        update={
+            "allow_string_item_schema_projection": True,
+            "_string_item_schema_projection_capability": True,
+        }
+    )
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[tool])
+
+    rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert tool.allow_string_item_schema_projection is False
+    assert injected_copy.allow_string_item_schema_projection is False
+    assert rows["items"] == {"type": "array"}
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "",
+        " https://generativelanguage.googleapis.com/v1beta/openai",
+        "http://generativelanguage.googleapis.com/v1beta/openai",
+        "https://generativelanguage.googleapis.com:8443/v1beta/openai",
+        "https://generativelanguage.googleapis.com/v1beta/openai/custom",
+        "https://user@generativelanguage.googleapis.com/v1beta/openai",
+        "https://generativelanguage.googleapis.com/v1beta/openai?alt=sse",
+        "https://generativelanguage.googleapis.com/v1beta/openai#custom",
+    ],
+)
+def test_gemini_does_not_project_create_csv_on_nonofficial_api_roots(
+    monkeypatch: Any,
+    base_url: str,
+) -> None:
+    create_csv = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url=base_url,
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[create_csv])
+
+    rows = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["rows"]
+    assert rows["items"] == {"type": "array"}
+
+
+def test_string_item_projection_preserves_schema_shaped_literals() -> None:
+    literal = {"type": "array"}
+    tool = ToolDefinition(
+        name="create_csv",
+        description="Create a CSV file.",
+        input_schema=ToolInputSchema(
+            properties={
+                "value": {
+                    "anyOf": [{"type": "array"}],
+                    "default": literal,
+                    "enum": [literal],
+                    "const": literal,
+                }
+            }
+        ),
+    )
+    original_definition = tool.model_copy(deep=True)
+
+    payload = _build_openai_tool(
+        tool,
+        complete_itemless_arrays_with_string_items=True,
+    )
+
+    value = payload["function"]["parameters"]["properties"]["value"]
+    assert value["anyOf"] == [{"type": "array", "items": {"type": "string"}}]
+    assert value["default"] == literal
+    assert value["enum"] == [literal]
+    assert value["const"] == literal
+    assert tool == original_definition
+
+
+def test_gemini_projection_traverses_composed_schemas_without_mutating_source(
+    monkeypatch: Any,
+) -> None:
+    create_csv = next(
+        tool
+        for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "create_csv"
+    )
+    tool = create_csv.model_copy(
+        deep=True,
+        update={
+            "input_schema": ToolInputSchema(
+                properties={
+                    "all_of": {"allOf": [{"type": "array"}]},
+                    "any_of": {
+                        "anyOf": [
+                            {"type": ["array", "null"]},
+                            {"type": "string"},
+                        ]
+                    },
+                    "one_of": {"oneOf": [{"type": "array"}, {"type": "object"}]},
+                    "tuple": {
+                        "type": "array",
+                        "prefixItems": [{"type": "array"}],
+                    },
+                },
+            )
+        },
+    )
+    original_definition = tool.model_copy(deep=True)
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        provider_kind="gemini",
+    )
+
+    _collect_events(provider, ChatConfig(), tools=[tool])
+
+    properties = captured["payload"]["tools"][0]["function"]["parameters"][
+        "properties"
+    ]
+    assert properties["all_of"]["allOf"][0]["items"] == {"type": "string"}
+    assert properties["any_of"]["anyOf"][0]["items"] == {"type": "string"}
+    assert properties["one_of"]["oneOf"][0]["items"] == {"type": "string"}
+    assert properties["tuple"]["items"] == {"type": "string"}
+    assert properties["tuple"]["prefixItems"][0]["items"] == {"type": "string"}
+    assert tool == original_definition
+
+
 def test_deepseek_thinking_uses_provider_thinking_field_not_openai_reasoning_effort(
     monkeypatch: Any,
 ) -> None:
@@ -1360,6 +2344,40 @@ def test_deepseek_v4_non_thinking_replays_prior_reasoning_content(
         captured["payload"]["messages"][0]["reasoning_content"]
         == "prior thinking from earlier deepseek turn"
     )
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek-v4-flash-0731", "tokenrhythm/deepseek-v4-flash-0731"],
+)
+def test_tokenrhythm_deepseek_v4_flash_0731_requires_reasoning_content(
+    monkeypatch: Any,
+    model: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    messages = [
+        Message(role="assistant", content="Prior assistant turn."),
+        Message(role="user", content="continue"),
+    ]
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=ChatConfig(thinking=True)):
+            pass
+
+    asyncio.run(_run())
+
+    assert captured["payload"]["messages"][0] == {
+        "role": "assistant",
+        "content": "Prior assistant turn.",
+        "reasoning_content": "",
+    }
 
 
 def test_deepseek_v4_replays_reasoning_content_without_catalog_capabilities(
@@ -1671,6 +2689,220 @@ def test_zai_non_thinking_sends_provider_disabled_for_default_thinking_model(
     assert captured["payload"]["thinking"] == {"type": "disabled"}
 
 
+_ZHIPU_CATALOG_MODELS = (
+    ("glm-4.5", True),
+    ("glm-4.5-air", True),
+    ("glm-4.5-flash", True),
+    ("glm-4.5v", True),
+    ("glm-4.6", False),
+    ("glm-4.6v", False),
+    ("glm-4.7", True),
+    ("glm-4.7-flash", True),
+    ("glm-4.7-flashx", True),
+    ("glm-5", True),
+    ("glm-5-turbo", True),
+    ("glm-5.1", True),
+    ("glm-5.2", True),
+    ("glm-5v-turbo", True),
+)
+
+
+def _project_zhipu_payload(
+    *,
+    model: str = "glm-5.2",
+    base_url: str,
+    thinking: bool,
+    capabilities: ModelCapabilities,
+    provider_kind: str = "zhipu",
+) -> dict[str, Any]:
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url=base_url,
+        provider_kind=provider_kind,
+    )
+    return provider.project_final_request(
+        [Message(role="user", content="hi")],
+        config=ChatConfig(
+            thinking=thinking,
+            thinking_level=ThinkingLevel.HIGH,
+            model_capabilities=capabilities,
+        ),
+    ).payload
+
+
+@pytest.mark.parametrize(("model", "supports_reasoning"), _ZHIPU_CATALOG_MODELS)
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    ("base_url", "official"),
+    [
+        ("https://open.bigmodel.cn/api/paas/v4", True),
+        ("https://relay.example.test/v1", False),
+    ],
+)
+def test_all_zhipu_catalog_models_scope_zai_to_the_official_api_root(
+    model: str,
+    supports_reasoning: bool,
+    thinking: bool,
+    base_url: str,
+    official: bool,
+) -> None:
+    capabilities = ModelCatalog().get_capabilities(
+        model,
+        provider_name="zhipu",
+        base_url=base_url,
+    )
+    assert capabilities.supports_reasoning is supports_reasoning
+    assert capabilities.reasoning_format == ("zai" if supports_reasoning else "none")
+
+    payload = _project_zhipu_payload(
+        model=model,
+        base_url=base_url,
+        thinking=thinking,
+        capabilities=capabilities,
+    )
+
+    expected = {"type": "enabled" if thinking else "disabled"}
+    if official and supports_reasoning:
+        assert payload["thinking"] == expected
+    else:
+        assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    ("base_url", "official"),
+    [
+        ("https://open.bigmodel.cn/api/paas/v4", True),
+        ("HTTPS://OPEN.BIGMODEL.CN/api/paas/v4", True),
+        ("https://open.bigmodel.cn:443/api/paas/v4", True),
+        ("https://open.bigmodel.cn/api/paas/v4/", True),
+        ("http://open.bigmodel.cn/api/paas/v4", False),
+        ("http://open.bigmodel.cn:80/api/paas/v4", False),
+        ("https://open.bigmodel.cn:80/api/paas/v4", False),
+        ("https://open.bigmodel.cn:8443/api/paas/v4", False),
+        ("https://open.bigmodel.cn", False),
+        ("https://open.bigmodel.cn/api/paas", False),
+        ("https://open.bigmodel.cn/api/paas/v4/chat/completions", False),
+        ("https://user@open.bigmodel.cn/api/paas/v4", False),
+        ("https://user:pass@open.bigmodel.cn/api/paas/v4", False),
+        ("https://open.bigmodel.cn/api/paas/v4?relay=1", False),
+        ("https://open.bigmodel.cn/api/paas/v4#relay", False),
+        ("https://open.bigmodel.cn/api/paas/v4?", False),
+        ("https://open.bigmodel.cn/api/paas/v4#", False),
+        ("https://open.bigmodel.cn/api/paas/v4?#", False),
+        ("https://open.bigmodel.cn.evil.test/api/paas/v4", False),
+        ("https://evil-open.bigmodel.cn/api/paas/v4", False),
+        ("https://open.bigmodel.cn\\@evil.test/api/paas/v4", False),
+        ("https://open.bigmodel.cn:bad/api/paas/v4", False),
+        ("open.bigmodel.cn/api/paas/v4", False),
+    ],
+)
+def test_zhipu_zai_endpoint_identity_matrix(
+    base_url: str,
+    official: bool,
+    thinking: bool,
+) -> None:
+    payload = _project_zhipu_payload(
+        base_url=base_url,
+        thinking=thinking,
+        capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="zai",
+        ),
+    )
+
+    if official:
+        assert payload["thinking"] == {
+            "type": "enabled" if thinking else "disabled"
+        }
+    else:
+        assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://trusted-zai-relay.example.test/v1",
+        "https://trusted-zai-relay.example.test/v1/%3F",
+        "https://trusted-zai-relay.example.test/v1;mode=compat",
+    ],
+)
+def test_custom_provider_with_explicit_zai_format_remains_available(
+    base_url: str,
+    thinking: bool,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "custom/glm-5.2": {
+                "supports_reasoning": True,
+                "supports_tools": True,
+                "reasoning_format": "zai",
+            }
+        }
+    )
+    payload = _project_zhipu_payload(
+        base_url=base_url,
+        thinking=thinking,
+        provider_kind="custom",
+        capabilities=catalog.get_capabilities(
+            "glm-5.2",
+            provider_name="custom",
+        ),
+    )
+
+    assert payload["thinking"] == {"type": "enabled" if thinking else "disabled"}
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+def test_zhipu_model_override_with_non_zai_format_is_not_host_gated(
+    thinking: bool,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "zhipu/glm-4.6": {
+                "supports_reasoning": True,
+                "supports_tools": True,
+                "reasoning_format": "deepseek",
+            }
+        }
+    )
+    payload = _project_zhipu_payload(
+        model="glm-4.6",
+        base_url="https://trusted-deepseek-relay.example.test/v1",
+        thinking=thinking,
+        capabilities=catalog.get_capabilities(
+            "glm-4.6",
+            provider_name="zhipu",
+        ),
+    )
+
+    assert payload["thinking"] == {"type": "enabled" if thinking else "disabled"}
+    if thinking:
+        assert payload["reasoning_effort"] == "high"
+    else:
+        assert "reasoning_effort" not in payload
+
+
+def test_other_provider_zai_format_is_not_gated_by_zhipu_endpoint_policy() -> None:
+    payload = _project_zhipu_payload(
+        base_url="https://another-provider.example.test/v1",
+        thinking=True,
+        provider_kind="openai",
+        capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="zai",
+        ),
+    )
+
+    assert payload["thinking"] == {"type": "enabled"}
+
+
 def test_dashscope_cache_on_marks_system_and_latest_user(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
@@ -1927,6 +3159,115 @@ def test_tokenrhythm_embeds_json_schema_without_response_format(
     assert payload["messages"][1] == {"role": "user", "content": "hi"}
     assert config.system == "Fuse the imported profile."
     assert config.output_json_schema == schema
+
+
+def test_deepseek_embeds_json_schema_and_requests_json_object(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = build_provider(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_key="test",
+    )
+    assert isinstance(provider, OpenAIProvider)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"schema_version": {"type": "integer", "const": 1}},
+        "required": ["schema_version"],
+    }
+    config = ChatConfig(
+        system="Fuse the imported profile.",
+        output_json_schema=schema,
+        output_json_schema_strict=True,
+    )
+
+    _collect(provider, config)
+
+    payload = captured["payload"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["messages"][0] == {
+        "role": "system",
+        "content": (
+            "Fuse the imported profile.\n\n"
+            "Return exactly one JSON value that validates against the authoritative "
+            "JSON Schema below. Do not use Markdown fences or add commentary.\n"
+            f"{json.dumps(schema, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}"
+        ),
+    }
+    assert config.system == "Fuse the imported profile."
+    assert config.output_json_schema == schema
+
+
+def test_deepseek_schema_prompt_message_projection_matches_payload_without_system(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = build_provider(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_key="test",
+    )
+    assert isinstance(provider, OpenAIProvider)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"schema_version": {"type": "integer", "const": 1}},
+        "required": ["schema_version"],
+    }
+    config = ChatConfig(output_json_schema=schema)
+
+    projection = provider.project_message_count(
+        [Message(role="user", content="hi")],
+        config,
+    )
+    _collect(provider, config)
+
+    payload_messages = captured["payload"]["messages"]
+    assert projection.actual_wire_messages == len(payload_messages) == 2
+    assert projection.system_messages == 1
+    assert payload_messages[0]["role"] == "system"
+    assert payload_messages[1] == {"role": "user", "content": "hi"}
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        None,
+        {"type": "array", "items": {"type": "string"}},
+    ],
+)
+def test_deepseek_omits_json_object_mode_without_an_object_schema(
+    monkeypatch: Any,
+    schema: dict[str, Any] | None,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        provider_kind="deepseek",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(system="Return JSON.", output_json_schema=schema),
+    )
+
+    payload = captured["payload"]
+    assert "response_format" not in payload
+    if schema is not None:
+        serialized_schema = json.dumps(
+            schema,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        assert serialized_schema in payload["messages"][0]["content"]
 
 
 def test_openrouter_omits_response_format_without_output_schema(monkeypatch: Any) -> None:
@@ -2397,6 +3738,88 @@ def test_dashscope_thinking_omits_implicit_level_budget(monkeypatch: Any) -> Non
 
 
 _DASHSCOPE_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
+_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV = "OPENSQUILLA_DASHSCOPE_PARALLEL_TOOL_CALLS"
+
+
+def _dashscope_tool_payload(
+    monkeypatch: Any,
+    *,
+    provider_kind: str = "dashscope",
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind=provider_kind,
+    )
+    tool = ToolDefinition(
+        name="read_file",
+        description="Read a file",
+        input_schema={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    )
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    _collect_events(provider, cfg, tools=[tool])
+    return captured["payload"]
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "false", "no", "off"])
+def test_dashscope_parallel_tool_calls_false_forms_omit_field(
+    monkeypatch: Any,
+    value: str | None,
+) -> None:
+    if value is None:
+        monkeypatch.delenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, value)
+
+    payload = _dashscope_tool_payload(monkeypatch)
+
+    assert "parallel_tool_calls" not in payload
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", " ON "])
+def test_dashscope_parallel_tool_calls_true_forms_send_true(
+    monkeypatch: Any,
+    value: str,
+) -> None:
+    monkeypatch.setenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, value)
+
+    payload = _dashscope_tool_payload(monkeypatch)
+
+    assert payload["parallel_tool_calls"] is True
+
+
+def test_dashscope_parallel_tool_calls_invalid_value_fails_closed(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, "treu")
+
+    with pytest.raises(ValueError, match="OPENSQUILLA_DASHSCOPE_PARALLEL_TOOL_CALLS"):
+        _dashscope_tool_payload(monkeypatch)
+
+
+def test_non_dashscope_provider_ignores_parallel_tool_calls_env(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, "on")
+
+    payload = _dashscope_tool_payload(monkeypatch, provider_kind="openrouter")
+
+    assert "parallel_tool_calls" not in payload
 
 
 def test_dashscope_env_thinking_budget_absent_leaves_payload_inert(
@@ -2593,14 +4016,23 @@ def test_dashscope_request_logs_qwen_provider_profile(monkeypatch: Any) -> None:
     assert profile["stream_fallback"] == "non_stream_once"
 
 
-def test_dashscope_qwen36_flash_thinking_does_not_replay_reasoning_content(
+@pytest.mark.parametrize(
+    "model",
+    [
+        "qwen3.6-flash",
+        "qwen3.7-flash-2026-07-15",
+    ],
+)
+def test_dashscope_experimental_preserve_model_replays_reasoning_content(
     monkeypatch: Any,
+    model: str,
 ) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", "on")
     provider = OpenAIProvider(
         api_key="test",
-        model="qwen3.6-flash",
+        model=model,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         provider_kind="dashscope",
     )
@@ -2644,8 +4076,190 @@ def test_dashscope_qwen36_flash_thinking_does_not_replay_reasoning_content(
     asyncio.run(_run())
 
     assert captured["payload"]["enable_thinking"] is True
+    assert captured["payload"]["preserve_thinking"] is True
+    assert captured["payload"]["messages"][0]["reasoning_content"] == (
+        "I chose a minimal patch before calling the tool."
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "qwen3.6-flash",
+        "qwen3.7-flash-2026-07-15",
+    ],
+)
+def test_dashscope_preserve_thinking_unset_keeps_main_default(
+    monkeypatch: Any,
+    model: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content="previous visible answer",
+            reasoning_content="previous DashScope thinking",
+        ),
+        Message(role="user", content="continue"),
+    ]
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=cfg):
+            pass
+
+    asyncio.run(_run())
+
     assert "preserve_thinking" not in captured["payload"]
     assert "reasoning_content" not in captured["payload"]["messages"][0]
+
+
+def test_dashscope_preserve_thinking_off_keeps_supported_model_history_hidden(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", "off")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content="previous visible answer",
+            reasoning_content="previous DashScope thinking",
+        ),
+        Message(role="user", content="continue"),
+    ]
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=cfg):
+            pass
+
+    asyncio.run(_run())
+
+    assert captured["payload"]["enable_thinking"] is True
+    assert "preserve_thinking" not in captured["payload"]
+    assert "reasoning_content" not in captured["payload"]["messages"][0]
+
+
+def test_dashscope_preserve_thinking_invalid_value_fails_closed(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", "treu")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING",
+    ):
+        _collect(
+            provider,
+            ChatConfig(
+                thinking=True,
+                model_capabilities=ModelCapabilities(
+                    supports_reasoning=True,
+                    supports_tools=True,
+                    reasoning_format="dashscope",
+                ),
+            ),
+        )
+
+
+def test_dashscope_preserve_thinking_auto_keeps_unsupported_model_history_hidden(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3-max",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content="previous visible answer",
+            reasoning_content="unsupported reasoning history",
+        ),
+        Message(role="user", content="continue"),
+    ]
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=cfg):
+            pass
+
+    asyncio.run(_run())
+
+    assert "preserve_thinking" not in captured["payload"]
+    assert "reasoning_content" not in captured["payload"]["messages"][0]
+
+
+def test_dashscope_preserve_thinking_on_rejects_unsupported_model(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", "on")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3-max",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="not supported.*qwen3-max",
+    ):
+        _collect(
+            provider,
+            ChatConfig(
+                thinking=True,
+                model_capabilities=ModelCapabilities(
+                    supports_reasoning=True,
+                    supports_tools=True,
+                    reasoning_format="dashscope",
+                ),
+            ),
+        )
 
 
 def test_dashscope_preserve_thinking_model_replays_reasoning_content(

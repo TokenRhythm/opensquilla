@@ -4,11 +4,14 @@ import os
 import runpy
 import subprocess
 import sys
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[2]
 HOOK_PATH = (
@@ -258,18 +261,34 @@ def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
     smoke_source = (ROOT / "desktop/electron/scripts/smoke-gateway.mjs").read_text(
         encoding="utf-8"
     )
-    project_source = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    runtime_requirements = [Requirement(value) for value in project["project"]["dependencies"]]
+    certifi_requirements = [value for value in runtime_requirements if value.name == "certifi"]
 
     assert "'--runtime-hook',\n  caRuntimeHookPath," in build_source
     assert "'--collect-data',\n  'certifi'," in build_source
     assert "'--hidden-import',\n  'certifi'," in build_source
-    assert '"certifi>=2024.7.4"' in project_source
+    assert len(certifi_requirements) == 1
+    certifi_requirement = certifi_requirements[0]
+    assert certifi_requirement.marker is None
+    assert certifi_requirement.url is None
+    # Keep certifi mandatory with an explicit trust-bundle floor; raising that
+    # floor must not break the packaging contract.
+    assert any(
+        specifier.operator in {">=", ">"}
+        and Version(specifier.version) >= Version("2024.7.4")
+        for specifier in certifi_requirement.specifier
+    )
     assert "--_desktop-ca-probe" in entry_source
+    assert "--internal-child" in entry_source
     assert "--_sandbox-filesystem-worker" in entry_source
     assert "--elevated-helper" in entry_source
     assert "x509_ca={ca_certificate_count}" in entry_source
     assert "spawnSync(gatewayBinary, ['--_desktop-ca-probe']" in smoke_source
-    assert "spawnSync(gatewayBinary, ['--_sandbox-filesystem-worker']" in smoke_source
+    assert (
+        "spawnSync(gatewayBinary, ['--internal-child', 'filesystem-worker', '-']"
+        in smoke_source
+    )
     assert "caCertificateCount <= 0" in smoke_source
     for name in (
         "ALL_PROXY",
@@ -298,6 +317,87 @@ def test_gateway_entry_runs_hidden_filesystem_worker_without_entering_cli(
 
     completed = subprocess.run(
         [sys.executable, str(gateway_entry), "--_sandbox-filesystem-worker"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["message"].splitlines() == ["1\tworker-ok"]
+    assert completed.stderr == ""
+
+
+def test_gateway_entry_runs_unicode_tool_search_probe_without_entering_cli() -> None:
+    gateway_entry = ROOT / "desktop/electron/scripts/gateway-entry.py"
+    completed = subprocess.run(
+        [sys.executable, str(gateway_entry), "--_desktop-tool-search-probe"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "opensquilla-desktop-tool-search-ok"
+    assert completed.stderr == ""
+
+
+@pytest.mark.parametrize("failure", [ModuleNotFoundError, FileNotFoundError])
+def test_gateway_entry_unicode_probe_rejects_missing_resource(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: type[Exception],
+) -> None:
+    import anyascii
+
+    def missing_resource(*_args: object) -> bytes:
+        raise failure("private missing resource detail")
+
+    monkeypatch.setattr(anyascii, "_blocks", {})
+    monkeypatch.setattr(anyascii, "read_binary", missing_resource)
+    entry_path = ROOT / "desktop/electron/scripts/gateway-entry.py"
+    monkeypatch.setattr(sys, "argv", [str(entry_path), "--_desktop-tool-search-probe"])
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_path(str(entry_path), run_name="__main__")
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "could not load its Unicode resources" in captured.err
+    assert "private missing resource detail" not in captured.err
+
+
+def test_desktop_build_and_smoke_require_unicode_tool_search_resources() -> None:
+    build = (ROOT / "desktop/electron/scripts/build-gateway.mjs").read_text(encoding="utf-8")
+    smoke = (ROOT / "desktop/electron/scripts/smoke-gateway.mjs").read_text(encoding="utf-8")
+    assert "'--collect-all',\n  'anyascii'," in build
+    assert "spawnSync(gatewayBinary, ['--_desktop-tool-search-probe']" in smoke
+    main_body = smoke[smoke.index("async function main") :]
+    assert main_body.index("verifyGatewayToolSearch(gatewayBinary, env)") < main_body.index(
+        "await waitForGateway(",
+    )
+
+
+def test_gateway_entry_runs_canonical_internal_filesystem_worker(
+    tmp_path: Path,
+) -> None:
+    gateway_entry = ROOT / "desktop/electron/scripts/gateway-entry.py"
+    target = tmp_path / "worker-probe.txt"
+    target.write_text("worker-ok\n", encoding="utf-8")
+    payload = {
+        "kind": "read_file",
+        "path": str(target),
+        "displayPath": str(target),
+    }
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(gateway_entry),
+            "--internal-child",
+            "filesystem-worker",
+            "-",
+        ],
         input=json.dumps(payload),
         text=True,
         capture_output=True,

@@ -52,10 +52,43 @@ async def test_router_control_set_hold_writes_store_and_requests_replay() -> Non
     assert payload["accepted"] is True
     assert payload["target_tier"] == "c3"
     assert payload["target_model"] == "anthropic/claude-opus-4.8"
+    assert payload["target_label"] == "claude-opus-4.8"
+    assert payload["target_execution_kind"] == "single_model"
+    assert payload["target_model_role"] == "selected_model"
     assert payload["replay_required"] is True
     hold = ctx.router_control_hold_store.get_valid(ctx.session_key or "")
     assert hold is not None
     assert hold.tier == "c3"
+
+
+@pytest.mark.asyncio
+async def test_router_control_ensemble_target_keeps_anchor_but_reports_fusion() -> None:
+    ctx = _ctx()
+    ctx.router_control_config.tiers["c3"]["ensemble_enabled"] = True
+    handler = build_tool_handler(get_default_registry(), ctx)
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="call-ensemble",
+            tool_name="router_control",
+            arguments={
+                "action": "set_hold",
+                "target_id": "tier:c3",
+                "evidence": "use the highest tier",
+            },
+        )
+    )
+
+    payload = json.loads(result.content)
+    assert payload["target_model"] == "anthropic/claude-opus-4.8"
+    assert payload["target_provider"] == "openrouter"
+    assert payload["target_label"] == "multi-model fusion"
+    assert payload["target_execution_kind"] == "ensemble"
+    assert payload["target_model_role"] == "ensemble_anchor"
+    hold = ctx.router_control_hold_store.get_valid(ctx.session_key or "")
+    assert hold is not None
+    assert hold.model == "anthropic/claude-opus-4.8"
+    assert hold.provider == "openrouter"
 
 
 @pytest.mark.asyncio
@@ -94,6 +127,15 @@ def test_router_control_tool_schema_includes_dynamic_target_enum() -> None:
     assert "tier:c3" in target_schema["enum"]
     assert "tier:t3" not in target_schema["enum"]
     assert "model:z-ai/glm-5.2" not in target_schema["enum"]
+
+
+def test_router_control_tool_is_hidden_when_router_is_disabled() -> None:
+    ctx = _ctx()
+    ctx.router_control_config.enabled = False
+
+    definitions = get_default_registry().to_tool_definitions(ctx)
+
+    assert "router_control" not in {tool.name for tool in definitions}
 
 
 @pytest.mark.asyncio

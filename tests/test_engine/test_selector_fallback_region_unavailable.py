@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from opensquilla.engine.runtime import _SelectorFallbackProvider
-from opensquilla.provider import DoneEvent, ErrorEvent, TextDeltaEvent
+from opensquilla.provider import DoneEvent, ErrorEvent, ProviderActivityEvent, TextDeltaEvent
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 
 HIGH_TIER_MODEL = "openrouter/high-tier-region-locked"
@@ -95,9 +95,18 @@ async def test_runtime_falls_back_from_region_unavailable_router_model(
     events = [event async for event in provider.chat([{"role": "user", "content": "hi"}])]
 
     assert calls == [HIGH_TIER_MODEL, MID_TIER_MODEL]
-    assert [getattr(event, "kind", "") for event in events] == ["text_delta", "done"]
-    assert events[0].text == f"fallback-response-from:{MID_TIER_MODEL}"
-    assert events[1].model == MID_TIER_MODEL
+    assert [getattr(event, "kind", "") for event in events] == [
+        "provider_activity",
+        "text_delta",
+        "done",
+    ]
+    activity = events[0]
+    assert isinstance(activity, ProviderActivityEvent)
+    assert (activity.phase, activity.reason) == ("fallback", "unknown")
+    assert activity.retry_attempt == 1
+    assert activity.started_at > 0
+    assert events[1].text == f"fallback-response-from:{MID_TIER_MODEL}"
+    assert events[2].model == MID_TIER_MODEL
 
 
 @pytest.mark.asyncio

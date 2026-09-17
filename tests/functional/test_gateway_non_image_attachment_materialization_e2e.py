@@ -35,11 +35,15 @@ from opensquilla.provider import ChatConfig, DoneEvent, Message, ModelCapabiliti
 from opensquilla.provider.types import (
     ContentBlockImage,
     ContentBlockText,
+    ContentBlockToolResult,
     ModelInfo,
     TextDeltaEvent,
+    ToolUseEndEvent,
+    ToolUseStartEvent,
 )
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
+from tests.helpers.image_bytes import image_bytes
 
 _TEXT_MODEL = "test/text"
 _GATE_MODEL = "test/gate"
@@ -47,12 +51,7 @@ _VISION_MODEL = "test/vision"
 _TURN_TERMINAL_EVENT_TIMEOUT_SECONDS = 30.0
 _TURN_TASK_DRAIN_TIMEOUT_SECONDS = 10.0
 
-_PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-    b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4"
-    b"\x89\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00\x01\x01"
-    b"\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+_PNG_BYTES = image_bytes()
 
 
 def _sample_pdf_bytes(text: str = "Machine Learning") -> bytes:
@@ -97,6 +96,7 @@ class _RecordingProvider:
     def __init__(self, text: str = "ok") -> None:
         self.text = text
         self.calls: list[dict[str, Any]] = []
+        self.read_file_paths: list[str] = []
 
     async def chat(
         self,
@@ -104,7 +104,22 @@ class _RecordingProvider:
         tools: list[Any] | None = None,
         config: ChatConfig | None = None,
     ) -> AsyncIterator[Any]:
-        self.calls.append({"messages": messages, "tools": tools, "config": config})
+        self.calls.append({
+            "messages": [message.model_copy(deep=True) for message in messages],
+            "tools": tools,
+            "config": config,
+        })
+        if self.read_file_paths:
+            assert "read_file" in {tool.name for tool in tools or []}
+            paths, self.read_file_paths = self.read_file_paths, []
+            for index, path in enumerate(paths):
+                tool_use_id = f"read-image-{index}"
+                yield ToolUseStartEvent(tool_use_id=tool_use_id, tool_name="read_file")
+                yield ToolUseEndEvent(
+                    tool_use_id=tool_use_id, tool_name="read_file", arguments={"path": path},
+                )
+            yield DoneEvent(stop_reason="tool_use", input_tokens=3, output_tokens=1)
+            return
         yield TextDeltaEvent(text=self.text)
         yield DoneEvent(stop_reason="end_turn", input_tokens=3, output_tokens=1)
 
@@ -133,6 +148,8 @@ class _RecordingSelector:
         self,
         model: str,
         fallback_chain: list[object],  # noqa: ARG002
+        *,
+        preserve_existing_tail: bool = True,  # noqa: ARG002
     ) -> None:
         self.override_model(model)
 
@@ -168,6 +185,9 @@ class _FakeModelCatalog:
         base_url: str = "",  # noqa: ARG002
     ) -> ModelCapabilities:
         return ModelCapabilities(supports_vision=model_id == _VISION_MODEL)
+
+    def resolve_deployment_vision_support(self, model_id: str, **_kwargs: Any) -> str:
+        return "supported" if model_id == _VISION_MODEL else "unsupported"
 
 
 class _EventSink:
@@ -230,16 +250,18 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
             "model": _TEXT_MODEL,
             "supports_image": False,
         },
-        "image_model": {
+        "c2": {
             "provider": "openrouter",
             "model": _VISION_MODEL,
             "supports_image": True,
-            "image_only": True,
         },
     }
     config.squilla_router.default_tier = "c1"
     config.llm.provider = "openrouter"
     config.llm.model = _TEXT_MODEL
+    # Synthetic model ids are absent from the production catalog. Declare the
+    # deployment contract exercised by this end-to-end fixture explicitly.
+    config.llm.context_window_tokens = 128_000
     return config
 
 
@@ -358,6 +380,10 @@ def _message_has_image(message: Message) -> bool:
 @pytest.fixture
 async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.ModelCatalog.resolve_deployment_vision_support",
+        _FakeModelCatalog.resolve_deployment_vision_support,
+    )
     monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _TextTierStrategy())
     config = _configure_gateway(tmp_path)
     store = UploadStore(marker_dir=tmp_path / "upload-markers")
@@ -370,9 +396,7 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         media_root=config.attachments.media_root,
     )
     text_provider = _RecordingProvider("text ok")
-    gate_provider = _RecordingProvider(
-        '{"decision":"needs_image","confidence":0.94,"reason":"visual detail"}'
-    )
+    gate_provider = _RecordingProvider("The retired image gate must not run.")
     vision_provider = _RecordingProvider("vision ok")
     selector = _RecordingSelector(
         {
@@ -441,6 +465,7 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         get_registry().unregister(sink.conn_id)
         set_upload_store(None)
         await storage.close()
+        assert gate_provider.calls == []
 
 
 @pytest.mark.asyncio
@@ -662,7 +687,7 @@ async def test_pdf_materialization_does_not_require_image_tier(
     _e2e_stack: dict[str, Any],
 ) -> None:
     config: GatewayConfig = _e2e_stack["config"]
-    config.squilla_router.tiers.pop("image_model", None)
+    config.squilla_router.tiers.pop("c2", None)
     manager: SessionManager = _e2e_stack["manager"]
     subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
     sink: _EventSink = _e2e_stack["sink"]
@@ -743,20 +768,32 @@ async def test_mixed_historical_image_and_pdf_followup_replays_image_and_materia
     sent_text = _all_provider_text(sent_messages)
     assert "historical attachment available: L11 RL.pdf (application/pdf" in sent_text
     done_events = _event_payloads(sink, "session.event.done")
-    assert done_events[-1]["image_route_reason"] == "gate_history"
-    assert done_events[-1]["vision_followup_needs_image"] is True
+    assert done_events[-1]["image_route_reason"] == "history_context"
+    assert done_events[-1].get("vision_followup_gate_decision") is None
 
 
 @pytest.mark.asyncio
-async def test_router_text_only_does_not_replay_image_but_keeps_pdf_path(
+@pytest.mark.parametrize("history_lookback", [0, 8])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "刚才那个 PDF 的 Machine Learning 文字需要遮住。",
+        "不要看之前的图片，只处理那个 PDF。",
+        "Ignore the earlier image and only discuss the PDF.",
+    ],
+)
+async def test_followup_wording_and_legacy_window_do_not_remove_active_images(
     _e2e_stack: dict[str, Any],
+    message: str,
+    history_lookback: int,
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
     subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
     sink: _EventSink = _e2e_stack["sink"]
-    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
     text_provider: _RecordingProvider = _e2e_stack["text_provider"]
     vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    config: GatewayConfig = _e2e_stack["config"]
+    config.squilla_router.vision_history_lookback_turns = history_lookback
     key = "agent:main:mixed-image-pdf-text-only"
     await manager.create(session_key=key, agent_id="main")
     subscription_manager.subscribe_messages(sink.conn_id, key)
@@ -785,9 +822,6 @@ async def test_router_text_only_does_not_replay_image_but_keeps_pdf_path(
     )
     await manager.append_message(key, "user", "中间普通文本。")
     await manager.append_message(key, "assistant", "普通回答。")
-    gate_provider.text = (
-        '{"decision":"text_only","confidence":0.91,"reason":"file edit only"}'
-    )
     text_calls_before = len(text_provider.calls)
     vision_calls_before = len(vision_provider.calls)
 
@@ -795,18 +829,92 @@ async def test_router_text_only_does_not_replay_image_but_keeps_pdf_path(
         ctx=_e2e_stack["ctx"],
         key=key,
         sink=sink,
-        message="刚才那个 PDF 的 Machine Learning 文字需要遮住。",
+        message=message,
     )
 
-    assert len(text_provider.calls) == text_calls_before + 1
-    assert len(vision_provider.calls) == vision_calls_before
-    sent_messages = text_provider.calls[-1]["messages"]
-    assert not any(_message_has_image(message) for message in sent_messages)
+    assert len(text_provider.calls) == text_calls_before
+    assert len(vision_provider.calls) == vision_calls_before + 1
+    sent_messages = vision_provider.calls[-1]["messages"]
+    assert any(_message_has_image(item) for item in sent_messages[:-1])
+    assert _message_text(sent_messages[-1]).startswith(message)
     sent_text = _all_provider_text(sent_messages)
     assert "historical attachment available: L11 RL.pdf (application/pdf" in sent_text
     done_events = _event_payloads(sink, "session.event.done")
-    assert done_events[-1]["vision_followup_gate_decision"] == "text_only"
-    assert done_events[-1]["vision_followup_needs_image"] is False
+    assert done_events[-1].get("image_route_reason") == "history_context"
+    assert done_events[-1].get("vision_followup_gate_decision") is None
+
+
+@pytest.mark.asyncio
+async def test_historical_upload_paths_read_images_through_gateway_tool_dispatch(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    from opensquilla.tools.registry import get_default_registry
+
+    manager: SessionManager = _e2e_stack["manager"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    config: GatewayConfig = _e2e_stack["config"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    runner._tool_registry = get_default_registry()
+    key = "agent:main:historical-image-path-read"
+    session = await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+    images = [
+        ("first.png", "image/png", _PNG_BYTES),
+        ("second.jpg", "image/jpeg", image_bytes("JPEG")),
+    ]
+    attachments: list[dict[str, Any]] = []
+    image_paths: list[str] = []
+    for name, mime, payload in images:
+        file_uuid = await _upload_file(_e2e_stack["app"], name=name, mime=mime, payload=payload)
+        attachments.append(_attachment(file_uuid, mime=mime, name=name))
+        image_paths.append(
+            f".opensquilla/attachments/{session.session_id}/{hashlib.sha256(payload).hexdigest()[:12]}-{name}"
+        )
+    pdf_uuid = await _upload_file(
+        _e2e_stack["app"], name="document.pdf", mime="application/pdf", payload=_sample_pdf_bytes(),
+    )
+    attachments.append(_attachment(pdf_uuid, mime="application/pdf", name="document.pdf"))
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"], key=key, sink=sink,
+        message="Keep these two images and the document available.", attachments=attachments,
+    )
+
+    calls_before = len(vision_provider.calls)
+    vision_provider.read_file_paths = image_paths
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"], key=key, sink=sink,
+        message="Open both retained image files and compare them.",
+    )
+
+    assert len(vision_provider.calls) == calls_before + 2
+    request_before_read = vision_provider.calls[-2]["messages"]
+    for path, (_name, _mime, payload) in zip(image_paths, images, strict=True):
+        assert path in _all_provider_text(request_before_read)
+        assert (Path(config.workspace_dir or "") / path).read_bytes() == payload
+    request_after_read = vision_provider.calls[-1]["messages"]
+    tool_result_message = next(
+        message for message in reversed(request_after_read)
+        if isinstance(message.content, list)
+        and any(isinstance(block, ContentBlockToolResult) for block in message.content)
+    )
+    results = [
+        block for block in tool_result_message.content
+        if isinstance(block, ContentBlockToolResult)
+    ]
+    assert len(results) == 2
+    assert all(not result.is_error and "Loaded image" in result.content for result in results)
+    loaded_images = [
+        block for block in tool_result_message.content if isinstance(block, ContentBlockImage)
+    ]
+    assert [(block.media_type, base64.b64decode(block.data)) for block in loaded_images] == [
+        (mime, payload) for _name, mime, payload in images
+    ]
+    assert "historical attachment available: document.pdf (application/pdf" in (
+        _all_provider_text(request_after_read)
+    )
+    assert not _event_payloads(sink, "session.event.error")
 
 
 @pytest.mark.asyncio

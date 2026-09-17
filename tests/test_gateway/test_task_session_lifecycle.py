@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -9,29 +11,41 @@ import pytest
 
 from opensquilla.gateway.boot import _make_task_session_lifecycle_listener
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+from opensquilla.gateway.rpc_sessions import _active_task_summary
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_lifecycle import (
+    SessionTaskSnapshot,
     TaskLifecycleEvent,
     apply_task_lifecycle_to_session,
     session_status_for_task_status,
 )
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
+    SessionIntent,
     SessionNode,
     SessionStatus,
 )
+from opensquilla.session.storage import SessionStorage
 
 
-def _make_envelope(session_key: str = "agent-1::sess-1") -> RouteEnvelope:
+def _make_envelope(
+    session_key: str = "agent-1::sess-1",
+    *,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
+) -> RouteEnvelope:
     return RouteEnvelope(
         source_kind=SourceKind.WEB,
         source_name="test",
         agent_id="agent-1",
         session_key=session_key,
+        session_id=session_id,
         input_provenance={"kind": "test"},
         metadata={},
+        session_epoch=session_epoch,
     )
 
 
@@ -39,7 +53,18 @@ def _make_task_storage() -> Any:
     storage = MagicMock()
     task_db: dict[str, AgentTaskRecord] = {}
 
-    async def create(record: AgentTaskRecord) -> None:
+    async def create(
+        record: AgentTaskRecord,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> None:
+        if expected_session_id is not None:
+            assert record.details is not None
+            assert record.details["session_id"] == expected_session_id
+        if expected_session_epoch is not None:
+            assert record.details is not None
+            assert record.details["session_epoch"] == expected_session_epoch
         task_db[record.task_id] = record
 
     async def update(task_id: str, **kwargs: Any) -> None:
@@ -65,14 +90,47 @@ class _SessionManager:
         self.finish_calls: list[tuple[str, str]] = []
         self.update_calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def get_session(self, session_key: str) -> SessionNode | None:
+    async def get_session(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> SessionNode | None:
         if session_key == self.node.session_key:
+            if (
+                expected_session_id is not None
+                and self.node.session_id != expected_session_id
+            ):
+                return None
+            if (
+                expected_session_epoch is not None
+                and self.node.epoch != expected_session_epoch
+            ):
+                return None
             return self.node
         return None
 
-    async def update(self, session_key: str, **fields: Any) -> SessionNode:
+    async def update(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **fields: Any,
+    ) -> SessionNode:
         if session_key != self.node.session_key:
             raise KeyError(session_key)
+        if (
+            expected_session_id is not None
+            and self.node.session_id != expected_session_id
+        ):
+            raise KeyError(expected_session_id)
+        if (
+            expected_session_epoch is not None
+            and self.node.epoch != expected_session_epoch
+        ):
+            raise KeyError(expected_session_epoch)
         self.update_calls.append((session_key, dict(fields)))
         for key, value in fields.items():
             if hasattr(self.node, key):
@@ -112,6 +170,36 @@ def test_sessions_changed_payload_has_shared_schema_fields() -> None:
         "reason": "turn_complete",
         "run_status": "idle",
     }
+
+
+def test_live_snapshot_matches_running_first_hydration_projection() -> None:
+    session_key = "agent-1::sess-1"
+    snapshot = SessionTaskSnapshot(
+        running_task_id="task-running",
+        queued_task_ids=("task-newer-queued",),
+    )
+    hydrated = _active_task_summary(
+        [
+            AgentTaskRecord(
+                task_id="task-running",
+                session_key=session_key,
+                status=AgentTaskStatus.RUNNING,
+                created_at=1000,
+            ),
+            AgentTaskRecord(
+                task_id="task-newer-queued",
+                session_key=session_key,
+                status=AgentTaskStatus.QUEUED,
+                created_at=2000,
+            ),
+        ]
+    )
+
+    assert hydrated is not None
+    assert {
+        "task_id": hydrated["task_id"],
+        "status": hydrated["status"],
+    } == snapshot.active_task
 
 
 def _make_runtime(
@@ -251,6 +339,69 @@ def test_task_terminal_status_mapping_matches_session_lifecycle() -> None:
     assert session_status_for_task_status(AgentTaskStatus.RUNNING) is None
 
 
+def test_task_lifecycle_event_preserves_legacy_positional_layout() -> None:
+    event = TaskLifecycleEvent(
+        "terminal",
+        "agent:main:legacy",
+        "task-legacy",
+        AgentTaskStatus.TIMEOUT,
+        "default",
+        "timeout",
+    )
+
+    assert event.terminal_reason == "timeout"
+    assert event.session_id is None
+    assert event.session_epoch is None
+
+
+@pytest.mark.asyncio
+async def test_modern_lifecycle_owner_rejects_kwargs_only_manager_proxy() -> None:
+    replacement = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(replacement)
+
+    class _DroppingProxy:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def get_session(self, *args: Any, **_kwargs: Any) -> SessionNode | None:
+            self.calls.append("get")
+            return await manager.get_session(args[0])
+
+        async def update(self, *args: Any, **kwargs: Any) -> SessionNode:
+            self.calls.append("update")
+            fields = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"expected_session_id", "expected_session_epoch"}
+            }
+            return await manager.update(args[0], **fields)
+
+    proxy = _DroppingProxy()
+
+    changed = await apply_task_lifecycle_to_session(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=replacement.session_key,
+            task_id="task-retired-owner",
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="default",
+            terminal_reason="completed",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=(),
+            ),
+            session_id="retired-session-id",
+            session_epoch=0,
+        ),
+        session_manager=proxy,
+    )
+
+    assert changed is False
+    assert proxy.calls == []
+    assert replacement.status == SessionStatus.RUNNING
+    assert manager.update_calls == []
+
+
 @pytest.mark.asyncio
 async def test_terminal_lifecycle_is_idempotent_for_already_terminal_session() -> None:
     session = _make_session(status=SessionStatus.TIMEOUT)
@@ -303,6 +454,219 @@ async def test_boot_lifecycle_listener_skips_subagent_tasks() -> None:
     assert session.status == SessionStatus.RUNNING
 
 
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        pytest.param(None, id="snapshot-unavailable"),
+        pytest.param(
+            SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=("task-owner",),
+            ),
+            id="snapshot-available",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_lifecycle_change_keeps_admitted_owner_for_epoch_filter(
+    snapshot: SessionTaskSnapshot | None,
+) -> None:
+    session = _make_session()
+    session.epoch = 7
+    admitted_session_id = session.session_id
+    admitted_epoch = session.epoch
+
+    class _ResetAfterUpdateManager(_SessionManager):
+        async def update(
+            self,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **fields: Any,
+        ) -> SessionNode:
+            node = await super().update(
+                session_key,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                **fields,
+            )
+            # Deterministically model B resetting the key after A's fenced
+            # update commits but before A's listener builds its broadcast.
+            self.node.session_id = "replacement-session-id"
+            self.node.epoch = admitted_epoch + 1
+            return node
+
+    manager = _ResetAfterUpdateManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(
+        session_key: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="queued",
+            session_key=session.session_key,
+            task_id="task-owner",
+            task_status=AgentTaskStatus.QUEUED,
+            run_kind="default",
+            task_snapshot=snapshot,
+            session_id=admitted_session_id,
+            session_epoch=admitted_epoch,
+        )
+    )
+
+    assert len(events) == 1
+    assert manager.node.session_id == "replacement-session-id"
+    assert manager.node.epoch == 8
+    assert events[0][2]["session_id"] == admitted_session_id
+    assert events[0][2]["epoch"] == admitted_epoch
+
+
+@pytest.mark.asyncio
+async def test_terminal_projection_waits_for_authoritative_task_persistence() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-terminal-write-failed",
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="goal",
+            terminal_reason="completed",
+            terminal_persisted=False,
+        )
+    )
+
+    assert manager.finish_calls == []
+    assert manager.update_calls == []
+    assert events == []
+    assert session.status == SessionStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_terminal_handoff_keeps_session_queued_without_idle_projection() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-old",
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="default",
+            terminal_reason="completed",
+            continuation_task_id="task-next",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=("task-next",),
+            ),
+        )
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert session.ended_at is None
+    assert session.runtime_ms is None
+    assert manager.update_calls == [
+        (
+            session.session_key,
+            {
+                "status": SessionStatus.RUNNING,
+                "ended_at": None,
+                "runtime_ms": None,
+            },
+        )
+    ]
+    assert events == [
+        (
+            session.session_key,
+            "sessions.changed",
+            {
+                "schema_version": 1,
+                "key": session.session_key,
+                "reason": "task_terminal",
+                "status": "running",
+                "run_status": "queued",
+                "last_task": {
+                    "task_id": "task-old",
+                    "status": "succeeded",
+                    "terminal_reason": "completed",
+                },
+                "active_task": {"task_id": "task-next", "status": "queued"},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_durable_continuation_projects_queued_when_not_runtime_active() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-old",
+            task_status=AgentTaskStatus.ABANDONED,
+            run_kind="default",
+            terminal_reason="shutdown_timeout",
+            continuation_task_id="task-durable-next",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=(),
+            ),
+        )
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert events[0][2]["status"] == "running"
+    assert events[0][2]["run_status"] == "queued"
+    assert events[0][2]["active_task"] == {
+        "task_id": "task-durable-next",
+        "status": "queued",
+    }
+    assert events[0][2]["run_status"] == "queued"
+
+
 @pytest.mark.asyncio
 async def test_task_running_broadcasts_change_for_already_running_session() -> None:
     session = _make_session(status=SessionStatus.RUNNING)
@@ -324,6 +688,10 @@ async def test_task_running_broadcasts_change_for_already_running_session() -> N
             task_id="task-active",
             task_status=AgentTaskStatus.RUNNING,
             run_kind="default",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id="task-active",
+                queued_task_ids=(),
+            ),
         )
     )
 
@@ -364,6 +732,10 @@ async def test_task_queued_broadcasts_change_for_waiting_session() -> None:
             task_id="task-waiting",
             task_status=AgentTaskStatus.QUEUED,
             run_kind="default",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=("task-waiting",),
+            ),
         )
     )
 
@@ -381,6 +753,285 @@ async def test_task_queued_broadcasts_change_for_waiting_session() -> None:
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_running_task_wins_when_followup_queues_and_terminal_hands_off() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    release_second = asyncio.Event()
+    run_count = 0
+
+    async def _controlled_handler(_run: Any) -> None:
+        nonlocal run_count
+        run_count += 1
+        if run_count == 1:
+            first_started.set()
+            await release_first.wait()
+            return
+        second_started.set()
+        await release_second.wait()
+
+    runtime = _make_runtime(
+        _controlled_handler,
+        session_manager=manager,
+        events=events,
+    )
+    first = await runtime.enqueue(_make_envelope(), "first")
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+
+    # Cancellation intent must not let a queued follower take foreground
+    # ownership before the running task reaches its terminal boundary.
+    async with runtime._state_lock:
+        runtime._tasks[first.task_id].cancel_requested = True
+    snapshot = await runtime.session_task_snapshot(session.session_key)
+    assert snapshot.running_task_id == first.task_id
+    assert snapshot.cancel_requested_task_ids == (first.task_id,)
+    async with runtime._state_lock:
+        runtime._tasks[first.task_id].cancel_requested = False
+
+    second = await runtime.enqueue(_make_envelope(), "second")
+    snapshot = await runtime.session_task_snapshot(session.session_key)
+    assert snapshot == SessionTaskSnapshot(
+        running_task_id=first.task_id,
+        queued_task_ids=(second.task_id,),
+    )
+
+    second_queued_change = next(
+        payload
+        for _, event_name, payload in events
+        if event_name == "sessions.changed"
+        and payload.get("reason") == "task_queued"
+        and payload.get("changed_task", {}).get("task_id") == second.task_id
+    )
+    assert second_queued_change["run_status"] == "running"
+    assert second_queued_change["active_task"] == {
+        "task_id": first.task_id,
+        "status": "running",
+    }
+    assert second_queued_change["changed_task"] == {
+        "task_id": second.task_id,
+        "status": "queued",
+    }
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=2.0)
+
+    first_terminal_change = next(
+        payload
+        for _, event_name, payload in events
+        if event_name == "sessions.changed"
+        and payload.get("reason") == "task_terminal"
+        and payload.get("last_task", {}).get("task_id") == first.task_id
+    )
+    assert first_terminal_change["status"] == "running"
+    assert first_terminal_change["run_status"] == "queued"
+    assert first_terminal_change["active_task"] == {
+        "task_id": second.task_id,
+        "status": "queued",
+    }
+
+    # A delayed terminal callback is projected against current state. Once B
+    # is running it must not regress to queued merely because A's callback is
+    # delivered again.
+    await runtime._notify_task_lifecycle(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id=first.task_id,
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="default",
+            terminal_reason="completed",
+        )
+    )
+    delayed_terminal_change = events[-1][2]
+    assert delayed_terminal_change["run_status"] == "running"
+    assert delayed_terminal_change["active_task"] == {
+        "task_id": second.task_id,
+        "status": "running",
+    }
+
+    release_second.set()
+    await runtime.wait(first.task_id, timeout=2.0)
+    await runtime.wait(second.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_delayed_queued_callback_uses_current_running_snapshot() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _controlled_handler(_run: Any) -> None:
+        started.set()
+        await release.wait()
+
+    runtime = _make_runtime(
+        _controlled_handler,
+        session_manager=manager,
+        events=events,
+    )
+    handle = await runtime.enqueue(_make_envelope(), "hello")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    await runtime._notify_task_lifecycle(
+        TaskLifecycleEvent(
+            phase="queued",
+            session_key=session.session_key,
+            task_id=handle.task_id,
+            task_status=AgentTaskStatus.QUEUED,
+            run_kind="default",
+        )
+    )
+
+    assert events[-1] == (
+        session.session_key,
+        "sessions.changed",
+        {
+            "schema_version": 1,
+            "key": session.session_key,
+            "reason": "task_queued",
+            "run_status": "running",
+            "active_task": {"task_id": handle.task_id, "status": "running"},
+        },
+    )
+
+    release.set()
+    await runtime.wait(handle.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_delayed_queued_callback_cannot_resurrect_terminal_task() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="queued",
+            session_key=session.session_key,
+            task_id="task-already-terminal",
+            task_status=AgentTaskStatus.QUEUED,
+            run_kind="default",
+            task_snapshot=SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=(),
+            ),
+        )
+    )
+
+    assert manager.update_calls == [(session.session_key, {})]
+    assert events == [
+        (
+            session.session_key,
+            "sessions.changed",
+            {
+                "schema_version": 1,
+                "key": session.session_key,
+                "reason": "task_queued",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_projection_fails_safe_when_runtime_snapshot_fails() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    async def _handler(_run: Any) -> None:
+        return None
+
+    async def _snapshot_failure(*_args: Any, **_kwargs: Any) -> SessionTaskSnapshot:
+        raise RuntimeError("snapshot unavailable")
+
+    runtime = TaskRuntime(
+        storage=_make_task_storage(),
+        turn_handler=_handler,
+        event_emitter=_emit,
+        lifecycle_listener=_make_task_session_lifecycle_listener(
+            session_manager=manager,
+            event_emitter=_emit,
+        ),
+    )
+    runtime.session_task_snapshot = _snapshot_failure  # type: ignore[method-assign]
+
+    await runtime._notify_task_lifecycle(
+        TaskLifecycleEvent(
+            phase="queued",
+            session_key=session.session_key,
+            task_id="task-changed",
+            task_status=AgentTaskStatus.QUEUED,
+            run_kind="default",
+        )
+    )
+
+    assert manager.update_calls == [(session.session_key, {})]
+    assert events == [
+        (
+            session.session_key,
+            "sessions.changed",
+            {
+                "schema_version": 1,
+                "key": session.session_key,
+                "reason": "task_queued",
+                "changed_task": {"task_id": "task-changed", "status": "queued"},
+            },
+        )
+    ]
+
+    # A can reach its terminal callback after B has acquired the same-session
+    # execution lock.  If the state-locked snapshot fails here, A's terminal
+    # status must not overwrite B's still-running session lifecycle.
+    await runtime._notify_task_lifecycle(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-old-running-owner",
+            task_status=AgentTaskStatus.CANCELLED,
+            run_kind="default",
+            terminal_reason="cancelled",
+        )
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert manager.update_calls == [
+        (session.session_key, {}),
+        (session.session_key, {}),
+    ]
+    assert events[-1] == (
+        session.session_key,
+        "sessions.changed",
+        {
+            "schema_version": 1,
+            "key": session.session_key,
+            "reason": "task_terminal",
+            "changed_task": {
+                "task_id": "task-old-running-owner",
+                "status": "cancelled",
+                "terminal_reason": "cancelled",
+                "terminal_message": "The task was cancelled before it finished.",
+            },
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -525,3 +1176,150 @@ async def test_task_runtime_persists_agent_task_timestamps_as_epoch_ms() -> None
     assert before_ms <= record.started_at <= after_ms
     assert before_ms <= record.finished_at <= after_ms
     assert record.finished_at >= record.started_at
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_lifecycle_events_keep_admitted_session_owner() -> None:
+    captured: list[TaskLifecycleEvent] = []
+
+    async def _success_handler(_run: Any) -> None:
+        return None
+
+    async def _capture(event: TaskLifecycleEvent) -> None:
+        captured.append(event)
+
+    runtime = TaskRuntime(
+        storage=_make_task_storage(),
+        turn_handler=_success_handler,
+        lifecycle_listener=_capture,
+    )
+    handle = await runtime.enqueue(
+        _make_envelope(
+            session_id="admitted-session-id",
+            session_epoch=7,
+        ),
+        "hello",
+    )
+
+    await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert [event.phase for event in captured] == ["queued", "running", "terminal"]
+    assert {
+        (event.session_id, event.session_epoch)
+        for event in captured
+    } == {("admitted-session-id", 7)}
+
+
+@pytest.mark.parametrize("include_epoch", [True, False], ids=["exact-owner", "id-only"])
+@pytest.mark.parametrize(
+    ("phase", "task_status", "snapshot", "replacement_status"),
+    [
+        pytest.param(
+            "queued",
+            AgentTaskStatus.QUEUED,
+            SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=("task-a",),
+            ),
+            SessionStatus.TIMEOUT,
+            id="queued",
+        ),
+        pytest.param(
+            "running",
+            AgentTaskStatus.RUNNING,
+            SessionTaskSnapshot(
+                running_task_id="task-a",
+                queued_task_ids=(),
+            ),
+            SessionStatus.TIMEOUT,
+            id="running",
+        ),
+        pytest.param(
+            "terminal",
+            AgentTaskStatus.SUCCEEDED,
+            SessionTaskSnapshot(
+                running_task_id=None,
+                queued_task_ids=(),
+            ),
+            SessionStatus.RUNNING,
+            id="terminal",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stale_lifecycle_event_cannot_touch_same_key_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_epoch: bool,
+    phase: str,
+    task_status: AgentTaskStatus,
+    snapshot: SessionTaskSnapshot,
+    replacement_status: SessionStatus,
+) -> None:
+    db_path = tmp_path / f"lifecycle-owner-{phase}-{include_epoch}.db"
+    process_a_storage = SessionStorage(str(db_path))
+    process_b_storage = SessionStorage(str(db_path))
+    await process_a_storage.connect()
+    await process_b_storage.connect()
+    process_a = SessionManager(process_a_storage, inject_time_prefix=False)
+    process_b = SessionManager(process_b_storage, inject_time_prefix=False)
+    session_key = "agent:main:lifecycle-owner-race"
+    monkeypatch.setenv(
+        "OPENSQUILLA_SESSION_ARCHIVE_DIR",
+        str(tmp_path / "archives"),
+    )
+    admitted = await process_a.create(session_key)
+    event = TaskLifecycleEvent(
+        phase=phase,  # type: ignore[arg-type]
+        session_key=session_key,
+        session_id=admitted.session_id,
+        session_epoch=int(admitted.epoch or 0) if include_epoch else None,
+        task_id="task-a",
+        task_status=task_status,
+        run_kind="default",
+        terminal_reason="completed" if phase == "terminal" else None,
+        task_snapshot=snapshot,
+    )
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(
+        key: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        events.append((key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=process_a,
+        event_emitter=_emit,
+    )
+    try:
+        replacement, rotated = await process_b.apply_intent(
+            session_key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await process_b.update(
+            session_key,
+            status=replacement_status,
+            ended_at=2_000 if replacement_status != SessionStatus.RUNNING else None,
+            runtime_ms=1_000 if replacement_status != SessionStatus.RUNNING else None,
+        )
+        await process_b_storage.conn.execute(
+            "UPDATE sessions SET updated_at = 1 WHERE session_key = ?",
+            (session_key,),
+        )
+        await process_b_storage.conn.commit()
+        before = await process_b.get_session(session_key)
+        assert before is not None
+
+        await listener(event)
+
+        after = await process_b.get_session(session_key)
+        assert after is not None
+        assert after.model_dump() == before.model_dump()
+        assert after.session_id == replacement.session_id
+        assert events == []
+    finally:
+        await process_b_storage.close()
+        await process_a_storage.close()

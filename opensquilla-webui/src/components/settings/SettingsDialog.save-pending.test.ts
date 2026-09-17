@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, reactive, ref, type App } from 'vue'
+import { createPinia } from 'pinia'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import SettingsDialog from './SettingsDialog.vue'
 
@@ -10,10 +11,12 @@ let routerMock: Record<string, any>
 let confirmState: ReturnType<typeof ref<boolean>>
 let leaveGuard: ((to: { path: string }) => boolean | Promise<boolean>) | null
 const confirmAction = vi.fn()
+const confirmChoiceAction = vi.fn()
 
 vi.mock('@/composables/setup/useSetupCatalog', () => ({
   SETTINGS_SECTIONS: [
-    { id: 'behavior', label: 'Behavior', icon: 'chat', group: 'preferences' },
+    { id: 'general', label: 'General', icon: 'settings', client: false, group: 'preferences' },
+    { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, group: 'ai' },
   ],
   useSetupCatalog: () => catalogApi,
 }))
@@ -24,24 +27,35 @@ vi.mock('vue-router', () => ({
 }))
 
 vi.mock('@/composables/useConfirm', () => ({
-  useConfirm: () => ({ confirm: confirmAction, confirmState }),
+  useConfirm: () => ({ confirm: confirmAction, confirmChoice: confirmChoiceAction, confirmState }),
 }))
 
-vi.mock('@/platform', () => ({
-  usePlatform: () => ({
+vi.mock('@/platform', () => {
+  const platform = {
+    id: 'web',
     capabilities: { isDesktop: false, hasTerminalWorkflow: false },
-  }),
-}))
+    gateway: {},
+    files: {},
+    workbench: { native: {} },
+    getOsLocale: vi.fn(async () => 'en'),
+    setNativeTheme: vi.fn(async () => undefined),
+  }
+  return {
+    getPlatform: () => platform,
+    usePlatform: () => platform,
+  }
+})
 
 let app: App<Element> | null = null
 
 function mockCatalog() {
-  const section = ref('behavior')
+  const section = ref('general')
   const saveAllPending = ref(true)
   const providerSavePending = ref(false)
   const providerDraftDirty = ref(false)
   const hasUnsavedChanges = ref(true)
   const saveDirtySections = vi.fn()
+  const saveProvider = vi.fn(async () => true)
   const discardChanges = vi.fn()
   const setAutoSessionTitles = vi.fn()
   const noop = vi.fn()
@@ -56,8 +70,8 @@ function mockCatalog() {
       statusText: 'Automatic titles are off.',
     }),
     privacyPanel: ref({}),
+    memoryPanel: ref({ autoCapture: true }),
     modelStrategyPanel: ref({}),
-    presetPanel: ref(null),
     channelsPanel: ref({}),
     capabilitiesPanel: ref({}),
     hasSetupAction: ref(false),
@@ -71,11 +85,12 @@ function mockCatalog() {
     sectionStatus: () => ({ label: 'Ready', tone: 'is-ok' }),
     sectionDirty: () => true,
     providerDraftDirty,
-    dirtySections: ref([{ id: 'behavior', label: 'Behavior' }]),
+    dirtySections: ref([{ id: 'general', label: 'General' }]),
     hasUnsavedChanges,
     saveAllPending,
     providerSavePending,
     saveDirtySections,
+    saveProvider,
     discardChanges,
     setAutoSessionTitles,
     copyCommand: noop,
@@ -93,6 +108,7 @@ function mockCatalog() {
     providerDraftDirty,
     hasUnsavedChanges,
     saveDirtySections,
+    saveProvider,
     discardChanges,
     setAutoSessionTitles,
   }
@@ -103,6 +119,7 @@ async function mountDialog() {
   document.body.appendChild(el)
   app = createApp(SettingsDialog)
   app.use(i18n)
+  app.use(createPinia())
   app.mount(el)
   await nextTick()
   await nextTick()
@@ -114,11 +131,13 @@ beforeEach(() => {
   confirmState = ref(false)
   confirmAction.mockReset()
   confirmAction.mockResolvedValue(true)
+  confirmChoiceAction.mockReset()
+  confirmChoiceAction.mockResolvedValue('primary')
   leaveGuard = null
   routeState = reactive({
-    params: { section: 'behavior' },
+    params: { section: 'general' },
     hash: '',
-    path: '/settings/behavior',
+    path: '/settings/general',
   })
   routerMock = {
     options: { history: { state: { back: '/sessions' } } },
@@ -154,6 +173,19 @@ afterEach(() => {
 })
 
 describe('SettingsDialog save-all pending state', () => {
+  it('shows local section feedback instead of a blank loading pane', async () => {
+    mockCatalog()
+    catalogApi.loaded.value = false
+    catalogApi.section.value = 'capabilities'
+    routeState.params.section = 'capabilities'
+
+    const el = await mountDialog()
+    const loading = el.querySelector<HTMLElement>('.settings-loading')
+
+    expect(loading?.textContent).toContain('Capabilities')
+    expect(loading?.getAttribute('role')).toBe('status')
+  })
+
   it('locks settings edits and dirty-bar actions while showing progress', async () => {
     const controls = mockCatalog()
     const el = await mountDialog()
@@ -183,6 +215,7 @@ describe('SettingsDialog save-all pending state', () => {
     expect(controls.saveDirtySections).not.toHaveBeenCalled()
     expect(controls.discardChanges).not.toHaveBeenCalled()
     expect(confirmAction).not.toHaveBeenCalled()
+    expect(confirmChoiceAction).not.toHaveBeenCalled()
 
     controls.saveAllPending.value = false
     await nextTick()
@@ -256,7 +289,7 @@ describe('SettingsDialog exit protection', () => {
     controls.hasUnsavedChanges.value = false
     controls.providerDraftDirty.value = true
     catalogApi.dirtySections.value = []
-    confirmAction.mockResolvedValue(false)
+    confirmChoiceAction.mockResolvedValue('cancel')
 
     const el = await mountDialog()
 
@@ -265,20 +298,66 @@ describe('SettingsDialog exit protection', () => {
 
     const internalResult = await leaveGuard!({ path: '/settings/modelStrategy' })
     expect(internalResult).toBe(true)
-    expect(confirmAction).not.toHaveBeenCalled()
+    expect(confirmChoiceAction).not.toHaveBeenCalled()
 
     const externalResult = await leaveGuard!({ path: '/sessions' })
     expect(externalResult).toBe(false)
-    expect(confirmAction).toHaveBeenCalledOnce()
+    expect(confirmChoiceAction).toHaveBeenCalledOnce()
 
-    confirmAction.mockClear()
+    confirmChoiceAction.mockClear()
     el.querySelector<HTMLButtonElement>('.settings-modal__head button')?.click()
     await nextTick()
     await Promise.resolve()
 
-    expect(confirmAction).toHaveBeenCalledOnce()
+    expect(confirmChoiceAction).toHaveBeenCalledOnce()
     expect(el.querySelector('.settings-modal')).toBeTruthy()
     expect(routerMock.push).not.toHaveBeenCalled()
+  })
+
+  it('saves unsaved settings before closing when Save and close is chosen', async () => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.saveDirtySections.mockImplementation(() => {
+      controls.hasUnsavedChanges.value = false
+    })
+    catalogApi.dirtySections.value = []
+    confirmChoiceAction.mockResolvedValue('primary')
+
+    const el = await mountDialog()
+    el.querySelector<HTMLButtonElement>('.settings-modal__head button')?.click()
+    await nextTick()
+    await Promise.resolve()
+    await nextTick()
+
+    expect(confirmChoiceAction).toHaveBeenCalledWith(expect.objectContaining({
+      primaryLabel: 'Save and close',
+      secondaryLabel: 'Discard changes',
+      showCancel: false,
+    }))
+    expect(controls.saveDirtySections).toHaveBeenCalledOnce()
+    expect(el.querySelector('.settings-modal')).toBeTruthy()
+  })
+
+  it('uses the provider save path before closing a provider-only draft', async () => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    controls.providerDraftDirty.value = true
+    controls.saveProvider.mockImplementation(async () => {
+      controls.providerDraftDirty.value = false
+      return true
+    })
+    catalogApi.dirtySections.value = []
+    confirmChoiceAction.mockResolvedValue('primary')
+
+    const el = await mountDialog()
+    el.querySelector<HTMLButtonElement>('.settings-modal__head button')?.click()
+    await nextTick()
+    await Promise.resolve()
+    await nextTick()
+
+    expect(controls.saveProvider).toHaveBeenCalledOnce()
+    expect(controls.saveDirtySections).not.toHaveBeenCalled()
   })
 
   it('blocks external exit while a provider save is pending', async () => {
@@ -294,6 +373,7 @@ describe('SettingsDialog exit protection', () => {
     expect(close?.disabled).toBe(true)
     expect(await leaveGuard!({ path: '/sessions' })).toBe(false)
     expect(confirmAction).not.toHaveBeenCalled()
+    expect(confirmChoiceAction).not.toHaveBeenCalled()
     expect(await leaveGuard!({ path: '/settings/provider' })).toBe(true)
 
     const unloadEvent = new Event('beforeunload', { cancelable: true })

@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
 from opensquilla.sandbox.backend.linux_payload import HelperPayload
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 
 
 async def run_filesystem_payload(payload: HelperPayload) -> dict[str, Any]:
@@ -22,10 +22,10 @@ async def run_filesystem_payload(payload: HelperPayload) -> dict[str, Any]:
         encoding="utf-8",
     )
     proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "opensquilla.sandbox.filesystem_worker",
-        str(worker_payload_path),
+        *internal_child_argv(
+            ChildRole.FILESYSTEM_WORKER,
+            args=(str(worker_payload_path),),
+        ),
         cwd=Path(payload.cwd),
         env={**os.environ, **payload.env},
         stdout=asyncio.subprocess.PIPE,

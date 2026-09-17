@@ -639,10 +639,12 @@ def test_profile_adds_ambient_tmp_write_only_once_from_shared_profile(
 
     rendered = render_seatbelt_profile(_request(policy, tmp_path))
 
+    canonical_tmp = Path("/tmp").resolve(strict=False)
     tmp_write_rules = [
         line
         for line in rendered.splitlines()
-        if line.startswith("(allow file-write*") and '(subpath "/tmp")' in line
+        if line.startswith("(allow file-write*")
+        and f'(subpath "{canonical_tmp}")' in line
     ]
     assert len(tmp_write_rules) == 1
 
@@ -1031,19 +1033,30 @@ def test_filesystem_worker_runtime_roots_cover_python_and_import_closure(
 ) -> None:
     venv = tmp_path / "venv"
     base_prefix = tmp_path / "python"
+    base_alias = tmp_path / "python-current"
     python_dir = venv / "bin"
+    base_bin = base_prefix / "bin"
     stdlib = tmp_path / "python" / "lib" / "stdlib"
     purelib = venv / "site-packages"
     package = tmp_path / "checkout" / "src" / "opensquilla"
     source = package.parent
-    for root in (python_dir, base_prefix, stdlib, purelib, package):
+    for root in (python_dir, base_bin, stdlib, purelib, package):
         root.mkdir(parents=True, exist_ok=True)
+    base_alias.symlink_to(base_prefix, target_is_directory=True)
+    base_executable = base_alias / "bin" / "python"
+    (base_prefix / "bin" / "python").touch()
     (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
     executable = python_dir / "python"
     executable.touch()
     monkeypatch.setattr(seatbelt_mod, "_python_executable", lambda: executable)
     monkeypatch.setattr(seatbelt_mod.sys, "prefix", str(venv))
     monkeypatch.setattr(seatbelt_mod.sys, "base_prefix", str(base_prefix))
+    monkeypatch.setattr(
+        seatbelt_mod.sys,
+        "_base_executable",
+        str(base_executable),
+        raising=False,
+    )
     monkeypatch.setattr(
         seatbelt_mod,
         "sysconfig",
@@ -1068,12 +1081,13 @@ def test_filesystem_worker_runtime_roots_cover_python_and_import_closure(
     assert roots == (
         python_dir.resolve(),
         venv.resolve(),
+        base_alias.absolute(),
+        base_prefix.resolve(),
         stdlib.resolve(),
         purelib.resolve(),
         package.resolve(),
         source.resolve(),
     )
-    assert base_prefix.resolve() not in roots
     assert Path("/") not in roots
     assert len(roots) == len(set(roots))
 
@@ -1085,7 +1099,6 @@ def test_filesystem_worker_argv_uses_python_module_outside_frozen_runtime(
 
     assert seatbelt_mod._filesystem_worker_argv() == (
         str(seatbelt_mod._python_executable()),
-        "-B",
         "-m",
         "opensquilla.sandbox.filesystem_worker",
         "-",
@@ -1099,7 +1112,9 @@ def test_filesystem_worker_argv_uses_internal_entrypoint_when_frozen(
 
     assert seatbelt_mod._filesystem_worker_argv() == (
         str(seatbelt_mod._python_executable()),
-        "--_sandbox-filesystem-worker",
+        "--internal-child",
+        "filesystem-worker",
+        "-",
     )
 
 
@@ -1165,8 +1180,8 @@ async def test_run_filters_env_and_returns_nonzero_without_raise(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        seatbelt_mod.asyncio,
-        "create_subprocess_exec",
+        seatbelt_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
@@ -1214,8 +1229,8 @@ async def test_run_injects_proxy_env_for_proxy_allowlist(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        seatbelt_mod.asyncio,
-        "create_subprocess_exec",
+        seatbelt_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
@@ -1274,8 +1289,8 @@ async def test_run_timeout_returns_timed_out_result(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        seatbelt_mod.asyncio,
-        "create_subprocess_exec",
+        seatbelt_mod,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(seatbelt_mod.os, "killpg", lambda pid, sig: None)
@@ -1284,6 +1299,56 @@ async def test_run_timeout_returns_timed_out_result(
 
     assert result.timed_out is True
     assert result.returncode == -15
+
+
+@pytest.mark.asyncio
+async def test_run_caller_cancel_terminates_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    terminated: list[int] = []
+
+    class FakeProcess:
+        pid = 12346
+        returncode = None
+        stdout = None
+        stderr = None
+
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            started.set()
+            await asyncio.Event().wait()
+
+    async def fake_create_subprocess_exec(*argv: str, **kwargs: object) -> FakeProcess:
+        assert "start_new_session" not in kwargs
+        return FakeProcess()
+
+    async def fake_terminate(proc: FakeProcess) -> tuple[bytes, bytes]:
+        terminated.append(proc.pid)
+        return b"", b""
+
+    monkeypatch.setattr(seatbelt_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        seatbelt_mod,
+        "_sandbox_exec_binary",
+        lambda binary=None: "/usr/bin/sandbox-exec",
+    )
+    monkeypatch.setattr(
+        seatbelt_mod,
+        "create_owned_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(seatbelt_mod, "_terminate_process_group", fake_terminate)
+
+    running = asyncio.create_task(
+        SeatbeltBackend().run(_request(_policy(tmp_path), tmp_path))
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    running.cancel()
+    cancelled = await asyncio.gather(running, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
+
+    assert terminated == [12346]
 
 
 @pytest.mark.asyncio
@@ -1544,7 +1609,7 @@ async def test_real_seatbelt_shell_can_write_slash_tmp_when_available(
     request = SandboxRequest(
         argv=(
             "sh",
-            "-lc",
+            "-c",
             f"printf '%s\\n' shell-temp-ok > {target} && cat {target} && rm {target}",
         ),
         cwd=tmp_path,
@@ -1787,7 +1852,7 @@ async def test_run_populates_backend_notes_on_denial(
     monkeypatch.setattr(
         seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/usr/bin/sandbox-exec"
     )
-    monkeypatch.setattr(seatbelt_mod.asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", fake_create)
 
     result = await SeatbeltBackend().run(_request(_policy(tmp_path), tmp_path))
 
@@ -1820,7 +1885,7 @@ async def test_run_populates_backend_notes_for_zero_exit_ping_packet_loss(
     monkeypatch.setattr(
         seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/usr/bin/sandbox-exec"
     )
-    monkeypatch.setattr(seatbelt_mod.asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", fake_create)
     policy = _policy(
         tmp_path,
         network=NetworkMode.PROXY_ALLOWLIST,
@@ -1859,7 +1924,7 @@ async def test_run_backend_notes_empty_on_success(
     monkeypatch.setattr(
         seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/usr/bin/sandbox-exec"
     )
-    monkeypatch.setattr(seatbelt_mod.asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", fake_create)
 
     result = await SeatbeltBackend().run(_request(_policy(tmp_path), tmp_path))
 
@@ -1922,7 +1987,6 @@ async def test_run_operation_delegates_filesystem_to_seatbelt_worker(
     assert request.cwd == workspace.resolve()
     assert request.argv == (
         str(seatbelt_mod._python_executable()),
-        "-B",
         "-m",
         "opensquilla.sandbox.filesystem_worker",
         "-",

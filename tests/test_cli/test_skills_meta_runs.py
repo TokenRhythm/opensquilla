@@ -10,10 +10,7 @@ from typer.testing import CliRunner
 
 from opensquilla.cli.main import app as cli_app
 from opensquilla.persistence.meta_run_writer import open_meta_run_writer
-from opensquilla.persistence.migrator import apply_pending
 from opensquilla.skills.meta.types import MetaPlan, MetaResult, MetaStep
-
-MIGRATIONS_DIR = Path(__file__).resolve().parents[1].parent / "migrations"
 
 
 @pytest.fixture
@@ -22,9 +19,8 @@ def runner() -> CliRunner:
 
 
 @pytest.fixture
-def seeded_db(tmp_path: Path, monkeypatch):
-    db = str(tmp_path / "test.db")
-    apply_pending(db, MIGRATIONS_DIR)
+def seeded_db(migrated_db: Path, monkeypatch):
+    db = str(migrated_db)
     w = open_meta_run_writer(db)
 
     plan_a = MetaPlan(
@@ -146,9 +142,8 @@ def test_runs_show_bad_id(runner: CliRunner, seeded_db) -> None:
     assert result.exit_code != 0
 
 
-def test_runs_list_empty(runner: CliRunner, tmp_path: Path, monkeypatch) -> None:
-    db = str(tmp_path / "empty.db")
-    apply_pending(db, MIGRATIONS_DIR)
+def test_runs_list_empty(runner: CliRunner, migrated_db: Path, monkeypatch) -> None:
+    db = str(migrated_db)
     monkeypatch.setenv("OPENSQUILLA_META_RUNS_DB", db)
     result = runner.invoke(cli_app, ["skills", "meta", "runs", "list", "--json"])
     assert result.exit_code == 0

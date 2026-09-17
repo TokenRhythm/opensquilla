@@ -169,6 +169,7 @@
     }
 
     .status-line {
+      --boot-progress: 0%;
       height: 5px;
       overflow: hidden;
       border-radius: 999px;
@@ -176,20 +177,18 @@
     }
 
     .status-line::before {
-      animation: progress 1.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
-      background: linear-gradient(90deg, transparent, var(--accent) 28%, var(--accent) 72%, transparent);
+      background: var(--accent);
       content: "";
       display: block;
       height: 100%;
-      width: 46%;
+      width: var(--boot-progress);
       border-radius: inherit;
     }
 
-    /* On a startup failure the splash is paused, not working — freeze every
-       indeterminate animation so it doesn't contradict the paused state. */
+    /* The bar is determinate and therefore freezes naturally on failure. Dim
+       the completed portion while the active startup attempt is paused. */
     body.errored .status-line::before {
-      animation: none;
-      opacity: 0.2;
+      opacity: 0.45;
     }
 
     body.errored .loader::before,
@@ -202,6 +201,20 @@
       display: flex;
       justify-content: space-between;
       gap: 18px;
+    }
+
+    .status-metrics {
+      align-items: center;
+      display: flex;
+      flex: 0 0 auto;
+      gap: 10px;
+    }
+
+    .progress-count {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
     }
 
     .phase {
@@ -312,6 +325,18 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 11px;
       overflow-wrap: anywhere;
+    }
+
+    .recovery-detail {
+      color: var(--dim);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      overflow-wrap: anywhere;
+      margin-top: 2px;
+    }
+
+    .recovery-detail[hidden] {
+      display: none;
     }
 
     .recovery-group {
@@ -436,12 +461,6 @@
       box-shadow: 0 6px 18px -10px var(--accent);
     }
 
-    @keyframes progress {
-      0% { transform: translateX(-115%); opacity: 0.35; }
-      28%, 68% { opacity: 1; }
-      100% { transform: translateX(250%); opacity: 0.35; }
-    }
-
     @keyframes loader-segment {
       0%, 12.5% {
         background: var(--accent);
@@ -508,11 +527,22 @@
         <p class="subtitle" data-i18n="subtitle">Starting the desktop control surface.</p>
       </section>
 
-      <section class="status" aria-live="polite">
-        <div class="status-line" aria-hidden="true"></div>
+      <section class="status">
+        <div
+          class="status-line"
+          id="startupProgress"
+          role="progressbar"
+          aria-labelledby="phase"
+          aria-valuemin="0"
+          aria-valuemax="4"
+          aria-valuenow="0"
+        ></div>
         <div class="status-copy">
-          <span class="phase" id="phase" data-i18n="phaseDefault">Preparing desktop profile</span>
-          <span class="timer" id="timer">00.0s</span>
+          <span class="phase" id="phase" data-i18n="phaseDefault" role="status" aria-live="polite" aria-atomic="true">Preparing desktop profile</span>
+          <span class="status-metrics" aria-hidden="true">
+            <span class="progress-count" id="progressCount">0/4</span>
+            <span class="timer" id="timer" aria-hidden="true">00.0s</span>
+          </span>
         </div>
         <div class="steps" aria-hidden="true">
           <span class="step active" data-step="profile" data-i18n="stepProfile">Profile</span>
@@ -526,6 +556,7 @@
         <p id="errorMessage" data-i18n="errorDefault">The gateway did not finish starting.</p>
         <div class="actions">
           <button id="revealLog" type="button" data-i18n="revealLog">Reveal log</button>
+          <button id="openKeychain" type="button" data-i18n="openKeychain" hidden>Open Keychain Access</button>
           <button id="resetSetup" type="button" data-i18n="resetSetup">Reset setup</button>
           <button id="quit" type="button" data-i18n="quit">Quit</button>
           <button id="retry" class="primary" type="button" data-i18n="retry">Retry</button>
@@ -538,6 +569,7 @@
           <p id="recoveryIntro" data-i18n="recoveryIntro">OpenSquilla paused the primary gateway because it could not prove that writing is safe. Primary data and any completed consolidation backups remain preserved.</p>
         </div>
         <div class="recovery-code" id="recoveryCode"></div>
+        <div class="recovery-detail" id="recoveryDetail" hidden></div>
 
         <div class="recovery-group" id="workspaceGroup">
           <label for="workspaceCandidates" data-i18n="workspaceLabel">Choose a verified workspace</label>
@@ -554,10 +586,9 @@
           </div>
         </div>
 
-        <div class="recovery-group" id="cleanupAbandonGroup" hidden>
-          <p data-i18n="abandonCleanupHelp">A cleanup stopped partway through. Preserve every remaining file, leave the interrupted transaction, and retry primary startup.</p>
+        <div class="recovery-group" id="updateGroup" hidden>
           <div class="recovery-row">
-            <button id="abandonCleanup" class="primary" type="button" data-i18n="abandonCleanup">Preserve remaining data and continue</button>
+            <button id="recoveryUpdate" class="primary" type="button" data-i18n="openDownloadPage">Get the latest version</button>
           </div>
         </div>
 
@@ -587,7 +618,8 @@
         errorTitle: 'Startup needs attention',
         errorDefault: 'The gateway did not finish starting.',
         profileInUse: 'The previous Gateway has not exited. Wait for it to finish, or quit every OpenSquilla app or terminal using this profile, then try again. If it will not exit, restart the computer. Do not delete profile lock files.',
-        revealLog: 'Reveal log', resetSetup: 'Reset setup', quit: 'Quit', retry: 'Retry',
+        revealLog: 'Reveal log', openKeychain: 'Open Keychain Access', resetSetup: 'Reset setup', quit: 'Quit', retry: 'Retry',
+        keychainUnavailable: 'OpenSquilla cannot read the macOS Keychain. Unlock the login keychain, then click Retry. If the credential cannot be recovered, choose Reset setup and enter the API key again.',
         startupPaused: 'Startup paused',
         resetConfirm: 'Reset desktop setup? This clears the saved provider credential and reopens onboarding. Your workspace path, identity, memory, and chat history are kept.',
         resetPhase: 'Resetting desktop setup',
@@ -595,10 +627,12 @@
         resetFailed: 'Reset failed',
         recoveryTitle: 'Your primary profile needs recovery',
         recoveryIntro: 'OpenSquilla paused the primary gateway because it could not prove that writing is safe. Primary data and any completed consolidation backups remain preserved.',
-        cleanupRecoveryTitle: 'A data cleanup stopped partway through',
-        cleanupRecoveryIntro: 'Some confirmed items may already have been deleted. OpenSquilla stopped before touching anything it could not verify and preserved every remaining file.',
+        recoveryTitleLockBusy: 'Another OpenSquilla process is using this profile',
+        recoveryTitleUpdate: 'Update OpenSquilla to open this profile',
+        recoveryIntroUpdate: 'This configuration was created by a newer version of OpenSquilla. Update the app to continue — your data stays untouched.',
+        openDownloadPage: 'Get the latest version',
         workspaceLabel: 'Choose a verified workspace', chooseWorkspace: 'Use selected workspace', browseWorkspace: 'Browse…',
-        recoverTransaction: 'Safely recover interrupted operation', abandonCleanup: 'Preserve remaining data and continue', abandonCleanupHelp: 'A cleanup stopped partway through. Preserve every remaining file, leave the interrupted transaction, and retry primary startup.', revealProfile: 'Show profile location', revealBackups: 'Show backup location',
+        recoverTransaction: 'Safely recover interrupted operation', revealProfile: 'Show profile location', revealBackups: 'Show backup location',
         copyDiagnostics: 'Copy diagnostics', diagnosticsCopied: 'Sanitized diagnostics copied.', recoveryWorking: 'Working…', noWorkspaceCandidates: 'No verified candidates; browse for a workspace.',
       },
       'zh-Hans': {
@@ -609,7 +643,8 @@
         errorTitle: '启动需要处理',
         errorDefault: '网关未能完成启动。',
         profileInUse: '上一个网关尚未退出。请等待其结束，或退出所有正在使用此配置的 OpenSquilla 应用和终端后重试；若仍无法退出，请重启电脑。不要删除配置锁文件。',
-        revealLog: '显示日志', resetSetup: '重新配置', quit: '退出', retry: '重试',
+        revealLog: '显示日志', openKeychain: '打开钥匙串访问', resetSetup: '重新配置', quit: '退出', retry: '重试',
+        keychainUnavailable: 'OpenSquilla 无法读取 macOS 钥匙串。请解锁 login 钥匙串，然后点击“重试”。如果凭据无法恢复，可选择“重新配置”并重新输入 API Key。',
         startupPaused: '启动已暂停',
         resetConfirm: '要重置桌面设置吗？这会清除已保存的提供商凭据并重新进入引导。工作区路径、身份、记忆和聊天记录都会保留。',
         resetPhase: '正在重置桌面设置',
@@ -617,10 +652,12 @@
         resetFailed: '重置失败',
         recoveryTitle: '主配置需要恢复',
         recoveryIntro: 'OpenSquilla 无法确认主配置可安全写入，因此已暂停主网关。主配置数据及已完成的聚合备份均会保留。',
-        cleanupRecoveryTitle: '数据清理在中途停止',
-        cleanupRecoveryIntro: '部分已确认条目可能已经删除。OpenSquilla 在遇到无法验证的内容前已停止，并保留了所有剩余文件。',
+        recoveryTitleLockBusy: '另一个 OpenSquilla 进程正在使用此配置',
+        recoveryTitleUpdate: '请更新 OpenSquilla 以打开此配置',
+        recoveryIntroUpdate: '此配置由更新版本的 OpenSquilla 创建。请将应用更新到最新版本后继续，你的数据不会受到影响。',
+        openDownloadPage: '获取最新版本',
         workspaceLabel: '选择已验证的工作区', chooseWorkspace: '使用所选工作区', browseWorkspace: '浏览…',
-        recoverTransaction: '安全恢复中断的操作', abandonCleanup: '保留剩余数据并继续', abandonCleanupHelp: '清理在中途停止。请保留所有剩余文件并结束中断的事务，然后重试主配置启动。', revealProfile: '显示配置位置', revealBackups: '显示备份位置',
+        recoverTransaction: '安全恢复中断的操作', revealProfile: '显示配置位置', revealBackups: '显示备份位置',
         copyDiagnostics: '复制诊断信息', diagnosticsCopied: '已复制脱敏诊断信息。', recoveryWorking: '正在处理…', noWorkspaceCandidates: '没有已验证候选；请浏览选择工作区。',
       },
       ja: {
@@ -631,7 +668,8 @@
         errorTitle: '起動の確認が必要です',
         errorDefault: 'ゲートウェイの起動が完了しませんでした。',
         profileInUse: '前のゲートウェイがまだ終了していません。終了を待つか、このプロファイルを使用しているすべての OpenSquilla アプリとターミナルを終了してから再試行してください。終了しない場合はコンピューターを再起動してください。プロファイルのロックファイルは削除しないでください。',
-        revealLog: 'ログを表示', resetSetup: '設定をリセット', quit: '終了', retry: '再試行',
+        revealLog: 'ログを表示', openKeychain: 'キーチェーンアクセスを開く', resetSetup: '設定をリセット', quit: '終了', retry: '再試行',
+        keychainUnavailable: 'OpenSquilla は macOS キーチェーンを読み取れません。login キーチェーンのロックを解除してから再試行してください。復元できない場合は設定をリセットして API キーを再入力してください。',
         startupPaused: '起動を一時停止しました',
         resetConfirm: 'デスクトップ設定をリセットしますか？保存済みのプロバイダー認証情報を消去してオンボーディングを再開します。ワークスペースのパス、ID、メモリ、チャット履歴は保持されます。',
         resetPhase: 'デスクトップ設定をリセットしています',
@@ -639,10 +677,12 @@
         resetFailed: 'リセットに失敗しました',
         recoveryTitle: 'プライマリプロファイルの復旧が必要です',
         recoveryIntro: '安全な書き込みを確認できないため、プライマリゲートウェイを一時停止しました。プライマリデータと完了済みの統合バックアップは保持されています。',
-        cleanupRecoveryTitle: 'データのクリーンアップが途中で停止しました',
-        cleanupRecoveryIntro: '確認済みの項目の一部は削除済みの可能性があります。検証できない項目に触れる前に停止し、残りのファイルをすべて保持しました。',
+        recoveryTitleLockBusy: '別の OpenSquilla プロセスがこのプロファイルを使用しています',
+        recoveryTitleUpdate: 'このプロファイルを開くには OpenSquilla の更新が必要です',
+        recoveryIntroUpdate: 'この設定は新しいバージョンの OpenSquilla で作成されています。アプリを最新版に更新すると続行できます。データはそのまま保持されます。',
+        openDownloadPage: '最新バージョンを入手',
         workspaceLabel: '検証済みワークスペースを選択', chooseWorkspace: '選択したワークスペースを使用', browseWorkspace: '参照…',
-        recoverTransaction: '中断した操作を安全に復旧', abandonCleanup: '残りのデータを保持して続行', abandonCleanupHelp: 'クリーンアップが途中で停止しました。残っているすべてのファイルを保持して中断したトランザクションを終了し、プライマリの起動を再試行してください。', revealProfile: 'プロファイルの場所を表示', revealBackups: 'バックアップの場所を表示',
+        recoverTransaction: '中断した操作を安全に復旧', revealProfile: 'プロファイルの場所を表示', revealBackups: 'バックアップの場所を表示',
         copyDiagnostics: '診断情報をコピー', diagnosticsCopied: 'サニタイズ済み診断情報をコピーしました。', recoveryWorking: '処理中…', noWorkspaceCandidates: '検証済み候補がありません。ワークスペースを参照してください。',
       },
       fr: {
@@ -653,7 +693,8 @@
         errorTitle: 'Le démarrage nécessite votre attention',
         errorDefault: 'La passerelle n\'a pas terminé son démarrage.',
         profileInUse: 'La passerelle précédente n’est pas terminée. Attendez sa fermeture, ou quittez toutes les applications et tous les terminaux OpenSquilla utilisant ce profil, puis réessayez. Si elle ne se ferme pas, redémarrez l’ordinateur. Ne supprimez pas les fichiers de verrouillage du profil.',
-        revealLog: 'Afficher le journal', resetSetup: 'Réinitialiser', quit: 'Quitter', retry: 'Réessayer',
+        revealLog: 'Afficher le journal', openKeychain: 'Ouvrir Trousseaux d’accès', resetSetup: 'Réinitialiser', quit: 'Quitter', retry: 'Réessayer',
+        keychainUnavailable: 'OpenSquilla ne peut pas lire le trousseau macOS. Déverrouillez le trousseau login, puis réessayez. Si l’identifiant ne peut pas être récupéré, réinitialisez la configuration et saisissez à nouveau la clé API.',
         startupPaused: 'Démarrage en pause',
         resetConfirm: 'Réinitialiser la configuration du bureau ? Cela efface les identifiants du fournisseur et relance l’onboarding. Le chemin de l’espace de travail, l’identité, la mémoire et l’historique des discussions sont conservés.',
         resetPhase: 'Réinitialisation de la configuration du bureau',
@@ -661,10 +702,12 @@
         resetFailed: 'Échec de la réinitialisation',
         recoveryTitle: 'Le profil principal doit être récupéré',
         recoveryIntro: 'OpenSquilla a suspendu la passerelle principale car une écriture sûre ne pouvait pas être garantie. Les données principales et les sauvegardes de consolidation terminées restent préservées.',
-        cleanupRecoveryTitle: 'Un nettoyage des données s’est arrêté en cours de route',
-        cleanupRecoveryIntro: 'Certains éléments confirmés peuvent déjà avoir été supprimés. OpenSquilla s’est arrêté avant tout élément non vérifiable et a conservé tous les fichiers restants.',
+        recoveryTitleLockBusy: 'Un autre processus OpenSquilla utilise ce profil',
+        recoveryTitleUpdate: 'Mettez à jour OpenSquilla pour ouvrir ce profil',
+        recoveryIntroUpdate: 'Cette configuration a été créée par une version plus récente d’OpenSquilla. Mettez l’application à jour pour continuer — vos données restent intactes.',
+        openDownloadPage: 'Obtenir la dernière version',
         workspaceLabel: 'Choisir un espace de travail vérifié', chooseWorkspace: 'Utiliser l’espace sélectionné', browseWorkspace: 'Parcourir…',
-        recoverTransaction: 'Récupérer l’opération interrompue en toute sécurité', abandonCleanup: 'Conserver les données restantes et continuer', abandonCleanupHelp: 'Un nettoyage s’est arrêté en cours de route. Conservez tous les fichiers restants, quittez la transaction interrompue, puis relancez le démarrage du profil principal.', revealProfile: 'Afficher l’emplacement du profil', revealBackups: 'Afficher les sauvegardes',
+        recoverTransaction: 'Récupérer l’opération interrompue en toute sécurité', revealProfile: 'Afficher l’emplacement du profil', revealBackups: 'Afficher les sauvegardes',
         copyDiagnostics: 'Copier le diagnostic', diagnosticsCopied: 'Diagnostic expurgé copié.', recoveryWorking: 'Traitement…', noWorkspaceCandidates: 'Aucun candidat vérifié ; parcourez les dossiers.',
       },
       de: {
@@ -675,7 +718,8 @@
         errorTitle: 'Der Start erfordert Ihre Aufmerksamkeit',
         errorDefault: 'Das Gateway hat den Start nicht abgeschlossen.',
         profileInUse: 'Das vorherige Gateway wurde noch nicht beendet. Warten Sie, bis es beendet ist, oder schließen Sie alle OpenSquilla-Apps und -Terminals, die dieses Profil verwenden, und versuchen Sie es erneut. Falls es nicht beendet wird, starten Sie den Computer neu. Löschen Sie keine Profilsperrdateien.',
-        revealLog: 'Protokoll anzeigen', resetSetup: 'Zurücksetzen', quit: 'Beenden', retry: 'Wiederholen',
+        revealLog: 'Protokoll anzeigen', openKeychain: 'Schlüsselbundverwaltung öffnen', resetSetup: 'Zurücksetzen', quit: 'Beenden', retry: 'Wiederholen',
+        keychainUnavailable: 'OpenSquilla kann den macOS-Schlüsselbund nicht lesen. Entsperren Sie den Schlüsselbund „login“ und versuchen Sie es erneut. Wenn die Zugangsdaten nicht wiederhergestellt werden können, setzen Sie die Einrichtung zurück und geben Sie den API-Schlüssel erneut ein.',
         startupPaused: 'Start angehalten',
         resetConfirm: 'Desktop-Einrichtung zurücksetzen? Die gespeicherten Anbieter-Zugangsdaten werden gelöscht und das Onboarding wird neu geöffnet. Arbeitsbereichspfad, Identität, Speicher und Chatverlauf bleiben erhalten.',
         resetPhase: 'Desktop-Einrichtung wird zurückgesetzt',
@@ -683,10 +727,12 @@
         resetFailed: 'Zurücksetzen fehlgeschlagen',
         recoveryTitle: 'Das Hauptprofil muss wiederhergestellt werden',
         recoveryIntro: 'OpenSquilla hat das Haupt-Gateway angehalten, weil sicheres Schreiben nicht bestätigt werden konnte. Hauptdaten und abgeschlossene Konsolidierungssicherungen bleiben erhalten.',
-        cleanupRecoveryTitle: 'Eine Datenbereinigung wurde unterbrochen',
-        cleanupRecoveryIntro: 'Einige bestätigte Elemente wurden möglicherweise bereits gelöscht. OpenSquilla stoppte vor nicht überprüfbaren Elementen und behielt alle verbleibenden Dateien.',
+        recoveryTitleLockBusy: 'Ein anderer OpenSquilla-Prozess verwendet dieses Profil',
+        recoveryTitleUpdate: 'Aktualisieren Sie OpenSquilla, um dieses Profil zu öffnen',
+        recoveryIntroUpdate: 'Diese Konfiguration wurde von einer neueren OpenSquilla-Version erstellt. Aktualisieren Sie die App, um fortzufahren — Ihre Daten bleiben unverändert.',
+        openDownloadPage: 'Neueste Version laden',
         workspaceLabel: 'Geprüften Arbeitsbereich wählen', chooseWorkspace: 'Auswahl verwenden', browseWorkspace: 'Durchsuchen…',
-        recoverTransaction: 'Unterbrochenen Vorgang sicher wiederherstellen', abandonCleanup: 'Verbleibende Daten behalten und fortfahren', abandonCleanupHelp: 'Eine Bereinigung wurde unterbrochen. Behalten Sie alle verbliebenen Dateien, beenden Sie die unterbrochene Transaktion und starten Sie anschließend das Hauptprofil erneut.', revealProfile: 'Profilordner anzeigen', revealBackups: 'Sicherungsordner anzeigen',
+        recoverTransaction: 'Unterbrochenen Vorgang sicher wiederherstellen', revealProfile: 'Profilordner anzeigen', revealBackups: 'Sicherungsordner anzeigen',
         copyDiagnostics: 'Diagnose kopieren', diagnosticsCopied: 'Bereinigte Diagnose kopiert.', recoveryWorking: 'Wird ausgeführt…', noWorkspaceCandidates: 'Keine geprüften Kandidaten; bitte Arbeitsbereich auswählen.',
       },
       es: {
@@ -697,7 +743,8 @@
         errorTitle: 'El inicio necesita atención',
         errorDefault: 'La pasarela no terminó de iniciarse.',
         profileInUse: 'La pasarela anterior aún no ha terminado. Espera a que se cierre o sal de todas las aplicaciones y terminales de OpenSquilla que usen este perfil y vuelve a intentarlo. Si no se cierra, reinicia el equipo. No elimines los archivos de bloqueo del perfil.',
-        revealLog: 'Mostrar registro', resetSetup: 'Restablecer', quit: 'Salir', retry: 'Reintentar',
+        revealLog: 'Mostrar registro', openKeychain: 'Abrir Acceso a Llaveros', resetSetup: 'Restablecer', quit: 'Salir', retry: 'Reintentar',
+        keychainUnavailable: 'OpenSquilla no puede leer el llavero de macOS. Desbloquea el llavero login y vuelve a intentarlo. Si no se puede recuperar la credencial, restablece la configuración y vuelve a introducir la clave API.',
         startupPaused: 'Inicio en pausa',
         resetConfirm: '¿Restablecer la configuración de escritorio? Esto borra la credencial del proveedor y vuelve a abrir la configuración inicial. Se conservan la ruta del espacio de trabajo, la identidad, la memoria y el historial de chat.',
         resetPhase: 'Restableciendo configuración de escritorio',
@@ -705,24 +752,41 @@
         resetFailed: 'Error al restablecer',
         recoveryTitle: 'El perfil principal necesita recuperación',
         recoveryIntro: 'OpenSquilla pausó la pasarela principal porque no pudo demostrar que fuera seguro escribir. Los datos principales y las copias de consolidación completadas permanecen conservados.',
-        cleanupRecoveryTitle: 'Una limpieza de datos se detuvo a mitad de camino',
-        cleanupRecoveryIntro: 'Es posible que algunos elementos confirmados ya se hayan eliminado. OpenSquilla se detuvo antes de tocar algo no verificable y conservó todos los archivos restantes.',
+        recoveryTitleLockBusy: 'Otro proceso de OpenSquilla está usando este perfil',
+        recoveryTitleUpdate: 'Actualiza OpenSquilla para abrir este perfil',
+        recoveryIntroUpdate: 'Esta configuración fue creada por una versión más reciente de OpenSquilla. Actualiza la aplicación para continuar; tus datos permanecen intactos.',
+        openDownloadPage: 'Obtener la última versión',
         workspaceLabel: 'Elegir un espacio verificado', chooseWorkspace: 'Usar el espacio seleccionado', browseWorkspace: 'Examinar…',
-        recoverTransaction: 'Recuperar de forma segura la operación interrumpida', abandonCleanup: 'Conservar los datos restantes y continuar', abandonCleanupHelp: 'Una limpieza se detuvo a mitad de camino. Conserva todos los archivos restantes, finaliza la transacción interrumpida y vuelve a iniciar el perfil principal.', revealProfile: 'Mostrar ubicación del perfil', revealBackups: 'Mostrar copias de seguridad',
+        recoverTransaction: 'Recuperar de forma segura la operación interrumpida', revealProfile: 'Mostrar ubicación del perfil', revealBackups: 'Mostrar copias de seguridad',
         copyDiagnostics: 'Copiar diagnóstico', diagnosticsCopied: 'Diagnóstico depurado copiado.', recoveryWorking: 'Procesando…', noWorkspaceCandidates: 'No hay candidatos verificados; busca un espacio de trabajo.',
       },
     };
     let msg = MESSAGES.en;
 
-    const started = performance.now();
+    let phaseStartedAt = performance.now();
+    let phaseStatusIdentity = '';
+    const BOOT_PROGRESS_MAX = 4;
+    const bootProgressByPhase = Object.freeze({
+      profile: 0,
+      'gateway-start': 1,
+      'gateway-health': 2,
+      control: 3,
+      ready: 4,
+    });
+    let completedBootMilestones = 0;
+    let resetBootProgressOnNextStatus = false;
     const phase = document.getElementById('phase');
     const timer = document.getElementById('timer');
+    const startupProgress = document.getElementById('startupProgress');
+    const progressCount = document.getElementById('progressCount');
     const errorPanel = document.getElementById('errorPanel');
     const errorMessage = document.getElementById('errorMessage');
+    const openKeychainButton = document.getElementById('openKeychain');
     const recoveryPanel = document.getElementById('recoveryPanel');
     const recoveryTitle = document.getElementById('recoveryTitle');
     const recoveryIntro = document.getElementById('recoveryIntro');
     const recoveryCode = document.getElementById('recoveryCode');
+    const recoveryDetail = document.getElementById('recoveryDetail');
     const recoveryStatus = document.getElementById('recoveryStatus');
     const workspaceCandidates = document.getElementById('workspaceCandidates');
     let currentRecoveryState = null;
@@ -769,27 +833,62 @@
       }
     }
 
+    function renderBootProgress() {
+      const value = Math.max(0, Math.min(BOOT_PROGRESS_MAX, completedBootMilestones));
+      startupProgress.style.setProperty('--boot-progress', `${(value / BOOT_PROGRESS_MAX) * 100}%`);
+      startupProgress.setAttribute('aria-valuenow', String(value));
+      progressCount.textContent = `${value}/${BOOT_PROGRESS_MAX}`;
+    }
+
     function applyStatus(payload) {
       const phaseId = payload && payload.phaseId ? String(payload.phaseId) : 'profile';
+      if (resetBootProgressOnNextStatus) {
+        completedBootMilestones = 0;
+        resetBootProgressOnNextStatus = false;
+        renderBootProgress();
+      }
+      const reportedProgress = bootProgressByPhase[phaseId];
+      if (Number.isInteger(reportedProgress)) {
+        completedBootMilestones = Math.max(completedBootMilestones, reportedProgress);
+        renderBootProgress();
+      }
+      const statusAt = payload && payload.at ? String(payload.at) : '';
+      const statusIdentity = phaseId + '\u0000' + statusAt;
+      if (statusIdentity !== phaseStatusIdentity) {
+        phaseStatusIdentity = statusIdentity;
+        const statusAtMs = Date.parse(statusAt);
+        const wallAgeMs = Number.isFinite(statusAtMs) ? Date.now() - statusAtMs : 0;
+        // Anchor once from the main-process wall-clock timestamp, then use the
+        // renderer's monotonic clock. Invalid or future timestamps start at zero.
+        phaseStartedAt = performance.now() - Math.max(0, wallAgeMs);
+        updateTimer();
+      }
       // The label is already localized by the main process; fall back to the
       // local default phase string only when no label was provided.
       phase.textContent = payload && payload.label ? String(payload.label) : msg.phaseDefault;
       errorPanel.classList.remove('visible');
+      openKeychainButton.hidden = true;
       recoveryPanel.classList.remove('visible');
       document.body.classList.remove('recovering');
-      // Leaving the error state: resume the sweep and the elapsed timer.
+      // Leaving the error state: resume the elapsed timer. The determinate
+      // progress bar advances only when a real milestone is reported.
       document.body.classList.remove('errored');
       if (!timerInterval) timerInterval = setInterval(updateTimer, 100);
-      setStepState(stepMap[phaseId] || 'profile', phaseId === 'ready');
+      const activeStep = stepMap[phaseId];
+      if (activeStep) setStepState(activeStep, phaseId === 'ready');
     }
 
     function applyError(payload) {
       const rawMessage = payload && payload.message ? String(payload.message) : msg.errorDefault;
-      const message = rawMessage.includes('OPENSQUILLA_PROFILE_IN_USE')
-        ? msg.profileInUse
-        : rawMessage;
+      const keychainUnavailable = payload && payload.code === 'keychain_unavailable';
+      const message = keychainUnavailable
+        ? msg.keychainUnavailable
+        : rawMessage.includes('OPENSQUILLA_PROFILE_IN_USE')
+          ? msg.profileInUse
+          : rawMessage;
       phase.textContent = msg.startupPaused;
       errorMessage.textContent = message;
+      openKeychainButton.hidden = !keychainUnavailable;
       errorPanel.classList.add('visible');
       recoveryPanel.classList.remove('visible');
       document.body.classList.remove('recovering');
@@ -797,6 +896,7 @@
       // the .errored class), and drop the active step highlight so a failed phase
       // is not shown as still running.
       document.body.classList.add('errored');
+      resetBootProgressOnNextStatus = true;
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
       for (const step of Object.values(steps)) {
         if (step) step.classList.remove('active');
@@ -815,17 +915,30 @@
 
       const wasVisible = recoveryPanel.classList.contains('visible');
       document.body.classList.add('recovering', 'errored');
+      resetBootProgressOnNextStatus = true;
       errorPanel.classList.remove('visible');
       recoveryPanel.classList.add('visible');
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
-      recoveryCode.textContent = String(inspection.stable_code || 'recovery_required');
-      const cleanupInterrupted = inspection.stable_code === 'cleanup_transaction_incomplete';
-      recoveryTitle.textContent = cleanupInterrupted
-        ? msg.cleanupRecoveryTitle
-        : msg.recoveryTitle;
-      recoveryIntro.textContent = cleanupInterrupted
-        ? msg.cleanupRecoveryIntro
-        : msg.recoveryIntro;
+      const stableCode = String(inspection.stable_code || 'recovery_required');
+      recoveryCode.textContent = stableCode;
+      const detail = typeof inspection.detail === 'string' ? inspection.detail : '';
+      recoveryDetail.textContent = detail;
+      recoveryDetail.hidden = !detail;
+      // The two conditions a user can act on directly get plain-language
+      // copy instead of the generic recovery framing: a config authored by a
+      // newer build (update the app) and a profile still held by another
+      // OpenSquilla process (let it finish or quit it).
+      const needsAppUpdate = stableCode === 'config_schema_too_new';
+      if (needsAppUpdate) {
+        recoveryTitle.textContent = msg.recoveryTitleUpdate;
+        recoveryIntro.textContent = msg.recoveryIntroUpdate;
+      } else if (stableCode === 'profile_lock_busy') {
+        recoveryTitle.textContent = msg.recoveryTitleLockBusy;
+        recoveryIntro.textContent = msg.profileInUse;
+      } else {
+        recoveryTitle.textContent = msg.recoveryTitle;
+        recoveryIntro.textContent = msg.recoveryIntro;
+      }
 
       const candidates = Array.isArray(inspection.candidates)
         ? inspection.candidates.filter((item) => (
@@ -856,9 +969,7 @@
 
       document.getElementById('workspaceGroup').hidden = !mayChooseWorkspace;
       document.getElementById('transactionRecoveryGroup').hidden = !allowedActions.has('recover-transaction');
-      const mayAbandonCleanup = allowedActions.has('abandon-cleanup')
-        && typeof api?.abandonCleanupTransaction === 'function';
-      document.getElementById('cleanupAbandonGroup').hidden = !mayAbandonCleanup;
+      document.getElementById('updateGroup').hidden = !needsAppUpdate;
       document.getElementById('revealBackups').hidden = !allowedActions.has('show-backups');
       document.getElementById('copyDiagnostics').hidden = !allowedActions.has('copy-diagnostics');
       recoveryStatus.textContent = state.error ? String(state.error) : (state.busy ? msg.recoveryWorking : '');
@@ -869,9 +980,6 @@
       document.getElementById('browseWorkspace').disabled = Boolean(state.busy) || !mayChooseWorkspace;
       document.getElementById('recoverTransaction').disabled = (
         Boolean(state.busy) || !allowedActions.has('recover-transaction')
-      );
-      document.getElementById('abandonCleanup').disabled = (
-        Boolean(state.busy) || !mayAbandonCleanup
       );
       if (moveFocus && !wasVisible) recoveryTitle.focus();
     }
@@ -913,16 +1021,22 @@
 
     let retryStartupInFlight = false;
     async function retryStartup() {
-      if (!api || typeof api.retryStartup !== 'function' || retryStartupInFlight) return null;
+      const resumeStartup = typeof api?.resumeStartup === 'function'
+        ? api.resumeStartup
+        : api?.retryStartup;
+      if (typeof resumeStartup !== 'function' || retryStartupInFlight) return null;
       const retryButton = document.getElementById('retry');
       const recoveryRetryButton = document.getElementById('recoveryRetry');
       retryStartupInFlight = true;
       retryButton.disabled = true;
       recoveryRetryButton.disabled = true;
       try {
-        const result = await api.retryStartup();
+        const result = await resumeStartup();
         if (result && result.ok === false) {
-          applyError({ message: result.error || msg.errorDefault });
+          applyError({
+            message: result.error || msg.errorDefault,
+            code: result.code,
+          });
         }
         return result;
       } catch (error) {
@@ -936,7 +1050,7 @@
     }
 
     function updateTimer() {
-      timer.textContent = `${((performance.now() - started) / 1000).toFixed(1).padStart(4, '0')}s`;
+      timer.textContent = `${((performance.now() - phaseStartedAt) / 1000).toFixed(1).padStart(4, '0')}s`;
     }
     let timerInterval = setInterval(updateTimer, 100);
 
@@ -958,6 +1072,15 @@
       document.getElementById('retry').addEventListener('click', () => retryStartup());
       document.getElementById('recoveryRetry').addEventListener('click', () => retryStartup());
       document.getElementById('revealLog').addEventListener('click', () => api.revealGatewayLog());
+      openKeychainButton.addEventListener('click', async () => {
+        openKeychainButton.disabled = true;
+        try {
+          const opened = await api.openKeychainAccess();
+          if (!opened) errorMessage.textContent = msg.keychainUnavailable;
+        } finally {
+          openKeychainButton.disabled = false;
+        }
+      });
       document.getElementById('quit').addEventListener('click', () => api.quitApp());
       const resetButton = document.getElementById('resetSetup');
       if (typeof api.resetDesktopSettings === 'function') {
@@ -974,9 +1097,12 @@
       document.getElementById('recoverTransaction').addEventListener('click', () => runRecoveryAction(() => (
         api.recoverProfileTransaction()
       )));
-      document.getElementById('abandonCleanup').addEventListener('click', () => runRecoveryAction(() => (
-        api.abandonCleanupTransaction()
-      )));
+      const updateButton = document.getElementById('recoveryUpdate');
+      if (typeof api.openLatestDownloadPage === 'function') {
+        updateButton.addEventListener('click', () => api.openLatestDownloadPage());
+      } else {
+        updateButton.style.display = 'none';
+      }
       document.getElementById('revealProfile').addEventListener('click', () => (
         api.revealRecoveryPath({ target: 'primary' })
       ));

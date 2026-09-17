@@ -247,7 +247,7 @@ async def test_info_is_additively_unavailable_without_default_model() -> None:
         "model": "synthetic-model",
         "isLocal": False,
         "maxInputBytes": 262_144,
-        "promptVersion": "profile-fusion-v2",
+        "promptVersion": "profile-fusion-v3",
         "recentImport": None,
     }
 

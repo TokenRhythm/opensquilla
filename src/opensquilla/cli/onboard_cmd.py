@@ -22,6 +22,7 @@ from opensquilla.cli.ui import (
     warning_panel,
 )
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_migration import ConfigParseError
 from opensquilla.onboarding.config_store import load_config, resolve_config_path
 from opensquilla.onboarding.errors import UserCancelledError
 from opensquilla.onboarding.flow import (
@@ -52,7 +53,11 @@ from opensquilla.onboarding.setup_engine import (
 )
 from opensquilla.onboarding.setup_paths import web_setup_url
 from opensquilla.onboarding.status import OnboardingStatus, get_onboarding_status
-from opensquilla.router_tiers import DEFAULT_TEXT_TIER, TEXT_TIERS
+from opensquilla.router_tiers import (
+    DEFAULT_TEXT_TIER,
+    ENSEMBLE_SELECTION_MODE_ORDER,
+    TEXT_TIERS,
+)
 
 # Exit code for a user-initiated cancellation (Esc/Ctrl+C in the wizard).
 # 130 = 128 + SIGINT, the conventional shell exit status for an interrupt;
@@ -249,7 +254,7 @@ def _exit_config_load_error(exc: Exception, path: str | Path | None = None) -> N
 def _load_config_for_cli(path: str | Path | None = None):
     try:
         return load_config(path)
-    except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         _exit_config_load_error(exc, path)
 
 
@@ -450,8 +455,12 @@ def _probe_saved_provider(cfg) -> bool:
     import asyncio
 
     from opensquilla.onboarding.probe import probe_llm_provider
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
 
     llm = cfg.llm
+    prewarm_tokenrhythm_install_id(config=cfg)
     console.print(f"[{ACCENT_SOFT}]◆[/] Checking the connection…")
     try:
         result = asyncio.run(
@@ -604,16 +613,19 @@ def onboard_command(
             router_mode = "recommended"
         try:
             engine = SetupEngine(cfg_before, path=config_path)
+            provider_payload = {
+                "providerId": provider,
+                "model": model,
+                "apiKey": api_key,
+                "apiKeyEnv": api_key_env,
+                "baseUrl": base_url,
+                "proxy": proxy,
+            }
+            if skip_image_generation:
+                provider_payload["imageGenerationIntent"] = "preserve"
             engine.apply(
                 "provider",
-                {
-                    "providerId": provider,
-                    "model": model,
-                    "apiKey": api_key,
-                    "apiKeyEnv": api_key_env,
-                    "baseUrl": base_url,
-                    "proxy": proxy,
-                },
+                provider_payload,
             )
             if router_mode:
                 engine.apply("router", {"mode": router_mode})
@@ -686,7 +698,7 @@ def onboard_command(
         # EOFError covers Ctrl+D / exhausted piped stdin at a prompt — the
         # same operator intent as Esc/Ctrl+C, so the same productized exit.
         _exit_cancelled(exc)
-    except (tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         # Corrupt config discovered mid-wizard (e.g. re-loaded after an
         # out-of-band edit): route through the same productized handoff as
         # `--if-needed`/`status` instead of a raw traceback.
@@ -776,6 +788,7 @@ def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
         "imageGenerationProvider": status.image_generation_provider,
         "imageGenerationPrimary": status.image_generation_primary,
         "imageGenerationEnvKey": status.image_generation_env_key,
+        "imageGenerationState": dict(status.image_generation_state),
         "audioConfigured": status.audio_configured,
         "audioEnabled": status.audio_enabled,
         "audioSource": status.audio_source,
@@ -1448,8 +1461,8 @@ def configure_command(
         "",
         "--selection-mode",
         help=(
-            "Ensemble selection mode: router_dynamic, static_openrouter_b5, "
-            "static_tokenrhythm_b5, or custom_b5."
+            "Ensemble selection mode: "
+            f"{', '.join(ENSEMBLE_SELECTION_MODE_ORDER)}."
         ),
         rich_help_panel="LLM ensemble",
     ),
@@ -1468,7 +1481,11 @@ def configure_command(
     all_failed_policy: str = typer.Option(
         "",
         "--all-failed-policy",
-        help="Policy when all proposers fail: fallback_single or error.",
+        # Kept as a hidden compatibility input for older automation. Explicit
+        # values remain authoritative even though new C3 setups use the
+        # resilient fallback_single default.
+        hidden=True,
+        help="Compatibility option for the stored ensemble failure policy.",
         rich_help_panel="LLM ensemble",
     ),
     search_provider: str = typer.Option(
@@ -1627,6 +1644,12 @@ def configure_command(
                         "presetId": preset,
                     },
                 )
+                if router:
+                    # An explicit --router is authoritative (the help promises
+                    # recommended | openrouter-mix | disabled); an omitted one
+                    # keeps the stored/synthesized router state untouched on a
+                    # re-save, mirroring the `onboard --provider` contract.
+                    engine.apply("router", {"mode": router})
                 result = engine.persist()
                 _print_saved_path(result.path)
                 _print_restart_guidance(result, config_path)
@@ -1657,7 +1680,7 @@ def configure_command(
                     if piece.strip()
                 ]
                 engine = SetupEngine(path=config_path)
-                engine.apply(
+                mutation = engine.apply(
                     "ensemble",
                     {
                         "enabled": enabled,
@@ -1668,6 +1691,8 @@ def configure_command(
                     },
                 )
                 result = engine.persist()
+                for warning in mutation.warnings:
+                    console.print(warning_panel(warning))
                 _print_saved_path(result.path)
                 _print_restart_guidance(result, config_path)
                 return
@@ -1751,7 +1776,7 @@ def configure_command(
                 # Explicit flags without the section's gate flag: refuse
                 # instead of silently forwarding nothing to the wizard.
                 _exit_incomplete_headless_flags(normalized, given)
-        except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+        except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
             _exit_config_load_error(exc, config_path)
         except (KeyError, TypeError, ValueError) as exc:
             error_console.print(f"[red]Error:[/red] {markup_escape(exc)}")
@@ -1773,7 +1798,7 @@ def configure_command(
         # EOFError covers Ctrl+D / exhausted piped stdin at a prompt — the
         # same operator intent as Esc/Ctrl+C, so the same productized exit.
         _exit_cancelled(exc)
-    except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         _exit_config_load_error(exc, config_path)
     except (KeyError, TypeError, ValueError) as exc:
         # Mutation-level validation failures reachable from the wizard (e.g.

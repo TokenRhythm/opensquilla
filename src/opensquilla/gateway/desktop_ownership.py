@@ -43,6 +43,7 @@ DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION: Final = 1
 DESKTOP_GATEWAY_INSTANCE_NONCE_ENV: Final = (
     "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE"
 )
+DESKTOP_GATEWAY_AUTH_CONTEXT: Final = b"opensquilla-desktop-gateway-auth-v1"
 
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 _PROOF_VALUE_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -85,6 +86,28 @@ def valid_desktop_challenge(value: object) -> bool:
 
 def valid_desktop_proof(value: object) -> bool:
     return isinstance(value, str) and _PROOF_VALUE_RE.fullmatch(value) is not None
+
+
+def desktop_gateway_auth_token(instance_nonce: str) -> str:
+    """Derive a renderer credential without exposing the process-control nonce."""
+
+    return hmac.new(
+        instance_nonce.encode("ascii"),
+        DESKTOP_GATEWAY_AUTH_CONTEXT,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def active_desktop_gateway_auth_token_matches(candidate: object) -> bool:
+    """Validate a credential only while its exact Desktop Gateway is active."""
+
+    owner = _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP
+    if owner is None or not isinstance(candidate, str) or not valid_desktop_proof(candidate):
+        return False
+    return hmac.compare_digest(
+        candidate,
+        desktop_gateway_auth_token(owner.instance_nonce),
+    )
 
 
 def _linux_process_start_identity(pid: int) -> str | None:
@@ -508,6 +531,7 @@ def release_active_desktop_gateway_ownership() -> None:
 
 
 __all__ = [
+    "DESKTOP_GATEWAY_AUTH_CONTEXT",
     "DESKTOP_GATEWAY_INSTANCE_NONCE_ENV",
     "DESKTOP_GATEWAY_OWNERSHIP_DIR_ENV",
     "DESKTOP_GATEWAY_OWNERSHIP_FILENAME",
@@ -515,9 +539,11 @@ __all__ = [
     "DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL",
     "DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION",
     "DesktopGatewayOwnership",
+    "active_desktop_gateway_auth_token_matches",
     "activate_desktop_gateway_ownership",
     "canonical_identity_payload",
     "canonical_shutdown_payload",
+    "desktop_gateway_auth_token",
     "process_start_identity",
     "release_active_desktop_gateway_ownership",
     "valid_desktop_challenge",

@@ -59,6 +59,20 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
       return vi.fn()
     }),
   }
+  const planCenter = {
+    available: () => true,
+    setMode: (sessionKey: string, mode: string, expectedRevision: number) => rpc.call('plans.setMode', { sessionKey, mode, expectedRevision }),
+    revise: (sessionKey: string, request: { revisionId: string; prompt: string }, clientRequestId: string) => rpc.call('plans.revise', { sessionKey, planRevisionId: request.revisionId, prompt: request.prompt, clientRequestId }),
+    implement: (sessionKey: string, target: { revisionId: string }, clientRequestId: string, options?: { intent?: string }) => rpc.call('plans.implement', { sessionKey, planRevisionId: target.revisionId, clientRequestId, ...(options?.intent ? { intent: options.intent } : {}) }),
+    cancelRun: (sessionKey: string, runId: string, expectedStateRevision?: number) => rpc.call('plans.cancelRun', { sessionKey, runId, ...(expectedStateRevision !== undefined ? { expectedStateRevision } : {}) }),
+    subscribe: (listener: (event: any) => void) => {
+      const unsubs = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run'].map(name => {
+        const handler = (...args: unknown[]) => listener({ kind: name.endsWith('run') ? 'run' : name.endsWith('revision') ? 'revision' : 'collaboration', sessionKey: (args[0] as Record<string, unknown>)?.session_key, collaboration: (args[0] as Record<string, unknown>)?.collaboration, plan: (args[0] as Record<string, unknown>)?.plan_revision, run: (args[0] as Record<string, unknown>)?.plan_run })
+        return rpc.on(name, handler)
+      })
+      return { close: () => unsubs.forEach(unsub => unsub()) }
+    },
+  }
   const sessionKey = ref(SESSION_ONE)
   const currentEpoch = ref(0)
   const isStreaming = ref(false)
@@ -67,7 +81,7 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
   const notifyError = vi.fn()
   const onMutationAccepted = vi.fn()
   const api = useChatPlans({
-    rpc,
+    planCenter,
     sessionKey,
     currentEpoch,
     isStreaming,
@@ -95,6 +109,133 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
 }
 
 describe('useChatPlans', () => {
+  it.each(['queued', 'running'])('pauses only the visible %s run when its owning task settles', status => {
+    const { api } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run(status, {
+      activeTaskId: 'task-owner',
+      steps: [
+        { stepId: 'inspect', title: 'Inspect', status: 'completed' },
+        { stepId: 'implement', title: 'Implement', status: 'in_progress' },
+      ],
+      currentStepId: 'implement',
+    }) })
+    const authoritative = api.activePlanRun.value!
+    api.noteTaskSettled('task-owner')
+    const visible = api.activePlanRun.value!
+    expect(visible).toEqual({ ...authoritative, status: 'paused', activeTaskId: undefined })
+    expect(authoritative.status).toBe(status)
+    expect(authoritative.activeTaskId).toBe('task-owner')
+    expect(visible.steps).toBe(authoritative.steps)
+    expect(visible.currentStepId).toBe('implement')
+    expect(visible.finishedAt).toBe(authoritative.finishedAt)
+    api.noteTaskSettled('task-owner')
+    expect(api.activePlanRun.value).toBe(visible)
+  })
+
+  it('does not pause a run for an unrelated or missing task identity', () => {
+    const { api } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    const authoritative = api.activePlanRun.value
+    api.noteTaskSettled('task-other')
+    api.noteTaskSettled('')
+    expect(api.activePlanRun.value).toBe(authoritative)
+    expect(api.activePlanRun.value?.status).toBe('running')
+  })
+
+  it('keeps late old-owner running updates paused and accepts a same-run new owner', () => {
+    const { api, handlers } = harness()
+    api.subscribe()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-old',
+    }) })
+    api.noteTaskSettled('task-old')
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('running', {
+      activeTaskId: 'task-old', stateRevision: 4, updatedAt: 304,
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'paused', stateRevision: 4, activeTaskId: undefined })
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('paused', {
+      activeTaskId: null, stateRevision: 5, updatedAt: 305, terminalReason: 'task_cancelled',
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'paused', stateRevision: 5, terminalReason: 'task_cancelled' })
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('running', {
+      activeTaskId: 'task-new', stateRevision: 6, updatedAt: 306,
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'running', stateRevision: 6, activeTaskId: 'task-new' })
+    // A delayed pre-resume snapshot must not transfer ownership back to A.
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('running', {
+      activeTaskId: 'task-old', stateRevision: 4, updatedAt: 304,
+    }) })
+    expect(api.activePlanRun.value?.activeTaskId).toBe('task-new')
+  })
+
+  it.each(['cancelled', 'completed', 'superseded'])('preserves an authoritative %s run after temporary pause', status => {
+    const { api, handlers } = harness()
+    api.subscribe()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    api.noteTaskSettled('task-owner')
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run(status, {
+      activeTaskId: 'task-owner', stateRevision: 4, updatedAt: 304, finishedAt: 304,
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status, finishedAt: 304 })
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('running', {
+      activeTaskId: 'task-owner', stateRevision: 5, updatedAt: 305,
+    }) })
+    expect(api.activePlanRun.value?.status).toBe(status)
+  })
+
+  it.each(['paused', 'blocked'])('does not rewrite an authoritative %s state or its progress', status => {
+    const { api } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run(status, {
+      activeTaskId: 'task-owner', terminalReason: 'needs_input',
+    }) })
+    const authoritative = api.activePlanRun.value
+    api.noteTaskSettled('task-owner')
+    expect(api.activePlanRun.value).toBe(authoritative)
+  })
+
+  it('remembers a task terminal received before its run bootstrap', () => {
+    const { api } = harness()
+    api.noteTaskSettled('task-owner')
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 0, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'paused', activeTaskId: undefined })
+  })
+
+  it('keeps a new-epoch task terminal through bootstrap and rejects an older-epoch terminal', () => {
+    const { api, currentEpoch } = harness()
+    api.noteTaskSettled('task-owner', 4)
+    expect(currentEpoch.value).toBe(4)
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 4, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    expect(api.activePlanRun.value?.status).toBe('paused')
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 4, activePlanRun: run('running', {
+      activeTaskId: 'task-new', stateRevision: 5, updatedAt: 305,
+    }) })
+    api.noteTaskSettled('task-new', 3)
+    expect(api.activePlanRun.value).toMatchObject({ status: 'running', activeTaskId: 'task-new' })
+  })
+
+  it.each(['reset', 'epoch', 'session'])('clears settled task presentation on %s without contaminating the new context', kind => {
+    const { api, currentEpoch, sessionKey } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 0, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    api.noteTaskSettled('task-owner')
+    if (kind === 'reset') api.reset()
+    else if (kind === 'epoch') currentEpoch.value = 1
+    else sessionKey.value = SESSION_TWO
+    api.applyBootstrap({ key: sessionKey.value, epoch: currentEpoch.value, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'running', activeTaskId: 'task-owner' })
+  })
+
   it('hydrates collaboration, current revision, and active run from bootstrap', () => {
     const { api } = harness()
 
@@ -665,3 +806,18 @@ describe('useChatPlans', () => {
     expect(api.pendingAction.value).toBeNull()
   })
 })
+  it('does not hide published Goal-owned PlanRun compatibility snapshots', () => {
+    const { api, handlers } = harness()
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+    })
+    api.subscribe()
+
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('running', { driverKind: 'goal', driverId: 'goal-1' }),
+    })
+
+    expect(api.activePlanRun.value?.driverKind).toBe('goal')
+  })

@@ -1,0 +1,464 @@
+import assert from 'node:assert/strict'
+import { spawn, spawnSync } from 'node:child_process'
+import { EventEmitter, once } from 'node:events'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import { createConnection } from 'node:net'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import {
+  runCommandWithTelemetry,
+  startCaseTelemetry,
+} from './ci-case-telemetry.mjs'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
+  gatewayProcessSnapshot,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
+import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
+
+const scriptDir = dirname(fileURLToPath(import.meta.url))
+const helperPath = join(scriptDir, 'ci-case-telemetry.mjs')
+const root = await mkdtemp(join(tmpdir(), 'opensquilla-ci-case-telemetry-'))
+const outputPath = join(root, 'reports', 'cases.jsonl')
+const emitted = []
+
+try {
+  for (const scheme of [
+    'windows-creation-filetime:', 'linux-proc-start-ticks:', 'posix-ps-lstart:',
+  ]) {
+    const record = { pid: 1234, start_identity: `${scheme}old` }
+    const probePid = pid => assert.equal(pid, record.pid)
+    const recycled = gatewayProcessSnapshot(record, {
+      probePid,
+      readStartIdentity: () => `${scheme}new`,
+    })
+    assert.equal(recycled.pidPresent, true)
+    assert.equal(recycled.identityConflict, true)
+    assert.equal(recycled.alive, false, 'PID reuse must not keep the old Gateway alive')
+    for (const liveStartIdentity of [record.start_identity, null, 'runtime-start:unknown']) {
+      assert.equal(gatewayProcessSnapshot(record, {
+        probePid,
+        readStartIdentity: () => liveStartIdentity,
+      }).alive, true, 'matching or unprovable identities must keep waiting')
+    }
+    assert.equal(gatewayProcessSnapshot(record, {
+      probePid: () => { throw Object.assign(new Error('missing'), { code: 'ESRCH' }) },
+      readStartIdentity: () => { assert.fail('an absent PID needs no identity probe') },
+    }).alive, false)
+    assert.equal(gatewayProcessSnapshot(record, {
+      probePid: () => { throw Object.assign(new Error('denied'), { code: 'EPERM' }) },
+      readStartIdentity: () => null,
+    }).alive, true, 'a denied probe is not exit evidence')
+  }
+  assert.equal(gatewayProcessSnapshot({ pid: 1234, start_identity: 'runtime-start:old' }, {
+    probePid: () => {},
+    readStartIdentity: () => 'windows-creation-filetime:new',
+  }).alive, true, 'an opaque recorded identity cannot prove PID reuse')
+  const telemetry = startCaseTelemetry({
+    caseName: 'direct-case',
+    os: 'TestOS',
+    shard: 'unit',
+    attempt: 2,
+    outputPath,
+    emit: line => emitted.push(line),
+  })
+  const direct = await telemetry.finish('passed')
+  assert.equal(direct.case, 'direct-case')
+  assert.equal(direct.os, 'TestOS')
+  assert.equal(direct.shard, 'unit')
+  assert.equal(direct.attempt, 2)
+  assert.equal(direct.status, 'passed')
+  assert.equal(direct.duration_unit, 'ms')
+  assert.ok(direct.duration >= 0)
+  assert.ok(Date.parse(direct.end) >= Date.parse(direct.start))
+  await assert.rejects(() => telemetry.finish('passed'), /already finished/)
+
+  const passed = await runCommandWithTelemetry({
+    caseName: 'command-pass',
+    os: 'TestOS',
+    shard: 'unit',
+    attempt: 1,
+    outputPath,
+    emit: line => emitted.push(line),
+    command: process.execPath,
+    args: ['-e', 'process.exit(0)'],
+  })
+  assert.equal(passed.exitCode, 0)
+  assert.equal(passed.record.status, 'passed')
+
+  const failed = await runCommandWithTelemetry({
+    caseName: 'command-fail',
+    os: 'TestOS',
+    shard: 'unit',
+    attempt: 3,
+    outputPath,
+    emit: line => emitted.push(line),
+    command: process.execPath,
+    args: ['-e', 'process.exit(7)'],
+  })
+  assert.equal(failed.exitCode, 7)
+  assert.equal(failed.record.status, 'failed')
+  assert.deepEqual(failed.record.details, { exit_code: 7, signal: null })
+
+  const timedOut = await runCommandWithTelemetry({
+    caseName: 'command-timeout',
+    os: 'TestOS',
+    shard: 'unit',
+    attempt: 1,
+    outputPath,
+    emit: line => emitted.push(line),
+    timeoutMs: 100,
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 30_000)'],
+  })
+  assert.notEqual(timedOut.exitCode, 0)
+  assert.equal(timedOut.record.status, 'failed')
+  assert.equal(timedOut.record.details.timed_out, true)
+  assert.equal(timedOut.record.details.timeout_ms, 100)
+
+  const cliPassed = spawnSync(process.execPath, [
+    helperPath,
+    'run',
+    '--case', 'cli-pass',
+    '--os', 'TestOS',
+    '--shard', 'cli',
+    '--attempt', '4',
+    '--output', outputPath,
+    '--',
+    process.execPath,
+    '-e',
+    'process.exit(process.env.OPENSQUILLA_DESKTOP_E2E_ATTEMPT === "4" '
+      + '&& process.env.OPENSQUILLA_DESKTOP_E2E_SHARD === "cli" '
+      + `&& process.env.OPENSQUILLA_CI_CASE_TELEMETRY_PATH === ${JSON.stringify(outputPath)} `
+      + '? 0 : 8)',
+  ], { encoding: 'utf8' })
+  assert.equal(cliPassed.status, 0, cliPassed.stderr)
+  const cliPassedRecord = JSON.parse(cliPassed.stdout.trim())
+  assert.equal(cliPassedRecord.status, 'passed')
+
+  const cliFailed = spawnSync(process.execPath, [
+    helperPath,
+    'run',
+    '--case', 'cli-fail',
+    '--os', 'TestOS',
+    '--shard', 'cli',
+    '--attempt', '5',
+    '--output', outputPath,
+    '--',
+    process.execPath,
+    '-e',
+    'process.exit(9)',
+  ], { encoding: 'utf8' })
+  assert.equal(cliFailed.status, 9, cliFailed.stderr)
+  const cliFailedRecord = JSON.parse(cliFailed.stdout.trim())
+  assert.equal(cliFailedRecord.status, 'failed')
+
+  const activeServer = createServer(() => {})
+  const activeConnections = trackHttpServerConnections(activeServer)
+  await new Promise((resolveListen, rejectListen) => {
+    activeServer.once('error', rejectListen)
+    activeServer.listen(0, '127.0.0.1', resolveListen)
+  })
+  const activeAddress = activeServer.address()
+  assert.ok(activeAddress && typeof activeAddress === 'object')
+  const activeServerClosed = once(activeServer, 'close')
+  const activeRequest = once(activeServer, 'request')
+  const activeSocket = createConnection(activeAddress.port, '127.0.0.1')
+  const activeSocketClosed = once(activeSocket, 'close')
+  await once(activeSocket, 'connect')
+  activeSocket.write('GET /held-open HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+  await activeRequest
+  await assert.rejects(
+    () => closeHttpServerWithDeadline(activeServer, activeConnections, {
+      label: 'held-open fixture shutdown',
+      timeoutMs: 25,
+    }),
+    /held-open fixture shutdown timed out after 25ms/,
+  )
+  await activeServerClosed
+  await activeSocketClosed
+  assert.equal(activeSocket.destroyed, true)
+  assert.equal(activeConnections.size, 0)
+
+  const successfulKiller = new EventEmitter()
+  successfulKiller.exitCode = null
+  successfulKiller.signalCode = null
+  successfulKiller.kill = () => true
+  const successfulTreeKill = terminateWindowsProcessTree({
+    pid: 41,
+    timeoutMs: 100,
+    fallback: () => assert.fail('successful taskkill must not use the fallback'),
+    spawnProcess: () => {
+      queueMicrotask(() => successfulKiller.emit('exit', 0, null))
+      return successfulKiller
+    },
+  })
+  await assert.doesNotReject(successfulTreeKill)
+  assert.equal(await successfulTreeKill, true)
+
+  const hangingKiller = new EventEmitter()
+  hangingKiller.exitCode = null
+  hangingKiller.signalCode = null
+  let killedTaskkillWith = null
+  hangingKiller.kill = signal => {
+    killedTaskkillWith = signal
+    return true
+  }
+  let directFallbacks = 0
+  let treeFailure = null
+  assert.equal(await terminateWindowsProcessTree({
+    pid: 42,
+    timeoutMs: 25,
+    fallback: () => { directFallbacks += 1 },
+    onFailure: failure => { treeFailure = failure },
+    spawnProcess: () => hangingKiller,
+  }), false)
+  assert.equal(killedTaskkillWith, 'SIGKILL')
+  assert.equal(directFallbacks, 1)
+  assert.deepEqual(treeFailure, {
+    pid: 42,
+    timedOut: true,
+    exitCode: null,
+    signal: null,
+    error: 'taskkill exceeded 25ms',
+  })
+
+  // ElectronApplication.process() depends on a live Playwright dispatcher.
+  // Successful close disposes it, so even diagnostics must retain the owned
+  // ChildProcess beforehand instead of accessing the application afterward.
+  const nativeFixtureSource = await readFile(
+    join(scriptDir, 'test-desktop-window-background-flow.mjs'), 'utf8',
+  )
+  const assertNativeShutdownProcessOwnership = source => {
+    const closeIndex = source.indexOf('const shutdown = await closeElectronWithDeadline(')
+    const capture = /const\s+ownedChild\s*=\s*desktopApp\s*\.\s*process\s*\(\s*\)/.exec(source)
+    assert.ok(closeIndex >= 0, 'native fixture must retain bounded Electron shutdown')
+    assert.ok(capture && capture.index < closeIndex,
+      'capture the owned ChildProcess before closing Electron')
+    assert.doesNotMatch(source.slice(closeIndex), /desktopApp\s*\.\s*process\s*\(/,
+      'never call the disposed Playwright process accessor after close begins')
+    assert.match(source.slice(closeIndex), /childExited:\s*ownedChild\s*\?/,
+      'post-close diagnostics must inspect the retained owned handle')
+  }
+  assertNativeShutdownProcessOwnership(nativeFixtureSource)
+  assert.throws(() => assertNativeShutdownProcessOwnership(
+    nativeFixtureSource.replace('childExited: ownedChild ?', 'childExited: desktopApp.process() ?'),
+  ), /never call the disposed Playwright process accessor/)
+  assert.throws(() => assertNativeShutdownProcessOwnership(
+    nativeFixtureSource.replace(/const\s+ownedChild\s*=\s*desktopApp\s*\.\s*process\s*\(\s*\)/, ''),
+  ), /capture the owned ChildProcess before closing Electron/)
+
+  const shutdownLogs = []
+  // The production helper invokes real taskkill on Windows, so this fixture
+  // must own its PID rather than supplying a synthetic EventEmitter PID.
+  const hangingProcess = spawn(process.execPath, ['-e', `
+    process.on('disconnect', () => process.exit(0));
+    process.send({ type: 'ready', pid: process.pid });
+    setInterval(() => {}, 1000);
+  `], {
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    windowsHide: true,
+  })
+  const hangingProcessClosed = new Promise(resolveClose => hangingProcess.once('close', resolveClose))
+  try {
+    const [ready] = await once(hangingProcess, 'message', { signal: AbortSignal.timeout(5_000) })
+    assert.deepEqual(ready, { type: 'ready', pid: hangingProcess.pid })
+    const hangingElectron = {
+      close: () => new Promise(() => {}),
+      process: () => hangingProcess,
+    }
+    const hangingShutdown = await closeElectronWithDeadline({
+      app: hangingElectron,
+      phase: 'unit-hanging-electron',
+      timeoutMs: 25,
+      diagnosticTimeoutMs: 25,
+      diagnostics: async () => ({ marker: 'bounded-diagnostic' }),
+      emit: line => shutdownLogs.push(line),
+    })
+    assert.equal(hangingShutdown.closed, false)
+    assert.equal(hangingShutdown.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+    assert.equal(hangingShutdown.forcedExitSucceeded, true)
+    assert.equal(hangingShutdown.processTreeReaped, true)
+    assert.match(hangingShutdown.error.message, /DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED/)
+    assert.ok(hangingProcess.exitCode !== null || hangingProcess.signalCode !== null)
+    assert.equal(shutdownLogs.length, 1)
+    const shutdownLog = JSON.parse(shutdownLogs[0])
+    assert.deepEqual({
+      ...shutdownLog,
+      error: String(shutdownLog.error).split('\n')[0],
+    }, {
+      event: 'desktop_e2e_electron_shutdown_failed',
+      phase: 'unit-hanging-electron',
+      timeoutMs: 25,
+      error: 'Error: unit-hanging-electron Electron shutdown timed out after 25ms',
+      process: {
+        pid: hangingProcess.pid,
+        exitCode: null,
+        signalCode: null,
+        killed: false,
+      },
+      diagnostics: { marker: 'bounded-diagnostic' },
+    })
+  } finally {
+    if (hangingProcess.exitCode === null && hangingProcess.signalCode === null) {
+      hangingProcess.kill('SIGKILL')
+    }
+    let closeTimer
+    try {
+      await Promise.race([
+        hangingProcessClosed,
+        new Promise((_, reject) => {
+          closeTimer = setTimeout(() => reject(new Error('Owned telemetry fixture did not close')), 5_000)
+        }),
+      ])
+    } finally {
+      clearTimeout(closeTimer)
+    }
+  }
+  assert.throws(() => process.kill(hangingProcess.pid, 0), { code: 'ESRCH' })
+
+  const shutdownCheckpoint = '{"event":"previous_launch"}\n'
+  const cleanGatewayExit = JSON.stringify({
+    event: 'quit_gateway_exit',
+    exited: true,
+    hardTerminated: false,
+  })
+  const committedExit = JSON.stringify({
+    event: 'desktop_exit_phase',
+    to: 'committed',
+    reason: 'all lifecycle-owned Gateways exited',
+  })
+  const shutdownEvidence = desktopShutdownEvidenceSince(
+    shutdownCheckpoint,
+    `${shutdownCheckpoint}${cleanGatewayExit}\n${committedExit}\n`,
+  )
+  assert.deepEqual(shutdownEvidence, {
+    gatewayExitLogged: true,
+    committedExitLogged: true,
+  })
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${cleanGatewayExit}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${committedExit}\n${cleanGatewayExit}\n`,
+    ),
+    { gatewayExitLogged: true, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${JSON.stringify({
+        event: 'quit_gateway_exit',
+        exited: true,
+        hardTerminated: true,
+      })}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      null,
+      `${shutdownCheckpoint}${cleanGatewayExit}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  const hardGatewayExit = JSON.stringify({
+    event: 'quit_gateway_exit',
+    exited: true,
+    hardTerminated: true,
+  })
+  const failedGatewayExit = JSON.stringify({
+    event: 'quit_gateway_exit',
+    exited: false,
+    hardTerminated: false,
+  })
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${cleanGatewayExit}\n${hardGatewayExit}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${cleanGatewayExit}\n${failedGatewayExit}\n${committedExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+  assert.deepEqual(
+    desktopShutdownEvidenceSince(
+      shutdownCheckpoint,
+      `${shutdownCheckpoint}${cleanGatewayExit}\n${committedExit}\n${hardGatewayExit}\n`,
+    ),
+    { gatewayExitLogged: false, committedExitLogged: false },
+  )
+
+  const acceptedShutdown = {
+    closed: false,
+    closeErrorCode: 'DESKTOP_E2E_SHUTDOWN_TIMEOUT',
+    forcedExitSucceeded: true,
+    processTreeReaped: true,
+  }
+  const acceptanceProof = {
+    platform: 'win32',
+    shutdown: acceptedShutdown,
+    ...shutdownEvidence,
+  }
+  assert.equal(canAcceptWindowsElectronShutdownFallback(acceptanceProof), true)
+  for (const rejected of [
+    { ...acceptanceProof, platform: 'darwin' },
+    { ...acceptanceProof, shutdown: { ...acceptedShutdown, closed: true } },
+    {
+      ...acceptanceProof,
+      shutdown: { ...acceptedShutdown, closeErrorCode: 'SYNTHETIC_CLOSE_FAILURE' },
+    },
+    {
+      ...acceptanceProof,
+      shutdown: { ...acceptedShutdown, forcedExitSucceeded: false },
+    },
+    {
+      ...acceptanceProof,
+      shutdown: { ...acceptedShutdown, processTreeReaped: false },
+    },
+    { ...acceptanceProof, gatewayExitLogged: false },
+    { ...acceptanceProof, committedExitLogged: false },
+  ]) {
+    assert.equal(canAcceptWindowsElectronShutdownFallback(rejected), false)
+  }
+
+  const records = (await readFile(outputPath, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line))
+  assert.deepEqual(records, [
+    ...emitted.map(line => JSON.parse(line)),
+    cliPassedRecord,
+    cliFailedRecord,
+  ])
+  assert.deepEqual(records.map(record => record.case), [
+    'direct-case',
+    'command-pass',
+    'command-fail',
+    'command-timeout',
+    'cli-pass',
+    'cli-fail',
+  ])
+  await import('./test-packaged-first-send-cleanup.mjs')
+  await import('./test-session-recovery-transport-contract.mjs')
+  console.log('Desktop E2E case telemetry checks passed')
+} finally {
+  await rm(root, { recursive: true, force: true })
+}

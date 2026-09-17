@@ -78,6 +78,21 @@ def _collect(provider: Any) -> list[Any]:
     return asyncio.run(run())
 
 
+def _assert_incomplete_tool_starts(
+    events: list[Any],
+    *,
+    expected: list[tuple[str, str]],
+) -> None:
+    starts = [event for event in events if isinstance(event, ToolUseStartEvent)]
+    assert [(event.tool_use_id, event.tool_name) for event in starts] == expected
+    assert not any(isinstance(event, ToolUseDeltaEvent | ToolUseEndEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert [event.code for event in errors] == ["incomplete_tool_call"]
+    error_index = events.index(errors[0])
+    assert all(events.index(start) < error_index for start in starts)
+
+
 def test_ollama_eof_without_done_preserves_text_but_never_commits_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -208,7 +223,7 @@ def test_ollama_done_true_commits_buffered_tool_and_done(
         pytest.param("x" * 257, {"q": "complete"}, id="oversized-tool-name"),
     ],
 )
-def test_ollama_done_true_rejects_invalid_native_tool_call_atomically(
+def test_ollama_done_true_rejects_invalid_native_tool_call_after_recognized_starts(
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
     arguments: Any,
@@ -244,14 +259,13 @@ def test_ollama_done_true_rejects_invalid_native_tool_call_atomically(
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
         "partial text"
     ]
-    assert not any(isinstance(event, _TOOL_EVENTS) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
-        "incomplete_tool_call"
-    ]
+    expected = [("call_0", "lookup")]
+    if tool_name == "lookup":
+        expected.append(("call_1", "lookup"))
+    _assert_incomplete_tool_starts(events, expected=expected)
 
 
-def test_ollama_duplicate_tool_ids_fail_before_any_tool_lifecycle_is_released(
+def test_ollama_duplicate_tool_ids_keep_only_prior_recognized_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     body = _ndjson(
@@ -281,11 +295,7 @@ def test_ollama_duplicate_tool_ids_fail_before_any_tool_lifecycle_is_released(
 
     events = _collect(OllamaProvider(model="test-model"))
 
-    assert not any(isinstance(event, _TOOL_EVENTS) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
-        "incomplete_tool_call"
-    ]
+    _assert_incomplete_tool_starts(events, expected=[("duplicate", "lookup")])
 
 
 def test_ollama_applies_tool_call_limit_before_terminal_evidence(
@@ -320,11 +330,10 @@ def test_ollama_applies_tool_call_limit_before_terminal_evidence(
 
     events = _collect(OllamaProvider(model="test-model"))
 
-    assert not any(isinstance(event, _TOOL_EVENTS) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
-        "incomplete_tool_call"
-    ]
+    _assert_incomplete_tool_starts(
+        events,
+        expected=[(f"call_{index}", "lookup") for index in range(DEFAULT_MAX_TOOL_CALLS)],
+    )
 
 
 def test_ollama_applies_aggregate_argument_limit_while_ingesting_chunks(
@@ -361,11 +370,10 @@ def test_ollama_applies_aggregate_argument_limit_while_ingesting_chunks(
 
     events = _collect(OllamaProvider(model="test-model"))
 
-    assert not any(isinstance(event, _TOOL_EVENTS) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
-        "incomplete_tool_call"
-    ]
+    _assert_incomplete_tool_starts(
+        events,
+        expected=[(f"call_{index}", "lookup") for index in range(6)],
+    )
 
 
 @pytest.mark.parametrize(
@@ -501,7 +509,7 @@ def test_responses_max_output_tokens_keeps_length_continuation_but_drops_partial
         pytest.param("x" * 257, '{"q":"complete"}', id="oversized-tool-name"),
     ],
 )
-def test_responses_completed_rejects_invalid_native_tool_call_atomically(
+def test_responses_completed_rejects_invalid_native_tool_call_after_recognized_starts(
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
     arguments: str,
@@ -530,11 +538,10 @@ def test_responses_completed_rejects_invalid_native_tool_call_atomically(
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
         "partial text"
     ]
-    assert not any(isinstance(event, _TOOL_EVENTS) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
-        "incomplete_tool_call"
-    ]
+    expected = [("call_valid", "lookup")]
+    if tool_name == "lookup":
+        expected.append(("call_1", "lookup"))
+    _assert_incomplete_tool_starts(events, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -546,7 +553,7 @@ def test_responses_completed_rejects_invalid_native_tool_call_atomically(
         pytest.param("id", {}, id="mapping-item-id"),
     ],
 )
-def test_responses_completed_rejects_invalid_tool_identity_atomically(
+def test_responses_completed_rejects_invalid_tool_identity_after_prior_start(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
     value: Any,
@@ -575,11 +582,7 @@ def test_responses_completed_rejects_invalid_tool_identity_atomically(
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
         "partial text"
     ]
-    assert not any(isinstance(event, _TOOL_EVENTS) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
-        "incomplete_tool_call"
-    ]
+    _assert_incomplete_tool_starts(events, expected=[("call_valid", "lookup")])
 
 
 def test_responses_completed_rejects_non_array_output(
@@ -603,7 +606,7 @@ def test_responses_completed_rejects_non_array_output(
     ]
 
 
-def test_responses_duplicate_public_tool_id_is_rejected_before_first_end(
+def test_responses_duplicate_public_tool_id_keeps_only_first_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = json.loads(_responses_body(status="completed"))
@@ -628,11 +631,7 @@ def test_responses_duplicate_public_tool_id_is_rejected_before_first_end(
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
         "partial text"
     ]
-    assert not any(isinstance(event, _TOOL_EVENTS) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
-        "incomplete_tool_call"
-    ]
+    _assert_incomplete_tool_starts(events, expected=[("call_1", "lookup")])
 
 
 @pytest.mark.parametrize(

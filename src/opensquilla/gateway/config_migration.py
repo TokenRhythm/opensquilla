@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import tomli_w
+from pydantic import TypeAdapter
 
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.search.types import MAX_SEARCH_RESULTS
@@ -25,8 +26,34 @@ from opensquilla.search.types import MAX_SEARCH_RESULTS
 # ``GatewayConfig.config_version`` (gateway/config.py) defaults to this value.
 LATEST_CONFIG_VERSION = 1
 
+
+class ConfigParseError(ValueError):
+    """A user config file holds invalid TOML.
+
+    Loaders raise this instead of a bare ``tomllib.TOMLDecodeError`` so CLI
+    surfaces can name the offending file and point at the offline repair
+    instead of printing a traceback.
+    """
+
+    def __init__(self, path: str | Path, error: Exception) -> None:
+        self.path = Path(path)
+        super().__init__(f"invalid TOML in {self.path}: {error}")
+
 DEPRECATED_MEMORY_FIELDS: frozenset[str] = frozenset(
     {
+        "memory.flush_enabled",
+        "memory.flush_triggers",
+        "memory.flush_pre_compaction",
+        "memory.flush_timeout_seconds",
+        "memory.flush_background_timeout_seconds",
+        "memory.flush_backoff_initial_seconds",
+        "memory.flush_backoff_max_seconds",
+        "memory.flush_archive_max_bytes",
+        "memory.flush_compaction_requires_safe_receipt",
+        "memory.flush_compaction_safety_mode",
+        "memory.repair_enabled",
+        "memory.repair_interval_seconds",
+        "memory.repair_max_items_per_tick",
         "memory.profile",
         "memory.cost.embedding_cache",
         "memory.cost.rerank_cache",
@@ -77,8 +104,23 @@ DEPRECATED_AGENT_TOKEN_SAVING_LEAVES: frozenset[str] = frozenset(
     k.removeprefix("agent_token_saving.")
     for k in DEPRECATED_AGENT_TOKEN_SAVING_FIELDS
 )
+DEPRECATED_SKILL_FILTER_LEAVES: frozenset[str] = frozenset(
+    {
+        "filter_enabled",
+        "filter_top_k",
+        "filter_strategy",
+        "filter_lexical_top_n",
+        "filter_semantic_top_n",
+        "filter_rrf_k",
+        "filter_embedding_model",
+    }
+)
+DEPRECATED_SKILL_FILTER_FIELDS: frozenset[str] = frozenset(
+    f"skills.{leaf}" for leaf in DEPRECATED_SKILL_FILTER_LEAVES
+)
 _LEGACY_LLM_ENSEMBLE_TIMEOUT_SECONDS = frozenset({120.0, 300.0})
 _DEFAULT_LLM_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
+_LEGACY_TELEMETRY_BOOL: TypeAdapter[bool | None] = TypeAdapter(bool | None)
 
 
 def _legacy_llm_ensemble_timeout_number(value: Any) -> float | None:
@@ -96,6 +138,8 @@ _LEGACY_MEMORY_FIELDS_SEEN: set[str] = set()
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_WARN_LOCK = threading.Lock()
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_WARNED = False
 _LEGACY_AGENT_TOKEN_SAVING_FIELDS_SEEN: set[str] = set()
+_LEGACY_SKILL_FILTER_WARN_LOCK = threading.Lock()
+_LEGACY_SKILL_FILTER_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -157,13 +201,13 @@ def handle_deprecated_memory_fields(
         warnings.warn(
             f"OpenSquilla: {n} legacy memory.* config field(s) ignored "
             f"(e.g. {first_three}); see {log_ref} for details. "
-            f"These fields will be removed in 0.2.0.",
+            "These fields will be cleaned during config rewrite.",
             DeprecationWarning,
             stacklevel=6,
         )
         logging.getLogger(__name__).warning(
             "OpenSquilla: %d legacy memory.* config field(s) ignored (e.g. %s); "
-            "see %s for details. These fields will be removed in 0.2.0.",
+            "see %s for details. These fields will be cleaned during config rewrite.",
             n,
             first_three,
             log_ref,
@@ -215,6 +259,65 @@ def handle_deprecated_agent_token_saving_fields(
             first_three,
             log_ref,
         )
+
+
+def _handle_deprecated_skill_filter_fields(
+    found: dict[str, object],
+    source: str,
+) -> None:
+    """Log value shapes and issue one process warning for removed filter keys."""
+
+    global _LEGACY_SKILL_FILTER_WARNED
+    if not found:
+        return
+    with _LEGACY_SKILL_FILTER_WARN_LOCK:
+        should_warn = not _LEGACY_SKILL_FILTER_WARNED
+        _LEGACY_SKILL_FILTER_WARNED = True
+    _write_legacy_field_log(found, source)
+    if not should_warn:
+        return
+    fields = ", ".join(sorted(found))
+    message = (
+        "OpenSquilla: removed Skill relevance-filter configuration was ignored "
+        f"and will be cleaned during config rewrite ({fields}); the Skill "
+        "catalog now uses deterministic eligibility and visibility projection."
+    )
+    warnings.warn(message, DeprecationWarning, stacklevel=6)
+    logging.getLogger(__name__).warning(message)
+
+
+def strip_deprecated_skill_filter_settings(data: dict[str, object]) -> dict[str, object]:
+    """Discard only retired filter keys before nested settings validation."""
+
+    removed = {
+        f"skills.{key}": value
+        for key, value in data.items()
+        if key in DEPRECATED_SKILL_FILTER_LEAVES
+    }
+    if not removed:
+        return data
+    _handle_deprecated_skill_filter_fields(removed, "settings_validation")
+    return {key: value for key, value in data.items() if key not in DEPRECATED_SKILL_FILTER_LEAVES}
+
+
+def handle_deprecated_skill_filter_env() -> None:
+    """Ignore and warn for legacy filter environment variables.
+
+    Values are never parsed or logged. Both the historical nested SkillsConfig
+    prefix and the top-level nested-settings spelling are recognized.
+    """
+
+    found: dict[str, object] = {}
+    for leaf in sorted(DEPRECATED_SKILL_FILTER_LEAVES):
+        upper = leaf.upper()
+        for env_name in (
+            f"OPENSQUILLA_SKILLS_{upper}",
+            f"OPENSQUILLA_GATEWAY_SKILLS__{upper}",
+        ):
+            if env_name in os.environ:
+                found[env_name] = os.environ[env_name]
+    if found:
+        _handle_deprecated_skill_filter_fields(found, "environment")
 
 
 def _write_legacy_field_log(found: dict[str, object], source: str) -> None:
@@ -305,11 +408,14 @@ def migrate_config_payload(
     """
     builder = _MigrationBuilder(payload=copy.deepcopy(data))
 
+    _strip_removed_sandbox_fields(builder)
     _normalize_memory_fields(builder, emit_diagnostics=emit_diagnostics)
     _normalize_agent_token_saving_fields(
         builder,
         emit_diagnostics=emit_diagnostics,
     )
+    _normalize_skill_filter_fields(builder, emit_diagnostics=emit_diagnostics)
+    _normalize_telemetry_upload_preference(builder)
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
     _disable_unverifiable_feishu_webhook_entries(builder)
@@ -330,6 +436,33 @@ def migrate_config_payload(
     return builder.result()
 
 
+def _normalize_telemetry_upload_preference(builder: _MigrationBuilder) -> None:
+    privacy = builder.payload.get("privacy")
+    if not isinstance(privacy, dict):
+        return
+    legacy_choices = (
+        _LEGACY_TELEMETRY_BOOL.validate_python(privacy.get(name))
+        for name in ("reliability_diagnostics_enabled", "product_analytics_enabled")
+    )
+    # Match the prior config model's boolean coercion before discarding retired
+    # fields. Invalid old values must still raise rather than silently enable.
+    choices = tuple(legacy_choices)
+    if any(choice is False for choice in choices):
+        privacy["disable_network_observability"] = True
+        builder.changes.append("Preserved legacy telemetry opt-out in the global privacy switch")
+    for name in (
+        "reliability_diagnostics_enabled",
+        "reliability_notice_version",
+        "reliability_consented_at_utc",
+        "product_analytics_enabled",
+        "product_analytics_notice_version",
+        "product_analytics_consented_at_utc",
+    ):
+        if name in privacy:
+            privacy.pop(name)
+            builder.removed_fields.append(f"privacy.{name}")
+
+
 def _payload_config_version(payload: dict[str, Any]) -> int:
     """Return the payload's migration stamp; anything missing or invalid is 0.
 
@@ -341,6 +474,16 @@ def _payload_config_version(payload: dict[str, Any]) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
     return int(value)
+
+
+def _strip_removed_sandbox_fields(builder: _MigrationBuilder) -> None:
+    """Always-run: strip sandbox fields removed from the strict settings model."""
+    sandbox = builder.payload.get("sandbox")
+    if not isinstance(sandbox, dict):
+        return
+    if "auto_setup" in sandbox:
+        sandbox.pop("auto_setup")
+        builder.removed_fields.append("sandbox.auto_setup")
 
 
 def _normalize_memory_fields(
@@ -441,6 +584,31 @@ def _normalize_agent_token_saving_fields(
                 "agent_token_saving.tool_result_compression_* was removed; "
                 "tokenjuice projection is now the built-in tool-result path"
             )
+
+
+def _normalize_skill_filter_fields(
+    builder: _MigrationBuilder,
+    *,
+    emit_diagnostics: bool,
+) -> None:
+    """Always-run compatibility strip for removed ``skills.filter_*`` keys."""
+
+    skills = builder.payload.get("skills")
+    if not isinstance(skills, dict):
+        return
+    removed: dict[str, object] = {}
+    for leaf in sorted(DEPRECATED_SKILL_FILTER_LEAVES):
+        if leaf in skills:
+            removed[f"skills.{leaf}"] = skills.pop(leaf)
+    if not removed:
+        return
+    builder.removed_fields.extend(sorted(removed))
+    builder.warnings.append(
+        "removed Skill relevance-filter configuration was discarded; "
+        "catalog projection is deterministic"
+    )
+    if emit_diagnostics:
+        _handle_deprecated_skill_filter_fields(removed, "config_migration")
 
 
 def _clamp_search_max_results(builder: _MigrationBuilder) -> None:
@@ -645,15 +813,17 @@ _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
 ]
 
 
-def backup_and_write_migrated_config(
-    path: str | Path,
-    payload: dict[str, Any],
-    result: ConfigMigrationResult,
-) -> Path:
-    """Back up and atomically replace a migrated user config file."""
-    target = Path(path)
-    backup = make_config_backup(target)
+def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
+    """Atomically replace one TOML config file (same-dir temp, fsync, 0600).
 
+    Every writer that replaces ``config.toml`` converges on this helper so the
+    crash-durability contract lives in exactly one place. The recovery module
+    is the one intentional exception: it creates the repaired file with
+    ``O_EXCL`` after parking the corrupt original, so a replace would be wrong
+    there.
+    """
+
+    target = Path(path)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target.name}.",
         suffix=".tmp",
@@ -662,6 +832,8 @@ def backup_and_write_migrated_config(
     try:
         with os.fdopen(fd, "wb") as fh:
             tomli_w.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, native_io_path(target))
     except Exception:
@@ -671,9 +843,19 @@ def backup_and_write_migrated_config(
             pass
         raise
 
+
+def backup_and_write_migrated_config(
+    path: str | Path,
+    payload: dict[str, Any],
+    result: ConfigMigrationResult,
+) -> Path:
+    """Back up and atomically replace a migrated user config file."""
+    target = Path(path)
+    backup = make_config_backup(target)
+    atomic_write_config(target, payload)
     os.chmod(native_io_path(target), 0o600)
     logging.getLogger(__name__).warning(
-        "OpenSquilla config migrated for 0.2.0 schema",
+        "OpenSquilla config migrated",
         extra={
             "path": str(target),
             "backup": str(backup),
@@ -683,6 +865,33 @@ def backup_and_write_migrated_config(
         },
     )
     return backup
+
+
+_CONFIG_BACKUP_KEEP = 10
+
+
+def _prune_config_backups(source: Path, *, keep: int = _CONFIG_BACKUP_KEEP) -> None:
+    """Delete the oldest sibling backups beyond the newest ``keep`` files.
+
+    Backup names embed a lexically sortable timestamp, so name order is age
+    order. Only plain files are removed; anything link-shaped is left for the
+    inspector to flag rather than followed.
+    """
+
+    prefix = f"{source.name}.backup."
+    try:
+        siblings = sorted(
+            entry.name
+            for entry in os.scandir(native_io_path(source.parent))
+            if entry.name.startswith(prefix) and entry.is_file(follow_symlinks=False)
+        )
+    except OSError:
+        return
+    for name in siblings[: max(len(siblings) - keep, 0)]:
+        try:
+            os.unlink(native_io_path(source.parent / name))
+        except OSError:
+            continue
 
 
 def make_config_backup(target: str | Path) -> Path:
@@ -710,6 +919,7 @@ def make_config_backup(target: str | Path) -> Path:
                 pass
             raise
         native_io_path(backup).chmod(0o600)
+        _prune_config_backups(source)
         return backup
 
     raise FileExistsError(f"Could not create unique backup for {source}")

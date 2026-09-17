@@ -18,15 +18,17 @@ import logging
 import os
 import re
 import shutil
-import signal
 import sys
 import sysconfig
 import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
-from typing import Any, cast
 
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.sandbox.backend.base import Backend
 from opensquilla.sandbox.backend.filesystem_worker_policy import (
     build_filesystem_worker_policy,
@@ -46,6 +48,7 @@ from opensquilla.sandbox.permissions import (
     logical_absolute_path,
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import (
     NetworkMode,
     NetworkProxySpec,
@@ -59,8 +62,6 @@ log = logging.getLogger(__name__)
 
 _SANDBOX_EXEC_NAME = "sandbox-exec"
 _SANDBOX_EXEC_SYSTEM_PATH = Path("/usr/bin/sandbox-exec")
-_FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
-_FROZEN_FILESYSTEM_WORKER_ARG = "--_sandbox-filesystem-worker"
 _FILESYSTEM_PATH_OPERATION_KINDS = frozenset(
     {
         "read_file",
@@ -957,6 +958,15 @@ def _runtime_readonly_roots() -> tuple[Path, ...]:
         if not link_target.is_absolute():
             link_target = executable.parent / link_target
         symlink_roots = (link_target.parent, link_target.parent.parent)
+    base_executable = Path(
+        getattr(sys, "_base_executable", "") or executable
+    ).expanduser()
+    base_runtime_root = base_executable.parent.parent.absolute()
+    base_runtime_alias_roots = (
+        (base_runtime_root,)
+        if base_runtime_root != base_runtime_root.resolve(strict=False)
+        else ()
+    )
     prefix = Path(sys.prefix).expanduser().resolve(strict=False)
     base_prefix = Path(sys.base_prefix).expanduser().resolve(strict=False)
     configured = sysconfig.get_paths()
@@ -966,6 +976,7 @@ def _runtime_readonly_roots() -> tuple[Path, ...]:
         executable.resolve(strict=False).parent,
         executable.resolve(strict=False).parent.parent,
         *((prefix,) if prefix != base_prefix else ()),
+        *base_runtime_alias_roots,
         *(
             Path(configured[name])
             for name in ("stdlib", "platstdlib", "purelib", "platlib")
@@ -1011,15 +1022,7 @@ def _python_executable() -> Path:
 
 
 def _filesystem_worker_argv() -> tuple[str, ...]:
-    if bool(getattr(sys, "frozen", False)):
-        return (str(_python_executable()), _FROZEN_FILESYSTEM_WORKER_ARG)
-    return (
-        str(_python_executable()),
-        "-B",
-        "-m",
-        _FILESYSTEM_WORKER_MODULE,
-        "-",
-    )
+    return internal_child_argv(ChildRole.FILESYSTEM_WORKER, args=("-",))
 
 
 def _filesystem_worker_env() -> dict[str, str]:
@@ -1146,14 +1149,13 @@ class SeatbeltBackend(Backend):
             wall = request.policy.limits.wall_timeout_s
             started = time.monotonic()
             try:
-                proc = await asyncio.create_subprocess_exec(
+                proc = await create_owned_subprocess_exec(
                     *argv,
                     stdin=asyncio.subprocess.PIPE if request.stdin is not None else None,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=str(request.cwd),
                     env=env,
-                    start_new_session=True,
                 )
             except FileNotFoundError as exc:
                 raise SandboxBackendError(f"seatbelt launch failed: {exc}") from exc
@@ -1165,9 +1167,19 @@ class SeatbeltBackend(Backend):
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     proc.communicate(input=request.stdin), timeout=wall
                 )
+            except asyncio.CancelledError:
+                await asyncio.shield(_terminate_process_group(proc))
+                raise
             except TimeoutError:
                 timed_out = True
                 stdout_bytes, stderr_bytes = await _terminate_process_group(proc)
+            else:
+                owner = getattr(proc, "_opensquilla_process_tree_owner", None)
+                if owner is not None:
+                    await owner.terminate(
+                        graceful_timeout=0.0,
+                        kill_timeout=_TERMINATE_GRACE_S,
+                    )
 
             elapsed = time.monotonic() - started
             stdout, trunc_out = _decode_capped(stdout_bytes)
@@ -1222,24 +1234,13 @@ def _decode_capped(raw: bytes | None) -> tuple[str, bool]:
 async def _terminate_process_group(
     proc: asyncio.subprocess.Process,
 ) -> tuple[bytes, bytes]:
-    pid = proc.pid
-    os_mod = cast(Any, os)
-    signal_mod = cast(Any, signal)
-    try:
-        os_mod.killpg(pid, signal_mod.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_S)
-    except TimeoutError:
-        try:
-            os_mod.killpg(pid, signal_mod.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+    owner = capture_process_tree_owner(proc, isolated=True)
+    await owner.terminate(
+        graceful_timeout=_TERMINATE_GRACE_S,
+        kill_timeout=_TERMINATE_GRACE_S,
+    )
+    with contextlib.suppress(ProcessLookupError):
+        await proc.wait()
 
     stdout = b""
     stderr = b""

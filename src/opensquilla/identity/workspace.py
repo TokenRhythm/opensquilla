@@ -7,9 +7,10 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from opensquilla.bootstrap_types import BootstrapFileReport
+from opensquilla.identity.bootstrap import RETIRED_WORKSPACE_FILENAMES
 from opensquilla.paths import native_io_path, state_dir
 from opensquilla.safety.injection_guard import InjectionFinding, scan_for_injection
-from opensquilla.session.keys import is_subagent_key
+from opensquilla.session.keys import is_guest_webchat_key, is_subagent_key
 
 # Matches YYYY-MM-DD.md or YYYY-MM-DD-<slug>.md (basename).
 _DATED_BASENAME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:-[a-z0-9][a-z0-9-]*)?\.md")
@@ -25,15 +26,12 @@ BOOTSTRAP_FILENAMES = [
     "AGENTS.md",
     "SOUL.md",
     "IDENTITY.md",
-    "TOOLS.md",
     "USER.md",
-    "BOOTSTRAP.md",
-    "HEARTBEAT.md",
 ]
 
-_SUBAGENT_BOOTSTRAP_ALLOWLIST = frozenset({"AGENTS.md", "SOUL.md", "TOOLS.md"})
-_CRON_BOOTSTRAP_ALLOWLIST = frozenset({"AGENTS.md", "TOOLS.md", "HEARTBEAT.md"})
-_SHARED_BOOTSTRAP_ALLOWLIST = frozenset({"AGENTS.md", "SOUL.md", "TOOLS.md"})
+_SUBAGENT_BOOTSTRAP_ALLOWLIST = frozenset({"AGENTS.md", "SOUL.md"})
+_CRON_BOOTSTRAP_ALLOWLIST = frozenset({"AGENTS.md"})
+_SHARED_BOOTSTRAP_ALLOWLIST = frozenset({"AGENTS.md", "SOUL.md"})
 
 
 def _is_within_root(root: Path, target: Path) -> bool:
@@ -63,6 +61,8 @@ def _bootstrap_allowlist_for_session(session_key: str | None) -> frozenset[str] 
         return None
 
     key = session_key.lower()
+    if is_guest_webchat_key(key):
+        return frozenset()
     if is_subagent_key(key):
         return _SUBAGENT_BOOTSTRAP_ALLOWLIST
     if key.startswith("cron:"):
@@ -77,7 +77,11 @@ def filter_workspace_filenames_for_session(
     session_key: str | None,
 ) -> tuple[str, ...]:
     """Filter candidate bootstrap filenames before disk reads and budgeting."""
-    ordered = tuple(filenames or BOOTSTRAP_FILENAMES)
+    ordered = tuple(
+        name
+        for name in (BOOTSTRAP_FILENAMES if filenames is None else filenames)
+        if name not in RETIRED_WORKSPACE_FILENAMES
+    )
     allowlist = _bootstrap_allowlist_for_session(session_key)
     if allowlist is None:
         return ordered
@@ -97,7 +101,7 @@ def load_workspace_files(
     root = Path(workspace_dir).expanduser()
     result: dict[str, str] = {}
 
-    for filename in filenames or BOOTSTRAP_FILENAMES:
+    for filename in filter_workspace_filenames_for_session(filenames, None):
         candidate = root / filename
         if not _is_within_root(root, candidate):
             continue
@@ -191,13 +195,12 @@ def load_workspace_files_budgeted_with_report(
             break
         file_limit = min(per_file_limit, remaining)
         raw_chars = len(content)
-        if filename != "BOOTSTRAP.md":
-            content, findings = scan_for_injection(
-                content,
-                f"workspace:{filename}",
-                mode=normalized_scan_mode,
-            )
-            _write_injection_findings(findings, safety_log_path=safety_log_path)
+        content, findings = scan_for_injection(
+            content,
+            f"workspace:{filename}",
+            mode=normalized_scan_mode,
+        )
+        _write_injection_findings(findings, safety_log_path=safety_log_path)
         injected = _truncate_with_marker(content, filename, file_limit)
         if not injected:
             continue
@@ -233,6 +236,11 @@ def filter_workspace_files_for_session(
 ) -> dict[str, str]:
     """Filter bootstrap files for a session's privacy and execution context."""
     allowlist = _bootstrap_allowlist_for_session(session_key)
+    workspace_files = {
+        name: content
+        for name, content in workspace_files.items()
+        if name not in RETIRED_WORKSPACE_FILENAMES
+    }
     if allowlist is None:
         return dict(workspace_files)
 
@@ -283,10 +291,7 @@ def load_daily_notes(
         # Canonical file first, then slugged variants (alphabetical).
         canonical_name = f"{prefix}.md"
         matches = sorted(
-            (
-                memory_dir / candidate.name
-                for candidate in native_memory_dir.glob(f"{prefix}*.md")
-            ),
+            (memory_dir / candidate.name for candidate in native_memory_dir.glob(f"{prefix}*.md")),
             key=lambda path: (path.name != canonical_name, path.name),
         )
         for candidate in matches:

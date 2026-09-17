@@ -1,0 +1,65 @@
+{
+  "format_version": 1,
+  "kind": "request",
+  "cases": [
+    {
+      "id": "request.default-page",
+      "coverage": "required-session-and-log-handle-with-page-defaults",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "execution-log-1",
+        "method": "sessions.executionLog.read",
+        "params": {
+          "sessionKey": "agent:main:webchat:synthetic-log",
+          "handle": "tr-0123456789abcdef0123456789abcdef"
+        }
+      }
+    },
+    {
+      "id": "request.page-beyond-preview",
+      "coverage": "character-offset-beyond-eight-mib-with-maximum-page-size",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "execution-log-2",
+        "method": "sessions.executionLog.read",
+        "params": {
+          "sessionKey": "agent:main:webchat:synthetic-log",
+          "handle": "tr-0123456789abcdef0123456789abcdef",
+          "offset": 9437184,
+          "limit": 12000
+        }
+      }
+    },
+    {
+      "id": "request.invalid-handle",
+      "coverage": "reject-a-file-path-in-place-of-a-log-handle",
+      "expectation": "reject",
+      "wire": {
+        "type": "req",
+        "id": "execution-log-invalid-handle",
+        "method": "sessions.executionLog.read",
+        "params": {
+          "sessionKey": "agent:main:webchat:synthetic-log",
+          "handle": "../synthetic-log.txt"
+        }
+      }
+    },
+    {
+      "id": "request.oversized-page",
+      "coverage": "reject-a-page-larger-than-the-response-budget",
+      "expectation": "reject",
+      "wire": {
+        "type": "req",
+        "id": "execution-log-oversized-page",
+        "method": "sessions.executionLog.read",
+        "params": {
+          "sessionKey": "agent:main:webchat:synthetic-log",
+          "handle": "tr-0123456789abcdef0123456789abcdef",
+          "limit": 12001
+        }
+      }
+    }
+  ]
+}

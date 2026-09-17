@@ -1,74 +1,36 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from './Icon.vue'
 import { useDesktopUpdate } from '@/composables/useDesktopUpdate'
+import { useDesktopUpdatePresentation } from '@/composables/useDesktopUpdatePresentation'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 
 const { t } = useI18n()
 const update = useDesktopUpdate()
 const open = ref(false)
 const triggerRef = ref<HTMLButtonElement | null>(null)
+const popoverRef = ref<HTMLElement | null>(null)
 const popoverStyle = ref<Record<string, string>>({})
-useDialogLayer(computed(() => open.value))
+useChatTopbarPopoverCoordination('desktop-update', open)
+const popoverIsTopmost = useDialogLayer(computed(() => open.value))
 
 onMounted(update.init)
 
-const status = computed(() => update.state.value.status)
-const latestVersion = computed(() => update.latestVersion.value)
-const manualInstall = computed(() => update.state.value.installMode === 'manual')
-const canInstall = computed(() => update.state.value.installMode !== 'unsupported')
-const busy = computed(() => update.actionBusy.value || status.value === 'downloading' || status.value === 'applying')
-const progressText = computed(() => {
-  const progress = update.state.value.progress
-  return typeof progress === 'number' ? String(Math.round(progress)) : ''
-})
-
-const indicatorLabel = computed(() => {
-  if (status.value === 'downloaded') {
-    return manualInstall.value
-      ? t('updates.desktop.indicatorInstallerReady')
-      : t('updates.desktop.indicatorDownloaded')
-  }
-  if (status.value === 'downloading') {
-    return progressText.value
-      ? t('updates.desktop.indicatorDownloadingProgress', { progress: progressText.value })
-      : t('updates.desktop.indicatorDownloading')
-  }
-  if (status.value === 'error') return t('updates.desktop.indicatorError')
-  return t('updates.desktop.indicatorAvailable', { version: latestVersion.value })
-})
-
-const title = computed(() => {
-  if (status.value === 'downloaded') {
-    return manualInstall.value
-      ? t('updates.desktop.manualDownloadedTitle')
-      : t('updates.desktop.downloadedTitle')
-  }
-  if (status.value === 'downloading') return t('updates.desktop.downloadingTitle')
-  if (status.value === 'error') return t('updates.desktop.errorTitle')
-  return t('updates.desktop.availableTitle', { version: latestVersion.value })
-})
-
-const description = computed(() => {
-  if (status.value === 'downloaded') {
-    return manualInstall.value
-      ? t('updates.desktop.manualDownloadedDesc', { version: latestVersion.value })
-      : t('updates.desktop.downloadedDesc', { version: latestVersion.value })
-  }
-  if (status.value === 'downloading') return t('updates.desktop.downloadingDesc')
-  if (status.value === 'error') return update.localizedError.value
-  if (manualInstall.value) return t('updates.desktop.manualAvailableDesc')
-  return t('updates.desktop.availableDesc')
-})
-
-const iconName = computed(() => {
-  if (status.value === 'downloaded') return 'check'
-  if (status.value === 'downloading') return 'refresh'
-  if (status.value === 'error') return 'info'
-  return 'download'
-})
+const {
+  status,
+  manualInstall,
+  canDownload,
+  canInstall,
+  busy,
+  indicatorLabel,
+  title,
+  description,
+  iconName,
+  severity,
+} = useDesktopUpdatePresentation(update)
 
 function positionPopover() {
   const trigger = triggerRef.value
@@ -90,11 +52,19 @@ function positionPopover() {
   }
 }
 
+watch(open, (isOpen, _wasOpen, onCleanup) => {
+  if (!isOpen) return
+  window.addEventListener('resize', positionPopover)
+  onCleanup(() => window.removeEventListener('resize', positionPopover))
+})
+
 async function toggle() {
   open.value = !open.value
   if (open.value) {
     await nextTick()
     positionPopover()
+    // Announce the dialog without placing initial focus on Quit and install.
+    popoverRef.value?.focus()
   }
 }
 
@@ -117,6 +87,34 @@ useDocumentEvent('click', (event) => {
   if (target instanceof Element && (target.closest('.desktop-update') || target.closest('.desktop-update__popover'))) return
   open.value = false
 })
+
+useDocumentEvent('keydown', event => {
+  if (event.defaultPrevented) return
+  if (!open.value || !popoverIsTopmost.value) return
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    open.value = false
+    triggerRef.value?.focus()
+    return
+  }
+  if (event.key !== 'Tab') return
+  const root = popoverRef.value
+  if (!root) return
+  const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>('button:not([disabled])'))
+  const first = buttons[0]
+  const last = buttons[buttons.length - 1]
+  const active = document.activeElement
+  if (!first || !last) {
+    event.preventDefault()
+    root.focus()
+  } else if (event.shiftKey && (active === first || active === root || !root.contains(active))) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && (active === last || active === root || !root.contains(active))) {
+    event.preventDefault()
+    first.focus()
+  }
+})
 </script>
 
 <template>
@@ -124,7 +122,8 @@ useDocumentEvent('click', (event) => {
     <button
       type="button"
       ref="triggerRef"
-      class="desktop-update__trigger"
+      class="desktop-update__trigger topbar-state topbar-state--update"
+      :data-state="severity"
       data-testid="desktop-update-indicator"
       :aria-expanded="open ? 'true' : 'false'"
       aria-haspopup="dialog"
@@ -136,7 +135,16 @@ useDocumentEvent('click', (event) => {
     </button>
 
     <Teleport to="body">
-      <div v-if="open" class="desktop-update__popover" :style="popoverStyle" role="dialog" :aria-label="title">
+      <div
+        v-if="open"
+        ref="popoverRef"
+        class="desktop-update__popover"
+        :style="popoverStyle"
+        role="dialog"
+        tabindex="-1"
+        :aria-label="title"
+        data-chat-topbar-popover="desktop-update"
+      >
         <div class="desktop-update__head">
           <Icon :name="iconName" :size="16" aria-hidden="true" />
           <strong>{{ title }}</strong>
@@ -144,7 +152,7 @@ useDocumentEvent('click', (event) => {
         <p class="desktop-update__desc">{{ description }}</p>
         <div class="desktop-update__actions">
           <button
-            v-if="status === 'available' && canInstall"
+            v-if="status === 'available' && canDownload"
             type="button"
             class="btn btn--primary"
             data-testid="desktop-update-download"
@@ -155,7 +163,7 @@ useDocumentEvent('click', (event) => {
             <span>{{ manualInstall ? t('updates.desktop.downloadInstaller') : t('updates.desktop.download') }}</span>
           </button>
           <button
-            v-if="status === 'downloaded' && update.state.value.installMode === 'native'"
+            v-if="status === 'downloaded' && canInstall"
             type="button"
             class="btn btn--primary"
             data-testid="desktop-update-relaunch"
@@ -163,12 +171,13 @@ useDocumentEvent('click', (event) => {
             @click="relaunch"
           >
             <Icon name="refresh" :size="14" aria-hidden="true" />
-            <span>{{ t('updates.desktop.relaunch') }}</span>
+            <span>{{ t(manualInstall ? 'updates.desktop.quitAndInstall' : 'updates.desktop.relaunch') }}</span>
           </button>
           <button
             v-if="status === 'downloaded' && manualInstall"
             type="button"
-            class="btn btn--primary"
+            class="btn"
+            :class="canInstall ? 'btn--ghost' : 'btn--primary'"
             data-testid="desktop-update-show-installer"
             :disabled="busy"
             @click="download"
@@ -199,10 +208,10 @@ useDocumentEvent('click', (event) => {
 
 .desktop-update__trigger {
   align-items: center;
-  background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
-  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: var(--topbar-state-fill);
+  border: 1px solid var(--topbar-state-border);
   border-radius: var(--radius-full);
-  color: var(--accent);
+  color: var(--topbar-state-channel);
   cursor: pointer;
   display: inline-flex;
   font: inherit;
@@ -221,7 +230,7 @@ useDocumentEvent('click', (event) => {
 }
 
 .desktop-update__trigger:hover {
-  background: color-mix(in srgb, var(--accent) 14%, var(--bg-elevated));
+  background: color-mix(in srgb, var(--topbar-state-channel) 14%, var(--bg-elevated));
 }
 
 .desktop-update__trigger:focus-visible {

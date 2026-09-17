@@ -211,6 +211,8 @@ Gateway-backed chat also supports session and operations commands:
 
 | Command | Purpose |
 | --- | --- |
+| `/goal <objective>` or `/goal set <objective>` | Start a durable multi-turn Goal. |
+| `/goal [status\|edit\|pause\|resume\|clear]` | Inspect or manage the current Goal; see [`goal-mode.md`](goal-mode.md). |
 | `/sessions [limit]` | Open a searchable recent-session picker in TUI (table in plain mode). |
 | `/resume [id]` | Open the picker, or resume a specific session. |
 | `/delete <id>` | Delete a session. |
@@ -286,4 +288,4 @@ running maintainer integration tests for terminal rendering.
 - [`features/tui-product-contract.md`](features/tui-product-contract.md) for
   ownership, shared-session, fallback, and legacy-freeze rules.
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

@@ -8,6 +8,7 @@ from opensquilla.gateway.config import (
     DingTalkChannelEntry,
     DiscordChannelEntry,
     FeishuChannelEntry,
+    GatewayConfig,
     MatrixChannelEntry,
     QQChannelEntry,
     SlackChannelEntry,
@@ -113,6 +114,7 @@ def test_safe_defaulted_identity_fields_fold_into_advanced(type_name: str):
 # decisions (transports, region). Positive pins per channel so a spec edit
 # that re-expands the default view fails loudly.
 ADVANCED_FOLDED_FIELDS = {
+    "dingtalk": {"cool_app_code"},
     "discord": {"application_id", "default_channel_id", "gateway_url", "intents"},
     "feishu": {"default_chat_id", "connection_mode", "webhook_path"},
     "matrix": {"device_id", "encryption"},
@@ -205,6 +207,32 @@ def test_dingtalk_stream_credentials_are_marked_correctly():
     assert fields["client_id"].secret is False
     assert fields["client_secret"].required is True
     assert fields["client_secret"].secret is True
+    assert fields["robot_code"].required is True
+    assert fields["robot_code"].secret is False
+    assert "not the application Client ID" in fields["robot_code"].description
+    assert fields["cool_app_code"].required is False
+    assert fields["cool_app_code"].default == ""
+    assert fields["cool_app_code"].advanced is True
+
+
+def test_dingtalk_legacy_stream_config_keeps_artifact_fields_optional():
+    config = GatewayConfig(
+        channels={
+            "channels": [
+                {
+                    "type": "dingtalk",
+                    "name": "legacy-dingtalk",
+                    "client_id": "legacy-client-id",
+                    "client_secret": "legacy-client-secret",
+                }
+            ]
+        }
+    )
+    entry = config.channels.channels[0]
+
+    assert isinstance(entry, DingTalkChannelEntry)
+    assert entry.robot_code == ""
+    assert entry.cool_app_code == ""
 
 
 def test_feishu_webhook_secrets_are_marked_secret():

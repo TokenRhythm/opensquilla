@@ -6,12 +6,54 @@ from collections.abc import Mapping
 from typing import Any
 
 from opensquilla.session.models import AgentTaskStatus
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 
 CONTEXT_PAYLOAD_TOO_LARGE_CODE = "provider_request_too_large"
+CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES = {
+    "provider_system_prompt_too_large": (
+        "The fixed system instructions exceed the provider request budget. "
+        "Shorten the system instructions or choose a larger-context model. "
+        "Stored history was not changed."
+    ),
+    "provider_tool_schema_too_large": (
+        "The tool definitions exceed the provider request budget. "
+        "Reduce the available tools or choose a larger-context model. "
+        "Stored history was not changed."
+    ),
+    "provider_protected_context_too_large": (
+        "The current input and protected recent context still exceed the "
+        "provider request budget after safe history reduction. Shorten the "
+        "current input or choose a larger-context model. Stored history was not changed."
+    ),
+}
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
     "Ensemble does not support image input yet. "
     "Switch to a single-model routing mode and try again."
+)
+IMAGE_INPUT_UNSUPPORTED_CODE = "image_input_unsupported"
+IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
+    "The selected model cannot process image input. Choose an image-capable "
+    "model or remove the image and try again."
+)
+_REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE = (
+    "the provider used the configured output budget for reasoning without returning a visible "
+    "answer. increase llm.max_tokens or choose another model or provider."
+)
+_REASONING_ONLY_OUTPUT_BUDGET_TERMINAL_MESSAGE = (
+    "The model used its output budget for reasoning without returning a visible answer. "
+    "Increase llm.max_tokens or choose another model or provider."
+)
+_REASONING_ONLY_EMPTY_ERROR_MESSAGE = (
+    "the provider returned reasoning without a visible answer. try again or choose another "
+    "model or provider."
+)
+_REASONING_ONLY_EMPTY_TERMINAL_MESSAGE = (
+    "The model returned reasoning without a visible answer. "
+    "Try again or choose another model or provider."
 )
 
 # Non-context budget-exhaustion codes. Context-window exhaustion has its own,
@@ -27,6 +69,101 @@ _BUDGET_CLASSES = frozenset(
         "turn_billed_cost_budget_exceeded",
     }
 )
+
+_SAFE_PROVIDER_FAILURE_MESSAGES = {
+    "rate_limited": "The model provider is rate-limiting requests. Try again later.",
+    "provider_overloaded": (
+        "The model provider is temporarily overloaded. Try again later."
+    ),
+    "auth_invalid": "The model provider rejected the configured credentials.",
+    "context_overflow": "The request exceeds the model provider's context window.",
+    "unsupported_feature": "The model provider does not support this request.",
+    "insufficient_credits": "The model provider account has insufficient credits.",
+    "model_not_found": "The configured model is unavailable from the provider.",
+    "transport_transient": (
+        "The connection to the model provider was interrupted. Try again."
+    ),
+    "policy_refusal": "The model provider refused this request under its policy.",
+    "empty_response": "The model provider returned an empty response.",
+    "malformed_response": "The model provider returned an invalid response.",
+    "bad_request": "The model provider rejected the request.",
+}
+_SAFE_PROVIDER_TERMINAL_CODES = frozenset(
+    {
+        "cancelled",
+        "context_length_exceeded",
+        "context_overflow",
+        "empty_response",
+        "ensemble_multimodal_unsupported",
+        "image_input_unsupported",
+        "incomplete_stream",
+        "incomplete_tool_call",
+        "incomplete_tool_stream",
+        "invalid_json",
+        "invalid_response",
+        "invalid_response_status",
+        "invalid_stream_frame",
+        "invalid_stream_order",
+        "iteration_timeout",
+        "llm_timeout",
+        "model_repetition_loop_detected",
+        "provider_protocol_error",
+        "provider_output_truncated",
+        "provider_pretext_buffer_exhausted",
+        "provider_retry_after_deadline",
+        "provider_request_budget_exhausted",
+        "provider_request_too_large",
+        "request_error",
+        "response_incomplete",
+        "synthetic_upstream_failure",
+        "stream_idle_timeout",
+        "timeout",
+        "usage_limit_reached",
+    }
+)
+
+
+def safe_provider_failure_message(
+    failure_kind: str | None, *, code: str | None = None, message: str | None = None
+) -> str:
+    """Project a stable provider failure kind to allowlisted user text.
+
+    This is a defense-in-depth boundary for Gateway producers other than the
+    current Agent. Raw upstream prose can echo prompts, response bodies, or
+    credentials and must never reach a client or durable terminal record.
+    """
+
+    if code == "empty_response" and isinstance(message, str) and message.lower() in {
+        _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE,
+        _REASONING_ONLY_EMPTY_ERROR_MESSAGE,
+    }:
+        return message
+    normalized = str(failure_kind or "").strip().lower().replace("-", "_")
+    return _SAFE_PROVIDER_FAILURE_MESSAGES.get(
+        normalized,
+        "The model provider request failed.",
+    )
+
+
+def safe_provider_failure_code(raw_code: str | None, failure_kind: str | None) -> str:
+    """Return a bounded terminal code without relaying provider-controlled text."""
+
+    normalized_code = str(raw_code or "").strip().lower().replace("-", "_")
+    if normalized_code.isascii() and normalized_code.isdigit() and len(normalized_code) <= 3:
+        return normalized_code
+    if normalized_code in _SAFE_PROVIDER_TERMINAL_CODES:
+        return normalized_code
+    normalized_kind = str(failure_kind or "").strip().lower().replace("-", "_")
+    if normalized_kind in _SAFE_PROVIDER_FAILURE_MESSAGES:
+        return f"provider_{normalized_kind}"
+    return "provider_error"
+
+
+def safe_error_id(value: object) -> str | None:
+    """Accept only the existing durable diagnostic reference format."""
+    if isinstance(value, str) and len(value) == 8 and all(c in "0123456789abcdef" for c in value):
+        return value
+    return None
 
 
 def build_terminal_reply(
@@ -61,7 +198,7 @@ def build_terminal_reply(
     if (
         status == AgentTaskStatus.TIMEOUT.value
         or reason == "timeout"
-        or error_class == "iteration_timeout"
+        or error_class in {"iteration_timeout", "llm_timeout", "stream_idle_timeout", "timeout"}
         or "timeouterror" in error_class
         or "iteration_timeout" in error_message
         or "stream idle" in error_message
@@ -70,14 +207,44 @@ def build_terminal_reply(
     if is_context_payload_too_large(record_or_payload) or (
         isinstance(existing, str) and _contains_context_payload_marker(existing)
     ):
+        capacity = _read_value(record_or_payload, "model_capacity")
+        capacity_hint = ""
+        if isinstance(capacity, Mapping) and capacity.get("source") == "default":
+            window = capacity.get("contextWindow")
+            if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+                capacity_hint = (
+                    f" The context window uses a system default of {window:,} tokens; "
+                    "verify this model's limits in Settings > Model Routing > Model settings."
+                )
+        # Only our complete, fixed diagnostics may survive this boundary.
+        # Upstream prose (including text appended to a known message) stays
+        # behind the generic context-error projection below.
+        for message in CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES.values():
+            if error_message == _normalize(message):
+                return message + capacity_hint
         return (
             "The request is too large for the provider context window after "
             "automatic context compaction and payload reduction. OpenSquilla "
             "preserved the recoverable state; retry with a narrower request "
             "or a larger-context model."
-        )
+        ) + capacity_hint
+    if (
+        error_class == "empty_response"
+        and error_message == _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE
+    ):
+        return _REASONING_ONLY_OUTPUT_BUDGET_TERMINAL_MESSAGE
+    if (
+        error_class == "empty_response"
+        and error_message == _REASONING_ONLY_EMPTY_ERROR_MESSAGE
+    ):
+        return _REASONING_ONLY_EMPTY_TERMINAL_MESSAGE
     if reason == "output_truncated" or error_class == "provider_output_truncated":
         return "The provider stopped because the output limit was reached before the task finished."
+    if (
+        reason == "model_repetition_loop_detected"
+        or error_class == "model_repetition_loop_detected"
+    ):
+        return "The model began repeating the same output, so OpenSquilla stopped the task."
     if status == AgentTaskStatus.CANCELLED.value or reason.startswith("cancelled"):
         return "The task was cancelled before it finished."
     if status == AgentTaskStatus.ABANDONED.value or reason == "shutdown_timeout":
@@ -90,6 +257,8 @@ def build_terminal_reply(
         or reason == ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE
     ):
         return ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE
+    if error_class == IMAGE_INPUT_UNSUPPORTED_CODE or reason == IMAGE_INPUT_UNSUPPORTED_CODE:
+        return IMAGE_INPUT_UNSUPPORTED_MESSAGE
     if error_class == "sandbox_threshold_exceeded" or reason == "sandbox_threshold_exceeded":
         return (
             "Automatic execution paused after repeated sandbox denials. Approve the "
@@ -109,7 +278,39 @@ def build_terminal_reply(
             "The task was blocked because a tool it needed is not permitted by the "
             "current policy."
         )
+    if (
+        error_class == SILENT_REPLY_NOT_ALLOWED_CODE
+        or reason == SILENT_REPLY_NOT_ALLOWED_CODE
+    ):
+        return SILENT_REPLY_NOT_ALLOWED_MESSAGE
+    if error_class in {
+        "usage_accounting_busy",
+        "usage_accounting_unavailable",
+    } or reason in {
+        "usage_accounting_busy",
+        "usage_accounting_unavailable",
+    }:
+        usage_call_index = _read_value(record_or_payload, "usage_call_index")
+        replay_safe = (
+            isinstance(usage_call_index, int)
+            and not isinstance(usage_call_index, bool)
+            and usage_call_index == 1
+            and _read_value(record_or_payload, "no_prior_provider_dispatch") is True
+            and _read_value(record_or_payload, "replay_safe") is True
+        )
+        if replay_safe:
+            return (
+                "Usage accounting is temporarily unavailable. The provider request was not "
+                "sent and no usage was billed, so it is safe to retry this turn."
+            )
+        return (
+            "Usage accounting is temporarily unavailable. This provider request was not "
+            "sent. Earlier work in this turn may already have run or been billed."
+        )
     if status == AgentTaskStatus.FAILED.value or reason in {"error", "tool_error"}:
+        failure_kind = _normalize(_read_value(record_or_payload, "failure_kind"))
+        if failure_kind:
+            return safe_provider_failure_message(failure_kind)
         return "The task failed before it could finish."
     if status == AgentTaskStatus.SUCCEEDED.value or reason in {"completed", "done"}:
         return "The task completed."

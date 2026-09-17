@@ -497,6 +497,241 @@ async def test_dispatch_redacts_secret_like_tool_result_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_preserves_assignments_in_source_file_results() -> None:
+    registry = ToolRegistry()
+    provider_key = "sk-or-v1-abcdefghijklmnopqrstuvwxyz"
+
+    async def read_file(path: str) -> str:
+        del path
+        return (
+            '1\tTOKEN = "fixture-value"\n'
+            "2\t$nextToken = $tokens[$index + 1];\n"
+            f"3\tprovider_key = '{provider_key}'\n"
+        )
+
+    registry.register(
+        ToolSpec(
+            name="read_file",
+            description="read",
+            parameters={"path": {"type": "string"}},
+            required=["path"],
+        ),
+        read_file,
+    )
+    handler = build_tool_handler(registry)
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-source-read",
+            tool_name="read_file",
+            arguments={"path": "src/Fixer.php"},
+        )
+    )
+
+    assert result.is_error is False
+    assert 'TOKEN = "fixture-value"' in result.content
+    assert "$nextToken = $tokens[$index + 1];" in result.content
+    assert provider_key not in result.content
+    assert "provider_key = '[REDACTED]'" in result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [".env.production", ".env.production.local"])
+async def test_dispatch_redacts_assignments_in_secret_file_results(path: str) -> None:
+    registry = ToolRegistry()
+
+    async def read_file(path: str) -> str:
+        del path
+        return "1\tAPI_TOKEN=abcdefghijklmnopqrstuvwx\n"
+
+    registry.register(
+        ToolSpec(
+            name="read_file",
+            description="read",
+            parameters={"path": {"type": "string"}},
+            required=["path"],
+        ),
+        read_file,
+    )
+    handler = build_tool_handler(registry)
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-secret-file-read",
+            tool_name="read_file",
+            arguments={"path": path},
+        )
+    )
+
+    assert result.is_error is False
+    assert result.content == "1\tAPI_TOKEN=[REDACTED]\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_match", "secret_match"),
+    [
+        (
+            "src/Fixer.php:2: $nextToken = $tokens[$index + 1];",
+            ".bashrc:1: export API_TOKEN=FAKE_REVIEW_PASSWORD_12345",
+        ),
+        (
+            "src/Fixer.php: $nextToken = $tokens[$index + 1];",
+            ".bashrc: API_TOKEN=FAKE_REVIEW_PASSWORD_12345",
+        ),
+    ],
+)
+async def test_dispatch_redacts_directory_grep_matches_from_secret_files(
+    source_match: str,
+    secret_match: str,
+) -> None:
+    registry = ToolRegistry()
+
+    async def grep_search(pattern: str, path: str, include: str) -> str:
+        del pattern, path, include
+        return f"{source_match}\n{secret_match}\n"
+
+    registry.register(
+        ToolSpec(
+            name="grep_search",
+            description="grep",
+            parameters={
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "include": {"type": "string"},
+            },
+            required=["pattern", "path", "include"],
+        ),
+        grep_search,
+    )
+    handler = build_tool_handler(registry)
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-secret-directory-grep",
+            tool_name="grep_search",
+            arguments={"pattern": "API_TOKEN", "path": ".", "include": ".bashrc"},
+        )
+    )
+
+    assert result.is_error is False
+    assert "$nextToken = $tokens[$index + 1];" in result.content
+    assert "FAKE_REVIEW_PASSWORD_12345" not in result.content
+    assert "API_TOKEN=[REDACTED]" in result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "Get-Content .env",
+        "pwd\ncat .env",
+        "custom-credential-dump",
+        "cat src/settings.py\ncustom-credential-dump",
+    ],
+)
+async def test_dispatch_redacts_assignments_from_non_source_commands(command: str) -> None:
+    registry = ToolRegistry()
+
+    async def exec_command(command: str) -> str:
+        del command
+        return "PASSWORD=FAKE_REVIEW_PASSWORD_12345\n"
+
+    registry.register(
+        ToolSpec(
+            name="exec_command",
+            description="exec",
+            parameters={"command": {"type": "string"}},
+            required=["command"],
+        ),
+        exec_command,
+    )
+    handler = build_tool_handler(registry)
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-non-source-command",
+            tool_name="exec_command",
+            arguments={"command": command},
+        )
+    )
+
+    assert result.is_error is False
+    assert "FAKE_REVIEW_PASSWORD_12345" not in result.content
+    assert result.content == "PASSWORD=[REDACTED]\n"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_distinguishes_source_commands_from_environment_dumps() -> None:
+    registry = ToolRegistry()
+
+    async def exec_command(command: str) -> str:
+        del command
+        return 'TOKEN="fixture-value"\n'
+
+    registry.register(
+        ToolSpec(
+            name="exec_command",
+            description="exec",
+            parameters={"command": {"type": "string"}},
+            required=["command"],
+        ),
+        exec_command,
+    )
+    handler = build_tool_handler(registry)
+
+    source_result = await handler(
+        ToolCall(
+            tool_use_id="tc-source-command",
+            tool_name="exec_command",
+            arguments={"command": "sed -n '1,20p' src/settings.py"},
+        )
+    )
+    env_result = await handler(
+        ToolCall(
+            tool_use_id="tc-env-command",
+            tool_name="exec_command",
+            arguments={"command": "printenv"},
+        )
+    )
+    secret_file_result = await handler(
+        ToolCall(
+            tool_use_id="tc-secret-file-command",
+            tool_name="exec_command",
+            arguments={"command": "cat .env.local"},
+        )
+    )
+    project_config_result = await handler(
+        ToolCall(
+            tool_use_id="tc-project-config-command",
+            tool_name="exec_command",
+            arguments={"command": "cat config.toml"},
+        )
+    )
+    opensquilla_config_result = await handler(
+        ToolCall(
+            tool_use_id="tc-opensquilla-config-command",
+            tool_name="exec_command",
+            arguments={"command": "cat ~/.opensquilla/config.toml"},
+        )
+    )
+    opensquilla_home_config_result = await handler(
+        ToolCall(
+            tool_use_id="tc-opensquilla-home-config-command",
+            tool_name="exec_command",
+            arguments={"command": "cat $HOME/.opensquilla/config.toml"},
+        )
+    )
+
+    assert source_result.content == 'TOKEN="fixture-value"\n'
+    assert env_result.content == "TOKEN=[REDACTED]\n"
+    assert secret_file_result.content == "TOKEN=[REDACTED]\n"
+    assert project_config_result.content == 'TOKEN="fixture-value"\n'
+    assert opensquilla_config_result.content == "TOKEN=[REDACTED]\n"
+    assert opensquilla_home_config_result.content == "TOKEN=[REDACTED]\n"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_rejects_unparsed_raw_tool_arguments_before_handler() -> None:
     handler = build_tool_handler(_build_registry())
 
@@ -1271,7 +1506,7 @@ async def test_dispatch_channel_approval_payload_is_pending_status() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_unattended_subagent_preserves_automatic_rule_review() -> None:
+async def test_dispatch_legacy_trusted_alias_keeps_safe_approval_boundary() -> None:
     reset_approval_queue()
     handler = build_tool_handler(_build_registry())
     token = current_tool_context.set(
@@ -1297,8 +1532,8 @@ async def test_dispatch_unattended_subagent_preserves_automatic_rule_review() ->
         reset_approval_queue()
 
     payload = json.loads(result.content)
-    assert payload["status"] == "approval_required"
-    assert payload.get("error_class") != "UnsupportedSurface"
+    assert payload["status"] == "error"
+    assert payload["error_class"] == "UnsupportedSurface"
 
 
 @pytest.mark.asyncio
@@ -1583,6 +1818,7 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
         session_key="agent:main:session-1",
         tool_result_store_dir=str(tmp_path / "tool-results"),
         tool_result_store_session_id="session-1",
+        tool_result_retrieval_available=True,
         tool_result_budget_policy=ToolResultBudgetPolicy(
             max_single_execution_result_chars=10_000,
         ),
@@ -1617,6 +1853,52 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
     assert stored.storage_encoding == "gzip+utf-8"
     assert stored.stored_size_bytes is not None
     assert stored.stored_size_bytes < 8 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_emit_handle_when_retrieval_is_not_visible(
+    tmp_path,
+) -> None:
+    registry = ToolRegistry()
+    raw_output = "HEAD\n" + ("x" * 2_000) + "\nTAIL"
+
+    async def exec_command(command: str) -> str:
+        assert command == "pytest -q"
+        return raw_output
+
+    registry.register(
+        ToolSpec(
+            name="exec_command",
+            description="exec",
+            parameters={"command": {"type": "string"}},
+            required=["command"],
+        ),
+        exec_command,
+    )
+    ctx = ToolContext(
+        session_key="agent:main:session-1",
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+        tool_result_store_session_id="session-1",
+        tool_result_retrieval_available=False,
+        tool_result_budget_policy=ToolResultBudgetPolicy(
+            max_single_execution_result_chars=200,
+        ),
+    )
+
+    result = await build_tool_handler(registry, ctx)(
+        ToolCall(
+            tool_use_id="tc-large-exec-no-retrieval",
+            tool_name="exec_command",
+            arguments={"command": "pytest -q"},
+        )
+    )
+
+    payload = json.loads(result.content)
+    assert payload["result_truncated"] is True
+    assert payload["result_original_chars"] == len(raw_output)
+    assert "tool_result_handle" not in payload
+    assert "retrieve_hint" not in payload
+    assert not list((tmp_path / "tool-results").rglob("meta.json"))
 
 
 @pytest.mark.asyncio
@@ -1851,6 +2133,44 @@ async def test_dispatch_clamps_web_fetch_max_chars_before_handler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_allows_transient_search_retry_but_retains_repeat_budget():
+    from opensquilla.search.canonical import run_canonical_web_search
+    from opensquilla.search.types import SearchOptions, SearchProviderError, SearchResult
+
+    attempts = []
+
+    class Provider:
+        async def search(self, query, max_results):
+            attempts.append(query)
+            if len(attempts) == 1:
+                raise SearchProviderError("tavily", "timeout", "synthetic timeout", retryable=True)
+            return [SearchResult(title="Source", url="https://example.test", snippet="found")]
+
+    async def search(query, **kwargs):
+        return json.dumps(await run_canonical_web_search(
+            SearchOptions(query=query, provider="tavily"), provider_factory=lambda name: Provider(),
+        ))
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec(name="web_search", description="search",
+                               parameters={"query": {"type": "string"}}), search)
+    handler = build_tool_handler(registry, ToolContext(
+        tool_run_budget_policy=ToolRunBudgetPolicy(), tool_run_budget_key="synthetic-search-turn",
+    ))
+    first = await handler(ToolCall(tool_use_id="search-1", tool_name="web_search",
+                                   arguments={"query": "dispatch transient retry"}))
+    assert json.loads(first.content)["retry_allowed"] is True
+    second = await handler(ToolCall(tool_use_id="search-2", tool_name="web_search",
+                                    arguments={"query": "dispatch transient retry"}))
+    assert json.loads(second.content)["ok"] is True
+    third = await handler(ToolCall(tool_use_id="search-3", tool_name="web_search",
+                                   arguments={"query": "dispatch transient retry"}))
+    assert json.loads(third.content)["reason"] == "tool_run_budget_exhausted"
+    assert json.loads(third.content)["retry_allowed"] is False
+    assert len(attempts) == 2
+
+
+@pytest.mark.asyncio
 async def test_dispatch_clamps_web_search_results_before_handler() -> None:
     registry = ToolRegistry()
     seen: dict[str, object] = {}
@@ -1895,7 +2215,7 @@ async def test_dispatch_clamps_web_search_results_before_handler() -> None:
     assert seen == {
         "query": "test",
         "max_results": 10,
-        "fetch_top_k": 3,
+        "fetch_top_k": None,
         "max_chars_per_source": 1500,
     }
 
@@ -3098,3 +3418,33 @@ async def test_dispatch_terminal_search_ledger_isolated_by_turn_key() -> None:
     assert next_turn.execution_status is not None
     assert first.execution_status["reason"] == "search_blocked"
     assert next_turn.execution_status["reason"] == "search_blocked"
+
+
+@pytest.mark.asyncio
+async def test_repeated_reads_return_real_results_without_runtime_notices(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_REPEATED_CALL_NOTICE", "1")
+    registry = ToolRegistry()
+    contents = ['{"value": "unchanged"}', '{"value": "unchanged"}', '{"value": "updated"}']
+    calls: list[str] = []
+
+    async def read_file(path: str) -> str:
+        calls.append(path)
+        return contents[len(calls) - 1]
+
+    registry.register(
+        ToolSpec(
+            name="read_file", description="read",
+            parameters={"path": {"type": "string"}}, required=["path"],
+        ),
+        read_file,
+    )
+    handler = build_tool_handler(registry, ToolContext(session_key="agent:main:repeated-read"))
+    results = [
+        await handler(ToolCall(
+            tool_use_id=f"read-{index}", tool_name="read_file", arguments={"path": "data.json"},
+        ))
+        for index in range(3)
+    ]
+    assert calls == ["data.json"] * 3
+    assert [result.content for result in results] == contents
+    assert all(not result.is_error for result in results)

@@ -35,6 +35,7 @@ from opensquilla.provider.selector import (
     ProviderConfig,
     SelectorConfig,
 )
+from opensquilla.provider.types import ModelCapabilities
 
 PROVIDER = "openrouter"
 MODEL = "test-chat-model"
@@ -416,6 +417,83 @@ def test_selector_fallback_wrapper_without_ledger_is_a_noop() -> None:
     wrapper = _SelectorFallbackProvider(provider, selector)
     wrapper._skip_benched_fallbacks()
     assert selector.current_config.model == "model-b"
+
+
+def test_tool_filter_skips_denial_then_benched_compatible_fallback() -> None:
+    primary = ProviderConfig("ollama", "model-a")
+    denied = ProviderConfig("ollama", "model-b")
+    benched = ProviderConfig("ollama", "model-c")
+    healthy = ProviderConfig("ollama", "model-d")
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=primary,
+            fallbacks=[denied, benched, healthy],
+        )
+    )
+    selector.resolve()
+    provider = selector.next_fallback()
+    ledger = _ledger()
+    ledger.record_failure("ollama", "model-c", ProviderFailureKind.RATE_LIMITED)
+    wrapper = _SelectorFallbackProvider(provider, selector, health_ledger=ledger)
+    wrapper.configure_fallback_deployment_limits(
+        [
+            (denied, 0, 0, ModelCapabilities(supports_tools=False)),
+            (benched, 0, 0, ModelCapabilities(supports_tools=True)),
+            (healthy, 0, 0, ModelCapabilities(supports_tools=True)),
+        ]
+    )
+
+    assert wrapper._advance_past_explicit_tool_denials() is True
+    assert selector.current_config is healthy
+    assert wrapper._pending_fallback_hops == 2
+
+
+def test_tool_filter_keeps_only_compatible_candidate_despite_bench() -> None:
+    primary = ProviderConfig("ollama", "model-a")
+    compatible = ProviderConfig("ollama", "model-b")
+    denied = ProviderConfig("ollama", "model-c")
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=primary,
+            fallbacks=[compatible, denied],
+        )
+    )
+    selector.resolve()
+    provider = selector.next_fallback()
+    ledger = _ledger()
+    ledger.record_failure("ollama", "model-b", ProviderFailureKind.RATE_LIMITED)
+    wrapper = _SelectorFallbackProvider(provider, selector, health_ledger=ledger)
+    wrapper.configure_fallback_deployment_limits(
+        [
+            (compatible, 0, 0, ModelCapabilities(supports_tools=True)),
+            (denied, 0, 0, ModelCapabilities(supports_tools=False)),
+        ]
+    )
+
+    assert wrapper._advance_past_explicit_tool_denials() is True
+    assert selector.current_config is compatible
+
+
+def test_capacity_filter_keeps_only_compatible_candidate_despite_bench() -> None:
+    primary = ProviderConfig("ollama", "model-a")
+    larger = ProviderConfig("ollama", "model-b")
+    too_small = ProviderConfig("ollama", "model-c")
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=primary,
+            fallbacks=[larger, too_small],
+        )
+    )
+    selector.resolve()
+    provider = selector.next_fallback()
+    ledger = _ledger()
+    ledger.record_failure("ollama", "model-b", ProviderFailureKind.RATE_LIMITED)
+    wrapper = _SelectorFallbackProvider(provider, selector, health_ledger=ledger)
+
+    assert wrapper._advance_past_explicit_tool_denials(
+        candidate_predicate=lambda candidate: candidate is larger
+    ) is True
+    assert selector.current_config is larger
 
 
 def test_selector_remaining_chain_lists_active_and_untried() -> None:

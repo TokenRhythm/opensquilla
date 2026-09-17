@@ -12,6 +12,7 @@ interface BehaviorPanelContract {
 
 defineProps<{
   panel: BehaviorPanelContract
+  embedded?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -20,8 +21,8 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <section class="control-section">
-    <div class="control-section__head">
+  <section class="control-section" :class="{ 'control-section--embedded': embedded }">
+    <div v-if="!embedded" class="control-section__head">
       <h3 class="control-section__title">{{ t('setup.behavior.title') }}</h3>
       <p class="control-section__desc">{{ panel.statusText }}</p>
     </div>
@@ -41,3 +42,7 @@ const emit = defineEmits<{
     </label>
   </section>
 </template>
+
+<style scoped>
+.control-section--embedded { display: contents; }
+</style>

@@ -94,12 +94,15 @@ condition and verified again after upload. A changed asset under an already
 mirrored tag is rejected; publish corrected release bytes under a new tag
 instead.
 
-Unsigned Windows clients do not execute an OSS object directly. They fetch the
-matching GitHub Release's canonical `SHA256SUMS`, stream the exact versioned EXE
-from the selected GitHub or OSS source into an application-owned directory,
-verify its SHA-256, and only then reveal the file for an explicit manual install.
-If GitHub's checksum is unavailable or the digest differs, the client fails
-closed and deletes the partial or mismatched download.
+Windows clients do not execute an OSS object directly. They fetch the
+matching release's `SHA256SUMS` from the OSS mirror first (itself verified
+against the GitHub Release at mirror time), falling back to the canonical
+GitHub Release copy when the mirror object is missing or unreadable. They then
+stream the exact versioned EXE from the selected GitHub or OSS source into an
+application-owned directory, verify its SHA-256, and only then reveal the file
+for an explicit manual install. If no checksum source is reachable or the
+digest differs, the client fails closed and deletes the partial or mismatched
+download.
 
 With the default public endpoint, use these direct download URLs:
 

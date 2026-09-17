@@ -305,7 +305,7 @@ async def test_parent_wake_preserves_captured_full_host_envelope_after_parent_fi
 async def test_active_run_mode_override_tracks_background_group_lifecycle() -> None:
     runtime = _TaskRuntime()
     accepted_override = AcceptedRunModeOverride(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         run_mode_source="user",
         source="request",
     )
@@ -367,6 +367,40 @@ async def test_cancel_session_blocks_late_subagent_parent_wake() -> None:
     assert cancelled == 1
     assert await manager.active_group_ids(PARENT) == []
     assert runtime.sent == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_preserves_other_groups_in_same_parent_session() -> None:
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+    other_task_id = "task-other"
+
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        pending_count=1,
+    )
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id=other_task_id,
+        pending_count=1,
+    )
+
+    assert await manager.cancel_task(PARENT, other_task_id) == 1
+    assert await manager.active_group_ids(PARENT) == [
+        manager.group_id(PARENT, PARENT_TASK)
+    ]
+
+    # Cancellation is also a fence for a not-yet-admitted exact task group.
+    late_task_id = "task-late"
+    assert await manager.cancel_task(PARENT, late_task_id) == 0
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id=late_task_id,
+        pending_count=1,
+    )
+    assert await manager.active_group_ids(PARENT) == [
+        manager.group_id(PARENT, PARENT_TASK)
+    ]
 
 
 @pytest.mark.asyncio

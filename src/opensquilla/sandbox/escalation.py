@@ -1248,7 +1248,7 @@ def grant_temporary_mount_for_current_tool(
     context = current_tool_run_context()
     if context is None:
         context = RunContext(
-            run_mode=RunMode.TRUSTED,
+            run_mode=RunMode.SAFE,
             workspace=getattr(ctx, "workspace_dir", None),
             source="temporary",
         )

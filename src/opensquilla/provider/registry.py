@@ -247,6 +247,7 @@ for _provider_spec in [
         "https://api.deepseek.com",
         reasoning_shape="deepseek",
         catalog_source=("deepseek",),
+        selectable_model_catalog="verified_live",
     ),
     _spec(
         "gemini",

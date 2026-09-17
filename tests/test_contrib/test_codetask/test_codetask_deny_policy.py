@@ -1,4 +1,4 @@
-"""code-task / SWE-bench tool deny policy (codex review: http_request + media).
+"""CodeTask tool deny policy.
 
 Deterministic: expand the declared deny selectors against an explicit tool
 universe so the assertions do not depend on which tools happen to be registered
@@ -12,9 +12,6 @@ from opensquilla.tools.policy_config import expand_selectors
 
 _ROOT = Path(__file__).resolve().parents[3]
 CODETASK_CONFIG = _ROOT / "src/opensquilla/contrib/codetask/data/agent_config/config.toml"
-SWEBENCH_CONFIG = (
-    _ROOT / "src/opensquilla/contrib/swebench/data/container_config/config.toml"
-)
 
 _AVAIL = frozenset(
     {
@@ -36,17 +33,6 @@ _CODING = {"exec_command", "edit_file", "apply_patch", "git_diff", "process"}
 def _denied(path):
     deny = tomllib.load(open(path, "rb"))["tools"]["deny"]
     return expand_selectors(frozenset(deny), _AVAIL)
-
-
-def test_swebench_blocks_all_network_including_http_request():
-    # group:web must cover http_request — the bare "web*" missed it (codex bug).
-    assert _NETWORK <= _denied(SWEBENCH_CONFIG)
-
-
-def test_swebench_blocks_media_and_keeps_coding():
-    d = _denied(SWEBENCH_CONFIG)
-    assert _MEDIA <= d
-    assert d.isdisjoint(_CODING)
 
 
 def test_codetask_keeps_network():

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const IMPORT_METHODS = [
@@ -91,9 +92,7 @@ async function installImportGateway(page: Page): Promise<ImportGateway> {
       }
 
       if (frame.type === 'req' && frame.method === 'connect') {
-        ws.send(JSON.stringify({
-          type: 'hello-ok',
-          protocol: 3,
+        ws.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'memory-import-e2e' },
           features: { methods: [...IMPORT_METHODS], events: [] },
           snapshot: {},
@@ -118,7 +117,7 @@ async function installImportGateway(page: Page): Promise<ImportGateway> {
           model: 'synthetic-model',
           isLocal: true,
           maxInputBytes: 262144,
-          promptVersion: 'profile-fusion-v2',
+          promptVersion: 'profile-fusion-v3',
           recentImport: null,
           draftJob: null,
         }))
@@ -185,6 +184,24 @@ test('imports a profile through analysis, diff confirmation, and a recoverable r
   const dialog = page.getByRole('dialog', { name: 'Settings' })
   const panel = dialog.getByTestId('settings-memory-panel')
   await expect(panel).toBeVisible({ timeout: 15000 })
+  await expect(panel.getByRole('heading', { name: 'Import memory from another AI' })).toBeVisible()
+
+  const steps = panel.locator('.memory-import__steps')
+  await expect(steps).toHaveAttribute('aria-label', 'Steps to import memory')
+  await expect(steps.locator('.memory-import__step')).toHaveCount(2)
+  await expect(panel.getByText('Copy the prompt and send it to your other AI')).toBeVisible()
+  await expect(panel.getByText("Paste the AI's complete response")).toBeVisible()
+
+  const prompt = panel.getByTestId('memory-import-export-prompt')
+  const promptToggle = panel.getByRole('button', { name: 'Hide prompt' })
+  await expect(prompt).toBeVisible()
+  await expect(promptToggle).toHaveAttribute('aria-expanded', 'true')
+  await promptToggle.click()
+  await expect(prompt).not.toBeVisible()
+  await expect(panel.getByRole('button', { name: 'View prompt' })).toHaveAttribute(
+    'aria-expanded',
+    'false',
+  )
 
   const textarea = panel.getByTestId('memory-import-textarea')
   await expect(textarea).toBeVisible()

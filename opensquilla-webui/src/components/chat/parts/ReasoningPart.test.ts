@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { createApp, h } from 'vue'
+import { createApp, h, nextTick } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
@@ -25,6 +25,9 @@ const i18n = createI18n({
         thoughtProcess: 'Thought process',
         thoughtForSeconds: 'Thought for {seconds}s',
         thoughtForMinutes: 'Thought for {minutes}m {seconds}s',
+        activityDurationSeconds: '{seconds}s',
+        activityDurationMinutes: '{minutes}m {seconds}s',
+        activity: { provider: { reasoning: 'Thinking deeply' } },
       },
     },
   },
@@ -39,6 +42,9 @@ function mount(props: {
   embedded?: boolean
   live?: boolean
   nested?: boolean
+  controlled?: boolean
+  open?: boolean
+  timelinePhase?: boolean
 }) {
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -106,6 +112,13 @@ describe('ReasoningPart nested-in-activity variant', () => {
       .toContain('Thought for 4s')
   })
 
+  it('uses the compact terminal phase wording inside the completed timeline', () => {
+    const host = mount({ part: part('t', 4), nested: true, timelinePhase: true })
+    expect(host.querySelector('.thinking-fold__summary')?.textContent)
+      .toContain('Thinking deeply · 4s')
+    expect(host.querySelector('.thinking-fold--timeline-phase')).not.toBeNull()
+  })
+
   it('keeps the standalone compat fold free of the in-activity modifier', () => {
     const host = mount({ part: part('t', 4) })
     expect(host.querySelector('details.thinking-fold')).not.toBeNull()
@@ -143,5 +156,35 @@ describe('ReasoningPart branches', () => {
     expect(fold?.querySelector('.thinking-fold__chevron')).not.toBeNull()
     expect(fold?.querySelector('.thinking-fold__body')?.textContent)
       .toBe('fold trace')
+  })
+
+  it('lets a settled native fold reopen after the outer activity is expanded', async () => {
+    const host = mount({ part: part('settled trace', 4), nested: true })
+    const fold = host.querySelector<HTMLDetailsElement>('details.thinking-fold')!
+    const summary = fold.querySelector<HTMLElement>('.thinking-fold__summary')!
+
+    expect(fold.open).toBe(false)
+    summary.click()
+    await nextTick()
+
+    expect(fold.open).toBe(true)
+    expect(fold.querySelector('.thinking-fold__body')?.textContent)
+      .toBe('settled trace')
+  })
+
+  it('keeps live timeline folds explicitly controlled', async () => {
+    const host = mount({
+      part: part('live trace', 4),
+      live: true,
+      controlled: true,
+      open: false,
+    })
+    const fold = host.querySelector<HTMLDetailsElement>('details.thinking-fold')!
+    const summary = fold.querySelector<HTMLElement>('.thinking-fold__summary')!
+
+    summary.click()
+    await nextTick()
+
+    expect(fold.open).toBe(false)
   })
 })

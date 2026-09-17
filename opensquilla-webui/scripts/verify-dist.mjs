@@ -15,16 +15,14 @@ export const MANIFEST_NAME = 'webui-artifact-manifest.json'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const webuiRoot = resolve(scriptDir, '..')
-const defaultDistDir = resolve(
-  scriptDir,
-  '../../src/opensquilla/gateway/static/dist',
-)
+const defaultDistDir = resolve(webuiRoot, 'dist')
 const sourceInputRoots = [
   '.node-version',
   '.env',
   '.env.local',
   '.env.production',
   '.env.production.local',
+  'desktop.html',
   'index.html',
   'package.json',
   'package-lock.json',
@@ -167,7 +165,8 @@ export function sourceFingerprint(rootDirectory = webuiRoot) {
 }
 
 function referencedEntryAssets(indexHtml) {
-  const references = [...indexHtml.matchAll(/\b(?:src|href)="([^"]+)"/g)]
+  const assetHtml = indexHtml.replace(/<base\b[^>]*>/gi, '')
+  const references = [...assetHtml.matchAll(/\b(?:src|href)="([^"]+)"/g)]
     .map((match) => match[1])
     .filter((value) => !value.startsWith('data:'))
     .filter((value) => !value.startsWith('http://'))
@@ -186,14 +185,16 @@ function referencedEntryAssets(indexHtml) {
   return references
 }
 
-export function writeManifest(distDir = defaultDistDir) {
+export function writeManifest(distDir = defaultDistDir, { sourceRoot = webuiRoot } = {}) {
   const root = resolve(distDir)
-  if (!existsSync(resolve(root, 'index.html'))) {
-    throw new Error(`Built Web UI entrypoint is missing: ${resolve(root, 'index.html')}`)
+  for (const entry of ['index.html', 'desktop.html']) {
+    if (!existsSync(resolve(root, entry))) {
+      throw new Error(`Built Web UI entrypoint is missing: ${resolve(root, entry)}`)
+    }
   }
   const manifest = {
     schemaVersion: 1,
-    sourceFingerprint: sourceFingerprint(),
+    sourceFingerprint: sourceFingerprint(sourceRoot),
     files: recordsFor(root),
   }
   writeFileSync(
@@ -206,13 +207,17 @@ export function writeManifest(distDir = defaultDistDir) {
 
 export function verifyDist(
   distDir = defaultDistDir,
-  { forbidPersonalBgm = false } = {},
+  { forbidPersonalBgm = false, sourceRoot = webuiRoot } = {},
 ) {
   const root = resolve(distDir)
   const indexPath = resolve(root, 'index.html')
+  const desktopPath = resolve(root, 'desktop.html')
   const manifestPath = resolve(root, MANIFEST_NAME)
   if (!existsSync(indexPath)) {
     throw new Error(`Built Web UI entrypoint is missing: ${indexPath}`)
+  }
+  if (!existsSync(desktopPath)) {
+    throw new Error(`Built Desktop UI entrypoint is missing: ${desktopPath}`)
   }
   if (!existsSync(manifestPath)) {
     throw new Error(`Web UI artifact manifest is missing: ${manifestPath}`)
@@ -226,7 +231,7 @@ export function verifyDist(
   ) {
     throw new Error(`Unsupported Web UI artifact manifest: ${manifestPath}`)
   }
-  const currentSourceFingerprint = sourceFingerprint()
+  const currentSourceFingerprint = sourceFingerprint(sourceRoot)
   if (manifest.sourceFingerprint !== currentSourceFingerprint) {
     throw new Error(
       'Web UI artifact is stale for the current frontend source. Rebuild it with `npm run build`.',
@@ -282,17 +287,31 @@ export function verifyDist(
     }
   }
 
-  const indexHtml = readFileSync(indexPath, 'utf8')
-  const references = referencedEntryAssets(indexHtml)
-  if (!references.some((path) => path.endsWith('.js'))) {
-    throw new Error('Web UI index.html does not reference an entry JavaScript module.')
-  }
-  if (!references.some((path) => path.endsWith('.css'))) {
-    throw new Error('Web UI index.html does not reference an entry stylesheet.')
-  }
-  for (const asset of references) {
-    if (!existsSync(resolve(root, asset))) {
-      throw new Error(`Web UI index.html references a missing asset: ${asset}`)
+  for (const entry of ['index.html', 'desktop.html']) {
+    const entryHtml = readFileSync(resolve(root, entry), 'utf8')
+    const references = referencedEntryAssets(entryHtml)
+    if (entry === 'index.html') {
+      const moduleScriptCount = [
+        ...entryHtml.matchAll(
+          /<script\b(?=[^>]*\btype=["']module["'])[^>]*\bsrc=["'][^"']+["'][^>]*>/gi,
+        ),
+      ].length
+      if (moduleScriptCount !== 1) {
+        throw new Error(
+          `Web UI index.html must reference exactly one executable module script for Gateway injection; found ${moduleScriptCount}.`,
+        )
+      }
+    }
+    if (!references.some((path) => path.endsWith('.js'))) {
+      throw new Error(`Web UI ${entry} does not reference an entry JavaScript module.`)
+    }
+    if (!references.some((path) => path.endsWith('.css'))) {
+      throw new Error(`Web UI ${entry} does not reference an entry stylesheet.`)
+    }
+    for (const asset of references) {
+      if (!existsSync(resolve(root, asset))) {
+        throw new Error(`Web UI ${entry} references a missing asset: ${asset}`)
+      }
     }
   }
 

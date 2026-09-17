@@ -9,6 +9,7 @@ reuse the same backend loop.
 from __future__ import annotations
 
 import getpass
+import inspect
 import os
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -39,6 +40,8 @@ class StandaloneRunConcurrentRepl(Protocol):
         surface: Surface,
         scope: StandaloneRuntimeScope,
         dispatch: Callable[[str], Coroutine[Any, Any, bool]],
+        on_surface_ready: Callable[[], Coroutine[Any, Any, None]] | None = None,
+        on_user_activity: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> None: ...
 
 
@@ -106,13 +109,13 @@ async def read_standalone_transcript(
     )
 
 
-async def flush_before_standalone_rewrite(
+async def checkpoint_before_standalone_rewrite(
     svc: Any,
     session_key: str,
     *,
     operation: str,
 ) -> bool:
-    return await _standalone_slash_adapter._flush_before_standalone_rewrite(
+    return await _standalone_slash_adapter._checkpoint_before_standalone_rewrite(
         standalone_slash_services_from_runtime(svc),
         session_key,
         operation=operation,
@@ -123,15 +126,12 @@ def standalone_slash_services_from_runtime(
     svc: Any,
 ) -> _standalone_slash_adapter.StandaloneSlashServices:
     session_manager = getattr(svc, "session_manager", None)
-    flush_service = getattr(svc, "flush_service", None)
 
     create_session = (
         getattr(session_manager, "get_or_create", None) if session_manager is not None else None
     )
     get_session = (
-        getattr(session_manager, "get_session", None)
-        if session_manager is not None
-        else None
+        getattr(session_manager, "get_session", None) if session_manager is not None else None
     )
     truncate_session = (
         getattr(session_manager, "truncate", None) if session_manager is not None else None
@@ -144,8 +144,19 @@ def standalone_slash_services_from_runtime(
         if session_manager is not None
         else None
     )
-    flush_transcript = (
-        getattr(flush_service, "execute", None) if flush_service is not None else None
+    checkpoint_transcript = (
+        getattr(session_manager, "record_memory_checkpoint", None)
+        if session_manager is not None else None
+    )
+    get_session_routing = (
+        getattr(session_manager, "get_session_routing", None)
+        if session_manager is not None
+        else None
+    )
+    set_session_routing = (
+        getattr(session_manager, "set_session_routing", None)
+        if session_manager is not None
+        else None
     )
     create_session_callable = (
         cast(_standalone_slash_adapter.StandaloneCreateSession, create_session)
@@ -172,9 +183,9 @@ def standalone_slash_services_from_runtime(
         if callable(compact_with_result)
         else None
     )
-    flush_transcript_callable = (
-        cast(_standalone_slash_adapter.StandaloneFlushTranscript, flush_transcript)
-        if callable(flush_transcript)
+    checkpoint_transcript_callable = (
+        cast(_standalone_slash_adapter.StandaloneCheckpointTranscript, checkpoint_transcript)
+        if callable(checkpoint_transcript)
         else None
     )
 
@@ -184,6 +195,41 @@ def standalone_slash_services_from_runtime(
             session_key,
         )
 
+    async def _get_session_routing(session_key: str) -> dict[str, Any]:
+        assert callable(get_session_routing)
+        from opensquilla.gateway.model_routing import model_routing_snapshot
+
+        config = getattr(svc, "config", None)
+        return cast(
+            dict[str, Any],
+            await get_session_routing(
+                session_key,
+                fallback_mode=model_routing_snapshot(config)["mode"],
+            ),
+        )
+
+    async def _set_session_routing(
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        assert callable(set_session_routing)
+        from opensquilla.gateway.model_routing import model_routing_patches
+
+        # Match the Gateway RPC's capability validation without mutating the
+        # global config. In particular, Ensemble must already have a viable
+        # lineup before a standalone Session can select it.
+        model_routing_patches(getattr(svc, "config", None), mode)
+        return cast(
+            dict[str, Any],
+            await set_session_routing(
+                session_key,
+                mode,
+                expected_revision=expected_revision,
+            ),
+        )
+
     return _standalone_slash_adapter.StandaloneSlashServices(
         create_session=create_session_callable,
         get_session=get_session_callable,
@@ -191,7 +237,9 @@ def standalone_slash_services_from_runtime(
         truncate_session=truncate_session_callable,
         compact_session=compact_session_callable,
         compact_with_result=compact_with_result_callable,
-        flush_transcript=flush_transcript_callable,
+        checkpoint_transcript=checkpoint_transcript_callable,
+        get_session_routing=(_get_session_routing if callable(get_session_routing) else None),
+        set_session_routing=(_set_session_routing if callable(set_session_routing) else None),
         config=getattr(svc, "config", None),
         provider_selector=getattr(svc, "provider_selector", None),
     )
@@ -216,8 +264,14 @@ async def run_standalone_chat(
     if session_manager is None:
         raise RuntimeError("standalone chat requires session manager")
     session_key = session_id or f"agent:main:standalone:{uuid4().hex[:8]}"
-    await session_manager.get_or_create(session_key, agent_id="main")
     active_workspace = workspace or getattr(svc.config, "workspace_dir", None)
+    # This private standalone service also creates /new sessions. Give its
+    # allocator the trusted CLI root before the first session is created.
+    if active_workspace and svc.config is not None:
+        svc.config.workspace_dir = active_workspace
+        if hasattr(svc.config, "_workspace_dir_explicit"):
+            svc.config._workspace_dir_explicit = True
+    await session_manager.get_or_create(session_key, agent_id="main")
     effective_workspace_strict = _resolve_workspace_strict(
         cli_value=workspace_strict,
         config_value=getattr(svc.config, "workspace_strict", None),
@@ -242,6 +296,7 @@ async def run_standalone_chat(
 
     async def _build_authoritative_tool_ctx(active_session_key: str) -> object:
         from opensquilla.gateway.project_workspace_runtime import (
+            apply_run_context_route_metadata,
             authoritative_project_run_context,
         )
         from opensquilla.gateway.session_services import get_session_storage
@@ -266,11 +321,7 @@ async def run_standalone_chat(
             sender_id=cli_sender_id(),
             source_name="chat",
         )
-        from opensquilla.gateway.rpc_sessions import (
-            _apply_run_context_route_metadata,
-        )
-
-        _apply_run_context_route_metadata(
+        apply_run_context_route_metadata(
             route_envelope,
             run_context,
             principal_is_owner=True,
@@ -450,10 +501,48 @@ async def run_standalone_chat(
         return True
 
     try:
-        await deps.run_concurrent_repl(
-            surface=Surface.CLI_STANDALONE,
-            scope=session_context.scope,
-            dispatch=_dispatch_input,
-        )
+
+        async def _record_user_activity() -> None:
+            from opensquilla.telemetry.contracts.common import ClientSurface
+
+            sink = getattr(svc, "growth_event_sink", None)
+            record = getattr(sink, "record_product_active", None)
+            if callable(record):
+                await record(surface=ClientSurface.TUI)
+
+        async def _record_surface_ready() -> None:
+            from opensquilla.telemetry.contracts.common import (
+                ClientEntrypoint,
+                ClientSurface,
+                ExecutionMode,
+            )
+
+            sink = getattr(svc, "growth_event_sink", None)
+            await _record_user_activity()
+            record = getattr(sink, "record_client_launch", None)
+            if callable(record):
+                await record(
+                    surface=ClientSurface.TUI,
+                    entrypoint=ClientEntrypoint.CHAT,
+                    execution_mode=ExecutionMode.STANDALONE,
+                )
+
+        repl_kwargs: dict[str, Any] = {
+            "surface": Surface.CLI_STANDALONE,
+            "scope": session_context.scope,
+            "dispatch": _dispatch_input,
+        }
+        parameters = inspect.signature(deps.run_concurrent_repl).parameters.values()
+        if any(
+            parameter.name == "on_surface_ready" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            repl_kwargs["on_surface_ready"] = _record_surface_ready
+        if any(
+            parameter.name == "on_user_activity" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            repl_kwargs["on_user_activity"] = _record_user_activity
+        await deps.run_concurrent_repl(**repl_kwargs)
     finally:
         await svc.close()

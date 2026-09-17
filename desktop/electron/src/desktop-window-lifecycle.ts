@@ -22,11 +22,12 @@ export type DesktopWorkbenchPreviewMode =
   typeof DESKTOP_WORKBENCH_PREVIEW_MODES[number]
 
 export interface DesktopPreferencesFile {
-  schema_version: 2
+  schema_version: 3
   main_window_close_behavior: DesktopMainWindowCloseBehavior
   background_close_notice_shown: boolean
   workbench_preview_mode: DesktopWorkbenchPreviewMode
   workbench_preview_notice_shown: boolean
+  sandbox_unavailable_warning_suppressed: boolean
 }
 
 export interface DesktopPreferencesNormalization {
@@ -62,6 +63,7 @@ const PREFERENCES_KEYS = new Set<string>([
   'background_close_notice_shown',
   'workbench_preview_mode',
   'workbench_preview_notice_shown',
+  'sandbox_unavailable_warning_suppressed',
 ])
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -86,11 +88,12 @@ export function defaultDesktopMainWindowCloseBehavior(
 
 export function defaultDesktopPreferences(platform: NodeJS.Platform): DesktopPreferencesFile {
   return {
-    schema_version: 2,
+    schema_version: 3,
     main_window_close_behavior: defaultDesktopMainWindowCloseBehavior(platform),
     background_close_notice_shown: false,
     workbench_preview_mode: 'full',
     workbench_preview_notice_shown: false,
+    sandbox_unavailable_warning_suppressed: false,
   }
 }
 
@@ -108,16 +111,17 @@ export function normalizeDesktopPreferences(
   if (!payload) return { value: defaults, writable: true }
 
   const schemaVersion = payload.schema_version
-  const legacySchema = schemaVersion === 1
-  const currentSchema = schemaVersion === 2
-  const futureSchema = Number.isSafeInteger(schemaVersion) && Number(schemaVersion) > 2
-  if (!legacySchema && !currentSchema && !futureSchema) {
+  const schemaV1 = schemaVersion === 1
+  const schemaV2 = schemaVersion === 2
+  const currentSchema = schemaVersion === 3
+  const futureSchema = Number.isSafeInteger(schemaVersion) && Number(schemaVersion) > 3
+  if (!schemaV1 && !schemaV2 && !currentSchema && !futureSchema) {
     return { value: defaults, writable: true }
   }
 
   return {
     value: {
-      schema_version: 2,
+      schema_version: 3,
       main_window_close_behavior: isCloseBehavior(payload.main_window_close_behavior)
         ? payload.main_window_close_behavior
         : defaults.main_window_close_behavior,
@@ -126,23 +130,28 @@ export function normalizeDesktopPreferences(
           ? payload.background_close_notice_shown
           : false,
       workbench_preview_mode:
-        currentSchema || futureSchema
+        schemaV2 || currentSchema || futureSchema
           ? isPreviewMode(payload.workbench_preview_mode)
             ? payload.workbench_preview_mode
             : defaults.workbench_preview_mode
           : defaults.workbench_preview_mode,
       workbench_preview_notice_shown:
-        (currentSchema || futureSchema)
+        (schemaV2 || currentSchema || futureSchema)
         && typeof payload.workbench_preview_notice_shown === 'boolean'
           ? payload.workbench_preview_notice_shown
           : false,
+      sandbox_unavailable_warning_suppressed:
+        (currentSchema || futureSchema)
+        && typeof payload.sandbox_unavailable_warning_suppressed === 'boolean'
+          ? payload.sandbox_unavailable_warning_suppressed
+          : false,
     },
-    writable: legacySchema || currentSchema,
+    writable: schemaV1 || schemaV2 || currentSchema,
   }
 }
 
 /**
- * Emit one canonical schema-v2 document. Serialization is deliberately strict:
+ * Emit one canonical schema-v3 document. Serialization is deliberately strict:
  * callers must normalize untrusted input first, and accidental future/unknown
  * fields must not be silently downgraded.
  */
@@ -150,21 +159,23 @@ export function serializeDesktopPreferences(value: DesktopPreferencesFile): stri
   const payload = record(value)
   if (
     !payload
-    || payload.schema_version !== 2
+    || payload.schema_version !== 3
     || !isCloseBehavior(payload.main_window_close_behavior)
     || typeof payload.background_close_notice_shown !== 'boolean'
     || !isPreviewMode(payload.workbench_preview_mode)
     || typeof payload.workbench_preview_notice_shown !== 'boolean'
+    || typeof payload.sandbox_unavailable_warning_suppressed !== 'boolean'
     || Object.keys(payload).some((key) => !PREFERENCES_KEYS.has(key))
   ) {
-    throw new Error('Desktop preferences are not a valid schema-v2 document.')
+    throw new Error('Desktop preferences are not a valid schema-v3 document.')
   }
   const canonical: DesktopPreferencesFile = {
-    schema_version: 2,
+    schema_version: 3,
     main_window_close_behavior: payload.main_window_close_behavior,
     background_close_notice_shown: payload.background_close_notice_shown,
     workbench_preview_mode: payload.workbench_preview_mode,
     workbench_preview_notice_shown: payload.workbench_preview_notice_shown,
+    sandbox_unavailable_warning_suppressed: payload.sandbox_unavailable_warning_suppressed,
   }
   return `${JSON.stringify(canonical, null, 2)}\n`
 }

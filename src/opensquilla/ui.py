@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from typing import IO, cast
 
 from rich.console import Console
@@ -70,7 +71,8 @@ def _apply_typer_help_theme() -> None:
     rich_utils.STYLE_SWITCH = ACCENT_HEADER
     rich_utils.STYLE_COMMANDS_TABLE_FIRST_COLUMN = ACCENT_HEADER
     rich_utils.STYLE_USAGE = ACCENT_SOFT
-    rich_utils.STYLE_METAVAR = f"bold {ACCENT_SOFT}"
+    metavar_style = f"bold {ACCENT_SOFT}"
+    rich_utils.STYLE_TYPES = metavar_style
 
     def _is_argument(param: object) -> bool:
         return (
@@ -81,7 +83,7 @@ def _apply_typer_help_theme() -> None:
     def _is_option(param: object) -> bool:
         return isinstance(param, click.Option) or getattr(param, "param_type_name", "") == "option"
 
-    def _make_metavar(param: click.Parameter) -> str:
+    def _make_metavar(param: object) -> str:
         metavar = getattr(param, "metavar", None)
         if metavar:
             return str(metavar)
@@ -90,12 +92,16 @@ def _apply_typer_help_theme() -> None:
             return str(name).upper()
         param_type = getattr(param, "type", None)
         type_name = getattr(param_type, "name", "text")
+        # Typer's vendored Click calls string parameters "str". Preserve the
+        # existing CLI help vocabulary without overriding explicit metavars.
+        if type_name == "str":
+            return "TEXT"
         return str(type_name).upper()
 
-    def _parameter_label(param: click.Parameter, ctx: click.Context) -> Text:
+    def _parameter_label(param: object, ctx: object) -> Text:
         if _is_argument(param):
             metavar = _make_metavar(param)
-            return Text(metavar, style=rich_utils.STYLE_METAVAR)
+            return Text(metavar, style=metavar_style)
 
         if not _is_option(param):
             return Text(str(getattr(param, "name", "") or ""), style=rich_utils.STYLE_OPTION)
@@ -108,16 +114,16 @@ def _apply_typer_help_theme() -> None:
         metavar = _make_metavar(param)
         if metavar != "BOOLEAN":
             label.append(" ")
-            label.append(metavar, style=rich_utils.STYLE_METAVAR)
+            label.append(metavar, style=metavar_style)
         if getattr(param, "required", False):
             label.append(" ")
             label.append(rich_utils.REQUIRED_SHORT_STRING, style=rich_utils.STYLE_REQUIRED_SHORT)
         return label
 
-    def _parameter_help(param: click.Parameter, ctx: click.Context) -> Text:
+    def _parameter_help(param: object, ctx: object) -> Text:
         if _is_option(param):
             try:
-                help_record = param.get_help_record(ctx)
+                help_record = getattr(param, "get_help_record")(ctx)
             except (AttributeError, TypeError):
                 help_text = str(getattr(param, "help", "") or "")
                 default = getattr(param, "default", None)
@@ -132,10 +138,10 @@ def _apply_typer_help_theme() -> None:
     def _print_compact_options_panel(
         *,
         name: str,
-        params: list[click.Option] | list[click.Argument],
-        ctx: click.Context,
+        params: Sequence[object],
+        ctx: object,
         markup_mode: rich_utils.MarkupModeStrict,
-        console,
+        console: Console,
     ) -> None:
         if not params:
             return

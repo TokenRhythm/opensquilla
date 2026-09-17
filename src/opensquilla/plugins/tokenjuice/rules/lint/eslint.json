@@ -4,6 +4,7 @@
   "description": "Compact ESLint output while preserving file diagnostics and summary counts.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["eslint"],
     "commandIncludes": ["eslint"]
   },
   "transforms": {

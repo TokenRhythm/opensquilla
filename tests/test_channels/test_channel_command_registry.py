@@ -37,6 +37,43 @@ def test_channel_command_names_include_usage_and_registry_words() -> None:
 
 
 @pytest.mark.asyncio
+async def test_channel_goal_commands_are_explicitly_unsupported() -> None:
+    assert "goal" not in DEFAULT_COMMAND_REGISTRY.command_names
+    msg = IncomingMessage(
+        sender_id="channel-user",
+        channel_id="channel-1",
+        content="/goal set finish the release",
+    )
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:feishu:channel-user",
+        session_prefix="feishu",
+        agent_id="main",
+    )
+
+    class RejectingDispatcher:
+        async def dispatch(self, *_args, **_kwargs):
+            raise AssertionError("unsupported Goal commands must not reach RPC")
+
+    reply = await _dispatch_channel_slash_command(
+        route_envelope=envelope,
+        msg=msg,
+        session_manager=None,
+        session_key=envelope.session_key,
+        session_prefix="feishu",
+        rpc_dispatcher=RejectingDispatcher(),
+        context_factory=lambda _envelope: object(),
+    )
+
+    assert reply is not None
+    assert reply.metadata == {
+        "command": "goal",
+        "method": None,
+        "unsupported": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_channel_sandbox_command_sets_run_mode_from_argument() -> None:
     msg = IncomingMessage(sender_id="admin-1", channel_id="c1", content="/sandbox full")
     envelope = build_channel_route_envelope(
@@ -70,6 +107,37 @@ async def test_channel_sandbox_command_sets_run_mode_from_argument() -> None:
     assert reply is not None
     assert reply.content == "Sandbox mode set to Full Host Access."
     assert reply.metadata["command"] == "sandbox"
+
+
+@pytest.mark.asyncio
+async def test_channel_sandbox_command_canonicalizes_legacy_safe_alias() -> None:
+    msg = IncomingMessage(sender_id="admin-1", channel_id="c1", content="/sandbox trusted")
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:feishu:admin-1",
+        session_prefix="feishu",
+        agent_id="main",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeDispatcher:
+        async def dispatch(self, req_id, method, params, ctx):
+            captured["params"] = params
+            return make_ok_res(req_id, {"runMode": "safe"})
+
+    reply = await DEFAULT_COMMAND_REGISTRY.dispatch(
+        envelope=envelope,
+        message_content=msg.content,
+        rpc_dispatcher=FakeDispatcher(),
+        context_factory=lambda _envelope: object(),
+    )
+
+    assert captured["params"] == {
+        "sessionKey": "agent:main:feishu:admin-1",
+        "runMode": "safe",
+    }
+    assert reply is not None
+    assert reply.content == "Sandbox mode set to Safe mode."
 
 
 @pytest.mark.asyncio
