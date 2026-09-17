@@ -34,6 +34,91 @@ _TRANSCRIPT_SESSION_KEY = "agent:main:webchat:transcript-reader"
 _TRANSCRIPT_SESSION_ID = "session-transcript-reader"
 
 
+@pytest.mark.asyncio
+async def test_startup_waits_for_writer_before_restoring_interactive_timeout(
+    tmp_path, monkeypatch,
+) -> None:
+    path = tmp_path / "sessions.db"
+    initial = await SessionStorage.open(str(path))
+    await initial.close()
+    storage = SessionStorage(str(path))
+    writer_started = threading.Event()
+    startup_write = threading.Event()
+    release_writer = threading.Event()
+    initialize_schema = storage._initialize_schema
+
+    def observe_write(statement: str) -> None:
+        if "INSERT OR IGNORE INTO usage_billing_receipt_state" in statement:
+            startup_write.set()
+
+    async def observe_initialization(*, goal_pause_reason: str) -> None:
+        await storage.conn.set_trace_callback(observe_write)
+        try:
+            await initialize_schema(goal_pause_reason=goal_pause_reason)
+        finally:
+            await storage.conn.set_trace_callback(None)
+
+    def hold_writer() -> None:
+        writer = sqlite3.connect(path, isolation_level=None)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer_started.set()
+            assert startup_write.wait(30), "startup did not reach its singleton write"
+            # Hold a real SQLite writer beyond the interactive 100 ms handler.
+            # Release on this thread so event-loop scheduling cannot extend it.
+            release_writer.wait(0.25)
+        finally:
+            writer.rollback()
+            writer.close()
+
+    monkeypatch.setattr(storage, "_initialize_schema", observe_initialization)
+    writer_task = asyncio.create_task(asyncio.to_thread(hold_writer))
+    try:
+        assert await asyncio.to_thread(writer_started.wait, 30)
+        await storage.connect()
+        assert startup_write.is_set()
+        for connection in (storage.conn, storage._transcript_reader):
+            assert connection is not None
+            async with connection.execute("PRAGMA busy_timeout") as cursor:
+                row = await cursor.fetchone()
+            assert row[0] == 100
+        async with storage.conn.execute(
+            "SELECT count(*) FROM usage_billing_receipt_state"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row[0] == 1
+    finally:
+        release_writer.set()
+        startup_write.set()
+        await writer_task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True], ids=["failure", "cancellation"])
+async def test_failed_startup_closes_its_connection(tmp_path, monkeypatch, cancelled) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    connections = []
+
+    async def reject_initialization(*, goal_pause_reason: str) -> None:
+        connections.append(storage.conn)
+        if cancelled:
+            raise asyncio.CancelledError
+        raise RuntimeError("synthetic initialization failure")
+
+    monkeypatch.setattr(storage, "_initialize_schema", reject_initialization)
+    try:
+        with pytest.raises(asyncio.CancelledError if cancelled else RuntimeError):
+            await storage.connect()
+        assert storage._conn is None
+        assert storage._transcript_reader is None
+        assert storage._meta_launch_draft_gc_task is None
+        with pytest.raises(ValueError, match="no active connection"):
+            await connections[0].execute("SELECT 1")
+    finally:
+        await storage.close()
+
+
 def _agent_task(task_id: str) -> AgentTaskRecord:
     return AgentTaskRecord(
         task_id=task_id,
