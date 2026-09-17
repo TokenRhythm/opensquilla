@@ -156,6 +156,7 @@ export interface UseChatRpcEventHandlersOptions {
   normalizeRunStatus: (status: string) => string
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
+  updateRouterExecutionModel?: (model: string, turnId?: string) => void
   onTaskSettled?: (taskId: string, epoch?: number) => void
   queueRouterDecision: (payload: ConversationRoutingDecision, identityStreamSeq?: number) => void
   bindRouterDecisionToModelCall?: (
@@ -1669,6 +1670,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (aborted.value) return
     if (bufferPendingStreamEvent('provider-activity', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
 
     const phase = String(payload.phase || '')
@@ -1679,10 +1681,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const limit = providerActivityCounter(payload.retry_limit, 10_000)
     const retryAfterMs = providerActivityCounter(payload.retry_after_ms, 900_000)
     const retryAfterSeconds = Math.ceil(retryAfterMs / 1000)
+    const model = String(payload.model || '').trim()
+    const turnId = String(payload.turn_id || payload.task_id || '').trim() || undefined
 
     if (!stream.isStreaming.value) stream.startStreaming()
     stream.resetStreamIdleTimer()
-    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
+    options.markEnsembleHandoff(turnId)
+    if (model) options.updateRouterExecutionModel?.(model, turnId)
 
     if (phase === 'requesting') {
       recordActivityPhase('Waiting for model', 'provider:requesting')

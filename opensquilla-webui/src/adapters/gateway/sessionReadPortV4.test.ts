@@ -408,6 +408,33 @@ describe('v4 SessionReadPort Adapter', () => {
     expect(harness.calls).toHaveLength(0)
   })
 
+  it('restores physical provider models independently of the router selection', async () => {
+    const harness = makeHarness()
+    const routerDecision = { model: 'deepseek-v4-pro', tier: 'c2', decision_id: 'decision-A' }
+    const activities = [
+      { phase: 'requesting', model: 'deepseek-v4-pro' },
+      { phase: 'fallback', model: 'kimi-k2.7-code' },
+      { phase: 'retrying', model: 'kimi-k2.7-code', retry_attempt: 1 },
+      { phase: 'fallback', model: 'deepseek-v4-pro-0813' },
+      { phase: 'reasoning', model: 'deepseek-v4-pro-0813' },
+      { phase: 'reasoning', heartbeat: true },
+    ]
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ events: [
+      { event: 'session.event.router_decision', payload: routerDecision },
+      ...activities.map(payload => ({ event: 'session.event.provider_activity', payload })),
+    ] }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    try {
+      const live = await lease.live
+      expect(live.snapshot?.events).toEqual([
+        { semanticKind: 'router-decision', payload: routerDecision },
+        ...activities.map(payload => ({ semanticKind: 'provider-activity', payload })),
+      ])
+    } finally {
+      await lease.close()
+    }
+  })
+
   it.each([
     {
       name: 'an empty canonical key',

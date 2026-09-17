@@ -199,7 +199,8 @@ export type ConversationTextContent = WithIdentity<'text' | 'presentation' | 'mo
 export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration' | 'execution_log_handle'>
 export type ConversationThinkingContent = WithIdentity<'text' | 'model_call_id' | 'iteration' | 'block_id' | 'block_index' | 'content_kind' | 'ended_at' | 'status'>
 export type ConversationCompactionContent = WithIdentity<'status' | 'compacted' | 'detail' | 'reason' | 'skip_reason' | 'source' | 'phase' | 'compaction_id' | 'sequence' | 'heartbeat' | 'heartbeat_at' | 'elapsed_ms' | 'stage' | 'refused' | 'safe_to_send' | 'applied' | 'durability' | 'user_visible' | 'intent'>
-export type ConversationProviderActivity = WithIdentity<'activity_id' | 'phase' | 'reason' | 'retry_attempt' | 'retry_limit' | 'retry_after_ms' | 'heartbeat'>
+/** The physical request model is optional for older Gateway producers. */
+export type ConversationProviderActivity = WithIdentity<'activity_id' | 'phase' | 'reason' | 'retry_attempt' | 'retry_limit' | 'retry_after_ms' | 'heartbeat' | 'model'>
 export type ConversationEnsembleProgress = WithIdentity<'event_type' | 'proposer_index' | 'proposer_label' | 'proposer_model' | 'proposer_provider' | 'watchdogMemberId' | 'sample_index' | 'elapsed_ms' | 'input_tokens' | 'output_tokens' | 'cost_usd' | 'error' | 'error_code'>
 export type ConversationAnswerReset = WithIdentity<'old_generation_epoch' | 'new_generation_epoch' | 'preserve_completed_tools' | 'authoritative_text_snapshot' | 'authoritative_reasoning_snapshot' | 'sequence' | 'terminal' | 'terminal_text_snapshot'>
 export type ConversationSubagentCompletion = WithIdentity<'type' | 'parent_session_key' | 'child_session_key' | 'status' | 'terminal_reason' | 'message_id'> & { result?: { text?: string; [key: string]: unknown } }
@@ -214,7 +215,7 @@ export type ConversationArtifact = WithIdentity<'id' | 'kind' | 'name' | 'sha256
 export type ConversationUsage = Pick<ChatUsagePayload,
   'model' | 'routed_model' | 'input_tokens' | 'output_tokens' | 'cached_tokens' | 'reasoning_tokens'
   | 'cost_usd' | 'routed_tier' | 'routing_source' | 'total_savings_pct' | 'total_savings_usd'
-  | 'savings_usd' | 'savings_pct' | 'model_usage_breakdown' | 'ensemble_trace' | 'route_plan'
+  | 'savings_usd' | 'savings_pct' | 'model_usage_breakdown' | 'ensemble_trace' | 'route_plan' | 'execution_legs'
   | 'model_call_segments' | 'router_model_call_id' | 'router_iteration' | 'coverage_status'
   | 'usage_unknown' | 'unknown_usage_events' | 'decision_id' | '__savings_ui_suppressed'
 > & { cache_write?: number; cache_write_tokens?: number; billed_cost?: number; total_tokens?: number; estimated_cost_component_usd?: number }

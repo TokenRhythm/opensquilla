@@ -3715,6 +3715,8 @@
     "aiModelEnsembleRouter": "Routeur agrégé de modèles IA",
     "routerFx": {
       "selectedModel": "Le routeur a sélectionné {model}",
+      "executionModel": "Modèle en cours d’exécution : {model}",
+      "executionModelCompleted": "Exécuté par {model}",
       "ensembleModel": "Fusion multimodèle",
       "ensembleSelecting": "Routeur agrégé de modèles IA · sélection des candidats",
       "ensembleHandedOff": "Routeur agrégé de modèles IA · transmis à l'agent",

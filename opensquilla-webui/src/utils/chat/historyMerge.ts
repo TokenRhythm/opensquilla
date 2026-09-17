@@ -9,6 +9,14 @@ const TERMINAL_STEER_DISPOSITIONS = new Set([
   'cancelled',
   'rejected',
 ])
+const TERMINAL_TURN_STATUSES = new Set([
+  'succeeded',
+  'failed',
+  'cancelled',
+  'timeout',
+  'abandoned',
+  'interrupted',
+])
 
 function isPromotedSteerRow(message: ChatMessage): boolean {
   return message.role === 'user'
@@ -629,7 +637,32 @@ export function reconcileRunningHistoryMessages(
   if (incoming.length === 0) return prev
 
   const previousLastUserIndex = lastUserIndex(prev)
-  if (previousLastUserIndex < 0) return reconcileHistoryMessages(prev, incoming)
+  if (previousLastUserIndex < 0) {
+    // Subscribe can restore the live snapshot before initial history supplies
+    // its user row. Anchor only the newest identified live tail to that exact
+    // canonical turn; unrelated or already-terminal history stays authoritative.
+    const latest = prev[prev.length - 1]!
+    const turnId = latest.restoredFromHistory ? undefined : latest.turnId
+    const latestUser = incoming[lastUserIndex(incoming)]
+    const anchor = turnId
+      ? incoming.find(message => message.role === 'user' && message.turnId === turnId)
+      : undefined
+    const terminal = turnId && incoming.some(message => message.turnId === turnId && (
+      message.role === 'error'
+      || TERMINAL_TURN_STATUSES.has(String(message.turnOutcome?.status || '').trim().toLowerCase())
+      || Boolean(message.usage || message.turn_usage || message.routerUsage)
+    ))
+    if (!anchor || latestUser?.turnId !== turnId || terminal) {
+      return reconcileHistoryMessages(prev, incoming)
+    }
+    let tailStart = prev.length - 1
+    while (
+      tailStart > 0
+      && prev[tailStart - 1]?.turnId === turnId
+      && prev[tailStart - 1]?.restoredFromHistory !== true
+    ) tailStart--
+    return reconcileRunningHistoryMessages([anchor, ...prev.slice(tailStart)], incoming)
+  }
 
   const incomingById = new Map(
     incoming

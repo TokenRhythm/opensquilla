@@ -317,8 +317,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
 
   function stableRouterStripRenderKey(
     turnIdentity: string,
-    message: Pick<ChatMessage, 'routerModelCallId' | 'messageId' | 'clientId'>
-      | Pick<ChatRenderedMessage, 'routerModelCallId' | 'messageId' | 'sourceIndex' | 'id' | 'clientId'>,
+    message: Pick<ChatMessage, 'role' | 'routerModelCallId' | 'messageId' | 'clientId'>
+      | Pick<ChatRenderedMessage, 'role' | 'routerModelCallId' | 'messageId' | 'sourceIndex' | 'id' | 'clientId'>,
     messageId?: string,
     index = 0,
   ): string {
@@ -331,10 +331,16 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     // A provisional card acquires its real event id in place. Keep the same
     // row mounted, then teach the event/call aliases to reuse its original key.
     const localIdentity = message.clientId ? `${identityPrefix}local:${message.clientId}` : ''
-    const key = (callIdentity ? stableRouterKeys.get(callIdentity) : undefined)
-      || (localIdentity ? stableRouterKeys.get(localIdentity) : undefined)
+    const callKey = callIdentity ? stableRouterKeys.get(callIdentity) : undefined
+    // A control replay restarts provider call numbering within the same turn.
+    // Distinct live route events keep their own keys; receipts reuse the latest
+    // call alias so final settlement still updates the current attempt in place.
+    const key = (localIdentity ? stableRouterKeys.get(localIdentity) : undefined)
       || stableRouterKeys.get(eventIdentity)
-      || routerStripRenderKey(turnIdentity, message, messageId, index)
+      || (message.role !== 'router' ? callKey : undefined)
+      || (callKey && message.role === 'router'
+        ? `router-event:${turnIdentity}:${eventId}`
+        : routerStripRenderKey(turnIdentity, message, messageId, index))
     stableRouterKeys.set(eventIdentity, key)
     if (localIdentity) stableRouterKeys.set(localIdentity, key)
     if (callIdentity) stableRouterKeys.set(callIdentity, key)
@@ -459,8 +465,15 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const routerDecision = normalizeRouterDecision(msg.routerDecision || (msg.provenanceKind === 'router_decision' ? msg : null))
       if (routerDecision) {
         turnRouterDecision = routerDecision
+        const latestUserTurnId = options.messages.value[lastUserIdx]?.turnId
+        const inLiveTurn = options.isStreaming?.value === true && (
+          i > lastUserIdx || Boolean(messageTurnId && messageTurnId === latestUserTurnId)
+        )
+        const settledMessage = msg.routerExecutionModel && options.isStreaming && !inLiveTurn
+          ? { ...msg, routerSettled: true }
+          : msg
         const stripItem = renderedRouterStrip(
-          msg,
+          settledMessage,
           routerDecision,
           turnIdx,
           i,
@@ -789,7 +802,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       isRouterStrip: true,
       routerTurnKey: stableRouterStripRenderKey(
         turnIdentity,
-        { routerModelCallId: routerModelCallIdFromMessage(msg), messageId, clientId: msg.clientId },
+        { role: msg.role, routerModelCallId: routerModelCallIdFromMessage(msg), messageId, clientId: msg.clientId },
         messageId,
         index,
       ),
@@ -806,6 +819,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       gridCells: cells,
       winnerIdx: routerWinnerCellIndex(cells, decision.tier),
       routerSelectedModel: String(decision.model || decision.routed_model || '').trim(),
+      routerExecutionModel: executionModelFromMessage(msg) || undefined,
       messageId: messageId || `${index}-router`,
     }
   }
@@ -905,7 +919,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       isRouterStrip: true,
       routerTurnKey: stableRouterStripRenderKey(
         turnIdentity,
-        { routerModelCallId: routerModelCallIdFromMessage(msg), messageId, clientId: msg.clientId },
+        { role: msg.role, routerModelCallId: routerModelCallIdFromMessage(msg), messageId, clientId: msg.clientId },
         messageId,
         index,
       ),
@@ -916,6 +930,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routerSource: 'llm_ensemble',
       routerObserve: false,
       routerStatic: msg.restoredFromHistory === true,
+      routerExecutionModel: executionModelFromMessage(msg) || undefined,
       // Live strips stay unsettled (animating) while members stream in; a member
       // list alone no longer forces 'settled'. History strips are frozen instead.
       routerSettled: msg.routerSettled === true || msg.restoredFromHistory === true,
@@ -1620,6 +1635,7 @@ function routerIterationFromMessage(msg: ChatMessage): number {
 }
 
 function routerStripIdentity(strip: ChatRenderedMessage): string {
+  if (strip.messageId) return `event:${strip.messageId}`
   if (strip.routerModelCallId) return `call:${strip.routerModelCallId}`
   return `event:${strip.messageId || strip.sourceIndex || strip.id || 'router'}`
 }
@@ -1696,14 +1712,23 @@ function upsertRouterStrip(
   }
   if (previousIndex >= 0) {
     if (options.settleReplacement !== false) stripItem.routerSettled = true
-    stripItem.routerTurnKey = result[previousIndex]?.routerTurnKey || stripItem.routerTurnKey
+    const previous = result[previousIndex]
+    if (options.settlement && !stripItem.routerExecutionModel) {
+      stripItem.routerExecutionModel = previous?.routerExecutionModel
+    }
+    stripItem.routerTurnKey = previous?.routerTurnKey || stripItem.routerTurnKey
     result[previousIndex] = stripItem
     indexes.set(identity, previousIndex)
+    if (stripItem.routerModelCallId) indexes.set(`call:${stripItem.routerModelCallId}`, previousIndex)
     return
+  }
+  if (options.settlement && options.settleReplacement !== false && !stripItem.routerStatic) {
+    stripItem.routerSettled = true
   }
   result.push(stripItem)
   const index = result.length - 1
   indexes.set(identity, index)
+  if (stripItem.routerModelCallId) indexes.set(`call:${stripItem.routerModelCallId}`, index)
   order.push(index)
 }
 
@@ -1796,6 +1821,54 @@ function routerDecisionFromUsage(
     accepted_routing_mode: msg.turnOutcome?.acceptedRoutingMode,
     router_tier_snapshot: routerTierSnapshot,
   })
+}
+
+function executionModelFromMessage(msg: ChatMessage): string {
+  const usage = msg.routerUsage || msg.usage || msg.turn_usage
+  const rawLegs = usage?.execution_legs ?? usage?.executionLegs
+  let latestLeg: Record<string, unknown> | undefined
+  if (Array.isArray(rawLegs)) {
+    for (let index = rawLegs.length - 1; index >= 0; index -= 1) {
+      const leg = rawLegs[index]
+      if (!leg || typeof leg !== 'object' || Array.isArray(leg)) continue
+      const model = (leg as Record<string, unknown>).model
+      if (typeof model === 'string' && model.trim()) {
+        latestLeg = leg as Record<string, unknown>
+        break
+      }
+    }
+  }
+  const legModel = typeof latestLeg?.model === 'string' ? latestLeg.model.trim() : ''
+  // Selector fallbacks are physical single-model requests and can follow an
+  // earlier ensemble call whose trace remains on the turn receipt.
+  if (latestLeg?.kind === 'provider_fallback') return legModel
+
+  const rawTrace = usage?.ensemble_trace ?? usage?.ensembleTrace
+  const trace = rawTrace && typeof rawTrace === 'object' && !Array.isArray(rawTrace)
+    ? rawTrace as Record<string, unknown> : null
+  const rawFinalRequest = trace?.final_request
+  const finalRequest = rawFinalRequest && typeof rawFinalRequest === 'object' && !Array.isArray(rawFinalRequest)
+    ? rawFinalRequest as Record<string, unknown> : null
+  const finalRoles = ['aggregator', 'fixed_aggregator', 'fixed_direct']
+  const finalRole = typeof finalRequest?.role === 'string' ? finalRequest.role : ''
+  const rawExecution = finalRequest?.execution
+  const execution = rawExecution && typeof rawExecution === 'object' && !Array.isArray(rawExecution)
+    ? rawExecution as Record<string, unknown> : null
+  if (finalRequest?.request_started === true && finalRoles.includes(finalRole)
+    && typeof execution?.model === 'string' && execution.model.trim()) {
+    return execution.model.trim()
+  }
+  const hasEnsembleTrace = trace && (
+    [trace.profile, trace.mode].some(value => typeof value === 'string' && value.trim())
+    || finalRoles.includes(finalRole)
+    || finalRoles.includes(String(trace.final_request_role || ''))
+    || Array.isArray(trace.candidates)
+  )
+  // Older ensemble receipts recorded the wrapper's unused baseline as a
+  // primary leg. A plan without a started final request cannot establish it
+  // as the physical model; retain live evidence when that is all we have.
+  if (!hasEnsembleTrace && legModel) return legModel
+  return String(msg.routerExecutionModel || '').trim()
 }
 
 export function routerDecisionState(decision: NormalizedRouterDecision): string {

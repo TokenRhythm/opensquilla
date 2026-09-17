@@ -89,7 +89,7 @@ async def test_typed_connection_wait_is_independent_of_finite_retry_budget(
         [[httpx.ConnectError("untrusted error prose")]] * 7 + [_success()],
         creation_failure=creation_failure,
     )
-    events = await _run(provider, max_provider_retries=0)
+    events = await _run(provider, max_provider_retries=0, model_id="synthetic-physical-model")
     waits = [
         event
         for event in events
@@ -99,6 +99,11 @@ async def test_typed_connection_wait_is_independent_of_finite_retry_budget(
     assert [event.retry_limit for event in waits] == [0] * 7
     assert [event.retry_attempt for event in waits] == list(range(1, 8))
     assert all(event.reason == "transport_transient" for event in waits)
+    assert all(
+        event.model == "synthetic-physical-model"
+        for event in events
+        if event.kind == "provider_activity"
+    )
     assert len(provider.calls) == 8
     assert any(event.kind == "done" and event.text == "done" for event in events)
 

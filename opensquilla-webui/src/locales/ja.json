@@ -3715,6 +3715,8 @@
     "aiModelEnsembleRouter": "AI モデル集約ルーター",
     "routerFx": {
       "selectedModel": "ルーターが {model} を選択しました",
+      "executionModel": "現在の実行モデル：{model}",
+      "executionModelCompleted": "実際に実行したモデル：{model}",
       "ensembleModel": "マルチモデル融合",
       "ensembleSelecting": "AI モデル集約ルーター · 候補を選択中",
       "ensembleHandedOff": "AI モデル集約ルーター · エージェントへ引き継ぎ済み",

@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.fallback import FallbackPolicy
 from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.runtime import _SelectorFallbackProvider
 from opensquilla.provider.failures import ProviderFailureKind
@@ -265,6 +266,39 @@ async def test_rate_retry_budget_applies_once_per_physical_leg(
     failures = [event for event in events if event.kind == "error"]
     assert len(failures) == 1
     assert failures[0].failure_kind == "rate_limited"
+    assert [event.model for event in events if (
+        event.kind == "provider_activity" and event.phase == "retry_wait"
+    )] == [name for name in streams for _ in range(retries)]
+
+
+@pytest.mark.parametrize("error", [_connection(), _rate()])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_selector_retry_activity_carries_physical_model_before_agent_projection(
+    monkeypatch, clock, error, fallback,
+):
+    streams = {"primary": [[error], _success()]}
+    expected_model = "primary"
+    if fallback:
+        streams = {
+            "primary": [[ErrorEvent(message="model not found", code="404")]],
+            "secondary": [[error], _success()],
+        }
+        expected_model = "secondary"
+    provider, _, calls = _wrapper(monkeypatch, streams)
+    provider.configure_retry_policy(FallbackPolicy(
+        max_retries=1, base_backoff_ms=0, max_backoff_ms=0,
+    ))
+
+    events = [event async for event in provider.chat([Message(role="user", content="run")])]
+
+    activities = [event for event in events if event.kind == "provider_activity"]
+    assert [(event.phase, event.model) for event in activities] == [
+        *([("fallback", "secondary")] if fallback else []),
+        ("retry_wait", expected_model),
+        ("retrying", expected_model),
+    ]
+    assert calls == (["primary"] if fallback else []) + [expected_model] * 2
+    assert any(event.kind == "done" for event in events)
 
 
 async def test_connection_wait_keeps_selected_leg_and_discards_failed_tool_frames(
@@ -346,6 +380,12 @@ async def test_recovery_preserves_each_physical_request_execution_identity(
         assert json.dumps(f'"model":"{model}"')[1:-1] in serialized
     assert len({serialized for model, _, serialized in captured if model == expected[-1]}) == 1
     assert agent.config.execution_identity == selected
+    assert [(event.phase, event.model) for event in events if (
+        event.kind == "provider_activity" and event.phase == "fallback"
+    )] == ([] if path == "same_leg" else [("fallback", "secondary")])
+    assert all(event.model == expected[-1] for event in events if (
+        event.kind == "provider_activity" and event.phase in {"retry_wait", "retrying"}
+    ))
     status = agent._execution_status_snapshot()
     assert status["selection"]["model"] == "primary"
     assert status["current_request"]["model"] == expected[-1]

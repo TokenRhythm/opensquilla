@@ -12,6 +12,8 @@ from opensquilla.artifact_session import (
     ArtifactKind,
     ArtifactSessionService,
 )
+from opensquilla.engine.turn_runner.turn_finalizer_stage import _turn_usage_payload
+from opensquilla.engine.types import DoneEvent
 from opensquilla.gateway.adapters import session_history_projection
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
@@ -128,6 +130,74 @@ async def _record_finalized_usage(
             coverage_status="complete",
         ),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_receipt", [False, True])
+async def test_chat_history_restores_physical_fallback_receipt_after_storage_reopen(
+    tmp_path, legacy_receipt,
+) -> None:
+    models = ["deepseek-v4-pro", "kimi-k2.7-code", "deepseek-v4-pro-0813"]
+    route_plan = {"version": 2, "plan_id": "fallback-turn", "model": models[0]}
+    legs = [
+        {
+            "index": index,
+            "kind": "primary" if index == 0 else "provider_fallback",
+            "provider": "synthetic-provider",
+            "model": model,
+            "plan_id": "fallback-turn",
+        }
+        for index, model in enumerate(models)
+    ]
+    receipt = _turn_usage_payload(
+        DoneEvent(model=models[-1], route_plan=route_plan, execution_legs=legs),
+        resolved_model=models[0],
+    )
+    assert receipt is not None
+    if legacy_receipt:
+        receipt.pop("execution_legs")
+    database_path = str(tmp_path / "physical-fallback-history.db")
+    storage = SessionStorage(database_path)
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:physical-fallback"
+    try:
+        session = await manager.create(session_key)
+        with turn_context_scope({"turn_id": "fallback-turn"}):
+            await manager.append_message(
+                session_key, "assistant", "synthetic answer", turn_usage=receipt,
+            )
+        await _record_finalized_usage(
+            storage,
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            turn_id="fallback-turn",
+            event_id="fallback-usage",
+        )
+    finally:
+        await storage.close()
+
+    reopened = SessionStorage(database_path)
+    await reopened.connect()
+    try:
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=SessionManager(reopened, inject_time_prefix=False),
+            ),
+        )
+        usage = result["messages"][0]["usage"]
+        assert usage["model"] == models[-1]
+        assert usage["route_plan"] == route_plan
+        if legacy_receipt:
+            assert "execution_legs" not in usage
+        else:
+            assert usage["execution_legs"] == legs
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio

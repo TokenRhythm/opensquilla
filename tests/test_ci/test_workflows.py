@@ -2237,6 +2237,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "new-task-ensemble-race.spec.ts",
         "plan-questionnaire-lifecycle.spec.ts",
         "provider-error-experience.spec.ts",
+        "router-physical-model.spec.ts",
         "queue-steer.spec.ts",
         "session-created-card.spec.ts",
         "session-switch-transport.spec.ts",

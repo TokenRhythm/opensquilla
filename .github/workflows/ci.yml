@@ -816,6 +816,7 @@ jobs:
           history-hydration.spec.ts
           idle-chat-recovery.spec.ts
           provider-error-experience.spec.ts
+          router-physical-model.spec.ts
           user-message-newlines.spec.ts
           session-created-card.spec.ts
           session-switch-transport.spec.ts

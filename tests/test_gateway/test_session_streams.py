@@ -846,7 +846,11 @@ def test_live_turn_snapshot_preserves_active_compaction_state() -> None:
 def test_provider_activity_pulses_are_lossy_in_replay_but_keep_phase_boundaries() -> None:
     registry = SessionStreamRegistry(max_events_per_session=2)
     session_key = "agent:main:provider-activity"
-    common = {"task_id": "task-live", "activity_id": "activity-1"}
+    common = {
+        "task_id": "task-live",
+        "activity_id": "activity-1",
+        "model": "deepseek-v4-pro",
+    }
     registry.record(
         session_key,
         "session.event.provider_activity",
@@ -872,6 +876,10 @@ def test_provider_activity_pulses_are_lossy_in_replay_but_keep_phase_boundaries(
     assert [event.payload["phase"] for event in replay.events] == [
         "requesting",
         "reasoning",
+    ]
+    assert [event.payload["model"] for event in replay.events] == [
+        "deepseek-v4-pro",
+        "deepseek-v4-pro",
     ]
     assert all(event.payload.get("heartbeat") is not True for event in replay.events)
 

@@ -1002,6 +1002,56 @@ describe('useChatRenderedMessages immutable route history', () => {
     })
   })
 
+  it('projects the live execution model without replacing the selected route model', () => {
+    const routerMessage: ChatMessage = {
+      role: 'router',
+      text: '',
+      ts: 2,
+      turnId: 'turn-live-route',
+      provenanceKind: 'router_decision',
+      routerDecision: {
+        tier: 'c2',
+        model: 'deepseek-v4-pro',
+        source: 'classifier',
+      },
+      routerExecutionModel: 'deepseek-v4-pro-0813',
+    }
+    const api = renderedMessagesFor([
+      { role: 'user', text: 'Solve this', ts: 1, turnId: 'turn-live-route' },
+      routerMessage,
+    ], undefined, true)
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerSelectedModel).toBe('deepseek-v4-pro')
+    expect(strip?.routerExecutionModel).toBe('deepseek-v4-pro-0813')
+    expect(routerMessage.routerDecision?.model).toBe('deepseek-v4-pro')
+  })
+
+  it('retains live physical evidence when a terminal receipt omits execution legs', () => {
+    const api = renderedMessagesFor([
+      { role: 'user', text: 'Solve this', ts: 1, turnId: 'turn-legacy-receipt' },
+      {
+        role: 'router', text: '', ts: 2, turnId: 'turn-legacy-receipt',
+        provenanceKind: 'router_decision', routerModelCallId: '1.0',
+        routerDecision: { tier: 'c2', model: 'deepseek-v4-pro', source: 'classifier' },
+        routerExecutionModel: 'kimi-k2.7-code',
+      },
+      {
+        role: 'assistant', text: 'Solved', ts: 3, turnId: 'turn-legacy-receipt',
+        usage: {
+          router_model_call_id: '1.0', routed_tier: 'c2', routed_model: 'deepseek-v4-pro',
+          routing_source: 'classifier', routing_applied: true,
+        },
+      },
+    ], undefined, true)
+    const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+    expect(strips).toHaveLength(1)
+    expect(strips[0]).toMatchObject({
+      routerSelectedModel: 'deepseek-v4-pro', routerExecutionModel: 'kimi-k2.7-code',
+      routerSettled: true,
+    })
+  })
+
   it('keeps the logical RoutePlan model after a provider fallback leg', () => {
     const api = useChatRenderedMessages({
       messages: ref<ChatMessage[]>([
@@ -1011,20 +1061,22 @@ describe('useChatRenderedMessages immutable route history', () => {
           text: 'Solved',
           ts: 2,
           turnId: 'turn-route',
+          restoredFromHistory: true,
           usage: {
             routed_tier: 'c2',
-            routed_model: 'provider/fallback-model',
+            routed_model: 'deepseek-v4-pro-0813',
             routing_source: 'classifier',
             routing_applied: true,
             route_plan: {
               tier: 'c2',
-              model: 'provider/original-model',
+              model: 'deepseek-v4-pro',
               source: 'classifier',
               routing_applied: true,
             },
             execution_legs: [
-              { kind: 'primary', model: 'provider/original-model' },
-              { kind: 'provider_fallback', model: 'provider/fallback-model' },
+              { kind: 'primary', model: 'deepseek-v4-pro' },
+              { kind: 'provider_fallback', model: 'kimi-k2.7-code' },
+              { kind: 'provider_fallback', model: 'deepseek-v4-pro-0813' },
             ],
           },
         },
@@ -1046,7 +1098,10 @@ describe('useChatRenderedMessages immutable route history', () => {
 
     const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
     const winner = strip?.gridCells?.[strip.winnerIdx ?? -1]
-    expect(winner?.model).toBe('provider/original-model')
+    expect(winner?.model).toBe('deepseek-v4-pro')
+    expect(strip?.routerSelectedModel).toBe('deepseek-v4-pro')
+    expect(strip?.routerExecutionModel).toBe('deepseek-v4-pro-0813')
+    expect(strip?.routerStatic).toBe(true)
     expect(strip?.routerSource).toBe('classifier')
   })
 

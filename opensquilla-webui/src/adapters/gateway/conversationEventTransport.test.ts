@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { TransportEventHandler, TransportConsumptionHandler, TransportGapHandler } from './transportTypes'
 import { createConversationEventTransport } from './conversationEventTransport'
-import { projectConversationContent } from './conversationContentV4'
+import { projectConversationContent, projectConversationSnapshotEvent } from './conversationContentV4'
+import type { ConversationEvent } from '@/modules/conversationEvents'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import { conversationCursorSignal } from '@/utils/chat/streamEvents'
 import chatTypesSource from '@/types/chat.ts?raw'
@@ -28,6 +29,63 @@ function harness() {
 }
 
 describe('conversation event transport adapter', () => {
+  it('preserves physical model transitions through live, replay, and snapshot ingress', () => {
+    const { rpc, transport } = harness()
+    const observed = vi.fn<(event: ConversationEvent) => void>()
+    transport.subscribe({ onEvent: observed })
+    const activities = [
+      { phase: 'requesting', model: 'deepseek-v4-pro', retry_attempt: 0 },
+      { phase: 'fallback', model: 'kimi-k2.7-code', retry_attempt: 0 },
+      { phase: 'retry_wait', model: 'kimi-k2.7-code', retry_attempt: 1 },
+      { phase: 'retrying', model: 'kimi-k2.7-code', retry_attempt: 1 },
+      { phase: 'fallback', model: 'deepseek-v4-pro-0813', retry_attempt: 0 },
+      { phase: 'reasoning', model: 'deepseek-v4-pro-0813', retry_attempt: 0 },
+    ]
+    for (const [index, activity] of activities.entries()) {
+      const payload = Object.freeze({
+        key: 'alpha', task_id: 'turn-A', activity_id: 'provider-A',
+        stream_generation: 'generation-A', stream_seq: index + 1, ...activity,
+      })
+      rpc.emit('*', 'session.event.provider_activity', payload, { authoritativeLive: true })
+      rpc.emit('*', 'session.event.provider_activity', payload, { replayed: true })
+      const live = observed.mock.calls[index * 2]?.[0]
+      const replay = observed.mock.calls[index * 2 + 1]?.[0]
+      const snapshot = projectConversationSnapshotEvent('session.event.provider_activity', payload)
+      expect(live?.kind).toBe('conversation')
+      expect(replay?.kind).toBe('conversation')
+      expect(snapshot?.semanticKind).toBe('provider-activity')
+      if (live?.kind !== 'conversation' || replay?.kind !== 'conversation'
+        || live.event.semanticKind !== 'provider-activity'
+        || replay.event.semanticKind !== 'provider-activity'
+        || snapshot?.semanticKind !== 'provider-activity') throw new Error('Missing provider activity')
+      expect(live.event.payload.model).toBe(activity.model)
+      expect(live.event.payload).toMatchObject(payload)
+      expect(replay.event.payload).toEqual(live.event.payload)
+      expect(snapshot.payload).toEqual(live.event.payload)
+      expect(live.event.meta).toEqual({ authoritativeLive: true })
+      expect(replay.event.meta).toEqual({ replayed: true })
+    }
+  })
+
+  it.each([undefined, null, 42, false, ['model-a'], { model: 'model-a' }])(
+    'accepts legacy or malformed physical model fields without losing activity: %j', model => {
+      const { rpc, transport } = harness()
+      const observed = vi.fn<(event: ConversationEvent) => void>()
+      transport.subscribe({ onEvent: observed })
+      const payload = { key: 'alpha', phase: 'retry_wait', retry_attempt: 1, ...(model === undefined ? {} : { model }) }
+      rpc.emit('*', 'session.event.provider_activity', payload, { replayed: true })
+      const event = observed.mock.calls[0]?.[0]
+      const snapshot = projectConversationSnapshotEvent('session.event.provider_activity', payload)
+      expect(event?.kind).toBe('conversation')
+      expect(snapshot?.semanticKind).toBe('provider-activity')
+      if (event?.kind !== 'conversation' || event.event.semanticKind !== 'provider-activity'
+        || snapshot?.semanticKind !== 'provider-activity') throw new Error('Missing provider activity')
+      expect(event.event.payload).toEqual({ key: 'alpha', phase: 'retry_wait', retry_attempt: 1 })
+      expect(event.event.payload.model).toBeUndefined()
+      expect(snapshot.payload).toEqual(event.event.payload)
+    },
+  )
+
   it('preserves recovery scope and rejects unowned flow delivery instead of manufacturing dirty responsibility', async () => {
     const consumed = new Map<string, TransportConsumptionHandler>()
     let gap!: TransportGapHandler

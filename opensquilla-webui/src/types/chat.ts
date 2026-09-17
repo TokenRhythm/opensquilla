@@ -523,6 +523,17 @@ export interface ChatModelCallSegment {
   endCodepoint?: number
 }
 
+export interface ChatExecutionLeg {
+  index?: number
+  kind?: string
+  provider?: string
+  model?: string
+  plan_id?: string
+  execution_id?: string
+  call_kind?: string
+  reason?: string
+}
+
 export interface ChatUsagePayload {
   model?: string
   routed_model?: string
@@ -550,6 +561,8 @@ export interface ChatUsagePayload {
   ensembleTrace?: ChatEnsembleTrace
   route_plan?: Record<string, unknown>
   routePlan?: Record<string, unknown>
+  execution_legs?: ChatExecutionLeg[]
+  executionLegs?: ChatExecutionLeg[]
   model_call_segments?: ChatModelCallSegment[]
   modelCallSegments?: ChatModelCallSegment[]
   /** Physical provider call whose visible output owns the route card. */
@@ -697,6 +710,8 @@ export interface ChatMessage {
   reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
+  /** Live physical execution model; never overwrites the logical route decision. */
+  routerExecutionModel?: string
   routerDecision?: ConversationRoutingSnapshot | null
   /** Routing-only usage projection for a split historical answer segment. */
   routerUsage?: ChatUsagePayload
@@ -861,6 +876,8 @@ export interface ChatRenderedMessage {
   winnerIdx?: number
   /** Authoritative model from the historical routing decision, independent of UI cells. */
   routerSelectedModel?: string
+  /** Current or terminal physical execution model, independent of the route decision. */
+  routerExecutionModel?: string
   parts?: import('./parts').ChatPart[]
   sources?: import('./parts').SourcePart[]
   statusHistory?: import('./parts').StatusPart[]

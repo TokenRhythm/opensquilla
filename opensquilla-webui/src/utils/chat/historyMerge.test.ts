@@ -635,6 +635,81 @@ describe('reconcileHistoryWindow', () => {
 })
 
 describe('reconcileRunningHistoryMessages', () => {
+  it.each([undefined, 'running', 'queued', 'approval_pending'])(
+    'anchors a live router snapshot before canonical user history with outcome %s',
+    (status) => {
+      const router = msg({
+        role: 'router',
+        messageId: 'router-current',
+        turnId: 'turn-current',
+        routerDecision: { tier: 'c1', model: 'deepseek-v4-pro', source: 'squilla_router' },
+        routerExecutionModel: 'kimi-k2.7-code',
+      })
+      const user = msg({
+        role: 'user',
+        messageId: 'user-current',
+        turnId: 'turn-current',
+        restoredFromHistory: true,
+        ...(status ? {
+          turnOutcome: {
+            turnId: 'turn-current',
+            status,
+            kind: 'unknown',
+            reason: 'mutation_ledger_with_nonterminal_task',
+          },
+        } : {}),
+      })
+      const previous = [
+        msg({ role: 'router', messageId: 'router-old', turnId: 'turn-old' }),
+        router,
+        msg({ text: 'Live progress', turnId: 'turn-current', clientId: 'progress-current' }),
+      ]
+
+      const out = reconcileRunningHistoryMessages(previous, [user])
+
+      expect(out.map(message => message.messageId ?? message.clientId)).toEqual([
+        'user-current', 'router-current', 'progress-current',
+      ])
+      expect(out[1]).toMatchObject({
+        routerDecision: { model: 'deepseek-v4-pro' },
+        routerExecutionModel: 'kimi-k2.7-code',
+      })
+      expect(reconcileRunningHistoryMessages(out, [user])).toEqual(out)
+    },
+  )
+
+  it.each([
+    'different-turn', 'missing-turn', 'terminal-receipt',
+    'succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted',
+  ])(
+    'does not append an unanchored router snapshot to %s history',
+    (boundary) => {
+      const router = msg({
+        role: 'router', messageId: 'router-current', turnId: 'turn-current',
+        routerExecutionModel: 'kimi-k2.7-code',
+      })
+      const incoming = [msg({
+        role: 'user', messageId: 'user-current', restoredFromHistory: true,
+        turnId: boundary === 'missing-turn' ? undefined : 'turn-current',
+      })]
+      if (boundary === 'different-turn') {
+        incoming.push(msg({
+          role: 'user', messageId: 'user-next', turnId: 'turn-next', restoredFromHistory: true,
+        }))
+      } else if (boundary === 'terminal-receipt') {
+        incoming.push(msg({
+          role: 'assistant', messageId: 'answer-current', turnId: 'turn-current',
+          restoredFromHistory: true,
+          usage: { model: 'deepseek-v4-pro-0813' },
+        }))
+      } else if (boundary !== 'missing-turn') {
+        incoming[0]!.turnOutcome = { turnId: 'turn-current', status: boundary }
+      }
+
+      expect(reconcileRunningHistoryMessages([router], incoming)).toEqual(incoming)
+    },
+  )
+
   it('replaces a canonical live assistant with its durable row by turn identity', () => {
     const previous = [
       msg({

@@ -84,6 +84,7 @@ from .types import (
     Message,
     ModelCapabilities,
     ModelInfo,
+    ProviderActivityEvent,
     ProviderBillingReceipt,
     ProviderGenerationResetEvent,
     ProviderHeartbeatEvent,
@@ -253,10 +254,16 @@ async def _stream_with_heartbeats(
     timeout_seconds: float | None,
     reset_deadline_on_event: bool = False,
     on_request_start: Callable[[], Awaitable[None]] | None = None,
-) -> AsyncIterator[StreamEvent]:
+    request_activity: ProviderActivityEvent | None = None,
+) -> AsyncGenerator[StreamEvent, None]:
     stream_iter = stream.__aiter__()
     request_start_recorded = False
     request_start_allowed = getattr(stream, "_provider_request_started", True) is not False
+    started = (
+        asyncio.get_running_loop().create_future()
+        if request_activity is not None and request_start_allowed
+        else None
+    )
 
     async def pull_next() -> StreamEvent:
         nonlocal request_start_recorded
@@ -264,6 +271,8 @@ async def _stream_with_heartbeats(
             request_start_recorded = True
             if on_request_start is not None:
                 await on_request_start()
+            if started is not None and not started.done():
+                started.set_result(None)
         return await stream_iter.__anext__()
 
     pending: asyncio.Future[StreamEvent] = asyncio.ensure_future(pull_next())
@@ -275,8 +284,16 @@ async def _stream_with_heartbeats(
         else None
     )
     deadline = time.monotonic() + timeout_budget if timeout_budget is not None else None
+    activity_emitted = False
     try:
         while True:
+            if started is not None and started.done() and not activity_emitted:
+                # Publish identity at the admitted physical pull, including a
+                # silent provider, before exposing its first output.
+                assert request_activity is not None
+                request_activity.started_at = time.time_ns() // 1_000_000
+                activity_emitted = True
+                yield request_activity
             wait_seconds = _ensemble_heartbeat_interval()
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -304,7 +321,14 @@ async def _stream_with_heartbeats(
                     pending = asyncio.ensure_future(pull_next())
                     continue
                 wait_seconds = min(wait_seconds, remaining)
-            done, _ = await asyncio.wait({pending}, timeout=wait_seconds)
+            waiters = {pending}
+            if started is not None and not started.done():
+                waiters.add(started)
+            done, _ = await asyncio.wait(
+                waiters, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if started is not None and started in done:
+                continue
             if not done:
                 yield ProviderHeartbeatEvent(phase=phase, message=message)
                 continue
@@ -323,6 +347,8 @@ async def _stream_with_heartbeats(
                 deadline = time.monotonic() + timeout_budget
             pending = asyncio.ensure_future(pull_next())
     finally:
+        if started is not None and not started.done():
+            started.cancel()
         cleanup_deadline = time.monotonic() + max(
             0.0,
             float(_ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS),
@@ -445,6 +471,7 @@ async def _provider_stream_with_lifecycle(
     timeout_seconds: float | None,
     reset_deadline_on_event: bool,
     on_request_start: Callable[[], Awaitable[None]] | None = None,
+    request_activity: ProviderActivityEvent | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Run one provider stream under the turn-local admission lease.
 
@@ -497,7 +524,7 @@ async def _provider_stream_with_lifecycle(
         if on_request_start is not None:
             await on_request_start()
 
-    heartbeat_stream: AsyncIterator[StreamEvent] | None = None
+    heartbeat_stream: AsyncGenerator[StreamEvent, None] | None = None
     try:
         stream = stream_factory()
         heartbeat_stream = _stream_with_heartbeats(
@@ -507,6 +534,7 @@ async def _provider_stream_with_lifecycle(
             timeout_seconds=timeout_seconds,
             reset_deadline_on_event=reset_deadline_on_event,
             on_request_start=record_request_start,
+            request_activity=request_activity,
         )
         async for event in heartbeat_stream:
             if execution_context is not None and not isinstance(
@@ -1562,6 +1590,13 @@ class EnsembleProvider:
         self._primary_trace: dict[str, Any] | None = None
         self._primary_prior_rows: tuple[dict[str, Any], ...] = ()
         self._primary_prior_missing_count = 0
+        self._active_model_id = ""
+
+    @property
+    def active_model_id(self) -> str:
+        """The admitted final request, or no single model during proposals."""
+
+        return self._active_model_id
 
     def activate_provider_state_replay_boundary(self) -> None:
         """Commit the no-replay boundary after the runtime accepts this plan.
@@ -2542,6 +2577,7 @@ class EnsembleProvider:
         finally:
             with contextlib.suppress(Exception):
                 await stream.aclose()
+            self._active_model_id = ""
 
     async def _stream_single_attempt(
         self,
@@ -2658,6 +2694,7 @@ class EnsembleProvider:
             return
 
         async def mark_request_started() -> None:
+            self._active_model_id = model
             _mark_final_request_started(trace)
 
         started = time.monotonic()
@@ -2681,6 +2718,7 @@ class EnsembleProvider:
             timeout_seconds=request_config.timeout,
             reset_deadline_on_event=False,
             on_request_start=mark_request_started,
+            request_activity=ProviderActivityEvent(model=model),
         )
         try:
             async for event in stream:
@@ -2700,7 +2738,7 @@ class EnsembleProvider:
                         trace, event=event, output_text="".join(text_parts),
                     )
                     trace["final_request"]["execution"].update({
-                        "provider": actual_provider, "model": actual_model,
+                        "provider": actual_provider, "model": model,
                     })
                     # The outer turn already consumed prior request receipts.
                     # Only the trace is cumulative at this terminal boundary.
@@ -3898,6 +3936,7 @@ class EnsembleProvider:
             async def mark_aggregator_request_started() -> None:
                 nonlocal aggregator_request_started
                 aggregator_request_started = True
+                self._active_model_id = self.aggregator.provider_config.model
                 _mark_final_request_started(trace)
 
             attempt_text_parts: list[str] = []
@@ -3932,6 +3971,13 @@ class EnsembleProvider:
                     timeout_seconds=timeout_seconds,
                     reset_deadline_on_event=True,
                     on_request_start=mark_aggregator_request_started,
+                    request_activity=ProviderActivityEvent(
+                        model=self.aggregator.provider_config.model,
+                        phase="requesting" if attempt == 0 else "retrying",
+                        reason="initial" if attempt == 0 else "transport_transient",
+                        retry_attempt=attempt,
+                        retry_limit=_ENSEMBLE_AGGREGATOR_MAX_RETRIES,
+                    ),
                 )
                 async for event in heartbeat_stream:
                     attempt_buffer_bytes += _generation_buffer_event_bytes(
@@ -4132,7 +4178,7 @@ class EnsembleProvider:
                     ):
                         attempt_had_tool = True
                         yield event
-                    elif isinstance(event, ProviderHeartbeatEvent):
+                    elif isinstance(event, (ProviderHeartbeatEvent, ProviderActivityEvent)):
                         yield event
                     else:
                         continue
@@ -4511,6 +4557,7 @@ class EnsembleProvider:
             async def mark_fixed_request_started() -> None:
                 nonlocal fixed_request_started
                 fixed_request_started = True
+                self._active_model_id = physical_model
                 _mark_final_request_started(trace)
 
             attempt_started = time.monotonic()
@@ -4541,6 +4588,13 @@ class EnsembleProvider:
                     timeout_seconds=timeout_seconds,
                     reset_deadline_on_event=True,
                     on_request_start=mark_fixed_request_started,
+                    request_activity=ProviderActivityEvent(
+                        model=physical_model,
+                        phase="fallback" if fixed_attempt == 1 else "retrying",
+                        reason="unknown" if fixed_attempt == 1 else "transport_transient",
+                        retry_attempt=fixed_attempt - 1,
+                        retry_limit=1,
+                    ),
                 ):
                     attempt_buffer_bytes += _generation_buffer_event_bytes(
                         event,
@@ -4593,8 +4647,10 @@ class EnsembleProvider:
                         if isinstance(final_request, dict):
                             execution = final_request.get("execution")
                             if isinstance(execution, dict):
-                                execution["provider"] = provider_name
-                                execution["model"] = model
+                                # Response model aliases belong to the usage
+                                # receipt, not the identity of the request.
+                                execution["provider"] = physical_provider
+                                execution["model"] = physical_model
                         row = _done_usage_row(
                             event,
                             role=fixed_role,

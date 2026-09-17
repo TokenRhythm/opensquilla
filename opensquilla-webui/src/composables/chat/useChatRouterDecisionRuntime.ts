@@ -103,9 +103,30 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const seq = validIdentityStreamSeq(payload.stream_seq) ?? validIdentityStreamSeq(identityStreamSeq)
     // Snapshot restoration supplies the original sequence as identity even
     // though it removes it from the payload to bypass live cursor deduplication.
-    replayKeys.set(turnId, seq === null
+    const nextReplayKey = seq === null
       ? `local:${++localReplaySeq}`
-      : JSON.stringify([payload.stream_generation || '', seq]))
+      : JSON.stringify([payload.stream_generation || '', seq])
+    if (nextReplayKey !== replayKeyForTurn(turnId)) {
+      // Only the attempt before this boundary has ended. Snapshot restoration
+      // can already contain later attempts, and a repeated boundary must not
+      // settle the card that belongs to the attempt it opens.
+      for (let i = options.messages.value.length - 1; i >= 0; i--) {
+        const message = options.messages.value[i]
+        if (
+          message.role === 'router'
+          && message.provenanceKind === 'router_decision'
+          && (!turnId || message.turnId === turnId)
+          && belongsToCurrentAttempt(message, turnId)
+        ) {
+          message.routerSettled = true
+        }
+        if (
+          message.role === 'user'
+          && (!turnId || !message.turnId || message.turnId !== turnId)
+        ) break
+      }
+    }
+    replayKeys.set(turnId, nextReplayKey)
     if (!options.isStreaming.value) options.startStreaming()
     pendingRouterDecision.value = null
     options.resetStreamForRouterReplay()
@@ -385,6 +406,18 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     return findRouterMessageForTurn(targetTurnId)
   }
 
+  function updateRouterExecutionModel(
+    model: string,
+    targetTurnId = latestExplicitTurnId(),
+  ) {
+    const normalizedModel = String(model || '').trim()
+    if (!normalizedModel) return
+    const target = findRouterMessageForTurn(targetTurnId)
+    if (!target || target.routerExecutionModel === normalizedModel) return
+    target.routerExecutionModel = normalizedModel
+    scrollToBottomIfFollowing()
+  }
+
   function synthesizeHandoffRouterMessage(turnId: string): ChatMessage {
     const message: ChatMessage = {
       role: 'router',
@@ -475,6 +508,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     clearPendingRouterDecision,
     appendEnsembleProgress,
     markEnsembleHandoff,
+    updateRouterExecutionModel,
     bindRouterDecisionToModelCall,
     freezeActiveTurnRoutingMode,
   }
