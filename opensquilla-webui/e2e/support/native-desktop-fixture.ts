@@ -34,7 +34,12 @@ export const test = base.extend({
     }
     const app = await electron.launch({
       executablePath: require('electron'),
-      args: [`--user-data-dir=${userData}`, desktop],
+      args: [
+        // Supply this before Electron initializes macOS OS-crypt. Playwright's
+        // later loader switch is too late for isolated profiles on some hosts.
+        ...(process.platform === 'darwin' ? ['--use-mock-keychain'] : []),
+        `--user-data-dir=${userData}`, desktop,
+      ],
       env: { ...env, HOME: isolatedHome, USERPROFILE: isolatedHome,
         OPENSQUILLA_DESKTOP_REPO_ROOT: repo, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
         OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', PYTHONUTF8: '1' },
