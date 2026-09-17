@@ -14,6 +14,8 @@ while the subprocess is running.
 from __future__ import annotations
 
 import asyncio
+import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -25,7 +27,7 @@ from opensquilla.skills.meta.types import MetaStep
 from opensquilla.skills.types import SkillLayer, SkillSpec
 
 
-def _spec(base_dir: Path, command: str) -> SkillSpec:
+def _spec(base_dir: Path, command: str, *, timeout: float = 30.0) -> SkillSpec:
     return SkillSpec(
         name="slow-skill",
         description="test",
@@ -34,7 +36,7 @@ def _spec(base_dir: Path, command: str) -> SkillSpec:
         triggers=[],
         content="",
         base_dir=str(base_dir),
-        entrypoint={"command": command, "parse": "text", "timeout": 30.0},
+        entrypoint={"command": command, "parse": "text", "timeout": timeout},
     )
 
 
@@ -93,3 +95,48 @@ async def test_skill_exec_does_not_block_event_loop(tmp_path: Path) -> None:
         f"event loop was blocked during skill_exec subprocess: "
         f"only {tick_count} ticks in {wall:.2f}s (expected ≥20)"
     )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="deep process-group check is POSIX-specific")
+@pytest.mark.asyncio
+async def test_skill_exec_timeout_cleans_deep_owned_tree_and_registry(tmp_path: Path) -> None:
+    from opensquilla import process_tree
+
+    leaked = tmp_path / "synthetic-descendant-leaked"
+    child = (
+        "import pathlib, signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(1.0); "
+        f"pathlib.Path({str(leaked)!r}).write_text('unexpected')"
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        "time.sleep(5.0)\n",
+        encoding="utf-8",
+    )
+    spec = _spec(
+        tmp_path,
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(parent))}",
+        timeout=0.2,
+    )
+
+    with process_tree.task_process_scope(
+        tmp_path,
+        session_key="synthetic-session",
+        task_id="synthetic-task",
+    ):
+        with pytest.raises(RuntimeError, match="timed out"):
+            await run_skill_exec_step(
+                MetaStep(id="timeout", kind="skill_exec", skill=spec.name),
+                effective_skill=spec.name,
+                inputs={},
+                outputs={},
+                skill_loader=_Loader(spec),
+                workspace_dir=str(tmp_path),
+            )
+
+    await asyncio.sleep(1.1)
+    assert leaked.exists() is False
+    assert process_tree._load_owner_records(tmp_path) == ()

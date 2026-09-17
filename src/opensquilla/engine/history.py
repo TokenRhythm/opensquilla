@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import re
+from collections.abc import Callable, Collection, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass, field
 from typing import Any
 
+from opensquilla.artifacts import GENERATED_ARTIFACT_CONTEXT_PREFIX, artifact_history_context
 from opensquilla.execution_status import (
     normalize_execution_status,
     normalize_legacy_execution_status,
@@ -15,21 +22,347 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
 )
+from opensquilla.provider.replay_budget import project_message_replay_budget
+from opensquilla.provider.types import (
+    ContentBlockDocument,
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+    ContentBlockThinking,
+)
+from opensquilla.silent_reply import sanitize_historical_silent_reply
+
+_RECORDED_TOOL_HISTORY_PREFIX = "[Recorded tool history]"
 
 _SYNTHETIC_USER_PREFIXES = (
+    GENERATED_ARTIFACT_CONTEXT_PREFIX,
     "[Available skills for this turn]",
     "[Context summary]",
     "[Request context for this turn]",
     "[Runtime context for this turn]",
+    _RECORDED_TOOL_HISTORY_PREFIX,
 )
 
 
+@dataclass(frozen=True)
+class HistoryReplayEntryProjection:
+    """One transcript row projected into provider-visible replay material.
+
+    ``content`` is deliberately hidden from ``repr`` because it may contain
+    user text or an in-memory typed media block.  Callers can also represent
+    non-message transcript records without teaching this module about session
+    persistence: legacy summaries and terminal notices are accumulated on the
+    returned :class:`HistoryReplayProjection` instead.
+    """
+
+    role: str | None = None
+    content: Any = field(default="", repr=False)
+    tool_calls: list[dict[str, Any]] | None = field(default=None, repr=False)
+    reasoning_content: str | None = field(default=None, repr=False)
+    turn_context: Mapping[str, Any] | None = field(default=None, repr=False)
+    legacy_summary_marker: str | None = field(default=None, repr=False)
+    terminal_notice: str | None = field(default=None, repr=False)
+    estimate_complete: bool = True
+    persisted_token_count: int = 0
+    raw_token_floor_applies: bool = True
+    # ``None`` preserves the prior state, matching ignored/system rows.  A
+    # terminal notice uses ``False`` so positional current-user trimming does
+    # not remove a prompt that is no longer the transcript tail.
+    last_entry_was_user: bool | None = None
+    assistant_replay: Mapping[str, Any] | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class HistoryReplayMessageProvenance:
+    """Private transcript-row provenance for one reconstructed message."""
+
+    entry_index: int | None = field(default=None, repr=False)
+    estimate_complete: bool = field(default=True, repr=False)
+    persisted_token_count: int = field(default=0, repr=False)
+    raw_token_floor_applies: bool = field(default=True, repr=False)
+
+
+@dataclass(frozen=True)
+class HistoryReplayProjection:
+    """Side-effect-free reconstruction of a transcript replay slice."""
+
+    messages: tuple[Message, ...] = field(default=(), repr=False)
+    message_provenance: tuple[HistoryReplayMessageProvenance, ...] = field(
+        default=(),
+        repr=False,
+    )
+    legacy_summary_markers: tuple[str, ...] = field(default=(), repr=False)
+    terminal_notices: tuple[str, ...] = field(default=(), repr=False)
+    estimate_complete: bool = True
+
+
+@dataclass(frozen=True)
+class HistoryReplayCapacityProjection:
+    """Media-aware capacity projection for a reconstructed history slice."""
+
+    messages: tuple[Message, ...] = field(default=(), repr=False)
+    estimated_tokens: int = 0
+    message_count: int = 0
+    media_block_count: int = 0
+    media_reserve_tokens: int = 0
+    estimate_complete: bool = True
+
+
+def project_history_replay(
+    entries: Sequence[Any],
+    *,
+    excluded_entry_indexes: Collection[int] = (),
+    trim_last_user: bool = True,
+    bound_slice_applied: bool = False,
+    entry_projector: Callable[[Any, int], HistoryReplayEntryProjection],
+) -> HistoryReplayProjection:
+    """Reconstruct the exact pre-current transcript message sequence.
+
+    The caller owns persistence-specific decoding through ``entry_projector``;
+    this function owns the replay invariants shared by history loading and
+    router admission: bound/queued exclusions, persisted tool reconstruction,
+    positional current-user trimming, and terminal-notice placement.  Inputs
+    are never mutated.
+    """
+
+    excluded = set(excluded_entry_indexes)
+    messages: list[Message] = []
+    message_provenance: list[HistoryReplayMessageProvenance] = []
+    legacy_summary_markers: list[str] = []
+    terminal_notices: dict[str, HistoryReplayMessageProvenance] = {}
+    estimate_complete = True
+    last_entry_was_user = False
+
+    for entry_index, entry in enumerate(entries):
+        if entry_index in excluded:
+            # Mirrors the queued-send loader: a skipped bound/future user is
+            # not the replay tail and therefore disables positional trimming.
+            last_entry_was_user = False
+            continue
+
+        projected = entry_projector(entry, entry_index)
+        estimate_complete = estimate_complete and projected.estimate_complete
+        if projected.legacy_summary_marker is not None:
+            legacy_summary_markers.append(projected.legacy_summary_marker)
+        if projected.terminal_notice is not None:
+            terminal_notices.setdefault(
+                projected.terminal_notice,
+                HistoryReplayMessageProvenance(
+                    entry_index=entry_index,
+                    estimate_complete=projected.estimate_complete,
+                    persisted_token_count=max(0, projected.persisted_token_count),
+                    raw_token_floor_applies=projected.raw_token_floor_applies,
+                ),
+            )
+        if projected.role in {"user", "assistant"}:
+            reconstructed = reconstruct_messages_from_entry(
+                projected.role,
+                projected.content,
+                projected.tool_calls,
+                projected.reasoning_content,
+                assistant_replay=projected.assistant_replay,
+                turn_context=projected.turn_context,
+            )
+            messages.extend(reconstructed)
+            message_provenance.extend(
+                HistoryReplayMessageProvenance(
+                    entry_index=entry_index,
+                    estimate_complete=projected.estimate_complete,
+                    persisted_token_count=max(0, projected.persisted_token_count),
+                    raw_token_floor_applies=projected.raw_token_floor_applies,
+                )
+                for _message in reconstructed
+            )
+        if projected.last_entry_was_user is not None:
+            last_entry_was_user = projected.last_entry_was_user
+
+    if (
+        not bound_slice_applied
+        and trim_last_user
+        and last_entry_was_user
+        and messages
+        and messages[-1].role == "user"
+    ):
+        messages.pop()
+        message_provenance.pop()
+
+    unique_notices = tuple(terminal_notices)
+    messages.extend(Message(role="assistant", content=notice) for notice in unique_notices)
+    message_provenance.extend(terminal_notices[notice] for notice in unique_notices)
+    return HistoryReplayProjection(
+        messages=tuple(messages),
+        message_provenance=tuple(message_provenance),
+        legacy_summary_markers=tuple(legacy_summary_markers),
+        terminal_notices=unique_notices,
+        estimate_complete=estimate_complete,
+    )
+
+
+def project_history_replay_capacity(
+    projection: HistoryReplayProjection,
+    *,
+    max_history_turns: int = 0,
+) -> HistoryReplayCapacityProjection:
+    """Estimate replay tokens after the route's real history-tail policy.
+
+    Typed media is replaced by a bounded placeholder before tokenization and
+    pays the same media estimate used by provider request proof.  Plain
+    dictionaries (including arbitrary JSON/data URLs in tool arguments) are
+    intentionally *not* recognized as media and remain fully tokenized.
+    Invalid or unsupported typed media keeps its raw conservative projection
+    and marks the result incomplete so admission fails closed.
+    """
+
+    from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_MIMES
+    from opensquilla.provider.request_proof import estimate_provider_media_tokens
+    from opensquilla.session.tokenizer import estimate_tokens
+
+    messages = list(projection.messages)
+    provenance = list(projection.message_provenance)
+    if messages and not provenance:
+        # Compatibility for internal callers that construct a projection by
+        # hand. Runtime-built projections always carry row provenance.
+        provenance = [
+            HistoryReplayMessageProvenance(
+                estimate_complete=projection.estimate_complete,
+            )
+            for _ in range(len(messages))
+        ]
+    provenance_shape_complete = len(provenance) == len(messages)
+    if not provenance_shape_complete:
+        provenance = [
+            HistoryReplayMessageProvenance(estimate_complete=False)
+            for _ in range(len(messages))
+        ]
+    if max_history_turns > 0:
+        retained_indexes = _limit_turn_retained_indexes(messages, max_history_turns)
+        messages = [messages[index] for index in retained_indexes]
+        provenance = [provenance[index] for index in retained_indexes]
+    messages, retained_indexes = _repair_tool_pairing_with_retained_indexes(messages)
+    provenance = [provenance[index] for index in retained_indexes]
+
+    media_block_count = 0
+    media_reserve_tokens = 0
+    estimate_complete = provenance_shape_complete and all(
+        item.estimate_complete for item in provenance
+    )
+
+    def _project_value(value: Any) -> Any:
+        nonlocal media_block_count, media_reserve_tokens, estimate_complete
+
+        media_kind: str | None = None
+        if isinstance(value, ContentBlockImage):
+            if (
+                value.source_type != "base64"
+                or value.media_type not in IMAGE_ATTACHMENT_MIMES
+            ):
+                estimate_complete = False
+            else:
+                media_kind = "image"
+        elif isinstance(value, ContentBlockDocument):
+            if value.source_type != "base64" or value.media_type != "application/pdf":
+                estimate_complete = False
+            else:
+                media_kind = "pdf"
+
+        if media_kind is not None:
+            try:
+                decoded_bytes = len(base64.b64decode(value.data, validate=True))
+            except (binascii.Error, ValueError):
+                estimate_complete = False
+            else:
+                reserve = estimate_provider_media_tokens(
+                    media_kind, decoded_bytes, encoded_data=value.data,
+                )
+                media_block_count += 1
+                media_reserve_tokens += reserve
+                dumped = value.model_dump(mode="json", exclude_none=True)
+                dumped["data"] = (
+                    f"[history_{media_kind}_omitted: {len(value.data)} chars]"
+                )
+                return dumped
+
+        if isinstance(value, list | tuple):
+            return [_project_value(item) for item in value]
+        if isinstance(value, dict):
+            # Do not infer media from untyped user/tool JSON.
+            return {str(key): _project_value(item) for key, item in value.items()}
+        model_fields = getattr(type(value), "model_fields", None)
+        if isinstance(model_fields, dict):
+            projected_model: dict[str, Any] = {}
+            for name in model_fields:
+                item = getattr(value, name, None)
+                if item is not None:
+                    projected_model[str(name)] = _project_value(item)
+            return projected_model
+        return value
+
+    payload: list[Any] = []
+    entry_estimates: dict[tuple[str, int], int] = {}
+    entry_media_reserves: dict[tuple[str, int], int] = {}
+    entry_token_floors: dict[tuple[str, int], int] = {}
+    for message_index, (message, source) in enumerate(zip(messages, provenance, strict=True)):
+        media_before = media_reserve_tokens
+        projected_message = _project_value(project_message_replay_budget(message))
+        payload.append(projected_message)
+        serialized_message = json.dumps(
+            projected_message,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        message_tokens = estimate_tokens(serialized_message)
+        message_media_reserve = media_reserve_tokens - media_before
+        source_key = (
+            ("entry", source.entry_index)
+            if source.entry_index is not None
+            else ("message", message_index)
+        )
+        entry_estimates[source_key] = entry_estimates.get(source_key, 0) + message_tokens
+        entry_media_reserves[source_key] = (
+            entry_media_reserves.get(source_key, 0) + message_media_reserve
+        )
+        if source.raw_token_floor_applies:
+            entry_token_floors[source_key] = max(
+                entry_token_floors.get(source_key, 0),
+                max(0, source.persisted_token_count),
+            )
+
+    adjusted_entry_tokens = sum(
+        max(tokens, entry_token_floors.get(source_key, 0))
+        + entry_media_reserves.get(source_key, 0)
+        for source_key, tokens in entry_estimates.items()
+    )
+    serialized_tokens = 0
+    if payload:
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        serialized_tokens = estimate_tokens(serialized) + media_reserve_tokens
+    estimated_tokens = max(serialized_tokens, adjusted_entry_tokens)
+    return HistoryReplayCapacityProjection(
+        messages=tuple(messages),
+        estimated_tokens=max(0, estimated_tokens),
+        message_count=len(messages),
+        media_block_count=media_block_count,
+        media_reserve_tokens=max(0, media_reserve_tokens),
+        estimate_complete=estimate_complete,
+    )
+
+
+def _is_synthetic_context_message(message: Message) -> bool:
+    content = message.content
+    if isinstance(content, list):
+        # Historical tool media is extracted beside the leading record text.
+        # Its provenance applies to the entire message, including that media.
+        if not content or not isinstance(content[0], ContentBlockText):
+            return False
+        content = content[0].text
+    return isinstance(content, str) and content.startswith(_SYNTHETIC_USER_PREFIXES)
+
+
+
 def _is_real_user_turn(message: Message) -> bool:
-    if message.role != "user":
+    if message.role != "user" or _is_synthetic_context_message(message):
         return False
     content = message.content
-    if isinstance(content, str):
-        return not content.startswith(_SYNTHETIC_USER_PREFIXES)
     if isinstance(content, list):
         return not all(isinstance(block, ContentBlockToolResult) for block in content)
     return True
@@ -69,6 +402,19 @@ def limit_turns(messages: list[Message], max_turns: int) -> list[Message]:
         return messages  # within budget
 
     return messages[cut_index:]
+
+
+def _limit_turn_retained_indexes(
+    messages: list[Message],
+    max_turns: int,
+) -> tuple[int, ...]:
+    """Return source indexes for the suffix retained by ``limit_turns``."""
+
+    limited = limit_turns(messages, max_turns)
+    if limited is messages:
+        return tuple(range(len(messages)))
+    start = len(messages) - len(limited)
+    return tuple(range(start, len(messages)))
 
 
 def _extract_tool_use_ids(content: Any) -> set[str]:
@@ -121,8 +467,10 @@ def _dedupe_tool_result_blocks(content: Any) -> tuple[Any, bool]:
     return next_content, changed
 
 
-def repair_tool_pairing(messages: list[Message]) -> list[Message]:
-    """Remove messages with malformed tool_use/tool_result adjacency.
+def _repair_tool_pairing_with_retained_indexes(
+    messages: list[Message],
+) -> tuple[list[Message], tuple[int, ...]]:
+    """Repair tool pairing and return indexes retained from ``messages``.
 
     OpenAI-compatible providers require an assistant message with tool calls to
     be followed immediately by tool result messages for every requested
@@ -130,10 +478,12 @@ def repair_tool_pairing(messages: list[Message]) -> list[Message]:
     ordinary user/context messages between the call and result still make the
     provider request invalid.
 
-    Returns original list reference if no repairs needed.
+    Returns the original list reference if no repairs are needed. The private
+    index sidecar lets capacity accounting discard provenance for messages that
+    this repair removes without changing the public repair API.
     """
     if not messages:
-        return messages
+        return messages, ()
 
     valid_tool_call_indices: set[int] = set()
     valid_tool_result_indices: set[int] = set()
@@ -163,6 +513,7 @@ def repair_tool_pairing(messages: list[Message]) -> list[Message]:
             valid_tool_result_indices.update(result_indices)
 
     repaired: list[Message] = []
+    retained_indexes: list[int] = []
     changed = False
     for index, message in enumerate(messages):
         use_ids = _extract_tool_use_ids(message.content)
@@ -178,16 +529,22 @@ def repair_tool_pairing(messages: list[Message]) -> list[Message]:
         if result_ids:
             content, deduped = _dedupe_tool_result_blocks(message.content)
             if deduped:
-                message = Message(
-                    role=message.role,
-                    content=content,
-                    reasoning_content=message.reasoning_content,
-                )
+                message = message.model_copy(update={"content": content})
                 changed = True
 
         repaired.append(message)
+        retained_indexes.append(index)
 
-    return messages if not changed else repaired
+    if not changed:
+        return messages, tuple(range(len(messages)))
+    return repaired, tuple(retained_indexes)
+
+
+def repair_tool_pairing(messages: list[Message]) -> list[Message]:
+    """Remove messages with malformed tool_use/tool_result adjacency."""
+
+    repaired, _retained_indexes = _repair_tool_pairing_with_retained_indexes(messages)
+    return repaired
 
 
 def _coerce_tool_input(raw: Any) -> dict[str, Any]:
@@ -212,11 +569,176 @@ def _coerce_tool_input(raw: Any) -> dict[str, Any]:
     return {}
 
 
+class AssistantReplayError(ValueError):
+    """A durable assistant replay envelope cannot be restored without data loss."""
+
+
+def decode_assistant_replay(value: Mapping[str, Any]) -> list[Message]:
+    """Restore versioned accepted messages without guessing missing native state."""
+
+    if not isinstance(value, Mapping):
+        raise AssistantReplayError("assistant replay must be an object")
+    if type(value.get("version")) is not int or value.get("version") != 1:
+        raise AssistantReplayError("unsupported assistant replay version")
+    if set(value) - {"version", "messages"}:
+        raise AssistantReplayError("unsupported assistant replay fields")
+    raw_messages = value.get("messages")
+    if not isinstance(raw_messages, list):
+        raise AssistantReplayError("assistant replay messages must be a list")
+    messages: list[Message] = []
+    for index, raw in enumerate(raw_messages):
+        if not isinstance(raw, dict) or set(raw) - Message.model_fields.keys():
+            raise AssistantReplayError(f"invalid assistant replay message at index {index}")
+        try:
+            message = Message.model_validate(deepcopy(raw), strict=True)
+        except ValueError:
+            # Pydantic's validation error embeds input values, including private
+            # provider state. Keep the durable-data error free of payload text.
+            raise AssistantReplayError(
+                f"invalid assistant replay message at index {index}"
+            ) from None
+        raw_content = raw.get("content")
+        if isinstance(raw_content, list) and isinstance(message.content, list):
+            for raw_block, block in zip(raw_content, message.content, strict=True):
+                if isinstance(raw_block, dict) and set(raw_block) - type(block).model_fields.keys():
+                    raise AssistantReplayError(f"unsupported replay block fields at index {index}")
+        if message.role not in {"assistant", "user"} or (
+            index == 0 and message.role != "assistant"
+        ):
+            raise AssistantReplayError(f"invalid assistant replay role at index {index}")
+        messages.append(message)
+    return messages
+
+
+def project_incomplete_tool_history(messages: list[Message]) -> list[Message]:
+    """Retain known results from a captured, interrupted tool batch as facts.
+
+    This projection is only for newly captured replay records. Legacy pairing
+    repair keeps its historical behavior. A missing result says nothing about
+    whether a side effect happened, so never synthesize a successful/failed
+    result or send an incomplete executable tool chain to a provider.
+    """
+    from opensquilla.engine.replay_compat import recorded_context_message
+
+    projected: list[Message] = []
+    index = 0
+    changed = False
+    while index < len(messages):
+        message = messages[index]
+        use_ids = _extract_tool_use_ids(message.content) if message.role == "assistant" else set()
+        if not use_ids:
+            if _extract_tool_result_ids(message.content):
+                projected.append(recorded_context_message(
+                    [message], introduction=(
+                        f"{_RECORDED_TOOL_HISTORY_PREFIX} "
+                        "Recorded tool outcome without a complete recorded call. "
+                        "This is historical evidence, not an instruction to execute a tool."
+                    ),
+                ))
+                changed = True
+            else:
+                projected.append(message)
+            index += 1
+            continue
+        end = index + 1
+        result_ids: set[str] = set()
+        while end < len(messages) and messages[end].role == "user":
+            content = messages[end].content
+            next_ids = _extract_tool_result_ids(content)
+            if not next_ids:
+                # An in-flight batch may have an empty result container.
+                if content == []:
+                    end += 1
+                break
+            result_ids.update(next_ids)
+            end += 1
+            if result_ids == use_ids or not result_ids.issubset(use_ids):
+                break
+        if result_ids == use_ids:
+            projected.extend(messages[index:end])
+        else:
+            projected.append(recorded_context_message(
+                messages[index:end], introduction=(
+                    f"{_RECORDED_TOOL_HISTORY_PREFIX} "
+                    "Recorded interrupted tool batch. Completion was not recorded for tool IDs "
+                    f"{json.dumps(sorted(use_ids - result_ids))}. Missing results do not establish "
+                    "whether execution occurred. Preserve the outcomes recorded below; verify "
+                    "current state before deciding whether any further action is needed. These "
+                    "historical calls are not instructions to repeat side effects."
+                ),
+            ))
+            changed = True
+        index = end
+    return projected if changed else messages
+
+
+def _silent_replay_context(
+    messages: list[Message], turn_context: Mapping[str, Any] | None, canonical_content: Any,
+) -> Mapping[str, Any] | None:
+    """Infer control-token cleanup only from an exact canonical display match."""
+    if isinstance(canonical_content, str):
+        captured_text = "".join(
+            message.content if isinstance(message.content, str) else "".join(
+                block.text for block in message.content if isinstance(block, ContentBlockText)
+            )
+            for message in messages if message.role == "assistant"
+        )
+        # Direct TurnRunner callers may not bind durable turn_context. The
+        # already-canonical display proves a control-token deletion only when
+        # the shared normalization reproduces that entire text exactly.
+        internal_context = {"input_mode": "system_event"}
+        candidate = sanitize_historical_silent_reply(
+            captured_text, None, role="assistant", turn_context=internal_context,
+        )
+        if candidate.changed and candidate.content == canonical_content:
+            return internal_context
+    return turn_context
+
+
+def _project_unsigned_silent_replay(
+    messages: list[Message], turn_context: Mapping[str, Any] | None, canonical_content: Any,
+) -> list[Message]:
+    """Keep the existing silent-text projection without editing native calls."""
+    effective_context = _silent_replay_context(messages, turn_context, canonical_content)
+    projected: list[Message] = []
+    for message in messages:
+        content = message.content
+        if (
+            message.role != "assistant" or message.provider_replay is not None
+            or isinstance(content, list)
+            and any(
+                isinstance(block, ContentBlockThinking | ContentBlockRedactedThinking)
+                for block in content
+            )
+        ):
+            projected.append(message)
+            continue
+        result = sanitize_historical_silent_reply(
+            content if isinstance(content, str) else "",
+            [block.model_dump(mode="json") for block in content]
+            if isinstance(content, list) else None,
+            role="assistant", turn_context=effective_context,
+        )
+        if not result.changed:
+            projected.append(message)
+            continue
+        projected_content = (
+            result.content if isinstance(content, str) else
+            Message.model_validate({"role": "assistant", "content": result.segments or []}).content
+        )
+        if projected_content:
+            projected.append(message.model_copy(update={"content": projected_content}))
+    return projected
+
+
 def reconstruct_messages_from_entry(
     role: str,
     content: Any,
     tool_calls: list[dict[str, Any]] | None,
     reasoning_content: str | None = None,
+    *,
+    assistant_replay: Mapping[str, Any] | None = None,
+    turn_context: Mapping[str, Any] | None = None,
 ) -> list[Message]:
     """Rebuild provider Messages from one persisted transcript entry.
 
@@ -238,6 +760,28 @@ def reconstruct_messages_from_entry(
     """
     if role not in ("user", "assistant"):
         return []
+
+    if role == "assistant" and assistant_replay is not None:
+        replayed_messages = project_incomplete_tool_history(
+            _project_unsigned_silent_replay(
+                decode_assistant_replay(assistant_replay), turn_context, content,
+            )
+        )
+        artifact_context = artifact_history_context(content)
+        if artifact_context:
+            # Generated files are attached by the application after provider
+            # capture. Keep their facts outside signed/native assistant content.
+            replayed_messages.append(Message(role="user", content=artifact_context))
+        return replayed_messages
+
+    silent_reply = sanitize_historical_silent_reply(
+        content,
+        tool_calls,
+        role=role,
+        turn_context=turn_context,
+    )
+    content = silent_reply.content
+    tool_calls = silent_reply.segments
 
     if role == "user":
         if content:
@@ -302,6 +846,15 @@ def reconstruct_messages_from_entry(
                 result_content: str | list[Any] = raw_result
             else:
                 result_content = str(raw_result)
+            log_handle = seg.get("execution_log_handle")
+            if (
+                isinstance(result_content, str)
+                and isinstance(log_handle, str)
+                and re.fullmatch(r"tr-[0-9a-f]{32}", log_handle)
+                and log_handle not in result_content
+            ):
+                # Transcript previews can omit the original tool's log address.
+                result_content += f"\nexecution_log_handle: {log_handle}"
             pending_results.append(
                 ContentBlockToolResult(
                     tool_use_id=tool_use_id,

@@ -175,6 +175,7 @@ _SQLITE_ALL_SIDECAR_SUFFIXES = (
 )
 _WINDOWS_LOCK_ERROR_CODES = frozenset({32, 33})
 _REPARSE_POINT_ATTRIBUTE = 0x400
+_REPARSE_NAME_SURROGATE_BIT = 0x20000000
 _GATEWAY_AUTHORITY_MAX_BYTES = 64 * 1024
 _JOURNAL_PHASES = frozenset(
     {
@@ -280,10 +281,9 @@ def _path_is_relative_to_lexical(path: Path, root: Path) -> bool:
             result = candidate.lstat()
         except OSError:
             return None
-        attributes = int(getattr(result, "st_file_attributes", 0) or 0)
         if (
             stat.S_ISLNK(result.st_mode)
-            or attributes & _REPARSE_POINT_ATTRIBUTE
+            or _has_reparse_attribute(result)
             or not stat.S_ISDIR(result.st_mode)
         ):
             return None
@@ -979,7 +979,13 @@ def _remove_matching_staging(path: Path, expected: object) -> None:
 
 def _has_reparse_attribute(result: os.stat_result) -> bool:
     attributes = int(getattr(result, "st_file_attributes", 0) or 0)
-    return bool(attributes & _REPARSE_POINT_ATTRIBUTE)
+    if not attributes & _REPARSE_POINT_ATTRIBUTE:
+        return False
+    tag = int(getattr(result, "st_reparse_tag", 0) or 0)
+    # Data-only reparse points (cloud sync placeholders, WOF compression) do
+    # not redirect path resolution; only name surrogates - or an unreadable
+    # tag - stay blocked.
+    return tag == 0 or bool(tag & _REPARSE_NAME_SURROGATE_BIT)
 
 
 def _supported_entry_type(path: Path, result: os.stat_result) -> str:
@@ -1668,93 +1674,6 @@ def _scan_source_tree_posix(
         )
     finally:
         os.close(root_descriptor)
-
-
-def _scan_source_tree_path(
-    root: Path,
-    *,
-    destination_prefix: Path,
-    role: str,
-    excluded: set[Path] | frozenset[Path] = frozenset(),
-    excluded_leaf_suffixes: tuple[str, ...] = (),
-) -> _SourceSnapshot:
-    """Create a stable, no-follow manifest with temporary content digests."""
-    if destination_prefix.is_absolute() or ".." in destination_prefix.parts:
-        raise OSError(f"import destination prefix is unsafe: {destination_prefix}")
-    root_stat = root.lstat()
-    if _supported_entry_type(root, root_stat) != "directory":
-        raise OSError(f"import root is not a directory: {root}")
-    root_identity = _identity_from_stat(root_stat)
-    entries: list[_ManifestEntry] = []
-    pending: list[tuple[Path, Path]] = [(root, Path())]
-    while pending:
-        directory, relative_directory = pending.pop()
-        before_directory = directory.lstat()
-        if _supported_entry_type(directory, before_directory) != "directory":
-            raise OSError(f"source directory changed type during enumeration: {directory}")
-        try:
-            with os.scandir(directory) as iterator:
-                children = sorted(iterator, key=lambda child: child.name)
-        except OSError as exc:
-            raise OSError(f"could not enumerate source directory: {directory}") from exc
-        for child in children:
-            relative = relative_directory / child.name
-            if relative in excluded or any(parent in excluded for parent in relative.parents):
-                continue
-            if child.name.endswith(excluded_leaf_suffixes):
-                continue
-            path = Path(child.path)
-            result = child.stat(follow_symlinks=False)
-            entry_type = _supported_entry_type(path, result)
-            entry = _ManifestEntry(
-                source=path,
-                relative=relative,
-                entry_type=entry_type,
-                identity=_identity_from_stat(result),
-                mode=int(result.st_mode),
-                size=int(result.st_size),
-                mtime_ns=int(result.st_mtime_ns),
-                digest=None,
-            )
-            digest = _digest_regular_file(path, expected=entry) if entry_type == "file" else None
-            entries.append(
-                _ManifestEntry(
-                    source=entry.source,
-                    relative=entry.relative,
-                    entry_type=entry.entry_type,
-                    identity=entry.identity,
-                    mode=entry.mode,
-                    size=entry.size,
-                    mtime_ns=entry.mtime_ns,
-                    digest=digest,
-                )
-            )
-            if entry_type == "directory":
-                pending.append((path, relative))
-        after_directory = directory.lstat()
-        if (
-            _identity_from_stat(after_directory) != _identity_from_stat(before_directory)
-            or (
-                not excluded_leaf_suffixes
-                and int(after_directory.st_mtime_ns) != int(before_directory.st_mtime_ns)
-            )
-        ):
-            raise OSError(f"source directory changed during enumeration: {directory}")
-    after_root = root.lstat()
-    if _identity_from_stat(after_root) != root_identity:
-        raise OSError(f"source root changed during enumeration: {root}")
-    entries.sort(key=lambda entry: (len(entry.relative.parts), entry.relative.as_posix()))
-    return _SourceSnapshot(
-        root=root,
-        destination_prefix=destination_prefix,
-        identity=root_identity,
-        root_mode=int(root_stat.st_mode),
-        root_mtime_ns=int(root_stat.st_mtime_ns),
-        entries=tuple(entries),
-        role=role,
-        excluded=frozenset(excluded),
-        excluded_leaf_suffixes=tuple(excluded_leaf_suffixes),
-    )
 
 
 def _scan_source_tree(
@@ -2601,30 +2520,6 @@ def _read_small_regular_bytes(path: Path, *, limit: int) -> bytes | None:
         return data
     except OSError:
         return None
-
-
-def _tree_size_bytes(root: Path) -> int:
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        directory = Path(dirpath)
-        safe_dirnames: list[str] = []
-        for name in dirnames:
-            path = directory / name
-            try:
-                if _supported_entry_type(path, path.lstat()) == "directory":
-                    safe_dirnames.append(name)
-            except OSError:
-                continue
-        dirnames[:] = safe_dirnames
-        for name in filenames:
-            try:
-                path = directory / name
-                result = path.lstat()
-                if _supported_entry_type(path, result) == "file":
-                    total += result.st_size
-            except OSError:
-                continue
-    return total
 
 
 def _era_hint(home: Path) -> str:
@@ -5501,6 +5396,7 @@ class OpenSquillaHomeMigrator:
                     "migrated",
                 )
             self._snapshot_sqlite_stores(staging)
+            self._sanitize_imported_machine_authority(staging)
             self._transform_staged_config(staging)
             self._write_staged_env(staging)
             staged_scheduler = staging / "state" / "scheduler.db"
@@ -5706,6 +5602,83 @@ class OpenSquillaHomeMigrator:
                 "consistent snapshot verified",
             )
 
+    def _sanitize_imported_machine_authority(self, staging: Path) -> None:
+        """Keep portable bookmarks while revoking source-host path authority."""
+
+        sessions_db = staging / "state" / "sessions.db"
+        grants_db = staging / "state" / "sandbox_user_grants.sqlite"
+        try:
+            if sessions_db.is_file():
+                connection = sqlite3.connect(sessions_db)
+                try:
+                    table = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='project_workspaces'"
+                    ).fetchone()
+                    columns = (
+                        {
+                            str(row[1])
+                            for row in connection.execute(
+                                "PRAGMA table_info(project_workspaces)"
+                            ).fetchall()
+                        }
+                        if table is not None
+                        else set()
+                    )
+                    if "trusted_at" in columns:
+                        connection.execute("UPDATE project_workspaces SET trusted_at=NULL")
+                        connection.commit()
+                    if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                        raise sqlite3.DatabaseError("sessions.db quick_check failed")
+                finally:
+                    connection.close()
+
+            if grants_db.is_file():
+                connection = sqlite3.connect(grants_db)
+                try:
+                    table = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='sandbox_user_grants'"
+                    ).fetchone()
+                    if table is not None:
+                        connection.execute(
+                            "DELETE FROM sandbox_user_grants WHERE kind='mounts'"
+                        )
+                        connection.commit()
+                    if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                        raise sqlite3.DatabaseError(
+                            "sandbox_user_grants.sqlite quick_check failed"
+                        )
+                finally:
+                    connection.close()
+        except sqlite3.Error as exc:
+            self._record(
+                "security",
+                self.source,
+                self.target,
+                "error",
+                f"could not revoke imported path authority: {exc}",
+            )
+            raise OSError("could not revoke imported path authority") from exc
+
+        legacy_grants = staging / "state" / "sandbox_user_grants.json"
+        if legacy_grants.is_file():
+            try:
+                payload = json.loads(legacy_grants.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload["mounts"] = []
+                _atomic_write_json(legacy_grants, payload)
+            except (OSError, json.JSONDecodeError, TypeError) as exc:
+                self._record(
+                    "security",
+                    self.source,
+                    self.target,
+                    "error",
+                    f"could not revoke imported legacy path authority: {exc}",
+                )
+                raise OSError("could not revoke imported legacy path authority") from exc
+
     def _transform_staged_config(self, staging: Path) -> None:
         staged_config = staging / "config.toml"
         if not staged_config.is_file():
@@ -5716,7 +5689,7 @@ class OpenSquillaHomeMigrator:
         if payload is None or original_payload is None or source_bytes is None:
             raise OSError("validated source config is unavailable")
         try:
-            from opensquilla.migration.lossless_toml import patch_import_config
+            from opensquilla.lossless_toml import patch_import_config
 
             patched = patch_import_config(source_bytes, original_payload, payload)
             staged_config.write_bytes(patched)

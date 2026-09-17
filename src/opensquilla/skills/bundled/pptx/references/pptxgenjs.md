@@ -7,10 +7,23 @@ PptxGenJS is MIT-licensed upstream.
 
 ## Install
 
-```bash
-npm install -g pptxgenjs            # global, for ad-hoc scripts
-npm install pptxgenjs                # local, in a Node project
+Create a fresh per-run OS temporary directory outside the target repository.
+For example, create it from the available Python runtime:
+
+```python
+from pathlib import Path
+import tempfile
+
+work_dir = Path(tempfile.mkdtemp(prefix="opensquilla-pptxgenjs-"))
 ```
+
+Use `work_dir` as the working directory for `npm install --ignore-scripts
+--no-save pptxgenjs` and `node build_deck.js`. Keep the authoring script in
+this disposable directory so Node resolves the local `node_modules/pptxgenjs`.
+Do not use `npm install -g`: global packages are not a reliable `require()`
+search path. Do not use a fixed path or a shell-specific directory-creation
+command. Write the final `.pptx` into the active workspace, then remove the
+temporary directory.
 
 ## Boilerplate
 

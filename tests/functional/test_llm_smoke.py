@@ -11,7 +11,9 @@ import uuid
 
 import pytest
 
+from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.openai import OpenAIProvider
+from opensquilla.provider.selector import ProviderConfig, _build_provider
 from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
@@ -57,6 +59,54 @@ async def test_openrouter_live_smoke_returns_expected_token() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_id",
+    ["qwen_token_plan", "qwen_token_plan_anthropic"],
+)
+async def test_qwen_token_plan_live_smoke_returns_expected_token(
+    provider_id: str,
+) -> None:
+    api_key = os.environ.get("QWEN_TOKEN_PLAN_API_KEY")
+    if not api_key:
+        pytest.skip("QWEN_TOKEN_PLAN_API_KEY not set")
+
+    model = os.environ.get("QWEN_TOKEN_PLAN_MODEL", "qwen3.7-plus")
+    provider = _build_provider(
+        ProviderConfig(
+            provider=provider_id,
+            model=model,
+            api_key=api_key,
+        )
+    )
+    caps = ModelCatalog().get_capabilities(
+        model,
+        provider_name=provider_id,
+    )
+    text_parts: list[str] = []
+    done = False
+
+    async for event in provider.chat(
+        [Message(role="user", content=f"Reply with exactly {_EXPECTED_TOKEN}.")],
+        config=ChatConfig(
+            max_tokens=128,
+            temperature=0.0,
+            thinking=False,
+            model_capabilities=caps,
+            timeout=90.0,
+        ),
+    ):
+        if isinstance(event, ErrorEvent):
+            pytest.fail(f"live Token Plan smoke failed: {event.code} {event.message}")
+        if isinstance(event, TextDeltaEvent):
+            text_parts.append(event.text)
+        if isinstance(event, DoneEvent):
+            done = True
+
+    assert done is True
+    assert _EXPECTED_TOKEN in "".join(text_parts).strip().lower()
+
+
+@pytest.mark.asyncio
 async def test_tokenrhythm_live_smoke_returns_expected_token() -> None:
     api_key = os.environ.get("TOKENRHYTHM_API_KEY")
     if not api_key:
@@ -64,7 +114,7 @@ async def test_tokenrhythm_live_smoke_returns_expected_token() -> None:
 
     provider = OpenAIProvider(
         api_key=api_key,
-        model=os.environ.get("TOKENRHYTHM_MODEL", "deepseek-v4-flash"),
+        model=os.environ.get("TOKENRHYTHM_MODEL", "deepseek-v4-pro-0813"),
         base_url=os.environ.get("TOKENRHYTHM_BASE_URL", "https://tokenrhythm.studio/v1"),
         provider_kind="tokenrhythm",
     )

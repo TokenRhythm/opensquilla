@@ -410,13 +410,69 @@ def test_temporary_tree_cleanup_never_suppresses_scan_or_delete_failures(
     delete_root.mkdir()
     monkeypatch.setattr(security, "_temporary_tree_contains_secret", lambda *_args: False)
     monkeypatch.setattr(
-        security.shutil,
-        "rmtree",
+        security,
+        "_remove_owned_temporary_tree",
         lambda _path: (_ for _ in ()).throw(OSError("synthetic delete failure")),
     )
     with pytest.raises(OSError, match="synthetic delete failure"):
         security.scan_and_remove_temporary_tree(delete_root, {})
     assert delete_root.is_dir()
+
+
+def test_windows_temporary_tree_cleanup_retries_readonly_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "opensquilla-readonly-live-artifacts"
+    root.mkdir()
+    entry = root / "gateway.log"
+    entry.write_text("synthetic public output", encoding="utf-8")
+    calls: list[tuple[object, ...]] = []
+
+    def fake_rmtree(path: Path, *, onexc: object | None = None) -> None:
+        assert path == root.resolve()
+        assert callable(onexc)
+        calls.append((path, onexc))
+        onexc(entry.unlink, str(entry), PermissionError("synthetic read-only entry"))
+        root.rmdir()
+
+    monkeypatch.setattr(security, "_windows_temporary_cleanup_enabled", lambda: True)
+    monkeypatch.setattr(security.os, "chmod", lambda *args: calls.append(args))
+    monkeypatch.setattr(security.shutil, "rmtree", fake_rmtree)
+
+    security._remove_owned_temporary_tree(root.resolve())
+
+    assert len(calls) == 2
+    assert calls[1] == (entry, security.stat.S_IWRITE)
+    assert not root.exists()
+
+
+def test_temporary_tree_cleanup_retries_transient_scan_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "opensquilla-transient-scan-failure"
+    root.mkdir()
+    attempts = 0
+
+    def _scan(_root: Path, _needles: tuple[bytes, ...]) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OSError("synthetic transient scan failure")
+        return False
+
+    monkeypatch.setattr(security, "_temporary_tree_scan_attempts", lambda: 3)
+    monkeypatch.setattr(security, "_temporary_tree_contains_secret", _scan)
+    monkeypatch.setattr(security.time, "sleep", lambda _seconds: None)
+
+    security.scan_and_remove_temporary_tree(
+        root,
+        {"OPENAI_API_KEY": "offline-secret-not-present"},
+    )
+
+    assert attempts == 3
+    assert not root.exists()
 
 
 @pytest.mark.parametrize(
@@ -709,7 +765,13 @@ def test_token_budgets_are_enforced_before_any_child(
 def test_deep_models_use_file_then_repo_c0_c2_dedup_and_skip_premium() -> None:
     assert matrix._deep_models("deepseek", {"DEEPSEEK_MODEL": "custom-low-model"}) == (
         "custom-low-model",
+        "deepseek-flash",
+        "deepseek-v4-pro",
+    )
+    assert matrix._deep_models("deepseek", {}) == ("deepseek-flash", "deepseek-v4-pro")
+    assert matrix._deep_models("deepseek", {"DEEPSEEK_MODEL": "deepseek-v4-flash"}) == (
         "deepseek-v4-flash",
+        "deepseek-flash",
         "deepseek-v4-pro",
     )
     assert matrix._deep_models("openai", {"OPENAI_MODEL": "gpt-5.5"}) == (

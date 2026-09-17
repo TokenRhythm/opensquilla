@@ -1,4 +1,5 @@
 import type { Ref } from 'vue'
+import i18n from '@/i18n'
 import { downloadBlob } from '@/utils/browser'
 
 export type ShareExportTheme = 'light' | 'dark'
@@ -51,6 +52,9 @@ const SHARE_CLONE_STRIP_SELECTORS = [
   '.chat-share-checkbox',
   '[data-share-checkbox]',
   '[data-share-control]',
+  '.turn-usage-details',
+  '[data-turn-usage-details]',
+  '.msg-ai-meta',
   '.msg-meta__more',
   '.msg-meta__cost',
   '.step-view-btn',
@@ -328,7 +332,8 @@ function cleanupShareClone(clone: HTMLElement): HTMLElement {
       block.className = 'chat-share-export-activity'
       const label = document.createElement('div')
       label.className = 'chat-share-export-activity__label'
-      label.textContent = summary?.textContent?.replace(/\s+/g, ' ').trim() || 'Activity'
+      label.textContent = summary?.textContent?.replace(/\s+/g, ' ').trim()
+        || i18n.global.t('chat.activityLabel')
       body.className = 'chat-share-export-activity__body'
       body.removeAttribute('data-share-activity-body')
       block.append(label, body)
@@ -350,7 +355,7 @@ function cleanupShareClone(clone: HTMLElement): HTMLElement {
     block.className = 'chat-share-export-thinking'
     const label = document.createElement('div')
     label.className = 'chat-share-export-thinking__label'
-    label.textContent = 'Thinking'
+    label.textContent = i18n.global.t('chat.thinking')
     const bodyText = document.createElement('div')
     bodyText.className = 'chat-share-export-thinking__body'
     bodyText.textContent = text
@@ -445,6 +450,14 @@ function shareExportCss(): string {
       display: grid;
       gap: 6px;
       min-width: 0;
+    }
+
+    /* The live reasoning body is a capped scroll container; a static image has
+       no scrollbar, so the cap would silently truncate long reasoning. Let the
+       export lay out the full text instead. */
+    #${SHARE_STAGE_ID} .thinking-block__body {
+      max-height: none !important;
+      overflow-y: visible !important;
     }
 
     /* The live meta line is hover-dimmed; the static image has no hover. */
@@ -710,8 +723,11 @@ function loadOptionalImage(src: string): Promise<HTMLImageElement | null> {
   })
 }
 
-function staticAssetUrl(path: string): string {
-  const base = document.getElementById('opensquilla-data')?.dataset.basePath || '/control'
+export function staticAssetUrl(path: string): string {
+  const rawBase = document.getElementById('opensquilla-data')?.dataset.basePath || '/control'
+  // Desktop uses the root base path. Keep `/static/...` origin-relative instead
+  // of producing `//static/...`, which browsers interpret as a different host.
+  const base = rawBase.replace(/\/+$/, '')
   return `${base}/static/${path.replace(/^\/+/, '')}`
 }
 

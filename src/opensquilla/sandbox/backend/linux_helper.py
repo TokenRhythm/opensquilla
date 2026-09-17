@@ -324,7 +324,25 @@ def _filesystem_profile_from_payload(
             raise ValueError("linux helper filesystem profile entry is invalid") from exc
         if not path.is_absolute():
             raise ValueError("linux helper filesystem profile path must be absolute")
-        entries.append(FileSystemPermissionEntry(path=path, access=access))
+        raw_logical_path = raw_entry.get("logicalPath")
+        logical_path: Path | None = None
+        if raw_logical_path is not None:
+            if not isinstance(raw_logical_path, str) or not raw_logical_path:
+                raise ValueError(
+                    "linux helper filesystem profile logicalPath must be a non-empty absolute path"
+                )
+            logical_path = Path(raw_logical_path)
+            if not logical_path.is_absolute():
+                raise ValueError(
+                    "linux helper filesystem profile logicalPath must be a non-empty absolute path"
+                )
+        entries.append(
+            FileSystemPermissionEntry(
+                path=path,
+                access=access,
+                logical_path=logical_path,
+            )
+        )
     raw_globs = raw_profile.get("deniedReadGlobs", [])
     if not isinstance(raw_globs, list):
         raise ValueError("linux helper denied-read globs are invalid")
@@ -385,6 +403,7 @@ def _helper_runtime_mounts() -> list[MountSpec]:
             )
         )
     return mounts
+
 
 def _python_symlink_runtime_roots(executable: Path) -> list[Path]:
     roots: list[Path] = []

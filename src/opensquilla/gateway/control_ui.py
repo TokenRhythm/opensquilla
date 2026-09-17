@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path, PurePosixPath
 
@@ -101,7 +102,27 @@ class _CachedStaticFiles(StaticFiles):
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _STATIC_DIR = Path(__file__).parent / "static"
-_DIST_DIR = _STATIC_DIR / "dist"
+
+
+def _resolve_control_ui_dist_dir() -> Path:
+    """Resolve one Web UI artifact for both Desktop and standalone installs."""
+    configured = os.environ.get("OPENSQUILLA_CONTROL_UI_DIST", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    if getattr(sys, "frozen", False):
+        executable_dir = Path(sys.executable).resolve().parent
+        for candidate in (
+            executable_dir / "control-ui-dist",
+            executable_dir.parent / "control-ui-dist",
+        ):
+            if (candidate / "index.html").is_file():
+                return candidate
+
+    return _STATIC_DIR / "dist"
+
+
+_DIST_DIR = _resolve_control_ui_dist_dir()
 
 _TEMPLATE_VERSION_SUFFIX = str(int(time.time()))
 
@@ -201,6 +222,7 @@ def _build_bootstrap_context(config: GatewayConfig, request: Request) -> dict:
         "ws_url": _request_ws_url(request, config),
         "auth_mode": config.auth.mode,
         "base_path": config.control_ui.base_path,
+        "asset_base_path": config.control_ui.base_path.rstrip("/"),
         "config_path": config.config_path or "",
         "locale": _resolve_locale(config, request),
         "update": _update_payload(config),
@@ -288,6 +310,7 @@ def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
         )
 
     base = config.control_ui.base_path
+    route_base = "" if base == "/" else base
     template = _get_jinja_env().get_template("index.html")
 
     async def serve_index(request: Request) -> HTMLResponse:
@@ -308,12 +331,21 @@ def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
         return response
 
     routes: list[Route | Mount] = [
+        # Desktop packages keep the Vite artifact beside the frozen Gateway so
+        # Electron and browser /control reuse the same physical copy. Mount it
+        # before the broader static tree; standalone wheels continue to resolve
+        # _DIST_DIR to static/dist and behave exactly as before.
         Mount(
-            f"{base}/static",
+            f"{route_base}/static/dist",
+            app=_CachedStaticFiles(directory=str(_DIST_DIR), check_dir=False),
+            name="control_ui_dist",
+        ),
+        Mount(
+            f"{route_base}/static",
             app=_CachedStaticFiles(directory=str(_STATIC_DIR)),
             name="control_ui_static",
         ),
-        Route(f"{base}/{{path:path}}", serve_index, methods=["GET"]),
-        Route(f"{base}/", serve_index, methods=["GET"]),
+        Route(f"{route_base}/{{path:path}}", serve_index, methods=["GET"]),
+        Route(f"{route_base}/", serve_index, methods=["GET"]),
     ]
     return routes

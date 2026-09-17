@@ -17,6 +17,7 @@ by every caller (gateway, CLI, cron, channel adapters). The pipeline is:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import time
@@ -52,12 +53,17 @@ from opensquilla.sandbox.operation_runtime import (
     run_tool_handler_with_operation_guard,
 )
 from opensquilla.search_tool_outcome import parse_web_tool_outcome
-from opensquilla.tool_boundary import AgentToolHandler, ToolCall, ToolResult
+from opensquilla.tool_boundary import (
+    AgentToolHandler,
+    ToolCall,
+    ToolResult,
+)
 from opensquilla.tools.argument_normalization import (
     canonicalize_tool_arguments,
     format_alias_conflicts,
 )
 from opensquilla.tools.envelope import build_tool_failure_envelope
+from opensquilla.tools.plan_access import preflight_plan_access
 from opensquilla.tools.policy import DispatchInput, finalize, run_chain_with_emit
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
@@ -70,6 +76,7 @@ from opensquilla.tools.types import (
     InvalidToolArgumentsError,
     ProjectedToolArgumentsError,
     ToolContext,
+    current_execution_log,
     current_tool_context,
 )
 
@@ -86,6 +93,25 @@ _MISSING_REQUIRED_ARGUMENT_SHAPE_GUIDANCE_ENV = (
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _plan_access_preflight(
+    tool_call: ToolCall,
+    registered: Any,
+    ctx: ToolContext | None,
+) -> ToolResult | None:
+    denial = preflight_plan_access(tool_call, registered, ctx)
+    if denial is None:
+        return None
+    log.warning(
+        "dispatch.defense_in_depth_block",
+        tool=tool_call.tool_name,
+        reason="plan_mode_denied",
+        tool_use_id=tool_call.tool_use_id,
+        agent_id=ctx.agent_id if ctx else None,
+        session_key=ctx.session_key if ctx else None,
+    )
+    return denial
 
 
 def _resolve_budget_policy(ctx: ToolContext | None) -> ToolResultBudgetPolicy:
@@ -445,6 +471,7 @@ def _record_invalid_tool_arguments_event(
     required: list[str] | None = None,
     errors: list[str] | None = None,
     shape_guidance_enabled: bool | None = None,
+    example_guidance_emitted: bool | None = None,
 ) -> None:
     if effective_ctx is None or effective_ctx.on_runtime_event is None:
         return
@@ -470,8 +497,59 @@ def _record_invalid_tool_arguments_event(
         event["errors"] = errors
     if shape_guidance_enabled is not None:
         event["shape_guidance_enabled"] = shape_guidance_enabled
+    if example_guidance_emitted is not None:
+        event["example_guidance_emitted"] = example_guidance_emitted
     try:
         effective_ctx.on_runtime_event(event)
+    except Exception:
+        return
+
+
+def _closest_tool_names(
+    target: str,
+    candidates: list[str],
+    *,
+    limit: int = 3,
+    cutoff: float = 0.6,
+) -> list[str]:
+    """Return up to ``limit`` registered tool names closest to ``target``.
+
+    Used to offer an advisory "did you mean" hint on a registry miss so the
+    model can recover a mistyped or glued tool name instead of blindly
+    retrying an unavailable one. Pure stdlib difflib; returns an empty list
+    when nothing clears the similarity ``cutoff``.
+    """
+    if not target or not candidates:
+        return []
+    return difflib.get_close_matches(target, candidates, n=limit, cutoff=cutoff)
+
+
+def _record_registry_miss_event(
+    ctx: ToolContext | None,
+    tool_call: ToolCall,
+    *,
+    is_skill: bool,
+    untrusted: bool,
+    suggestions: list[str],
+) -> None:
+    if ctx is None or ctx.on_runtime_event is None:
+        return
+    event: dict[str, Any] = {
+        "feature": "tool_dispatch",
+        "name": "dispatch.registry_miss",
+        "tool": tool_call.tool_name,
+        "tool_name": tool_call.tool_name,
+        "tool_use_id": tool_call.tool_use_id,
+        "is_skill": is_skill,
+        "untrusted_caller": untrusted,
+        "suggestions": suggestions,
+        "suggestion_emitted": bool(suggestions),
+        "executed": False,
+        "agent_id": ctx.agent_id,
+        "session_key": ctx.session_key,
+    }
+    try:
+        ctx.on_runtime_event(event)
     except Exception:
         return
 
@@ -884,6 +962,13 @@ def _check_schema_valid_arguments(
         f"schema: {'; '.join(errors[:5])}. Reissue the tool call with corrected "
         "JSON arguments."
     )
+    guidance = _invalid_argument_guidance(
+        tool_call.tool_name,
+        missing=[],
+        effective_ctx=effective_ctx,
+    )
+    if guidance:
+        user_message = f"{user_message}{guidance}"
     log.warning(
         "dispatch.invalid_tool_arguments",
         tool=tool_call.tool_name,
@@ -893,12 +978,14 @@ def _check_schema_valid_arguments(
         reason="schema_validation_failed",
         errors=errors[:5],
         argument_keys=sorted(str(name) for name in tool_call.arguments if str(name)),
+        example_guidance_emitted=bool(guidance),
     )
     _record_invalid_tool_arguments_event(
         effective_ctx,
         tool_call,
         reason="schema_validation_failed",
         errors=errors[:5],
+        example_guidance_emitted=bool(guidance),
     )
     return _build_invalid_attempt_result(
         tool_call,
@@ -999,9 +1086,18 @@ def _resolve_registry_miss(
     tool_call: ToolCall,
     known_skill_names: frozenset[str],
     ctx: ToolContext | None,
+    registry: ToolRegistry,
 ) -> ToolResult:
     untrusted = _is_untrusted_caller(ctx)
     is_skill = tool_call.tool_name in known_skill_names
+
+    # Advisory "did you mean" recovery hint. Only computed for trusted callers
+    # on the generic path: untrusted callers receive an opaque envelope (below)
+    # and must not be able to enumerate the catalogue, skills have their own
+    # redirect, and ``bash`` has a targeted exec_command redirect.
+    suggestions: list[str] = []
+    if not untrusted and not is_skill and tool_call.tool_name != "bash":
+        suggestions = _closest_tool_names(tool_call.tool_name, registry.list_names())
 
     # Always record the actual tool name in the structured log so operators
     # retain debug visibility regardless of what the caller is allowed to see.
@@ -1013,6 +1109,13 @@ def _resolve_registry_miss(
         untrusted_caller=untrusted,
         agent_id=ctx.agent_id if ctx else None,
         session_key=ctx.session_key if ctx else None,
+    )
+    _record_registry_miss_event(
+        ctx,
+        tool_call,
+        is_skill=is_skill,
+        untrusted=untrusted,
+        suggestions=suggestions,
     )
 
     if untrusted:
@@ -1051,6 +1154,8 @@ def _resolve_registry_miss(
             f"Tool not found: {tool_call.tool_name}. Do not retry unavailable tools; "
             "use only tools listed in Available Tools."
         )
+        if suggestions:
+            user_message += " Did you mean: " + ", ".join(suggestions) + "?"
     return _build_envelope_result(
         tool_call,
         exc=KeyError(tool_call.tool_name),
@@ -1075,7 +1180,11 @@ async def preflight_tool_call(
 
     registered = registry.get(tool_call.tool_name)
     if registered is None:
-        return _resolve_registry_miss(tool_call, known, ctx)
+        return _resolve_registry_miss(tool_call, known, ctx, registry)
+
+    plan_access_denial = _plan_access_preflight(tool_call, registered, ctx)
+    if plan_access_denial is not None:
+        return plan_access_denial
 
     tool_call = _unwrap_nested_json_arguments(tool_call, registered, ctx)
     injection_envelope = _check_injection_guard(tool_call, ctx)
@@ -1123,11 +1232,6 @@ async def preflight_tool_call(
     return None
 
 
-# ---------------------------------------------------------------------------
-# Public factory
-# ---------------------------------------------------------------------------
-
-
 def build_tool_handler(
     registry: ToolRegistry,
     ctx: ToolContext | None = None,
@@ -1154,6 +1258,8 @@ def build_tool_handler(
     ``tool_hooks`` defaults to empty so callers that do not pass hooks are
     bit-for-bit equivalent to the legacy path.
     """
+    if ctx is not None:
+        ctx.validate_path_roots()
     known = frozenset(known_skill_names or ())
     hooks: tuple[ToolHook, ...] = tuple(tool_hooks or ())
     fallback_budget_tracker = _build_budget_tracker(ctx)
@@ -1196,6 +1302,7 @@ def build_tool_handler(
 
     async def _handler(tool_call: ToolCall) -> ToolResult:  # type: ignore[return]
         effective_ctx = current_tool_context.get() or ctx
+
         # 1. Ingress injection guard.
         injection_envelope = _check_injection_guard(tool_call, effective_ctx)
         if injection_envelope is not None:
@@ -1204,18 +1311,31 @@ def build_tool_handler(
         # 2. Registry lookup.
         registered = registry.get(tool_call.tool_name)
         if registered is None:
-            return _resolve_registry_miss(tool_call, known, effective_ctx)
+            registry_miss = _resolve_registry_miss(
+                tool_call,
+                known,
+                effective_ctx,
+                registry,
+            )
+            return registry_miss
 
+        plan_access_denial = _plan_access_preflight(
+            tool_call,
+            registered,
+            effective_ctx,
+        )
+        if plan_access_denial is not None:
+            return plan_access_denial
+
+        # The unwrap preserves the immutable origin trace, so the authoritative
+        # ingress injection decision above cannot change after normalization.
         tool_call = _unwrap_nested_json_arguments(tool_call, registered, effective_ctx)
-        injection_envelope = _check_injection_guard(tool_call, effective_ctx)
-        if injection_envelope is not None:
-            return injection_envelope
 
         runtime_only_supplied = sorted(
             set(tool_call.arguments) & registered.spec.runtime_only_arguments
         )
         if tool_call.continuation is None and runtime_only_supplied:
-            return _build_invalid_attempt_result(
+            invalid_result = _build_invalid_attempt_result(
                 tool_call,
                 reason_code="runtime_only_tool_argument",
                 user_message=(
@@ -1223,6 +1343,7 @@ def build_tool_handler(
                     + ", ".join(runtime_only_supplied)
                 ),
             )
+            return invalid_result
 
         non_executable_arguments = _check_non_executable_arguments(tool_call, effective_ctx)
         if non_executable_arguments is not None:
@@ -1307,7 +1428,7 @@ def build_tool_handler(
             tool_use_id=tool_call.tool_use_id,
             session_key=(effective_ctx.session_key if effective_ctx is not None else None),
         ):
-            return _build_invalid_attempt_result(
+            invalid_result = _build_invalid_attempt_result(
                 tool_call,
                 reason_code="approval_continuation_mismatch",
                 user_message=(
@@ -1315,7 +1436,10 @@ def build_tool_handler(
                     "and session."
                 ),
             )
+            return invalid_result
         execution_arguments = dict(tool_call.arguments)
+        if "_tool_use_id" in registered.spec.runtime_only_arguments:
+            execution_arguments["_tool_use_id"] = tool_call.tool_use_id
         if (
             tool_call.continuation is not None
             and "approval_id" in registered.spec.runtime_only_arguments
@@ -1337,6 +1461,8 @@ def build_tool_handler(
         reservation = reservation_or_control
 
         token = current_tool_context.set(effective_ctx)
+        execution_log: dict[str, str] = {}
+        log_token = current_execution_log.set(execution_log)
         tool_started_at = time.monotonic()
         raw_result: Any = None
         exception: BaseException | None = None
@@ -1411,7 +1537,7 @@ def build_tool_handler(
                         exception=exception,
                     )
                     # 7. Single finalisation point.
-                    return await finalize(
+                    final_result = await finalize(
                         tool_call,
                         effective_ctx,
                         raw_result,
@@ -1420,7 +1546,19 @@ def build_tool_handler(
                         _budget_tracker_for(effective_ctx),
                         registered,
                     )
+                    final_result.execution_log_handle = execution_log.get("handle")
+                    return final_result
             finally:
+                current_execution_log.reset(log_token)
                 current_tool_context.reset(token)
 
+    # Agent-side lossy projection is only safe when the callable can actually
+    # dispatch the provider-visible recovery tool.  Keep this capability on
+    # the handler itself so embedded Agents and wrapped Meta children do not
+    # mistake an arbitrary non-null callback for a retrieval implementation.
+    setattr(
+        _handler,
+        "_opensquilla_available_tools",
+        frozenset(registry.list_names()),
+    )
     return _handler

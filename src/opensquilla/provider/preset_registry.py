@@ -52,7 +52,9 @@ LEGACY_PROVIDER_PRESET_IDS: frozenset[str] = frozenset(
 # ``squilla_router.tier_profile`` id: the accepted set stays pinned to the
 # legacy nine (downgrade contract), so provider saves and boot defaults apply
 # these ladders as inline tiers instead.
-CURATED_INLINE_PRESET_IDS: frozenset[str] = frozenset({"tokenrhythm"})
+CURATED_INLINE_PRESET_IDS: frozenset[str] = frozenset(
+    {"qwen_token_plan", "tokenrhythm"}
+)
 
 _PRESETS_SUBDIR = "presets"
 
@@ -103,15 +105,16 @@ def _tier(
     description: str,
     *,
     thinking_level: str = "",
-    supports_image: bool = False,
+    supports_image: bool | None = None,
     image_only: bool = False,
 ) -> dict:
     entry: dict[str, object] = {
         "provider": provider_id,
         "model": model,
         "description": description,
-        "supports_image": supports_image,
     }
+    if supports_image is not None:
+        entry["supports_image"] = supports_image
     if thinking_level:
         entry["thinking_level"] = thinking_level
     if image_only:
@@ -301,7 +304,6 @@ def _synthesized_tiers(provider_id: str, default_model: str) -> dict[str, dict]:
                 f"{provider_id} {role} route (synthesized default; no curated "
                 f"per-tier model ladder)."
             ),
-            "supports_image": False,
         }
     return tiers
 

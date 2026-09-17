@@ -1,9 +1,13 @@
 // @vitest-environment happy-dom
 
-import { describe, expect, it } from 'vitest'
+import { createApp, h } from 'vue'
+import { afterEach, describe, expect, it } from 'vitest'
 
+import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import i18n from '@/i18n'
+import zhHans from '@/locales/zh-Hans.json'
 import { useChatTextRendering } from './useChatTextRendering'
-import { buildShareDom } from './useChatShareExport'
+import { buildShareDom, staticAssetUrl } from './useChatShareExport'
 
 describe('buildShareDom protocol-shaped documentation', () => {
   it('clones the complete rendered message into the share image stage', () => {
@@ -63,6 +67,40 @@ describe('buildShareDom protocol-shaped documentation', () => {
 
     expect(stage.querySelector('.tool-timeline__toolbar')).toBeNull()
     expect(stage.querySelector('.tool-row-body')?.textContent).toBe('tool output')
+  })
+
+  it('removes turn usage details from the static share image', () => {
+    const source = document.createElement('article')
+    source.dataset.shareMessageId = 'assistant-usage'
+    source.innerHTML = [
+      '<div data-share-activity data-share-expanded="true">',
+      '<button data-share-activity-label data-share-control>Completed · 2s</button>',
+      '<div data-share-activity-body>',
+      '<div class="turn-usage-details">model-a · 321 input tokens</div>',
+      '<div data-turn-usage-details>reasoning 45 · $0.0012</div>',
+      '<div class="msg-ai-meta"><button class="msg-meta__more">Usage details</button></div>',
+      '<div class="tool-row-body">Kept activity output</div>',
+      '</div>',
+      '</div>',
+      '<div class="msg-meta__more">Legacy usage trigger</div>',
+      '<div class="msg-meta__cost">$0.0012</div>',
+      '<div class="msg-ai-text">Canonical answer</div>',
+    ].join('')
+
+    const stage = buildShareDom([source])
+
+    expect(stage.querySelector('.turn-usage-details')).toBeNull()
+    expect(stage.querySelector('[data-turn-usage-details]')).toBeNull()
+    expect(stage.querySelector('.msg-ai-meta')).toBeNull()
+    expect(stage.querySelector('.msg-meta__more')).toBeNull()
+    expect(stage.querySelector('.msg-meta__cost')).toBeNull()
+    expect(stage.textContent).toContain('Kept activity output')
+    expect(stage.textContent).toContain('Canonical answer')
+    expect(stage.textContent).not.toContain('model-a')
+    expect(stage.textContent).not.toContain('321 input tokens')
+    expect(stage.textContent).not.toContain('reasoning 45')
+    expect(stage.textContent).not.toContain('$0.0012')
+    expect(stage.textContent).not.toContain('Legacy usage trigger')
   })
 
   it('omits collapsed execution activity while keeping the canonical answer', () => {
@@ -138,6 +176,33 @@ describe('buildShareDom protocol-shaped documentation', () => {
     expect(stage.textContent?.match(/Canonical answer/g)).toHaveLength(1)
   })
 
+  it('uncaps the reasoning scroll container so long reasoning is not clipped', () => {
+    // ReasoningPart caps .thinking-block__body at max-height 16rem with a
+    // scrollbar. The exported PNG has no scrollbar, so without a stage-scoped
+    // reset a long trace inside an expanded activity fold would be silently
+    // cut off with no indication anything is missing.
+    const source = document.createElement('article')
+    source.dataset.shareMessageId = 'assistant-long-reasoning'
+    source.innerHTML = [
+      '<div data-share-activity data-share-expanded="true">',
+      '<div data-share-activity-body>',
+      '<section class="thinking-block">',
+      '<div class="thinking-block__body">A very long reasoning trace.</div>',
+      '</section>',
+      '</div>',
+      '</div>',
+    ].join('')
+
+    const stage = buildShareDom([source])
+    const css = stage.querySelector('style')?.textContent || ''
+    const bodyRule = css.match(/\.thinking-block__body\s*\{[^}]*\}/)?.[0] || ''
+
+    expect(stage.querySelector('.thinking-block__body')?.textContent)
+      .toBe('A very long reasoning trace.')
+    expect(bodyRule).toContain('max-height: none !important;')
+    expect(bodyRule).toContain('overflow-y: visible !important;')
+  })
+
   it('keeps legacy details activity compatible during the data-contract migration', () => {
     const source = document.createElement('article')
     source.dataset.shareMessageId = 'assistant-legacy-activity'
@@ -160,5 +225,155 @@ describe('buildShareDom protocol-shaped documentation', () => {
     expect(stage.textContent).not.toContain('Hidden legacy output')
     expect(stage.textContent).toContain('Visible legacy output')
     expect(stage.textContent?.match(/Canonical answer/g)).toHaveLength(1)
+  })
+})
+
+describe('share export label localization', () => {
+  afterEach(() => {
+    i18n.global.locale.value = 'en'
+  })
+
+  it('localizes the activity and thinking fallback labels baked into the image', () => {
+    // The exported PNG is static: any fallback label the composable writes is
+    // burned in, so it must follow the UI locale rather than hardcode English.
+    i18n.global.setLocaleMessage('zh-Hans', zhHans)
+    i18n.global.locale.value = 'zh-Hans'
+
+    const source = document.createElement('article')
+    source.dataset.shareMessageId = 'assistant-localized'
+    source.innerHTML = [
+      '<div data-share-activity data-share-expanded="true">',
+      '<div data-share-activity-body><div>step output</div></div>',
+      '</div>',
+      '<details class="thinking-fold" open>',
+      '<summary class="thinking-fold__summary"></summary>',
+      '<div class="thinking-fold__body">Weighed the options.</div>',
+      '</details>',
+    ].join('')
+
+    const stage = buildShareDom([source])
+
+    expect(stage.querySelector('.chat-share-export-activity__label')?.textContent).toBe('活动')
+    expect(stage.querySelector('.chat-share-export-thinking__label')?.textContent).toBe('思考中')
+  })
+})
+
+describe('share export static asset URLs', () => {
+  afterEach(() => {
+    document.getElementById('opensquilla-data')?.remove()
+  })
+
+  it('keeps Desktop root assets on the current origin', () => {
+    const data = document.createElement('div')
+    data.id = 'opensquilla-data'
+    data.dataset.basePath = '/'
+    document.body.appendChild(data)
+
+    const assetUrl = staticAssetUrl('img/QRcode.png')
+    expect(assetUrl).toBe('/static/img/QRcode.png')
+    expect(new URL(assetUrl, 'opensquilla-app://desktop/chat/new').href)
+      .toBe('opensquilla-app://desktop/static/img/QRcode.png')
+  })
+
+  it('preserves a trailing-slash gateway base path', () => {
+    const data = document.createElement('div')
+    data.id = 'opensquilla-data'
+    data.dataset.basePath = '/control/'
+    document.body.appendChild(data)
+
+    expect(staticAssetUrl('/img/opensquilla-mark.png'))
+      .toBe('/control/static/img/opensquilla-mark.png')
+  })
+})
+
+// Pins the renderer/export boundary against the REAL ActivityDisclosure
+// markup: the data-share-* hooks are a contract, and restyling the fold must
+// not silently drop expanded activity from (or leak collapsed activity into)
+// the share image.
+describe('ActivityDisclosure share hook contract', () => {
+  const mountedApps: ReturnType<typeof createApp>[] = []
+
+  function mountDisclosure(props: InstanceType<typeof ActivityDisclosure>['$props']) {
+    const host = document.createElement('article')
+    host.dataset.shareMessageId = 'assistant-disclosure'
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, props, {
+        default: () => h('div', { class: 'activity-step' }, 'step output'),
+      }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    return host
+  }
+
+  afterEach(() => {
+    while (mountedApps.length) mountedApps.pop()?.unmount()
+    document.body.innerHTML = ''
+  })
+
+  it('exports the expanded settled fold through the data-share hooks', () => {
+    const host = mountDisclosure({
+      lifecycle: 'settled',
+      stepCount: 2,
+      failureCount: 0,
+      summaryLabel: 'Ran 2 tools',
+      defaultOpen: true,
+    })
+    const activity = host.querySelector<HTMLElement>('[data-share-activity]')
+
+    expect(activity).not.toBeNull()
+    expect(activity?.dataset.shareExpanded).toBe('true')
+    const label = activity?.querySelector<HTMLElement>('[data-share-activity-label]')
+    expect(label?.textContent).toContain('Ran 2 tools')
+    // The interactive summary chrome must keep opting out of the static image.
+    expect(label?.hasAttribute('data-share-control')).toBe(true)
+    expect(activity?.querySelector('[data-share-activity-body]')).not.toBeNull()
+
+    const stage = buildShareDom([host])
+
+    expect(stage.querySelector('[data-share-activity]')).toBeNull()
+    expect(stage.querySelector('.chat-share-export-activity__label')?.textContent)
+      .toContain('Ran 2 tools')
+    expect(stage.querySelector('.chat-share-export-activity__body')?.textContent)
+      .toContain('step output')
+  })
+
+  it('drops the collapsed settled fold from the share image', () => {
+    const host = mountDisclosure({
+      lifecycle: 'settled',
+      stepCount: 2,
+      failureCount: 0,
+      summaryLabel: 'Ran 2 tools',
+    })
+
+    expect(
+      host.querySelector<HTMLElement>('[data-share-activity]')?.dataset.shareExpanded,
+    ).toBe('false')
+
+    const stage = buildShareDom([host])
+
+    expect(stage.querySelector('.chat-share-export-activity')).toBeNull()
+    expect(stage.textContent).not.toContain('step output')
+  })
+
+  it('drops live activity from the share image while it is collapsed', () => {
+    const host = mountDisclosure({
+      lifecycle: 'working',
+      stepCount: 3,
+      failureCount: 0,
+      phaseLabel: 'Running commands',
+    })
+    const activity = host.querySelector<HTMLElement>('[data-share-activity]')
+
+    expect(activity?.dataset.shareExpanded).toBe('false')
+    expect(activity?.querySelector('[data-share-activity-label]')).not.toBeNull()
+    expect(activity?.querySelector('[data-share-activity-body]')).not.toBeNull()
+
+    const stage = buildShareDom([host])
+
+    expect(stage.querySelector('.chat-share-export-activity')).toBeNull()
+    expect(stage.textContent).not.toContain('step output')
   })
 })

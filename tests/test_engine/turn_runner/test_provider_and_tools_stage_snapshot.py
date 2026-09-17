@@ -49,7 +49,7 @@ def _make_assemble_prompt_probe():
     def _probe(
         self, agent_id, tool_defs, *, session_key, semantic_message,
         extra_context, prompt_metadata, bootstrap_context_mode,
-        fresh_user_session=False,
+        fresh_user_session=False, workspace_dir=None,
     ):  # noqa: ARG001
         # Walk up the stack to find the ``_run_turn`` frame. Under the
         # In the staged runtime, ``_assemble_prompt`` is called from inside
@@ -138,7 +138,12 @@ def _patch_observability(runner, state):
 
     runner._emit_turn_event = _emit_turn_event.__get__(runner, TurnRunner)
 
-    async def _persist_turn_error(self, session_key, event):  # noqa: ARG001
+    async def _persist_turn_error(  # noqa: ARG001
+        self,
+        session_key,
+        event,
+        **_owner_kwargs,
+    ):
         state.persist_error_calls.append((session_key, event))
 
     runner._persist_turn_error = _persist_turn_error.__get__(runner, TurnRunner)
@@ -156,7 +161,7 @@ def _build_runner() -> TurnRunner:
         model_catalog=None,
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,

@@ -33,8 +33,8 @@ def _write_vite_static(static_dir: Path) -> Path:
         '<link rel="stylesheet" crossorigin href="./assets/index.css">',
         encoding="utf-8",
     )
-    (assets_dir / "index.js").write_text("export {};\n", encoding="utf-8")
-    (assets_dir / "index.css").write_text("body{}\n", encoding="utf-8")
+    (assets_dir / "index.js").write_bytes(b"export {};\n")
+    (assets_dir / "index.css").write_bytes(b"body{}\n")
     return dist_dir
 
 
@@ -58,6 +58,33 @@ def test_static_asset_carries_long_cache_control(_app: Starlette) -> None:
     cache = response.headers.get("Cache-Control", "")
     assert "max-age=2592000" in cache, cache
     assert "public" in cache, cache
+
+
+def test_control_ui_can_serve_dist_from_desktop_shared_location(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    static_dir = tmp_path / "embedded-static"
+    static_dir.mkdir()
+    shared_dist = _write_vite_static(tmp_path / "desktop-shared")
+    monkeypatch.setattr(control_ui, "_STATIC_DIR", static_dir)
+    monkeypatch.setattr(control_ui, "_DIST_DIR", shared_dist)
+    app = Starlette(routes=create_control_ui_routes(GatewayConfig()))
+
+    response = TestClient(app).get("/control/static/dist/assets/index.js")
+
+    assert response.status_code == 200
+    assert response.text == "export {};\n"
+
+
+def test_control_ui_dist_resolver_prefers_explicit_desktop_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = tmp_path / "control-ui-dist"
+    monkeypatch.setenv("OPENSQUILLA_CONTROL_UI_DIST", str(configured))
+
+    assert control_ui._resolve_control_ui_dist_dir() == configured.resolve()
 
 
 def test_control_ui_bootstrap_includes_config_path(
@@ -93,6 +120,32 @@ def test_control_ui_vite_asset_urls_use_configured_base_path(
 
     assert js_url == "/ops/static/dist/assets/index.js"
     assert css_urls == ["/ops/static/dist/assets/index.css"]
+
+
+def test_control_ui_root_mount_keeps_explicit_base_and_valid_asset_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    static_dir = tmp_path / "static"
+    dist_dir = _write_vite_static(static_dir)
+    monkeypatch.setattr(control_ui, "_STATIC_DIR", static_dir)
+    monkeypatch.setattr(control_ui, "_DIST_DIR", dist_dir)
+    control_config = ControlUiConfig(base_path="/")
+    config = GatewayConfig(control_ui=control_config)
+    app = Starlette(routes=create_control_ui_routes(config))
+
+    with TestClient(app) as client:
+        page = client.get("/")
+        deep_link = client.get("/sessions/synthetic")
+        asset = client.get("/static/dist/assets/index.js")
+
+    assert control_config.base_path == "/"
+    assert page.status_code == 200
+    assert deep_link.status_code == 200
+    assert asset.status_code == 200
+    assert 'data-base-path="/"' in page.text
+    assert 'src="/static/dist/assets/index.js"' in page.text
+    assert "//static/" not in page.text
 
 
 def test_read_vite_assets_extracts_every_stylesheet(

@@ -1,0 +1,481 @@
+{
+  "schema_version": 1,
+  "windows_test_assignments": ".github/scripts/windows_test_assignments.json",
+  "macos_recovery_test_inputs": [
+    "tests/test_recovery/**",
+    "tests/test_migration/test_opensquilla_home_migration.py",
+    "tests/test_desktop/test_electron_startup_contract.py",
+    "tests/test_engine/test_request_execution_identity.py",
+    "tests/test_gateway/test_session_model_routing_rpc.py",
+    "tests/test_tools/test_execution_status.py",
+    "tests/test_provider_ensemble.py"
+  ],
+  "baseline_suites": [
+    "dependency-audit",
+    "readme-locale",
+    "workflow-lint"
+  ],
+  "full_suites": [
+    "dependency-audit",
+    "desktop-recovery-e2e",
+    "desktop-static",
+    "frontend-artifact",
+    "frontend-validation",
+    "macos-recovery",
+    "managed-toolchain",
+    "python-full",
+    "readme-locale",
+    "release-packaging",
+    "skill-hub",
+    "tui",
+    "webui-chat-recovery",
+    "wheel-webui-roundtrip",
+    "windows-high-risk",
+    "windows-nsis-regression",
+    "workflow-lint"
+  ],
+  "full_desktop_matrix": [
+    {
+      "os": "ubuntu-latest",
+      "shard": "all"
+    },
+    {
+      "os": "macos-latest",
+      "shard": "profiles"
+    },
+    {
+      "os": "macos-latest",
+      "shard": "ownership"
+    },
+    {
+      "os": "macos-latest",
+      "shard": "workbench"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "ownership"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "workbench"
+    }
+  ],
+  "full_python_matrix": {
+    "ubuntu": [
+      "core",
+      "gateway-sqlite",
+      "recovery-migration",
+      "desktop-installer-contracts"
+    ],
+    "windows": [
+      "core",
+      "gateway-sqlite",
+      "recovery-migration",
+      "desktop-installer-contracts"
+    ]
+  },
+  "desktop_groups": {
+    "profiles": {
+      "keywords": [
+        "cleanup",
+        "consolidat",
+        "import",
+        "migration",
+        "onboarding",
+        "persistence",
+        "profile",
+        "recovery",
+        "repair",
+        "session"
+      ],
+      "path_patterns": [
+        "desktop/electron/scripts/test-onboarding*.mjs",
+        "desktop/electron/scripts/test-profile*.mjs",
+        "desktop/electron/scripts/test-primary-repair*.mjs",
+        "desktop/electron/scripts/test-desktop-cleanup*.mjs"
+      ]
+    },
+    "ownership": {
+      "keywords": [
+        "gateway-lifecycle",
+        "gateway_lifecycle",
+        "lifecycle",
+        "orphan",
+        "ownership",
+        "process-tree",
+        "process_tree",
+        "sandbox",
+        "shell",
+        "theme",
+        "window-background"
+      ],
+      "path_patterns": [
+        "desktop/electron/scripts/test-desktop-gateway-ownership.mjs",
+        "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
+        "desktop/electron/scripts/test-desktop-window-background-flow.mjs",
+        "desktop/electron/scripts/test-desktop-theme-flow.mjs",
+        "desktop/electron/scripts/test-windows-update-*.mjs",
+        "desktop/electron/scripts/fixtures/windows-update-electron/**",
+        "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
+        "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
+        "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs",
+        "desktop/electron/scripts/fixtures/packaged-cached-handoff/**",
+        "desktop/electron/src/windows-update-*.ts"
+      ]
+    },
+    "workbench": {
+      "keywords": [
+        "artifact",
+        "document",
+        "editor",
+        "preview",
+        "workbench",
+        "zoom"
+      ],
+      "path_patterns": [
+        "desktop/electron/scripts/test-native-workbench*.mjs",
+        "desktop/electron/scripts/test-desktop-zoom*.mjs",
+        "desktop/electron/scripts/test-native-workbench-v2-electron.mjs",
+        "desktop/electron/scripts/test-unsafe-legacy-recovery-no-write.mjs",
+        "desktop/electron/scripts/test-desktop-browser*.mjs"
+      ]
+    }
+  },
+  "suites": {
+    "windows-nsis-regression": {
+      "execution_inputs": [
+        ".github/actions/download-required-artifact/action.yml",
+        ".github/scripts/audit_dependencies.py",
+        ".github/scripts/verify-nsis-upgrade-regression.py",
+        ".github/scripts/verify-release-profile-preservation.py",
+        ".github/scripts/upgrade_baseline.py",
+        ".github/scripts/verify-release-windows-upgrade.ps1",
+        ".github/scripts/verify-sandbox-package.mjs",
+        ".github/workflows/windows-nsis-upgrade-regression.yml",
+        "desktop/electron/**",
+        "migrations/**",
+        "opensquilla-webui/**",
+        "pyproject.toml",
+        "scripts/build_wheelhouse_zip.py",
+        "scripts/release_dependency_inventory.py",
+        "src/opensquilla/**",
+        "tests/fixtures/upgrade-v054/**",
+        "uv.lock"
+      ]
+    },
+    "workflow-lint": {
+      "execution_inputs": [
+        ".github/workflows/**",
+        ".github/scripts/check_ci_results.py",
+        ".github/scripts/plan_ci.py",
+        ".github/ci/suites.v1.json",
+        ".github/ci/trust-policy.v1.json"
+      ]
+    },
+    "readme-locale": {
+      "execution_inputs": [
+        "CONTRIBUTING.md",
+        "README*.md",
+        "RELEASES.md",
+        "desktop/electron/README.md",
+        "docs/README.md",
+        "docs/quickstart.md",
+        "docs/web-ui.md",
+        "opensquilla-webui/.node-version",
+        "opensquilla-webui/package.json",
+        "opensquilla-webui/scripts/check-readme-locales.mjs",
+        "opensquilla-webui/src/components/LanguageSwitcher.vue",
+        "opensquilla-webui/src/i18n/index.ts"
+      ]
+    },
+    "frontend-artifact": {
+      "execution_inputs": [
+        "opensquilla-webui/**",
+        "src/opensquilla/gateway/static/**",
+        "pyproject.toml"
+      ]
+    },
+    "frontend-validation": {
+      "execution_inputs": [
+        ".gitattributes",
+        "contracts/gateway/v4/**",
+        "opensquilla-webui/**",
+        "pyproject.toml",
+        "scripts/contracts/**",
+        "src/opensquilla/__init__.py",
+        "src/opensquilla/contracts/**",
+        "tests/contracts/**",
+        "tests/fixtures/contracts/gateway/v4/**",
+        "uv.lock"
+      ]
+    },
+    "wheel-webui-roundtrip": {
+      "execution_inputs": [
+        "opensquilla-webui/**",
+        "pyproject.toml",
+        "scripts/verify_webui_artifact.py",
+        "src/opensquilla/gateway/static/**"
+      ]
+    },
+    "webui-chat-recovery": {
+      "execution_inputs": [
+        "opensquilla-webui/e2e/**",
+        "opensquilla-webui/src/**",
+        "src/opensquilla/gateway/**",
+        "src/opensquilla/session/**"
+      ]
+    },
+    "tui": {
+      "execution_inputs": [
+        "opensquilla-webui/.node-version",
+        "src/opensquilla/cli/tui/**",
+        "packages/opensquilla-tui-host/**",
+        "scripts/build_tui_host_companion.py",
+        "scripts/smoke_tui_host_companion.py"
+      ]
+    },
+    "desktop-static": {
+      "execution_inputs": [
+        "desktop/**",
+        "opensquilla-webui/src/platform/**",
+        "src/opensquilla/gateway/**"
+      ]
+    },
+    "desktop-recovery-e2e": {
+      "execution_inputs": [
+        ".github/scripts/verify-windows-native-write-view.mjs",
+        ".github/scripts/native-audit-write-view.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
+        "desktop/electron/**",
+        "opensquilla-webui/**",
+        "src/opensquilla/gateway/**",
+        "src/opensquilla/persistence/**",
+        "src/opensquilla/recovery/**",
+        "src/opensquilla/session/**",
+        "tests/test_desktop/**",
+        "tests/test_recovery/**"
+      ]
+    },
+    "python-targeted": {
+      "execution_inputs": [
+        ".github/scripts/**",
+        ".github/signing/**",
+        ".github/scripts/windows_test_assignments.json",
+        ".github/scripts/windows_test_durations.json",
+        ".github/workflows/desktop-fault-injection.yml",
+        ".github/workflows/wheelhouse-release.yml",
+        "desktop/electron/scripts/build-signed-windows.cjs",
+        "desktop/electron/scripts/gateway-integrity.mjs",
+        "desktop/electron/scripts/verify-prepared-gateway.mjs",
+        "desktop/electron/scripts/e2e-shutdown-helpers.mjs",
+        "desktop/electron/scripts/packaged-smoke-helpers.mjs",
+        "desktop/electron/scripts/packaged-first-send-cleanup.mjs",
+        "desktop/electron/scripts/test-packaged-first-send-cleanup.mjs",
+        "desktop/electron/scripts/test-packaged-first-send-renderer.mjs",
+        "desktop/electron/scripts/test-ci-case-telemetry.mjs",
+        "desktop/electron/scripts/session-recovery-transport-contract.mjs",
+        "desktop/electron/scripts/test-session-recovery-transport-contract.mjs",
+        "desktop/electron/scripts/test-packaged-session-recovery.mjs",
+        "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
+        "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
+        "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
+        "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs",
+        "desktop/electron/scripts/fixtures/packaged-cached-handoff/**",
+        "migrations/**",
+        "pyproject.toml",
+        "scripts/**",
+        "service-units/**",
+        "src/opensquilla/**",
+        "tests/**",
+        "uv.lock"
+      ]
+    },
+    "python-full": {
+      "execution_inputs": [
+        "**"
+      ]
+    },
+    "windows-high-risk": {
+      "execution_inputs": [
+        "**"
+      ]
+    },
+    "macos-recovery": {
+      "execution_inputs": [
+        "desktop/**",
+        "src/opensquilla/engine/**",
+        "src/opensquilla/provider/**",
+        "src/opensquilla/tools/**",
+        "src/opensquilla/gateway/**",
+        "src/opensquilla/router_control.py",
+        "src/opensquilla/persistence/**",
+        "src/opensquilla/recovery/**",
+        "src/opensquilla/session/**",
+        "tests/test_desktop/test_electron_startup_contract.py",
+        "tests/test_migration/test_opensquilla_home_migration.py",
+        "tests/test_recovery/**",
+        "tests/test_engine/test_request_execution_identity.py",
+        "tests/test_gateway/test_session_model_routing_rpc.py",
+        "tests/test_tools/test_execution_status.py",
+        "tests/test_provider_ensemble.py"
+      ]
+    },
+    "release-packaging": {
+      "execution_inputs": [
+        "README*.md",
+        "README.release.md",
+        "RELEASES.md",
+        ".github/scripts/prestage-release-to-oss.sh",
+        ".github/scripts/release_signing_preflight.py",
+        ".github/scripts/verify-release-*",
+        ".github/scripts/verify-windows-signatures.ps1",
+        ".github/scripts/verify-windows-native-write-view.mjs",
+        ".github/scripts/native-audit-write-view.py",
+        ".github/scripts/verify_desktop_slim_size.py",
+        ".github/signing/**",
+        ".github/workflows/desktop-fault-injection.yml",
+        ".github/workflows/wheelhouse-release.yml",
+        "desktop/electron/package*.json",
+        "desktop/electron/scripts/build-signed-windows.cjs",
+        "desktop/electron/scripts/gateway-integrity.mjs",
+        "desktop/electron/scripts/verify-prepared-gateway.mjs",
+        "desktop/electron/scripts/e2e-shutdown-helpers.mjs",
+        "desktop/electron/scripts/packaged-smoke-helpers.mjs",
+        "desktop/electron/scripts/packaged-first-send-cleanup.mjs",
+        "desktop/electron/scripts/test-packaged-first-send-cleanup.mjs",
+        "desktop/electron/scripts/test-packaged-first-send-renderer.mjs",
+        "desktop/electron/scripts/test-ci-case-telemetry.mjs",
+        "desktop/electron/scripts/session-recovery-transport-contract.mjs",
+        "desktop/electron/scripts/test-session-recovery-transport-contract.mjs",
+        "desktop/electron/scripts/test-packaged-session-recovery.mjs",
+        "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
+        "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
+        "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
+        "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs",
+        "desktop/electron/scripts/fixtures/packaged-cached-handoff/**",
+        "install.*",
+        "pyproject.toml",
+        "scripts/build_wheelhouse_zip.py",
+        "scripts/install_source.*",
+        "start.*",
+        "tests/test_ci/test_upgrade_baselines.py",
+        "tests/test_ci/test_nsis_fresh_interaction.py",
+        "tests/fixtures/upgrade-v054/**",
+        "scripts/build_v054_upgrade_fixture.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
+        "tests/test_ci/test_release_signing_preflight.py",
+        "tests/test_ci/test_windows_signatures.py",
+        "tests/test_packaging/**",
+        "tests/test_release_consistency.py",
+        "uv.lock"
+      ]
+    },
+    "skill-hub": {
+      "execution_inputs": [
+        "pyproject.toml",
+        "src/opensquilla/cli/gateway_client.py",
+        "src/opensquilla/cli/main.py",
+        "src/opensquilla/cli/skills_cmd.py",
+        "src/opensquilla/cli/skills_meta_cmd.py",
+        "src/opensquilla/application/skill_catalog.py",
+        "src/opensquilla/application/skill_management.py",
+        "src/opensquilla/application/skill_proposal_review.py",
+        "src/opensquilla/gateway/app.py",
+        "src/opensquilla/gateway/adapters/skill_catalog.py",
+        "src/opensquilla/gateway/adapters/skill_catalog_contract.py",
+        "src/opensquilla/gateway/adapters/skill_management.py",
+        "src/opensquilla/gateway/adapters/skill_management_contract.py",
+        "src/opensquilla/gateway/adapters/skill_proposal_review.py",
+        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
+        "src/opensquilla/gateway/boot.py",
+        "src/opensquilla/gateway/config.py",
+        "src/opensquilla/gateway/protocol.py",
+        "src/opensquilla/gateway/rpc/__init__.py",
+        "src/opensquilla/gateway/rpc/registry.py",
+        "src/opensquilla/gateway/rpc_skills.py",
+        "src/opensquilla/gateway/rpc_proposals.py",
+        "src/opensquilla/gateway/scopes.py",
+        "src/opensquilla/gateway/websocket.py",
+        "src/opensquilla/skills/**",
+        "src/opensquilla/tools/builtin/skill_tools.py",
+        "src/opensquilla/tools/policy_config.py",
+        "src/opensquilla/tools/registry.py",
+        "src/opensquilla/tools/types.py",
+        "tests/test_cli/test_cli_product_completeness.py",
+        "tests/test_cli/test_skills_*.py",
+        "tests/test_engine/turn_runner/test_provider_and_tools_stage_unit.py",
+        "tests/test_gateway/test_rpc_skills_*.py",
+        "tests/test_gateway/test_skill_catalog_*.py",
+        "tests/test_gateway/test_skill_management_*.py",
+        "tests/test_gateway/test_skill_management_service_injection.py",
+        "tests/test_gateway/test_skill_proposal_review_*.py",
+        "tests/test_scripts/test_bench_skill_integrity.py",
+        "tests/test_skills/test_hub_*.py",
+        "tests/test_skills/test_loader_*.py",
+        "tests/test_skills_bundled_baseline.py",
+        "tests/test_skill_catalog_projection.py",
+        "tests/test_gateway/test_meta_catalog_compatibility.py",
+        "tests/test_gateway/test_rpc_commands.py",
+        "tests/test_migration/test_legacy_config_fixtures.py",
+        "tests/test_skills/test_catalog_upgrade_retirement.py",
+        "tests/test_skills/test_sop_compiler.py",
+        "tests/unit/cli/tui/test_opentui_completion_catalog.py",
+        "tests/test_skills_hash_consumers.py",
+        "tests/test_skills_hot_reload.py",
+        "tests/test_skills_hub_*.py",
+        "tests/test_skills_loader_namespaces.py",
+        "tests/test_skills_manifest.py",
+        "tests/test_skills_tree.py",
+        "tests/test_tools/test_skill_view_resources.py",
+        "uv.lock",
+        "tests/test_skill_install_source.py",
+        "tests/test_skills_hub_streaming.py",
+        "tests/test_skills_hub_streaming_faults.py",
+        "src/opensquilla/application/skill_source.py",
+        "tests/test_engine/test_skill_install_settlement.py",
+        "tests/test_gateway/test_skill_install_status.py",
+        "tests/test_skills/test_hub_install_operations.py",
+        "tests/test_skills/test_staging_io_worker.py",
+        "src/opensquilla/engine/agent.py",
+        "tests/test_engine/test_skill_install_turn.py",
+        "src/opensquilla/engine/runtime.py"
+      ]
+    },
+    "managed-toolchain": {
+      "execution_inputs": [
+        "scripts/validate_managed_toolchain_artifacts*.py",
+        "src/opensquilla/skills/bundled/meta-paper-write/**",
+        "src/opensquilla/skills/bundled/meta-short-drama/**",
+        "src/opensquilla/skills/bundled/paper-*/**",
+        "src/opensquilla/skills/bundled/subtitle-burner/**",
+        "src/opensquilla/skills/bundled/video-still-animator/**",
+        "src/opensquilla/skills/runtime_env.py",
+        "src/opensquilla/skills/toolchains/**",
+        "tests/test_skills/test_managed_toolchains.py",
+        "tests/test_skills/test_meta_paper*.py",
+        "tests/test_skills/test_meta_short_drama*.py",
+        "tests/test_skills/test_paper_*.py",
+        "tests/test_skills/test_subtitle_burner.py",
+        "tests/test_skills/test_toolchain_*.py"
+      ]
+    },
+    "dependency-audit": {
+      "execution_inputs": [
+        ".github/ci/dependency-audit.v1.json",
+        ".github/scripts/audit_dependencies.py",
+        ".github/workflows/ci.yml",
+        "desktop/electron/package-lock.json",
+        "desktop/electron/package.json",
+        "opensquilla-webui/package-lock.json",
+        "opensquilla-webui/package.json",
+        "pyproject.toml",
+        "tests/test_security/test_weasyprint_presentational_hints.py",
+        "uv.lock"
+      ]
+    }
+  }
+}

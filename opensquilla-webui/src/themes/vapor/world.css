@@ -52,14 +52,26 @@
   transform: translateX(-60%);
 }
 
-/* -- ACCENT SURFACES: soft neon bloom ---------------------------------------- */
+/* -- ACCENT SURFACES: soft neon bloom ----------------------------------------
+   Normal semantic topbar states are deliberately excluded: a healthy
+   connection and a deliverable count are information, not attention. */
 [data-theme="vapor"] .btn--primary,
-[data-theme="vapor"] .conn-pill,
-[data-theme="vapor"] .sidebar-new-session {
+[data-theme="vapor"] .conn-pill:not(.topbar-state) {
   box-shadow:
     var(--elev-1),
     0 0 18px color-mix(in srgb, var(--accent) 32%, transparent),
     0 0 42px color-mix(in srgb, var(--accent-secondary) 16%, transparent);
+}
+
+[data-theme="vapor"] .topbar .topbar-state:is(
+  [data-state="info"],
+  [data-state="warning"],
+  [data-state="danger"]
+) {
+  box-shadow:
+    var(--elev-1),
+    0 0 18px color-mix(in srgb, var(--topbar-state-channel) 32%, transparent),
+    0 0 42px color-mix(in srgb, var(--topbar-state-channel) 16%, transparent);
 }
 
 /* Focus styling lives in tokens.css as --focus-ring/--focus-ring-inset overrides

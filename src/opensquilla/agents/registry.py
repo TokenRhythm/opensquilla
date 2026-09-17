@@ -12,7 +12,7 @@ from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig
 from opensquilla.identity.bootstrap import (
     CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
-    ONE_SHOT_BOOTSTRAP_FILENAME,
+    RETIRED_WORKSPACE_FILENAMES,
     ensure_agent_workspace,
 )
 from opensquilla.identity.parser import parse_identity
@@ -20,8 +20,6 @@ from opensquilla.session.keys import normalize_agent_id
 
 _WORKSPACE_AGENT_FILE_NAMES = (
     *CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
-    ONE_SHOT_BOOTSTRAP_FILENAME,
-    "MEMORY.md",
     "memory.md",
 )
 _WORKSPACE_AGENT_FILE_NAME_SET = frozenset(_WORKSPACE_AGENT_FILE_NAMES)
@@ -289,7 +287,11 @@ class AgentRegistry:
         if name != Path(name).name or "/" in name or "\\" in name:
             raise ValueError("workspace file name must not contain path separators")
         if name not in _WORKSPACE_AGENT_FILE_NAME_SET:
-            raise ValueError(f"Unsupported workspace agent file: {name}")
+            raise ValueError(
+                f"Retired workspace agent file: {name}; use ordinary file tools to access it"
+                if name in RETIRED_WORKSPACE_FILENAMES
+                else f"Unsupported workspace agent file: {name}"
+            )
         return name
 
     def _resolve_workspace_agent_file(self, root: Path, name: str) -> tuple[str, Path]:

@@ -35,7 +35,7 @@ test.describe('Console clarity', () => {
     await expect(settingsRow).toHaveAttribute('data-icon', 'settings')
     await expect(page.locator('.sidebar-nav-group-toggle')).toHaveCount(0)
     await expect(page.locator('.sidebar-core .sidebar-fn-label')).toHaveText([
-      'Sessions', 'Overview', 'Skills & Channels', 'Cron',
+      'Overview', 'Skills & Channels', 'Cron',
     ])
   })
 

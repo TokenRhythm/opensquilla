@@ -1,5 +1,87 @@
-import type { ArtifactPayload } from './rpc'
+import type { ArtifactPayload } from './artifacts'
+import type { PromptAnnotationSnapshot } from './promptAnnotations'
 import type { IconName } from '@/utils/icons'
+import type { ConversationRoutingSnapshot } from '@/modules/conversationEventContent'
+
+export interface RawSessionTask {
+  status?: string
+  task_id?: string
+  taskId?: string
+  turn_id?: string
+  turnId?: string
+  started_at?: number | string
+  startedAt?: number | string
+  finished_at?: number | string
+  finishedAt?: number | string
+  turn_outcome?: Record<string, unknown>
+  turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
+  steer_capability?: ChatSteerCapability
+  steerCapability?: ChatSteerCapability
+}
+
+export type ProviderActivityPhase =
+  | 'requesting'
+  | 'reasoning'
+  | 'retry_wait'
+  | 'retrying'
+  | 'fallback'
+
+export type ProviderActivityReason =
+  | 'initial'
+  | 'rate_limited'
+  | 'provider_overloaded'
+  | 'transport_transient'
+  | 'reasoning_only'
+  | 'empty_response'
+  | 'stream_incomplete'
+  | 'invalid_response'
+  | 'context_overflow'
+  | 'unknown'
+
+export interface ApprovalStatusPayload {
+  found?: boolean
+  id?: string
+  namespace?: string
+  pending?: boolean
+  resolved?: boolean
+  approved?: boolean
+  resolution?: string
+  resolutionInProgress?: boolean
+  consumed?: boolean
+  deadline?: number
+}
+
+export type AssistantDelivery = 'visible' | 'suppressed'
+export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
+
+export interface ChatSendAttachmentPayload {
+  type: string
+  mime: string
+  name: string
+  data?: string
+  file_uuid?: string
+}
+
+/** Exact editable document head bound to one chat send attempt. */
+export interface ChatDocumentContext {
+  documentId: string
+  headRevisionId: string
+}
+
+export interface SessionSteerV2Params {
+  key: string
+  message: string
+  expected_turn_id: string
+  client_request_id: string
+  client_message_id: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
+  surface_id?: string
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
+}
 
 export interface Attachment {
   kind: 'inline' | 'staged' | 'inline_pending' | 'uploading' | 'failed'
@@ -14,6 +96,8 @@ export interface Attachment {
   ttl_seconds?: number
   error?: string
   file?: File
+  /** Server-owned bytes restored from the durable pending-input queue. */
+  durable_material?: true
 }
 
 export interface DisplayAttachment {
@@ -31,12 +115,48 @@ export interface DisplayAttachment {
   localFile?: File
   download_url?: string
   sha256_ref?: string
+  /** Session-scoped opaque identity for Workbench preview/import actions. */
+  attachmentId?: string
+}
+
+/**
+ * Local delivery state for a same-turn steer that has not yet been proven
+ * durable. A pending attempt is deliberately not a transcript message: only
+ * an accepted response, typed disposition event, or matching history row may
+ * project it into `ChatMessage`.
+ */
+export type PendingSteerPhase =
+  | 'submitting'
+  | 'retryable_rejected'
+  | 'acceptance_unknown'
+
+export interface PendingSteerAttempt {
+  phase: PendingSteerPhase
+  /** Immutable idempotent request replayed byte-for-byte on manual retry. */
+  request: Readonly<SessionSteerV2Params>
+  errorCode?: string
+  retryAfterMs?: number
+  /** Stop raced admission; the authoritative disposition still decides. */
+  stopRequested?: boolean
 }
 
 export interface ChatPendingItem {
+  /** Stable local identity for keyed rendering and UI actions across peer edits. */
+  pendingUiId: string
   text: string
+  /** Annotation batch retained when a follow-up is queued behind an active turn. */
+  draftIds?: string[]
+  /** Upgrade recovery requires the user to select the page again before sending. */
+  retiredAnnotationInput?: boolean
+  pageContext?: import('./pageContext').ChatPageContext
   attachments: Attachment[]
   intent: string | null
+  /** Slash-prefixed text that a complete command catalog classified as ordinary input. */
+  confirmedPlainText?: boolean
+  /** Generic non-v2 queue/hidden-control delivery lease. V2 Steer uses `steerAttempt`. */
+  deliveryState?: 'steering' | 'retryable'
+  /** Canonical transport identity/state for a not-yet-durable steer. */
+  steerAttempt?: PendingSteerAttempt
   /** Session that owned this item when it entered the in-memory queue. */
   ownerSessionKey?: string
   /** chat.send request whose canonical response may carry this item to a child. */
@@ -46,6 +166,75 @@ export interface ChatPendingItem {
   // normal user-bubble push / composer consumption on drain.
   hiddenControl?: boolean
   displayTextOverride?: string
+  // Stable ingress identity for a queued hidden control. Provider-setup
+  // handoffs reuse it across remounts/tabs so Gateway idempotency can collapse
+  // duplicate resumes of the same original intent.
+  clientRequestId?: string
+  /** Session that owns a durable hidden-control intent. */
+  hiddenControlSessionKey?: string
+  /** Stable transport identity for retrying a hidden control exactly once. */
+  hiddenClientRequestId?: string
+  hiddenClientMessageId?: string
+  /** The visible confirmation bubble was already rendered optimistically. */
+  hiddenVisibleCommitted?: boolean
+  /** Stable identity shared by IndexedDB WAL and the Gateway staged queue. */
+  pendingInputId?: string
+  pendingClientRequestId?: string
+  pendingClientMessageId?: string
+  pendingRequestFingerprint?: string
+  pendingServerRevision?: number
+  pendingPosition?: number
+  pendingWalRevision?: number
+  pendingCreatedAt?: number
+  /**
+   * The stable identity may already exist in a Gateway even when its enqueue
+   * acknowledgement was lost.  Keep this provenance across mixed-version or
+   * disconnected periods so a local cancel cannot discard the only durable
+   * delete intent.
+   */
+  pendingMayHaveServerCopy?: boolean
+  /** Offline drafts may only cross the wire under their original Gateway identity. */
+  pendingDeliveryIdentity?: string
+  /** A cancelling transport row must become a local editable draft after tombstoning. */
+  pendingRetainAfterCancel?: boolean
+  /** Browser/server staging lifecycle. Unknown enqueue results remain `saving`. */
+  pendingPersistenceState?:
+    | 'saving'
+    | 'staged'
+    | 'local_only'
+    | 'retryable'
+    | 'cancelling'
+}
+
+export type HiddenControlDispatchStatus =
+  | 'accepted'
+  | 'queued'
+  | 'rejected'
+  | 'unknown'
+
+export type HiddenControlDispatchReason =
+  | 'accepted'
+  | 'queued'
+  | 'already_queued'
+  | 'queue_full'
+  | 'discarded'
+  | 'invalid_request'
+  | 'outbox_conflict'
+  | 'outbox_persist_failed'
+  | 'send_rejected'
+  | 'response_unknown'
+
+/**
+ * Machine-owned result for a hidden control send. `accepted` is the only state
+ * that proves the Gateway durably owns the request; `queued` is recoverable
+ * local work and must keep its persisted source intent until a later accepted
+ * result arrives.
+ */
+export interface HiddenControlDispatchResult {
+  status: HiddenControlDispatchStatus
+  reason: HiddenControlDispatchReason
+  clientRequestId: string
+  sessionKey: string
 }
 
 export interface ChatRouterCell {
@@ -54,12 +243,15 @@ export interface ChatRouterCell {
   tiers: string[]
   displayName: string
   model?: string
+  executionKind?: 'single_model' | 'ensemble'
 }
 
 export interface ChatRouterTierConfig {
   model: string
-  supportsImage: boolean
+  /** Accepted from legacy snapshots, not used to determine capability. */
+  supportsImage?: boolean
   imageOnly: boolean
+  ensembleEnabled?: boolean
 }
 
 export interface ChatToolCall {
@@ -74,8 +266,27 @@ export interface ChatToolCall {
   isError: boolean
   result: string
   resultPreview: string
+  executionLogHandle?: string
   sources?: unknown
   isOpen: boolean
+  activityOrder?: number
+  presentation?: ToolPresentation
+}
+
+export type ToolPresentationCategory =
+  | 'search'
+  | 'file_read'
+  | 'network_read'
+  | 'command'
+  | 'subagent'
+  | 'mutation'
+  | 'generic'
+
+export interface ToolPresentation {
+  category: ToolPresentationCategory
+  primaryArguments: string[]
+  argumentDisplay: 'primary' | 'all'
+  lifecycleDisplay: 'boundary' | 'default'
 }
 
 export type ChatToolCallRenderItem = ChatToolCall & {
@@ -90,6 +301,8 @@ export interface ToolResultContext {
   toolName?: string
   inputRaw?: string
   section?: 'input' | 'result' | 'error'
+  format?: 'diff'
+  executionLogHandle?: string
 }
 
 export interface ChatToolCallGroup {
@@ -102,20 +315,40 @@ export interface ChatToolCallGroup {
   isRunning: boolean
   isError: boolean
   status: '' | 'success' | 'error'
+  activityOrder?: number
 }
 
+export type ChatTextPresentation = 'intermediate' | 'answer'
+
 export interface ChatStreamSegment {
-  type: 'text' | 'tool-group'
+  type: 'text' | 'tool-group' | 'interrupt'
   raw?: string
   html?: string
   dirty?: boolean
+  presentation?: ChatTextPresentation
   groupId?: string
   operationKey?: string
+  approvalId?: string
+  activityOrder?: number
 }
 
 export type ChatStreamTimelineItem =
-  | { type: 'text'; key: string; html: string; rawText?: string }
-  | { type: 'tool-group'; key: string; group: ChatToolCallGroup }
+  | {
+      type: 'text'
+      key: string
+      html: string
+      rawText?: string
+      presentation?: ChatTextPresentation
+      activityOrder?: number
+    }
+  | { type: 'tool-group'; key: string; group: ChatToolCallGroup; activityOrder?: number }
+  | {
+      type: 'interrupt'
+      key: string
+      approvalId: string
+      part: Extract<import('./parts').ChatPart, { type: 'interrupt' }>
+      activityOrder?: number
+    }
 
 export type ChatRole = 'user' | 'assistant' | 'system' | 'error' | 'router' | string
 
@@ -129,8 +362,87 @@ export type ChatRunStatusState =
   | 'timeout'
   | 'cancelled'
 
+export type ChatSteerDisposition =
+  | 'steering'
+  | 'applied'
+  | 'promoted'
+  | 'cancelled'
+  | 'rejected'
+
+export interface ChatSteerCapability {
+  mode: 'same_turn' | 'queue_only' | 'disabled'
+  expected_turn_id?: string
+  input_kinds?: string[]
+  reason?: string
+}
+
+export type DocumentMutationStatus =
+  | 'not_attempted'
+  | 'applied'
+  | 'not_applied'
+  | 'conflict'
+  | 'ambiguous'
+
+export type DocumentMutationPhase = 'proposal' | 'commit'
+
+export type DocumentMutationRetryPolicy =
+  | 'same_turn'
+  | 'new_turn'
+  | 'refresh'
+  | 'reconcile'
+  | 'never'
+
+/**
+ * Authoritative document-side effect receipt projected onto one completed turn.
+ * Assistant prose and generic task completion never participate in this state.
+ */
+export interface DocumentMutationOutcome {
+  version: number
+  status: DocumentMutationStatus
+  phase?: DocumentMutationPhase
+  code?: string
+  retryPolicy?: DocumentMutationRetryPolicy
+  attemptId?: string
+  changeSetId?: string
+  resultRevisionId?: string
+  proposalAttempts?: number
+  corrected?: boolean
+}
+
+export interface ChatTurnOutcome {
+  turnId: string
+  taskId?: string
+  status: string
+  /** Client-only provenance: lifecycle/history status outranks a stream receipt. */
+  statusSource?: 'task'
+  kind?: string
+  reason?: string
+  cancellationSource?: string
+  startedAt?: number | string
+  finishedAt?: number | string
+  retryable?: boolean
+  documentMutationOutcome?: DocumentMutationOutcome
+  errorClass?: string
+  failureKind?: string
+  /** null retains invalid/conflicting evidence across notice merges. */
+  errorId?: string | null
+  terminalMessage?: string
+  retryAfterMs?: number
+  statusHistory?: import('./parts').StatusPart[]
+  usageCallIndex?: number
+  noPriorProviderDispatch?: boolean
+  replaySafe?: boolean
+  userMessageId?: string
+  acceptedRoutingMode?: 'direct' | 'router' | 'ensemble'
+  activitySnapshot?: ActivitySnapshotV2
+}
+
 export interface ChatRunTask {
+  /** Control ownership projected independently from persisted outcome identity. */
+  ownershipTaskId?: string
   status?: string
+  cancel_requested?: boolean
+  cancelRequested?: boolean
   task_id?: string
   taskId?: string
   started_at?: number | string
@@ -141,6 +453,14 @@ export interface ChatRunTask {
   terminalReason?: string
   task_group_count?: number
   taskGroupCount?: number
+  turn_id?: string
+  turnId?: string
+  steer_capability?: ChatSteerCapability
+  steerCapability?: ChatSteerCapability
+  turn_outcome?: Record<string, unknown>
+  turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
 }
 
 export interface ChatRunStatus {
@@ -167,6 +487,7 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   tool_name?: string
   input?: unknown
   result?: unknown
+  user_input_request?: unknown
   content?: unknown
   output?: unknown
   sources?: unknown
@@ -176,14 +497,41 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   execution_status?: { status?: string }
   groupId?: string
   group_id?: string
+  presentation?: ChatTextPresentation
+  tool_presentation?: ToolPresentation
 }
 
 export interface ChatTimelineSegment extends Record<string, unknown> {
   type?: string
   raw?: string
   text?: string
+  presentation?: ChatTextPresentation
   groupId?: string
   group_id?: string
+  approvalId?: string
+  approval_id?: string
+  activityOrder?: number
+}
+
+export interface ChatModelCallSegment {
+  model_call_id?: string
+  modelCallId?: string
+  iteration?: number
+  start_codepoint?: number
+  startCodepoint?: number
+  end_codepoint?: number
+  endCodepoint?: number
+}
+
+export interface ChatExecutionLeg {
+  index?: number
+  kind?: string
+  provider?: string
+  model?: string
+  plan_id?: string
+  execution_id?: string
+  call_kind?: string
+  reason?: string
 }
 
 export interface ChatUsagePayload {
@@ -211,6 +559,24 @@ export interface ChatUsagePayload {
   modelUsageBreakdown?: ChatEnsembleUsageRow[]
   ensemble_trace?: ChatEnsembleTrace
   ensembleTrace?: ChatEnsembleTrace
+  route_plan?: Record<string, unknown>
+  routePlan?: Record<string, unknown>
+  execution_legs?: ChatExecutionLeg[]
+  executionLegs?: ChatExecutionLeg[]
+  model_call_segments?: ChatModelCallSegment[]
+  modelCallSegments?: ChatModelCallSegment[]
+  /** Physical provider call whose visible output owns the route card. */
+  router_model_call_id?: string
+  routerModelCallId?: string
+  router_iteration?: number
+  routerIteration?: number
+  /** Per-turn ledger coverage. Older gateways omit these additive fields. */
+  coverage_status?: string
+  coverageStatus?: string
+  usage_unknown?: boolean
+  usageUnknown?: boolean
+  unknown_usage_events?: number
+  unknownUsageEvents?: number
   /** V017 routing-decision id — presence is what makes a turn rateable. */
   decision_id?: string
   __savings_ui_suppressed?: boolean
@@ -298,6 +664,39 @@ export interface ChatReasoning {
   seconds: number
 }
 
+export type ActivitySnapshotEntry = Record<string, unknown> & {
+  type: 'phase' | 'reasoning' | 'segment' | 'interrupt' | 'maintenance'
+  id: string
+  order: number
+}
+
+export interface ActivitySnapshotV2 {
+  version: 2
+  taskId: string
+  turnId: string
+  complete: boolean
+  reasoningUtf16Length?: number
+  entries: ActivitySnapshotEntry[]
+  checksum?: string
+}
+
+/** A non-conversational maintenance event rendered inside transcript chronology. */
+export interface ChatMaintenanceEvent {
+  kind: 'context_compaction'
+  compactionId: string
+  source: string
+  state: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
+  durability: string
+  detail?: string
+  reason?: string
+  removedCount?: number
+  keptCount?: number
+  /** This event marks a durable summary/archive boundary in canonical history. */
+  historyArchived?: boolean
+  /** Whether every original row remains available across that boundary. */
+  canonicalComplete?: boolean | null
+}
+
 export interface ChatMessage {
   role: ChatRole
   text: string
@@ -305,16 +704,49 @@ export interface ChatMessage {
   /** Stable client-only identity for optimistic rows before the backend assigns messageId. */
   clientId?: string
   reasoning?: ChatReasoning
-  routerDecision?: import('./rpc').RouterDecisionPayload | null
+  /** Structured physical-call reasoning retained across live-to-history sync. */
+  reasoningBlocks?: import('./turnlog').ReasoningBlock[]
+  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
+  reasoningPresentationPending?: boolean
+  activitySnapshot?: ActivitySnapshotV2
+  activitySnapshotIncomplete?: boolean
+  /** Live physical execution model; never overwrites the logical route decision. */
+  routerExecutionModel?: string
+  routerDecision?: ConversationRoutingSnapshot | null
+  /** Routing-only usage projection for a split historical answer segment. */
+  routerUsage?: ChatUsagePayload
+  routerModelCallId?: string
+  routerIteration?: number
   artifacts?: ArtifactPayload[]
   tool_calls?: RawToolCallPayload[]
+  planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timeline?: ChatTimelineSegment[]
   attachments?: DisplayAttachment[]
+  promptAnnotations?: PromptAnnotationSnapshot[]
   provenanceKind?: string
   provenanceSourceSessionKey?: string
   provenanceSourceTool?: string
   /** Durable causal turn identity restored from transcript turn_context. */
   turnId?: string
+  /** Internal-input provenance used by presentation-only compatibility rules. */
+  turnInputMode?: string
+  /** Runtime turn kind used by presentation-only compatibility rules. */
+  turnRunKind?: string
+  /** Same-turn input lifecycle, sourced only from durable context or typed events. */
+  inputDisposition?: ChatSteerDisposition
+  /** Monotonic server revision for the disposition state machine. */
+  inputDispositionRevision?: number
+  steerClientRequestId?: string
+  steerClientMessageId?: string
+  /** Physical model call that durably applied this same-turn adjustment. */
+  steerModelCallId?: string
+  steerAppliedIteration?: number
+  steerRestored?: boolean
+  /** Local Stop was requested; the server disposition remains authoritative. */
+  steerStopRequested?: boolean
+  /** Original turn when this accepted adjustment was promoted into a follow-up. */
+  promotedFromTurnId?: string
+  turnOutcome?: ChatTurnOutcome
   interrupted?: boolean
   routerState?: string
   routerSettled?: boolean
@@ -330,13 +762,18 @@ export interface ChatMessage {
   output?: number
   output_tokens?: number
   restoredFromHistory?: boolean
+  /** Durable transcript maintenance restored from chat.history metadata. */
+  maintenance?: ChatMaintenanceEvent
   statusHistory?: import('./parts').StatusPart[]
+  /** Live approval/clarify snapshots referenced by interrupt timeline segments. */
+  interrupts?: Extract<import('./parts').ChatPart, { type: 'interrupt' }>[]
   stopNotice?: boolean
   /** Client terminal error retained until history contains a durable error row. */
   terminalNotice?: boolean
   /** Typed terminal error code (e.g. 'sandbox_threshold_exceeded') carried on
    *  role:'error' messages so the renderer can offer a recovery action. */
   errorCode?: string
+  modelCapacity?: import('@/modules/providerConfiguration').ModelCapacityFailure
 }
 
 export interface ChatMessageMeta {
@@ -352,8 +789,20 @@ export interface ChatMessageMeta {
   savedLabel: string
   turnSavedPct?: number
   ensemble?: ChatEnsembleMeta
+  /** Normalized additive coverage metadata from the per-turn usage receipt. */
+  coverageStatus?: string
+  usageUnknown?: boolean
+  unknownUsageEvents?: number
+  /** True when at least one measured token/cost fact contributes to the receipt. */
+  hasKnownUsage?: boolean
   /** Routing-decision id from turn usage; thumbs render only when present. */
   decisionId?: string
+}
+
+export interface ChatCreatedSessionLink {
+  callId: string
+  sessionKey: string
+  title?: string
 }
 
 export interface ChatRenderedMessage {
@@ -371,15 +820,37 @@ export interface ChatRenderedMessage {
   showHeader: boolean
   isStreaming?: boolean
   messageId?: string
+  restoredFromHistory?: boolean
+  /** Durable server turn identity restored from transcript context once assigned. */
+  turnId?: string
   /** Stable identity of the owning user turn for client-only UI continuity. */
   turnKey?: string
+  /** Internal-input provenance copied from the source ChatMessage. */
+  turnInputMode?: string
+  /** Runtime turn kind copied from the source ChatMessage. */
+  turnRunKind?: string
+  inputDisposition?: ChatSteerDisposition
+  maintenance?: ChatMaintenanceEvent
+  inputDispositionRevision?: number
+  turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
+  promptAnnotations?: PromptAnnotationSnapshot[]
+  /** Explicit placement for successful sessions_spawn cards. An empty array
+   *  suppresses the source card after it is rehomed below the parent reply. */
+  createdSessionLinks?: ChatCreatedSessionLink[]
   toolCalls?: ChatToolCall[]
+  planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]
   artifacts?: ArtifactPayload[]
   meta?: ChatMessageMeta
   reasoning?: ChatReasoning
+  /** Structured physical-call reasoning retained across live-to-history sync. */
+  reasoningBlocks?: import('./turnlog').ReasoningBlock[]
+  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
+  reasoningPresentationPending?: boolean
+  activitySnapshot?: ActivitySnapshotV2
+  activitySnapshotIncomplete?: boolean
   interrupted?: boolean
   /** The turn ended with a terminal error after this partial assistant output. */
   terminalFailure?: boolean
@@ -389,9 +860,10 @@ export interface ChatRenderedMessage {
   daySeparator?: boolean
   dayLabel?: string
   isRouterStrip?: boolean
-  /** Stable per-turn render identity. Unlike the router event message id, this
-   *  does not change when a live strip is replaced by its settled trace. */
+  /** Stable per-card render identity; preserved during terminal reconciliation. */
   routerTurnKey?: string
+  routerModelCallId?: string
+  routerIteration?: number
   routerState?: string
   routerSource?: string
   routerObserve?: boolean
@@ -402,6 +874,10 @@ export interface ChatRenderedMessage {
   ensemble?: ChatEnsembleMeta
   gridCells?: ChatRouterCell[]
   winnerIdx?: number
+  /** Authoritative model from the historical routing decision, independent of UI cells. */
+  routerSelectedModel?: string
+  /** Current or terminal physical execution model, independent of the route decision. */
+  routerExecutionModel?: string
   parts?: import('./parts').ChatPart[]
   sources?: import('./parts').SourcePart[]
   statusHistory?: import('./parts').StatusPart[]
@@ -409,4 +885,5 @@ export interface ChatRenderedMessage {
   /** Typed terminal error code, propagated from the raw message so the error
    *  card can render a recovery action (e.g. resume after a sandbox pause). */
   errorCode?: string
+  modelCapacity?: import('@/modules/providerConfiguration').ModelCapacityFailure
 }

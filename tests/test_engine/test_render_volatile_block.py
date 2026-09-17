@@ -6,16 +6,14 @@ from unittest.mock import MagicMock
 from opensquilla.engine.runtime import TurnRunner
 
 
-def test_bootstrap_md_renders_under_named_heading() -> None:
+def test_retired_bootstrap_md_has_no_special_rendering() -> None:
     rendered = TurnRunner._render_volatile_block(
         daily_notes=None,
         workspace_files={"BOOTSTRAP.md": "do the setup ritual"},
         extra_context=None,
     )
 
-    assert "### One-Shot Workspace Bootstrap" in rendered
-    assert "do the setup ritual" in rendered
-    assert "Workspace Context" not in rendered
+    assert rendered == ""
 
 
 def test_bootstrap_md_absent_emits_no_bootstrap_heading() -> None:
@@ -30,7 +28,7 @@ def test_bootstrap_md_absent_emits_no_bootstrap_heading() -> None:
     assert "<untrusted source='workspace:USER.md'>user profile</untrusted>" in rendered
 
 
-def test_bootstrap_md_alongside_other_files_keeps_named_heading_and_renumbers_others() -> None:
+def test_retired_file_does_not_consume_a_context_slot() -> None:
     rendered = TurnRunner._render_volatile_block(
         daily_notes=None,
         workspace_files={
@@ -41,14 +39,12 @@ def test_bootstrap_md_alongside_other_files_keeps_named_heading_and_renumbers_ot
         extra_context=None,
     )
 
-    assert "### One-Shot Workspace Bootstrap\n\nbootstrap body" in rendered
+    assert "bootstrap body" not in rendered
     assert (
-        "### Workspace Context 1\n\n"
-        "<untrusted source='workspace:AGENTS.md'>agents body</untrusted>"
+        "### Workspace Context 1\n\n<untrusted source='workspace:AGENTS.md'>agents body</untrusted>"
     ) in rendered
     assert (
-        "### Workspace Context 2\n\n"
-        "<untrusted source='workspace:USER.md'>user body</untrusted>"
+        "### Workspace Context 2\n\n<untrusted source='workspace:USER.md'>user body</untrusted>"
     ) in rendered
     # BOOTSTRAP.md must not consume an index slot.
     assert "### Workspace Context 3" not in rendered
@@ -77,7 +73,7 @@ def test_workspace_untrusted_wrapping_can_be_disabled() -> None:
     assert "<untrusted" not in rendered
 
 
-def test_subagent_prompt_compact_keeps_only_agents_and_tools(tmp_path) -> None:
+def test_subagent_prompt_compact_keeps_only_agents(tmp_path) -> None:
     for name in ("AGENTS.md", "SOUL.md", "TOOLS.md", "USER.md"):
         (tmp_path / name).write_text(f"{name} body", encoding="utf-8")
     runner = TurnRunner(
@@ -103,6 +99,6 @@ def test_subagent_prompt_compact_keeps_only_agents_and_tools(tmp_path) -> None:
     assert isinstance(assembled, tuple)
     dynamic_suffix = assembled[1]
     assert "AGENTS.md body" in dynamic_suffix
-    assert "TOOLS.md body" in dynamic_suffix
+    assert "TOOLS.md body" not in dynamic_suffix
     assert "USER.md body" not in dynamic_suffix
     assert "SOUL.md body" not in dynamic_suffix

@@ -1,0 +1,313 @@
+name: Windows NSIS Upgrade Regression
+
+# Unsigned full packages on disposable runners; never installs on a developer's
+# machine. Signing, interactive UAC and Windows 10/11 remain release gates.
+on:
+  # CI owns change selection, cancellation, and the required aggregate result.
+  # Reusing this workflow keeps manual diagnostics on the same acceptance path.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          lfs: true
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: |
+            opensquilla-webui/package-lock.json
+            desktop/electron/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Hydrate router assets
+        run: |
+          git lfs pull --include='src/opensquilla/squilla_router/models/**'
+          if ($LASTEXITCODE -ne 0) { throw 'Router LFS fetch failed' }
+      - name: Build and verify complete WebUI
+        working-directory: opensquilla-webui
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed' }
+          npm run verify:release-dist
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI verification failed' }
+          node scripts/stage-dist.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI staging failed' }
+      - name: Build complete unsigned Windows package
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Electron npm ci failed' }
+          npm run test:nsis-upgrade
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS template and native environment tests failed' }
+          npm run test:installer-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Visible installer progress contract failed' }
+          node ../../.github/scripts/verify-sandbox-package.mjs --source
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime catalog verification failed' }
+          npm run build:gateway
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Electron build failed' }
+          node scripts/test-packaged-first-send-cleanup.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged cleanup contract failed' }
+          node --test scripts/test-packaged-first-send-evidence.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged renderer evidence contract failed' }
+          npm run verify:prepared
+          if ($LASTEXITCODE -ne 0) { throw 'Prepared package verification failed' }
+          node -e "const b=require('electron-builder'); b.build({targets:b.Platform.WINDOWS.createTarget('nsis'),publish:'never',config:{win:{signExecutable:false},forceCodeSigning:false}}).catch(e=>{console.error(e);process.exitCode=1})"
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS build failed' }
+          npm run verify:package
+          if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+      - name: Audit frozen dependencies and verify packaged first interaction
+        env:
+          OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
+        run: |
+          $inventory = 'dist/desktop-electron/win-unpacked/resources/runtime/gateway/dependency-inventory.json'
+          python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$env:RUNNER_TEMP/frozen-dependency-audit"
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
+          Push-Location desktop/electron
+          try {
+            npm run verify:gateway-smoke
+            if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
+            node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/security-first-send-report.log"
+            $probeExitCode = $LASTEXITCODE
+            if ($probeExitCode -ne 0) { throw "Packaged first interaction failed with exit code $probeExitCode" }
+          } finally { Pop-Location }
+      - name: Record exact candidate identities
+        run: |
+          $root = Join-Path $PWD 'dist/desktop-electron'
+          $installers = @(Get-ChildItem -LiteralPath $root -Filter 'OpenSquilla-*-win-x64.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one installer' }
+          $exe = Join-Path $root 'win-unpacked/OpenSquilla.exe'
+          $asar = Join-Path $root 'win-unpacked/resources/app.asar'
+          $manifest = [ordered]@{
+            sourceSha = (git rev-parse HEAD).Trim()
+            auditRunId = $env:GITHUB_RUN_ID
+            signing = 'unsigned regression only'
+            installerName = $installers[0].Name
+            installerSha256 = (Get-FileHash -LiteralPath $installers[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            asarSha256 = (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash.ToLowerInvariant()
+            version = ([Diagnostics.FileVersionInfo]::GetVersionInfo($exe)).ProductVersion
+            dependencyInventorySha256 = (Get-FileHash -LiteralPath (Join-Path $root 'win-unpacked/resources/runtime/gateway/dependency-inventory.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'audit-candidate.json') -Encoding utf8
+          $manifest | ConvertTo-Json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nsis-regression-installer
+          path: |
+            dist/desktop-electron/OpenSquilla-*-win-x64.exe
+            dist/desktop-electron/audit-candidate.json
+            dist/desktop-electron/win-unpacked/resources/runtime/gateway/dependency-inventory.json
+            dist/desktop-electron/win-unpacked/resources/runtime/gateway/gateway-build.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frozen-dependency-audit
+          path: ${{ runner.temp }}/frozen-dependency-audit/
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nsis-native-environment-evidence
+          path: ${{ runner.temp }}/nsis-upgrade-native-*/
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: packaged-first-send-evidence
+          path: |
+            ${{ runner.temp }}/security-first-send-report.log
+            ${{ runner.temp }}/security-first-send/logs/desktop.log*
+            ${{ runner.temp }}/security-first-send/first-send-main-console.jsonl
+          if-no-files-found: warn
+          retention-days: 14
+
+  wheelhouse-security:
+    name: Windows locked wheelhouse (${{ matrix.profile }})
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, recommended]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          lfs: true
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Build wheels with locked profile constraints
+        run: |
+          python scripts/build_wheelhouse_zip.py --profile '${{ matrix.profile }}' --skip-zip
+          if ($LASTEXITCODE -ne 0) { throw 'Locked wheelhouse build failed' }
+          $inventories = @(Get-ChildItem build/wheelhouse-zip -Filter dependency-inventory.json -Recurse -File)
+          if ($inventories.Count -ne 1) { throw 'Expected one wheelhouse inventory' }
+          python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventories[0].FullName --output-dir "$env:RUNNER_TEMP/wheelhouse-dependency-audit"
+          if ($LASTEXITCODE -ne 0) { throw 'Wheelhouse dependency audit failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wheelhouse-dependency-audit-${{ matrix.profile }}
+          path: |
+            ${{ runner.temp }}/wheelhouse-dependency-audit/
+            build/wheelhouse-zip/**/dependency-inventory.json
+            build/wheelhouse-zip/**/dependency-constraints.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  upgrade-and-start:
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        baseline: ['0.5.3', '0.5.4']
+        install-path: [default, custom]
+        scenario: [baseline, readlock, longpath]
+        include:
+          - baseline: fresh
+            install-path: default
+            scenario: fresh
+          - baseline: fresh
+            install-path: custom
+            scenario: fresh
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - name: Prepare packaged-client interaction probe
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Probe npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Probe build failed' }
+      - name: Download pinned official baseline
+        if: matrix.scenario != 'fresh'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Path old,candidate | Out-Null
+          gh release download 'v${{ matrix.baseline }}' --repo TokenRhythm/opensquilla --pattern 'OpenSquilla-${{ matrix.baseline }}-win-x64.exe' --dir old
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
+      - uses: ./.github/actions/download-required-artifact
+        with:
+          name: nsis-regression-installer
+          path: candidate
+      - name: Verify fresh first interaction or retained upgrade and restart
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidate = @(Get-ChildItem candidate -Filter '*.exe' -File)
+          if ($candidate.Count -ne 1) { throw 'Unexpected candidate installer count' }
+          $manifest = Get-Content candidate/audit-candidate.json -Raw | ConvertFrom-Json
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'Acceptance checkout mismatch' }
+          if ($manifest.sourceSha -ne (git rev-parse HEAD).Trim()) { throw 'Candidate source mismatch' }
+          if ((Get-FileHash -LiteralPath $candidate[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.installerSha256) { throw 'Candidate hash mismatch' }
+          $arguments = @('.github/scripts/verify-nsis-upgrade-regression.py',
+            '--candidate-installer', $candidate[0].FullName, '--candidate-version', $manifest.version,
+            '--case', '${{ matrix.scenario }}', '--install-path', '${{ matrix.install-path }}',
+            '--candidate-source-sha', $manifest.sourceSha,
+            '--candidate-installer-sha256', $manifest.installerSha256,
+            '--candidate-asar-sha256', $manifest.asarSha256,
+            '--candidate-executable-sha256', $manifest.executableSha256,
+            '--candidate-dependency-inventory-sha256', $manifest.dependencyInventorySha256,
+            '--evidence-root', (Join-Path $env:RUNNER_TEMP 'nsis-regression-evidence'))
+          if ('${{ matrix.scenario }}' -ne 'fresh') {
+            $old = @(Get-ChildItem old -Filter '*.exe' -File)
+            if ($old.Count -ne 1) { throw 'Unexpected baseline installer count' }
+            $arguments += @('--baseline-installer', $old[0].FullName, '--baseline-version', '${{ matrix.baseline }}')
+          }
+          & python @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS upgrade/startup regression assertions failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nsis-${{ matrix.baseline }}-${{ matrix.install-path }}-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/nsis-regression-evidence/
+            candidate/audit-candidate.json
+          if-no-files-found: warn
+          retention-days: 14
+  acceptance-result:
+    name: Windows NSIS acceptance result
+    needs: [build, wheelhouse-security, upgrade-and-start]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject cancelled acceptance
+        if: ${{ cancelled() }}
+        run: |
+          echo 'ERROR: cancelled Windows acceptance cannot pass.' >&2
+          exit 1
+      - name: Require every packaged acceptance job
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          WHEELHOUSE_RESULT: ${{ needs.wheelhouse-security.result }}
+          UPGRADE_RESULT: ${{ needs.upgrade-and-start.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for result in "${BUILD_RESULT}" "${WHEELHOUSE_RESULT}" "${UPGRADE_RESULT}"; do
+            if [[ "${result}" != "success" ]]; then
+              echo "ERROR: every Windows acceptance job must succeed; got ${result:-missing}." >&2
+              exit 1
+            fi
+          done

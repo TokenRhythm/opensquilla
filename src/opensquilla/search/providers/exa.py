@@ -214,7 +214,7 @@ def _string_list(value: object) -> list[str]:
 
 
 def _safe_metadata(item: dict[str, Any], response_data: dict[str, Any]) -> dict[str, Any]:
-    metadata = {
+    metadata: dict[str, Any] = {
         key: response_data[key]
         for key in ("requestId", "request_id")
         if key in response_data

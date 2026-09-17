@@ -5,6 +5,11 @@
   "match": {
     "toolNames": ["exec"],
     "argv0": ["npm"],
+    "argvStartsWithAny": [
+      ["npm", "test"],
+      ["npm", "run", "test"],
+      ["npm", "run-script", "test"]
+    ],
     "argvIncludes": [["test"]]
   },
   "transforms": {
@@ -26,6 +31,7 @@
       "^AssertionError: .+",
       "^Error: .+",
       "^Caused by: .+",
+      "^\\s*at\\s+.+$",
       "^\\s*Test Files\\s+.+",
       "^\\s*Tests\\s+.+",
       "^\\s*Duration\\s+.+",
@@ -44,12 +50,12 @@
   "counters": [
     {
       "name": "failed",
-      "pattern": "fail",
+      "pattern": "^(?!\\s*at\\s).*fail",
       "flags": "i"
     },
     {
       "name": "passed",
-      "pattern": "pass",
+      "pattern": "^(?!\\s*at\\s).*pass",
       "flags": "i"
     }
   ]

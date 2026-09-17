@@ -5,6 +5,7 @@
   "match": {
     "argv0": ["git"],
     "gitSubcommands": ["worktree"],
+    "gitSubcommandArgsStartsWithAny": [["list"]],
     "argvIncludes": [["list"]]
   },
   "transforms": {

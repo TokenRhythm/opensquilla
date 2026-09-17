@@ -454,8 +454,14 @@ def test_launch_bridge_routes_interactive_structlog_to_file(
         structlog.get_logger("opensquilla.test").warning(
             "ui.hidden_warning",
             answer=42,
+            error="synthetic private interactive content",
         )
-        logging.getLogger("opensquilla.test").warning("ui.hidden_stdlib_warning")
+        try:
+            raise ValueError("synthetic private interactive content")
+        except ValueError:
+            logging.getLogger("opensquilla.test").exception(
+                "synthetic private interactive content",
+            )
 
         captured = capsys.readouterr()
         assert captured.out == ""
@@ -463,7 +469,8 @@ def test_launch_bridge_routes_interactive_structlog_to_file(
         assert terminal_stream.getvalue() == ""
         log_text = (tmp_path / "interactive.log").read_text()
         assert "ui.hidden_warning" in log_text
-        assert "ui.hidden_stdlib_warning" in log_text
+        assert "ValueError" in log_text
+        assert "synthetic private interactive content" not in log_text
     finally:
         for handler in list(root.handlers):
             root.removeHandler(handler)

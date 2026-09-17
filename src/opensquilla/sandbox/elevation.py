@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -12,6 +13,109 @@ from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 
 SandboxPermissionIntent = Literal["use_default", "require_escalated"]
 ApprovalReviewerName = Literal["user", "auto_review"]
+ApprovalDisplayKind = Literal[
+    "delete",
+    "modify",
+    "create",
+    "run_command",
+    "run_code",
+    "network_access",
+    "path_access",
+    "plugin_permission",
+    "sensitive_operation",
+]
+BackupState = Literal[
+    "not_applicable",
+    "enabled",
+    "disabled",
+    "unavailable_requires_confirmation",
+]
+
+_APPROVAL_DISPLAY_KINDS = frozenset(
+    {
+        "delete",
+        "modify",
+        "create",
+        "run_command",
+        "run_code",
+        "network_access",
+        "path_access",
+        "plugin_permission",
+        "sensitive_operation",
+    }
+)
+_BACKUP_STATES = frozenset(
+    {
+        "not_applicable",
+        "enabled",
+        "disabled",
+        "unavailable_requires_confirmation",
+    }
+)
+
+_CHANNEL_APPROVAL_ROUTING_UNAVAILABLE = (
+    "This elevated action cannot request channel approval because the authenticated "
+    "administrator sender or session route is unavailable."
+)
+
+
+def effective_approval_reviewer(
+    configured: object,
+    run_mode: object,
+) -> ApprovalReviewerName:
+    """Resolve the reviewer, with canonical Safe mode owned by the user."""
+
+    mode = getattr(run_mode, "value", run_mode)
+    normalized = str(mode or "").strip().lower()
+    if normalized in {"safe", "standard", "trusted", "managed"}:
+        return "user"
+    return cast(
+        "ApprovalReviewerName",
+        configured if configured in {"user", "auto_review"} else "user",
+    )
+
+
+@dataclass(frozen=True)
+class ApprovalDisplay:
+    """Fingerprint-bound, browser-safe meaning of an approval request."""
+
+    kind: ApprovalDisplayKind
+    target: str = ""
+    destructive: bool = False
+    irreversible: bool = False
+    backup_state: BackupState = "not_applicable"
+
+    def canonical_payload(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "target": self.target,
+            "destructive": self.destructive,
+            "irreversible": self.irreversible,
+            "backup_state": self.backup_state,
+        }
+
+    @classmethod
+    def from_canonical_payload(cls, payload: Mapping[str, Any]) -> ApprovalDisplay:
+        kind = str(payload.get("kind") or "")
+        if kind not in _APPROVAL_DISPLAY_KINDS:
+            raise ValueError("invalid_approval_display_kind")
+        backup_state = str(payload.get("backup_state") or "")
+        if backup_state not in _BACKUP_STATES:
+            raise ValueError("invalid_approval_backup_state")
+        destructive = payload.get("destructive", False)
+        irreversible = payload.get("irreversible", False)
+        if not isinstance(destructive, bool) or not isinstance(irreversible, bool):
+            raise ValueError("invalid_approval_display_flags")
+        target = payload.get("target", "")
+        if not isinstance(target, str):
+            raise ValueError("invalid_approval_display_target")
+        return cls(
+            kind=cast("ApprovalDisplayKind", kind),
+            target=target,
+            destructive=destructive,
+            irreversible=irreversible,
+            backup_state=cast("BackupState", backup_state),
+        )
 
 
 @dataclass(frozen=True)
@@ -31,11 +135,12 @@ class ElevationAction:
     risk_markers: tuple[str, ...] = ()
     tty: bool = False
     prefix_rule: tuple[str, ...] | None = None
+    display: ApprovalDisplay | None = None
 
     def canonical_payload(self) -> dict[str, object]:
         """Return the stable JSON-compatible representation used for review."""
 
-        return {
+        payload: dict[str, object] = {
             "tool_name": self.tool_name,
             "action_kind": self.action_kind,
             "argv": list(self.argv),
@@ -50,6 +155,11 @@ class ElevationAction:
             "tty": self.tty,
             "prefix_rule": list(self.prefix_rule) if self.prefix_rule is not None else None,
         }
+        # Keep legacy action fingerprints stable when no typed display contract
+        # has been supplied by the call site.
+        if self.display is not None:
+            payload["display"] = self.display.canonical_payload()
+        return payload
 
     @classmethod
     def from_canonical_payload(cls, payload: dict[str, Any]) -> ElevationAction:
@@ -89,6 +199,9 @@ class ElevationAction:
             or raw_content_length < 0
         ):
             raise ValueError("invalid_content_length")
+        raw_display = payload.get("display")
+        if raw_display is not None and not isinstance(raw_display, Mapping):
+            raise ValueError("invalid_approval_display")
 
         return cls(
             tool_name=str(payload.get("tool_name") or ""),
@@ -114,6 +227,11 @@ class ElevationAction:
             prefix_rule=(
                 tuple(str(item) for item in raw_prefix_rule)
                 if raw_prefix_rule is not None
+                else None
+            ),
+            display=(
+                ApprovalDisplay.from_canonical_payload(raw_display)
+                if isinstance(raw_display, Mapping)
                 else None
             ),
         )
@@ -149,12 +267,80 @@ class ElevationGateResult:
         return payload
 
 
+def _active_channel_context() -> Any | None:
+    """Return the active Channel context without trusting generic owner state."""
+
+    try:
+        from opensquilla.tools.types import CallerKind, current_tool_context
+
+        ctx = current_tool_context.get()
+    except Exception:  # pragma: no cover - defensive context lookup
+        return None
+    if ctx is None:
+        return None
+    caller_kind = getattr(ctx, "caller_kind", None)
+    if caller_kind is CallerKind.CHANNEL or str(caller_kind) == CallerKind.CHANNEL.value:
+        return ctx
+    return None
+
+
+def channel_admin_approval_identity() -> tuple[str, str] | None:
+    """Return the authenticated sender/session binding for a Channel admin.
+
+    The ingress boundary alone sets ``channel_admin_verified``.  Requiring it
+    here prevents an internally constructed ``is_owner`` Channel context from
+    creating an approval whose recipient cannot be authenticated on reply.
+    """
+
+    ctx = _active_channel_context()
+    if (
+        ctx is None
+        or not bool(getattr(ctx, "is_owner", False))
+        or not bool(getattr(ctx, "channel_admin_verified", False))
+    ):
+        return None
+    sender_id = str(getattr(ctx, "sender_id", "") or "").strip()
+    session_key = str(getattr(ctx, "session_key", "") or "").strip()
+    if not sender_id or not session_key:
+        return None
+    return sender_id, session_key
+
+
+def _channel_elevation_metadata(
+    *,
+    session_key: str | None,
+    metadata: dict[str, object] | None,
+) -> tuple[dict[str, object], ElevationGateResult | None]:
+    """Bind a Channel elevation request to its verified approval recipient."""
+
+    if _active_channel_context() is None:
+        return dict(metadata or {}), None
+
+    identity = channel_admin_approval_identity()
+    requested_session_key = str(session_key or "").strip()
+    if identity is None or not requested_session_key or requested_session_key != identity[1]:
+        return {}, ElevationGateResult(
+            requested=False,
+            allowed=False,
+            status="approval_denied",
+            reason=_CHANNEL_APPROVAL_ROUTING_UNAVAILABLE,
+        )
+
+    routed_metadata = dict(metadata or {})
+    # Do not let a call-site supplied metadata value select a different
+    # recipient. The authenticated ingress identity is the only authority.
+    routed_metadata["senderId"] = identity[0]
+    return routed_metadata, None
+
+
 def _pending_elevation_id(
     queue: ApprovalQueue,
     *,
     fingerprint: str,
     session_key: str | None,
+    sender_id: str | None,
 ) -> str | None:
+    expected_sender_id = str(sender_id or "").strip()
     for pending in queue.list_pending("exec"):
         params = pending.get("params")
         if not isinstance(params, dict):
@@ -164,6 +350,8 @@ def _pending_elevation_id(
         if str(params.get("fingerprint") or "") != fingerprint:
             continue
         if str(params.get("sessionKey") or "") != str(session_key or ""):
+            continue
+        if str(params.get("senderId") or "").strip() != expected_sender_id:
             continue
         approval_id = str(pending.get("id") or "")
         if approval_id:
@@ -185,13 +373,37 @@ def request_elevation(
         raise ValueError("require_escalated_required")
     if not action.justification.strip():
         raise ValueError("justification_required")
+    routed_metadata, routing_denial = _channel_elevation_metadata(
+        session_key=session_key,
+        metadata=metadata,
+    )
+    if routing_denial is not None:
+        return routing_denial
+
     fingerprint = action.fingerprint()
     pending_id = _pending_elevation_id(
         queue,
         fingerprint=fingerprint,
         session_key=session_key,
+        sender_id=str(routed_metadata.get("senderId") or ""),
     )
     if pending_id is not None:
+        if reviewer == "user":
+            entry = queue.get(pending_id)
+            if (
+                entry.params.get("reviewer") != "user"
+                or entry.params.get("humanActionable") is not True
+            ):
+                pending_params = dict(entry.params)
+                pending_params.update(
+                    {
+                        "reviewer": "user",
+                        "humanActionable": True,
+                        "reviewStatus": "human_confirmation_required",
+                        "reviewSource": "standard_mode_policy",
+                    }
+                )
+                queue.update_params(pending_id, pending_params)
         return ElevationGateResult(
             requested=True,
             allowed=False,
@@ -207,7 +419,7 @@ def request_elevation(
         "action": action.canonical_payload(),
         "sessionKey": str(session_key or ""),
     }
-    for key, value in (metadata or {}).items():
+    for key, value in routed_metadata.items():
         if key not in params:
             params[str(key)] = value
     approval_id = queue.request(
@@ -228,6 +440,8 @@ def consume_approved_elevation(
     action: ElevationAction,
     *,
     expected_session_key: str | None = None,
+    expected_reviewer: ApprovalReviewerName | None = None,
+    expected_sender_id: str | None = None,
 ) -> ElevationGateResult:
     """Validate and consume an approved grant before its side effect starts."""
 
@@ -257,6 +471,30 @@ def consume_approved_elevation(
             status="approval_session_mismatch",
             approval_id=approval_id,
             reason="approval_session_mismatch",
+        )
+    if expected_reviewer is not None and (
+        entry.params.get("reviewer") != expected_reviewer
+        or (
+            expected_reviewer == "user"
+            and entry.params.get("humanActionable") is not True
+        )
+    ):
+        return ElevationGateResult(
+            requested=True,
+            allowed=False,
+            status="approval_reviewer_mismatch",
+            approval_id=approval_id,
+            reason="approval_reviewer_mismatch",
+        )
+    if expected_sender_id is not None and str(
+        entry.params.get("senderId") or ""
+    ).strip() != str(expected_sender_id or "").strip():
+        return ElevationGateResult(
+            requested=True,
+            allowed=False,
+            status="approval_sender_mismatch",
+            approval_id=approval_id,
+            reason="approval_sender_mismatch",
         )
     if not entry.resolved:
         return ElevationGateResult(
@@ -337,18 +575,39 @@ def gate_elevated_action(
 
         runtime = get_runtime()
         configured = getattr(getattr(runtime, "settings", None), "approvals_reviewer", None)
-        reviewer = cast(
-            "ApprovalReviewerName",
+        reviewer = effective_approval_reviewer(
             configured if configured in {"user", "auto_review"} else "auto_review",
+            None,
         )
+    from opensquilla.tools.run_mode import current_run_mode
+
+    reviewer = effective_approval_reviewer(reviewer, current_run_mode())
+    routed_metadata, routing_denial = _channel_elevation_metadata(
+        session_key=session_key,
+        metadata=metadata,
+    )
+    if routing_denial is not None:
+        return routing_denial
+    expected_sender_id = str(routed_metadata.get("senderId") or "").strip() or None
     if approval_id:
         try:
-            return consume_approved_elevation(
+            consumed = consume_approved_elevation(
                 queue,
                 approval_id,
                 action,
                 expected_session_key=session_key,
+                expected_reviewer=reviewer,
+                expected_sender_id=expected_sender_id,
             )
+            if consumed.status == "approval_reviewer_mismatch":
+                return request_elevation(
+                    queue,
+                    action,
+                    session_key=session_key,
+                    reviewer=reviewer,
+                    metadata=routed_metadata,
+                )
+            return consumed
         except KeyError:
             reason = "approval not found"
         except ValueError as exc:
@@ -365,16 +624,21 @@ def gate_elevated_action(
         action,
         session_key=session_key,
         reviewer=reviewer,
-        metadata=metadata,
+        metadata=routed_metadata,
     )
 
 
 __all__ = [
+    "ApprovalDisplay",
+    "ApprovalDisplayKind",
     "ApprovalReviewerName",
+    "BackupState",
     "ElevationAction",
     "ElevationGateResult",
     "SandboxPermissionIntent",
+    "channel_admin_approval_identity",
     "consume_approved_elevation",
+    "effective_approval_reviewer",
     "gate_elevated_action",
     "request_elevation",
 ]

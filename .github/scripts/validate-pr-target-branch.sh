@@ -2,6 +2,7 @@
 set -euo pipefail
 
 base_ref="${PR_BASE_REF:-${BASE_REF:-${BASE:-}}}"
+base_ref="${base_ref#refs/heads/}"
 event_path="${GITHUB_EVENT_PATH:-}"
 
 if [[ -z "${base_ref}" ]]; then

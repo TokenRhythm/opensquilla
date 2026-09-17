@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -30,6 +32,9 @@ def test_wheel_contains_migrations_and_webui_artifact(
     with zipfile.ZipFile(isolated_core_wheel) as wheel:
         names = wheel.namelist()
         packaged_probe = wheel.read("opensquilla/gateway/static/dist/assets/packaging-probe.js")
+        packaged_runtime_catalog = wheel.read(
+            "opensquilla/runtime_packs/runtime-pack-catalog.json"
+        )
 
     assert any(n.endswith("opensquilla/_migrations/V010__meta_skill_runs.py") for n in names), (
         f"V010 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
@@ -47,9 +52,37 @@ def test_wheel_contains_migrations_and_webui_artifact(
         n.endswith("opensquilla/_migrations/V024__usage_native_billing_receipts.py")
         for n in names
     ), f"V024 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V030__meta_control_intents.py") for n in names
+    ), f"V030 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V031__meta_launch_drafts.py") for n in names
+    ), f"V031 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V032__meta_launch_discard_tombstones.py")
+        for n in names
+    ), f"V032 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V037__artifact_sessions.py") for n in names
+    ), f"V037 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V038__artifact_prompt_annotations.py")
+        for n in names
+    ), f"V038 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V039__artifact_mutation_attempts.py")
+        for n in names
+    ), f"V039 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    assert any(
+        n.endswith("opensquilla/_migrations/V040__document_resources.py") for n in names
+    ), f"V040 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
     assert "opensquilla/gateway/static/dist/index.html" in names
+    assert "opensquilla/gateway/static/dist/desktop.html" in names
     assert f"opensquilla/gateway/static/dist/{MANIFEST_NAME}" in names
     assert packaged_probe == SYNTHETIC_JS
+    assert packaged_runtime_catalog == (
+        REPO_ROOT / "desktop/electron/runtime/runtime-pack-catalog.json"
+    ).read_bytes()
 
     assert "opensquilla/gateway/templates/legacy_index.html" not in names
     for removed_prefix in (
@@ -74,7 +107,11 @@ def test_usage_query_client_source_is_part_of_webui_build_inputs() -> None:
         REPO_ROOT / "opensquilla-webui" / "scripts" / "check-runtime-bundle.mjs"
     ).read_text(encoding="utf-8")
 
-    assert "const USAGE_QUERY_METHOD = 'usage.query'" in source
+    assert re.search(
+        r"import type\s*\{[^}]*\bObservability\b[^}]*\}\s*from '@/modules/observability'",
+        source,
+    )
+    assert "return observability.usage(range, options)" in source
     assert "check-runtime-bundle.mjs" in package["scripts"]["build:artifact"]
     assert "usage.query" in bundle_guard
 
@@ -87,24 +124,22 @@ def test_installed_wheel_resolves_migrations(
     """An installed wheel resolves both the historical and latest migration."""
     venv_dir = tmp_path / "venv"
     subprocess.run(
-        ["uv", "venv", "--seed", str(venv_dir)],
+        ["uv", "venv", str(venv_dir), "--python", sys.executable],
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
         timeout=120,
     )
-    pip = venv_dir / ("Scripts" if os.name == "nt" else "bin") / "pip"
-    py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / "python"
+    py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / (
+        "python.exe" if os.name == "nt" else "python"
+    )
 
-    # 120s was tight enough that Windows CI runners began timing out as
-    # the base dependency list grew (each transitive wheel adds I/O the
-    # Defender real-time scanner has to walk through). Ubuntu still
-    # completes in ~30s; Windows now needs ~90-150s. Bumping the budget
-    # rather than skipping preserves the test's intent — verify the
-    # built wheel installs cleanly into a fresh venv and the migration
-    # resolver finds V010 afterwards.
+    # Use uv's installer against the fresh interpreter instead of seeding pip
+    # and then invoking a second resolver. This keeps the clean-install
+    # contract while reusing the hosted runner's uv cache; Windows Defender
+    # otherwise scans the same dependency wheels twice.
     subprocess.run(
-        [str(pip), "install", str(isolated_core_wheel)],
+        ["uv", "pip", "install", "--python", str(py), str(isolated_core_wheel)],
         check=True,
         capture_output=True,
         timeout=300,
@@ -127,6 +162,20 @@ def test_installed_wheel_resolves_migrations(
                 "        f'V023 missing in {d}';"
                 " assert (d / 'V024__usage_native_billing_receipts.py').exists(),"
                 "        f'V024 missing in {d}';"
+                " assert (d / 'V030__meta_control_intents.py').exists(),"
+                "        f'V030 missing in {d}';"
+                " assert (d / 'V031__meta_launch_drafts.py').exists(),"
+                "        f'V031 missing in {d}';"
+                " assert (d / 'V032__meta_launch_discard_tombstones.py').exists(),"
+                "        f'V032 missing in {d}';"
+                " assert (d / 'V037__artifact_sessions.py').exists(),"
+                "        f'V037 missing in {d}';"
+                " assert (d / 'V038__artifact_prompt_annotations.py').exists(),"
+                "        f'V038 missing in {d}';"
+                " assert (d / 'V039__artifact_mutation_attempts.py').exists(),"
+                "        f'V039 missing in {d}';"
+                " assert (d / 'V040__document_resources.py').exists(),"
+                "        f'V040 missing in {d}';"
                 " print('OK', d)"
             ),
         ],
@@ -149,7 +198,7 @@ def test_installed_wheel_resolves_migrations(
     reason="docker smoke is opt-in; it pulls external images",
 )
 def test_docker_image_resolves_migrations() -> None:
-    """`docker build` + `docker run` resolves _migrations through V024.
+    """`docker build` + `docker run` resolves _migrations through V027.
 
     Verifies (C1 v2): .dockerignore no longer excludes migrations/.
     """
@@ -180,6 +229,13 @@ def test_docker_image_resolves_migrations() -> None:
                 " assert (d / 'V022__telemetry_daily_usage.py').exists();"
                 " assert (d / 'V023__router_deployment_telemetry.py').exists();"
                 " assert (d / 'V024__usage_native_billing_receipts.py').exists();"
+                " assert (d / 'V030__meta_control_intents.py').exists();"
+                " assert (d / 'V031__meta_launch_drafts.py').exists();"
+                " assert (d / 'V032__meta_launch_discard_tombstones.py').exists();"
+                " assert (d / 'V037__artifact_sessions.py').exists();"
+                " assert (d / 'V038__artifact_prompt_annotations.py').exists();"
+                " assert (d / 'V039__artifact_mutation_attempts.py').exists();"
+                " assert (d / 'V040__document_resources.py').exists();"
                 " print('OK', d)"
             ),
         ],

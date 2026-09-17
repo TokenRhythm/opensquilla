@@ -1,27 +1,57 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, inject, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import Icon from './Icon.vue'
-import { useRpcCall } from '@/composables/useRpc'
+import {
+  optionalSessionRpcAllowed,
+} from '@/composables/chat/sessionBootstrapAdmission'
 import {
   onReadinessInvalidated,
   useReadinessSummary,
   type ReadinessStatus,
 } from '@/composables/setup/useReadinessSummary'
+import { useSetupStatus } from '@/composables/setup/useSetupStatus'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
 
 const { t } = useI18n()
 const router = useRouter()
-const { data: status, execute } = useRpcCall<ReadinessStatus>('onboarding.status')
+const setupWorkflow = inject(SETUP_WORKFLOW_KEY)
+if (!setupWorkflow) throw new Error('SetupWorkflow was not provided')
+const { data: status, loading, execute } = useSetupStatus<ReadinessStatus>(setupWorkflow, {
+  allowed: optionalSessionRpcAllowed,
+})
 const { needsAction, actionCount } = useReadinessSummary(status)
 
 // This banner outlives the Settings dialog (it is mounted once in App.vue), so
 // its status snapshot goes stale the moment a save hot-applies config. Re-fetch
 // whenever a save signals, otherwise "Setup needed" survives a completed setup
 // until the next full page reload.
+let readinessRefreshPending = false
+
+function flushReadinessRefresh() {
+  if (
+    !readinessRefreshPending
+    || loading.value
+    || !optionalSessionRpcAllowed.value
+  ) return
+  readinessRefreshPending = false
+  void execute()
+    .catch(() => { /* error already captured in the rpc-call state */ })
+    .finally(flushReadinessRefresh)
+}
+
 const stopReadinessSync = onReadinessInvalidated(() => {
-  execute().catch(() => { /* error already captured in the rpc-call state */ })
+  readinessRefreshPending = true
+  flushReadinessRefresh()
 })
+watch(
+  [optionalSessionRpcAllowed, loading],
+  ([admitted, busy]) => {
+    if (admitted && !busy) flushReadinessRefresh()
+  },
+  { flush: 'sync' },
+)
 onUnmounted(stopReadinessSync)
 
 // Per-session dismissal that re-arms when the readiness signal changes.

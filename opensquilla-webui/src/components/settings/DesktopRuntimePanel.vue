@@ -4,7 +4,10 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import GatewayStatusBlock from '@/components/settings/GatewayStatusBlock.vue'
 import SettingsUpdatePanel from '@/components/settings/SettingsUpdatePanel.vue'
-import { usePlatform, type GatewayStatus } from '@/platform'
+import {
+  usePlatform,
+  type GatewayStatus,
+} from '@/platform'
 import { useToasts } from '@/composables/useToasts'
 
 const { t } = useI18n()
@@ -87,7 +90,9 @@ async function restartGateway(): Promise<GatewayStatus | null> {
   }
 }
 
-onMounted(loadStatus)
+onMounted(() => {
+  void loadStatus()
+})
 </script>
 
 <template>
@@ -146,4 +151,5 @@ onMounted(loadStatus)
   flex-wrap: wrap;
   gap: var(--sp-2);
 }
+
 </style>

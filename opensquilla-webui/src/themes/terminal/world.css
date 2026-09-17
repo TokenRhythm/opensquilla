@@ -18,11 +18,20 @@
   text-shadow: 0 0 8px color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
-/* Glow on the primary action + the live connection pill + new-chat. */
+/* Glow on elevated accent surfaces; sidebar destinations and stable semantic
+   topbar states remain flat so the CRT treatment preserves urgency. */
 [data-theme="terminal"] .btn--primary,
-[data-theme="terminal"] .conn-pill,
-[data-theme="terminal"] .sidebar-new-session {
+[data-theme="terminal"] .conn-pill:not(.topbar-state) {
   box-shadow: var(--elev-1), 0 0 14px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+[data-theme="terminal"] .topbar .topbar-state:is(
+  [data-state="info"],
+  [data-state="warning"],
+  [data-state="danger"]
+) {
+  box-shadow: var(--elev-1),
+              0 0 14px color-mix(in srgb, var(--topbar-state-channel) 35%, transparent);
 }
 
 /* Focus styling lives in tokens.css as --focus-ring/--focus-ring-inset overrides:

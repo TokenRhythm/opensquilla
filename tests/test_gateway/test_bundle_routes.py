@@ -45,7 +45,11 @@ def _client(
     (home / "logs" / "debug.log").write_text("2026-07-07 [INFO] opensquilla: ok\n")
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
     monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(home / "logs"))
-    return TestClient(create_gateway_app(GatewayConfig()), client=peer)
+    return TestClient(
+        create_gateway_app(GatewayConfig()),
+        base_url="http://127.0.0.1:18791",
+        client=peer,
+    )
 
 
 def _track_mkdtemp(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
@@ -164,7 +168,7 @@ def test_bundle_route_rejects_same_host_different_port_origin(monkeypatch, tmp_p
         response = client.post(
             "/api/v1/diagnostics/bundle",
             json={},
-            headers={"Origin": "http://testserver:8080"},
+            headers={"Origin": "http://127.0.0.1:8080"},
         )
 
     assert response.status_code == 403
@@ -178,7 +182,7 @@ def test_bundle_route_allows_same_origin_request(monkeypatch, tmp_path) -> None:
         response = client.post(
             "/api/v1/diagnostics/bundle",
             json={},
-            headers={"Origin": "http://testserver"},
+            headers={"Origin": "http://127.0.0.1:18791"},
         )
 
     assert response.status_code == 200

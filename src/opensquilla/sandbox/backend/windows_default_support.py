@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 from opensquilla.sandbox.backend.windows_default_setup import (
     default_setup_marker_path,
     read_setup_marker,
+    setup_marker_identity_ready,
     setup_marker_is_current,
     setup_marker_proxy_allowlist_ready,
 )
@@ -24,6 +26,8 @@ class WindowsDefaultSupport:
     acl_api_available: bool
     setup_ready: bool
     proxy_allowlist_enforced: bool = False
+    identity_ready: bool = True
+    storage_ready: bool = True
 
     @property
     def requires_admin_setup(self) -> bool:
@@ -37,6 +41,8 @@ class WindowsDefaultSupport:
             and self.token_api_available
             and self.acl_api_available
             and self.setup_ready
+            and self.identity_ready
+            and self.storage_ready
         )
 
 
@@ -44,6 +50,7 @@ def probe_windows_default_support(
     *,
     home: Path | None = None,
     proxy_ports: tuple[int, ...] = (),
+    verify_runtime: bool = True,
 ) -> WindowsDefaultSupport:
     is_windows = sys.platform.startswith("win")
     if not is_windows:
@@ -54,6 +61,8 @@ def probe_windows_default_support(
             acl_api_available=False,
             setup_ready=False,
             proxy_allowlist_enforced=False,
+            identity_ready=False,
+            storage_ready=False,
         )
 
     ctypes_ready = _ctypes_available()
@@ -61,6 +70,20 @@ def probe_windows_default_support(
     acl_ready = ctypes_ready and _acl_api_available()
     marker_path = default_setup_marker_path(home)
     setup_ready = setup_marker_is_current(marker_path)
+    if verify_runtime:
+        identity_ready = setup_ready and _offline_identity_ready(marker_path)
+        storage_ready = setup_ready and _persistent_storage_ready(marker_path)
+    else:
+        marker = read_setup_marker(marker_path)
+        network = marker.network if marker is not None else None
+        identity_ready = bool(
+            setup_ready
+            and network is not None
+            and network.offline_user_sid
+            and network.offline_username
+            and network.protected_password
+        )
+        storage_ready = setup_ready and _persistent_storage_ready(marker_path, verify_runtime=False)
     if not proxy_ports:
         marker = read_setup_marker(marker_path)
         if marker is not None and marker.network is not None:
@@ -75,8 +98,46 @@ def probe_windows_default_support(
         token_api_available=token_ready,
         acl_api_available=acl_ready,
         setup_ready=setup_ready,
-        proxy_allowlist_enforced=token_ready and acl_ready and setup_ready and network_ready,
+        proxy_allowlist_enforced=(
+            token_ready and acl_ready and setup_ready and identity_ready and network_ready
+        ),
+        identity_ready=identity_ready,
+        storage_ready=storage_ready,
     )
+
+
+def _offline_identity_ready(marker_path: Path) -> bool:
+    return setup_marker_identity_ready(marker_path)
+
+
+def _persistent_storage_ready(marker_path: Path, *, verify_runtime: bool = True) -> bool:
+    opensquilla_root = marker_path.parent.parent
+    roots = (
+        marker_path.parent,
+        opensquilla_root / "sandbox-secrets",
+        opensquilla_root / "sandbox-bin",
+    )
+    if any(not root.is_dir() or not os.access(root, os.W_OK) for root in roots):
+        return False
+    if not verify_runtime:
+        return True
+    for candidate in (
+        marker_path.parent / ".cap_sids.json.lock",
+        marker_path.parent / "cap_sids.json",
+        marker_path.parent / ".allow_acl_state.json.lock",
+        marker_path.parent / "allow_acl_state.json",
+        marker_path.parent / ".deny_acl_state.json.lock",
+        marker_path.parent / "deny_acl_state.json",
+        marker_path.parent / "execution.lock",
+    ):
+        if not candidate.exists():
+            continue
+        try:
+            with candidate.open("a+b"):
+                pass
+        except OSError:
+            return False
+    return True
 
 
 def _ctypes_available() -> bool:

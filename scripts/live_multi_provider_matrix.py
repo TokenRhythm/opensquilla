@@ -134,7 +134,7 @@ _MODEL_ENV_NAMES: dict[str, tuple[str, ...]] = {
 _DEFAULT_MODELS = {
     "dashscope": "qwen3.7-plus",
     "openai": "gpt-5.4-mini",
-    "deepseek": "deepseek-v4-flash",
+    "deepseek": "deepseek-flash",
     "gemini": "gemini-3.5-flash",
     "moonshot": "kimi-k2.6",
     "zhipu": "glm-5",

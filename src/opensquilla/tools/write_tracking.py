@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import re
-import subprocess
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+from opensquilla.git_runtime import GitRunState, probe_git_repository, run_git
+from opensquilla.tools import write_policy
 from opensquilla.tools.types import RetryableToolInputError, current_tool_context
 
 _GENERATED_OR_DERIVED_PATH_PATTERNS = (
@@ -69,6 +72,45 @@ _SCRATCH_ONLY_NUDGE_COUNTS = frozenset({3, 6, 10})
 _WORKSPACE_WRITE_PROGRESS_COUNTS = frozenset({1, 3, 6, 10})
 
 
+class WorkspaceMutationSnapshot(dict[str, str]):
+    """Git-backed workspace status plus whether that status is authoritative.
+
+    This remains a ``dict`` subclass so existing embedded callers and tests that
+    compare snapshots with dictionaries keep working.  ``git_state`` prevents
+    an unavailable Git runtime or a non-repository workspace from being
+    mistaken for an authoritatively clean workspace.
+    """
+
+    def __init__(
+        self,
+        entries: dict[str, str] | None = None,
+        *,
+        git_state: GitRunState = GitRunState.OK,
+        observed: bool = True,
+        skip_reason: str | None = None,
+    ) -> None:
+        super().__init__(entries or {})
+        self.git_state = git_state
+        self.observed = observed
+        self.skip_reason = skip_reason
+
+    @property
+    def authoritative(self) -> bool:
+        return self.observed and self.git_state is GitRunState.OK
+
+
+def _snapshot_git_state(snapshot: dict[str, str]) -> GitRunState:
+    state = getattr(snapshot, "git_state", GitRunState.OK)
+    return state if isinstance(state, GitRunState) else GitRunState.FAILED
+
+
+def _normalize_relative_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
+
+
 def record_workspace_file_write(
     path: Path,
     *,
@@ -99,33 +141,42 @@ def mutation_ledger_text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
-def snapshot_current_workspace_mutations() -> dict[str, str]:
+def snapshot_current_workspace_mutations() -> WorkspaceMutationSnapshot:
     ctx = current_tool_context.get()
     if ctx is None or not ctx.workspace_dir:
-        return {}
+        return WorkspaceMutationSnapshot(
+            git_state=GitRunState.NOT_REPOSITORY,
+            observed=False,
+            skip_reason="missing_workspace",
+        )
+    from opensquilla.tools.run_mode import full_host_access_active
+
+    effect_observation_needed = bool(
+        not full_host_access_active()
+        and write_policy.workspace_write_deny_effect_mode() in {"warn", "revert"}
+        and getattr(ctx, "workspace_write_deny_globs", None)
+    )
+    if ctx.on_runtime_event is None and not effect_observation_needed:
+        return WorkspaceMutationSnapshot(
+            git_state=GitRunState.FAILED,
+            observed=False,
+            skip_reason="no_consumer",
+        )
     return snapshot_workspace_mutations(Path(ctx.workspace_dir).expanduser().resolve())
 
 
-def snapshot_workspace_mutations(workspace: Path) -> dict[str, str]:
-    try:
-        completed = subprocess.run(
-            [
-                "git",
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-            ],
-            cwd=workspace,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError:
-        return {}
-    if completed.returncode != 0:
-        return {}
-    return _parse_git_status_z(completed.stdout.decode("utf-8", errors="replace"))
+def snapshot_workspace_mutations(workspace: Path) -> WorkspaceMutationSnapshot:
+    result = run_git(
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        cwd=workspace,
+        timeout=2.0,
+    )
+    if not result.ok:
+        return WorkspaceMutationSnapshot(git_state=result.state)
+    return WorkspaceMutationSnapshot(
+        _parse_git_status_z(result.stdout.decode("utf-8", errors="replace")),
+        git_state=GitRunState.OK,
+    )
 
 
 def record_observed_workspace_mutations(
@@ -174,6 +225,10 @@ def diff_workspace_mutations(
     before: dict[str, str],
     after: dict[str, str],
 ) -> list[dict[str, str]]:
+    if _snapshot_git_state(before) is not GitRunState.OK:
+        return []
+    if _snapshot_git_state(after) is not GitRunState.OK:
+        return []
     paths: list[dict[str, str]] = []
     for relative_path in sorted(set(before) | set(after)):
         before_status = before.get(relative_path)
@@ -190,8 +245,301 @@ def diff_workspace_mutations(
     return paths
 
 
+def workspace_write_deny_effect_preflight(
+    *,
+    tool_name: str,
+    before: WorkspaceMutationSnapshot,
+) -> str | None:
+    """Fail closed before a revert-mode command when Git protection is unavailable."""
+
+    if write_policy.workspace_write_deny_effect_mode() != "revert":
+        return None
+    ctx = current_tool_context.get()
+    if (
+        ctx is None
+        or not ctx.workspace_dir
+        or not getattr(ctx, "workspace_write_deny_globs", None)
+    ):
+        return None
+    state = _snapshot_git_state(before)
+    if state is GitRunState.OK:
+        return None
+    return json.dumps(
+        {
+            "status": "blocked",
+            "code": "WORKSPACE_WRITE_PROTECTION_UNAVAILABLE",
+            "reason": "workspace_write_protection_unavailable",
+            "tool": tool_name,
+            "tool_name": tool_name,
+            "git_state": state.value,
+            "retryable": False,
+            "message": (
+                "OpenSquilla cannot safely run this command because Git-backed "
+                "workspace write protection is unavailable."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def enforce_workspace_write_deny_effects(
+    *,
+    tool_name: str,
+    before: dict[str, str],
+    output: str,
+) -> str:
+    """Post-execution effect check for the workspace write deny policy.
+
+    Pre-execution screens can only match paths named in tool arguments; a
+    command can still mutate a protected path indirectly (for example via a
+    helper program it wrote and ran). This check compares git status before
+    and after the command; in revert mode it restores protected paths to
+    their last committed content and prepends a deny notice to the tool
+    output, in warn mode it prepends the notice only. Active when
+    OPENSQUILLA_WORKSPACE_WRITE_DENY_EFFECT is warn or revert.
+    """
+
+    mode = write_policy.workspace_write_deny_effect_mode()
+    if mode == "off":
+        return output
+    ctx = current_tool_context.get()
+    if ctx is None or not ctx.workspace_dir:
+        return output
+    if not getattr(ctx, "workspace_write_deny_globs", None):
+        return output
+    workspace = Path(ctx.workspace_dir).expanduser().resolve()
+    after = snapshot_workspace_mutations(workspace)
+    before_state = _snapshot_git_state(before)
+    after_state = _snapshot_git_state(after)
+    if before_state is not GitRunState.OK or after_state is not GitRunState.OK:
+        return _workspace_write_protection_unavailable_warning(
+            tool_name=tool_name,
+            mode=mode,
+            state=(before_state if before_state is not GitRunState.OK else after_state),
+            output=output,
+        )
+    tracked_only = write_policy.workspace_write_deny_tracked_only()
+    violations: list[dict[str, str]] = []
+    for entry in diff_workspace_mutations(before, after):
+        status = entry["status"]
+        if status == "deleted":
+            # The path left git status entirely, i.e. it matches HEAD again
+            # (or an untracked file is gone) — nothing left to enforce.
+            continue
+        if tracked_only and status.startswith("??"):
+            continue
+        relative_path = entry["relative_path"]
+        match = write_policy.match_workspace_write_deny(
+            workspace / relative_path,
+            original_path=relative_path,
+            workspace=workspace,
+            ctx=ctx,
+        )
+        if match is None:
+            continue
+        if tracked_only and not _workspace_path_present_at_head(workspace, relative_path):
+            # Tracked-only scopes enforcement to the committed suite. A file
+            # the agent created has no HEAD version to protect, and staging it
+            # (`git add`) must not turn the creation into a violation: the
+            # index is not HEAD, and a revert here would delete the agent's
+            # own new file.
+            continue
+        violations.append({**entry, "pattern": match.pattern})
+    if not violations:
+        return output
+    reverted: list[str] = []
+    failures: list[str] = []
+    if mode == "revert":
+        for violation in violations:
+            relative_path = violation["relative_path"]
+            if _revert_workspace_path(workspace, relative_path, violation["status"]):
+                reverted.append(relative_path)
+            else:
+                failures.append(relative_path)
+    message = _effect_enforcement_message(
+        tool_name=tool_name,
+        mode=mode,
+        violations=violations,
+        failures=failures,
+        guidance=write_policy._deny_retry_guidance(ctx),
+    )
+    record: dict[str, Any] = {
+        "tool": tool_name,
+        "tool_name": tool_name,
+        "operation": "effect_enforcement",
+        "mode": mode,
+        "paths": violations,
+        "path_count": len(violations),
+        "reverted_paths": reverted,
+        "revert_failures": failures,
+    }
+    ctx.workspace_mutation_records.append(dict(record))
+    callback = getattr(ctx, "on_runtime_event", None)
+    if callback is not None:
+        event: dict[str, Any] = {
+            "feature": "workspace_write_deny",
+            "name": "effect_enforcement",
+            **record,
+            "injected_to_model": True,
+            "hint_text_sha256": mutation_ledger_text_hash(message),
+            "agent_id": getattr(ctx, "agent_id", None),
+            "session_key": getattr(ctx, "session_key", None),
+        }
+        try:
+            callback(event)
+        except Exception:
+            pass
+    return f"{message}\n\n{output}"
+
+
+def _workspace_write_protection_unavailable_warning(
+    *,
+    tool_name: str,
+    mode: str,
+    state: GitRunState,
+    output: str,
+) -> str:
+    """Inject at most one protection warning per logical turn."""
+
+    ctx = current_tool_context.get()
+    if ctx is None:
+        return output
+    turn_key = (
+        getattr(ctx, "execution_id", None)
+        or getattr(ctx, "task_id", None)
+        or f"session-epoch:{getattr(ctx, 'session_epoch', None)}"
+    )
+    already_warned = any(
+        record.get("operation") == "effect_enforcement_unavailable"
+        and record.get("turn_key") == turn_key
+        for record in getattr(ctx, "workspace_mutation_records", [])
+        if isinstance(record, dict)
+    )
+    if already_warned:
+        return output
+    record: dict[str, Any] = {
+        "tool": tool_name,
+        "tool_name": tool_name,
+        "operation": "effect_enforcement_unavailable",
+        "mode": mode,
+        "git_state": state.value,
+        "turn_key": turn_key,
+    }
+    ctx.workspace_mutation_records.append(record)
+    callback = getattr(ctx, "on_runtime_event", None)
+    if callback is not None:
+        # Runtime telemetry is best-effort and must not alter the tool result.
+        with contextlib.suppress(Exception):
+            callback(
+                {
+                    "feature": "workspace_write_deny",
+                    "name": "effect_enforcement_unavailable",
+                    **record,
+                    "agent_id": getattr(ctx, "agent_id", None),
+                    "session_key": getattr(ctx, "session_key", None),
+                    "injected_to_model": True,
+                }
+            )
+    message = (
+        "[workspace write protection unavailable] OpenSquilla could not verify "
+        f"write-protected workspace paths after {tool_name} because Git state is "
+        f"{state.value}."
+    )
+    if mode == "revert":
+        message += " Automatic restoration could not be guaranteed."
+    else:
+        message += " Review the command's workspace changes before finishing."
+    return f"{message}\n\n{output}"
+
+
+def _effect_enforcement_message(
+    *,
+    tool_name: str,
+    mode: str,
+    violations: list[dict[str, str]],
+    failures: list[str],
+    guidance: str,
+) -> str:
+    described = ", ".join(
+        f"{violation['relative_path']} (matches {violation['pattern']})"
+        for violation in violations
+    )
+    if mode != "revert":
+        return (
+            f"[workspace write deny] {tool_name} modified write-protected file(s): "
+            f"{described}. These changes violate the workspace write deny policy; "
+            f"revert them before finishing.{guidance}"
+        )
+    if failures:
+        revert_note = (
+            " The file(s) have been restored to their last committed content, "
+            f"except: {', '.join(failures)} (automatic restore failed; revert "
+            "those changes yourself)."
+        )
+    else:
+        revert_note = " The file(s) have been restored to their last committed content."
+    return (
+        f"[workspace write deny] {tool_name} modified write-protected file(s): "
+        f"{described}.{revert_note}{guidance} Output below that reports a "
+        "successful update to those file(s) is stale; do not rely on it."
+    )
+
+
+def _workspace_path_present_at_head(workspace: Path, relative_path: str) -> bool:
+    """Return True when the path has a committed version at HEAD.
+
+    Errors resolve to False: with no HEAD version to restore, enforcement
+    (and any revert) is skipped rather than risking deletion of a file the
+    agent created.
+    """
+
+    result = run_git(
+        ("ls-tree", "--name-only", "HEAD", "--", relative_path),
+        cwd=workspace,
+        timeout=10.0,
+    )
+    return result.ok and bool(result.stdout.strip())
+
+
+def _revert_workspace_path(workspace: Path, relative_path: str, status: str) -> bool:
+    target = workspace / relative_path
+    if status.startswith("??"):
+        try:
+            target.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+    completed = run_git(
+        ("checkout", "HEAD", "--", relative_path),
+        cwd=workspace,
+        timeout=10.0,
+    )
+    if completed.ok:
+        return True
+    # Staged-new paths (e.g. added via `git add`) have no HEAD version to
+    # restore; unstage and remove instead. Restricted to paths absent from
+    # HEAD so a failed checkout of a HEAD-tracked file is never destructive.
+    ls_tree = run_git(
+        ("ls-tree", "--name-only", "HEAD", "--", relative_path),
+        cwd=workspace,
+        timeout=10.0,
+    )
+    if not ls_tree.ok or ls_tree.stdout.strip():
+        return False
+    run_git(
+        ("rm", "--cached", "-f", "--", relative_path),
+        cwd=workspace,
+        timeout=10.0,
+    )
+    try:
+        target.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def classify_workspace_path(relative_path: str) -> str:
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = _normalize_relative_path(relative_path)
     if _path_is_inside_scratch(normalized):
         return "scratch"
     path = Path(normalized)
@@ -450,6 +798,26 @@ def workspace_write_progress_note() -> str:
     workspace_writes = len(getattr(ctx, "workspace_file_writes", []) or [])
     if workspace_writes not in _WORKSPACE_WRITE_PROGRESS_COUNTS and workspace_writes % 10 != 0:
         return ""
+    allowed_tools = getattr(ctx, "allowed_tools", None)
+    git_diff_visible = (
+        "git_diff" not in getattr(ctx, "denied_tools", set())
+        and (allowed_tools is None or "git_diff" in allowed_tools)
+    )
+    workspace_dir = getattr(ctx, "workspace_dir", None)
+    git_repository_available = bool(
+        git_diff_visible
+        and workspace_dir
+        and probe_git_repository(
+            workspace_dir,
+            run_mode=getattr(ctx, "run_mode", None),
+        )
+        is GitRunState.OK
+    )
+    if not git_repository_available:
+        return (
+            " Note: workspace changes are now present. Before final, run focused "
+            "verification for the changed behavior."
+        )
     return (
         " Note: workspace changes are now present. Before final, inspect git_diff "
         "and run focused verification for the changed behavior."
@@ -463,7 +831,7 @@ def workspace_write_note(path: Path) -> str:
     if relative_path is None:
         return ""
 
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = _normalize_relative_path(relative_path)
     notes: list[str] = []
     if _looks_generated_or_derived(path, normalized):
         notes.append(
@@ -492,7 +860,7 @@ def summarize_workspace_write_notes(paths: list[Path]) -> str:
         relative_path = _workspace_relative_path(path)
         if relative_path is None:
             continue
-        normalized = relative_path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_relative_path(relative_path)
         saw_generated = saw_generated or _looks_generated_or_derived(path, normalized)
         saw_docs = saw_docs or _matches_any(normalized, _DOCUMENTATION_PATH_PATTERNS)
         saw_tests = saw_tests or _looks_test_file(normalized)
@@ -525,7 +893,7 @@ def summarize_patch_hygiene_warning(paths: list[Path]) -> str:
         relative_path = _workspace_relative_path(path)
         if relative_path is None:
             continue
-        normalized = relative_path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_relative_path(relative_path)
         saw_generated = saw_generated or _looks_generated_or_derived(path, normalized)
         saw_docs = saw_docs or _matches_any(normalized, _DOCUMENTATION_PATH_PATTERNS)
         saw_tests = saw_tests or _looks_test_file(normalized)

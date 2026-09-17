@@ -8,7 +8,6 @@ from typing import Any
 from opensquilla.application.approval_queue import get_approval_queue
 from opensquilla.application.approval_rpc import (
     approval_extend_rpc_payload,
-    approval_forget_rpc_payload,
     approval_lookup_status_rpc_payload,
     approval_request_rpc_payload,
     approval_resolve_rpc_payload,
@@ -17,10 +16,14 @@ from opensquilla.application.approval_rpc import (
     approval_status_rpc_payload,
     approval_wait_decision_rpc_payload,
 )
+from opensquilla.gateway.adapters.approval_contract import register_approval_contract
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.escalation import (
     apply_sandbox_approval_choice,
     deny_matching_pending_sandbox_approvals,
+    discard_approval_run_context_authority,
     is_sandbox_approval_kind,
     remember_sandbox_approval_denial,
     validate_sandbox_approval_choice,
@@ -178,7 +181,6 @@ async def _handle_exec_approval_wait_decision(
     )
 
 
-@_d.method("exec.approval.status", scope="operator.approvals")
 async def _handle_exec_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or not str(params.get("id") or "").strip():
         raise ValueError("params.id is required")
@@ -189,24 +191,12 @@ async def _handle_exec_approval_status(params: dict | None, ctx: RpcContext) -> 
     )
 
 
-@_d.method("exec.approval.snapshot", scope="operator.approvals")
 async def _handle_exec_approval_snapshot(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Return a diagnostic snapshot for approval state."""
     queue = get_approval_queue()
     return approval_snapshot_rpc_payload(queue)
 
 
-@_d.method("exec.approval.forget", scope="operator.approvals")
-async def _handle_exec_approval_forget(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Compatibility no-op for removed cached intent approvals."""
-    if isinstance(params, dict):
-        target = params.get("target")
-    else:
-        target = None
-    return approval_forget_rpc_payload(target)
-
-
-@_d.method("exec.approval.resolve", scope="operator.approvals")
 async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -260,7 +250,11 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
     )
 
     if sandbox_approval and approved:
-        claim_token = queue.claim_resolution(params["id"])
+        claim_token = queue.claim_resolution(
+            params["id"],
+            resolution_metadata={"resolutionSource": "user_web"},
+        )
+        pending = queue.get(params["id"])
         try:
             queue.finalize_claimed_resolution(
                 params["id"],
@@ -274,10 +268,21 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         try:
             await apply_sandbox_approval_choice(
                 pending.params,
+                approval_id=params["id"],
                 choice=normalized_choice,
                 approved=True,
                 session_manager=ctx.session_manager,
                 config=ctx.config,
+            )
+        except ProjectWorkspaceStateError:
+            # This exact execution/session/workspace authority is gone.
+            # Reopening can never make the card actionable again.
+            discard_approval_run_context_authority(params["id"])
+            queue.expire_claimed_resolution(params["id"], claim_token)
+            return approval_status_rpc_payload(
+                queue,
+                params["id"],
+                queue.get_settings().mode,
             )
         except Exception:
             queue.reopen_resolved_approval(params["id"], expected_approved=True)
@@ -294,6 +299,7 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         approved,
         elevated_mode=None,
         allow_idempotent=not sandbox_approval,
+        resolution_metadata={"resolutionSource": "user_web"},
     )
     if sandbox_approval and not approved:
         remember_sandbox_approval_denial(pending.params, params["id"])
@@ -322,7 +328,6 @@ def _coerce_extend_seconds(raw: Any) -> float:
     return min(seconds, _EXTEND_MAX_SECONDS)
 
 
-@_d.method("exec.approval.extend", scope="operator.approvals")
 async def _handle_exec_approval_extend(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -331,7 +336,6 @@ async def _handle_exec_approval_extend(params: dict | None, ctx: RpcContext) -> 
     return approval_extend_rpc_payload(queue, params["id"], seconds)
 
 
-@_d.method("plugin.approval.extend", scope="operator.approvals")
 async def _handle_plugin_approval_extend(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -368,7 +372,6 @@ async def _handle_plugin_approval_wait_decision(
     )
 
 
-@_d.method("plugin.approval.status", scope="operator.approvals")
 async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or not str(params.get("id") or "").strip():
         raise ValueError("params.id is required")
@@ -379,7 +382,6 @@ async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -
     )
 
 
-@_d.method("plugin.approval.resolve", scope="operator.approvals")
 async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
@@ -399,3 +401,25 @@ async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) 
         if queue.get(approval_id).resolved:
             return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
         raise
+
+
+_EXEC_APPROVAL_CONTRACT_IMPLEMENTATIONS = {
+    "exec.approval.status": _handle_exec_approval_status,
+    "exec.approval.snapshot": _handle_exec_approval_snapshot,
+    "exec.approval.resolve": _handle_exec_approval_resolve,
+    "exec.approval.extend": _handle_exec_approval_extend,
+    "plugin.approval.status": _handle_plugin_approval_status,
+    "plugin.approval.resolve": _handle_plugin_approval_resolve,
+    "plugin.approval.extend": _handle_plugin_approval_extend,
+}
+
+_EXEC_APPROVAL_CONTRACT_HANDLERS = {
+    method: register_approval_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _EXEC_APPROVAL_CONTRACT_IMPLEMENTATIONS.items()
+}

@@ -1,0 +1,86 @@
+{
+  "format_version": 1,
+  "kind": "response",
+  "cases": [
+    {
+      "id": "response.unbound-workspace",
+      "coverage": "canonical-current-result",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-1",
+        "ok": true,
+        "payload": {
+          "session_key": "agent:main:webchat:default",
+          "session_id": "abc123",
+          "status": "running",
+          "agent_id": "main",
+          "model": null,
+          "workspaceId": null,
+          "projectWorkspaceDeferred": false,
+          "created_at": 1000,
+          "updated_at": 2000
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "response.bound-workspace",
+      "coverage": "workspace-binding-without-path-validation",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-2",
+        "ok": true,
+        "payload": {
+          "session_key": "agent:main:webchat:project",
+          "session_id": "project",
+          "status": "idle",
+          "agent_id": "main",
+          "model": "openai/gpt-5",
+          "workspaceId": "project-bound",
+          "projectWorkspaceDeferred": true,
+          "created_at": 1000,
+          "updated_at": 2000,
+          "futureExtension": {
+            "accepted": true
+          }
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "response.legacy-minimal",
+      "coverage": "new-client-old-gateway",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-legacy",
+        "ok": true,
+        "payload": {
+          "session_key": "agent:main:canonical",
+          "session_id": "canonical",
+          "model": "openai/test"
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "response.integral-float-number",
+      "coverage": "json-integer-cross-language-policy",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "resolve-integral-float",
+        "ok": true,
+        "payload": {
+          "session_key": "agent:main:canonical",
+          "session_id": "canonical",
+          "created_at": 1000.0,
+          "updated_at": 2000.0
+        },
+        "error": null
+      }
+    }
+  ]
+}

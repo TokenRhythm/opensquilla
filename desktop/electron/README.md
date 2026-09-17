@@ -1,9 +1,16 @@
 # OpenSquilla Electron Desktop Shell
 
-This package is the macOS desktop shell for the existing OpenSquilla Control UI.
-It does not rewrite the Vue frontend. The Electron main process configures a
-desktop credential, starts a local gateway, and loads the backend-served
-`/control/` app.
+This package is the macOS, Windows, and Linux desktop shell for the existing
+OpenSquilla Vue UI. It does not rewrite the frontend. Electron loads a local
+Desktop renderer first, then starts the Gateway as a background runtime and
+publishes a typed connection descriptor when it is ready. A Gateway failure
+disables runtime-backed features but does not take down the application window.
+
+The browser `/control/` entry remains available. Desktop packages keep one
+verified Vue artifact at `runtime/gateway/control-ui-dist`; Electron loads it
+locally and the bundled Gateway serves that same copy to browser clients. The
+artifact is removed from the frozen Python subtree after PyInstaller staging so
+the new startup model does not duplicate the UI or inflate the installer.
 
 ## Development Flow
 
@@ -19,10 +26,18 @@ npm ci
 npm run dev
 ```
 
-Use Node.js 22.12 or newer. The Vue build under
-`src/opensquilla/gateway/static/dist/` is generated and ignored by Git; local
-Desktop packaging verifies it against the current frontend source before
-PyInstaller runs.
+Use Node.js 22.12 or newer. Vite writes the Vue build under
+`opensquilla-webui/dist/`; `npm run build` then verifies and explicitly stages
+the same bytes under `src/opensquilla/gateway/static/dist/` for Python
+packaging. Both directories are generated and ignored by Git. Local Desktop
+packaging consumes the source-owned artifact and verifies it before PyInstaller
+runs.
+
+Desktop TypeScript uses Node 24 definitions to match Electron's embedded Node
+runtime. The Node.js version used to run build scripts is a separate requirement.
+Playwright stays on the 1.60 line while Electron 42 is supported: the hidden
+browser reload viewport check fails with Playwright 1.63 on Electron 42. Upgrade
+that pair only after the existing native viewport and rendering checks pass.
 
 On first run, the shell opens a setup window for provider, model, base URL, and
 API key. The key is encrypted with Electron `safeStorage` when available, and a
@@ -55,37 +70,49 @@ cd desktop/electron
 npm run dist:local
 ```
 
-This builds the Vue Control UI, bundles the gateway with PyInstaller, and emits
-desktop artifacts for the current platform under `dist/desktop-electron/`.
+This builds the shared Vue browser/Desktop artifact, bundles the gateway with
+PyInstaller, removes its staged duplicate UI copy, and emits desktop artifacts
+for the current platform under `dist/desktop-electron/`.
 
-For a faster rebuild after the runtime already exists:
+`npm run pack` (unpacked directory) and `npm run dist` (installer) both build
+the WebUI and Gateway before packaging. The `:local` names are compatibility aliases.
+For a faster Electron-only rebuild after a successful Gateway build:
 
 ```bash
 cd desktop/electron
-npm run build:web
-npm run dist
+npm run dist:prepared
 ```
+
+The internal `pack:prepared` / `dist:prepared` entries reject missing or stale
+Gateway build records and changed runtime files before electron-builder runs.
+Changes to Python sources, migrations, Router resources, the built WebUI, dependency
+locks, or the Gateway build recipe require a new full build. Final package verification
+also checks every migration ID/content and the Router manifest's SHA256 values.
+Release CI builds the Gateway once, verifies prepared outputs, then signs and packages
+them; final signature checks remain separate from resource checks.
 
 ## Windows Release Signing
 
-Windows release builds are currently unsigned. The release workflow builds the
-NSIS installer with electron-builder and uploads the unsigned `.exe`,
-`.blockmap`, and `latest.yml` artifacts together so updater metadata matches
-the exact installer bytes.
+The release workflow signs new Windows builds through DigiCert KeyLocker. It
+uses the protected `windows-code-signing` environment for manually
+dispatched test artifacts and `v*` release tags. Missing credentials, signing
+failures, and signature-policy mismatches fail the Windows build.
 
-Do not sign the `.exe` after `latest.yml` is emitted; that changes the
-installer bytes and invalidates the updater hash. If Windows code signing is
-enabled later, it must run inside the release build before updater metadata,
-blockmaps, and `SHA256SUMS` are finalized. See
+Signing runs inside electron-builder before updater metadata, blockmaps, and
+`SHA256SUMS` are finalized, so those files describe the signed installer bytes.
+The expected public certificate identity and timestamp endpoint are defined in
+`.github/signing/windows-signing-policy.json`; credentials remain GitHub
+environment secrets. See
 [`docs/code-signing-policy.md`](../../docs/code-signing-policy.md) for the
 current policy.
 
 ## Current Scope
 
-- Reuses `opensquilla-webui` and the Python gateway exactly as they run in the
-  browser.
+- Reuses `opensquilla-webui` for both the local Desktop entry and browser
+  `/control/` entry.
+- Loads the local renderer before waiting for Gateway `/readyz`.
 - Starts a bundled `runtime/gateway/opensquilla-gateway` in packaged builds.
-- Falls back to `uv run opensquilla gateway run --bind 127.0.0.1 --port <port>`
+- Falls back to `uv run opensquilla gateway run --listen 127.0.0.1 --port <port>`
   during development when no bundled runtime exists.
 - Uses `contextIsolation: true`, `nodeIntegration: false`, and a minimal preload
   bridge.

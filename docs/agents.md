@@ -75,6 +75,42 @@ opensquilla agents delete research --force
 Deleting an agent entry leaves workspace files and state untouched. Clean those
 up separately only when you are sure they are no longer needed.
 
+## Workspace Files and Default Upgrades
+
+New agent workspaces contain `AGENTS.md`, `SOUL.md`, `IDENTITY.md`,
+`USER.md`, `MEMORY.md`, and the `memory/` directory. `AGENTS.md` starts
+empty; add workspace operating rules or tool-use conventions when needed.
+An empty AGENTS file is valid and adds no prompt content.
+
+`BOOTSTRAP.md`, `HEARTBEAT.md`, and `TOOLS.md` are retired as core workspace
+files. They are no longer generated or automatically loaded, and the core
+`agents.files` RPCs no longer manage them. Old files and onboarding state stay
+on disk. Ordinary file tools can still access them when requested; old custom
+instructions may also ask the model to read them.
+
+On a standard Gateway or standalone CLI startup, the held profile writer lease
+allows a narrow upgrade of the two defaults replaced by this change:
+
+- An unchanged old AGENTS template becomes empty.
+- An unchanged old SOUL template routes tool notes to AGENTS instead of TOOLS.
+- Custom text is preserved. Matching tolerates only UTF-8 BOM and LF/CRLF
+  differences; it does not guess from headings or keywords.
+- Original bytes are retained under
+  `.opensquilla/template-backups/md-retirement-v1/` inside that workspace,
+  named with the filename and original SHA-256 digest.
+
+File-read RPCs and stateless runs never trigger this upgrade. Embedders without
+the profile lease skip it. Unsafe links, read-only files, conflicting backups,
+backup failures, or detected concurrent edits leave the source unchanged and
+produce a diagnostic. The last check and atomic replacement are not a
+cross-process content compare-and-swap against arbitrary external editors.
+Repeated startup does not re-upgrade a successfully updated file.
+
+To roll back, stop the service, revert to the previous software version, and
+restore the desired file from its backup. Reverting only the file to the exact
+old default while keeping the new version makes it eligible again on startup.
+No cron tasks are created, moved, or changed by this upgrade.
+
 ## Agents vs Sessions vs Skills
 
 | Concept | Use for |
@@ -93,4 +129,4 @@ Read next:
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

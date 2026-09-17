@@ -67,10 +67,6 @@ async def test_schedule_like_channel_text_reaches_normal_runtime() -> None:
             new=AsyncMock(return_value=(MagicMock(), False)),
         ),
         patch(
-            "opensquilla.gateway.channel_dispatch._should_skip_unmentioned",
-            new=MagicMock(return_value=False),
-        ),
-        patch(
             "opensquilla.gateway.channel_dispatch._transcript_watermark",
             new=AsyncMock(return_value=0),
         ),

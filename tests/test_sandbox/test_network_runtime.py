@@ -9,13 +9,18 @@ import pytest
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.sandbox import integration as integration_mod
 from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.escalation import (
+    build_network_approval_params,
+    request_sandbox_approval,
+)
+from opensquilla.sandbox.network_guard import NetworkDecision
 from opensquilla.sandbox.network_proxy import SandboxProxyServer
 from opensquilla.sandbox.network_runtime import (
     NetworkApprovalService,
     NetworkPolicyRequest,
     NetworkProtocol,
 )
-from opensquilla.sandbox.run_context import RunContext
+from opensquilla.sandbox.run_context import DomainGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.sandbox.types import (
     NetworkMode,
@@ -61,7 +66,44 @@ async def _wait_for_pending_network_approval() -> dict:
     raise AssertionError("network approval was not queued")
 
 
-async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
+@pytest.mark.asyncio
+async def test_default_open_network_request_completes_without_approval(
+    tmp_path: Path,
+) -> None:
+    reset_approval_queue()
+    request = SandboxRequest(
+        argv=("exec_command", "curl", "https://cancelled.example"),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=_proxy_policy(),
+        session_id="cancelled-network",
+        run_mode="standard",
+    )
+    context = RunContext(
+        run_mode=RunMode.SAFE,
+        workspace=str(tmp_path),
+    )
+    service = NetworkApprovalService(
+        context=context,
+        request=request,
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    decision = await service.decide(
+        NetworkPolicyRequest(
+            protocol=NetworkProtocol.HTTPS_CONNECT,
+            host="cancelled.example",
+            port=443,
+            method="CONNECT",
+        )
+    )
+
+    assert decision.status == "allow"
+    assert decision.reason == "public_default"
+    assert get_approval_queue().list_pending("exec") == []
+
+
+async def test_proxy_runtime_default_open_forwards_without_approval(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -107,8 +149,16 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         run_mode="standard",
     )
     runtime = SimpleNamespace(workspace=tmp_path)
+    tool_context = ToolContext(
+        workspace_dir=str(tmp_path),
+        session_key="s1",
+        sandbox_run_context=RunContext(
+            run_mode=RunMode.SAFE,
+            workspace=str(tmp_path),
+        ),
+    )
     service = NetworkApprovalService(
-        context=RunContext(run_mode=RunMode.STANDARD),
+        context=tool_context.sandbox_run_context,
         request=request,
         runtime=runtime,
         approval_timeout_seconds=2.0,
@@ -117,6 +167,7 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         policy_decider=service,
         resolver=lambda host, port: ("93.184.216.34", upstream_port),
     )
+    context_token = current_tool_context.set(tool_context)
     await server.start()
     try:
         response_task = asyncio.create_task(
@@ -127,16 +178,9 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
                 b"\r\n",
             )
         )
-        pending = await _wait_for_pending_network_approval()
-        params = pending["params"]
-        assert params["approvalKind"] == "sandbox_network"
-        assert params["host"] == "unknown.test"
-        assert params["sessionKey"] == "s1"
-        assert params["fingerprint"]
-
-        get_approval_queue().resolve(str(pending["id"]), True)
         response = await response_task
     finally:
+        current_tool_context.reset(context_token)
         await server.stop()
         upstream.close()
         await upstream.wait_closed()
@@ -149,6 +193,7 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         b"Connection: close\r\n"
         b"\r\n"
     ]
+    assert get_approval_queue().list_pending("exec") == []
 
 
 async def test_trusted_runtime_network_decider_allows_without_approval(
@@ -164,7 +209,7 @@ async def test_trusted_runtime_network_decider_allows_without_approval(
         run_mode="trusted",
     )
     service = NetworkApprovalService(
-        context=RunContext(run_mode=RunMode.TRUSTED),
+        context=RunContext(run_mode=RunMode.SAFE),
         request=request,
         runtime=SimpleNamespace(workspace=tmp_path),
         approval_timeout_seconds=0.01,
@@ -182,13 +227,13 @@ async def test_trusted_runtime_network_decider_allows_without_approval(
     )
 
     assert decision.status == "allow"
-    assert decision.reason == "auto_trusted"
+    assert decision.reason == "public_default"
     assert get_approval_queue().list_pending("exec") == []
 
 
-async def test_network_approval_missing_payload_blocks_request(tmp_path: Path) -> None:
+async def test_default_open_does_not_request_approval_payload(tmp_path: Path) -> None:
     request = SandboxRequest(
-        argv=("http_request", "GET", "https://unknown.test/path"),
+        argv=("http_request", "GET", "https://standard-human-only.invalid/path"),
         cwd=tmp_path,
         action_kind="network.http",
         policy=_proxy_policy(),
@@ -196,7 +241,7 @@ async def test_network_approval_missing_payload_blocks_request(tmp_path: Path) -
         run_mode="standard",
     )
     service = NetworkApprovalService(
-        context=RunContext(run_mode=RunMode.STANDARD),
+        context=RunContext(run_mode=RunMode.SAFE),
         request=request,
         runtime=SimpleNamespace(workspace=tmp_path),
         approval_requester=lambda *_args, **_kwargs: None,
@@ -211,8 +256,86 @@ async def test_network_approval_missing_payload_blocks_request(tmp_path: Path) -
         )
     )
 
-    assert decision.status == "block"
-    assert decision.reason == "approval_missing"
+    assert decision.status == "allow"
+    assert decision.reason == "public_default"
+
+
+@pytest.mark.asyncio
+async def test_safe_default_open_does_not_create_human_review(
+    tmp_path: Path,
+) -> None:
+    reset_approval_queue()
+    seen_params: dict[str, object] = {}
+    auto_review_called = False
+    runtime = SimpleNamespace(
+        workspace=tmp_path,
+        settings=SandboxSettings(approvals_reviewer="auto_review"),
+    )
+    request = SandboxRequest(
+        argv=("http_request", "GET", "https://standard-human-only.invalid/path"),
+        cwd=tmp_path,
+        action_kind="network.http",
+        policy=_proxy_policy(),
+        session_id="network-standard-human",
+        run_mode="standard",
+    )
+
+    def _request(params: dict[str, object], **kwargs: object) -> dict[str, object]:
+        from opensquilla.sandbox.escalation import request_sandbox_approval
+
+        seen_params.update(params)
+        payload = request_sandbox_approval(params, **kwargs)
+        ctx.sandbox_run_context = RunContext(
+            run_mode=RunMode.SAFE,
+            workspace=str(tmp_path),
+            domains=(
+                DomainGrant(
+                    domain="standard-human-only.invalid",
+                    scope="once",
+                    source="temporary",
+                ),
+            ),
+        )
+        get_approval_queue().resolve(str(payload["approval_id"]), True)
+        return payload
+
+    async def _auto_review(_payload: dict[str, object]) -> None:
+        nonlocal auto_review_called
+        auto_review_called = True
+
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.CLI,
+        workspace_dir=str(tmp_path),
+        session_key="network-standard-human",
+        run_mode="standard",
+        sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
+        on_sandbox_auto_review=_auto_review,
+    )
+    token = current_tool_context.set(ctx)
+    try:
+        decision = await NetworkApprovalService(
+            context=ctx.sandbox_run_context,
+            request=request,
+            runtime=runtime,
+            approval_timeout_seconds=0.1,
+            approval_requester=_request,
+        ).decide(
+            NetworkPolicyRequest(
+                protocol=NetworkProtocol.HTTPS_CONNECT,
+                host="standard-human-only.invalid",
+                port=443,
+                method="CONNECT",
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+        reset_approval_queue()
+
+    assert decision.status == "allow"
+    assert decision.reason == "public_default"
+    assert seen_params == {}
+    assert auto_review_called is False
 
 
 @pytest.mark.asyncio
@@ -231,7 +354,7 @@ async def test_auto_review_network_request_is_hidden_and_canonical(
         action_kind="network.http",
         policy=_proxy_policy(),
         session_id="network-auto",
-        run_mode="standard",
+        run_mode="trusted",
     )
 
     async def _review(payload: dict[str, object]) -> None:
@@ -251,31 +374,38 @@ async def test_auto_review_network_request_is_hidden_and_canonical(
         caller_kind=CallerKind.CLI,
         workspace_dir=str(tmp_path),
         session_key="network-auto",
-        run_mode="standard",
-        sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+        run_mode="trusted",
+        sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
     )
     setattr(ctx, "on_sandbox_auto_review", _review)
+    service = NetworkApprovalService(
+        context=ctx.sandbox_run_context,
+        request=request,
+        runtime=runtime,
+        approval_timeout_seconds=0.1,
+    )
+    params = build_network_approval_params(
+        NetworkDecision(
+            status="ask",
+            normalized_host="unknown.test",
+            reason="unknown_domain",
+            source=None,
+        ),
+        session_key="network-auto",
+        workspace=str(tmp_path),
+        fingerprint=service.fingerprint,
+        reviewer="auto_review",
+    )
+    assert params is not None
+    payload = request_sandbox_approval(params, message="Review the exact network request.")
     token = current_tool_context.set(ctx)
     try:
-        decision = await NetworkApprovalService(
-            context=ctx.sandbox_run_context,
-            request=request,
-            runtime=runtime,
-            approval_timeout_seconds=0.1,
-        ).decide(
-            NetworkPolicyRequest(
-                protocol=NetworkProtocol.HTTPS_CONNECT,
-                host="unknown.test",
-                port=443,
-                method="CONNECT",
-            )
-        )
+        await service._run_auto_review(payload, str(payload["approval_id"]))
     finally:
         current_tool_context.reset(token)
 
-    assert decision.status == "allow"
-    assert decision.reason == "approval"
     assert len(seen) == 1
+    assert get_approval_queue().get(str(payload["approval_id"])).approved is True
     assert get_approval_queue().list_pending("exec") == []
 
 
@@ -294,39 +424,104 @@ async def test_auto_review_network_without_reviewer_callback_fails_closed(
         action_kind="network.http",
         policy=_proxy_policy(),
         session_id="network-no-reviewer",
-        run_mode="standard",
+        run_mode="trusted",
     )
-    requested_ids: list[str] = []
-
-    def _request(params: dict[str, object], **kwargs: object) -> dict[str, object]:
-        from opensquilla.sandbox.escalation import request_sandbox_approval
-
-        payload = request_sandbox_approval(params, **kwargs)
-        requested_ids.append(str(payload["approval_id"]))
-        return payload
-
-    decision = await NetworkApprovalService(
-        context=RunContext(run_mode=RunMode.STANDARD),
+    service = NetworkApprovalService(
+        context=RunContext(run_mode=RunMode.SAFE),
         request=request,
         runtime=runtime,
         approval_timeout_seconds=0.1,
-        approval_requester=_request,
-    ).decide(
-        NetworkPolicyRequest(
-            protocol=NetworkProtocol.HTTPS_CONNECT,
-            host="unknown.test",
-            port=443,
-            method="CONNECT",
-        )
     )
+    params = build_network_approval_params(
+        NetworkDecision(
+            status="ask",
+            normalized_host="unknown.test",
+            reason="unknown_domain",
+            source=None,
+        ),
+        session_key="network-no-reviewer",
+        workspace=str(tmp_path),
+        fingerprint=service.fingerprint,
+        reviewer="auto_review",
+    )
+    assert params is not None
+    payload = request_sandbox_approval(params, message="Review the exact network request.")
 
-    assert decision.status == "block"
-    assert "failed closed" in decision.reason
-    assert len(requested_ids) == 1
-    entry = get_approval_queue().get(requested_ids[0])
+    await service._run_auto_review(payload, str(payload["approval_id"]))
+
+    entry = get_approval_queue().get(str(payload["approval_id"]))
     assert entry.params["humanActionable"] is False
     assert entry.resolved is True
     assert entry.approved is False
+    assert "failed closed" in str(entry.params["reviewRationale"])
+
+
+@pytest.mark.asyncio
+async def test_auto_review_network_converted_to_human_stays_pending(
+    tmp_path: Path,
+) -> None:
+    reset_approval_queue()
+    runtime = SimpleNamespace(
+        workspace=tmp_path,
+        settings=SandboxSettings(approvals_reviewer="auto_review"),
+    )
+    request = SandboxRequest(
+        argv=("http_request", "GET", "https://legacy.test/path"),
+        cwd=tmp_path,
+        action_kind="network.http",
+        policy=_proxy_policy(),
+        session_id="network-legacy",
+        run_mode="standard",
+    )
+
+    async def _convert_to_human(payload: dict[str, object]) -> None:
+        queue = get_approval_queue()
+        approval_id = str(payload["approval_id"])
+        entry = queue.get(approval_id)
+        params = dict(entry.params)
+        params.update({"reviewer": "user", "humanActionable": True})
+        queue.update_params(approval_id, params)
+
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.CLI,
+        workspace_dir=str(tmp_path),
+        session_key="network-legacy",
+        run_mode="standard",
+        sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
+        on_sandbox_auto_review=_convert_to_human,
+    )
+    service = NetworkApprovalService(
+        context=ctx.sandbox_run_context,
+        request=request,
+        runtime=runtime,
+        approval_timeout_seconds=0.01,
+    )
+    params = build_network_approval_params(
+        NetworkDecision(
+            status="ask",
+            normalized_host="legacy.test",
+            reason="unknown_domain",
+            source=None,
+        ),
+        session_key="network-legacy",
+        workspace=str(tmp_path),
+        fingerprint=service.fingerprint,
+        reviewer="auto_review",
+    )
+    assert params is not None
+    payload = request_sandbox_approval(params, message="Review the exact network request.")
+    token = current_tool_context.set(ctx)
+    try:
+        await service._run_auto_review(payload, str(payload["approval_id"]))
+        entry = get_approval_queue().get(str(payload["approval_id"]))
+    finally:
+        current_tool_context.reset(token)
+        reset_approval_queue()
+
+    assert entry.resolved is False
+    assert entry.params["reviewer"] == "user"
+    assert entry.params["humanActionable"] is True
 
 
 async def test_subprocess_preflight_leaves_explicit_url_approval_to_proxy_runtime(
@@ -353,7 +548,7 @@ async def test_subprocess_preflight_leaves_explicit_url_approval_to_proxy_runtim
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )

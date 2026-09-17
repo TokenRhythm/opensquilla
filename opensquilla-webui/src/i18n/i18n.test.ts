@@ -13,6 +13,33 @@ import i18n, {
   isSupportedLocale,
 } from '@/i18n'
 import { useAppStore } from '@/stores/app'
+import { useToasts } from '@/composables/useToasts'
+import type { AppSettings, SettingChange, SettingsMutation } from '@/modules/appSettings'
+
+function bindAppSettings(
+  store: ReturnType<typeof useAppStore>,
+  patchSafe = vi.fn(async (_changes: readonly SettingChange[]) => ({} as SettingsMutation)),
+  read = vi.fn(async (_path: string) => 'en'),
+) {
+  store.bindAppSettings({ patchSafe, read } as unknown as AppSettings)
+  return patchSafe
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((accept, fail) => {
+    resolve = accept
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
+function desktopLocale(code: string) {
+  ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = {
+    getOsLocale: async () => code,
+  }
+}
 
 function flatten(obj: Record<string, unknown>, prefix = '', out: Record<string, unknown> = {}) {
   for (const [k, v] of Object.entries(obj)) {
@@ -110,8 +137,13 @@ describe('appStore locale state', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     localStorage.clear()
+    useToasts().toasts.value = []
     i18n.global.locale.value = 'en'
     document.documentElement.removeAttribute('lang')
+  })
+
+  afterEach(() => {
+    ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = undefined
   })
 
   it('setLocale loads the chunk, persists, and applies all side effects', async () => {
@@ -126,6 +158,73 @@ describe('appStore locale state', () => {
     expect(i18n.global.t('nav.sessions')).toBe('会话')
   })
 
+  it('syncs an explicit language selection to the Gateway channel-notice locale', async () => {
+    const store = useAppStore()
+    const patchSafe = bindAppSettings(store)
+
+    await store.setLocale('zh-Hans')
+
+    expect(patchSafe).toHaveBeenCalledWith([
+      { path: 'control_ui.default_locale', value: 'zh-Hans' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+  })
+
+  it('keeps a disconnected explicit selection and syncs it after reconnect', async () => {
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBe('zh-Hans')
+    const toasts = useToasts().toasts.value
+    expect(toasts[toasts.length - 1]).toMatchObject({ tone: 'warn' })
+
+    const patchSafe = bindAppSettings(store)
+    await store.syncLocaleToGateway()
+
+    expect(patchSafe).toHaveBeenCalledWith([
+      { path: 'control_ui.default_locale', value: 'zh-Hans' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('retries a pending locale sync after the domain adapter becomes available', async () => {
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+
+    const patchSafe = bindAppSettings(store)
+    await store.syncLocaleToGateway({ warnOnUnavailable: false })
+
+    expect(patchSafe).toHaveBeenCalledWith([
+      { path: 'control_ui.default_locale', value: 'zh-Hans' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('retains a failed locale sync without rolling back the local interface', async () => {
+    const store = useAppStore()
+    const patchSafe = vi.fn(async (_changes: readonly SettingChange[]) => {
+      throw new Error('disk full')
+    })
+    bindAppSettings(store, patchSafe)
+
+    await store.setLocale('zh-Hans')
+
+    expect(store.locale).toBe('zh-Hans')
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    const toasts = useToasts().toasts.value
+    expect(toasts[toasts.length - 1]).toMatchObject({ tone: 'warn' })
+
+    patchSafe.mockResolvedValueOnce({} as never)
+    await store.syncLocaleToGateway()
+
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
   it('setLocale ignores unsupported codes (no throw, stays en)', async () => {
     const store = useAppStore()
     await store.setLocale('ko' as never)
@@ -138,6 +237,224 @@ describe('appStore locale state', () => {
     await store.initLocale()
     expect(store.locale).toBe('zh-Hans')
     expect(document.documentElement.getAttribute('lang')).toBe('zh-Hans')
+  })
+
+  it('initLocale never writes the Gateway locale from browser-local state', async () => {
+    localStorage.setItem('opensquilla-locale', 'zh-Hans')
+    const store = useAppStore()
+    const patchSafe = bindAppSettings(store)
+
+    await store.initLocale()
+
+    expect(store.locale).toBe('zh-Hans')
+    expect(patchSafe).not.toHaveBeenCalled()
+  })
+
+  it('syncs the Desktop client locale to the Gateway on startup', async () => {
+    ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = {
+      getOsLocale: async () => 'zh-CN',
+    }
+    const store = useAppStore()
+    const patchSafe = bindAppSettings(store)
+
+    await store.initLocale()
+
+    expect(store.locale).toBe('zh-Hans')
+    await vi.waitFor(() => {
+      expect(patchSafe).toHaveBeenCalledWith([
+        { path: 'control_ui.default_locale', value: 'zh-Hans' },
+      ])
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('keeps the profile untouched when the Desktop startup locale already matches', async () => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+
+    await store.initLocale()
+    await store.syncLocaleToGateway()
+
+    expect(read).toHaveBeenCalledWith('control_ui.default_locale')
+    expect(patchSafe).not.toHaveBeenCalled()
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+  })
+
+  it('retains an automatic comparison until the Gateway adapter becomes available', async () => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    await store.initLocale()
+    expect(store.pendingChannelNoticeLocale).toBe('en')
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.syncLocaleToGateway()
+
+    expect(read).toHaveBeenCalledOnce()
+    expect(patchSafe).not.toHaveBeenCalled()
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('retries a failed automatic read before synchronizing a different locale', async () => {
+    desktopLocale('zh-CN')
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+      .mockRejectedValueOnce(new Error('disconnected'))
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    expect(patchSafe).not.toHaveBeenCalled()
+
+    await store.syncLocaleToGateway()
+
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'zh-Hans' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('persists an explicit selection even when its effective value already matches', async () => {
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+
+    await store.setLocale('en')
+
+    expect(read).not.toHaveBeenCalled()
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'en' },
+    ])
+  })
+
+  it('waits for reconnect after a failed automatic patch and compares again', async () => {
+    desktopLocale('zh-CN')
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const pendingPatch = deferred<SettingsMutation>()
+    const patchSafe = vi.fn((_changes: readonly SettingChange[]) => pendingPatch.promise)
+    bindAppSettings(store, patchSafe, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(patchSafe).toHaveBeenCalledOnce())
+    const initialSync = store.syncLocaleToGateway({ warnOnUnavailable: false })
+    pendingPatch.reject(new Error('disconnected after write'))
+    await initialSync
+
+    expect(read).toHaveBeenCalledOnce()
+    expect(patchSafe).toHaveBeenCalledOnce()
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    read.mockResolvedValue('zh-Hans')
+    await store.syncLocaleToGateway()
+
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(patchSafe).toHaveBeenCalledOnce()
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('does not replace an explicit selection when startup locale resolution finishes later', async () => {
+    const osLocale = deferred<string>()
+    ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = {
+      getOsLocale: () => osLocale.promise,
+    }
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+    const startup = store.initLocale()
+    await store.setLocale('ja')
+    osLocale.resolve('en-US')
+    await startup
+
+    expect(store.locale).toBe('ja')
+    expect(read).not.toHaveBeenCalled()
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'ja' },
+    ])
+    expect(localStorage.getItem('opensquilla-locale')).toBe('ja')
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it.each(['matching', 'failed'])('preserves same-value explicit intent during a %s automatic read', async (outcome) => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const pendingRead = deferred<string>()
+    const read = vi.fn((_path: string) => pendingRead.promise)
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+
+    const selection = store.setLocale('en')
+    await vi.waitFor(() => expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBe('en'))
+    if (outcome === 'matching') pendingRead.resolve('en')
+    else pendingRead.reject(new Error('disconnected'))
+    await selection
+
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'en' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+  })
+
+  it('keeps the latest explicit choice while an automatic read is pending', async () => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const pendingRead = deferred<string>()
+    const read = vi.fn((_path: string) => pendingRead.promise)
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+
+    const first = store.setLocale('zh-Hans')
+    const latest = store.setLocale('ja')
+    await vi.waitFor(() => expect(store.locale).toBe('ja'))
+    pendingRead.resolve('en')
+    await Promise.all([first, latest])
+
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'ja' },
+    ])
+    expect(localStorage.getItem('opensquilla-locale')).toBe('ja')
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('does not strand an explicit selection queued as an automatic read completes', async () => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const pendingRead = deferred<string>()
+    const read = vi.fn((_path: string) => pendingRead.promise)
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+
+    pendingRead.resolve('en')
+    await store.setLocale('en')
+
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'en' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('keeps a durable explicit retry when Desktop startup resolves another locale', async () => {
+    localStorage.setItem('opensquilla-locale-sync-pending', 'ja')
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+
+    await store.initLocale()
+    await store.syncLocaleToGateway()
+
+    expect(read).not.toHaveBeenCalled()
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'ja' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
   })
 })
 
@@ -159,13 +476,80 @@ describe('catalog parity', () => {
     }
   })
 
+  it('warns that removing a goal does not recall current-task work', () => {
+    expect(en.chat.goal.removeConfirmBody).toContain('use Stop')
+    expect(zhHans.chat.goal.removeConfirmBody).toContain('请使用“停止”')
+  })
+
+  it('explains the Ensemble image limit with actionable routing choices', () => {
+    const locales = [
+      { messages: en, imagePattern: /image input/i, unsupportedImagePattern: /image input/i },
+      { messages: zhHans, imagePattern: /图片输入/, unsupportedImagePattern: /图片输入/ },
+      { messages: de, imagePattern: /Bildeingaben/i, unsupportedImagePattern: /Bilder/i },
+      { messages: es, imagePattern: /im[aá]gen/i, unsupportedImagePattern: /imágenes/i },
+      { messages: fr, imagePattern: /images en entrée/i, unsupportedImagePattern: /images/i },
+      { messages: ja, imagePattern: /画像入力/, unsupportedImagePattern: /画像/ },
+    ]
+
+    for (const { messages, imagePattern, unsupportedImagePattern } of locales) {
+      const composer = messages.chat.composer
+      expect(composer.modelRoutingEnsembleDesc).toMatch(imagePattern)
+      expect(composer.ensembleImageUnsupported).toMatch(imagePattern)
+      expect(composer.imageInputUnsupported).toMatch(unsupportedImagePattern)
+      expect(composer.ensembleImageUnsupported).toContain(composer.modelRouting)
+      expect(composer.ensembleImageUnsupported).toContain(composer.modelRoutingSquillaRouter)
+      expect(composer.ensembleImageUnsupported).toContain(composer.modelRoutingOff)
+    }
+  })
+
   it('no zh-Hans value is left as the English source', () => {
     const enFlat = flatten(en as Record<string, unknown>)
     const zhFlat = flatten(zhHans as Record<string, unknown>)
+    const intentionalEnglishTerms = new Set(['chat.routerFx.ensembleTokens'])
     const leaked = Object.keys(enFlat).filter(
-      (k) => typeof zhFlat[k] === 'string' && zhFlat[k] === enFlat[k] && /[A-Za-z]/.test(zhFlat[k] as string),
+      (k) =>
+        typeof zhFlat[k] === 'string'
+        && zhFlat[k] === enFlat[k]
+        && /[A-Za-z]/.test(zhFlat[k] as string)
+        && !intentionalEnglishTerms.has(k),
     )
     expect(leaked).toEqual([])
+  })
+
+  it('uses model fusion consistently in zh-Hans ensemble copy', () => {
+    const zhFlat = flatten(zhHans as Record<string, unknown>)
+    const ensemblePrefixes = [
+      'setup.modelStrategy.',
+      'setup.router.',
+      'setup.ensemble.',
+      'chat.routerFx.',
+      'chat.msgMeta.',
+      'chat.routeFeedback.',
+    ]
+    const ensembleKeys = new Set([
+      'setup.provider.activateEnsembleOnPreserved',
+      'setup.provider.routingDesc',
+      'setup.toast.ensembleSaved',
+      'chat.aiModelEnsembleRouter',
+      'chat.composer.modelRoutingEnsemble',
+      'chat.stream.synthesizingCandidates',
+    ])
+    const deprecated = Object.entries(zhFlat).filter(([key, value]) =>
+      typeof value === 'string'
+      && value.includes('聚合')
+      && (ensembleKeys.has(key) || ensemblePrefixes.some(prefix => key.startsWith(prefix))),
+    )
+
+    expect(deprecated).toEqual([])
+    expect({
+      setup: zhHans.setup.router.summaryEnsemble,
+      composer: zhHans.chat.composer.modelRoutingEnsemble,
+      runtime: zhHans.chat.routerFx.ensembleSelecting,
+    }).toEqual({
+      setup: 'AI 智能融合路由',
+      composer: 'AI 智能融合路由',
+      runtime: 'AI 智能融合路由 · 正在选择候选',
+    })
   })
 
   it('ships the approved Model Service labels in every locale', () => {
@@ -232,7 +616,6 @@ describe('catalog parity', () => {
     expect(en.setup.provider.recommendation).toEqual({
       title: 'Recommended: TokenRhythm',
       value: 'TokenRhythm API calls are free for a limited time.',
-      registration: 'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
       cta: 'Register and get an API key',
       externalLabel: 'Register and get an API key — TokenRhythm (opens in a new tab)',
       stepsLabel: 'How to connect TokenRhythm',
@@ -245,7 +628,6 @@ describe('catalog parity', () => {
     expect(zhHans.setup.provider.recommendation).toEqual({
       title: '推荐使用 TokenRhythm',
       value: 'TokenRhythm API 调用限时免费。',
-      registration: '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
       cta: '注册并获取 API Key',
       externalLabel: '注册并获取 API Key — TokenRhythm（在新标签页中打开）',
       stepsLabel: '如何接入 TokenRhythm',
@@ -259,10 +641,6 @@ describe('catalog parity', () => {
     for (const messages of [en, zhHans, ja, fr, de, es]) {
       const copy = messages.setup.provider.recommendation
       expect(copy.title).toContain('TokenRhythm')
-      expect(copy.registration).toContain('DeepSeek')
-      expect(copy.registration).toContain('GLM')
-      expect(copy.registration).toContain('MiniMax')
-      expect(copy.registration).toContain('Kimi')
       expect(copy.cta).toBeTruthy()
       expect(copy.externalLabel).toBeTruthy()
       expect(copy.externalLabel).toContain(copy.cta)
@@ -273,5 +651,18 @@ describe('catalog parity', () => {
       expect(copy.stepSelectAndPaste).toBeTruthy()
       expect(copy.stepReplaceAndPaste).toBeTruthy()
     }
+  })
+
+  it('ships English and Simplified Chinese image-onboarding copy', () => {
+    expect(en.setup.provider.imageGenerationOptInLabel)
+      .toBe('Also enable image generation (recommended)')
+    expect(zhHans.setup.provider.imageGenerationOptInLabel)
+      .toBe('同时启用图像生成（推荐）')
+    expect(en.setup.capabilities.imageRecommendationUse).toBe('Use {provider}')
+    expect(zhHans.setup.capabilities.imageRecommendationUse).toBe('使用 {provider}')
+    expect(en.setup.capabilities.imageRecommendationRegisterExternal)
+      .toContain('opens in a new tab')
+    expect(zhHans.setup.capabilities.imageRecommendationRegisterExternal)
+      .toContain('在新标签页中打开')
   })
 })

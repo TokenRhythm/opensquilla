@@ -16,6 +16,10 @@ async function openControl(page: Page, path = '') {
 }
 
 test.describe('Sidebar', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  })
+
   test('desktop separator resizes, persists, and collapses only on pointer release', async ({ page }) => {
     await page.addInitScript(() => {
       if (sessionStorage.getItem('sidebar-resize-e2e-seeded')) return
@@ -225,7 +229,7 @@ test.describe('Sidebar', () => {
       )
     })).toBeLessThanOrEqual(0.00001)
 
-    await openControl(page, 'settings/appearance')
+    await openControl(page, 'settings/interface')
     const wide = page.getByTestId('settings-sidebar-width-wide')
     await wide.locator('..').click()
     await page.getByRole('dialog').getByRole('button', { name: 'Close' }).focus()
@@ -238,7 +242,7 @@ test.describe('Sidebar', () => {
   test('Appearance provides a click-only alternative for preset, custom width, and collapse', async ({ page }) => {
     await page.addInitScript(() => localStorage.removeItem('opensquilla.sidebar.width.v1'))
     await page.setViewportSize({ width: 1440, height: 900 })
-    await openControl(page, 'settings/appearance')
+    await openControl(page, 'settings/interface')
 
     const sidebar = page.locator('.sidebar')
     const sidebarWidth = async () => Math.round((await sidebar.boundingBox())?.width || 0)
@@ -460,10 +464,27 @@ test.describe('Sidebar', () => {
   })
 
   test('footer pins Settings; connection state shows in the topbar', async ({ page }) => {
-    await openControl(page)
+    await page.goto(CONTROL_URL)
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+    await page.waitForTimeout(800)
 
     const foot = page.locator('.sidebar-foot')
     await expect(foot.getByText('Settings', { exact: true })).toBeVisible()
+    // Empty profiles omit SidebarConversations entirely. Simulate that state
+    // after the shared fixture settles and verify the footer owns its bottom
+    // anchor instead of relying on the optional Recents region's flex growth.
+    await page.evaluate(() => document.querySelector('.sidebar-history')?.remove())
+    const footerGeometry = await page.evaluate(() => {
+      const sidebarElement = document.querySelector<HTMLElement>('.sidebar')!
+      const sidebar = sidebarElement.getBoundingClientRect()
+      const footer = document.querySelector('.sidebar-foot')!.getBoundingClientRect()
+      return {
+        bottomGap: sidebar.bottom - footer.bottom,
+        paddingBottom: Number.parseFloat(getComputedStyle(sidebarElement).paddingBottom),
+      }
+    })
+    expect(Math.abs(footerGeometry.bottomGap - footerGeometry.paddingBottom)).toBeLessThanOrEqual(1)
     // Connection state is shown once, in the global topbar pill — not duplicated
     // in the sidebar footer.
     await expect(foot.locator('.sidebar-conn')).toHaveCount(0)

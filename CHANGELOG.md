@@ -6,6 +6,354 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Browser extensions can now reach state-changing HTTP and WebSocket endpoints
+  through a loopback request authority when their exact custom-scheme origin
+  (for example `chrome-extension://<id>`) is listed in `cors.allowed_origins`.
+  Non-loopback request authorities remain rejected by those guards, `"*"` is
+  never accepted, and existing CORS response-header behavior is unchanged.
+
+### Changed
+
+- Retired four experiment-only diagnostic outputs: runtime-recovery events,
+  final-diff observations, salvage events and focused-verification classification.
+  These events are no longer produced even when runtime event output is configured;
+  final-diff `log` remains accepted but no longer observes. Actual recovery,
+  warnings, salvage, observer events and independent turn-call logs remain.
+  An unused failure-summary cache is removed; public settings/defaults are unchanged.
+  Historical experiment-delivery details are preserved in Git history.
+- Retired the opt-in patch evidence ledger collector and JSON export. Legacy
+  path configuration remains accepted and excludes old diagnostic files from
+  final-diff checks, but no longer creates or overwrites a ledger. Recovery
+  decisions, source-diff salvage and model-visible defaults are unchanged.
+- Retired optional runtime experiments: strict/variant finalize challenges,
+  submit review, patch-evidence prompts, tool-description overrides, tool-loop
+  observation, runtime capsules, text-only tool nudges, and independent deadline
+  thinking cutoffs. Legacy configuration fields remain accepted but inert.
+  Base evidence gates, recovery, tool-result retrieval, Plan/Goal delivery, and
+  deadline wrap-up remain available. Strict-only counters and the retired
+  observers no longer emit runtime diagnostics.
+- The bundled Skill catalog now exposes eight ordinary entry points and three
+  stable Meta workflows, with coding instructions available in coding mode.
+  Internal helpers remain available to their owning workflows. The optional
+  relevance filter is retired; old filter settings are ignored during upgrade.
+- Redundant bundled wrappers, including `cron`, `memory`, `git-diff`, and
+  `http-fetch`, are retired while their native tools remain available. The
+  weather and tmux wrappers and the dedicated HTML-to-PDF/LaTeX wrappers are
+  also retired; generic tools remain available, but their former scripts and
+  output contracts are not preserved. PDF extraction, composition and
+  generation remain supported; arbitrary in-place PDF rewriting is no longer
+  a dedicated Skill capability.
+- In total, 31 bundled Skills are retired: four native-tool wrappers, five
+  audio wrappers, `summarize`, five weather/tmux/HTML-to-PDF/LaTeX/PDF-rewrite
+  wrappers, eight obsolete paper helpers, three creator helpers whose work
+  now runs in the creator runtime, and five stack-trace probes.
+- Catalog retirement takes effect when the upgraded Gateway restarts and
+  rebuilds its Skill snapshot. Personal, project and other user-installed
+  copies are not removed, and memory files and scheduled jobs stay in place.
+  Old Meta workflow definitions that reference retired Skills must be updated
+  by their authors; they are not automatically migrated.
+- Retired opt-in projection experiments: signal-scan hints, provider-history
+  deduplication, tiny compaction guards, configurable stub previews, and fresh
+  diagnostic preservation/retrieval gates. Existing configuration fields remain
+  accepted but no longer activate these mechanisms. Default Tokenjuice results,
+  Store/retrieval guarantees, fixed previews and compaction safety protections
+  remain unchanged; experimental diagnostic counters and events are removed.
+
+### Fixed
+
+- DeepSeek settings now discover official models for the model picker and expose
+  refresh, loading, and discovery errors in the provider editor. New configurations
+  use `deepseek-flash` with current vision support and peak-rate cost estimates;
+  saved legacy model IDs remain unchanged.
+
+- Python code execution in packaged Gateways now uses the bundled Python runtime,
+  allowing tools to create documents with bundled dependencies such as `python-pptx`.
+  Linux Bubblewrap also retains read-only access to the selected Python runtime
+  instead of unnecessarily falling back to a system Python without those dependencies.
+- Automatic session titles now fall back to the first user message when the
+  naming model refuses. Known historical refusal titles also use this display
+  fallback, including the original message archived by context compaction;
+  manual names and stored title data remain unchanged.
+- Restored V1 installation/version reporting and daily conversation/token
+  aggregation and uploads alongside V2 telemetry. Uploads start after Gateway
+  readiness, retain installation state, and honor reporting opt-outs. Daily
+  deduplication now uses a persistent identity per aggregate database so separate
+  profiles do not lose each other's totals. Already acknowledged days remain
+  untouched; pending legacy days adopt the new keys, which can replay an old
+  accepted upload if its acknowledgment was lost before this upgrade.
+  V2 events and the retired provider install-ID header are unchanged.
+- Default Gateway, CLI, decision, trace and safety logs no longer retain
+  prompt/conversation previews, tool output or exception payloads. Gateway
+  operational logs keep their level prefix and use JSON metadata with event
+  identifiers, counts, status codes and exception types; decision logs no longer
+  store prompt-derived intent text.
+  Support bundles re-filter current and rotated legacy logs, omitting legacy
+  free text that cannot be safely parsed. Existing local logs are not deleted
+  and may still contain pre-upgrade private content: review them before sharing
+  outside the bundle flow. Explicit raw turn-call capture remains opt-in (#1208).
+
+- Skill and Meta catalog reads remain compatible when the Web UI and Gateway
+  are upgraded separately. Meta details fall back on older gateways; new
+  gateways preserve public Meta list and detail responses for older clients.
+  Managed instances keep their source and lifecycle identity, and dependency
+  status refreshes after setup without retaining old missing-dependency counts.
+- Retired nested Skill-filter environment variables no longer prevent Gateway
+  startup. Newly authored personal and project Meta SOPs receive the correct
+  invocation defaults, and command completion follows the public catalog.
+
+- Aborting a turn no longer leaves an orphan task that crashes while the turn
+  generator is finalized. The gateway now closes the runner stream when the
+  consuming task exits, and the turn scope stack (process ownership, sandbox
+  policy, Git run mode, runtime pack, and managed toolchain state) tolerates
+  being unwound from a different asyncio Context, such as asyncio's
+  async-generator finalizer. Previously every `chat.abort` logged
+  `Task exception was never retrieved` with a nested
+  `ValueError: ... was created in a different Context` chain, and the
+  subscriber-visible turn-terminal event could be lost.
+
+- Skill catalog filtering and trigger matching tolerate numeric or nested YAML
+  trigger values, including restored caches and older Gateway responses (#1018).
+
+## [0.5.4] - 2026-08-25
+
+### Added
+
+- Electron Desktop includes a beta for editing single-file HTML attachments and
+  deliverables. It provides preview, source, version, and change views plus
+  Agent-assisted candidate edits that users review before committing. Other
+  document formats and project-wide editing are not included.
+- Optional Python, Node.js, and Windows Git Bash Runtime Packs can be downloaded
+  from Sandbox settings through an immutable catalog. Downloads support resume,
+  cancellation, source fallback, integrity verification, removal, and cache
+  discard without modifying system-installed runtimes.
+- Each chat can now keep its own Direct, Router, or Ensemble strategy while the
+  global strategy remains the default for new chats. C3 can use the shared
+  multi-model fusion plan with resilient fixed-model fallback and independent
+  image routing.
+- The OpenSquilla technical report is available in English and Chinese PDF
+  editions, with the English edition also published on aiXiv.
+
+### Changed
+
+- Fresh and managed TokenRhythm configurations now use DeepSeek V4 Flash 0731
+  for C0, DeepSeek V4 Pro 0813 as the direct and C1 default, Kimi K2.7 Code for
+  C2, and GLM 5.2 B5 fusion for C3. Existing custom inline tiers are not
+  migrated, and the mixed-family preset continues to leave thinking levels
+  unset.
+- Settings now use ten stable destinations, including combined Security &
+  Privacy controls and a first-level Memory page. Existing Settings deep links
+  continue through compatibility aliases.
+- Desktop installers are slimmer because optional developer runtimes are no
+  longer bundled. The Gateway and control console remain included, and users
+  can install only the Runtime Packs they need.
+
+### Fixed
+
+- Desktop startup now shows monotonic, milestone-based progress without
+  estimating remaining time or changing recovery and Gateway startup behavior.
+- Stop now acknowledges immediately for provider and ordinary tool work while
+  safely settling in-flight filesystem mutations before publishing a terminal
+  turn. Late provider or tool results are discarded, timed-out writes retain
+  their timeout outcome, and committed file changes are recorded before the
+  next turn can run.
+- Chat recovery now preserves activity order, router panels, live steering,
+  pending input, long-session scrolling, and durable turn commits across
+  reconnects and session switches. Large and image attachments use complete
+  routing capacity, and current-turn images are available to workspace tools.
+- Desktop and Gateway startup, process-tree cancellation, Windows Safe shell
+  execution, Windows installer progress, macOS Keychain recovery, CLI failure
+  exits, Skill catalog verification, prompt caching, usage accounting, and
+  provider fallback behavior are more reliable across supported platforms.
+
+### Security
+
+- The HTML editing beta uses isolated preview surfaces, opaque mutation grants,
+  atomic revisions, and capability-gated document tools. Older or incomplete
+  Desktop bridges fail closed, while existing attachments and deliverables
+  remain readable and immutable.
+- Runtime Pack downloads are restricted to pinned sources and verified by exact
+  size and SHA-256 before safe extraction and activation. Failures remain local
+  to the requested component and do not block Gateway startup.
+
+## [0.5.3] - 2026-08-13
+
+### Added
+
+- Durable Goals can continue across turns with explicit progress, pause,
+  resume, edit, clear, and Plan-mode deferral controls. Queued follow-ups,
+  attachments, project handoffs, and session forks now survive reconnects and
+  preserve their intended ordering during long-running work.
+- MetaSkills, Cron workspace management, inline `/meta` requests, and richer
+  Skills lifecycle diagnostics are available through the shared runtime and
+  management surfaces.
+- Community Skills from ClawHub and GitHub now support immutable source
+  resolution and transactional management through one shared service. Gateway
+  RPC and CLI add read-only Doctor diagnostics, agent installs return lifecycle
+  diagnostics, and the Web UI displays lifecycle and selection state. The
+  compatibility claim is intentionally limited to single-root,
+  instruction-first Skills; unsupported execution dialects remain inert and
+  explicit. Source package, managed storage, and runtime names are tracked
+  separately, dangerous scanner confirmations are bound to the reviewed
+  artifact, and GitHub batches are serial, capped at 10 references, and pause
+  remaining work when the source reports a rate limit.
+- Official TokenRhythm HTTPS requests can include an optional pseudonymous
+  installation identifier. It is limited to official service endpoints and
+  respects the unified privacy and telemetry opt-outs.
+- TokenRhythm model discovery now combines the official published catalog with
+  the current credential's declared model entitlements, exposes versioned
+  `metadata.published` / `metadata.declared` fields, and reports stale catalog
+  state without blocking normal model listing or turns.
+- The Sandbox settings module now covers Safe/Full defaults, versioned file,
+  command and network policies, bounded recursive-delete backups, pinned
+  bundled runtime versions, LAN listening/CIDR controls, and named tokens.
+- Safe availability is now decided by cached live process, filesystem worker,
+  deny-write, and authority-deny-read canaries instead of setup state alone.
+
+### Fixed
+
+- Long-running chat streams recover more reliably from renderer reconnects and
+  provider activity gaps, while bounded history rendering keeps large sessions
+  responsive. Assistant answers, tool markers, pending input, session counts,
+  and created-chat cards now keep their correct UI boundaries and state.
+- Desktop startup, profile recovery, update checks, Windows packaging, provider
+  reasoning replay, prompt-cache continuity, compaction, schedules, and usage
+  receipts are more reliable across supported platforms.
+- TokenRhythm maximum-output limits now prefer the authenticated top-level
+  declaration, preserve the published value separately from the runtime-safe
+  value, and clamp fallback requests to each physical model's known limit.
+- TokenRhythm catalog refreshes now use bounded lazy caching, last-good
+  snapshots, authority isolation, credential-safe persistence, and explicit
+  refresh/credential lifecycle invalidation without a background timer.
+
+### Changed
+
+- The landing-page game suggestion now submits only its visible localized
+  label. The previously hidden, detailed game request is no longer bundled in
+  the client or sent when the suggestion is selected.
+- The responsive chat header, floating composer, sidebar peer sections, and
+  artifact presentation have been refined without changing existing gateway
+  configuration or persisted chat data.
+- `onboarding.models.discover`, profile model discovery, and `models.list` add
+  optional catalog metadata and maximum-output fields. Existing clients may
+  ignore them; external decoders using `additionalProperties: false` must allow
+  the new additive fields before upgrading.
+
+### Removed
+
+- Removed the in-repository `opensquilla swebench` CLI, optional dependency,
+  Python namespace, and bundled skill. Benchmark recipes and evidence now live
+  in the external experiment ledger and handoff runner; `opensquilla agent` and
+  Coding Mode are unchanged. Existing local benchmark artifacts are left
+  untouched and are no longer managed by OpenSquilla.
+
+### Security
+
+- Community Skill ingestion now fails closed on unsafe archive paths and links,
+  ambiguous package roots, source drift, malformed manifests, YAML alias/depth
+  expansion, bounded artifact limits, and interrupted publication recovery.
+- LAN WebSocket peers are limited to loopback, RFC 1918, or IPv6 ULA ranges
+  and may be narrowed further with `auth.allowed_client_cidrs`; public peers
+  are rejected before authentication.
+- Safe tasks pin one policy version for the entire turn. High-risk commands
+  require exact user approval, and recursive deletion is brokered through an
+  irreversible-action prompt plus a default 3 GiB oldest-first backup vault.
+
+## [0.5.2] - 2026-07-30
+
+### Added
+
+- Versioned same-turn steering now works consistently across the Web UI, CLI,
+  Gateway, and shared runtime for supported single-model and router turns.
+  Accepted input is idempotent and survives reconnects and eligible provider
+  fallback without rerouting the logical turn; older clients and gateways keep
+  their legacy or visible queue compatibility paths.
+
+### Fixed
+
+- Desktop and Gateway startup no longer wait on unnecessary recovery scans,
+  legacy-recovery maintenance, repeated ownership readiness windows, or
+  historical usage backfill.
+- Retained session history loads independently from interactive controls, so
+  navigation, controls, existing messages, and message sending remain usable
+  during hydration and recovery.
+- Recovery consolidation preserves historical usage for deduplicated sessions,
+  and usage backfill uses smaller transactions with bounded SQLite contention
+  handling.
+- Windows Desktop validates the Electron profile marker for sandbox setup, and
+  the macOS project picker supports folder creation, system-localized text, and
+  the intended initial directory.
+- Desktop HTML artifacts render when their native preview surface appears, and
+  preview mode switches no longer require an extra confirmation or overwrite
+  the saved default.
+- Custom compatible providers expose their Base URL fields again, the Usage
+  currency toggle applies consistently, and provider/usage presentation avoids
+  clipped or ambiguous actions.
+- Model Ensemble activity timing remains stable across generic channel
+  heartbeats, and the Desktop startup loader rotates in the expected direction.
+
+## [0.5.1] - 2026-07-29
+
+### Added
+
+- Durable Plan mode, project workspaces, native macOS project-folder creation,
+  desktop deep links, richer artifact workbench previews, and general pasted
+  file attachments.
+- Qwen Token Plan and custom Anthropic-compatible providers.
+- Recoverable Desktop profile import and bounded primary-profile
+  consolidation.
+- New agent tool `audio_config`: configures the audio (TTS) provider through
+  the same validated path as onboarding — atomic UTF-8 persistence with
+  backup, live hot-apply, and `restartRequired: false`. Agent-driven setup is
+  restricted to the registered ElevenLabs endpoint and credential environment
+  variable; advanced endpoint settings remain operator-managed. API keys are
+  stored but omitted from tool results and validation errors.
+
+### Fixed
+
+- Local-owner `bypass` again resolves to Full host execution consistently
+  across Web, CLI, TaskRuntime, and Cron. Full file, Shell, and Git operations
+  no longer initialize a sandbox worker or apply sandbox path checks.
+- Cron creation is atomically idempotent for identical tool requests, and
+  owner jobs preserve their host execution target.
+- Frozen macOS filesystem workers start through the packaged gateway's
+  dedicated worker entry point, while frozen Windows gateways resolve sandbox
+  setup paths correctly.
+- First-install provider and model routing state, long-session recovery,
+  reasoning timers, subagent usage accounting, and session deletion lifecycle
+  handling are more reliable.
+- Settings overlays cover the viewport, Skills navigation remains stable, and
+  project/chat activity, onboarding, assistant activity, and provider settings
+  are clearer.
+- The `gateway` tool no longer advertises capabilities it cannot deliver:
+  `restart` and `config_set` now report their actual availability, audio
+  settings point to `audio_config`, and `config_get` uses the canonical
+  public-config redactor instead of echoing credentials.
+- Shell commands that would terminate the gateway's own process
+  (`Stop-Process -Id <gateway pid>`, `taskkill /PID`, `kill`, and
+  name-targeted variants) are structurally refused in every host mode,
+  before any configurable policy layer; other processes stay manageable.
+- Config persistence explicitly routes non-UTF-8 (e.g. GBK-corrupted)
+  config files into the backup-then-rewrite recovery path, with regression
+  coverage for corrupt-file recovery, CJK round-trips, and mid-write
+  failures leaving the original bytes untouched.
+
+### Changed
+
+- The packaged Desktop gateway carries its CA trust bundle, channel
+  administration approvals are aligned, and coding/delivery guidance now
+  reflects actual runtime capability.
+- Desktop now consolidates data from legacy recovery profiles into the single
+  primary profile before startup. Existing primary settings remain
+  authoritative; when the primary profile has no settings, the newest legacy
+  recovery settings are adopted automatically. Desktop no longer creates or
+  asks users to confirm isolated recovery profiles.
+- Closing the Desktop main window now preserves the live Control UI on macOS
+  and keeps Windows reachable from a system tray icon. Explicit **Quit
+  OpenSquilla** still drains and stops the local Gateway, and the close behavior
+  can be changed in Runtime settings.
+
 ## [0.5.0] - 2026-07-23
 
 OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting the

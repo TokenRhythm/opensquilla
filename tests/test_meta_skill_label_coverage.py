@@ -6,7 +6,6 @@ import pytest
 import yaml
 
 BUNDLED_META_SKILLS = [
-    "meta-kid-project-planner",
     "meta-paper-write",
     "meta-short-drama",
     "meta-skill-creator",

@@ -266,6 +266,43 @@ def test_load_recent_history_bounds_window_and_per_session(tmp_path: Path) -> No
     writer.close()
 
 
+def test_load_next_turn_indexes_uses_persisted_max_for_every_retained_session(
+    tmp_path: Path,
+) -> None:
+    now_ms = 5_000_000_000_000
+    writer, _db = _make_writer(tmp_path, clock=lambda: now_ms)
+    writer.record_decision(
+        _base_record(
+            decision_id="older-high",
+            session_key="agent:a",
+            turn_index=40,
+            ts_ms=now_ms - 1900 * 1000,
+        )
+    )
+    writer.record_decision(
+        _base_record(
+            decision_id="recent-low",
+            session_key="agent:a",
+            turn_index=5,
+            ts_ms=now_ms - 1000,
+        )
+    )
+    writer.record_decision(
+        _base_record(
+            decision_id="inactive",
+            session_key="agent:inactive",
+            turn_index=99,
+            ts_ms=now_ms - 1900 * 1000,
+        )
+    )
+
+    assert writer.load_next_turn_indexes() == {
+        "agent:a": 41,
+        "agent:inactive": 100,
+    }
+    writer.close()
+
+
 def test_list_decisions_orders_newest_first_and_parses_json(tmp_path: Path) -> None:
     writer, _db = _make_writer(tmp_path)
     for index in range(3):

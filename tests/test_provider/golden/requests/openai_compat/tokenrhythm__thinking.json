@@ -13,7 +13,7 @@
       },
       {
         "content": "Canberra.",
-        "reasoning_content": "The capital is Canberra, not Sydney.",
+        "reasoning_content": "",
         "role": "assistant"
       },
       {
@@ -31,11 +31,15 @@
       }
     ],
     "model": "deepseek-v4-flash",
+    "reasoning_effort": "high",
     "stream": true,
     "stream_options": {
       "include_usage": true
     },
-    "temperature": 0.7
+    "temperature": 0.7,
+    "thinking": {
+      "type": "enabled"
+    }
   },
   "content_type": "application/json",
   "method": "POST",

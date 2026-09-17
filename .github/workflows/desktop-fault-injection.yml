@@ -1,0 +1,526 @@
+name: Desktop Fault Injection
+
+# Exercises a real packaged Desktop build against hostile profile layouts before
+# a release tag exists. The tag-time gate only proved the packaged process
+# survived eight seconds and that `recovery inspect` reported `ready`, which is
+# why the 0.5.0 profile-consolidation regression shipped: nothing asserted the
+# user could actually reach the control surface.
+#
+# Signed installers are reused from a completed Release Assets run rather than
+# rebuilt here, so this workflow never needs the Apple signing credentials.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Completed Release Assets run holding opensquilla-electron-macos
+        required: false
+        default: ""
+      scenarios:
+        description: Space-separated scenario names (empty runs the whole catalogue)
+        required: false
+        default: ""
+      run_wedge_probe:
+        description: Also probe interrupted consolidations (reported, never gating)
+        type: boolean
+        required: false
+        default: true
+      windows_source_run_id:
+        description: >-
+          Approval-gated Release Assets run holding a signed Windows installer
+          artifact. Leave empty to skip the Windows job.
+        required: false
+        default: ""
+      windows_artifact_name:
+        description: Windows artifact name to download
+        required: false
+        default: opensquilla-electron-windows
+      run_windows_release_audit:
+        description: Run first-send and the four Windows upgrade/reinstall audits against the original signed artifact
+        type: boolean
+        required: false
+        default: false
+      run_windows_upgrade_matrix:
+        description: Include all four installation audits; disable only for a focused first-send diagnosis
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: desktop-fault-injection-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-fault-injection:
+    name: macOS packaged fault injection
+    if: github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla' && inputs.source_run_id != ''
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download signed macOS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-macos
+          path: packaged-macos
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Mount the installer and stage the application
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(packaged-macos/*.dmg)
+          if [[ "${#dmgs[@]}" -ne 1 ]]; then
+            printf 'expected exactly one DMG, found %d\n' "${#dmgs[@]}" >&2
+            ls -la packaged-macos >&2 || true
+            exit 1
+          fi
+          # RUNNER_TEMP is a real path; consolidation refuses profile roots that
+          # resolve through a link, and /tmp on macOS is such a link.
+          stage="$(cd "${RUNNER_TEMP}" && pwd -P)/fault-injection"
+          mount="${stage}/mount"
+          apps="${stage}/Applications"
+          mkdir -p "${mount}" "${apps}"
+          hdiutil attach -nobrowse -readonly -mountpoint "${mount}" "${dmgs[0]}"
+          ditto "${mount}/OpenSquilla.app" "${apps}/OpenSquilla.app"
+          hdiutil detach "${mount}" -quiet
+          printf 'stage=%s\n' "${stage}" >> "${GITHUB_OUTPUT}"
+          printf 'app=%s\n' "${apps}/OpenSquilla.app" >> "${GITHUB_OUTPUT}"
+
+      - name: Record the signature the scenarios actually run against
+        shell: bash
+        run: |
+          set -euo pipefail
+          app='${{ steps.stage.outputs.app }}'
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          codesign --display --verbose=4 "${app}" 2>&1 | tee signature.txt
+          # An ad-hoc signature cannot exercise the real safeStorage keychain
+          # policy, so say so loudly instead of reporting a false pass.
+          if grep -qi 'Signature=adhoc' signature.txt; then
+            printf '::warning::Artifact is ad-hoc signed; the safeStorage credential path is NOT covered.\n'
+          fi
+          spctl --assess --type execute --verbose "${app}" || \
+            printf '::warning::Gatekeeper assessment failed for the staged app.\n'
+
+      - name: Run fault-injection scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected='${{ inputs.scenarios }}'
+          args=()
+          for name in ${selected}; do
+            args+=(--scenario "${name}")
+          done
+          python .github/scripts/desktop_fault_injection.py run \
+            --app '${{ steps.stage.outputs.app }}' \
+            --workdir '${{ steps.stage.outputs.stage }}/scenarios' \
+            --report '${{ steps.stage.outputs.stage }}/scenario-report.json' \
+            "${args[@]}"
+
+      - name: Summarize scenarios
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/desktop_fault_injection.py summarize \
+            --report '${{ steps.stage.outputs.stage }}/scenario-report.json' \
+            --title 'macOS packaged fault injection' >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload scenario evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-fault-injection-macos-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ steps.stage.outputs.stage }}/scenario-report.json
+            ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/desktop.log
+            ${{ steps.stage.outputs.stage }}/scenarios/*/launch-stdio.log
+            signature.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  macos-wedge-probe:
+    name: macOS interrupted-consolidation probe (reported, not gating)
+    if: >-
+      github.repository == 'TokenRhythm/opensquilla'
+      && github.actor == 'Open-Squilla'
+      && inputs.run_wedge_probe
+      && inputs.source_run_id != ''
+    runs-on: macos-latest
+    timeout-minutes: 60
+    # Two resume paths are known to refuse continuation once a recorded source
+    # snapshot stops reproducing. Failing the workflow on them would keep it red
+    # indefinitely and mask new regressions, so the probe reports instead.
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download signed macOS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-macos
+          path: packaged-macos
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Mount the installer and stage the application
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(packaged-macos/*.dmg)
+          if [[ "${#dmgs[@]}" -ne 1 ]]; then
+            printf 'expected exactly one DMG, found %d\n' "${#dmgs[@]}" >&2
+            exit 1
+          fi
+          stage="$(cd "${RUNNER_TEMP}" && pwd -P)/wedge-probe"
+          mount="${stage}/mount"
+          apps="${stage}/Applications"
+          mkdir -p "${mount}" "${apps}"
+          hdiutil attach -nobrowse -readonly -mountpoint "${mount}" "${dmgs[0]}"
+          ditto "${mount}/OpenSquilla.app" "${apps}/OpenSquilla.app"
+          hdiutil detach "${mount}" -quiet
+          printf 'stage=%s\n' "${stage}" >> "${GITHUB_OUTPUT}"
+          printf 'app=%s\n' "${apps}/OpenSquilla.app" >> "${GITHUB_OUTPUT}"
+
+      - name: Probe interrupted consolidations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/desktop_fault_injection.py wedge \
+            --app '${{ steps.stage.outputs.app }}' \
+            --workdir '${{ steps.stage.outputs.stage }}/probes' \
+            --report '${{ steps.stage.outputs.stage }}/wedge-report.json'
+
+      - name: Summarize probes
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report='${{ steps.stage.outputs.stage }}/wedge-report.json'
+          test -f "${report}" || exit 0
+          python - "${report}" >> "${GITHUB_STEP_SUMMARY}" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          probes = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          wedged = [probe for probe in probes if probe["wedged"]]
+          print("## Interrupted-consolidation probe\n")
+          print(
+              f"{len(wedged)} of {len(probes)} interruptions left startup blocked "
+              "after an ordinary metadata change.\n"
+          )
+          print("| killed after | journal phase | relaunch | startup |")
+          print("| --- | --- | --- | --- |")
+          for probe in probes:
+              state = "**blocked**" if probe["wedged"] else "recovered"
+              print(
+                  f"| {probe['kill_after_seconds']:g}s "
+                  f"| `{probe['journal_phase_after_kill']}` "
+                  f"| {probe['relaunch_verdict']} | {state} |"
+              )
+          PY
+
+      - name: Upload probe evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-wedge-probe-macos-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ steps.stage.outputs.stage }}/wedge-report.json
+            ${{ steps.stage.outputs.stage }}/probes/*/user-data/logs/desktop.log
+            ${{ steps.stage.outputs.stage }}/probes/*/user-data/.opensquilla-profile-consolidation.json
+            ${{ steps.stage.outputs.stage }}/probes/*/launch-stdio.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-fault-injection:
+    name: ${{ inputs.run_windows_release_audit && 'Windows signed first-send audit' || 'Windows packaged fault injection' }}
+    if: >-
+      github.repository == 'TokenRhythm/opensquilla'
+      && github.actor == 'Open-Squilla'
+      && inputs.windows_source_run_id != ''
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record signed artifact and harness source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.windows_source_run_id }}
+          HARNESS_SHA: ${{ github.workflow_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_RUN_ID -notmatch '^[0-9]+$') { throw 'Invalid Windows source run ID.' }
+          $source = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:SOURCE_RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $source.path -ne '.github/workflows/wheelhouse-release.yml') {
+            throw 'Windows artifacts must come from a Release Assets run.'
+          }
+          "Source Release workflow head: $($source.head_sha) (run $env:SOURCE_RUN_ID); verification harness: $env:HARNESS_SHA" |
+            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Set up Node.js for signed first-send audit
+        if: inputs.run_windows_release_audit
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+
+      - name: Build the verification harness
+        if: inputs.run_windows_release_audit
+        working-directory: desktop/electron
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Harness dependencies failed.' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Harness compilation failed.' }
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.windows_artifact_name }}
+          path: packaged-windows
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.windows_source_run_id }}
+
+      - name: Install into a controlled directory
+        id: stage
+        shell: pwsh
+        env:
+          STRICT_RELEASE_AUDIT: ${{ inputs.run_windows_release_audit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem packaged-windows -Filter *.exe -Recurse)
+          if ($installers.Count -ne 1) {
+            Get-ChildItem packaged-windows -Recurse | Format-Table -AutoSize | Out-String | Write-Host
+            throw "expected exactly one installer .exe, found $($installers.Count)"
+          }
+          $installer = $installers[0].FullName
+          if ($env:STRICT_RELEASE_AUDIT -eq 'true') {
+            Write-Host "Signed candidate SHA256: $((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant())"
+            .github/scripts/verify-windows-signatures.ps1 -InstallerPath $installer
+            if ($LASTEXITCODE -ne 0) { throw 'Downloaded installer signature verification failed.' }
+          }
+          # Report what the scenarios actually run against. An unsigned or
+          # test-signed installer cannot exercise the real trust path, so say so
+          # rather than implying full coverage.
+          $signature = Get-AuthenticodeSignature $installer
+          Write-Host "installer signature status: $($signature.Status)"
+          if ($signature.SignerCertificate) {
+            Write-Host "installer signer: $($signature.SignerCertificate.Subject)"
+          }
+          if ($signature.Status -ne 'Valid') {
+            Write-Host "::warning::Installer signature is $($signature.Status); the trust path is NOT covered."
+          }
+          $stage = Join-Path $env:RUNNER_TEMP 'fault-injection'
+          $target = Join-Path $stage 'app'
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          # electron-builder NSIS honours /S for silent and /D for the target.
+          $install = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$target" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer failed with exit code $($install.ExitCode)." }
+          $exe = Get-ChildItem $target -Filter 'OpenSquilla.exe' -Recurse |
+            Select-Object -First 1
+          if (-not $exe) {
+            Get-ChildItem $target -Recurse | Format-Table -AutoSize | Out-String | Write-Host
+            throw 'OpenSquilla.exe was not found after install'
+          }
+          "stage=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "app=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($env:STRICT_RELEASE_AUDIT -eq 'true') {
+            .github/scripts/verify-windows-signatures.ps1 -InstalledRoot $target
+            if ($LASTEXITCODE -ne 0) { throw 'Installed executable signature verification failed.' }
+          }
+
+      - name: Verify signed installed first-send
+        id: first_send
+        if: inputs.run_windows_release_audit
+        timeout-minutes: 15
+        working-directory: desktop/electron
+        shell: pwsh
+        env:
+          CANDIDATE_EXE: ${{ steps.stage.outputs.app }}
+          AUDIT_STAGE: ${{ steps.stage.outputs.stage }}
+        run: |
+          $userData = Join-Path $env:AUDIT_STAGE 'first-send-user-data'
+          node scripts/test-packaged-first-send-renderer.mjs `
+            --executable $env:CANDIDATE_EXE --user-data-dir $userData
+          if ($LASTEXITCODE -ne 0) { throw 'Signed installed first-send audit failed.' }
+
+      - name: Run fault-injection scenarios
+        if: ${{ !inputs.run_windows_release_audit }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $args = @()
+          foreach ($name in ('${{ inputs.scenarios }}' -split '\s+' | Where-Object { $_ })) {
+            $args += @('--scenario', $name)
+          }
+          python .github/scripts/desktop_fault_injection.py run `
+            --app '${{ steps.stage.outputs.app }}' `
+            --workdir '${{ steps.stage.outputs.stage }}\scenarios' `
+            --report '${{ steps.stage.outputs.stage }}\scenario-report.json' `
+            @args
+
+      - name: Uninstall the signed first-send candidate
+        if: ${{ always() && inputs.run_windows_release_audit && steps.stage.outputs.app != '' }}
+        shell: pwsh
+        env:
+          CANDIDATE_EXE: ${{ steps.stage.outputs.app }}
+        run: |
+          $target = Split-Path -Parent $env:CANDIDATE_EXE
+          $uninstallers = @(Get-ChildItem -LiteralPath $target -Filter 'Uninstall*.exe' -File)
+          if ($uninstallers.Count -ne 1) { throw 'Expected one signed uninstaller.' }
+          $uninstall = Start-Process -FilePath $uninstallers[0].FullName -ArgumentList '/S' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)." }
+
+      - name: Summarize scenarios
+        if: ${{ always() && !inputs.run_windows_release_audit }}
+        shell: pwsh
+        run: |
+          $report = '${{ steps.stage.outputs.stage }}\scenario-report.json'
+          if (-not (Test-Path $report)) { exit 0 }
+          python .github/scripts/desktop_fault_injection.py summarize --report $report |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Upload scenario evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-fault-injection-windows-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ steps.stage.outputs.stage }}/scenario-report.json
+            ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/desktop.log
+            ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/gateway.log
+            ${{ steps.stage.outputs.stage }}/scenarios/*/launch-stdio.log
+            ${{ steps.stage.outputs.stage }}/first-send-user-data/logs/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-release-upgrade-audit:
+    name: Audit reused signed Windows artifact (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }})
+    if: ${{ github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla' && inputs.run_windows_release_audit && inputs.run_windows_upgrade_matrix && inputs.windows_source_run_id != '' }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline-version: ['0.5.3', '0.5.4']
+        install-mode: [default, custom]
+    steps:
+      - name: Checkout the fixed verification harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - name: Install release verification dependencies
+        working-directory: desktop/electron
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Verification dependency installation failed.' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness build failed.' }
+          node --input-type=module -e "await import('./scripts/packaged-first-send-cleanup.mjs')"
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness import failed.' }
+      - name: Record signed artifact and harness source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.windows_source_run_id }}
+          HARNESS_SHA: ${{ github.workflow_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_RUN_ID -notmatch '^[0-9]+$') { throw 'Invalid Windows source run ID.' }
+          $source = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:SOURCE_RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $source.path -ne '.github/workflows/wheelhouse-release.yml') {
+            throw 'Windows artifacts must come from a Release Assets run.'
+          }
+          "Source Release workflow head: $($source.head_sha) (run $env:SOURCE_RUN_ID); verification harness: $env:HARNESS_SHA" |
+            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+      - name: Download the original signed Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.windows_artifact_name }}
+          path: release-audit
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.windows_source_run_id }}
+      - name: Verify downloaded signature, install, launch, and uninstall
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
+          INSTALL_MODE: ${{ matrix.install-mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
+          if ($candidates.Count -ne 1) { throw 'Expected one signed test installer.' }
+          Write-Host "Signed candidate SHA256: $((Get-FileHash -LiteralPath $candidates[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+          .github/scripts/verify-windows-signatures.ps1 -InstallerPath $candidates[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Downloaded installer signature verification failed.' }
+          .github/scripts/verify-release-windows-upgrade.ps1 `
+            -CandidateInstaller $candidates[0].FullName `
+            -Label "reused-$env:BASELINE_VERSION-$env:INSTALL_MODE" `
+            -InstallMode $env:INSTALL_MODE `
+            -BaselineVersion $env:BASELINE_VERSION
+      - name: Upload isolated Windows upgrade diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reused-windows-upgrade-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
+          path: ${{ runner.temp }}/opensquilla-release-preservation-reused-${{ matrix.baseline-version }}-${{ matrix.install-mode }}-${{ matrix.install-mode }}-${{ matrix.baseline-version }}/appdata/OpenSquilla/logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7

@@ -12,10 +12,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.gateway.routing import tool_context_from_envelope
+from opensquilla.gateway.routing import RouteEnvelope, SourceKind, tool_context_from_envelope
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.run_context import (
@@ -119,6 +120,7 @@ class _StubTaskRuntime:
         *,
         task_id=None,
         provider_request_correlation=None,
+        persisted_user_message_id=None,
     ):
         self.enqueued.append(
             {
@@ -128,6 +130,7 @@ class _StubTaskRuntime:
                 "run_kind": run_kind,
                 "task_id": task_id,
                 "provider_request_correlation": provider_request_correlation,
+                "persisted_user_message_id": persisted_user_message_id,
             }
         )
 
@@ -166,6 +169,70 @@ def _ctx(session_key: str = "agent:caller:main", agent_id: str = "caller") -> To
         session_key=session_key,
         task_id="task-parent",
     )
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_rejects_unbounded_inline_task_before_creating_child() -> None:
+    mgr = _StubSessionManager(
+        {"caller": {"id": "caller", "name": "Caller", "enabled": True}}
+    )
+    rt = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(rt)
+    token = current_tool_context.set(_ctx())
+    try:
+        with pytest.raises(sessions_tool.ToolError, match="artifact or workspace file"):
+            await sessions_tool.sessions_spawn(task="x" * 60_001)
+    finally:
+        current_tool_context.reset(token)
+
+    assert mgr.created == []
+    assert rt.enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_applies_declared_child_budget_before_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_models: list[str] = []
+
+    def resolve_budget(_provider: object, **kwargs: object) -> SimpleNamespace:
+        captured_models.append(str(kwargs.get("model") or ""))
+        return SimpleNamespace(
+            provider_id="fake",
+            model=str(kwargs.get("model") or ""),
+            context_window_tokens=2048,
+            max_output_tokens=2047,
+            provider_request_max_chars=4096,
+        )
+
+    monkeypatch.setattr(
+        sessions_tool,
+        "resolve_auxiliary_request_budget",
+        resolve_budget,
+    )
+    mgr = _StubSessionManager(
+        {
+            "caller": {"id": "caller", "enabled": True},
+            "worker": {"id": "worker", "enabled": True, "model": "worker-small"},
+        }
+    )
+    rt = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(rt)
+    token = current_tool_context.set(_ctx())
+    try:
+        with pytest.raises(
+            sessions_tool.ToolError,
+            match="resolved child deployment",
+        ):
+            await sessions_tool.sessions_spawn(agent_id="worker", task="bounded task")
+    finally:
+        current_tool_context.reset(token)
+
+    assert captured_models == ["worker-small"]
+    assert mgr.created == []
+    assert rt.enqueued == []
 
 
 @pytest.mark.asyncio
@@ -295,7 +362,7 @@ async def test_sessions_spawn_does_not_propagate_once_or_temporary_grants(
         {"path": one_shot_path, "access": "rw", "scope": "once"},
     ]
     parent_ctx.sandbox_run_context = RunContext(
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         workspace=workspace,
         mounts=(
             MountGrant(durable_path, scope="chat"),
@@ -336,7 +403,7 @@ async def test_sessions_spawn_does_not_propagate_once_or_temporary_grants(
     child_ctx = tool_context_from_envelope(envelope, is_owner=True)
     child_run_context = child_ctx.sandbox_run_context
     assert child_run_context is not None
-    assert child_run_context.run_mode is RunMode.TRUSTED
+    assert child_run_context.run_mode is RunMode.SAFE
     assert {grant.path for grant in child_run_context.mounts} == {durable_path}
     assert {grant.domain for grant in child_run_context.domains} == {"durable.example"}
     assert {grant.bundle_id for grant in child_run_context.bundles} == {"python-package-install"}
@@ -521,6 +588,87 @@ async def test_sessions_spawn_reuses_run_id_as_task_and_provider_execution() -> 
     assert correlation.turn_id == root.turn_id
     assert correlation.execution_id == run_id
     assert correlation.call_kind == "subagent.chat"
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_freezes_child_owner_across_persist_enqueue_reset() -> None:
+    class RotatingSessionManager(_StubSessionManager):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "caller": {"id": "caller", "enabled": True},
+                    "worker": {"id": "worker", "enabled": True},
+                }
+            )
+            self.admitted = SimpleNamespace(session_id="child-owner-old", epoch=2)
+            self.current = self.admitted
+            self.append_owner = None
+            self.parent_reads: list[tuple[str | None, int | None]] = []
+
+        async def get_session(
+            self,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+        ) -> SimpleNamespace:
+            assert session_key == "agent:caller:main"
+            self.parent_reads.append((expected_session_id, expected_session_epoch))
+            return SimpleNamespace(
+                session_key=session_key,
+                session_id="parent-owner-old",
+                epoch=4,
+                workspace_id=None,
+            )
+
+        async def create(self, **kwargs):
+            self.created.append(kwargs)
+            return self.admitted
+
+        async def append_message(self, *args, **kwargs):
+            self.append_owner = (
+                kwargs.get("expected_session_id"),
+                kwargs.get("expected_session_epoch"),
+            )
+            # Deterministically model reset after old-owner persistence but
+            # before sessions_spawn reaches TaskRuntime.enqueue.
+            self.current = SimpleNamespace(session_id="child-owner-new", epoch=3)
+            return SimpleNamespace(message_id="child-input-old")
+
+    manager = RotatingSessionManager()
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(manager)
+    sessions_tool.set_task_runtime(runtime)
+    parent_context = tool_context_from_envelope(
+        RouteEnvelope(
+            source_kind=SourceKind.WEB,
+            source_name="test",
+            agent_id="caller",
+            session_key="agent:caller:main",
+            session_id="parent-owner-old",
+            metadata={"task_id": "task-parent"},
+            session_epoch=4,
+        ),
+        is_owner=True,
+    )
+    token = current_tool_context.set(parent_context)
+    try:
+        await sessions_tool.sessions_spawn(agent_id="worker", task="fenced child")
+    finally:
+        current_tool_context.reset(token)
+
+    envelope = runtime.enqueued[0]["envelope"]
+    assert manager.parent_reads == [("parent-owner-old", 4)]
+    assert manager.append_owner == ("child-owner-old", 2)
+    assert (manager.current.session_id, manager.current.epoch) == (
+        "child-owner-new",
+        3,
+    )
+    assert (envelope.session_id, envelope.session_epoch) == ("child-owner-old", 2)
+    assert envelope.metadata["parent_session_id"] == "parent-owner-old"
+    assert envelope.metadata["parent_session_epoch"] == 4
+    assert manager.created[0]["origin"]["task_id"] == runtime.enqueued[0]["task_id"]
+    assert runtime.enqueued[0]["persisted_user_message_id"] == "child-input-old"
 
 
 # ── model fallback chain ────────────────────────────────────────────────

@@ -928,7 +928,24 @@ async def query_usage_ledger(
     historical_component_conflicts = 0
     crosses_cutover = resolved.from_ms is None or resolved.from_ms < ledger_started_at
     if crosses_cutover:
-        baselines = await storage.list_usage_legacy_baselines()
+        all_baselines = await storage.list_usage_legacy_baselines()
+        # Initial legacy baselines are captured in the same transaction, at
+        # exactly the ledger cutover. Later rows are cumulative generation
+        # checkpoints used by per-session reconciliation; adding them to the
+        # legacy pool would count earlier live events again after every epoch.
+        baselines = [
+            baseline
+            for baseline in all_baselines
+            if _integer(
+                _first(
+                    baseline,
+                    "captured_at_ms",
+                    "capturedAtMs",
+                    default=ledger_started_at,
+                )
+            )
+            <= ledger_started_at
+        ]
         if include_legacy:
             historical_candidates = [
                 event for event in finalized if not _is_live_event(event)

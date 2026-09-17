@@ -160,6 +160,8 @@ def test_send_failure_denies_the_approval_fail_closed() -> None:
     # prompt is denied immediately instead of hanging until deadline expiry.
     assert entry.resolved is True
     assert entry.approved is False
+    assert entry.params["resolutionSource"] == "approval_delivery_failure"
+    assert entry.params["resolutionReason"] == "send_failed"
 
 
 def test_prompt_offers_always_only_when_same_type_choice_exists() -> None:
@@ -260,6 +262,8 @@ def test_adapter_missing_denies_the_approval_fail_closed() -> None:
     entry = get_approval_queue().get(approval_id)
     assert entry.resolved is True
     assert entry.approved is False
+    assert entry.params["resolutionSource"] == "approval_delivery_failure"
+    assert entry.params["resolutionReason"] == "adapter_missing"
 
 
 def test_session_missing_denies_the_approval_fail_closed() -> None:
@@ -270,6 +274,8 @@ def test_session_missing_denies_the_approval_fail_closed() -> None:
     entry = get_approval_queue().get(approval_id)
     assert entry.resolved is True
     assert entry.approved is False
+    assert entry.params["resolutionSource"] == "approval_delivery_failure"
+    assert entry.params["resolutionReason"] == "session_missing"
 
 
 def test_missing_channel_manager_stays_additive() -> None:
@@ -347,3 +353,76 @@ def test_sandbox_path_prompt_names_the_path() -> None:
     message = adapter.sent[0]
     assert "Path: /srv/data (rw)" in message.content
     assert "(unknown command)" not in message.content
+
+
+@pytest.mark.parametrize("display_kind", ("modify", "create", "sensitive_operation"))
+def test_sandbox_elevation_prompt_never_exposes_internal_tool_names(
+    display_kind: str,
+) -> None:
+    adapter = _FakeAdapter(interactive_cards=False)
+    _run_notifier_with(
+        session_manager=_FakeSessionManager(),
+        channel_manager=_FakeChannelManager(adapter),
+        params={
+            "approvalKind": "sandbox_elevation",
+            "toolName": "sandbox_elevation",
+            "action_kind": "fs.edit_source",
+            "sessionKey": "agent:main:chat",
+            "senderId": "owner-1",
+            "action": {
+                "display": {
+                    "kind": display_kind,
+                    "target": "/srv/data/config.toml",
+                },
+            },
+        },
+    )
+
+    assert len(adapter.sent) == 1
+    content = adapter.sent[0].content
+    assert "Path: /srv/data/config.toml" in content
+    assert "sandbox_elevation" not in content
+    assert "fs.edit_source" not in content
+
+
+@pytest.mark.parametrize(
+    ("backup_state", "expected_notice"),
+    (
+        ("enabled", "Backup is enabled"),
+        ("disabled", "Turn it on in Sandbox Settings"),
+        ("unavailable_requires_confirmation", "Backup is unavailable"),
+    ),
+)
+def test_delete_prompt_names_exact_target_and_backup_recoverability(
+    backup_state: str,
+    expected_notice: str,
+) -> None:
+    adapter = _FakeAdapter(interactive_cards=True)
+    _run_notifier_with(
+        session_manager=_FakeSessionManager(),
+        channel_manager=_FakeChannelManager(adapter),
+        params={
+            "approvalKind": "sandbox_elevation",
+            "sessionKey": "agent:main:chat",
+            "senderId": "owner-1",
+            "action": {
+                "tool_name": "exec_command",
+                "justification": "Delete warning",
+                "display": {
+                    "kind": "delete",
+                    "target": "/srv/data/important.txt",
+                    "destructive": True,
+                    "irreversible": backup_state != "enabled",
+                    "backup_state": backup_state,
+                },
+            },
+        },
+    )
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]
+    assert "Path: /srv/data/important.txt" in message.content
+    assert expected_notice in message.content
+    card = str(message.metadata["card"])
+    assert "/srv/data/important.txt" in card
+    assert expected_notice in card

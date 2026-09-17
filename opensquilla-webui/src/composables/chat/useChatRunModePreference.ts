@@ -1,6 +1,15 @@
 import { computed, ref, watch } from 'vue'
 
-import { SANDBOX_RUN_MODES, isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
+import type {
+  SandboxChatRuntime,
+  SandboxRunModePreference,
+} from '@/modules/sandboxRuntime'
+import {
+  SANDBOX_RUN_MODES,
+  isRecognizedSandboxRunMode,
+  normalizeSandboxRunMode,
+  type SandboxRunMode,
+} from '@/types/sandbox'
 
 export const RUN_MODE_STORAGE_KEY = 'opensquilla.chat.runMode'
 
@@ -12,6 +21,7 @@ export interface RunModePolicy {
 
 interface UseChatRunModePreferenceOptions {
   runModePolicy: () => RunModePolicy | null | undefined
+  sandbox: Pick<SandboxChatRuntime, 'preference' | 'selectMode'>
 }
 
 function availableStorage(): Storage | null {
@@ -26,7 +36,10 @@ function availableStorage(): Storage | null {
 function readStoredRunMode(): SandboxRunMode | null {
   try {
     const value = availableStorage()?.getItem(RUN_MODE_STORAGE_KEY)
-    return isSandboxRunMode(value) ? value : null
+    if (!isRecognizedSandboxRunMode(value)) return null
+    const normalized = normalizeSandboxRunMode(value)
+    if (value !== normalized) availableStorage()?.setItem(RUN_MODE_STORAGE_KEY, normalized)
+    return normalized
   } catch {
     return null
   }
@@ -53,17 +66,17 @@ function preferredRunMode(
   preferred: SandboxRunMode,
 ): SandboxRunMode {
   if (modes.includes(preferred)) return preferred
-  if (modes.includes('trusted')) return 'trusted'
-  return modes[0] ?? 'trusted'
+  if (modes.includes('safe')) return 'safe'
+  return modes[0] ?? 'safe'
 }
 
 export function useChatRunModePreference(options: UseChatRunModePreferenceOptions) {
-  // Default to full host access. For the local owner the backend policy already
-  // reports 'full'; this seeds it before the policy loads (no trusted flicker).
-  // Remote non-owners still get 'trusted' from their policy, and the backend
-  // coerces disallowed modes, so this does not weaken the sandbox boundary.
+  // Full Access is the product default until the principal-specific backend
+  // preference arrives. Sandbox readiness is reconciled separately by ChatView.
   const runMode = ref<SandboxRunMode>('full')
   const runModeUserSelected = ref(false)
+  const runModeHydrated = ref(false)
+  let writeSequence = 0
 
   const currentRunModePolicy = computed(() => {
     const policy = options.runModePolicy()
@@ -72,49 +85,117 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
 
   const runModePolicyDefault = computed<SandboxRunMode>(() => {
     const raw = currentRunModePolicy.value?.defaultRunMode
-    // Fall back to 'full' only when the policy omits a default; the backend
-    // always supplies 'trusted' for non-owner principals, so they are unaffected.
-    return isSandboxRunMode(raw) ? raw : 'full'
+    return isRecognizedSandboxRunMode(raw) ? normalizeSandboxRunMode(raw) : 'full'
   })
 
   const allowedRunModes = computed<SandboxRunMode[]>(() => {
     const raw = currentRunModePolicy.value?.allowedRunModes
     if (!Array.isArray(raw)) return [...SANDBOX_RUN_MODES]
-    const allowed = raw.filter(isSandboxRunMode)
+    const allowed = raw
+      .filter(isRecognizedSandboxRunMode)
+      .map(value => normalizeSandboxRunMode(value))
+      .filter((value, index, values) => values.indexOf(value) === index)
     return allowed.length > 0 ? allowed : [...SANDBOX_RUN_MODES]
   })
 
+  let initialized = false
   watch([allowedRunModes, runModePolicyDefault], ([modes, defaultMode]) => {
-    const storedMode = readStoredRunMode()
-    if (storedMode && modes.includes(storedMode)) {
-      runMode.value = storedMode
-      runModeUserSelected.value = true
+    if (!initialized) {
+      initialized = true
+      const storedMode = readStoredRunMode()
+      if (storedMode && modes.includes(storedMode)) {
+        runMode.value = storedMode
+        runModeUserSelected.value = true
+        return
+      }
+      if (storedMode) clearStoredRunMode()
+      runMode.value = preferredRunMode(modes, defaultMode)
       return
     }
-    if (storedMode) clearStoredRunMode()
-
-    if (runModeUserSelected.value && modes.includes(runMode.value)) return
-
+    if (modes.includes(runMode.value)) return
+    const fallback = preferredRunMode(modes, defaultMode)
+    runMode.value = fallback
     runModeUserSelected.value = false
-    runMode.value = preferredRunMode(modes, defaultMode)
+    if (runModeHydrated.value) writeStoredRunMode(fallback)
   }, { immediate: true })
 
-  function setRunMode(mode: SandboxRunMode): SandboxRunMode {
-    const next = modesSafeIncludes(allowedRunModes.value, mode)
-      ? mode
+  function normalizePreference(mode: unknown): SandboxRunMode {
+    const candidate = isRecognizedSandboxRunMode(mode)
+      ? normalizeSandboxRunMode(mode)
+      : runModePolicyDefault.value
+    return modesSafeIncludes(allowedRunModes.value, candidate)
+      ? candidate
       : preferredRunMode(allowedRunModes.value, runModePolicyDefault.value)
+  }
+
+  function applyConfirmedPreference(
+    mode: unknown,
+    options: { selected: boolean },
+  ): SandboxRunMode {
+    const next = normalizePreference(mode)
     runMode.value = next
-    runModeUserSelected.value = true
+    runModeUserSelected.value = options.selected
+    runModeHydrated.value = true
     writeStoredRunMode(next)
     return next
+  }
+
+  async function hydrateRunModePreference(): Promise<SandboxRunMode> {
+    const preference = await options.sandbox.preference({ timeoutMs: 10_000 })
+    return applyConfirmedPreference(
+      preference.runMode,
+      { selected: preference.source === 'preference' },
+    )
+  }
+
+  async function setGlobalRunMode(mode: SandboxRunMode): Promise<SandboxRunMode> {
+    const requested = modesSafeIncludes(allowedRunModes.value, mode)
+      ? mode
+      : preferredRunMode(allowedRunModes.value, runModePolicyDefault.value)
+    const previous = runMode.value
+    const previousSelected = runModeUserSelected.value
+    const sequence = ++writeSequence
+
+    // A mode switch is a local interaction first. Reflect it immediately so a
+    // slow or queued persistence request cannot make the composer look stuck.
+    // Browser storage remains confirmation-only.
+    runMode.value = requested
+    runModeUserSelected.value = true
+
+    try {
+      const preference = await options.sandbox.selectMode(requested, { timeoutMs: 5_000 })
+      if (sequence !== writeSequence) return runMode.value
+      return applyConfirmedPreference(
+        preference.runMode,
+        { selected: true },
+      )
+    } catch (cause) {
+      if (sequence === writeSequence) {
+        runMode.value = previous
+        runModeUserSelected.value = previousSelected
+      }
+      throw cause
+    }
+  }
+
+  function applyRunModePreferenceChanged(
+    preference: SandboxRunModePreference,
+  ): SandboxRunMode {
+    return applyConfirmedPreference(
+      preference.runMode,
+      { selected: true },
+    )
   }
 
   return {
     runMode,
     runModeUserSelected,
+    runModeHydrated,
     runModePolicyDefault,
     allowedRunModes,
-    setRunMode,
+    hydrateRunModePreference,
+    setGlobalRunMode,
+    applyRunModePreferenceChanged,
   }
 }
 

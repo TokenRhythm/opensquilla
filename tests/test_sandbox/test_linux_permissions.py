@@ -6,11 +6,13 @@ from pathlib import Path
 import pytest
 
 from opensquilla.sandbox.backend.linux_permissions import compile_linux_permissions
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.permissions import (
     FileSystemAccess,
     FileSystemPermissionEntry,
     FileSystemPermissionProfile,
 )
+from opensquilla.sandbox.policy import build_policy
 from opensquilla.sandbox.types import (
     MountSpec,
     NetworkMode,
@@ -18,6 +20,13 @@ from opensquilla.sandbox.types import (
     SandboxPolicy,
     SecurityLevel,
 )
+
+
+def _make_directory_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlink unsupported/unavailable: {exc}")
 
 
 def _policy(tmp_path: Path, *, network: NetworkMode = NetworkMode.NONE) -> SandboxPolicy:
@@ -203,7 +212,7 @@ def test_compile_linux_permissions_compiles_effective_profile_entries(
     assert compiled.denied_roots == (denied,)
     assert compiled.denied_globs == (str(workspace / "**" / ".env"),)
     assert readonly in compiled.protected_subpaths
-    assert denied not in compiled.protected_subpaths
+    assert denied in compiled.protected_subpaths
     assert workspace / ".git" in compiled.protected_subpaths
     assert compiled.read_all is profile.has_full_disk_read_baseline
     assert profile.unsandboxed_execution_allowed is False
@@ -229,6 +238,309 @@ def test_compile_linux_permissions_compiles_workspace_profile(tmp_path: Path) ->
     assert compiled.read_all is profile.has_full_disk_read_baseline
     assert workspace in {root.host_path for root in compiled.write_roots}
     assert workspace / ".git" in compiled.protected_subpaths
+
+
+@pytest.mark.parametrize(
+    "access",
+    (FileSystemAccess.READ, FileSystemAccess.DENY),
+)
+def test_compile_linux_permissions_protects_all_symlinked_carveout_variants(
+    tmp_path: Path,
+    access: FileSystemAccess,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "outside-target"
+    workspace.mkdir()
+    target.mkdir()
+    logical = workspace / "carveout-link"
+    _make_directory_symlink(logical, target)
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(
+                target,
+                access,
+                logical_path=logical,
+            ),
+        )
+    )
+    policy = replace(
+        _policy(tmp_path),
+        mounts=(),
+        workspace_rw=False,
+        file_system=profile,
+    )
+
+    compiled = compile_linux_permissions(policy)
+
+    assert logical in compiled.protected_subpaths
+    assert target in compiled.protected_subpaths
+    if access is FileSystemAccess.READ:
+        assert target in {root.host_path for root in compiled.read_roots}
+        assert logical not in {root.host_path for root in compiled.read_roots}
+        assert compiled.denied_roots == ()
+    else:
+        assert compiled.denied_roots == (logical, target)
+
+
+def test_compile_linux_permissions_protects_retargeted_metadata_symlink(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_target = tmp_path / "frozen-target"
+    current_target = tmp_path / "current-target"
+    workspace.mkdir()
+    frozen_target.mkdir()
+    current_target.mkdir()
+    logical = workspace / ".git"
+    _make_directory_symlink(logical, frozen_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    logical.unlink()
+    _make_directory_symlink(logical, current_target)
+    policy = replace(
+        _policy(tmp_path),
+        mounts=(),
+        workspace_rw=False,
+        file_system=profile,
+    )
+
+    compiled = compile_linux_permissions(policy)
+
+    assert logical in compiled.protected_subpaths
+    assert frozen_target in compiled.protected_subpaths
+    assert current_target in compiled.protected_subpaths
+
+
+def test_compile_linux_permissions_denies_all_retargeted_alias_variants(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_target = tmp_path / "frozen-secret"
+    current_target = tmp_path / "current-secret"
+    logical = tmp_path / "secret-alias"
+    workspace.mkdir()
+    frozen_target.mkdir()
+    current_target.mkdir()
+    _make_directory_symlink(logical, frozen_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        denied_read_roots=(logical,),
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    logical.unlink()
+    _make_directory_symlink(logical, current_target)
+    policy = replace(
+        _policy(tmp_path),
+        mounts=(),
+        workspace_rw=False,
+        file_system=profile,
+    )
+
+    compiled = compile_linux_permissions(policy)
+
+    assert compiled.denied_roots == (
+        logical,
+        frozen_target,
+        current_target,
+    )
+
+
+def test_compile_linux_permissions_rejects_retargeted_write_root(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    writable_root = tmp_path / "writable-root"
+    current_target = tmp_path / "current-target"
+    workspace.mkdir()
+    writable_root.mkdir()
+    current_target.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        writable_roots=(writable_root,),
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    writable_root.rmdir()
+    _make_directory_symlink(writable_root, current_target)
+    policy = replace(
+        _policy(tmp_path),
+        mounts=(),
+        workspace_rw=False,
+        file_system=profile,
+    )
+
+    with pytest.raises(ValueError, match="retargeted writable filesystem root"):
+        compile_linux_permissions(policy)
+
+
+def test_compile_linux_permissions_does_not_follow_retargeted_write_alias(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_target = tmp_path / "frozen-target"
+    current_target = tmp_path / "current-target"
+    logical = tmp_path / "writable-alias"
+    workspace.mkdir()
+    frozen_target.mkdir()
+    current_target.mkdir()
+    _make_directory_symlink(logical, frozen_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        writable_roots=(logical,),
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+        protect_metadata=False,
+    )
+    logical.unlink()
+    _make_directory_symlink(logical, current_target)
+    policy = replace(
+        _policy(tmp_path),
+        mounts=(),
+        workspace_rw=False,
+        file_system=profile,
+    )
+
+    compiled = compile_linux_permissions(policy)
+
+    write_roots = {root.host_path for root in compiled.write_roots}
+    assert frozen_target in write_roots
+    assert logical not in write_roots
+    assert current_target not in write_roots
+
+
+def test_compile_linux_permissions_freezes_retargeted_built_policy_rw_mount(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_target = tmp_path / "frozen-target"
+    current_target = tmp_path / "current-target"
+    logical = tmp_path / "writable-alias"
+    workspace.mkdir()
+    frozen_target.mkdir()
+    current_target.mkdir()
+    _make_directory_symlink(logical, frozen_target)
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        workspace,
+        SandboxSettings(
+            host_root_readonly=False,
+            network_default="none",
+            extra_rw_mounts=[str(logical)],
+            exclude_slash_tmp=True,
+            exclude_tmpdir_env_var=True,
+        ),
+    )
+    logical.unlink()
+    _make_directory_symlink(logical, current_target)
+
+    compiled = compile_linux_permissions(policy)
+
+    assert any(
+        root.host_path == frozen_target and root.sandbox_path == logical
+        for root in compiled.write_roots
+    )
+    assert logical not in {root.host_path for root in compiled.write_roots}
+    assert current_target not in {root.host_path for root in compiled.write_roots}
+
+
+def test_compile_linux_permissions_preserves_stable_symlink_mount_mapping(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_target = tmp_path / "frozen-target"
+    logical = tmp_path / "writable-alias"
+    sandbox_path = Path("/mounted/generated")
+    workspace.mkdir()
+    frozen_target.mkdir()
+    _make_directory_symlink(logical, frozen_target)
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        workspace,
+        SandboxSettings(
+            host_root_readonly=False,
+            network_default="none",
+            extra_rw_mounts=[str(logical)],
+            exclude_slash_tmp=True,
+            exclude_tmpdir_env_var=True,
+        ),
+    )
+    policy = replace(
+        policy,
+        mounts=tuple(
+            replace(mount, sandbox_path=sandbox_path) if mount.host_path == logical else mount
+            for mount in policy.mounts
+        ),
+    )
+
+    compiled = compile_linux_permissions(policy)
+
+    assert any(
+        root.host_path == frozen_target and root.sandbox_path == sandbox_path
+        for root in compiled.write_roots
+    )
+
+
+@pytest.mark.parametrize(
+    "restricted_access",
+    (FileSystemAccess.READ, FileSystemAccess.DENY),
+)
+def test_compile_linux_permissions_removes_exact_conflicting_alias_write_root(
+    tmp_path: Path,
+    restricted_access: FileSystemAccess,
+) -> None:
+    target = tmp_path / "shared-target"
+    writable_alias = tmp_path / "writable-alias"
+    restricted_alias = tmp_path / "restricted-alias"
+    sandbox_path = Path("/mounted/shared")
+    target.mkdir()
+    _make_directory_symlink(writable_alias, target)
+    _make_directory_symlink(restricted_alias, target)
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(
+                target,
+                FileSystemAccess.WRITE,
+                logical_path=writable_alias,
+            ),
+            FileSystemPermissionEntry(
+                target,
+                restricted_access,
+                logical_path=restricted_alias,
+            ),
+        )
+    )
+    policy = replace(
+        _policy(tmp_path),
+        mounts=(
+            MountSpec(
+                host_path=writable_alias,
+                sandbox_path=sandbox_path,
+                mode="rw",
+                required=True,
+            ),
+        ),
+        file_system=profile,
+    )
+
+    compiled = compile_linux_permissions(policy)
+
+    assert profile.resolve(target) is restricted_access
+    assert compiled.write_roots == ()
+    if restricted_access is FileSystemAccess.READ:
+        assert any(
+            root.host_path == target and root.sandbox_path == sandbox_path
+            for root in compiled.read_roots
+        )
+    else:
+        assert target not in {root.host_path for root in compiled.read_roots}
+        assert {restricted_alias, target} <= set(compiled.denied_roots)
 
 
 def test_compile_linux_permissions_has_no_builtin_sensitive_deny_roots(

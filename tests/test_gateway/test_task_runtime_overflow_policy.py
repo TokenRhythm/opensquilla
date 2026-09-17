@@ -208,7 +208,11 @@ async def test_drop_oldest_closes_evicted_input_disposition() -> None:
     await asyncio.wait_for(started.wait(), timeout=1.0)
     victim_env = replace(
         env,
-        metadata={"client_message_id": "client-victim", "surface_id": "tui:test"},
+        metadata={
+            "client_request_id": "request-victim",
+            "client_message_id": "client-victim",
+            "surface_id": "tui:test",
+        },
     )
     victim = await rt.enqueue(
         victim_env,
@@ -226,6 +230,7 @@ async def test_drop_oldest_closes_evicted_input_disposition() -> None:
             "message-overflow-victim",
             {
                 "turn_id": victim.task_id,
+                "client_request_id": "request-victim",
                 "client_message_id": "client-victim",
                 "surface_id": "tui:test",
                 "intent": "send",
@@ -238,6 +243,7 @@ async def test_drop_oldest_closes_evicted_input_disposition() -> None:
         payload for _session, name, payload in events if name == "session.event.input_disposition"
     )
     assert disposition["turn_id"] == victim.task_id
+    assert disposition["client_request_id"] == "request-victim"
     assert disposition["disposition"] == "cancelled"
     assert disposition["terminal_reason"] == "dropped_by_overflow"
 

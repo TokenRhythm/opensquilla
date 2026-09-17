@@ -74,6 +74,15 @@ describe('model-input image detection', () => {
 })
 
 describe('attachment display normalization', () => {
+  it('preserves the opaque attachment identity used by Workbench actions', () => {
+    expect(normalizeDisplayAttachment({
+      attachment_id: 'att_opaque_fixture',
+      name: 'page.html',
+      mime: 'text/html',
+      sha256_ref: 'a'.repeat(64),
+    }).attachmentId).toBe('att_opaque_fixture')
+  })
+
   it('renders inline HTML history attachments as downloadable file chips without DOM data', () => {
     const attachment = normalizeDisplayAttachment(
       { type: 'text/html', name: 'preview.html', data: 'PGh0bWw+' },
@@ -133,6 +142,23 @@ describe('attachment display normalization', () => {
     })
     expect(JSON.stringify(attachment)).not.toContain('u-secret')
     expect(attachment.data).toBeUndefined()
+  })
+
+  it('accepts the semantic camel-case projection from the Session Read Adapter', () => {
+    const attachment = normalizeDisplayAttachment({
+      mimeType: 'application/pdf',
+      sha256Ref: 'e'.repeat(64),
+      attachmentId: 'attachment-e',
+      downloadUrl: '/api/v1/attachments/e',
+    })
+
+    expect(attachment).toMatchObject({
+      kind: 'staged',
+      mime: 'application/pdf',
+      sha256_ref: 'e'.repeat(64),
+      attachmentId: 'attachment-e',
+      download_url: '/api/v1/attachments/e',
+    })
   })
 
   it('chooses the first valid MIME-like value and ignores generic type values', () => {

@@ -7,6 +7,8 @@ import i18n, {
   isSupportedLocale,
   type LocaleCode,
 } from '@/i18n'
+import { useToasts } from '@/composables/useToasts'
+import type { AppSettings } from '@/modules/appSettings'
 import { getManifest, isValueThemeId, normalizeThemeId, themePickerOptions } from '@/themes/registry'
 import { ensureThemeWorld } from '@/themes/apply'
 import {
@@ -16,13 +18,57 @@ import {
   parseSidebarWidthPreference,
   type SidebarWidthPreference,
 } from '@/utils/sidebarLayout'
+import type { ChatLiveConnectionPhase } from '@/utils/chat/chatConnectionState'
 
 // 'system' or any registered value-theme id. The string branch keeps custom
 // themes typeable while preserving autocomplete for the built-ins.
 export type ThemeMode = 'light' | 'dark' | 'system' | (string & {})
 
+const LOCALE_SYNC_PENDING_KEY = 'opensquilla-locale-sync-pending'
+
+function readPendingLocaleSync(): LocaleCode | null {
+  try {
+    const saved = localStorage.getItem(LOCALE_SYNC_PENDING_KEY)
+    return isSupportedLocale(saved) ? saved : null
+  } catch {
+    return null
+  }
+}
+
 type FeatureWindow = Window & {
   OPENSQUILLA_FEATURES?: Record<string, boolean>
+}
+
+// The release-default annotation surface is safe only when the renderer and
+// Desktop shell were shipped as one complete protocol-v3 unit. This is a
+// synchronous shape check by design: asynchronous runtime capability queries
+// still run when a preview opens and may fail closed for that document.
+const NATIVE_V3_ANNOTATION_BRIDGE_METHODS = [
+  'createArtifactPreviewLease',
+  'renewArtifactPreviewLease',
+  'revokeArtifactPreviewLease',
+  'createSurface',
+  'setSurfaceRect',
+  'activateSurface',
+  'destroySurface',
+  'onSurfaceEvent',
+  'getArtifactAnnotationCapabilities',
+  'setArtifactAnnotationMode',
+  'showArtifactAnnotationOverlay',
+  'closeArtifactAnnotationOverlay',
+  'getWorkbenchBrowserTarget',
+  'focusWorkbenchAnnotation',
+  'captureWorkbenchScreenshot',
+] as const
+
+function hasNativeV3AnnotationBridge(): boolean {
+  const platform = getPlatform()
+  const api = platform.workbench.native as unknown as Record<string, unknown> | undefined
+  return Boolean(
+    platform.capabilities.isDesktop
+    && api
+    && NATIVE_V3_ANNOTATION_BRIDGE_METHODS.every(method => typeof api[method] === 'function'),
+  )
 }
 
 function hydrateSidebarWidthPreference(): SidebarWidthPreference {
@@ -33,7 +79,7 @@ function hydrateSidebarWidthPreference(): SidebarWidthPreference {
   }
 }
 
-/** One pending approval, ordered oldest-first (closest to timeout). */
+/** One pending approval, ordered oldest-first. */
 export interface PendingApproval {
   approvalId: string
   sessionKey: string
@@ -41,14 +87,23 @@ export interface PendingApproval {
   command: string
 }
 
+/** One-shot request for ChatView to reveal and focus a pending approval card. */
+export interface ApprovalFocusRequest {
+  requestId: number
+  approvalId: string
+  sessionKey: string
+}
+
 export const useAppStore = defineStore('app', () => {
   const theme = ref<ThemeMode>('system')
-  // Active UI locale. Mirrors the theme pattern: localStorage is the source of
-  // truth, set instantly with no save, applied to <html lang>/dir and the
-  // vue-i18n instance. The sidebar/topbar switcher and the Settings Appearance
-  // Language row both write through setLocale, so they can never drift.
+  // Active UI locale. Browser-local storage preserves the immediate UI
+  // preference; an explicit selection also syncs the Gateway-wide language
+  // used for fixed channel notices. The sidebar/topbar switcher and the
+  // Settings Appearance Language row both write through setLocale.
   const locale = ref<LocaleCode>('en')
+  const pendingChannelNoticeLocale = ref<LocaleCode | null>(readPendingLocaleSync())
   const sidebarOpen = ref(true)
+  const chatLivePhase = ref<ChatLiveConnectionPhase>('idle')
   // Browser-local layout preference, hydrated synchronously so the first
   // mounted frame uses the saved width. Viewport clamping is intentionally a
   // consumer concern: zooming or rotating must not overwrite this preference.
@@ -59,6 +114,8 @@ export const useAppStore = defineStore('app', () => {
   // still supports snapshot consumers (back-compat).
   const pendingApprovals = ref<PendingApproval[]>([])
   const approvalCountRaw = ref(0)
+  const approvalFocusRequest = ref<ApprovalFocusRequest | null>(null)
+  let approvalFocusRequestId = 0
 
   // True once App.vue has wired the live approval source (push events + seed
   // fetch). While live, `approvalCount` is derived from `pendingApprovals`;
@@ -69,7 +126,7 @@ export const useAppStore = defineStore('app', () => {
   const approvalCount = computed(() =>
     approvalsLive.value ? pendingApprovals.value.length : approvalCountRaw.value)
 
-  // The oldest pending approval with a routable session (closest to timeout).
+  // The oldest pending approval with a routable session.
   const oldestPendingWithSession = computed<PendingApproval | null>(() =>
     pendingApprovals.value.find(item => !!item.sessionKey) ?? null)
 
@@ -84,16 +141,33 @@ export const useAppStore = defineStore('app', () => {
     return systemDark.value ? 'dark' : 'light'
   })
 
-  const desktopNativeThemeSource = computed<'light' | 'dark'>(() => {
-    const colorScheme = getManifest(resolvedTheme.value)?.capabilities.colorScheme
+  const desktopNativeThemeSource = computed<'light' | 'dark' | 'system'>(() => {
+    // Keep Electron on its native system source while the UI is in system mode.
+    // Resolving that choice to a fixed light/dark source would override the OS,
+    // which in turn freezes the renderer's prefers-color-scheme media query.
+    if (theme.value === 'system') return 'system'
+    const colorScheme = getManifest(theme.value)?.capabilities.colorScheme
     if (colorScheme === 'light') return 'light'
     if (colorScheme === 'dark') return 'dark'
-    return systemDark.value ? 'dark' : 'light'
+    // A theme that supports both schemes (or omits the capability) should leave
+    // native chrome under OS control instead of snapshotting the current scheme.
+    return 'system'
   })
 
   let mq: MediaQueryList | null = null
   let mqHandler: ((e: MediaQueryListEvent) => void) | null = null
   let themeWatchStop: (() => void) | null = null
+  let localeSyncPromise: Promise<void> | null = null
+  let localeSyncWarningShown = false
+  let localeSelectionRevision = 0
+  let pendingLocaleSyncRevision = 0
+  let pendingLocaleSyncAutomatic = false
+  let appSettings: AppSettings | null = null
+
+  function bindAppSettings(settings: AppSettings) {
+    appSettings = settings
+  }
+  const { pushToast } = useToasts()
 
   function applyTheme() {
     const platform = getPlatform()
@@ -101,7 +175,9 @@ export const useAppStore = defineStore('app', () => {
     // Lazily bring in the theme's global "world" layer (structure/type/texture)
     // if it has one; flat value themes have no world and this is a no-op.
     void ensureThemeWorld(resolvedTheme.value)
-    void platform.setNativeTheme({ source: desktopNativeThemeSource.value })
+    void platform
+      .setNativeTheme({ source: desktopNativeThemeSource.value })
+      .catch(() => undefined)
   }
 
   function initTheme() {
@@ -132,19 +208,33 @@ export const useAppStore = defineStore('app', () => {
       // ignore
     }
 
+    // Wire the OS listener before the immediate apply. On desktop, applying a
+    // fixed theme also changes Electron's prefers-color-scheme; listening first
+    // ensures that feedback cannot land between the initial apply and setup.
+    if (!mq) {
+      mq = window.matchMedia('(prefers-color-scheme: dark)')
+      mqHandler = (e: MediaQueryListEvent) => {
+        systemDark.value = e.matches
+      }
+      if (mq.addEventListener) mq.addEventListener('change', mqHandler)
+      else if (mq.addListener) mq.addListener(mqHandler)
+    }
+    // Re-snapshot on every init so destroy/re-init cannot retain a stale OS
+    // preference from the previous listener lifetime.
+    systemDark.value = mq.matches
+
     if (!themeWatchStop) {
-      themeWatchStop = watch(resolvedTheme, applyTheme, { immediate: true })
+      // Both axes matter: dark -> system can leave resolvedTheme at "dark" but
+      // must still send source:"system" to Electron. Conversely, an OS change
+      // in system mode changes resolvedTheme while the native source stays system.
+      themeWatchStop = watch(
+        [resolvedTheme, desktopNativeThemeSource],
+        applyTheme,
+        { immediate: true },
+      )
     } else {
       applyTheme()
     }
-
-    if (mq) return // idempotent
-    mq = window.matchMedia('(prefers-color-scheme: dark)')
-    mqHandler = (e: MediaQueryListEvent) => {
-      systemDark.value = e.matches
-    }
-    if (mq.addEventListener) mq.addEventListener('change', mqHandler)
-    else if (mq.addListener) mq.addListener(mqHandler)
   }
 
   function destroyTheme() {
@@ -182,23 +272,110 @@ export const useAppStore = defineStore('app', () => {
     document.documentElement.setAttribute('dir', 'ltr')
   }
 
+  function savePendingLocaleSync(code: LocaleCode, automatic = false) {
+    pendingLocaleSyncRevision += 1
+    pendingLocaleSyncAutomatic = automatic
+    pendingChannelNoticeLocale.value = code
+    // Startup resolves again after a restart. Only explicit selections need a
+    // durable retry, and startup must never replace an existing explicit one.
+    if (!automatic) {
+      try { localStorage.setItem(LOCALE_SYNC_PENDING_KEY, code) } catch {}
+    }
+  }
+
+  function clearPendingLocaleSync(revision: number) {
+    if (pendingLocaleSyncRevision !== revision) return
+    pendingChannelNoticeLocale.value = null
+    if (!pendingLocaleSyncAutomatic) {
+      try { localStorage.removeItem(LOCALE_SYNC_PENDING_KEY) } catch {}
+    }
+  }
+
+  function notifyLocaleSyncPending() {
+    if (localeSyncWarningShown) return
+    localeSyncWarningShown = true
+    pushToast(i18n.global.t('settings.appearance.channelNoticeLocaleSyncPending'), { tone: 'warn' })
+  }
+
+  async function syncLocaleToGateway(
+    { warnOnUnavailable = true }: { warnOnUnavailable?: boolean } = {},
+  ): Promise<void> {
+    if (localeSyncPromise) return localeSyncPromise
+    let attemptedRevision = pendingLocaleSyncRevision
+    localeSyncPromise = (async () => {
+      while (pendingChannelNoticeLocale.value) {
+        attemptedRevision = pendingLocaleSyncRevision
+        if (!appSettings) {
+          if (warnOnUnavailable) notifyLocaleSyncPending()
+          return
+        }
+        const target = pendingChannelNoticeLocale.value
+        const revision = pendingLocaleSyncRevision
+        const settings = appSettings
+        try {
+          if (pendingLocaleSyncAutomatic) {
+            const current = await settings.read('control_ui.default_locale')
+            // A user can explicitly choose even the same locale during this
+            // read. That new intent still needs its own durable write.
+            if (revision !== pendingLocaleSyncRevision) continue
+            if (current === target) {
+              clearPendingLocaleSync(revision)
+              localeSyncWarningShown = false
+              continue
+            }
+          }
+          await settings.patchSafe([
+            { path: 'control_ui.default_locale', value: target },
+          ])
+          clearPendingLocaleSync(revision)
+          localeSyncWarningShown = false
+        } catch {
+          if (revision !== pendingLocaleSyncRevision) continue
+          // Retry the current intent after reconnect, retaining whether it was
+          // automatic or an explicit selection.
+          if (warnOnUnavailable) notifyLocaleSyncPending()
+          return
+        }
+      }
+    })().finally(() => {
+      localeSyncPromise = null
+      // A selection can finish loading between the last loop check and this
+      // finalizer. Drain that newer intent, without retrying a failed one here.
+      if (pendingChannelNoticeLocale.value && pendingLocaleSyncRevision !== attemptedRevision) {
+        return syncLocaleToGateway({ warnOnUnavailable })
+      }
+    })
+    return localeSyncPromise
+  }
+
   // Resolve and apply the startup locale (saved → OS locale → data-locale →
   // <html lang> → navigator → en). Loads the locale chunk before applying so the
   // first paint is never half-translated; a failed chunk load falls back to en.
-  // Does NOT write localStorage — it only reflects what is already chosen.
+  // It does not replace the browser's saved UI preference.
+  // Desktop has one native client locale, so it queues that value for the
+  // Gateway-wide channel-notice setting without making a disconnected startup
+  // noisy. Browser clients remain read-only until an explicit language choice.
   async function initLocale() {
+    const selectionRevision = localeSelectionRevision
     let osLocale: string | undefined
+    const platform = getPlatform()
     try {
-      osLocale = await getPlatform().getOsLocale()
+      osLocale = await platform.getOsLocale()
     } catch {
       osLocale = undefined
     }
     const resolved = resolveInitialLocale(osLocale)
     try {
       await loadLocaleMessages(resolved)
+      if (selectionRevision !== localeSelectionRevision) return
       locale.value = resolved
       applyLocale(resolved)
+      if (platform.capabilities.isDesktop) {
+        if (!pendingChannelNoticeLocale.value) savePendingLocaleSync(resolved, true)
+        void syncLocaleToGateway({ warnOnUnavailable: false })
+      }
     } catch {
+      if (selectionRevision !== localeSelectionRevision) return
       locale.value = 'en'
       applyLocale('en')
     }
@@ -206,19 +383,27 @@ export const useAppStore = defineStore('app', () => {
 
   async function setLocale(code: LocaleCode) {
     if (!isSupportedLocale(code)) return
+    const selectionRevision = ++localeSelectionRevision
     let target = code
     try {
       await loadLocaleMessages(target)
     } catch {
       target = 'en'
     }
+    if (selectionRevision !== localeSelectionRevision) return
     locale.value = target
     try { localStorage.setItem('opensquilla-locale', target) } catch {}
     applyLocale(target)
+    savePendingLocaleSync(target)
+    await syncLocaleToGateway()
   }
 
   function setSidebarOpen(open: boolean) {
     sidebarOpen.value = open
+  }
+
+  function setChatLivePhase(phase: ChatLiveConnectionPhase) {
+    chatLivePhase.value = phase
   }
 
   function toggleSidebar() {
@@ -273,6 +458,48 @@ export const useAppStore = defineStore('app', () => {
   function removePendingApproval(approvalId: string) {
     approvalsLive.value = true
     pendingApprovals.value = pendingApprovals.value.filter(a => a.approvalId !== approvalId)
+    if (approvalFocusRequest.value?.approvalId === approvalId) {
+      approvalFocusRequest.value = null
+    }
+  }
+
+  // A deleted session cannot own an actionable approval. Apply this locally
+  // as an idempotent latency guard; the Gateway remains authoritative and
+  // emits the matching `*.approval.resolved` events.
+  function removePendingApprovalsForSessions(sessionKeys: Iterable<string>) {
+    const keys = new Set(
+      [...sessionKeys]
+        .map(key => String(key || '').trim())
+        .filter(Boolean),
+    )
+    if (keys.size === 0) return
+    approvalsLive.value = true
+    pendingApprovals.value = pendingApprovals.value.filter(
+      approval => !keys.has(approval.sessionKey),
+    )
+    if (
+      approvalFocusRequest.value
+      && keys.has(approvalFocusRequest.value.sessionKey)
+    ) {
+      approvalFocusRequest.value = null
+    }
+  }
+
+  function requestApprovalFocus(
+    approval: Pick<PendingApproval, 'approvalId' | 'sessionKey'>,
+  ) {
+    if (!approval.approvalId || !approval.sessionKey) return
+    approvalFocusRequest.value = {
+      requestId: ++approvalFocusRequestId,
+      approvalId: approval.approvalId,
+      sessionKey: approval.sessionKey,
+    }
+  }
+
+  function clearApprovalFocusRequest(requestId: number) {
+    if (approvalFocusRequest.value?.requestId === requestId) {
+      approvalFocusRequest.value = null
+    }
   }
 
   const features = ref<Record<string, boolean>>({
@@ -283,26 +510,44 @@ export const useAppStore = defineStore('app', () => {
     // window.OPENSQUILLA_FEATURES. The preflight + ribbon cards are always-on
     // (driven by stream events) regardless of this flag.
     metaRuns: true,
+    // Application-level artifact Workbench. Operators can temporarily disable
+    // it to retain the previous Drawer/lightbox flow for one release cycle.
+    artifactWorkbench: true,
+    // Versioned HTML resource preview/edit is the V1 default on every client.
+    // Individual document capabilities still decide which actions are shown.
+    documentWorkbenchResources: true,
+    // DOM selection is Desktop-only and defaults on only for a shell exposing
+    // the complete native protocol-v3 annotation path. Older or partial shells
+    // fail closed while retaining the ordinary HTML Workbench.
+    artifactPromptAnnotations: hasNativeV3AnnotationBridge(),
+    // Keep operator/test overrides last. In particular, an explicit `false`
+    // remains the release emergency kill switch even on a complete Desktop.
     ...((window as FeatureWindow).OPENSQUILLA_FEATURES || {}),
   })
 
   return {
     theme,
     locale,
+    pendingChannelNoticeLocale,
     resolvedTheme,
     sidebarOpen,
+    chatLivePhase,
     sidebarWidthPreference,
     approvalCount,
     pendingApprovals,
     oldestPendingWithSession,
+    approvalFocusRequest,
     features,
     initTheme,
     destroyTheme,
     setTheme,
     cycleTheme,
     initLocale,
+    bindAppSettings,
     setLocale,
+    syncLocaleToGateway,
     setSidebarOpen,
+    setChatLivePhase,
     toggleSidebar,
     setSidebarWidthPreference,
     resetSidebarWidthPreference,
@@ -310,5 +555,8 @@ export const useAppStore = defineStore('app', () => {
     setPendingApprovals,
     upsertPendingApproval,
     removePendingApproval,
+    removePendingApprovalsForSessions,
+    requestApprovalFocus,
+    clearApprovalFocusRequest,
   }
 })

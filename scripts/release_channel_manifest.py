@@ -19,7 +19,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 SCHEMA_VERSION = 1
-GITHUB_RELEASE_PAGE_ROOT = "https://github.com/opensquilla/opensquilla/releases/tag"
+GITHUB_RELEASE_PAGE_ROOT = "https://github.com/TokenRhythm/opensquilla/releases/tag"
+# Existing v1 clients require this exact URL spelling. Keep it for every v1
+# channel indefinitely so clients that skip releases can still discover updates.
+LEGACY_V1_RELEASE_PAGE_ROOT = "https://github.com/opensquilla/opensquilla/releases/tag"
 _TAG_RE = re.compile(
     r"^v(?P<major>0|[1-9]\d*)[.](?P<minor>0|[1-9]\d*)[.]"
     r"(?P<patch>0|[1-9]\d*)(?:rc(?P<rc>0|[1-9]\d*))?$"
@@ -116,7 +119,7 @@ def _published_at(value: object, *, field: str) -> str:
 
 
 def _release_url(tag: str) -> str:
-    return f"{GITHUB_RELEASE_PAGE_ROOT}/{tag}"
+    return f"{LEGACY_V1_RELEASE_PAGE_ROOT}/{tag}"
 
 
 def _expected_platforms(version: ReleaseVersion) -> dict[str, dict[str, str]]:
@@ -160,8 +163,8 @@ def build_manifest(
 
     published_at = _published_at(release.get("publishedAt"), field="release publishedAt")
     release_url = release.get("url")
-    expected_release_url = _release_url(tag)
-    if release_url != expected_release_url:
+    expected_release_url = f"{GITHUB_RELEASE_PAGE_ROOT}/{tag}"
+    if release_url not in (expected_release_url, _release_url(tag)):
         raise ManifestError(
             f"release url must be the canonical GitHub Release URL: {expected_release_url}"
         )
@@ -183,12 +186,32 @@ def build_manifest(
         "baseVersion": version.base,
         "prerelease": version.prerelease,
         "publishedAt": published_at,
-        "releaseUrl": release_url,
+        "releaseUrl": _release_url(tag),
         "sha256sums": "SHA256SUMS",
         "platforms": platforms,
     }
     validate_manifest(manifest)
     return manifest, channel_targets(version)
+
+
+def build_draft_rehearsal_manifest(
+    release: dict[str, Any],
+    asset_names: Iterable[str],
+) -> dict[str, Any]:
+    """Build an ephemeral manifest for the pre-publish updater rehearsal.
+
+    The resulting schema is identical to a published channel manifest, but it
+    is written only into the CI runner's loopback HTTP fixture.  Requiring an
+    actual Draft prevents this helper from becoming an alternate production
+    channel-promotion path.
+    """
+
+    if release.get("isDraft") is not True:
+        raise ManifestError("rehearsal release isDraft must be true")
+    published_shape = dict(release)
+    published_shape["isDraft"] = False
+    manifest, _ = build_manifest(published_shape, asset_names)
+    return manifest
 
 
 def validate_manifest(payload: object) -> dict[str, Any]:
@@ -369,6 +392,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_draft_rehearsal(args: argparse.Namespace) -> int:
+    release = _load_json(args.release_json)
+    if not isinstance(release, dict):
+        raise ManifestError("release metadata must be a JSON object")
+    assets = [path.name for path in args.assets_dir.iterdir() if path.is_file()]
+    manifest = build_draft_rehearsal_manifest(release, assets)
+    _write_json(args.output, manifest)
+    return 0
+
+
 def _cmd_should_promote(args: argparse.Namespace) -> int:
     current = _load_json(args.current)
     candidate = _load_json(args.candidate)
@@ -399,6 +432,15 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--output", type=Path, required=True)
     build.add_argument("--targets-output", type=Path, required=True)
     build.set_defaults(handler=_cmd_build)
+
+    rehearsal = subparsers.add_parser(
+        "build-draft-rehearsal",
+        help="build a loopback-only manifest for an exact Draft updater rehearsal",
+    )
+    rehearsal.add_argument("--release-json", type=Path, required=True)
+    rehearsal.add_argument("--assets-dir", type=Path, required=True)
+    rehearsal.add_argument("--output", type=Path, required=True)
+    rehearsal.set_defaults(handler=_cmd_build_draft_rehearsal)
 
     compare = subparsers.add_parser(
         "should-promote", help="exit 0 when a channel may move to the candidate"

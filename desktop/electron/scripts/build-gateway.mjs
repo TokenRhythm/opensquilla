@@ -1,7 +1,8 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { assertRouterIntegrity, gatewayInputs, writeGatewayBuildRecord } from './gateway-integrity.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -9,11 +10,20 @@ const repoRoot = resolve(packageRoot, '..', '..')
 const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
 const pyinstallerWorkDir = join(packageRoot, '.pyinstaller')
 const entryPath = join(scriptDir, 'gateway-entry.py')
-const controlUiDistDir = join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist')
+const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_ca_trust.py')
+// The WebUI package owns its generated output.  Desktop packaging consumes
+// that verified artifact and copies it to the shared runtime location below;
+// PyInstaller must not treat the Python source tree as a Vite output folder.
+const controlUiDistDir = join(repoRoot, 'opensquilla-webui', 'dist')
 const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
 const addDataSeparator = process.platform === 'win32' ? ';' : ':'
 const gitLfsPointerHeader = 'version https://git-lfs.github.com/spec/v1'
+const gatewayUvArgs = [
+  'run', '--locked', '--group', 'desktop-build',
+  '--extra', 'recommended', '--extra', 'mcp', '--extra', 'msg',
+  '--extra', 'matrix', '--extra', 'document-extras',
+]
 
 function findFilesByName(root, fileName) {
   const matches = []
@@ -33,6 +43,29 @@ function findFilesByName(root, fileName) {
       } else if (entry.isFile() && entry.name === fileName) {
         matches.push(path)
       }
+    }
+  }
+
+  walk(root)
+  return matches
+}
+
+function findEmbeddedControlUiDistDirs(root) {
+  const matches = []
+
+  function walk(dir) {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const path = join(dir, entry.name)
+      const suffix = ['opensquilla', 'gateway', 'static', 'dist'].join(sep)
+      if (resolve(path).endsWith(suffix)) matches.push(path)
+      else walk(path)
     }
   }
 
@@ -90,7 +123,7 @@ function pythonPackageFile(packageName, relativePath) {
   ].join('\n')
   const result = spawnSync(
     'uv',
-    ['run', '--extra', 'recommended', 'python', '-c', code],
+    [...gatewayUvArgs, 'python', '-c', code],
     {
       cwd: repoRoot,
       env: {
@@ -173,9 +206,12 @@ function assertRouterAssetsReady() {
 }
 
 function assertControlUiArtifactReady() {
-  if (!existsSync(join(controlUiDistDir, 'index.html'))) {
+  if (
+    !existsSync(join(controlUiDistDir, 'index.html'))
+    || !existsSync(join(controlUiDistDir, 'desktop.html'))
+  ) {
     throw new Error(
-      `Built Control UI not found at ${controlUiDistDir}. Run npm run build:web before npm run build:gateway.`,
+      `Built browser and Desktop UI entries were not found at ${controlUiDistDir}. Run npm run build:web before npm run build:gateway.`,
     )
   }
   const result = spawnSync(process.execPath, [controlUiVerifier, controlUiDistDir], {
@@ -225,8 +261,39 @@ function patchMacLightgbmRuntime() {
   }
 }
 
+function externalizeControlUiArtifact() {
+  const sharedDistDir = join(runtimeGatewayDir, 'control-ui-dist')
+  rmSync(sharedDistDir, { recursive: true, force: true })
+  cpSync(controlUiDistDir, sharedDistDir, { recursive: true })
+
+  // --collect-all opensquilla is intentionally retained for the rest of the
+  // package data. The WebUI is deliberately not added to that collection: the
+  // verified artifact lives once at the shared Desktop location.
+  for (const manifestPath of findFilesByName(runtimeGatewayDir, 'webui-artifact-manifest.json')) {
+    const artifactDir = dirname(manifestPath)
+    if (resolve(artifactDir) === resolve(sharedDistDir)) continue
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+  // Do not rely on the manifest alone: a stale or partially copied embedded
+  // dist without its manifest would still inflate the installer.
+  for (const embeddedDistDir of findEmbeddedControlUiDistDirs(runtimeGatewayDir)) {
+    rmSync(embeddedDistDir, { recursive: true, force: true })
+  }
+
+  const remaining = findFilesByName(runtimeGatewayDir, 'webui-artifact-manifest.json')
+  if (remaining.length !== 1 || resolve(dirname(remaining[0])) !== resolve(sharedDistDir)) {
+    throw new Error(`Desktop Gateway must contain exactly one shared Web UI artifact; found: ${remaining.join(', ')}`)
+  }
+  const embeddedDistDirs = findEmbeddedControlUiDistDirs(runtimeGatewayDir)
+  if (embeddedDistDirs.length > 0) {
+    throw new Error(`Desktop Gateway still contains an embedded Web UI dist: ${embeddedDistDirs.join(', ')}`)
+  }
+}
+
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
+assertRouterIntegrity(routerBundleDir)
+const buildInputs = gatewayInputs(repoRoot)
 
 rmSync(runtimeGatewayDir, { recursive: true, force: true })
 mkdirSync(runtimeGatewayDir, { recursive: true })
@@ -241,19 +308,7 @@ const macOpenMpBinaryArgs = process.platform === 'darwin'
   : []
 
 const args = [
-  'run',
-  '--extra',
-  'recommended',
-  '--extra',
-  'mcp',
-  '--extra',
-  'msg',
-  '--extra',
-  'matrix',
-  '--extra',
-  'document-extras',
-  '--with',
-  'pyinstaller',
+  ...gatewayUvArgs,
   'pyinstaller',
   '--noconfirm',
   '--clean',
@@ -270,6 +325,14 @@ const args = [
   'opensquilla',
   '--collect-all',
   'sqlite_vec',
+  // Tool search loads Unicode blocks through importlib.resources, outside
+  // PyInstaller's static import discovery of the anyascii._data subpackage.
+  '--collect-all',
+  'anyascii',
+  '--collect-data',
+  'certifi',
+  '--hidden-import',
+  'certifi',
   '--collect-binaries',
   'sklearn',
   '--copy-metadata',
@@ -304,10 +367,10 @@ const args = [
   'mcp',
   '--hidden-import',
   'yoyo.backends.core.sqlite3',
+  '--runtime-hook',
+  caRuntimeHookPath,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
-  '--add-data',
-  `${controlUiDistDir}${addDataSeparator}opensquilla/gateway/static/dist`,
   ...lightgbmBinaryArgs,
   ...macOpenMpBinaryArgs,
   entryPath,
@@ -332,3 +395,13 @@ if (result.status !== 0) {
 }
 
 patchMacLightgbmRuntime()
+externalizeControlUiArtifact()
+const dependencyInventory = spawnSync('uv', [
+  ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'release_dependency_inventory.py'),
+  '--repo', repoRoot, '--kind', 'pyinstaller',
+  '--analysis', join(pyinstallerWorkDir, 'opensquilla-gateway', 'Analysis-00.toc'),
+  '--output', join(runtimeGatewayDir, 'dependency-inventory.json'),
+], { cwd: repoRoot, stdio: 'inherit', windowsHide: true })
+if (dependencyInventory.error) throw dependencyInventory.error
+if (dependencyInventory.status !== 0) process.exit(dependencyInventory.status ?? 1)
+writeGatewayBuildRecord(repoRoot, runtimeGatewayDir, buildInputs)

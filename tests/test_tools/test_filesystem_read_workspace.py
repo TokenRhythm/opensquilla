@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 from collections.abc import Iterator
@@ -14,11 +15,13 @@ from opensquilla.engine.types import ToolCall
 from opensquilla.sandbox import filesystem_worker, sensitive_paths
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
-from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
 from opensquilla.tools.builtin import filesystem as fs
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
+from tests.helpers.image_bytes import image_bytes
 
 
 @contextmanager
@@ -29,6 +32,7 @@ def tool_context(
     artifact_media_root: Path | None = None,
     artifact_session_id: str | None = None,
     run_mode: str | None = None,
+    sandbox_profile: FileSystemPermissionProfile | None = None,
 ) -> Iterator[None]:
     token = current_tool_context.set(
         ToolContext(
@@ -40,6 +44,7 @@ def tool_context(
             artifact_media_root=str(artifact_media_root) if artifact_media_root else None,
             artifact_session_id=artifact_session_id,
             run_mode=run_mode,
+            sandbox_file_system_profile=sandbox_profile,
         )
     )
     try:
@@ -88,6 +93,127 @@ async def test_read_file_invalid_utf8_before_selected_window_errors(tmp_path: Pa
     target.write_bytes(b"ok\n\xff\nlater\n")
     with pytest.raises(ToolError, match="not valid UTF-8"):
         await fs.read_file(str(target), offset=3, limit=1)
+
+
+@pytest.mark.parametrize("format,mime", [
+    ("PNG", "image/png"), ("JPEG", "image/jpeg"),
+    ("GIF", "image/gif"), ("WEBP", "image/webp"),
+])
+@pytest.mark.parametrize("use_worker", [False, True])
+async def test_read_file_supplies_image_bytes_without_text_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format: str, mime: str, use_worker: bool,
+) -> None:
+    payload = image_bytes(format)
+    # Transcript material paths can be content hashes without a file extension.
+    target = tmp_path / "image-material"
+    target.write_bytes(payload)
+    worker_results: list[SandboxOperationResult] = []
+
+    async def sandbox_read(operation: fs.SandboxOperation) -> SandboxOperationResult | None:
+        if not use_worker:
+            return None
+        result = SandboxOperationResult.from_worker_stdout(
+            json.dumps(filesystem_worker._run(operation.to_payload()))
+        )
+        worker_results.append(result)
+        return result
+
+    monkeypatch.setattr(fs, "_run_sandbox_operation_if_required", sandbox_read)
+    with tool_context(tmp_path):
+        context = current_tool_context.get()
+        assert context is not None
+        handler = build_tool_handler(get_default_registry(), context)
+        result = await handler(ToolCall(
+            tool_use_id="read-image", tool_name="read_file", arguments={"path": str(target)},
+        ))
+        assert not result.is_error, result.content
+        media = context.tool_result_media["read-image"]
+        assert len(media) == 1
+        assert media[0]["mime"] == mime
+        assert base64.b64decode(media[0]["data"]) == payload
+        assert media[0]["data"] not in result.content
+        assert "Loaded image" in result.content
+        assert "not yet been analyzed" in result.content
+    if use_worker:
+        assert worker_results[0].metadata == {}
+
+
+async def test_read_file_keeps_multiple_image_calls_separate(tmp_path: Path) -> None:
+    with tool_context(tmp_path):
+        context = current_tool_context.get()
+        assert context is not None
+        handler = build_tool_handler(get_default_registry(), context)
+        for call_id, format in (("first", "PNG"), ("second", "JPEG")):
+            target = tmp_path / call_id
+            target.write_bytes(image_bytes(format))
+            result = await handler(ToolCall(
+                tool_use_id=call_id, tool_name="read_file", arguments={"path": str(target)},
+            ))
+            assert not result.is_error, result.content
+        assert set(context.tool_result_media) == {"first", "second"}
+        assert context.tool_result_media["first"][0]["mime"] == "image/png"
+        assert context.tool_result_media["second"][0]["mime"] == "image/jpeg"
+
+
+@pytest.mark.parametrize("payload", [b"not an image", b"\x89PNG\r\n\x1a\ninvalid pixels"])
+async def test_read_file_rejects_fake_or_corrupt_image(tmp_path: Path, payload: bytes) -> None:
+    target = tmp_path / "broken.png"
+    target.write_bytes(payload)
+    with tool_context(tmp_path):
+        with pytest.raises(ToolError, match="corrupt"):
+            await fs.read_file(str(target), _tool_use_id="broken")
+        context = current_tool_context.get()
+        assert context is not None
+        assert context.tool_result_media == {}
+
+
+async def test_read_file_image_byte_limit_precedes_decode(tmp_path: Path) -> None:
+    from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES
+
+    target = tmp_path / "large.png"
+    target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * IMAGE_ATTACHMENT_BYTES)
+    with tool_context(tmp_path):
+        with pytest.raises(ToolError, match="byte limit"):
+            await fs.read_file(str(target), _tool_use_id="too-large")
+
+
+async def test_read_file_blocks_other_session_image_before_loading(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    media_root = tmp_path / "media"
+    _, target, _ = write_transcript_material(
+        media_root=media_root, session_id="other-session", payload=image_bytes("JPEG")
+    )
+    with tool_context(
+        workspace, artifact_media_root=media_root, artifact_session_id="current-session",
+        sandbox_profile=FileSystemPermissionProfile(
+            entries=(), default_access=FileSystemAccess.READ,
+        ),
+    ):
+        with pytest.raises(ToolError, match="session-scoped transcript materials"):
+            await fs.read_file(str(target), _tool_use_id="foreign")
+        context = current_tool_context.get()
+        assert context is not None
+        assert context.tool_result_media == {}
+
+
+def test_filesystem_worker_blocks_foreign_image_with_session_boundary(tmp_path: Path) -> None:
+    base = tmp_path / ".opensquilla" / "attachments"
+    own = base / "own"
+    foreign = base / "foreign"
+    own.mkdir(parents=True)
+    foreign.mkdir()
+    target = foreign / "private.png"
+    target.write_bytes(image_bytes())
+    with pytest.raises(PermissionError, match="another session"):
+        filesystem_worker._read_file({
+            "path": str(target),
+            "permissions": {"filesystem": {
+                "workspaceStrict": True,
+                "attachmentBase": str(base),
+                "attachmentSessionRoot": str(own),
+            }},
+        })
 
 
 @pytest.mark.asyncio
@@ -181,6 +307,54 @@ async def test_filesystem_sandbox_boundary_preserves_existing_profile(
     assert seen_operations == [operation]
     assert seen_operations[0] is operation
     assert seen_operations[0].file_system_profile is profile
+
+
+@pytest.mark.asyncio
+async def test_filesystem_sandbox_boundary_carries_session_read_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_root = tmp_path / "media"
+    profile = FileSystemPermissionProfile.read_only(readable_roots=(tmp_path,))
+    operation = fs.SandboxOperation.filesystem(
+        kind="grep_search",
+        workspace=tmp_path,
+        run_mode="trusted",
+        path=tmp_path,
+        pattern="needle",
+        file_system_profile=profile,
+    )
+    seen_operations: list[fs.SandboxOperation] = []
+
+    class _RecordingRuntime:
+        def __init__(self, _runtime: object, *, host_execution_active: bool) -> None:
+            assert host_execution_active is False
+
+        async def run(self, actual_operation: fs.SandboxOperation) -> None:
+            seen_operations.append(actual_operation)
+
+    monkeypatch.setattr(fs, "get_runtime", object)
+    monkeypatch.setattr(fs, "full_host_access_active", lambda: False)
+    monkeypatch.setattr(fs, "SandboxOperationRuntime", _RecordingRuntime)
+
+    with tool_context(
+        tmp_path,
+        artifact_media_root=media_root,
+        artifact_session_id="session-current",
+    ):
+        await fs._run_sandbox_operation_if_required(operation)
+
+    filesystem_permissions = seen_operations[0].permissions.filesystem
+    assert filesystem_permissions["workspaceStrict"] is True
+    assert filesystem_permissions["attachmentBase"] == str(
+        tmp_path / ".opensquilla" / "attachments"
+    )
+    assert filesystem_permissions["transcriptBase"] == str(
+        media_root / "transcripts"
+    )
+    assert filesystem_permissions["transcriptSessionRoot"] == str(
+        media_root / "transcripts" / "session-current"
+    )
 
 
 @pytest.mark.parametrize(
@@ -386,9 +560,42 @@ async def test_workspace_strict_blocks_other_session_material_read(tmp_path: Pat
         workspace,
         artifact_media_root=media_root,
         artifact_session_id="s1",
+        sandbox_profile=FileSystemPermissionProfile(
+            entries=(),
+            default_access=FileSystemAccess.READ,
+        ),
     ):
-        with pytest.raises(ToolError, match="outside active read roots"):
+        with pytest.raises(ToolError, match="session-scoped transcript materials"):
             await fs.read_file(str(other_material_path))
+
+
+@pytest.mark.asyncio
+async def test_workspace_strict_blocks_other_session_material_discovery(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    media_root = tmp_path / "media"
+    write_transcript_material(
+        media_root=media_root,
+        session_id="s2",
+        payload=b"other material\n",
+    )
+    readable_profile = FileSystemPermissionProfile(
+        entries=(),
+        default_access=FileSystemAccess.READ,
+    )
+
+    with tool_context(
+        workspace,
+        artifact_media_root=media_root,
+        artifact_session_id="s1",
+        sandbox_profile=readable_profile,
+    ):
+        with pytest.raises(ToolError, match="session-scoped transcript materials"):
+            await fs.glob_search("*", path=str(media_root / "transcripts"))
+        with pytest.raises(ToolError, match="session-scoped transcript materials"):
+            await fs.grep_search("material", path=str(media_root / "transcripts"))
 
 
 @pytest.mark.asyncio
@@ -409,7 +616,7 @@ async def test_workspace_inside_sensitive_parent_allows_normal_files(
     target.write_text("hello\n", encoding="utf-8")
 
     with tool_context(workspace):
-        write_gate, elevated = await fs._gate_out_of_workspace_write(
+        write_gate, elevated, _backups = await fs._gate_out_of_workspace_write(
             "write_file",
             target.resolve(),
             "notes/plan.md",
@@ -443,7 +650,7 @@ async def test_workspace_inside_sensitive_parent_keeps_leaf_secret_blocks(
     )
 
     with tool_context(workspace):
-        payload, elevated = await fs._gate_out_of_workspace_write(
+        payload, elevated, _backups = await fs._gate_out_of_workspace_write(
             "write_file",
             (workspace / ".env").resolve(),
             ".env",
@@ -552,6 +759,7 @@ async def test_workspace_strict_block_is_actionable_in_tool_failure_envelope(
 @pytest.mark.asyncio
 async def test_workspace_write_deny_block_is_actionable_in_tool_failure_envelope(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -564,6 +772,14 @@ async def test_workspace_write_deny_block_is_actionable_in_tool_failure_envelope
         ),
         workspace=workspace,
     )
+    # This test isolates the handler's policy-error envelope. An explicit
+    # legacy noop runtime is Full Host Access by contract, so pin the policy
+    # helper to managed-mode semantics instead of reviving stale sandbox state.
+    monkeypatch.setattr(
+        "opensquilla.tools.run_mode.full_host_access_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(fs, "full_host_access_active", lambda: False)
     handler = build_tool_handler(get_default_registry())
     token = current_tool_context.set(
         ToolContext(

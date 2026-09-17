@@ -254,9 +254,10 @@ def _feishu_spec() -> ChannelSetupSpec:
         help=(
             "Default websocket mode only needs App id and App secret. "
             "Webhook verification fields are only needed when connection_mode=webhook. "
-            "Websocket order: save the channel first so the connection is live, then "
-            "enable long-connection event delivery in the Feishu console — it only "
-            "persists that choice while a client is connected."
+            "After the channel reports an open websocket connection, check Event & "
+            "Callbacks in the Feishu console and confirm long-connection event delivery "
+            "if expected events do not arrive. A zero ingress count alone does not prove "
+            "the console is misconfigured."
         ),
         fields=(
             *_common_fields(),
@@ -268,9 +269,8 @@ def _feishu_spec() -> ChannelSetupSpec:
             # Folded: websocket is the default and right for almost everyone;
             # switching to webhook happens inside Advanced, where the mode
             # select is declared FIRST so the webhook fields it reveals appear
-            # below it. The websocket save-order guidance lives post-save (the
-            # channel page's final-step callout) plus the spec help above for
-            # headless clients.
+            # below it. Websocket subscription guidance lives post-save on the
+            # channel page plus in the spec help above for headless clients.
             ChannelSetupField("connection_mode", "Connection mode", "select",
                               required=False, default="websocket",
                               choices=("webhook", "websocket"),
@@ -350,13 +350,42 @@ def _dingtalk_spec() -> ChannelSetupSpec:
         requires_public_url=False,
         dependency_extra=None,
         restart_required=True,
-        docs_hint="https://open.dingtalk.com/document/",
+        docs_hint="https://open.dingtalk.com/document/dingstart/robot-reply-and-send-messages",
+        help=(
+            "Robot Code is the robot identifier copied from the DingTalk developer "
+            "console; it is distinct from Client id and enables native outbound image "
+            "and file delivery. Grant qyapi_base and qyapi_robot_sendmsg to the app. "
+            "Cool App Code is needed only when the installed robot requires it."
+        ),
         fields=(
             *_common_fields(),
             ChannelSetupField("client_id", "Client id", "text", required=True,
-                              group="credentials"),
+                              group="credentials",
+                              description="DingTalk application Client ID (AppKey)."),
             ChannelSetupField("client_secret", "Client secret", "password",
                               required=True, secret=True, group="credentials"),
+            ChannelSetupField(
+                "robot_code",
+                "Robot Code",
+                "text",
+                required=True,
+                group="credentials",
+                description=(
+                    "Robot identifier from the DingTalk developer console. "
+                    "This is not the application Client ID."
+                ),
+                placeholder="ding...",
+            ),
+            ChannelSetupField(
+                "cool_app_code",
+                "Cool App Code",
+                "text",
+                required=False,
+                default="",
+                group="credentials",
+                advanced=True,
+                description="Optional; set only when required by the installed robot.",
+            ),
         ),
     )
 

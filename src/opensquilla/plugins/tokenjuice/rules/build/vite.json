@@ -4,6 +4,8 @@
   "description": "Compact vite build output while preserving warnings and failures.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["vite"],
+    "commandArgsStartsWithAny": [["build"]],
     "commandIncludes": ["vite", "build"]
   },
   "transforms": {

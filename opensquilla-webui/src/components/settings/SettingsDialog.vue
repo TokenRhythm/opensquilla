@@ -1,112 +1,19 @@
 <template>
-  <div class="settings-overlay" @click.self="requestClose()">
-    <Transition name="settings-pop" appear @after-leave="onLeaveComplete">
-    <section
-      v-if="visible"
-      ref="modalRef"
-      class="settings-modal"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="settings-modal-title"
-    >
-      <header class="settings-modal__head">
-        <h2 id="settings-modal-title" class="settings-modal__title">{{ t('settings.dialog.title') }}</h2>
-        <button
-          ref="closeBtn"
-          type="button"
-          class="btn btn--icon btn--ghost"
-          :disabled="saveAllPending"
-          :aria-label="t('common.close')"
-          :title="t('common.close')"
-          @click="requestClose()"
-        >
-          <Icon name="x" :size="16" />
-        </button>
-      </header>
-
-      <!-- The readiness banner needs config + status, so it waits for load. The
-           rail and Connection panel render immediately (below) so the gateway
-           can be (re)connected even before any config loads. -->
-      <template v-if="loaded">
-      <div class="settings-banner" :class="hasSetupAction ? 'is-warn' : 'is-ok'">
-        <div class="settings-banner__row">
-          <Icon :name="hasSetupAction ? 'info' : 'check'" :size="16" aria-hidden="true" />
-          <template v-if="hasSetupAction">
-            <strong class="settings-banner__count">{{ t('settings.dialog.actionNeeded', { count: actionItems.length }) }}</strong>
-            <span class="settings-banner__items">
-              <button
-                v-for="item in actionItems"
-                :key="item.label"
-                type="button"
-                class="settings-banner__item"
-                :aria-label="t('settings.dialog.openSection', { label: item.label, section: sectionLabel(item.section) })"
-                @click="selectSection(item.section)"
-              >{{ item.label }}</button>
-            </span>
-          </template>
-          <span v-else class="settings-banner__ready">{{ t('settings.dialog.readyToRun') }}</span>
-          <span class="settings-banner__spacer"></span>
-          <button
-            v-if="showCliHandoff"
-            type="button"
-            class="settings-banner__toggle"
-            :aria-expanded="disclosureOpen ? 'true' : 'false'"
-            aria-controls="settings-banner-disclosure"
-            @click="disclosureOpen = !disclosureOpen"
-          >
-            <span class="settings-banner__chevron" :class="{ 'is-open': disclosureOpen }" aria-hidden="true">&#9656;</span>
-            <span>{{ t('settings.dialog.cliHandoff') }}</span>
-          </button>
-        </div>
-        <div v-if="showCliHandoff" v-show="disclosureOpen" id="settings-banner-disclosure" class="settings-banner__disclosure">
-          <div class="setup-cli">
-            <section v-if="fixCommands.length > 0" class="setup-cli__group" :aria-label="t('settings.dialog.fixNow')">
-              <div class="setup-cli__group-head"><h4 class="control-panel__eyebrow">{{ t('settings.dialog.fixNow') }}</h4></div>
-              <SetupCommandBlock
-                v-for="cmd in fixCommands"
-                :key="cmd.label"
-                class="setup-cli__row"
-                :label="cmd.label"
-                :command="cmd.command"
-                @copy="copyCommand"
-              />
-            </section>
-            <section class="setup-cli__group" :aria-label="t('settings.dialog.cliHandoff')">
-              <div class="setup-cli__group-head"><h4 class="control-panel__eyebrow">{{ t('settings.dialog.cliHandoff') }}</h4></div>
-              <SetupCommandBlock
-                v-for="cmd in handoffCommands"
-                :key="cmd.label"
-                class="setup-cli__row"
-                :label="cmd.label"
-                :command="cmd.command"
-                @copy="copyCommand"
-              />
-            </section>
-            <section class="setup-cli__group" :aria-label="t('settings.dialog.cliRecipes')">
-              <div class="setup-cli__group-head"><h4 class="control-panel__eyebrow">{{ t('settings.dialog.cliRecipes') }}</h4></div>
-              <SetupCommandBlock
-                v-for="cmd in recipeCommands"
-                :key="cmd.label"
-                class="setup-cli__row"
-                :label="cmd.label"
-                :command="cmd.command"
-                @copy="copyCommand"
-              />
-            </section>
-          </div>
-          <div class="setup-summary" :aria-label="t('settings.dialog.configSummary')">
-            <div v-for="row in configSummary" :key="row.label">
-              <span>{{ row.label }}</span><strong>{{ row.value }}</strong>
-            </div>
-          </div>
-        </div>
-      </div>
-      </template>
-
+  <Teleport to="body">
+    <div class="settings-overlay" @click.self="requestClose($event)">
+      <Transition name="settings-pop" appear @after-leave="onLeaveComplete">
+      <section
+        v-if="visible"
+        ref="modalRef"
+        class="settings-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-modal-title"
+      >
       <div
         class="settings-body"
-        :inert="saveAllPending ? true : undefined"
-        :aria-busy="saveAllPending ? 'true' : undefined"
+        :inert="settingsInteractionLocked ? true : undefined"
+        :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
         <nav ref="railRef" class="settings-rail" role="tablist" :aria-label="t('settings.dialog.sections')" :aria-orientation="railOrientation">
           <template v-for="(s, i) in visibleSections" :key="s.id">
@@ -114,7 +21,7 @@
                  tab stop. Rendered when the group changes so each bin is headed
                  once. Hidden on the mobile horizontal strip. -->
             <span
-              v-if="i === 0 || s.group !== visibleSections[i - 1].group"
+              v-if="s.group && (i === 0 || s.group !== visibleSections[i - 1]?.group)"
               class="settings-rail__group"
               role="presentation"
               aria-hidden="true"
@@ -133,11 +40,27 @@
               <Icon :name="s.icon" :size="16" aria-hidden="true" />
               <span class="settings-rail__label">{{ t('settings.rail.' + s.id) }}</span>
               <span v-if="sectionDirty(s.id)" class="settings-rail__dirty" aria-hidden="true"></span>
-              <span v-if="!s.client && s.id === 'connection'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
+              <span v-if="s.id === 'gateway'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
               <span v-else-if="!s.client && sectionStatus(s.id).tone === 'is-warn'" class="settings-rail__warn" aria-hidden="true">!</span>
             </button>
           </template>
         </nav>
+
+        <div class="settings-main">
+          <header class="settings-modal__head">
+            <h2 id="settings-modal-title" class="settings-modal__title">{{ t('settings.dialog.title') }}</h2>
+            <button
+              ref="closeBtn"
+              type="button"
+              class="btn btn--icon btn--ghost settings-modal__close"
+              :disabled="hasPendingSettingsWrite"
+              :aria-label="t('common.close')"
+              :title="t('common.close')"
+              @click="requestClose($event)"
+            >
+              <Icon name="x" :size="16" />
+            </button>
+          </header>
 
         <div
           :id="'settings-section-' + section"
@@ -148,40 +71,80 @@
         >
           <fieldset
             class="settings-panel__interactions"
-            :disabled="saveAllPending"
-            :aria-busy="saveAllPending ? 'true' : undefined"
+            :disabled="settingsInteractionLocked"
+            :aria-busy="settingsInteractionLocked ? 'true' : undefined"
           >
-          <!-- Connection renders regardless of load state: it is how you point
-               the UI at a reachable gateway when nothing has loaded yet. -->
-          <SetupConnectionPanel v-if="section === 'connection'" />
+          <!-- Gateway remains available even when config readiness cannot load,
+               because this is where users recover the connection/runtime. -->
+          <SettingsGatewayPanel
+            v-if="section === 'gateway'"
+            :is-desktop="isDesktop"
+          />
 
-          <!-- Runtime (desktop only) also renders regardless of load state: it
-               reports the owned gateway and offers logs/restart precisely for
-               when the gateway is down and config never loaded. -->
-          <DesktopRuntimePanel v-else-if="section === 'runtime' && isDesktop" />
+          <!-- Memory & Export is first-level and owns its own RPC gate. -->
+          <SettingsMemoryPanel v-else-if="section === 'memory'" />
 
           <!-- Optional cross-installation discovery is deliberately mounted
                only when the user opens this section. It never runs at app or
                Settings-dialog startup. -->
           <DataMigrationPanel v-else-if="section === 'dataMigration'" />
 
-          <!-- Config-backed sections wait for readiness so their baselines are
-               final before any field can be edited. -->
-          <div v-else-if="!loaded" class="settings-loading">
+          <!-- Mixed pages render their local controls immediately and gate only
+               the config-backed rows on catalog readiness. -->
+          <SettingsGeneralPanel
+            v-else-if="section === 'general'"
+            :panel="behaviorPanel"
+            :loaded="loaded"
+            :is-desktop="isDesktop"
+            @update-auto-session-titles="setAutoSessionTitles"
+          />
+          <SettingsSecurityPrivacyPanel
+            v-else-if="section === 'securityPrivacy'"
+            :panel="privacyPanel"
+            :loaded="loaded"
+            :is-desktop="isDesktop"
+            @update-network-reporting-enabled="setNetworkReportingEnabled"
+          />
+          <SettingsAppearancePanel v-else-if="section === 'interface'" />
+          <SettingsKeyboardPanel v-else-if="section === 'shortcuts'" />
+          <SettingsAdvancedPanel
+            v-else-if="section === 'advanced'"
+            :auto-capture="memoryPanel.autoCapture"
+            :loaded="loaded"
+            :config-path="displayConfigPath"
+            @copy-config-path="copyDisplayPath"
+            @update-auto-capture="setMemoryAutoCapture"
+            @open-agent-configuration="openAgentConfiguration"
+            @open-data-maintenance="openDataMaintenance"
+          />
+
+          <!-- AI configuration pages wait for complete readiness baselines. -->
+          <div v-else-if="!loaded" class="settings-loading" role="status">
             <LoadingSpinner />
+            <strong>{{ t('settings.rail.' + section) }}</strong>
+            <span>{{ t('shared.loading') }}</span>
           </div>
           <template v-else>
+            <SetupModelCapacity v-if="section === 'modelStrategy' && capacityTarget" :key="JSON.stringify(capacityTarget)"
+              v-bind="capacityTarget" initial-open hide-trigger
+              :disabled="saveAllPending || primaryMutationPending || modelStrategyRoutingBusy" />
             <SetupProviderPanel
               v-if="section === 'provider'"
               :panel="providerPanel"
-              :preset="presetPanel"
+              :dirty="providerDraftDirty"
+              :saving="saveAllPending || providerSavePending || primaryMutationPending || modelStrategyRoutingBusy || providerPanel.busy"
               @update-provider-selected="selectProvider"
               @provider-change="onProviderChange"
               @update-provider-field="updateProviderField"
               @update-llm-timeout="updateLlmTimeout"
               @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
-              @apply-preset="applyProviderPreset"
+              @cancel-provider-probe="cancelProviderProbe"
+              @refresh-models="refreshProviderModels"
+              @cancel-configured-provider-probe="cancelConfiguredProviderProbe"
+              @save-provider="saveProvider"
+              @save-provider-and-activate="saveProviderAndActivate"
+              @cancel-provider-edit="cancelProviderEdit"
               @copy="copyCommand"
               @go-to-section="selectSection"
               @select-configured-provider="requestSelectConfiguredProvider"
@@ -189,26 +152,23 @@
               @add-provider="requestAddProvider"
               @probe-configured-provider="probeConfiguredProvider"
               @activate-provider="activateProvider"
-            />
-            <SetupBehaviorPanel
-              v-else-if="section === 'behavior'"
-              :panel="behaviorPanel"
-              @update-auto-session-titles="setAutoSessionTitles"
-            />
-            <SettingsPrivacyPanel
-              v-else-if="section === 'privacy'"
-              :panel="privacyPanel"
-              @update-disable-network-observability="setDisableNetworkObservability"
+              @update-image-generation-opt-in="setProviderImageGenerationOptIn"
             />
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
+              :routing-mode-busy="modelStrategyRoutingBusy || providerPanel.busy"
               @update-strategy="setModelStrategy"
+              @reset-recommended-router="resetRecommendedRouter"
+              @update-fixed-provider="setFixedProvider"
               @update-fixed-model="setFixedModel"
               @update-router-default-tier="setRouterDefaultTier"
               @update-router-visual-mode="setRouterVisualMode"
               @update-tier-field="updateTierField"
               @update-ensemble-scheme="setEnsembleScheme"
+              @update-ensemble-min-successful="setEnsembleMinSuccessful"
+              @update-ensemble-all-failed-policy="setEnsembleAllFailedPolicy"
+              @update-ensemble-proposer-max-retries="setEnsembleProposerMaxRetries"
               @add-ensemble-candidate="addEnsembleCandidate"
               @remove-ensemble-candidate="removeEnsembleCandidate"
               @replace-ensemble-candidate="replaceEnsembleCandidate"
@@ -216,8 +176,6 @@
               @request-provider-models="discoverModelStrategyProviderModels"
               @import-ensemble-tier-candidates="importEnsembleTierCandidates"
               @migrate-ensemble-legacy="migrateEnsembleLegacy"
-              @update-ensemble-min-successful="setEnsembleMinSuccessful"
-              @update-ensemble-all-failed-policy="setEnsembleAllFailedPolicy"
               @go-to-section="selectSection"
             />
             <SetupCapabilitiesPanel
@@ -225,103 +183,87 @@
               :panel="capabilitiesPanel"
               @update-field="updateCapabilityField"
               @search-provider-change="onSearchProviderChange"
-              @memory-provider-change="onMemoryProviderChange"
               @image-provider-change="onImageProviderChange"
-              @save-search="saveSearch"
-              @save-memory="saveMemory"
-              @save-image="saveImage"
-              @save-audio="saveAudio"
-              @copy="copyCommand"
-            />
-            <SettingsAppearancePanel v-else-if="section === 'appearance'" />
-            <SettingsKeyboardPanel v-else-if="section === 'keyboard'" />
-            <SettingsAdvancedPanel
-              v-else-if="section === 'advanced'"
-              @open-agent-configuration="openAgentConfiguration"
-              @open-data-maintenance="openDataMaintenance"
+              @use-image-recommendation="useImageRecommendation"
+              @reset-capability="resetCapability"
             />
           </template>
           </fieldset>
+        </div>
         </div>
       </div>
 
       <div
         v-if="loaded && hasUnsavedChanges"
         class="settings-dirtybar"
-        :aria-busy="saveAllPending ? 'true' : undefined"
+        :aria-busy="settingsInteractionLocked ? 'true' : undefined"
       >
         <span class="settings-dirtybar__pulse" aria-hidden="true"></span>
         <span class="settings-dirtybar__text" role="status" aria-live="polite" aria-atomic="true">
-          {{ saveAllPending ? t('settings.dialog.savingChanges') : dirtyBarText }}
+          {{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtyBarText }}
         </span>
         <span class="settings-dirtybar__spacer"></span>
-        <button type="button" class="btn" :disabled="saveAllPending" @click="discardChanges">
+        <button type="button" class="btn" :disabled="settingsInteractionLocked" @click="discardChanges">
           {{ dirtyDiscardLabel }}
         </button>
         <button
           type="button"
           class="btn btn--primary"
-          :disabled="saveAllPending"
-          :aria-busy="saveAllPending ? 'true' : undefined"
+          :disabled="settingsInteractionLocked"
+          :aria-busy="settingsInteractionLocked ? 'true' : undefined"
           @click="saveDirtySections"
-        >{{ saveAllPending ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
+        >{{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
       </div>
 
-      <footer class="settings-foot">
-        <span class="settings-foot__text">{{ t('settings.dialog.moreOptionsIn') }}</span>
-        <code class="settings-foot__path">{{ displayConfigPath }}</code>
-        <button
-          type="button"
-          class="settings-foot__copy"
-          :aria-label="t('settings.dialog.copyConfigPath')"
-          :title="t('settings.dialog.copyConfigPath')"
-          @click="copyDisplayPath"
-        >
-          <Icon name="copy" :size="13" />
-        </button>
-        <span class="settings-foot__sep" aria-hidden="true">&middot;</span>
-        <span class="settings-foot__text">{{ t('settings.dialog.applyLiveNote') }}</span>
-      </footer>
-    </section>
-    </Transition>
-  </div>
+      </section>
+      </Transition>
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
-import SetupCommandBlock from '@/components/setup/SetupCommandBlock.vue'
-import SetupBehaviorPanel from '@/components/setup/SetupBehaviorPanel.vue'
-import SetupConnectionPanel from '@/components/settings/SetupConnectionPanel.vue'
 import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
+import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
-import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
-import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
+import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
+import SettingsGatewayPanel from '@/components/settings/SettingsGatewayPanel.vue'
+import SettingsGeneralPanel from '@/components/settings/SettingsGeneralPanel.vue'
+import SettingsSecurityPrivacyPanel from '@/components/settings/SettingsSecurityPrivacyPanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
-import { parseProviderHash, sectionFromRouteParam } from '@/composables/setup/useSettingsSection'
+import {
+  parseProviderHash,
+  sectionFromRouteParam,
+  settingsSectionAliasFor,
+} from '@/composables/setup/useSettingsSection'
 import { useConfirm } from '@/composables/useConfirm'
 import { usePlatform } from '@/platform'
 import '@/styles/settings-forms.css'
 
 const route = useRoute()
 const router = useRouter()
+const capacityTarget = computed(() => {
+  const provider = route.query.capacityProvider
+  const model = route.query.capacityModel
+  return typeof provider === 'string' && provider.trim() && provider.length <= 1024
+    && typeof model === 'string' && model.trim() && model.length <= 1024 ? { provider, model } : null
+})
 const { t } = useI18n()
-const { confirm, confirmState } = useConfirm()
+const { confirmChoice, confirmState } = useConfirm()
 
-// Desktop owns a local gateway, so it exposes a Runtime section the web build
-// hides. `desktopOnly` sections are filtered out everywhere else.
+// The catalog retains the desktopOnly capability for future destinations. The
+// consolidated rail currently shares all ten destinations across surfaces.
 const isDesktop = usePlatform().capabilities.isDesktop
-// The CLI handoff disclosure assumes a terminal where `opensquilla` resolves;
-// the desktop shell has none, so the whole block is web-only.
-const showCliHandoff = usePlatform().capabilities.hasTerminalWorkflow
 const visibleSections = computed(() => SETTINGS_SECTIONS.filter(s => !s.desktopOnly || isDesktop))
 
 const {
@@ -331,30 +273,32 @@ const {
   providerPanel,
   behaviorPanel,
   privacyPanel,
+  memoryPanel,
   modelStrategyPanel,
-  presetPanel,
   capabilitiesPanel,
-  hasSetupAction,
-  actionItems,
-  fixCommands,
-  handoffCommands,
-  recipeCommands,
-  configSummary,
   configPath,
   selectInitialSection,
   sectionStatus,
   sectionDirty,
+  providerDraftDirty,
   dirtySections,
   hasUnsavedChanges,
   saveAllPending,
+  providerSavePending,
+  modelStrategyRoutingBusy,
   saveDirtySections,
   discardChanges,
   selectProvider,
   requestSelectConfiguredProvider,
   requestAddProvider,
+  cancelProviderEdit,
   setAutoSessionTitles,
-  setDisableNetworkObservability,
+  setNetworkReportingEnabled,
+  setMemoryAutoCapture,
+  setProviderImageGenerationOptIn,
   setModelStrategy,
+  resetRecommendedRouter,
+  setFixedProvider,
   setFixedModel,
   setRouterDefaultTier,
   setRouterVisualMode,
@@ -368,24 +312,27 @@ const {
   setEnsembleScheme,
   setEnsembleMinSuccessful,
   setEnsembleAllFailedPolicy,
-  applyProviderPreset,
+  setEnsembleProposerMaxRetries,
   updateProviderField,
   updateLlmTimeout,
   updateContextWindow,
   probeProviderConnection,
+  cancelProviderProbe,
+  refreshProviderModels,
   probeConfiguredProvider,
+  cancelConfiguredProviderProbe,
   activateProvider,
   removeProviderProfile,
   updateTierField,
   updateCapabilityField,
   onProviderChange,
   onSearchProviderChange,
-  onMemoryProviderChange,
   onImageProviderChange,
-  saveSearch,
-  saveMemory,
-  saveImage,
-  saveAudio,
+  useImageRecommendation,
+  saveProvider,
+  saveProviderAndActivate,
+  primaryMutationPending,
+  resetCapability,
   copyCommand,
   copyConfigPath,
 } = useSetupCatalog()
@@ -394,13 +341,16 @@ const {
 // the parent selected while its nested route is open so the rail communicates
 // hierarchy without advertising migration during normal Settings use.
 const activeRailSection = computed(() => (
-  section.value === 'dataMigration' ? 'advanced' : section.value
+  section.value === 'dataMigration'
+    ? 'advanced'
+    : section.value
 ))
 
 const modalRef = ref<HTMLElement | null>(null)
 const railRef = ref<HTMLElement | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
+const closeSavePending = ref(false)
 
 // Keep the active section's rail tab in view — on mobile the rail scrolls
 // horizontally, so a deep-linked or later section would otherwise sit off-screen.
@@ -423,14 +373,15 @@ function resetActivePanelScroll() {
 // Drives the modal's enter/leave <Transition>. Closing flips this to false so the
 // leave animation plays; the actual route navigation is deferred to onLeaveComplete.
 const visible = ref(true)
-const disclosureOpen = ref(false)
 const isMobile = ref(window.matchMedia('(max-width: 768px)').matches)
 // Set once the user picks a section so the deep-link auto landing (which waits
 // on readiness data) never stomps navigation made while config was loading.
 let userNavigated = false
 
 const railOrientation = computed(() => (isMobile.value ? 'horizontal' : 'vertical'))
-const dirtySectionNames = computed(() => dirtySections.value.map(s => s.label).join(' · '))
+const dirtySectionNames = computed(() => (
+  dirtySections.value.map(s => t(`settings.rail.${s.id}`)).join(' · ')
+))
 const dirtyProviderLabel = computed(() => (
   providerPanel.value.credentialPanel?.providerLabel
   || providerPanel.value.providerSelected
@@ -469,6 +420,43 @@ const dirtyDiscardLabel = computed(() => {
   return t('common.discard')
 })
 const displayConfigPath = computed(() => configPath.value || '~/.opensquilla/config.toml')
+// Provider drafts deliberately stay out of the settings-wide dirty bar because
+// their editor owns Save/Cancel. They still participate in every path that
+// unmounts Settings so browser navigation cannot silently discard credentials.
+const hasSettingsExitDraft = computed(() => (
+  hasUnsavedChanges.value || providerDraftDirty.value
+))
+const hasPendingSettingsWrite = computed(() => (
+  saveAllPending.value
+  || providerSavePending.value
+  || primaryMutationPending.value
+  || modelStrategyRoutingBusy.value
+  || closeSavePending.value
+))
+const settingsInteractionLocked = computed(() => (
+  saveAllPending.value || closeSavePending.value || primaryMutationPending.value
+))
+const shouldGuardBrowserUnload = computed(() => (
+  hasSettingsExitDraft.value || hasPendingSettingsWrite.value
+))
+
+function onBeforeUnload(event: BeforeUnloadEvent) {
+  if (!shouldGuardBrowserUnload.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
+let beforeUnloadAttached = false
+function setBeforeUnloadAttached(attached: boolean) {
+  if (attached === beforeUnloadAttached) return
+  beforeUnloadAttached = attached
+  if (attached) {
+    window.addEventListener('beforeunload', onBeforeUnload)
+  } else {
+    window.removeEventListener('beforeunload', onBeforeUnload)
+  }
+}
+watch(shouldGuardBrowserUnload, setBeforeUnloadAttached, { immediate: true })
 
 // Where to return when the overlay closes. Captured on open from the route the
 // user came from; null for a cold deep link (the overlay route was the entry
@@ -487,8 +475,11 @@ const routeParam = computed(() => route.params.section)
 // readiness is known; it is a routing sentinel, never a real rail section.
 const wantsAutoSection = computed(() => routeParam.value === 'auto')
 
-function sectionLabel(id: string): string {
-  return SETTINGS_SECTIONS.find(s => s.id === id)?.label || id
+const COMPOSITE_HASH_TARGETS: Record<string, string> = {
+  '#connection': 'settings-gateway-connection',
+  '#runtime': 'settings-gateway-runtime',
+  '#privacy': 'settings-security-privacy',
+  '#sandbox': 'settings-security-sandbox',
 }
 
 // Reflect the active section in the URL with replace (not push) so the browser
@@ -504,23 +495,43 @@ function selectSection(id: string) {
   }
 }
 
-// Resolve the section the route is asking for. Connection works before config
-// loads; the auto sentinel waits for readiness; everything else maps the param
-// (or the default) straight through.
+// Resolve aliases and nested destinations. Old URLs are canonicalized with a
+// subsection hash so bookmarks keep landing on their original content.
 function applyRouteSection() {
   if (wantsAutoSection.value) {
     if (loaded.value && !userNavigated) selectInitialSection('auto')
     return
   }
   const resolved = sectionFromRouteParam(routeParam.value)
+  const alias = settingsSectionAliasFor(routeParam.value)
+  if (alias) {
+    void router.replace({
+      path: `/settings/${alias.section}`,
+      hash: route.hash || alias.hash || '',
+    })
+  }
   if (resolved === 'dataMigration') {
     setSection(resolved)
     return
   }
-  // A desktopOnly section requested where it is unavailable (e.g. a stale
-  // /settings/runtime deep link on web) has no rail entry or panel branch; fall
-  // back to the default so the dialog never renders an empty body.
+  // A future surface-specific destination requested where unavailable has no
+  // rail entry or panel branch; fall back so the dialog never renders empty.
   setSection(visibleSections.value.some(s => s.id === resolved) ? resolved : 'provider')
+}
+
+function focusCompositeHash(): boolean {
+  const targetId = COMPOSITE_HASH_TARGETS[route.hash]
+  if (!targetId) return false
+  const target = document.getElementById(targetId)
+  if (!target) return false
+  target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' })
+  const initialFocus = target.querySelector<HTMLElement>('[data-settings-initial-focus]')
+  ;(initialFocus ?? target).focus({ preventScroll: true })
+  return true
+}
+
+function applyCompositeHash() {
+  void nextTick(() => { focusCompositeHash() })
 }
 
 // `#provider-<id>` deep links land on the Provider section with that provider
@@ -586,8 +597,7 @@ function navigateAway() {
   // directly (same breakpoint/platform branch as the '/' redirect in sharedRoutes)
   // so close is a single, predictable, loop-proof exit. `returnTo` is already
   // null for a cold deep link (onMounted rejects any '/settings…' back-entry).
-  const fallback = isDesktop || window.matchMedia('(max-width: 768px)').matches ? '/chat' : '/sessions'
-  void router.push(returnTo ?? fallback)
+  void router.push(returnTo ?? '/chat')
 }
 
 // The modal's leave transition finished — perform the deferred navigation that
@@ -597,13 +607,16 @@ function onLeaveComplete() {
   if (closing) navigateAway()
 }
 
-function closeOverlay() {
+function closeOverlay(restoreFocus = true) {
   if (closing) return
   closing = true
-  // Restore focus to the invoker synchronously (don't wait out the leave
-  // animation) so keyboard users and the focus-return tests see focus land now.
-  const target = usableInvoker() ?? sidebarSettingsButton()
-  target?.focus()
+  // Pointer users already chose their next location by clicking, so forcing
+  // focus back to the Settings row leaves a misleading orange keyboard ring.
+  // Keyboard-triggered closes still restore focus synchronously.
+  if (restoreFocus) {
+    const target = usableInvoker() ?? sidebarSettingsButton()
+    target?.focus()
+  }
   invokerEl = null
   // Flip visibility to play the modal's leave transition; onLeaveComplete then
   // navigates away (which unmounts the route component).
@@ -641,29 +654,58 @@ async function openDataMaintenance() {
   panelRef.value?.querySelector<HTMLElement>('[data-testid="data-migration-heading"]')?.focus()
 }
 
-// One discard prompt shared by every exit path: requestClose (Escape, the
-// close button, backdrop click) and the history-back leave guard below.
-function confirmDiscard(): Promise<boolean> {
-  return confirm({
+// One exit prompt shared by every exit path: requestClose (Escape, the close
+// button, backdrop click) and the history-back leave guard below. Saving is
+// the primary action; discarding remains explicit and destructive.
+function confirmExitChanges() {
+  return confirmChoice({
     title: t('settings.dialog.discardTitle'),
     body: t('settings.dialog.discardBody'),
-    primaryLabel: t('settings.dialog.discardPrimary'),
+    primaryLabel: t('settings.dialog.saveAndClose'),
+    primaryClass: 'btn--primary',
+    secondaryLabel: t('settings.dialog.discardConfirmPrimary'),
+    secondaryClass: 'btn--danger',
+    showCancel: false,
   })
 }
 
-// Closes unless a section carries unsaved edits and the user keeps them.
-async function requestClose(): Promise<boolean> {
-  if (saveAllPending.value) return false
-  if (hasUnsavedChanges.value && !(await confirmDiscard())) return false
-  closeOverlay()
+// Save every kind of Settings draft before allowing an exit. Provider drafts
+// have their own save path, while the remaining sections share the dirty bar.
+// If validation or a request fails, their dirty state remains and the dialog
+// stays open for correction.
+async function saveExitChanges(): Promise<boolean> {
+  if (closeSavePending.value || hasPendingSettingsWrite.value) return false
+  closeSavePending.value = true
+  try {
+    if (providerDraftDirty.value && !(await saveProvider())) return false
+    if (hasUnsavedChanges.value) await saveDirtySections()
+    await nextTick()
+    return !hasSettingsExitDraft.value
+  } finally {
+    closeSavePending.value = false
+  }
+}
+
+// Closes unless a section carries unsaved edits and the user chooses to keep
+// them, save them, or discard them.
+async function requestClose(event?: MouseEvent): Promise<boolean> {
+  if (hasPendingSettingsWrite.value) return false
+  if (hasSettingsExitDraft.value) {
+    const choice = await confirmExitChanges()
+    if (choice === 'cancel') return false
+    if (choice === 'primary' && !(await saveExitChanges())) return false
+  }
+  // Keyboard-generated click events have detail 0; real pointer clicks have a
+  // positive click count. Preserve focus restoration for keyboard activation.
+  closeOverlay(!event || event.detail === 0)
   return true
 }
 
 // History traversal (browser Back, a trackpad back-swipe) pops the /settings
 // route and unmounts the overlay without passing through requestClose, which
 // would silently drop unsaved edits. This router-level guard runs the same
-// discard prompt for any navigation that leaves /settings while the dialog is
-// mounted; cancelling restores the URL. Registered on the router rather than
+// save/discard prompt for any navigation that leaves /settings while the dialog
+// is mounted; cancelling restores the URL. Registered on the router rather than
 // via onBeforeRouteLeave because selectSection's replace swaps the matched
 // record between `settings` and `settings-section` while the viewKey-keyed
 // component instance survives — a component guard would stay bound to the
@@ -671,19 +713,22 @@ async function requestClose(): Promise<boolean> {
 const removeLeaveGuard = router.beforeEach(async (to) => {
   if (closing) return true
   if (to.path === '/settings' || to.path.startsWith('/settings/')) return true
-  if (saveAllPending.value) return false
-  if (!hasUnsavedChanges.value) return true
+  if (hasPendingSettingsWrite.value) return false
+  if (!hasSettingsExitDraft.value) return true
   // requestClose already has the prompt up — hold this navigation instead of
   // stacking a second prompt (useConfirm cancels a pending request).
   if (confirmState.value) return false
-  return confirmDiscard()
+  const choice = await confirmExitChanges()
+  if (choice === 'cancel') return false
+  if (choice === 'primary') return saveExitChanges()
+  return true
 })
 
 function onDocumentKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return
   // The confirm modal owns the keyboard while it is open; let it handle Escape
   // so a single keypress cannot both dismiss the prompt and re-open it.
-  if (confirmState.value) return
+  if (confirmState.value || hasOpenDialogLayer()) return
   if (event.key === 'Escape') {
     event.preventDefault()
     void requestClose()
@@ -720,7 +765,10 @@ watch(routeParam, () => applyRouteSection())
 // A provider deep-link hash can arrive (or change) after mount. (Legacy
 // #channel- hashes never reach this dialog: a router guard rewrites them to
 // the /channels workspace before the settings route resolves.)
-watch(() => route.hash, () => { applyProviderHash() })
+watch(() => route.hash, () => {
+  applyProviderHash()
+  applyCompositeHash()
+})
 
 // Whenever the active section changes (rail click, deep link, Back), bring its
 // tab into view on the horizontally-scrolling mobile rail.
@@ -728,6 +776,7 @@ watch(section, () => {
   scrollActiveTabIntoView()
   resetActivePanelScroll()
   applyProviderHash()
+  applyCompositeHash()
 })
 
 // The auto deep link lands on its readiness-derived section once config is
@@ -735,7 +784,10 @@ watch(section, () => {
 watch(loaded, (isLoaded) => {
   if (isLoaded && wantsAutoSection.value && !userNavigated) selectInitialSection('auto')
   // Catalog data is required to validate a provider hash, so (re)try now.
-  if (isLoaded) { applyProviderHash() }
+  if (isLoaded) {
+    applyProviderHash()
+    applyCompositeHash()
+  }
 })
 
 onMounted(() => {
@@ -751,10 +803,13 @@ onMounted(() => {
   document.addEventListener('keydown', onDocumentKeydown)
   mq = window.matchMedia('(max-width: 768px)')
   mq.addEventListener('change', onViewportChange)
-  nextTick(() => closeBtn.value?.focus())
+  nextTick(() => {
+    if (!focusCompositeHash()) closeBtn.value?.focus()
+  })
 })
 
 onUnmounted(() => {
+  setBeforeUnloadAttached(false)
   removeLeaveGuard()
   document.removeEventListener('keydown', onDocumentKeydown)
   mq?.removeEventListener('change', onViewportChange)
@@ -822,11 +877,10 @@ onUnmounted(() => {
 
 .settings-modal__head {
   align-items: center;
-  border-bottom: 1px solid var(--border);
   display: flex;
   flex-shrink: 0;
   gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
+  padding: var(--sp-4) var(--sp-4) 0;
 }
 
 .settings-modal__title {
@@ -836,116 +890,29 @@ onUnmounted(() => {
   margin: 0;
 }
 
+.settings-modal__close {
+  border: 0;
+  box-shadow: none;
+}
+
+.settings-modal__close:focus-visible {
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+
 .settings-loading {
   align-items: center;
   display: flex;
   flex: 1;
-  justify-content: center;
-}
-
-/* Readiness banner */
-.settings-banner {
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-  max-height: 45%;
-  overflow-y: auto;
-}
-
-.settings-banner.is-ok {
-  background: color-mix(in srgb, var(--ok) 8%, var(--bg-surface));
-  color: var(--ok);
-}
-
-.settings-banner.is-warn {
-  background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
-  color: var(--warn);
-}
-
-.settings-banner__row {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--sp-2);
-  min-height: 40px;
-  padding: var(--sp-2) var(--sp-4);
-}
-
-.settings-banner__count {
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.settings-banner__ready {
-  font-size: var(--fs-sm);
-  font-weight: 600;
-}
-
-.settings-banner__items {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--sp-1);
-  min-width: 0;
-}
-
-.settings-banner__item {
-  background: transparent;
-  border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border));
-  border-radius: var(--radius-full);
-  color: var(--text-muted);
-  cursor: pointer;
-  font-size: var(--fs-xs);
-  padding: 2px 10px;
-}
-
-.settings-banner__item:hover {
-  border-color: var(--warn);
-  color: var(--text);
-}
-
-.settings-banner__spacer {
-  flex: 1;
-}
-
-.settings-banner__toggle {
-  align-items: center;
-  background: transparent;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  display: inline-flex;
-  font-size: var(--fs-xs);
-  gap: var(--sp-1);
-  padding: 4px var(--sp-2);
-}
-
-.settings-banner__toggle:hover {
-  color: var(--text);
-}
-
-.settings-banner__chevron {
-  display: inline-block;
-  transition: transform var(--transition);
-}
-
-.settings-banner__chevron.is-open {
-  transform: rotate(90deg);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .settings-banner__chevron {
-    transition: none;
-  }
-}
-
-.settings-banner__disclosure {
-  border-top: 1px solid var(--border);
-  color: var(--text);
-  display: flex;
   flex-direction: column;
-  gap: var(--sp-4);
-  padding: var(--sp-4);
+  gap: var(--sp-2);
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.settings-loading strong {
+  color: var(--text);
+  font-size: var(--fs-md);
 }
 
 /* Body: rail + active section */
@@ -954,6 +921,15 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+}
+
+.settings-main {
+  background: var(--bg-surface);
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
 }
 
 .settings-rail {
@@ -1089,50 +1065,6 @@ onUnmounted(() => {
   flex: 1;
 }
 
-/* Footer */
-.settings-foot {
-  align-items: center;
-  border-top: 1px solid var(--border);
-  color: var(--text-dim);
-  display: flex;
-  flex-shrink: 0;
-  flex-wrap: wrap;
-  font-size: var(--fs-xs);
-  gap: var(--sp-2);
-  min-width: 0;
-  padding: var(--sp-2) var(--sp-4);
-}
-
-.settings-foot__path {
-  color: var(--text-muted);
-  flex: 1 1 240px;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.settings-foot__copy {
-  align-items: center;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  cursor: pointer;
-  display: inline-flex;
-  height: 24px;
-  justify-content: center;
-  width: 24px;
-}
-
-.settings-foot__copy:hover {
-  background: var(--bg-hover);
-  border-color: var(--border);
-  color: var(--text);
-}
-
 /* Mobile: full screen, horizontal section chips */
 @media (max-width: 768px) {
   .settings-overlay {
@@ -1148,6 +1080,10 @@ onUnmounted(() => {
 
   .settings-body {
     flex-direction: column;
+  }
+
+  .settings-main {
+    width: 100%;
   }
 
   .settings-rail {
@@ -1178,24 +1114,6 @@ onUnmounted(() => {
 
   .settings-panel {
     padding: var(--sp-3);
-  }
-
-  .settings-foot {
-    align-items: flex-start;
-    gap: var(--sp-1) var(--sp-2);
-    padding-bottom: max(var(--sp-2), env(safe-area-inset-bottom));
-  }
-
-  .settings-foot__text:first-child {
-    display: none;
-  }
-
-  .settings-foot__path {
-    flex-basis: calc(100% - 32px);
-  }
-
-  .settings-foot__sep {
-    display: none;
   }
 }
 </style>

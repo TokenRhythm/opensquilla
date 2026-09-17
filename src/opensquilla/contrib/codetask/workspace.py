@@ -28,6 +28,7 @@ from opensquilla.contrib.codetask.config import (
     repo_dir,
     run_dir,
 )
+from opensquilla.git_runtime import GitRunResult, GitRunState, run_git
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +47,48 @@ class PreparedRepo:
     branch: str
 
 
-def _git(args: list[str], cwd: Path, timeout: int = 120) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
+def _git_unavailable_error(result: GitRunResult) -> WorkspaceError:
+    reason = result.capability.reason or result.stderr_text.strip() or "git_unavailable"
+    return WorkspaceError(
+        "code-task requires Git, but no safe Git runtime is available "
+        f"({reason}). Install or enable Git before running code-task."
     )
+
+
+def _completed_git_process(
+    args: list[str],
+    result: GitRunResult,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=["git", *args],
+        returncode=result.returncode if result.returncode is not None else 1,
+        stdout=result.stdout_text,
+        stderr=result.stderr_text,
+    )
+
+
+def _git(
+    args: list[str],
+    cwd: Path,
+    timeout: int = 120,
+    *,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = run_git(
+        args,
+        cwd=cwd,
+        timeout=timeout,
+        input_bytes=input_text.encode("utf-8") if input_text is not None else None,
+        allow_user_interaction=True,
+    )
+    if result.state is GitRunState.UNAVAILABLE:
+        raise _git_unavailable_error(result)
+    if result.state is GitRunState.TIMED_OUT:
+        raise WorkspaceError(f"git {' '.join(args)} timed out after {timeout}s")
+    if result.returncode is None:
+        detail = result.stderr_text.strip() or result.state.value
+        raise WorkspaceError(f"git {' '.join(args)} could not be launched: {detail}")
+    return _completed_git_process(args, result)
 
 
 def is_dirty(path: Path) -> bool:
@@ -131,23 +164,20 @@ def prepare_repo(
     if dest.exists():
         shutil.rmtree(dest)
 
-    clone_cmd = ["git", "clone"]
+    clone_args = ["clone"]
     if shallow:
-        clone_cmd += ["--depth", "1"]
-    clone_cmd += [_normalize_source(repo), str(dest)]
-    try:
-        result = subprocess.run(
-            clone_cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=CLONE_TIMEOUT,
-        )
-    except FileNotFoundError as exc:
-        raise WorkspaceError("git is not installed.") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise WorkspaceError(f"git clone timed out after {CLONE_TIMEOUT}s.") from exc
+        clone_args += ["--depth", "1"]
+    clone_args += [_normalize_source(repo), str(dest)]
+    clone_result = run_git(
+        clone_args,
+        timeout=CLONE_TIMEOUT,
+        allow_user_interaction=True,
+    )
+    if clone_result.state is GitRunState.UNAVAILABLE:
+        raise _git_unavailable_error(clone_result)
+    if clone_result.state is GitRunState.TIMED_OUT:
+        raise WorkspaceError(f"git clone timed out after {CLONE_TIMEOUT}s.")
+    result = _completed_git_process(clone_args, clone_result)
     if result.returncode != 0:
         raise WorkspaceError(f"git clone failed: {(result.stderr or '').strip()[-400:]}")
 
@@ -248,15 +278,11 @@ def _empty_tree(repo: Path) -> str:
     SHA-1 and SHA-256 repositories. Uses ``--stdin`` with empty input so it
     works on Windows too (``/dev/null`` does not exist there).
     """
-    r = subprocess.run(
-        ["git", "hash-object", "-t", "tree", "--stdin"],
-        cwd=str(repo),
-        input="",
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    r = _git(
+        ["hash-object", "-t", "tree", "--stdin"],
+        repo,
         timeout=30,
+        input_text="",
     )
     if r.returncode != 0:
         raise WorkspaceError(f"could not compute empty tree: {(r.stderr or '').strip()}")
@@ -335,16 +361,15 @@ def persist_to_source(
         return False, f"source HEAD moved ({head[:12]} != base {base_commit[:12]})"
     if not patch.strip():
         return False, "no change to persist"
-    proc = subprocess.run(
-        ["git", "apply", "--whitespace=nowarn"],
-        cwd=str(source_repo),
-        input=patch,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=120,
-    )
+    try:
+        proc = _git(
+            ["apply", "--whitespace=nowarn"],
+            source_repo,
+            timeout=120,
+            input_text=patch,
+        )
+    except WorkspaceError as exc:
+        return False, str(exc)
     if proc.returncode != 0:
         return False, f"git apply failed: {(proc.stderr or '').strip()[-300:]}"
     _git(["config", "user.email", GIT_USER_EMAIL], source_repo)

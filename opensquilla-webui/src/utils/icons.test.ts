@@ -19,3 +19,10 @@ describe('sidebar toggle icons', () => {
     expect(svg).not.toContain('l-6 6')
   })
 })
+
+describe('plan disclosure icons', () => {
+  it('uses outward corners for expand and inward corners for collapse', () => {
+    expect(getIconSvg('expand', 15)).toContain('15 3 21 3 21 9')
+    expect(getIconSvg('collapse', 15)).toContain('4 14 10 14 10 20')
+  })
+})

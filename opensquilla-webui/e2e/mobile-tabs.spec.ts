@@ -11,22 +11,19 @@ async function openMobileChat(page: Page) {
 }
 
 test.describe('Mobile bottom tab bar', () => {
-  test('tabs are visible and navigate between Chat, Sessions, Overview, and More', async ({ page }) => {
+  test('tabs are visible and navigate between Chat, Overview, and More', async ({ page }) => {
     await openMobileChat(page)
 
     const tabbar = page.locator('.mobile-tabbar')
     await expect(tabbar).toBeVisible()
-    await expect(tabbar.locator('.mobile-tab')).toHaveCount(4)
+    await expect(tabbar.locator('.mobile-tab')).toHaveCount(3)
     await expect(tabbar.getByRole('link', { name: 'Agents' })).toHaveCount(0)
 
-    // Chat is the active tab on the chat route.
-    const chatTab = tabbar.getByRole('link', { name: 'Chat' })
+    // Task (the chat route) is the active tab.
+    const chatTab = tabbar.getByRole('link', { name: 'Task', exact: true })
     await expect(chatTab).toHaveClass(/is-active/)
 
-    await tabbar.getByRole('link', { name: 'Sessions' }).click()
-    await expect(page).toHaveURL(/\/sessions$/)
-    await expect(tabbar.getByRole('link', { name: 'Sessions' })).toHaveClass(/is-active/)
-    await expect(chatTab).not.toHaveClass(/is-active/)
+    // Session history is managed in the More drawer sidebar.
 
     // Overview fronts Status/Usage and remains active for diagnostic Logs.
     await tabbar.getByRole('link', { name: 'Overview' }).click()
@@ -57,7 +54,7 @@ test.describe('Mobile bottom tab bar', () => {
     await expect(page.locator('.sidebar.docked')).toBeVisible()
     await expect(page.locator('.sidebar-scrim')).toBeVisible()
     await expect(page.locator('.sidebar-core .sidebar-fn-label')).toHaveText([
-      'Sessions', 'Overview', 'Skills & Channels', 'Cron',
+      'Overview', 'Skills & Channels', 'Cron',
     ])
 
     // Skills & Channels and Cron live in this same flat drawer instead of a

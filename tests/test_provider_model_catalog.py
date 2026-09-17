@@ -7,19 +7,145 @@ import pytest
 from opensquilla.provider.model_catalog import ModelCatalog, _corrections_budget_fallback
 
 
-def test_deepseek_v4_direct_models_use_models_dev_limits() -> None:
-    # The vendored models.dev snapshot supplies the real per-(provider, model)
-    # budgets offline (PR #406 roadmap item 4); the packaged corrections
-    # budget rows remain only the emergency floor beneath it.
+def test_deployment_context_window_distinguishes_unknown_from_operator_and_runtime() -> None:
+    catalog = ModelCatalog()
+    unknown = catalog.resolve_deployment_limits("synthetic-private-model", provider="private-api")
+    assert unknown.context_window == 200_000
+    assert unknown.context_window_known is False
+    local = catalog.resolve_deployment_limits("synthetic-private-model", provider="ollama")
+    assert local.context_window_known is True
+    catalog.set_user_overrides({"private-api/synthetic-private-model": {"context_window": 48_000}})
+    explicit = catalog.resolve_deployment_limits("synthetic-private-model", provider="private-api")
+    assert explicit.context_window == 48_000
+    assert explicit.context_window_known is True
+
+
+def test_user_override_price_fields_keep_qualified_precedence_and_bare_fallback() -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "vendor/priced-model": {
+                "input_cost_per_mtok": 1.0,
+                "output_cost_per_mtok": 2.0,
+                "cache_write_cost_per_mtok": 4.0,
+                "context_window": 131_072,
+            },
+            "custom/vendor/priced-model": {
+                "input_cost_per_mtok": 0.0,
+                "cache_read_cost_per_mtok": 0.1,
+            },
+        }
+    )
+
+    assert catalog.user_override_price_fields(
+        "VENDOR/PRICED-MODEL", provider="CUSTOM"
+    ) == {
+        "input_cost_per_mtok": 0.0,
+        "output_cost_per_mtok": 2.0,
+        "cache_read_cost_per_mtok": 0.1,
+        "cache_write_cost_per_mtok": 4.0,
+    }
+
+
+def test_deepseek_direct_current_flash_alias_and_pro_limits() -> None:
+    # Official direct API metadata: current Flash and its retired V4 alias
+    # share the V4.1 deployment, while Pro remains a text-only deployment.
     catalog = ModelCatalog()
 
-    for model in ("deepseek-v4-flash", "deepseek-v4-pro"):
+    for model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"):
         assert catalog.resolve_context_window(model, "deepseek") == 1_000_000
+        assert catalog.resolve_context_window_with_source(model, "deepseek")[1] == "catalog"
         assert catalog.resolve_max_tokens(model, provider="deepseek") == 384_000
         caps = catalog.get_capabilities(model, provider_name="deepseek")
         assert caps.supports_reasoning is True
         assert caps.supports_tools is True
+        assert caps.supports_vision is (model != "deepseek-v4-pro")
         assert caps.reasoning_format == "deepseek"
+
+
+@pytest.mark.parametrize("model", ["deepseek-flash", "deepseek-v4-flash"])
+def test_deepseek_flash_prices_use_official_peak_estimates(model: str) -> None:
+    entry = ModelCatalog().resolve_entry(model, provider="deepseek")
+
+    assert entry.input_cost_per_mtok == pytest.approx(0.3)
+    assert entry.output_cost_per_mtok == pytest.approx(1.2)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(0.006)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "input_cost", "output_cost", "cache_read_cost"),
+    [
+        ("tokenrhythm", "deepseek-flash", 0.2867383512544803, 1.1469534050179212,
+         0.005734767025089606),
+        ("tokenrhythm", "deepseek-v4-flash", 0.14336917562724014, 0.2867383512544803,
+         0.02867383512544803),
+        ("openrouter", "deepseek/deepseek-v4-flash", 0.09, 0.18, 0.018),
+    ],
+)
+def test_deepseek_official_price_corrections_do_not_replace_other_provider_rates(
+    provider: str, model: str, input_cost: float, output_cost: float, cache_read_cost: float,
+) -> None:
+    entry = ModelCatalog().resolve_entry(model, provider=provider)
+
+    assert entry.input_cost_per_mtok == pytest.approx(input_cost)
+    assert entry.output_cost_per_mtok == pytest.approx(output_cost)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(cache_read_cost)
+
+
+def test_openrouter_c5_models_have_offline_budgets_and_capabilities() -> None:
+    catalog = ModelCatalog()
+    expected = {
+        "deepseek/deepseek-v4.1-flash": (1_048_576, 384_000),
+        "z-ai/glm-5.3-flash": (1_310_720, 131_072),
+        "qwen/qwen3.8-flash": (1_000_000, 131_072),
+        "qwen/qwen3.8-max-0902": (1_000_000, 131_072),
+    }
+
+    for model, (context_window, max_tokens) in expected.items():
+        assert catalog.resolve_context_window_with_source(
+            model, provider="openrouter"
+        ) == (context_window, "catalog")
+        assert catalog.resolve_max_tokens(model, provider="openrouter") == max_tokens
+        capabilities = catalog.get_capabilities(model, provider_name="openrouter")
+        assert capabilities.supports_reasoning is True
+        assert capabilities.supports_tools is True
+        assert capabilities.supports_vision is True
+        assert capabilities.reasoning_format == "openrouter"
+
+
+@pytest.mark.parametrize(
+    ("model", "window", "output"),
+    [
+        ("deepseek/deepseek-v4-flash", 1_024_000, 384_000),
+        ("deepseek/deepseek-v4-pro", 1_048_576, 393_216),
+        ("z-ai/glm-5.2", 1_048_576, 131_072),
+        ("z-ai/glm-5.1", 200_000, 128_000),
+        ("moonshotai/kimi-k2.6", 262_144, 235_929),
+    ],
+)
+def test_openrouter_public_physical_limits_are_available_offline(
+    model: str, window: int, output: int,
+) -> None:
+    catalog = ModelCatalog()
+    entry = catalog.resolve_entry(model, provider="openrouter")
+    assert (entry.context_window, entry.max_output_tokens) == (window, output)
+    assert catalog.resolve_context_window_with_source(model, "openrouter") == (window, "catalog")
+    assert catalog.resolve_max_tokens(model, provider="openrouter") == output
+    assert entry.supports_tools is True
+    assert entry.supports_reasoning is True
+
+
+@pytest.mark.parametrize("top_window", [None, -1, 100_000, 250_000])
+def test_openrouter_live_context_respects_the_smaller_positive_top_provider_limit(
+    top_window: int | None,
+) -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data([{
+        "id": "vendor/synthetic-model", "context_length": 200_000,
+        "top_provider": {"context_length": top_window, "max_completion_tokens": 8_192},
+    }])
+    expected = 100_000 if top_window == 100_000 else 200_000
+    assert catalog.resolve_context_window("vendor/synthetic-model", "openrouter") == expected
 
 
 def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
@@ -32,16 +158,54 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     them (see test_provider/test_live_catalog.py)."""
     catalog = ModelCatalog()
 
+    expected_c5_budgets = {
+        "deepseek-flash": (1_000_000, 384_000),
+        "glm-5.3-flash": (1_048_576, 131_072),
+        "qwen3.8-flash": (1_000_000, 131_072),
+        "qwen3.8-max": (1_000_000, 131_072),
+    }
+    for model, (context_window, max_tokens) in expected_c5_budgets.items():
+        assert catalog.resolve_context_window_with_source(
+            model, provider="tokenrhythm"
+        ) == (context_window, "catalog")
+        assert (
+            catalog.resolve_max_tokens(model, provider="tokenrhythm")
+            == max_tokens
+        )
+
     assert catalog.resolve_context_window_with_source(
         "deepseek-v4-flash", provider="tokenrhythm"
     ) == (1_000_000, "catalog")
     assert catalog.resolve_max_tokens("deepseek-v4-flash", provider="tokenrhythm") == 384_000
+    assert catalog.resolve_context_window_with_source(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == (1_000_000, "catalog")
+    assert (
+        catalog.resolve_max_tokens(
+            "deepseek-v4-flash-0731", provider="tokenrhythm"
+        )
+        == 384_000
+    )
+    assert catalog.resolve_context_window_with_source(
+        "qwen3.7-flash", provider="tokenrhythm"
+    ) == (1_000_000, "catalog")
+    assert catalog.resolve_max_tokens("qwen3.7-flash", provider="tokenrhythm") == 65_536
+    qwen_flash_caps = catalog.get_capabilities(
+        "qwen3.7-flash", provider_name="tokenrhythm"
+    )
+    # TokenRhythm streams reasoning content but rejects thinking-toggle
+    # request fields, so the effective capability intentionally keeps the
+    # injectable reasoning dialect disabled.
+    assert qwen_flash_caps.supports_reasoning is False
+    assert qwen_flash_caps.reasoning_format == "none"
+    assert qwen_flash_caps.supports_tools is True
+    assert qwen_flash_caps.supports_vision is True
     # Discriminating rows — the bare-id merge would report the origin
     # providers' windows here, not the relay's published ones.
     assert catalog.resolve_context_window("glm-5", provider="tokenrhythm") == 1_000_000
     assert catalog.resolve_context_window("kimi-k2.5", provider="tokenrhythm") == 256_000
     assert catalog.resolve_context_window("kimi-k2.7-code", provider="tokenrhythm") == 256_000
-    assert catalog.resolve_max_tokens("kimi-k2.7-code", provider="tokenrhythm") == 128_000
+    assert catalog.resolve_max_tokens("kimi-k2.7-code", provider="tokenrhythm") == 16_000
     assert catalog.resolve_context_window("qwen3.7-max", provider="tokenrhythm") == 1_000_000
     assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
     # The correction is scoped to TokenRhythm. Direct/provider-less snapshot
@@ -52,6 +216,53 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     # The same bare id on direct DeepSeek keeps its own snapshot-table
     # budgets — the provider-scoped layer never leaks across providers.
     assert catalog.resolve_context_window("deepseek-v4-flash", "deepseek") == 1_000_000
+
+
+def test_tokenrhythm_v4_flash_0731_offline_metadata_is_exact_and_scoped() -> None:
+    catalog = ModelCatalog()
+
+    entry = catalog.resolve_entry("deepseek-v4-flash-0731", provider="tokenrhythm")
+    assert entry.context_window == 1_000_000
+    assert entry.max_output_tokens == 384_000
+    assert entry.supports_reasoning is True
+    assert entry.supports_tools is True
+    assert entry.supports_vision is False
+    assert entry.reasoning_format == "none"
+    assert entry.status == "testing"
+    assert entry.input_cost_per_mtok == pytest.approx(0.14336917562724014)
+    assert entry.output_cost_per_mtok == pytest.approx(0.2867383512544803)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(0.002867383512544803)
+    assert catalog.resolve_context_window(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == 1_000_000
+    assert catalog.resolve_max_tokens(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == 384_000
+
+    direct = catalog.resolve_entry("deepseek-v4-flash-0731", provider="deepseek")
+    assert direct.input_cost_per_mtok is None
+    assert direct.output_cost_per_mtok is None
+    assert direct.cache_read_cost_per_mtok is None
+
+
+def test_tokenrhythm_v4_pro_0813_offline_metadata_is_exact_and_scoped() -> None:
+    catalog = ModelCatalog()
+
+    entry = catalog.resolve_entry("deepseek-v4-pro-0813", provider="tokenrhythm")
+    assert entry.context_window == 1_000_000
+    assert entry.max_output_tokens == 384_000
+    assert entry.supports_reasoning is True
+    assert entry.supports_tools is True
+    assert entry.supports_vision is False
+    assert entry.reasoning_format == "none"
+    assert entry.input_cost_per_mtok == pytest.approx(1.2903225806451613)
+    assert entry.output_cost_per_mtok == pytest.approx(3.870967741935484)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(0.043010752688172046)
+
+    direct = catalog.resolve_entry("deepseek-v4-pro-0813", provider="deepseek")
+    assert direct.input_cost_per_mtok is None
+    assert direct.output_cost_per_mtok is None
+    assert direct.cache_read_cost_per_mtok is None
 
 
 def test_direct_profile_windows_resolve_from_models_dev_snapshot() -> None:
@@ -261,6 +472,67 @@ def test_get_capabilities_honors_user_vision_override_on_live_reasoning_model() 
 
     assert caps.supports_reasoning is True
     assert caps.supports_vision is False
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="openrouter",
+    ) == "unsupported"
+
+
+def test_vision_support_distinguishes_live_evidence_from_synthesized_default() -> None:
+    catalog = _catalog_with_live_reasoning_model()
+
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="openrouter",
+    ) == "supported"
+    assert catalog.resolve_vision_support(
+        "vendor/unknown-model",
+        provider_name="openrouter",
+    ) == "unknown"
+    assert catalog.resolve_vision_support(
+        "vendor/reasoning-model",
+        provider_name="synthetic-provider",
+    ) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expected"),
+    [
+        ({}, "unknown"),
+        ({"input_modalities": None}, "unknown"),
+        ({"input_modalities": []}, "unknown"),
+        ({"input_modalities": "text"}, "unknown"),
+        ({"input_modalities": [None]}, "unknown"),
+        ({"input_modalities": [""]}, "unknown"),
+        ({"input_modalities": ["text"]}, "unsupported"),
+        ({"input_modalities": ["text", "image"]}, "supported"),
+        ({"input_modalities": [" TEXT ", " IMAGE "]}, "supported"),
+        ({"output_modalities": ["image"]}, "unknown"),
+    ],
+)
+def test_live_vision_requires_explicit_input_modality_evidence(
+    architecture: dict, expected: str,
+) -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [{"id": "synthetic/capability-check", "architecture": architecture}]
+    )
+
+    assert catalog.resolve_deployment_vision_support(
+        "synthetic/capability-check", provider="openrouter"
+    ) == expected
+
+
+def test_missing_live_vision_does_not_mask_known_catalog_input_capability() -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data([{"id": "synthetic/catalog-vision"}])
+    with patch(
+        "opensquilla.provider.model_catalog._snapshot_layer_fields",
+        return_value={"supports_vision": True},
+    ):
+        assert catalog.resolve_vision_support(
+            "synthetic/catalog-vision", provider_name="openrouter"
+        ) == "supported"
 
 
 @pytest.mark.parametrize(

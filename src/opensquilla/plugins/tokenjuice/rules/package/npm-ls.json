@@ -5,6 +5,7 @@
   "match": {
     "toolNames": ["exec"],
     "argv0": ["npm"],
+    "argvStartsWithAny": [["npm", "ls"], ["npm", "list"]],
     "argvIncludesAny": [["ls"], ["list"]]
   },
   "transforms": {

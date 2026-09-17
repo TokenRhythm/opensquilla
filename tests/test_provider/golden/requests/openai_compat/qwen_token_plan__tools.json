@@ -1,0 +1,95 @@
+{
+  "auth_style": "bearer",
+  "body": {
+    "enable_thinking": true,
+    "max_tokens": 16384,
+    "messages": [
+      {
+        "content": "You are a synthetic assistant used to freeze provider request payloads.",
+        "role": "system"
+      },
+      {
+        "content": "List the files in the workspace root.",
+        "role": "user"
+      },
+      {
+        "content": "I will list the files.",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"path\": \".\", \"max_entries\": 3}",
+              "name": "list_files"
+            },
+            "id": "call_001",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "README.md\nsrc\ntests",
+        "role": "tool",
+        "tool_call_id": "call_001"
+      }
+    ],
+    "model": "qwen3.8-max-preview",
+    "preserve_thinking": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "temperature": 0.7,
+    "tools": [
+      {
+        "function": {
+          "description": "List files under a workspace-relative path.",
+          "name": "list_files",
+          "parameters": {
+            "properties": {
+              "filters": {
+                "default": [],
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 5,
+                "minItems": 1,
+                "type": "array"
+              },
+              "max_entries": {
+                "maximum": 50,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "options": {
+                "additionalProperties": false,
+                "properties": {
+                  "include_hidden": {
+                    "default": false,
+                    "type": "boolean"
+                  }
+                },
+                "type": "object"
+              },
+              "path": {
+                "default": ".",
+                "description": "Workspace-relative directory to list.",
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "content_type": "application/json",
+  "method": "POST",
+  "url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+}

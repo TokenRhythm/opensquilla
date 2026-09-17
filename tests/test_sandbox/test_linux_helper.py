@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.sandbox.backend import linux_helper
+from opensquilla.sandbox.backend import linux_process as linux_process_mod
 from opensquilla.sandbox.backend.linux_filesystem import run_filesystem_payload
 from opensquilla.sandbox.backend.linux_helper import build_outer_bwrap_command
 from opensquilla.sandbox.backend.linux_payload import (
@@ -36,7 +38,7 @@ def test_filesystem_profile_from_legacy_payload_defaults_to_deny() -> None:
     policy = linux_helper._policy_from_payload(
         {
             "fileSystem": {
-                "entries": [],
+                "entries": [{"path": "/", "access": "read"}],
                 "deniedReadGlobs": [],
             }
         }
@@ -44,6 +46,7 @@ def test_filesystem_profile_from_legacy_payload_defaults_to_deny() -> None:
 
     assert policy.file_system is not None
     assert policy.file_system.default_access is FileSystemAccess.DENY
+    assert policy.file_system.entries[0].logical_path is None
 
 
 @pytest.mark.asyncio
@@ -184,9 +187,7 @@ async def test_run_process_payload_times_out(tmp_path) -> None:
         cwd=str(tmp_path),
         env={},
         policy={"wallTimeoutS": 0.01},
-        process=ProcessHelperPayload(
-            argv=[sys.executable, "-c", "import time; time.sleep(5)"]
-        ),
+        process=ProcessHelperPayload(argv=[sys.executable, "-c", "import time; time.sleep(5)"]),
         filesystem=None,
     )
 
@@ -195,6 +196,48 @@ async def test_run_process_payload_times_out(tmp_path) -> None:
     assert result["returncode"] == 124
     assert result["timedOut"] is True
     assert "timed out" in result["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_run_process_payload_caller_cancel_terminates_process_group(tmp_path) -> None:
+    payload = HelperPayload(
+        operation_type="process",
+        action_kind="shell.exec",
+        run_mode="trusted",
+        session_id="s1",
+        cwd=str(tmp_path),
+        env={},
+        policy={"wallTimeoutS": 30.0},
+        process=ProcessHelperPayload(
+            argv=[sys.executable, "-c", "import time; time.sleep(30)"]
+        ),
+        filesystem=None,
+    )
+    created: list[asyncio.subprocess.Process] = []
+    original_create = linux_process_mod.asyncio.create_subprocess_exec
+
+    async def capture_process(*args, **kwargs):
+        process = await original_create(*args, **kwargs)
+        created.append(process)
+        return process
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            linux_process_mod.asyncio,
+            "create_subprocess_exec",
+            capture_process,
+        )
+        running = asyncio.create_task(run_process_payload(payload))
+        for _attempt in range(100):
+            if created:
+                break
+            await asyncio.sleep(0.01)
+        assert created
+        running.cancel()
+        cancelled = await asyncio.gather(running, return_exceptions=True)
+        assert isinstance(cancelled[0], asyncio.CancelledError)
+
+    assert created[0].returncode is not None
 
 
 @pytest.mark.asyncio
@@ -477,7 +520,7 @@ def test_linux_helper_outer_mode_runs_bwrap_and_prints_inner_json(
             available=True,
             message="ready",
             path="bwrap",
-            ),
+        ),
     )
     monkeypatch.setattr(
         linux_helper.asyncio,

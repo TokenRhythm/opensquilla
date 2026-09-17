@@ -14,19 +14,19 @@
      surface-2 < elevated < hover) so surfaces separate by lightness AND by the
      machined --elev shadow below. Deeper/cooler than the old #121212 so raised
      surfaces read as lit. */
-  --bg: #0E0F11;
-  --bg-surface: #161719;
-  --bg-surface-2: #1C1E21;
-  --bg-elevated: #232529;
-  --bg-hover: #2C2E33;
-  --text: #EEF0F2;
-  --text-muted: #A6ABB3;
-  --text-dim: #868C95;
-  --border: #2E3138;
-  --border-strong: #42464D;
-  --border-focus: #4A4F57;
-  --card: #161719;
-  --hairline: #202327;
+  --bg: #18181A;
+  --bg-surface: #202022;
+  --bg-surface-2: #28282B;
+  --bg-elevated: #2D2D30;
+  --bg-hover: #353539;
+  --text: #F5F5F7;
+  --text-muted: #B0B0B6;
+  --text-dim: #87878E;
+  --border: #303034;
+  --border-strong: #444448;
+  --border-focus: #55555B;
+  --card: #202022;
+  --hairline: #29292C;
 
   /* User bubble: the deeper graphite canvas needs one more step than the
      foundation's 7% default for the fill to read at a glance. */

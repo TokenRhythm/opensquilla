@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
-from opensquilla.execution_status import ExecutionStatus
-from opensquilla.session.compaction_lifecycle import (
-    DEFAULT_FLUSH_TRIGGERS,
-    normalize_flush_triggers_strict,
+from opensquilla.contracts.turn_execution import (
+    AnswerGenerationResetEvent,
 )
+from opensquilla.execution_status import ExecutionStatus
+from opensquilla.provider.types import ExecutionIdentity
 from opensquilla.tool_boundary import ToolCall as ToolCall
+from opensquilla.tool_boundary import ToolEffectOutcome as ToolEffectOutcome
 from opensquilla.tool_boundary import ToolResult as ToolResult
 
 if TYPE_CHECKING:
@@ -48,15 +49,56 @@ class AgentState(StrEnum):
     DONE = "done"
 
 
+class ControlTerminalReason(StrEnum):
+    """Control-owned terminal reasons; none of these are provider failures."""
+
+    CANCEL = "cancel"
+    SHUTDOWN = "shutdown"
+    HARD_DEADLINE = "hard_deadline"
+    PLATFORM_VALIDATION = "platform_validation"
+    PLATFORM_SAFETY = "platform_safety"
+
+
 # ---------------------------------------------------------------------------
 # Agent events
 # ---------------------------------------------------------------------------
 
 
 @dataclass
+class ThinkingStartEvent:
+    kind: Literal["thinking_start"] = field(default="thinking_start", init=False)
+    block_id: str = ""
+    block_index: int = 0
+    started_at: int = 0
+    content_kind: Literal["summary", "reasoning"] = "reasoning"
+    generation_epoch: int = 0
+
+
+@dataclass
 class ThinkingEvent:
     kind: Literal["thinking"] = field(default="thinking", init=False)
     text: str = ""
+    started_at: int = 0
+    # Optional block identity keeps the existing thinking delta wire contract
+    # compatible while allowing newer clients to preserve provider-call
+    # boundaries. Empty/-1 remain the legacy single-block representation.
+    block_id: str = ""
+    block_index: int = -1
+    generation_epoch: int = 0
+    # Physical provider-call identity for stable presentation ownership.
+    # Additive defaults preserve legacy producers and positional construction.
+    model_call_id: str = ""
+    iteration: int = 0
+
+
+@dataclass
+class ThinkingEndEvent:
+    kind: Literal["thinking_end"] = field(default="thinking_end", init=False)
+    block_id: str = ""
+    block_index: int = 0
+    status: Literal["completed", "interrupted", "error"] = "completed"
+    ended_at: int = 0
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -69,6 +111,11 @@ class TextDeltaEvent:
     # ended up making tool calls — see agent.py. Defaults to "answer" so any
     # producer that does not set it keeps the pre-existing card behavior.
     presentation: Literal["intermediate", "answer"] = "answer"
+    generation_epoch: int = 0
+    # Physical provider-call identity for stable presentation ownership.
+    # Additive defaults preserve legacy producers and positional construction.
+    model_call_id: str = ""
+    iteration: int = 0
 
 
 @dataclass
@@ -78,6 +125,41 @@ class RunHeartbeatEvent:
     elapsed_ms: int = 0
     idle_ms: int = 0
     message: str = ""
+    generation_epoch: int = 0
+
+
+@dataclass
+class ProviderActivityEvent:
+    """Public, provider-neutral progress for long model operations.
+
+    Fields are deliberately closed enums and counters: provider error bodies
+    and failed-leg reasoning must never cross this boundary.
+    """
+
+    kind: Literal["provider_activity"] = field(default="provider_activity", init=False)
+    schema_version: int = 1
+    activity_id: str = ""
+    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = (
+        "requesting"
+    )
+    reason: Literal[
+        "initial",
+        "rate_limited",
+        "provider_overloaded",
+        "transport_transient",
+        "reasoning_only",
+        "empty_response",
+        "stream_incomplete",
+        "invalid_response",
+        "context_overflow",
+        "unknown",
+    ] = "initial"
+    retry_attempt: int = 0
+    retry_limit: int = 0
+    retry_after_ms: int = 0
+    started_at: int = 0
+    heartbeat: bool = False
+    model: str = ""
 
 
 @dataclass
@@ -92,6 +174,8 @@ class ToolUseStartEvent:
     # clock every time the component remounts (see issue #329). 0 means
     # "unstamped" — clients fall back to their own clock.
     started_at: int = 0
+    generation_epoch: int = 0
+    tool_presentation: dict[str, Any] | None = None
 
 
 @dataclass
@@ -99,6 +183,25 @@ class ToolUseDeltaEvent:
     kind: Literal["tool_use_delta"] = field(default="tool_use_delta", init=False)
     tool_use_id: str = ""
     json_fragment: str = ""
+    generation_epoch: int = 0
+
+
+@dataclass
+class ToolUseEndEvent:
+    """Committed end of one provider tool-call declaration.
+
+    Like start/delta, this event is buffered inside the Agent until the
+    provider call reaches a legal DoneEvent.  ``arguments`` is the validated,
+    authoritative object supplied by the provider boundary.
+    """
+
+    kind: Literal["tool_use_end"] = field(default="tool_use_end", init=False)
+    tool_use_id: str = ""
+    tool_name: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    synthetic_from_text: bool = False
+    generation_epoch: int = 0
+    tool_presentation: dict[str, Any] | None = None
 
 
 @dataclass
@@ -110,6 +213,10 @@ class ToolResultEvent:
     is_error: bool = False
     arguments: dict[str, Any] | None = None
     execution_status: ExecutionStatus | None = None
+    effect_outcome: ToolEffectOutcome | None = None
+    generation_epoch: int = 0
+    tool_presentation: dict[str, Any] | None = None
+    execution_log_handle: str | None = None
 
 
 @dataclass
@@ -138,6 +245,8 @@ class ArtifactEvent:
     download_url: str = ""
     store: str = "artifacts"
     has_thumbnail: bool = False
+    generation_epoch: int = 0
+    publication_id: str = ""
 
 
 @dataclass
@@ -156,6 +265,40 @@ class ErrorEvent:
     # Appended last with a default: positional construction elsewhere must not
     # shift (same hazard the DoneEvent comment in this file documents).
     error_id: str = ""
+    # Stable provider taxonomy for terminal consumers.  The provider's raw
+    # ``code`` remains available for diagnostics and wire compatibility.
+    failure_kind: str = ""
+    generation_epoch: int = 0
+    # Optional bounded retry hint for errors that prove no provider dispatch.
+    # Appended for positional-construction compatibility.
+    retry_after_ms: int | None = None
+    # Usage-ledger admission evidence. ``retryable`` describes the transient
+    # error class; these fields separately prove whether replaying the whole
+    # user turn cannot duplicate an earlier provider dispatch or side effect.
+    usage_call_index: int | None = None
+    no_prior_provider_dispatch: bool | None = None
+    replay_safe: bool | None = None
+    model_capacity: dict[str, Any] | None = None
+
+
+@dataclass
+class ControlTerminalEvent:
+    """Public terminal event owned by turn control, not by a provider."""
+
+    kind: Literal["control_terminal"] = field(default="control_terminal", init=False)
+    turn_id: str = ""
+    assistant_message_id: str = ""
+    sequence: int = 0
+    reason: ControlTerminalReason = ControlTerminalReason.CANCEL
+    preserve_completed_tools: bool = True
+    terminal: bool = True
+
+    def __post_init__(self) -> None:
+        self.reason = ControlTerminalReason(self.reason)
+        if not self.preserve_completed_tools:
+            raise ValueError("control terminal events must preserve completed tools")
+        if not self.terminal:
+            raise ValueError("control terminal events must be terminal")
 
 
 @dataclass
@@ -219,11 +362,47 @@ class DoneEvent:
     # Configured registry identity that served the terminal model response.
     # Appended for compatibility with existing positional construction.
     provider: str = ""
+    # Historical output-token count for the parent assistant message itself.
+    # Aggregated output_tokens may also include completed in-process subagents.
+    message_output_tokens: int | None = None
+    # Number of non-free usage components whose cost could not be determined.
+    missing_cost_entries: int = 0
+    # Immutable logical router choice plus append-only physical provider calls.
+    # Appended for wire and positional-construction compatibility.
+    route_plan: dict[str, Any] | None = None
+    execution_legs: list[dict[str, Any]] = field(default_factory=list)
+    # Output ranges produced by model calls that applied a same-turn steer.
+    # Offsets are Unicode codepoint indexes into ``text_snapshot``/``text``.
+    # Appended for wire and positional-construction compatibility.
+    model_call_segments: list[dict[str, Any]] = field(default_factory=list)
+    # Typed presentation contract for silent replies. Appended so existing
+    # positional DoneEvent construction keeps its historical field order.
+    delivery: Literal["visible", "suppressed"] = "visible"
+    suppression_reason: Literal["no_reply", "heartbeat_ack"] | None = None
+    generation_epoch: int = 0
+    # First physical provider call that emitted visible output for the route
+    # plan. Clients use this to keep its route card on the same answer segment.
+    router_model_call_id: str = ""
+    router_iteration: int = 0
+
+    # Internal continuation state; never part of public event payloads.
+    assistant_replay: dict[str, Any] | None = field(
+        default=None, repr=False, metadata={"private": True}
+    )
 
     @property
     def upstream_cost_usd(self) -> float:
         """Backward-compatible alias for earlier OpenRouter cost consumers."""
         return self.billed_cost
+
+
+def public_agent_event_payload(event: Any) -> dict[str, Any]:
+    """Serialize an event without copying private provider continuation state."""
+    if isinstance(event, DoneEvent):
+        payload = asdict(replace(event, assistant_replay=None))
+        payload.pop("assistant_replay", None)
+        return payload
+    return asdict(event)
 
 
 def done_text_snapshot(event_or_mapping: object) -> tuple[bool, str]:
@@ -254,10 +433,9 @@ class RouterDecisionEvent:
     pre-turn pipeline resolves the tier/model. Frontend uses this to drive
     the router HUD (tier pill, tier-shift highlight, scanner popover).
 
-    Routing fires once per user-message and the tier sticks across the
-    agent loop; consumers must treat the event as last-writer-wins state,
-    because a mid-turn selector failover re-emits it once before the
-    DoneEvent with ``source="fallback"`` and the model that actually ran.
+    Routing fires once per logical turn and the plan sticks across the
+    agent loop. Provider fallback is reported through the terminal
+    ``execution_legs`` payload and never creates a second routing decision.
     """
 
     kind: Literal["router_decision"] = field(default="router_decision", init=False)
@@ -275,6 +453,9 @@ class RouterDecisionEvent:
     routing_applied: bool = True
     rollout_phase: str = "full"
     context_window: int | None = None
+    # Display-safe, versioned candidate pool from the immutable RoutePlan.
+    # Appended for positional-construction and older consumer compatibility.
+    router_tier_snapshot: dict[str, Any] | None = None
 
 
 @dataclass
@@ -295,6 +476,7 @@ class EnsembleProgressEvent:
     output_tokens: int = 0
     cost_usd: float = 0.0
     error: str = ""
+    generation_epoch: int = 0
 
 
 @dataclass
@@ -393,10 +575,17 @@ class CompactionEvent:
 
     kind: Literal["compaction"] = field(default="compaction", init=False)
     compaction_id: str | None = None
+    compaction_deadline_at_monotonic: float | None = None
+    compaction_timeout_seconds: float | None = None
     summary: str = ""
     kept_entries: list[dict] = field(default_factory=list)
     kept_count: int = 0
     removed_count: int = 0
+    summary_payload: dict[str, Any] | None = None
+    summary_format: str = "text"
+    coverage_status: str = "unknown"
+    missing_obligations: list[str] | None = None
+    critical_carry_forward: list[str] | None = None
 
 
 @dataclass
@@ -406,25 +595,49 @@ class CompactionOutcome:
     messages: list = field(default_factory=list)
     compacted: bool = False
     summary: str = ""
+    summary_payload: dict[str, Any] | None = None
+    summary_format: str = "text"
+    coverage_status: str = "unknown"
+    missing_obligations: list[str] | None = None
+    critical_carry_forward: list[str] | None = None
     kept_entries: list[dict] = field(default_factory=list)
     removed_count: int = 0
     compaction_id: str | None = None
+    compaction_deadline_at_monotonic: float | None = None
+    compaction_timeout_seconds: float | None = None
     request_context_insert_index: int | None = None
     runtime_context_insert_index: int | None = None
     protected_turn_start_index: int | None = None
+    # Request-scoped projection only. The canonical turn transcript remains
+    # raw and no CompactionEvent may be persisted for this outcome.
+    ephemeral_only: bool = False
+    # Runtime-only owner for a multi-stage overflow recovery. Durable and
+    # request-scoped projections share its absolute deadline and physical LLM
+    # call counter; it must never enter persistence, logs, or event reprs.
+    runtime_compaction_config: Any | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 AgentEvent = (
-    ThinkingEvent
+    ThinkingStartEvent
+    | ThinkingEvent
+    | ThinkingEndEvent
     | TextDeltaEvent
     | RunHeartbeatEvent
+    | ProviderActivityEvent
     | ToolUseStartEvent
     | ToolUseDeltaEvent
+    | ToolUseEndEvent
     | ToolResultEvent
     | RouterControlReplayEvent
     | ArtifactEvent
     | StateChangeEvent
     | ErrorEvent
+    | AnswerGenerationResetEvent
+    | ControlTerminalEvent
     | DoneEvent
     | CompactionEvent
     | WarningEvent
@@ -457,17 +670,15 @@ class AgentConfig:
     # bounded operator budgets for CI, benchmarks, and constrained runs.
     max_iterations: int = 0
     # Total turn wall-clock budget (seconds; 0 = disabled)
-    # 30 min — see iteration_timeout note below; outer turn budget for
+    # Default outer turn budget (30 minutes) for
     # meta-skill DAGs (paper-write / arxiv-deck run 5-7 min commonly).
     timeout: float = 1800.0
-    # Per-iteration timeout: one LLM call + its tool executions
-    # 30 min — single iteration may be the whole meta DAG when the soft
-    # path treats meta_invoke as a single tool call.
-    iteration_timeout: float = 1800.0
+    # Deprecated, unused compatibility slot; preserve constructor position.
+    iteration_timeout: float = 0.0
     # HTTP-level timeout for a single LLM API request
     request_timeout: float = 120.0
-    # Per-tool execution timeout
-    tool_timeout: float = 60.0
+    # Deprecated, unused compatibility slot; tools declare their own deadlines.
+    tool_timeout: float = 0.0
     # Upper bound for same-turn safe tool execution. Safe tools can overlap, but
     # unbounded fan-out can overload local/network resources.
     max_safe_tool_concurrency: int = 6
@@ -497,10 +708,15 @@ class AgentConfig:
     provider_id: str = ""
     stop_sequences: list[str] = field(default_factory=list)
     context_window_tokens: int = 200000
+    # Positive only when the gateway operator explicitly configured the global
+    # ``llm.context_window_tokens`` value. Keep it separate from the resolved
+    # active-model window so selector fallback can apply the same precedence to
+    # its own physical deployment. Zero preserves catalog-derived rebinding.
+    context_window_tokens_global_override: int = 0
     context_overflow_threshold: float = 0.85  # trigger at 85%
-    max_overflow_retries: int = 2
+    max_overflow_retries: int = 1
     max_history_turns: int = 0  # 0 = unlimited; compaction handles oversized history
-    preserve_historical_images: bool = False
+    preserve_historical_images: bool = True
     materialize_historical_attachments: bool = True
     # Retry policy for transient LLM errors (429, 500, 503)
     max_provider_retries: int = 3
@@ -516,28 +732,38 @@ class AgentConfig:
     # Per-turn volatile request context injected after persisted history
     # and before the current user turn. It is not persisted to history.
     request_context_prompt: str | None = None
+    # Initial facts; physical request boundaries rebind this immutable snapshot.
+    execution_identity: ExecutionIdentity | None = None
     # Per-turn user-role skill context injected after persisted history
     # and before the current user turn. The agent persists each turn's
     # skill context in history so provider KV-cache prefixes stay stable.
     skills_context_prompt: str | None = None
-    # Pre-compaction memory flush
-    flush_enabled: bool = False
-    flush_triggers: list[str] = field(default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS))
-    flush_pre_compaction: bool = False
-    flush_timeout_seconds: float = 15.0
-    flush_background_timeout_seconds: float = 120.0
-    flush_backoff_initial_seconds: float = 30.0
-    flush_backoff_max_seconds: float = 300.0
-    flush_archive_max_bytes: int = 800_000
-    flush_compaction_requires_safe_receipt: bool = False
-    flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     compaction_protected_recent_messages: int = 0
-    repair_enabled: bool = True
-    repair_interval_seconds: float = 60.0
-    repair_max_items_per_tick: int = 5
-    flush_workspace_dir: str | None = None
+    compaction_total_timeout_seconds: float = 120.0
+    compaction_heartbeat_interval_seconds: float = 15.0
+    # Frozen runtime-only single-deployment chain for auxiliary compaction.
+    # Kept opaque here to avoid coupling engine types to session internals.
+    compaction_execution_plan: Any | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    # Re-resolve the selector's current physical leg at the start of each
+    # compaction operation, then freeze the returned plan for that operation.
+    compaction_execution_plan_factory: Callable[[], Any | None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
+    # Active-deployment tool capability provenance for diagnostics and routing.
+    # Tool authorization remains owned by the projected registry surface and
+    # dispatch/side-effect boundaries; unknown provenance does not remove tools.
+    model_tools_capability_verified: bool = False
+    # Runtime-only tri-state evidence; synthesized capability defaults remain
+    # ``unknown`` instead of becoming an authoritative vision denial.
+    model_vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
     # Tokenjuice projection: project eligible fresh tool results before the
     # next LLM turn. This is not user-selectable behavior.
     # Legacy compression knobs remain as compatibility shims for meta_invoke
@@ -550,13 +776,9 @@ class AgentConfig:
     tool_result_compression_summary_timeout_seconds: float = 20.0
     tool_result_compression_summary_input_max_chars: int = 60_000
     tool_result_projection_max_inline_chars: int = 60_000
-    # Fresh diagnostic delivery is experimental; unattended profiles should opt
-    # in only after model-specific validation.
+    # Deprecated, unused compatibility slots; preserve positional/keyword construction.
     tool_result_fresh_diagnostic_policy_enabled: bool = False
     tool_result_diagnostic_retrieval_gate_enabled: bool = False
-    # When the fresh diagnostic policy is enabled, keep bounded failures intact
-    # for the immediate handoff, then let older history/replay compaction handle
-    # long-term context pressure.
     tool_result_fresh_diagnostic_inline_max_chars: int = 64_000
     # Dispatch-layer tool result caps. 0 disables the cap. These run before
     # provider-request projection and are intended for unattended automation
@@ -565,113 +787,97 @@ class AgentConfig:
     tool_result_dispatch_turn_max_chars: int = 0
     tool_result_provider_request_max_chars: int = 0
     provider_request_proof_max_chars: int = 0
+    # ``None`` means infer an explicit operator limit from a positive value.
+    # Internal callers that bind a cap derived for a concrete child deployment
+    # set this to ``False`` so selector fallback can re-plan independently.
+    provider_request_proof_max_chars_explicit: bool | None = None
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
     tool_result_external_keep_recent: int = 2
+    # Deprecated, unused compatibility slot; preserve constructor position.
     tool_failure_loop_block_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve constructor position.
     repeated_tool_call_recovery_threshold: int = 0
-    # Extra tool names covered by repeated-identical-call recovery, on top of
-    # the built-in read-only set. Set via OPENSQUILLA_TOOL_REPEAT_NUDGE_TOOLS
-    # (comma-separated); the threshold is tunable via
-    # OPENSQUILLA_TOOL_REPEAT_NUDGE_THRESHOLD.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     repeated_tool_call_recovery_extra_tools: tuple[str, ...] = ()
+    # Deprecated, unused compatibility slot; preserve constructor position.
     progress_watchdog_mode: Literal["off", "log", "warn_model", "block"] = "off"
+    # Deprecated, unused compatibility slot; preserve constructor position.
     progress_watchdog_repeated_tool_error_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve constructor position.
     progress_watchdog_repeated_provider_failure_threshold: int = 2
+    # Deprecated, unused compatibility slot; preserve constructor position.
     progress_watchdog_repeated_failure_anchor_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_enabled: bool = False
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_warn_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_finalize_after_warning: int = 3
+    # Deprecated, unused compatibility slot; preserve constructor position.
     patch_evidence_ledger_path: str | None = None
-    # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
-    # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     finalize_evidence_gate_enabled: bool = False
-    # Keep rejection feedback visible when blocked compacted-placeholder tool
-    # calls are projected out of provider requests: the blocked tool_use keeps
-    # a placeholder input and its error tool_result stays in the projection.
-    # Off by default; enabled via OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
+    finalize_evidence_strict: bool = False
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
+    submit_review_enabled: bool = False
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
+    submit_review_diff_max_chars: int = 20000
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
+    patch_hygiene_block_mode: Literal["off", "test_paths", "protected_paths"] = "off"
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
+    scratch_verify_mirror: bool = False
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
+    finalize_variant_challenge: bool = False
+    # Deprecated, unused compatibility slot; preserve constructor position.
     provider_context_block_feedback: bool = False
-    # Byte-identical provider-request loop breaker. 0 = off. At N consecutive
-    # identical projected payloads the request is perturbed with a loop nudge;
-    # at 2N the turn aborts. Set via OPENSQUILLA_IDENTICAL_REQUEST_LOOP_BREAK.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     identical_request_loop_break_threshold: int = 0
-    # Escalating recovery directive for repeated compacted-placeholder tool-call
-    # offenses within one turn. 0 = off. From the Nth iteration that blocks a
-    # placeholder reuse onward, a stronger directive is appended after the tool
-    # results so the model rebuilds arguments from fresh file/command output
-    # instead of re-offending until the wall clock expires. Set via
-    # OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     placeholder_escalation_threshold: int = 0
-    # Pre-deadline wrap-up nudge. 0 = off. When positive and a total turn
-    # timeout is configured, the wrap-up directive arms once when remaining
-    # wall-clock time drops below this many seconds, then is rebuilt each
-    # iteration (so the remaining-minutes figure stays current) and spliced
-    # into every subsequent provider request; only the arming log event is
-    # one-shot. Unlike the max_iterations finalization, tools stay available
-    # so the model can still apply and verify its final changes. Set via
-    # OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     deadline_wrapup_margin_seconds: int = 0
-    # Retry the reasoning-only provider failure with thinking disabled instead
-    # of re-requesting visible content with thinking still enabled. Off by
-    # default (the retry keeps thinking on). Set via
-    # OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK.
-    reasoning_only_thinking_fallback: bool = False
-    # Force thinking off for every provider call once remaining wall-clock
-    # time drops below this many seconds. 0 = off. Complements the wrap-up
-    # directive: the nudge alone leaves thinking enabled, so the model can
-    # still spend the entire margin inside a single reasoning stream. Set via
-    # OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS.
-    deadline_thinking_off_margin_seconds: int = 0
-    # Preempt a runaway reasoning-only stream once its streamed reasoning text
-    # exceeds this many characters. 0 = off. The partial reasoning is
-    # discarded and the call retries immediately with thinking disabled for
-    # that retry only (the next iteration re-enables thinking), so the budget
-    # goes to tool calls instead of one unbounded reasoning stream. One
-    # preempt per iteration; attempts that already emitted user-visible text
-    # or tool calls are never preempted. Set via
-    # OPENSQUILLA_REASONING_STREAM_CHAR_CAP.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     reasoning_stream_char_cap: int = 0
-    # Re-apply captured source-diff candidates whose paths end the turn with
-    # no live workspace diff (that path's earlier work would otherwise be
-    # missing from the collected patch). Off by default. Runs once per turn
-    # end — normal finalization and terminal errors alike — applying the
-    # newest candidate per path, each guarded by `git apply --check`. Set via
-    # OPENSQUILLA_FINAL_DIFF_SALVAGE.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     final_diff_salvage: bool = False
-    # Freeze workspace-reverting git commands (restore, checkout paths or
-    # branches, reset --hard, clean -fd, stash) in the shell tools once
-    # remaining wall-clock time drops below this many seconds. 0 = off.
-    # Unlike source_diff_preservation_mode="block", the freeze blocks the
-    # operations outright — no protected-path intersection — so a last-minute
-    # revert cannot empty the collected diff. Set via
-    # OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_git_freeze_margin_seconds: int = 0
-    # Mid-budget progress nudges. Off by default. When enabled and the turn
-    # has a wall-clock budget (timeout > 0), a one-shot user message is
-    # appended after tool results the first time elapsed time crosses 50% and
-    # again at 75% of the budget while the workspace shows no change yet (no
-    # write receipts, no captured diff candidates, empty live workspace
-    # diff). Set via OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE.
+    # Deprecated, unused compatibility slot; preserve constructor position.
+    max_iterations_deadline_extend_seconds: int = 0
+    # Deprecated, unused compatibility slot; preserve constructor position.
+    final_diff_salvage_veto: bool = False
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
+    endgame_git_freeze_instrumentation_exempt: bool = False
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
+    endgame_fix_directive_margin_seconds: int = 0
+    # Inject an act-now user message when a provider response is reasoning
+    # only (no visible text, no tool calls) and grant one extra retry for that
+    # failure kind. Off by default (the bare retry re-requests with nothing
+    # added). Set via OPENSQUILLA_REASONING_ONLY_ACT_NOW.
+    reasoning_only_act_now: bool = False
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     mid_budget_no_diff_nudge: bool = False
-    # Provider-view dedup of byte-identical repeated tool results. Off by
-    # default. When enabled, older duplicate tool_result payloads (same content
-    # emitted N+ times across iterations) are replaced in the provider request
-    # projection with a compact back-reference to the surviving newest copy;
-    # persisted history is never mutated. Set via
-    # OPENSQUILLA_PROVIDER_HISTORY_DEDUP.
+    # Deprecated, unused compatibility slots; preserve positional/keyword construction.
     provider_history_dedup_enabled: bool = False
-    # Minimum number of byte-identical copies of a tool result before dedup
-    # elides the older ones (keeps the newest copy full). Set via
-    # OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS.
     provider_history_dedup_min_repeats: int = 2
+    projection_signal_hints: bool = False
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_loop_observer_mode: Literal["off", "log"] = "off"
     runtime_recovery_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve constructor position.
     runtime_recovery_source_loop_max_nudges: int = 1
+    # Deprecated, unused compatibility slot; preserve constructor position.
     final_diff_contract_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve constructor position.
     source_diff_preservation_mode: Literal["off", "log", "block"] = "log"
+    # Deprecated, unused compatibility slot; preserve constructor position.
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"
     post_tool_empty_recovery_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "off"
     reasoning_prefill_recovery_mode: Literal["off", "log", "recover"] = "log"
     runtime_events_path: str | None = None
@@ -689,13 +895,24 @@ class AgentConfig:
     # stays gateway-agnostic and a broken observer can never affect a turn.
     provider_call_observer: Callable[..., None] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Internal provenance: a compatibility/default history window is not a
+    # physical provider fact. Direct AgentConfig callers retain their supplied
+    # window; runtime catalog resolution explicitly marks unknown values false.
+    context_window_known: bool = True
 
     def __post_init__(self) -> None:
-        self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))
+        if self.provider_request_proof_max_chars_explicit is None:
+            self.provider_request_proof_max_chars_explicit = (
+                int(self.provider_request_proof_max_chars or 0) > 0
+            )
         self.compaction_protected_recent_messages = max(
             0,
             int(self.compaction_protected_recent_messages or 0),
         )
+        if float(self.compaction_total_timeout_seconds or 0) <= 0:
+            self.compaction_total_timeout_seconds = 120.0
+        if float(self.compaction_heartbeat_interval_seconds or 0) <= 0:
+            self.compaction_heartbeat_interval_seconds = 15.0
 
     def resolve_thinking(self, prompt: str | None = None) -> tuple[bool, int]:
         """Return (enabled, budget_tokens) based on the thinking field.

@@ -417,3 +417,29 @@ def test_config_system_override_per_prompt() -> None:
     )
     assert runs[0].ok is True
     assert base.system is None  # base config not mutated
+
+
+def test_benchmark_binds_nonzero_budget_to_physical_provider() -> None:
+    class CapturingProvider(SyntheticProvider):
+        def __init__(self) -> None:
+            super().__init__(model="m")
+            self.seen_config: ChatConfig | None = None
+
+        def chat(self, messages, *, tools=None, config=None):
+            self.seen_config = config
+            return super().chat(messages, tools=tools, config=config)
+
+    provider = CapturingProvider()
+    runs = asyncio.run(
+        run_arm(
+            provider,
+            [BenchmarkPrompt(id="budget", text="small prompt")],
+            arm="x",
+            base_config=ChatConfig(max_tokens=42),
+            clock=_latency_clock([0.0]),
+        )
+    )
+
+    assert runs[0].ok is True
+    assert provider.seen_config is not None
+    assert provider.seen_config.provider_request_max_chars > 0

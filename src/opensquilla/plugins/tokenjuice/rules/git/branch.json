@@ -4,6 +4,7 @@
   "description": "Compact git branch output while preserving branch names and current branch context.",
   "match": {
     "argv0": ["git"],
+    "gitSubcommands": ["branch"],
     "argvIncludes": [["branch"]]
   },
   "transforms": {

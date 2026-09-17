@@ -811,7 +811,7 @@ class LongTermMemoryStore:
                 (path, source.value, file_hash, mtime, size),
             )
             await self._db.commit()
-        except Exception:
+        except BaseException:
             await self._db.rollback()
             raise
 
@@ -820,19 +820,25 @@ class LongTermMemoryStore:
 
     async def remove_file(self, path: str) -> None:
         assert self._db is not None
-        # Vec first — needs chunk IDs before they're deleted (same pattern as index_file)
-        if self._vec_available:
-            try:
-                await self._db.execute(
-                    "DELETE FROM chunks_vec WHERE id IN (SELECT id FROM chunks WHERE path = ?)",
-                    (path,),
-                )
-            except Exception:
-                pass
-        await self._db.execute("DELETE FROM chunks_fts WHERE path = ?", (path,))
-        await self._db.execute("DELETE FROM chunks WHERE path = ?", (path,))
-        await self._db.execute("DELETE FROM files WHERE path = ?", (path,))
-        await self._db.commit()
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            # Vec first — needs chunk IDs before they're deleted (same pattern as index_file)
+            if self._vec_available:
+                try:
+                    await self._db.execute(
+                        "DELETE FROM chunks_vec WHERE id IN "
+                        "(SELECT id FROM chunks WHERE path = ?)",
+                        (path,),
+                    )
+                except Exception:
+                    pass
+            await self._db.execute("DELETE FROM chunks_fts WHERE path = ?", (path,))
+            await self._db.execute("DELETE FROM chunks WHERE path = ?", (path,))
+            await self._db.execute("DELETE FROM files WHERE path = ?", (path,))
+            await self._db.commit()
+        except BaseException:
+            await self._db.rollback()
+            raise
 
     async def rebuild(self) -> None:
         """Clear rebuildable index rows.

@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from opensquilla.provider import openai as openai_module
 from opensquilla.provider.openai import OpenAIProvider
@@ -129,12 +130,25 @@ def test_openrouter_deepseek_auto_cache_does_not_add_top_level_cache_control(mon
     assert payload["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
 
-def test_dashscope_qwen36_flash_auto_cache_adds_message_cache_control(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "model",
+    (
+        "qwen3.8-max",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-flash",
+        "qwen-plus",
+    ),
+)
+def test_dashscope_verified_qwen_auto_cache_adds_message_cache_control(
+    monkeypatch,
+    model: str,
+) -> None:
     captured: dict[str, Any] = {}
     _patch_openai_transport(monkeypatch, captured)
     provider = OpenAIProvider(
         api_key="test",
-        model="qwen3.6-flash",
+        model=model,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         provider_kind="dashscope",
     )
@@ -155,6 +169,113 @@ def test_dashscope_qwen36_flash_auto_cache_adds_message_cache_control(monkeypatc
     assert system_message["content"][0]["cache_control"] == {"type": "ephemeral"}
     assert system_message["content"][0]["text"] == "stable base"
     assert payload["messages"][1] == {"role": "user", "content": "hi"}
+
+
+@pytest.mark.parametrize("model", ("qwen3.7-max", "qwen3.8-max"))
+def test_tokenrhythm_verified_qwen_on_adds_message_cache_control(
+    monkeypatch,
+    model: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_openai_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    cfg = ChatConfig(
+        system="stable base",
+        cache_breakpoints=[{"text": "stable base", "cache": "true"}],
+        cache_mode="on",
+    )
+
+    done = _collect_done(provider, cfg)
+
+    assert done.cached_tokens == 5
+    payload = captured["payload"]
+    assert "cache_control" not in payload
+    assert payload["messages"] == [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "stable base",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+    ]
+
+
+@pytest.mark.parametrize("model", ("qwen3.7-max", "qwen3.8-max"))
+def test_tokenrhythm_verified_qwen_auto_enables_system_cache_control(
+    monkeypatch,
+    model: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_openai_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    cfg = ChatConfig(
+        system="stable base",
+        cache_breakpoints=[{"text": "stable base", "cache": "true"}],
+        cache_mode="auto",
+    )
+
+    _collect_done(provider, cfg)
+
+    assert captured["payload"]["messages"] == [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "stable base",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_tokenrhythm_non_qwen_cache_on_does_not_add_cache_control(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+    _patch_openai_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="glm-5.2",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    cfg = ChatConfig(
+        system="stable base",
+        cache_breakpoints=[{"text": "stable base", "cache": "true"}],
+        cache_mode="on",
+    )
+
+    _collect_done(provider, cfg)
+
+    assert captured["payload"]["messages"] == [
+        {"role": "system", "content": "stable base"},
+        {"role": "user", "content": "hi"},
+    ]
 
 
 def test_openrouter_qwen36_flash_auto_cache_adds_alibaba_message_cache_control(

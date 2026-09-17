@@ -29,11 +29,18 @@ from pathlib import Path
 
 import structlog
 
+from opensquilla.session.models import ProjectWorkspace, SessionNode
+
 log = structlog.get_logger(__name__)
 
-SessionMaterialCleanup = Callable[[str, str], Awaitable[None]]
+PreparedSessionMaterialCleanup = Callable[[], Awaitable[None]]
+SessionMaterialCleanup = Callable[
+    [SessionNode, ProjectWorkspace | None], Awaitable[PreparedSessionMaterialCleanup],
+]
+SessionArtifactCleanup = Callable[[str, str], Awaitable[None]]
 
 _hook: SessionMaterialCleanup | None = None
+_artifact_hook: SessionArtifactCleanup | None = None
 
 
 def set_session_material_cleanup(hook: SessionMaterialCleanup | None) -> None:
@@ -43,22 +50,74 @@ def set_session_material_cleanup(hook: SessionMaterialCleanup | None) -> None:
 
 
 def reset_session_material_cleanup() -> None:
-    """Test hook — drop the registered cleanup."""
-    global _hook
+    """Test hook — drop every registered session-material cleanup."""
+
+    global _artifact_hook, _hook
     _hook = None
+    _artifact_hook = None
 
 
-async def run_session_material_cleanup(session_id: str, session_key: str) -> None:
+def set_session_artifact_cleanup(hook: SessionArtifactCleanup | None) -> None:
+    """Register post-commit cleanup for internal ArtifactSession material."""
+
+    global _artifact_hook
+    _artifact_hook = hook
+
+
+def reset_session_artifact_cleanup() -> None:
+    """Test hook — drop the internal ArtifactSession cleanup."""
+
+    global _artifact_hook
+    _artifact_hook = None
+
+
+async def run_session_artifact_cleanup(session_id: str, session_key: str) -> None:
+    """Best-effort removal of internal revision/candidate bytes after commit."""
+
+    hook = _artifact_hook
+    if hook is None:
+        return
+    try:
+        await hook(session_id, session_key)
+    except Exception as exc:  # noqa: BLE001 - DB boundary already committed
+        log.warning(
+            "session_artifact_cleanup.failed",
+            session_id=session_id,
+            session_key=session_key,
+            error=str(exc),
+        )
+
+
+async def prepare_session_material_cleanup(
+    session: SessionNode,
+    workspace: ProjectWorkspace | None,
+) -> PreparedSessionMaterialCleanup | None:
+    """Capture cleanup authority before the session's database rows disappear."""
+    if _hook is None:
+        return None
+    try:
+        return await _hook(session, workspace)
+    except Exception as exc:  # noqa: BLE001 - material cleanup must not prevent deletion
+        log.warning(
+            "session_material_cleanup.prepare_failed",
+            session_id=session.session_id,
+            error_type=type(exc).__name__,
+        )
+        return None
+
+
+async def run_session_material_cleanup(
+    session_id: str, session_key: str, cleanup: PreparedSessionMaterialCleanup | None,
+) -> None:
     """Invoke the registered cleanup for a deleted session, if any.
 
     Best-effort: a cleanup failure is logged but never propagated, so a
     filesystem hiccup cannot block a session delete.
     """
-    hook = _hook
-    if hook is None:
+    if cleanup is None:
         return
     try:
-        await hook(session_id, session_key)
+        await cleanup()
     except Exception as exc:  # noqa: BLE001 — cleanup must never fail the delete
         log.warning(
             "session_material_cleanup.failed",

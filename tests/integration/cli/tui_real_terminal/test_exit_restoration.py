@@ -14,7 +14,11 @@ from tui_real_terminal.driver import (
     probe_terminal_capabilities,
 )
 from tui_real_terminal.evidence import EvidenceBundle
-from tui_real_terminal.targets import TargetContext, build_tui_target
+from tui_real_terminal.targets import (
+    TargetContext,
+    build_tui_target,
+    opentui_host_capability_gate,
+)
 
 pytestmark = pytest.mark.tui_real_terminal
 
@@ -42,7 +46,6 @@ def test_exit_restores_primary_screen_and_shell(
         if pytestconfig.getoption("--tui-require-capabilities"):
             pytest.fail("required real-terminal capability is unavailable: tmux")
         pytest.skip("exit-restoration requires tmux")
-
     evidence = EvidenceBundle.create(
         artifact_root,
         scenario_id="exit_restoration",
@@ -56,6 +59,10 @@ def test_exit_restores_primary_screen_and_shell(
             scenario_id="exit_restoration",
             size=TerminalSize(cols=100, rows=30),
         ),
+    )
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
     )
     shell_script = (
         f"{shlex.join(target.command)}; "

@@ -24,13 +24,22 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 TABLES = (
     "sessions",
     "transcript_entries",
+    "compacted_transcript_entries",
     "session_summaries",
+    "memory_durable_receipts",
     "usage_events",
     "usage_event_items",
     "usage_item_billing_receipts",
     "usage_billing_receipt_state",
     "usage_ledger_state",
     "usage_legacy_baselines",
+    "meta_control_intents",
+    "meta_launch_drafts",
+    "meta_launch_discard_tombstones",
+    "plan_revisions",
+    "plan_runs",
+    "session_goals",
+    "goal_command_receipts",
 )
 
 # Synthetic approximation of the oldest supported on-disk shape. It is the
@@ -42,6 +51,8 @@ TABLES = (
 #   - V009__transcript_reasoning_content: reasoning_content
 #     (transcript_entries)
 #   - V010__transcript_turn_usage: turn_usage (transcript_entries)
+#   - V025__session_collaboration_state: collaboration_mode,
+#     collaboration_revision, active_plan_revision_id (sessions)
 # session_summaries is not mutated by any yoyo migration (its later columns
 # arrive via SessionStorage connect-time shims), so its legacy DDL matches
 # the current one; it is still compared below to catch a future one-sided
@@ -141,6 +152,32 @@ CREATE TABLE session_summaries (
     flush_receipt_status TEXT NOT NULL DEFAULT 'unknown',
     covered_through_id INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE compacted_transcript_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    compaction_id TEXT,
+    compaction_index INTEGER,
+    original_entry_id INTEGER,
+    message_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_calls TEXT,
+    tool_call_id TEXT,
+    reasoning_content TEXT,
+    turn_usage TEXT,
+    turn_context TEXT,
+    created_at INTEGER NOT NULL,
+    token_count INTEGER,
+    provenance_kind TEXT,
+    provenance_origin_session_id TEXT,
+    provenance_source_session_key TEXT,
+    provenance_source_channel TEXT,
+    provenance_source_tool TEXT,
+    archived_at INTEGER NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1
 );
 """

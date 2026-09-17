@@ -2,7 +2,10 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import type { ConnectionState } from '@/composables/setup/useSetupProviderForm'
+import {
+  isModelVerifiedConnection,
+  type ConnectionState,
+} from '@/composables/setup/useSetupProviderForm'
 
 const { t } = useI18n()
 
@@ -27,11 +30,16 @@ interface ProviderCredentialPanelContract {
   probeReady: boolean
   probeDisabledReason: string
   probeButtonLabel: string
+  reachabilityReady?: boolean
+  reachabilityDisabledReason?: string
+  probeModesSupported?: boolean
   connection: ConnectionState
 }
 
 const props = defineProps<{
   panel: ProviderCredentialPanelContract
+  compact?: boolean
+  showVerification?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -40,7 +48,9 @@ const emit = defineEmits<{
   replace: []
   cancelReplace: []
   removeCredential: []
-  testConnection: []
+  checkReachability: []
+  testModel: []
+  cancelProbe: []
   updateField: [name: string, value: string]
 }>()
 
@@ -104,6 +114,7 @@ const showPublicHint = computed(() => (
 const showCredentialControls = computed(() => props.panel.providerSelected && props.panel.acceptsApiKey)
 const hasRemovableCredential = computed(() => (
   showCredentialControls.value
+  && !props.compact
   && props.panel.removable
 ))
 const removeCredentialLabel = computed(() => t(
@@ -148,8 +159,15 @@ watch(editingCredential, editing => {
 })
 watch(() => props.panel.providerLabel, () => { showApiKey.value = false })
 const probing = computed(() => props.panel.connection.phase === 'probing')
+const checkingReachability = computed(() => (
+  probing.value && props.panel.connection.probeMode === 'reachability'
+))
+const reachabilityReady = computed(() => props.panel.reachabilityReady ?? props.panel.probeReady)
+const reachabilityDisabledReason = computed(() => (
+  props.panel.reachabilityDisabledReason ?? props.panel.probeDisabledReason
+))
 const probeHintId = computed(() => (
-  `setup-provider-probe-hint-${props.panel.providerLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+  `setup-provider-probe-hint-${props.compact ? 'compact' : 'full'}-${props.panel.providerLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
 ))
 
 const FAILURE_SENTENCE_KEYS: Record<string, string> = {
@@ -160,6 +178,7 @@ const FAILURE_SENTENCE_KEYS: Record<string, string> = {
   model_not_found: 'setup.provider.failureModelNotFound',
   transport_transient: 'setup.provider.failureUnreachable',
   bad_request: 'setup.provider.failureBadRequest',
+  probe_timeout: 'setup.provider.failureProbeTimeout',
 }
 
 const PROTOCOL_FAILURE_KINDS = new Set([
@@ -180,10 +199,29 @@ const connectionPill = computed(() => {
   if (connection.phase === 'unverified') {
     return { tone: '', text: t('setup.provider.currentSettingsNotTested'), title: '' }
   }
-  if (connection.phase === 'verified') {
-    return { tone: 'control-pill--ok', text: t('setup.provider.endpointVerified'), title: '' }
+  if (connection.phase === 'reachable') {
+    return { tone: 'control-pill--ok', text: t('setup.provider.reachableNotModelTested'), title: '' }
+  }
+  if (connection.phase === 'model_verified' || connection.phase === 'verified') {
+    return { tone: 'control-pill--ok', text: t('setup.provider.modelVerified'), title: '' }
+  }
+  if (connection.phase === 'timed_out') {
+    return {
+      tone: 'control-pill--warn',
+      text: connection.failureStage === 'reachability'
+        ? t('setup.provider.reachabilityTimedOut')
+        : t('setup.provider.modelTimedOut'),
+      title: [connection.failureKind, connection.detail].filter(Boolean).join(' — '),
+    }
   }
   const title = [connection.failureKind, connection.detail].filter(Boolean).join(' — ')
+  if (connection.phase === 'reachable_error') {
+    return {
+      tone: 'control-pill--warn',
+      text: t('setup.provider.endpointResponded', { reason: failureSentence(connection) }),
+      title,
+    }
+  }
   if (PROTOCOL_FAILURE_KINDS.has(connection.failureKind)) {
     return {
       tone: 'control-pill--warn',
@@ -229,12 +267,12 @@ const completeProbeText = computed(() => {
 const hasProbeTimings = computed(() => Boolean(firstResponseText.value || completeProbeText.value))
 const failureProbeTimings = computed(() => {
   const phase = props.panel.connection.phase
-  return phase === 'key_invalid' || phase === 'unreachable'
+  return ['reachable_error', 'key_invalid', 'unreachable', 'timed_out'].includes(phase)
 })
 
 const verdictModelsText = computed(() => {
   const connection = props.panel.connection
-  if (connection.phase !== 'verified' || connection.modelSource !== 'live') return ''
+  if (!['model_verified', 'verified'].includes(connection.phase) || connection.modelSource !== 'live') return ''
   if (connection.models.length === 0) return ''
   const joiner = t('setup.provider.verdictSampleJoiner')
   const samples = connection.models.slice(0, 3).map(model => model.id).join(joiner)
@@ -245,9 +283,10 @@ const verdictModelsText = computed(() => {
 <template>
   <section
     class="setup-provider-credential"
+    :class="{ 'setup-provider-credential--compact': compact }"
     :aria-busy="panel.removing ? 'true' : undefined"
   >
-    <div class="setup-provider-credential__head">
+    <div v-if="!compact" class="setup-provider-credential__head">
       <div>
         <h4 class="setup-provider-credential__title">{{ title }}</h4>
         <p class="setup-provider-credential__source">{{ sourceText }}</p>
@@ -353,10 +392,66 @@ const verdictModelsText = computed(() => {
           </div>
         </label>
       </template>
-      <p v-if="showPublicHint" class="control-row__desc">{{ t('setup.provider.credentialPublicHint') }}</p>
+      <p v-if="showPublicHint && !compact" class="control-row__desc">{{ t('setup.provider.credentialPublicHint') }}</p>
     </div>
 
-    <div class="setup-provider-credential__footer">
+    <div v-if="compact && showVerification" class="setup-provider-credential__compact-verification">
+      <button
+        v-if="!probing && panel.probeModesSupported !== false"
+        type="button"
+        class="btn"
+        :disabled="!panel.providerSelected || !reachabilityReady"
+        :title="!reachabilityReady ? reachabilityDisabledReason : undefined"
+        :aria-describedby="!reachabilityReady && reachabilityDisabledReason ? probeHintId : undefined"
+        @click="emit('checkReachability')"
+      >
+        {{ t('setup.provider.checkConnection') }}
+      </button>
+      <button
+        v-if="!probing"
+        type="button"
+        class="btn btn--ghost"
+        :disabled="!panel.providerSelected || !panel.probeReady"
+        :title="!panel.probeReady ? panel.probeDisabledReason : undefined"
+        :aria-describedby="!panel.probeReady && panel.probeDisabledReason ? probeHintId : undefined"
+        @click="emit('testModel')"
+      >
+        {{ t('setup.provider.testModel') }}
+      </button>
+      <button
+        v-if="probing"
+        type="button"
+        class="btn btn--ghost"
+        :aria-busy="'true'"
+        @click="emit('cancelProbe')"
+      >
+        <span class="setup-connection__spinner" aria-hidden="true"></span>
+        {{ checkingReachability ? t('setup.provider.cancelConnectionCheck') : t('setup.provider.cancelTest') }}
+      </button>
+      <span
+        v-if="connectionPill && panel.connection.phase !== 'unverified'"
+        class="setup-provider-credential__compact-result"
+        :class="{
+          'is-success': ['reachable', 'model_verified', 'verified'].includes(panel.connection.phase),
+          'is-error': ['reachable_error', 'key_invalid', 'unreachable', 'timed_out'].includes(panel.connection.phase),
+        }"
+        role="status"
+        aria-live="polite"
+      >
+        <span>{{ connectionPill.text }}</span>
+        <template v-if="(isModelVerifiedConnection(panel.connection) || failureProbeTimings) && hasProbeTimings">
+          <span v-if="firstResponseText" class="setup-connection__timing setup-connection__timing--primary">· {{ firstResponseText }}</span>
+          <span v-if="completeProbeText" class="setup-connection__timing setup-connection__timing--secondary">· {{ completeProbeText }}</span>
+        </template>
+      </span>
+      <span
+        v-if="!probing && (panel.probeDisabledReason || (panel.probeModesSupported !== false && reachabilityDisabledReason))"
+        :id="probeHintId"
+        class="setup-connection__hint setup-provider-credential__compact-hint"
+      >{{ panel.probeDisabledReason || reachabilityDisabledReason }}</span>
+    </div>
+
+    <div v-else-if="!compact" class="setup-provider-credential__footer">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.provider.connectionLabel') }}</span>
         <span class="control-row__desc">{{ t('setup.provider.connectionDesc') }}</span>
@@ -364,16 +459,36 @@ const verdictModelsText = computed(() => {
       <div class="control-row__control control-row__control--stack">
         <div class="setup-connection__actions">
           <button
+            v-if="!probing && panel.probeModesSupported !== false"
             type="button"
             class="btn"
-            :disabled="!panel.providerSelected || !panel.probeReady || probing"
-            :title="!panel.probeReady ? panel.probeDisabledReason : undefined"
-            :aria-busy="probing ? 'true' : undefined"
-            :aria-describedby="panel.probeDisabledReason ? probeHintId : undefined"
-            @click="emit('testConnection')"
+            :disabled="!panel.providerSelected || !reachabilityReady"
+            :title="!reachabilityReady ? reachabilityDisabledReason : undefined"
+            :aria-describedby="reachabilityDisabledReason ? probeHintId : undefined"
+            @click="emit('checkReachability')"
           >
-            <span v-if="probing" class="setup-connection__spinner" aria-hidden="true"></span>
-            {{ probing ? t('setup.provider.testing') : (panel.probeButtonLabel || t('setup.provider.testConnection')) }}
+            {{ t('setup.provider.checkConnection') }}
+          </button>
+          <button
+            v-if="!probing"
+            type="button"
+            class="btn btn--ghost"
+            :disabled="!panel.providerSelected || !panel.probeReady"
+            :title="!panel.probeReady ? panel.probeDisabledReason : undefined"
+            :aria-describedby="panel.probeDisabledReason ? probeHintId : undefined"
+            @click="emit('testModel')"
+          >
+            {{ panel.probeButtonLabel || t('setup.provider.testModel') }}
+          </button>
+          <button
+            v-if="probing"
+            type="button"
+            class="btn btn--ghost"
+            :aria-busy="'true'"
+            @click="emit('cancelProbe')"
+          >
+            <span class="setup-connection__spinner" aria-hidden="true"></span>
+            {{ checkingReachability ? t('setup.provider.cancelConnectionCheck') : t('setup.provider.cancelTest') }}
           </button>
           <span role="status" aria-live="polite" aria-atomic="true">
             <strong
@@ -388,22 +503,26 @@ const verdictModelsText = computed(() => {
             </template>
           </span>
         </div>
-        <span v-if="panel.probeDisabledReason" :id="probeHintId" class="setup-connection__hint">{{ panel.probeDisabledReason }}</span>
+        <span
+          v-if="panel.probeDisabledReason || reachabilityDisabledReason"
+          :id="probeHintId"
+          class="setup-connection__hint"
+        >{{ panel.probeDisabledReason || reachabilityDisabledReason }}</span>
         <div class="setup-connection__verdict" aria-live="polite">
-          <template v-if="panel.connection.phase === 'verified'">
+          <template v-if="panel.connection.phase === 'model_verified' || panel.connection.phase === 'verified'">
             <span v-if="firstResponseText" class="setup-connection__timing setup-connection__timing--primary">{{ firstResponseText }}</span>
             <span v-if="completeProbeText" class="setup-connection__timing setup-connection__timing--secondary">{{ firstResponseText ? '· ' : '' }}{{ completeProbeText }}</span>
             <span v-if="verdictModelsText" class="setup-connection__verdict-models">· {{ verdictModelsText }}</span>
           </template>
         </div>
         <span
-          v-if="panel.connection.phase === 'verified' && panel.connection.discoverError"
+          v-if="['reachable', 'model_verified', 'verified'].includes(panel.connection.phase) && panel.connection.discoverError"
           class="setup-connection__hint"
         >{{ t('setup.provider.discoverFailed') }}</span>
       </div>
     </div>
 
-    <details v-if="showCredentialControls" class="setup-provider-credential__details" :open="detailsOpen">
+    <details v-if="showCredentialControls && !compact" class="setup-provider-credential__details" :open="detailsOpen">
       <summary class="setup-provider-credential__summary" @click.prevent="detailsOpen = !detailsOpen">{{ t('setup.provider.credentialSourceOptions') }}</summary>
       <label v-if="detailsOpen" class="control-row control-row--stack">
         <div class="control-row__label-block">
@@ -429,6 +548,12 @@ const verdictModelsText = computed(() => {
   padding: var(--sp-2) 0;
   border-block: 1px solid var(--border);
   background: transparent;
+}
+
+.setup-provider-credential--compact {
+  border: 0;
+  margin: 0;
+  padding: 0;
 }
 
 .setup-provider-credential__head {
@@ -462,6 +587,41 @@ const verdictModelsText = computed(() => {
 .setup-provider-credential__footer {
   display: grid;
   gap: var(--sp-1);
+}
+
+.setup-provider-credential__compact-verification {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+
+.setup-provider-credential__compact-verification .btn {
+  align-items: center;
+  display: inline-flex;
+  gap: var(--sp-2);
+}
+
+.setup-provider-credential__compact-result {
+  align-items: center;
+  color: var(--text-muted);
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  font-size: var(--fs-sm);
+}
+
+.setup-provider-credential__compact-result.is-success {
+  color: var(--ok);
+}
+
+.setup-provider-credential__compact-result.is-error {
+  color: var(--danger);
+}
+
+.setup-provider-credential__compact-hint {
+  flex: 1 0 100%;
 }
 
 .setup-provider-credential__footer {

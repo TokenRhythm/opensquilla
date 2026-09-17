@@ -7,11 +7,21 @@ import time
 import types
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from websockets.protocol import State as WebSocketState
 
-from opensquilla.channels.feishu import FeishuChannel, FeishuChannelConfig, FeishuWebSocketTransport
+from opensquilla.channels.approval_prompt import ApprovalPromptRequest, render_approval_prompt
+from opensquilla.channels.contract import ChannelCapabilities
+from opensquilla.channels.feishu import (
+    FeishuChannel,
+    FeishuChannelConfig,
+    FeishuWebSocketTransport,
+    _feishu_sdk_websocket_is_open,
+    _TokenState,
+)
 from opensquilla.channels.transports import InboundEventEnvelope
 
 
@@ -81,6 +91,7 @@ def _install_fake_lark_module(monkeypatch: pytest.MonkeyPatch) -> tuple[types.Mo
             self.disconnect_called = False
             self.started = False
             self.start_loop: asyncio.AbstractEventLoop | None = None
+            self._conn: Any | None = None
             FakeClient.instances.append(self)
 
         def start(self) -> None:
@@ -88,6 +99,7 @@ def _install_fake_lark_module(monkeypatch: pytest.MonkeyPatch) -> tuple[types.Mo
             assert isinstance(loop, asyncio.AbstractEventLoop)
             self.start_loop = loop
             self.started = True
+            self._conn = SimpleNamespace(state=WebSocketState.OPEN)
             loop.run_until_complete(_select_forever())
 
         async def _disconnect(self) -> None:
@@ -120,6 +132,83 @@ async def _wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> No
     raise AssertionError("condition was not met before timeout")
 
 
+class _AliveThread:
+    @staticmethod
+    def is_alive() -> bool:
+        return True
+
+
+def _health_transport() -> FeishuWebSocketTransport:
+    transport = FeishuWebSocketTransport(
+        FeishuChannelConfig(
+            app_id="cli_test_health_only",
+            app_secret="test-secret-health-only",
+            connection_mode="websocket",
+        )
+    )
+    transport._thread = _AliveThread()  # type: ignore[assignment]
+    return transport
+
+
+@pytest.mark.parametrize(
+    "client",
+    (
+        object(),
+        SimpleNamespace(_conn=None),
+        SimpleNamespace(_conn=SimpleNamespace(state="OPEN")),
+    ),
+)
+def test_feishu_websocket_connection_helper_fails_closed_for_unknown_sdk_state(
+    client: object,
+) -> None:
+    assert _feishu_sdk_websocket_is_open(client) is False
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_worker_without_connection_is_connecting() -> None:
+    transport = _health_transport()
+    transport._ws_client = SimpleNamespace(_conn=None)
+
+    health = await transport.health_check()
+
+    assert health.connected is False
+    assert health.extra == {
+        "transport": "websocket",
+        "connection_phase": "connecting",
+    }
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_requires_open_state_and_reports_reconnecting_after_close() -> None:
+    transport = _health_transport()
+    connection = SimpleNamespace(state=WebSocketState.OPEN)
+    transport._ws_client = SimpleNamespace(_conn=connection)
+
+    open_health = await transport.health_check()
+
+    assert open_health.connected is True
+    assert open_health.extra["connection_phase"] == "open"
+
+    connection.state = WebSocketState.CLOSED
+    closed_health = await transport.health_check()
+
+    assert closed_health.connected is False
+    assert closed_health.extra["connection_phase"] == "reconnecting"
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_closed_sdk_connection_is_reconnecting() -> None:
+    transport = _health_transport()
+    transport._ws_client = SimpleNamespace(
+        _conn=SimpleNamespace(state=WebSocketState.CLOSED)
+    )
+
+    health = await transport.health_check()
+
+    assert health.connected is False
+    assert health.extra["connection_phase"] == "reconnecting"
+
+
 @pytest.mark.asyncio
 async def test_feishu_websocket_stop_stops_sdk_loop_thread(
     monkeypatch: pytest.MonkeyPatch,
@@ -136,10 +225,220 @@ async def test_feishu_websocket_stop_stops_sdk_loop_thread(
     assert client.start_loop is sdk_module.loop
     assert client.args[:2] == ("app", "secret")
 
+    open_health = await transport.health_check()
+    assert open_health.connected is True
+    assert open_health.extra["connection_phase"] == "open"
+
     await transport.stop()
 
     assert client.disconnect_called is True
     assert transport._thread is None
+    stopped_health = await transport.health_check()
+    assert stopped_health.connected is False
+    assert stopped_health.extra["connection_phase"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_worker_error_is_structured_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_module, fake_client = _install_fake_lark_module(monkeypatch)
+    app_id = "cli_test_redaction_identifier"
+    app_secret = "test-secret-redaction-value"
+
+    def fail_with_credentials(_self: Any) -> None:
+        raise RuntimeError(f"failed for app_id={app_id} app_secret={app_secret}")
+
+    monkeypatch.setattr(fake_client, "start", fail_with_credentials)
+    transport = FeishuWebSocketTransport(
+        FeishuChannelConfig(
+            app_id=app_id,
+            app_secret=app_secret,
+            connection_mode="websocket",
+        )
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await transport.start(_noop_handler)
+
+    health = await transport.health_check()
+    diagnostic = health.extra["last_error"]
+    combined = f"{caught.value!s} {diagnostic!r}"
+    assert health.connected is False
+    assert health.extra["connection_phase"] == "stopped"
+    assert diagnostic["error_class"] == "transport_transient"
+    assert diagnostic["retryable"] is True
+    assert "***" in diagnostic["message"]
+    assert app_id not in combined
+    assert app_secret not in combined
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_client_init_error_is_structured_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_module, fake_client = _install_fake_lark_module(monkeypatch)
+    app_id = "cli_test_init_redaction_identifier"
+    app_secret = "test-secret-init-redaction-value"
+
+    def fail_with_credentials(_self: Any, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(f"failed for app_id={app_id} app_secret={app_secret}")
+
+    monkeypatch.setattr(fake_client, "__init__", fail_with_credentials)
+    transport = FeishuWebSocketTransport(
+        FeishuChannelConfig(
+            app_id=app_id,
+            app_secret=app_secret,
+            connection_mode="websocket",
+        )
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await transport.start(_noop_handler)
+
+    health = await transport.health_check()
+    diagnostic = health.extra["last_error"]
+    combined = f"{caught.value!s} {caught.value!r} {diagnostic!r}"
+    assert health.connected is False
+    assert health.extra["connection_phase"] == "stopped"
+    assert diagnostic["error_class"] == "transport_transient"
+    assert diagnostic["retryable"] is True
+    assert "***" in diagnostic["message"]
+    assert app_id not in combined
+    assert app_secret not in combined
+    assert transport._handler is None
+    assert transport._loop is None
+    assert transport._lark is None
+    assert transport._ws_client is None
+    assert transport._active_registration is False
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_auth_failure_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_module, fake_client = _install_fake_lark_module(monkeypatch)
+    client_exception = type(
+        "ClientException",
+        (RuntimeError,),
+        {"__module__": "lark_oapi.ws.exception"},
+    )
+
+    def reject_credentials(_self: Any) -> None:
+        raise client_exception("invalid app credentials")
+
+    monkeypatch.setattr(fake_client, "start", reject_credentials)
+    transport = FeishuWebSocketTransport(
+        FeishuChannelConfig(
+            app_id="cli_test_auth_invalid",
+            app_secret="test-secret-auth-invalid",
+            connection_mode="websocket",
+        )
+    )
+
+    with pytest.raises(RuntimeError):
+        await transport.start(_noop_handler)
+
+    health = await transport.health_check()
+    diagnostic = health.extra["last_error"]
+    assert diagnostic["error_class"] == "auth_invalid"
+    assert diagnostic["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_delayed_auth_failure_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_module, fake_client = _install_fake_lark_module(monkeypatch)
+    client_exception = type(
+        "ClientException",
+        (RuntimeError,),
+        {"__module__": "lark_oapi.ws.exception"},
+    )
+
+    def reject_credentials_after_connect_attempt(_self: Any) -> None:
+        # This exceeds the former 50 ms grace window. Startup must wait for
+        # the transport to open or fail, rather than registering a dead client.
+        time.sleep(0.1)
+        raise client_exception("invalid app credentials")
+
+    monkeypatch.setattr(fake_client, "start", reject_credentials_after_connect_attempt)
+    transport = FeishuWebSocketTransport(
+        FeishuChannelConfig(
+            app_id="cli_test_delayed_auth_invalid",
+            app_secret="test-secret-delayed-auth-invalid",
+            connection_mode="websocket",
+        )
+    )
+
+    with pytest.raises(RuntimeError):
+        await transport.start(_noop_handler)
+
+    health = await transport.health_check()
+    diagnostic = health.extra["last_error"]
+    assert diagnostic["error_class"] == "auth_invalid"
+    assert diagnostic["retryable"] is False
+    assert health.extra["connection_phase"] == "stopped"
+
+
+def test_feishu_websocket_approval_prompt_falls_back_to_text() -> None:
+    channel = FeishuChannel(
+        FeishuChannelConfig(app_id="app", app_secret="secret", connection_mode="websocket")
+    )
+    request = ApprovalPromptRequest(
+        approval_id="approval-1",
+        namespace="exec",
+        session_key="agent:main:chat",
+        command_or_tool="rm target.txt",
+        agent="main",
+        short_code="AB12",
+    )
+
+    prompt = render_approval_prompt(channel.capability_profile, request)
+
+    assert channel.capability_profile.supports(ChannelCapabilities.CARDS)
+    assert not channel.capability_profile.supports(ChannelCapabilities.INTERACTIVE_CARDS)
+    assert "card" not in prompt
+    assert "/approve AB12" in prompt["text"]
+    assert "/deny AB12" in prompt["text"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_channel_propagates_transport_phase_and_structured_error() -> None:
+    channel = FeishuChannel(
+        FeishuChannelConfig(
+            app_id="cli_test_channel_health",
+            app_secret="test-secret-channel-health",
+            connection_mode="websocket",
+        )
+    )
+    transport = channel._transport
+    assert isinstance(transport, FeishuWebSocketTransport)
+    transport._thread = _AliveThread()  # type: ignore[assignment]
+    transport._ws_client = SimpleNamespace(
+        _conn=SimpleNamespace(state=WebSocketState.CLOSED)
+    )
+    transport._last_error = {
+        "error_class": "transport_transient",
+        "message": "Synthetic websocket failure",
+        "retryable": True,
+    }
+    channel._connected = True
+
+    health = await channel.health_check()
+
+    assert channel.is_connected() is False
+    assert health.connected is False
+    assert health.extra == {
+        "transport": "websocket",
+        "transport_connected": False,
+        "connection_phase": "reconnecting",
+        "last_error": {
+            "error_class": "transport_transient",
+            "message": "Synthetic websocket failure",
+            "retryable": True,
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -248,6 +547,48 @@ async def test_feishu_websocket_start_does_not_block_on_bot_info(
 
     assert transport.started is True
     assert transport.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_bot_identity_error_log_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_id = "cli_test_identity_redaction_identifier"
+    app_secret = "test-secret-identity-redaction-value"
+    tenant_token = "t-synthetic-tenant-token"
+    channel = FeishuChannel(
+        FeishuChannelConfig(
+            app_id=app_id,
+            app_secret=app_secret,
+            connection_mode="websocket",
+        )
+    )
+    channel._token_state = _TokenState(token=tenant_token, expires_at=float("inf"))
+
+    async def fail_with_credentials() -> None:
+        raise RuntimeError(
+            f"failed for app_id={app_id} app_secret={app_secret} token={tenant_token}"
+        )
+
+    captured: dict[str, Any] = {}
+
+    def capture_warning(event: str, **kwargs: Any) -> None:
+        captured.update(event=event, **kwargs)
+
+    monkeypatch.setattr(channel, "_refresh_bot_identity", fail_with_credentials)
+    monkeypatch.setattr(
+        "opensquilla.channels.feishu.log",
+        SimpleNamespace(warning=capture_warning),
+    )
+
+    await channel._refresh_bot_identity_best_effort()
+
+    combined = repr(captured)
+    assert captured["event"] == "feishu.bot_identity_lookup_failed"
+    assert "***" in captured["error"]
+    assert app_id not in combined
+    assert app_secret not in combined
+    assert tenant_token not in combined
 
 
 @pytest.mark.asyncio

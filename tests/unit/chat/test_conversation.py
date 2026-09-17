@@ -50,6 +50,20 @@ def test_web_chat_source_metadata_preserves_run_mode_hint() -> None:
     assert source["runMode"] == "full"
 
 
+def test_web_chat_source_metadata_decodes_legacy_mode_to_canonical_safe() -> None:
+    source = chat_source_metadata(
+        caller_kind="web",
+        channel_kind="webchat",
+        channel_id="webchat:webchat:main",
+        sender_id="operator",
+        source_kind="webui",
+        source_name="WebChat",
+        run_mode="trusted",
+    )
+
+    assert source["runMode"] == "safe"
+
+
 def test_chat_send_request_preserves_message_attachments_and_intent() -> None:
     request = ChatSendRequest(
         session_key="webchat:main",

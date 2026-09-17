@@ -1,6 +1,23 @@
 <template>
   <div>
-    <div ref="rootEl" class="msg-ai-text" v-html="part.html" />
+    <ResourceActionsMenu ref="fileMenu" :session-key="sessionKey" @open="emit('openResource', $event)" />
+    <div v-if="part.html" ref="rootEl" class="msg-ai-text" v-html="part.html" />
+    <p v-if="unmentionedPreviews.length" class="workspace-preview-fallback">
+      <span>{{ t('workbench.artifactDocument.preview') }}: </span>
+      <template v-for="(preview, index) in unmentionedPreviews" :key="workspacePreviewIdentity(preview)">
+        <span v-if="index" aria-hidden="true"> · </span>
+        <button
+          type="button"
+          role="link"
+          class="workspace-file-link"
+          :title="previewLabel(preview)"
+          :aria-label="previewLabel(preview)"
+          @click.stop="emit('workspacePreview', preview)"
+          @contextmenu="showFileMenu($event, preview)"
+          @keydown="showFileMenu($event, preview)"
+        >{{ workspacePreviewLabel(preview, workspacePreviews) }}</button>
+      </template>
+    </p>
     <p v-if="missingCitationLabel" class="msg-ai-citation-warning">
       Some citations do not map to available sources: {{ missingCitationLabel }}
     </p>
@@ -9,24 +26,55 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { useI18n } from 'vue-i18n'
 import type { ChatPart, SourcePart } from '@/types/parts'
 import { decorateCitations } from '@/utils/chat/citations'
+import {
+  decorateWorkspacePreviewLinks,
+  workspacePreviewLabel,
+  workspacePreviewIdentity,
+  workspacePreviewOpenAction,
+  type WorkspacePreviewLink,
+} from '@/utils/chat/workspacePreviews'
 import { copyTextWithFallback } from '@/utils/browser'
+import { usePlatform } from '@/platform'
+import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
 
 const props = withDefaults(
   defineProps<{
     part: Extract<ChatPart, { type: 'text' }>
     sources?: SourcePart[]
+    workspacePreviews?: WorkspacePreviewLink[]
+    sessionKey?: string
   }>(),
-  { sources: () => [] },
+  { sources: () => [], workspacePreviews: () => [] },
 )
 
-const emit = defineEmits<{ citation: [sourceId: number] }>()
+const emit = defineEmits<{
+  citation: [sourceId: number]
+  workspacePreview: [preview: WorkspacePreviewLink]
+  openResource: [artifact: ArtifactPayload]
+}>()
 
 const { t } = useI18n()
+const platform = usePlatform()
+const fileMenu = ref<InstanceType<typeof ResourceActionsMenu> | null>(null)
+function showFileMenu(event: MouseEvent | KeyboardEvent, preview: WorkspacePreviewLink) {
+  void fileMenu.value?.show(event, workspacePreviewOpenAction(preview, props.sessionKey))
+}
 const rootEl = ref<HTMLDivElement | null>(null)
 const missingCitationIds = ref<number[]>([])
+const mentionedPreviewIds = ref<string[]>([])
+const unmentionedPreviews = computed(() => props.workspacePreviews.filter(
+  preview => !preview.previewPagePath
+    && !mentionedPreviewIds.value.includes(workspacePreviewIdentity(preview)),
+))
+
+function previewLabel(preview: WorkspacePreviewLink): string {
+  return t('chat.openTitle', { title: workspacePreviewLabel(preview, props.workspacePreviews) })
+}
 
 const missingCitationLabel = computed(() =>
   missingCitationIds.value.map(id => `[${id}]`).join(', '),
@@ -130,13 +178,46 @@ function decorateCodeBlocks() {
   }
 }
 
+function decorateBrowserLinks() {
+  const root = rootEl.value
+  if (
+    !root
+    || platform.id !== 'desktop'
+    || !platform.capabilities.hasNativeWorkbenchSurfaces
+  ) return
+  for (const anchor of root.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+    if (!/^https?:/i.test(anchor.href)) continue
+    const next = anchor.nextElementSibling
+    if (next?.classList.contains('link-side-browser-btn')) continue
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'link-side-browser-btn'
+    button.textContent = '↗'
+    const label = t('workbench.browser.openSide')
+    button.title = label
+    button.setAttribute('aria-label', label)
+    button.addEventListener('click', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      requestBrowserWorkbenchOpen(anchor.href)
+    })
+    anchor.insertAdjacentElement('afterend', button)
+  }
+}
+
 // After `v-html` has applied the sanitized body, upgrade any `[n]` that maps to
 // a real source into a focusable citation pill. The pass works on already-clean
 // text nodes only (createElement/textContent — never innerHTML), so it adds no
 // HTML sink and re-runs idempotently when the body re-renders during streaming.
 function decorate() {
   const root = rootEl.value
-  if (!root) return
+  if (!root) {
+    mentionedPreviewIds.value = []
+    return
+  }
+  mentionedPreviewIds.value = decorateWorkspacePreviewLinks(
+    root, props.workspacePreviews, preview => emit('workspacePreview', preview), previewLabel, showFileMenu,
+  )
   missingCitationIds.value = []
   decorateCitations(root, props.sources, {
     onActivate: n => emit('citation', n),
@@ -146,11 +227,13 @@ function decorate() {
     },
   })
   decorateCodeBlocks()
+  decorateBrowserLinks()
 }
 
 onMounted(decorate)
 watch(() => props.part.html, decorate, { flush: 'post' })
 watch(() => props.sources, decorate, { flush: 'post' })
+watch(() => props.workspacePreviews, decorate, { flush: 'post' })
 </script>
 
 <style scoped>
@@ -160,6 +243,42 @@ watch(() => props.sources, decorate, { flush: 'post' })
   color: var(--text);
   word-break: break-word;
   margin-bottom: 0.5rem;
+}
+
+.workspace-preview-fallback {
+  margin: 0.375rem 0 0.5rem;
+  font-size: 0.875rem;
+  line-height: 1.6;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.workspace-file-link,
+.msg-ai-text :deep(.workspace-file-link) {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--accent);
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.workspace-file-link:focus-visible,
+.msg-ai-text :deep(.workspace-file-link:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--radius-sm);
+}
+
+.msg-ai-text :deep(.workspace-file-link code) {
+  padding: 0;
+  background: transparent;
+  color: inherit;
 }
 
 .msg-ai-text :deep(p) { margin: 0.375rem 0; }
@@ -175,26 +294,38 @@ watch(() => props.sources, decorate, { flush: 'post' })
   color: var(--text-muted);
 }
 .msg-ai-text :deep(pre) {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  background: var(--code-block-bg);
+  border: 1px solid var(--code-block-border);
   border-radius: var(--radius-md);
   padding: 0.625rem;
   overflow-x: auto;
   margin: 0.375rem 0;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
 }
 .msg-ai-text :deep(pre.code-block) {
   position: relative;
-  padding-top: 1.9rem;
+  padding-top: 2.375rem;
+  background: linear-gradient(
+    to bottom,
+    var(--code-block-header-bg) 0,
+    var(--code-block-header-bg) 1.75rem,
+    var(--code-block-bg) 1.75rem,
+    var(--code-block-bg) 100%
+  );
 }
 
 .msg-ai-text :deep(pre.code-block > .code-lang) {
-  right: 2.75rem;
+  top: 0.375rem;
+  right: 2.5rem;
+  line-height: 1rem;
+  background: transparent;
+  color: var(--text-dim);
 }
 
 .msg-ai-text :deep(.code-copy-btn) {
   position: absolute;
-  top: 0.375rem;
-  right: 0.375rem;
+  top: 0;
+  right: 0.25rem;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -208,6 +339,30 @@ watch(() => props.sources, decorate, { flush: 'post' })
   opacity: 0.78;
   cursor: pointer;
   transition: color var(--transition), background var(--transition), opacity var(--transition);
+}
+
+.msg-ai-text :deep(.link-side-browser-btn) {
+  display: inline-flex;
+  width: 1.35rem;
+  height: 1.35rem;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.2rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  vertical-align: text-bottom;
+}
+
+.msg-ai-text :deep(.link-side-browser-btn:hover),
+.msg-ai-text :deep(.link-side-browser-btn:focus-visible) {
+  background: var(--bg-hover);
+  color: var(--accent);
 }
 
 .msg-ai-text :deep(.code-copy-btn svg) {

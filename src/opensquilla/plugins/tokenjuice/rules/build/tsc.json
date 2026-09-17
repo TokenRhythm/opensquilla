@@ -4,6 +4,7 @@
   "description": "Compact TypeScript compiler output while preserving real diagnostics.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["tsc"],
     "commandIncludes": ["tsc"]
   },
   "transforms": {

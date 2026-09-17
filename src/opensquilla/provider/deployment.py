@@ -21,6 +21,7 @@ import structlog
 
 from opensquilla.endpoint_identity import base_url_allows_credential_reuse
 
+from .credentials import credential_provider_hint, endpoint_provider_hint
 from .environment import environment_value
 from .registry import UnknownProviderError, get_provider_spec
 from .selector import ProviderConfig
@@ -48,6 +49,7 @@ class ProviderDeploymentResolution:
     endpoint_source: str = "none"
     proxy_source: str = "none"
     provider_config: ProviderConfig | None = field(default=None, repr=False)
+    credential_pool_lease_token: str = field(default="", repr=False, compare=False)
 
 
 def _profile_for(config: Any, provider_id: str) -> Any | None:
@@ -148,6 +150,7 @@ def resolve_provider_deployment(
     credential_source = "member" if api_key else "none"
     credential_env = ""
     credential_endpoint = ""
+    credential_pool_lease_token = ""
     blocked_reason = ""
 
     if not api_key and same_provider:
@@ -193,6 +196,9 @@ def resolve_provider_deployment(
             api_key = _text(getattr(pooled, "api_key", ""))
             credential_source = "profile_pool"
             credential_env = _text(getattr(pooled, "env_name", ""))
+            credential_pool_lease_token = _text(
+                getattr(pooled, "lease_token", "")
+            )
             credential_endpoint = profile_base_url or _text(spec.default_base_url)
             if turn_metadata is not None:
                 # Non-secret identifiers only; used by the router failure hook
@@ -242,6 +248,17 @@ def resolve_provider_deployment(
         blocked_reason = "missing_credential"
     if not spec.requires_api_key() and not api_key:
         credential_source = "keyless"
+    credential_hint = credential_provider_hint(api_key)
+    if api_key and credential_hint and credential_hint != provider:
+        # Keep a known cross-provider credential out of every downstream
+        # ProviderConfig, including status/readiness callers that might
+        # otherwise accidentally reuse an unready resolution.
+        api_key = ""
+        credential_source = "none"
+        credential_env = ""
+        blocked_reason = "credential_provider_mismatch"
+        if turn_metadata is not None:
+            turn_metadata.pop("credential_pool", None)
 
     base_url = member_base_url
     endpoint_source = "member" if base_url else "none"
@@ -257,6 +274,19 @@ def resolve_provider_deployment(
         base_url = _text(spec.default_base_url)
         if base_url:
             endpoint_source = "registry"
+    endpoint_hint = endpoint_provider_hint(base_url)
+    if (
+        api_key
+        and credential_hint
+        and endpoint_hint
+        and credential_hint != endpoint_hint
+    ):
+        api_key = ""
+        credential_source = "none"
+        credential_env = ""
+        blocked_reason = "credential_endpoint_provider_mismatch"
+        if turn_metadata is not None:
+            turn_metadata.pop("credential_pool", None)
     if not base_url and spec.requires_base_url() and not blocked_reason:
         blocked_reason = "missing_base_url"
     if (
@@ -271,6 +301,7 @@ def resolve_provider_deployment(
         api_key = ""
         credential_source = "none"
         credential_env = ""
+        credential_pool_lease_token = ""
         blocked_reason = "credential_endpoint_mismatch"
         if turn_metadata is not None:
             turn_metadata.pop("credential_pool", None)
@@ -337,4 +368,5 @@ def resolve_provider_deployment(
         endpoint_source=endpoint_source,
         proxy_source=proxy_source,
         provider_config=provider_config,
+        credential_pool_lease_token=credential_pool_lease_token,
     )

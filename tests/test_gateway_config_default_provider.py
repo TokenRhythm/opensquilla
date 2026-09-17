@@ -33,8 +33,48 @@ TOKENRHYTHM_BASE_URL = "https://tokenrhythm.studio/v1"
 def test_keyless_default_resolves_tokenrhythm() -> None:
     cfg = GatewayConfig()
     assert cfg.llm.provider == "tokenrhythm"
-    assert cfg.llm.model == "deepseek-v4-pro"
+    assert cfg.llm.model == "deepseek-v4-pro-0813"
     assert cfg.llm.base_url == TOKENRHYTHM_BASE_URL
+
+
+@pytest.mark.parametrize(
+    "llm",
+    [
+        {"api_key": "sk_tr_abcdefghijklmnop"},
+        {"api_key_env": "TOKENRHYTHM_API_KEY"},
+        {"base_url": TOKENRHYTHM_BASE_URL},
+    ],
+)
+def test_providerless_strong_tokenrhythm_evidence_recovers_in_memory(
+    llm: dict[str, str],
+) -> None:
+    cfg = GatewayConfig(llm=llm)
+
+    assert cfg.llm.provider == "tokenrhythm"
+    assert cfg.provider_resolution()["status"] == "recovered"
+    assert cfg.provider_resolution()["action_recommended"] is True
+
+
+def test_providerless_conflicting_evidence_is_action_required() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "api_key": "sk_tr_abcdefghijklmnop",
+            "base_url": LEGACY_DEFAULT_LLM_BASE_URL,
+        }
+    )
+
+    assert cfg.llm.provider == "openrouter"
+    assert cfg.provider_resolution()["status"] == "conflict"
+    assert cfg.provider_resolution()["effective_provider"] == ""
+    assert cfg.provider_resolution()["action_required"] is True
+
+
+def test_providerless_ambiguous_key_keeps_legacy_openrouter() -> None:
+    cfg = GatewayConfig(llm={"api_key": "synthetic-ambiguous-key"})
+
+    assert cfg.llm.provider == "openrouter"
+    assert cfg.provider_resolution()["status"] == "legacy_inferred"
+    assert cfg.provider_resolution()["action_recommended"] is True
 
 
 def test_openrouter_env_key_alone_keeps_legacy_default(
@@ -55,13 +95,17 @@ def test_tokenrhythm_env_key_resolves_tokenrhythm(
     monkeypatch.setenv("TOKENRHYTHM_API_KEY", "sk_tr_test")
     cfg = GatewayConfig()
     assert cfg.llm.provider == "tokenrhythm"
+    assert cfg.provider_resolution()["status"] == "recovered"
 
 
-def test_both_env_keys_prefer_tokenrhythm(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_both_env_keys_require_explicit_provider_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.setenv("TOKENRHYTHM_API_KEY", "sk_tr_test")
     cfg = GatewayConfig()
-    assert cfg.llm.provider == "tokenrhythm"
+    assert cfg.provider_resolution()["status"] == "conflict"
+    assert cfg.provider_resolution()["action_required"] is True
 
 
 @pytest.mark.parametrize(
@@ -134,8 +178,8 @@ def test_tokenrhythm_default_binds_router_tiers_to_tokenrhythm() -> None:
     cfg = GatewayConfig()
     tiers = cfg.squilla_router.tiers
     expected_models = {
-        "c0": "deepseek-v4-flash",
-        "c1": "deepseek-v4-pro",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
         "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
@@ -143,6 +187,11 @@ def test_tokenrhythm_default_binds_router_tiers_to_tokenrhythm() -> None:
     for name, model in expected_models.items():
         assert tiers[name]["provider"] == "tokenrhythm"
         assert tiers[name]["model"] == model
+    assert tiers["c3"]["ensemble_enabled"] is True
+    assert tiers["c0"]["supports_image"] is False
+    assert tiers["c2"]["supports_image"] is False
+    assert all("thinking_level" not in tier for tier in tiers.values())
+    assert "ensemble_selection_mode" not in tiers["c3"]
     assert cfg.squilla_router.tier_profile is None
 
 
@@ -152,7 +201,7 @@ def test_tokenrhythm_curated_ladder_is_not_rebound_to_the_direct_model() -> None
     # packaged profiles.
     cfg = GatewayConfig(llm={"provider": "tokenrhythm", "model": "glm-5.2"})
     assert cfg.llm.model == "glm-5.2"
-    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek-v4-pro"
+    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek-v4-pro-0813"
 
 
 def test_tokenrhythm_custom_tiers_are_preserved() -> None:
@@ -218,3 +267,79 @@ def test_resolved_tokenrhythm_tiers_are_not_persisted(tmp_path: Path) -> None:
     data = tomllib.loads(target.read_text(encoding="utf-8"))
     assert "squilla_router" not in data
     assert "llm" not in data
+
+
+def test_runtime_withholds_known_cross_provider_key_without_erasing_disk(
+    tmp_path: Path,
+) -> None:
+    import tomllib
+
+    from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+    from opensquilla.onboarding.config_store import load_config, persist_config
+
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "\n".join(
+            [
+                "[llm]",
+                'provider = "openrouter"',
+                'api_key = "sk_tr_abcdefghijklmnop"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(target)
+
+    runtime = resolve_llm_runtime_config(cfg)
+    assert runtime.provider == "openrouter"
+    assert runtime.api_key == ""
+    assert cfg.provider_resolution()["reason_code"] == "credential_provider_mismatch"
+
+    cfg.log_level = "DEBUG"
+    persist_config(cfg, path=target, backup=False)
+    raw = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert raw["llm"]["api_key"] == "sk_tr_abcdefghijklmnop"
+
+
+def test_runtime_withholds_key_from_conflicting_official_endpoint() -> None:
+    from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "api_key": "sk_tr_abcdefghijklmnop",
+            "base_url": LEGACY_DEFAULT_LLM_BASE_URL,
+        }
+    )
+
+    runtime = resolve_llm_runtime_config(cfg)
+
+    assert runtime.api_key == ""
+    assert (
+        cfg.provider_resolution()["reason_code"]
+        == "credential_endpoint_provider_mismatch"
+    )
+    assert cfg.provider_resolution()["action_required"] is True
+
+
+def test_providerless_tokenrhythm_recovery_does_not_rewrite_disk(
+    tmp_path: Path,
+) -> None:
+    import tomllib
+
+    from opensquilla.onboarding.config_store import load_config, persist_config
+
+    target = tmp_path / "config.toml"
+    target.write_text(
+        '[llm]\napi_key = "sk_tr_abcdefghijklmnop"\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(target)
+    assert cfg.llm.provider == "tokenrhythm"
+
+    cfg.log_level = "DEBUG"
+    persist_config(cfg, path=target, backup=False)
+
+    raw = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert "provider" not in raw["llm"]

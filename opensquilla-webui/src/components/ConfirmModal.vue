@@ -16,10 +16,29 @@
             <p id="confirm-modal-description">{{ confirmState.body }}</p>
           </div>
           <div class="modal__footer">
-            <button :class="['btn', confirmState.primaryClass]" @click="onConfirm">
+            <button
+              v-if="confirmState.showCancel !== false"
+              ref="cancelBtn"
+              type="button"
+              class="btn btn--ghost"
+              @click.stop="onCancel"
+            >{{ t('common.cancel') }}</button>
+            <button
+              v-if="confirmState.secondaryLabel"
+              type="button"
+              :class="['btn', 'modal__secondary', confirmState.secondaryClass]"
+              @click.stop="onSecondary"
+            >
+              {{ confirmState.secondaryLabel }}
+            </button>
+            <button
+              ref="primaryBtn"
+              type="button"
+              :class="['btn', 'modal__primary', confirmState.primaryClass]"
+              @click.stop="onConfirm"
+            >
               {{ confirmState.primaryLabel }}
             </button>
-            <button ref="cancelBtn" class="btn btn--ghost" @click="onCancel">{{ t('common.cancel') }}</button>
           </div>
         </div>
       </div>
@@ -34,11 +53,15 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 
 const { t } = useI18n()
-const { confirmState, resolveConfirm } = useConfirm()
+const { confirmState, resolveConfirm, resolveConfirmChoice } = useConfirm()
 
 const modalRef = ref<HTMLElement | null>(null)
 const cancelBtn = ref<HTMLElement | null>(null)
+const primaryBtn = ref<HTMLElement | null>(null)
 const isOpen = computed(() => confirmState.value !== null)
+const initialFocus = computed(() => (
+  confirmState.value?.showCancel === false ? primaryBtn.value : cancelBtn.value
+))
 
 function onConfirm() {
   resolveConfirm(true)
@@ -48,9 +71,15 @@ function onCancel() {
   resolveConfirm(false)
 }
 
-// Cancel is the initial focus target so a destructive primary is never
-// auto-focused; Escape and Tab-trapping come from the shared a11y helper.
-useDialogA11y(modalRef, isOpen, onCancel, { initialFocus: cancelBtn })
+function onSecondary() {
+  resolveConfirmChoice('secondary')
+}
+
+// Cancel sits first (leading edge) and is the initial focus target when shown.
+// A two-action save/discard prompt instead focuses its non-destructive save
+// action, never the destructive discard button. Escape and Tab-trapping come
+// from the shared a11y helper.
+useDialogA11y(modalRef, isOpen, onCancel, { initialFocus })
 </script>
 
 <style scoped>
@@ -96,8 +125,20 @@ useDialogA11y(modalRef, isOpen, onCancel, { initialFocus: cancelBtn })
 
 .modal__footer {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--sp-3);
   justify-content: flex-end;
+}
+
+.modal__footer .btn {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.modal__primary {
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--scrim) 24%, transparent);
+  min-width: 88px;
+  opacity: 1;
 }
 
 .modal-enter-active,

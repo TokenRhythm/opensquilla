@@ -249,3 +249,32 @@ def test_step_veto_mode_noop_when_cross_provider_enabled() -> None:
     assert ctx.metadata["routed_tier"] == "c2"
     assert ctx.metadata["routed_provider"] == "otherprov"
     assert "provider_mismatch_veto_applied" not in ctx.metadata
+
+
+def test_step_veto_cannot_rebind_large_context_below_floor(monkeypatch) -> None:
+    config = _config("veto")
+    config.squilla_router.tiers = tiers_with({"c3": "otherprov"})
+    ctx = TurnContext(
+        message="analyze the attached archive",
+        session_key="agent:veto:large-context",
+        config=config,
+        provider=None,
+        model=config.llm.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={"attachment_material_estimated_tokens": 90_000},
+    )
+    strategy = _FixedStrategy(
+        "c3",
+        0.9,
+        {"route_class": "R3", "thinking_mode": "T3", "prompt_policy": "P1"},
+    )
+    monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _config: strategy)
+
+    out = asyncio.run(squilla_router_step.apply_squilla_router(ctx))
+
+    assert out.metadata["provider_mismatch_veto_to_tier"] == "c2"
+    assert out.metadata["large_context_floor_min_tier"] == "c3"
+    assert out.metadata["large_context_capacity_blocked"] is True
+    assert "routed_tier" not in out.metadata

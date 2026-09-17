@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -64,11 +66,18 @@ def _patch_manager_dependencies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     )
     monkeypatch.setattr(
         "opensquilla.agents.scope.resolve_agent_data_dir",
-        lambda agent_id: tmp_path / "data" / agent_id,
+        lambda agent_id, state_dir=None: (
+            (Path(state_dir) if state_dir is not None else tmp_path / "data") / "agents" / agent_id
+        ),
     )
     monkeypatch.setattr(
         "opensquilla.agents.scope.resolve_agent_memory_dir",
-        lambda agent_id: tmp_path / "memory" / agent_id,
+        lambda agent_id, state_dir=None: (
+            (Path(state_dir) if state_dir is not None else tmp_path / "memory")
+            / "agents"
+            / agent_id
+            / "memory"
+        ),
     )
 
 
@@ -126,6 +135,110 @@ async def test_build_memory_enables_session_source_indexer_when_configured(
     finally:
         for manager in managers.values():
             await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_state_memory_source_uses_configured_external_state_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(_LOCAL_AVAILABLE_PATH, lambda *_: True)
+    external_state = tmp_path / "external-state"
+    _provider, managers = await _build_one(
+        GatewayConfig(
+            state_dir=str(external_state),
+            memory={"source": "state"},
+        ),
+        monkeypatch,
+        tmp_path,
+    )
+    try:
+        manager = managers["main"]
+        assert manager.memory_dir == external_state / "agents" / "main" / "memory"
+        assert manager.workspace_dir == external_state / "agents" / "main"
+        assert os.path.samefile(
+            manager.sync_manager.kwargs["memory_dir"],
+            external_state / "agents" / "main" / "memory",
+        )
+    finally:
+        for manager in managers.values():
+            await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+async def test_extended_length_state_keeps_memory_sync_and_capture_operational(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.memory.manager import _native_io_path, build_memory_managers
+
+    monkeypatch.setattr(
+        "opensquilla.agents.scope.maybe_migrate_legacy_memory",
+        lambda *_: None,
+    )
+    long_root = tmp_path / "long-state"
+    state_dir = long_root
+    index = 0
+    while len(str(state_dir / "agents" / "main" / "memory" / "memory.db")) < 300:
+        state_dir /= f"state-segment-{index:02d}-0123456789"
+        index += 1
+    workspace = state_dir / "agents" / "main"
+    memory_dir = workspace / "memory"
+    os.makedirs(_native_io_path(memory_dir))
+    (_native_io_path(workspace) / "MEMORY.md").write_text(
+        "# Memory\n\npersistent fact\n",
+        encoding="utf-8",
+    )
+    (_native_io_path(memory_dir) / "topic.md").write_text(
+        "# Topic\n\nindexed fact\n",
+        encoding="utf-8",
+    )
+    config = GatewayConfig(
+        state_dir=str(state_dir),
+        memory={
+            "source": "state",
+            "retrieval_mode": "fts_only",
+            "sync_interval_minutes": 0.0,
+            "ttl_sweep_interval_minutes": 0.0,
+            "capture_assistant": True,
+        },
+    )
+    managers = {}
+    try:
+        managers = await build_memory_managers(config, ["main"])
+        manager = managers["main"]
+
+        assert manager.db_path == workspace / "memory.db"
+        assert manager.workspace_dir == workspace
+        assert manager.memory_dir == memory_dir
+        assert not str(manager.db_path).startswith("\\\\?\\")
+        assert await manager.store.list_paths() == ["MEMORY.md", "memory/topic.md"]
+
+        rel_path = await manager.capture_turn(
+            session_key="agent:main:long-state",
+            session_id="long-state-session",
+            user_text="remember this",
+            assistant_text="remembered",
+        )
+        assert rel_path is not None
+        capture_path = workspace / rel_path
+        assert os.path.isfile(_native_io_path(capture_path))
+        with open(_native_io_path(capture_path), encoding="utf-8") as handle:
+            captured = handle.read()
+        assert "### User\nremember this" in captured
+        assert "### Assistant\nremembered" in captured
+
+        status = await manager.status()
+        assert status["file_count"] == 2
+        assert status["chunk_count"] >= 2
+        assert status["degraded"] == []
+    finally:
+        for manager in managers.values():
+            await manager.close()
+        native_root = _native_io_path(long_root)
+        if native_root.exists():
+            shutil.rmtree(native_root)
 
 
 @pytest.mark.asyncio
@@ -359,7 +472,11 @@ def test_resolver_explicit_remote_requires_memory_api_key() -> None:
 
 def test_resolver_auto_never_uses_llm_openrouter_key() -> None:
     cfg = GatewayConfig(
-        llm={"provider": "openrouter", "api_key": "or-key", "base_url": "https://openrouter.ai/api/v1"}
+        llm={
+            "provider": "openrouter",
+            "api_key": "or-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
     )
     decision = resolve_memory_embedding(cfg.memory, local_available=lambda *_: False)
     assert decision.effective_provider == "none"

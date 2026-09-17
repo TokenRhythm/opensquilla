@@ -7,7 +7,8 @@ requirements) for meta-skills, plus a few OpenSquilla-specific gates:
   conveys *when* to use the skill, not just *what* it does).
 * **L2**: ``triggers`` contains at least one entry (the skill needs a
   resolvable entry surface, even if the LLM-driven soft path also
-  works without one).
+  works without one). Fully disabled compatibility tombstones are exempt:
+  an empty trigger list is part of their retirement contract.
 * **L3**: ``meta_priority`` is explicitly declared (not relying on the
   default 0, which silently puts new meta-skills at the bottom of the
   hard-takeover resolution order).
@@ -73,7 +74,11 @@ def _lint_one(spec: object) -> list[LintFinding]:
         )
 
     triggers = list(getattr(spec, "triggers", None) or [])
-    if not triggers:
+    retired_tombstone = (
+        getattr(spec, "user_invocable", True) is False
+        and getattr(spec, "disable_model_invocation", False) is True
+    )
+    if not triggers and not retired_tombstone:
         findings.append(
             LintFinding(
                 rule="L2",

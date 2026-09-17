@@ -6,18 +6,20 @@ import os
 import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path, PurePath, PurePosixPath
-from typing import Any, Literal
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+from typing import Any, Literal, cast
 
+from opensquilla.sandbox.path_aliases import resolve_workspace_alias
 from opensquilla.sandbox.permissions import (
     FileSystemAccess,
     FileSystemPermissionProfile,
+    logical_absolute_path,
 )
 from opensquilla.sandbox.sensitive_paths import sensitive_path_marker
 
 MountAccess = Literal["ro", "rw"]
 MountStatus = Literal["allowed", "request", "blocked"]
-DecisionPath = Path | PurePosixPath
+DecisionPath = Path | PurePosixPath | PureWindowsPath
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,79 @@ def normalize_path(path: str | os.PathLike[str]) -> Path:
     return Path(path).expanduser().resolve(strict=False)
 
 
+def logical_tool_path(
+    raw_path: str | os.PathLike[str],
+    *,
+    base: Path,
+) -> Path:
+    """Make a tool path absolute without following any symlink component."""
+
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    logical = logical_absolute_path(candidate)
+    assert isinstance(logical, Path)
+    return logical
+
+
+def _profile_logical_candidate(
+    logical_path: str | os.PathLike[str],
+    *,
+    workspace: str | os.PathLike[str] | None,
+) -> DecisionPath:
+    """Resolve a raw model-visible spelling without losing its platform form."""
+
+    workspace_base = _profile_workspace_base(workspace)
+    raw_candidate = _raw_profile_logical_path(logical_path, workspace_base)
+    alias = resolve_workspace_alias(raw_candidate, workspace_base)
+    if alias is not None:
+        return _logical_path_from_base(
+            cast(DecisionPath, alias),
+            base=workspace_base or Path.cwd(),
+        )
+    return _logical_path_from_base(
+        raw_candidate,
+        base=workspace_base or Path.cwd(),
+    )
+
+
+def _profile_workspace_base(
+    workspace: str | os.PathLike[str] | None,
+) -> DecisionPath | None:
+    if workspace is None:
+        return None
+    if isinstance(workspace, PurePath) and not isinstance(workspace, Path):
+        return cast(DecisionPath, workspace)
+    return logical_tool_path(workspace, base=Path.cwd())
+
+
+def _raw_profile_logical_path(
+    logical_path: str | os.PathLike[str],
+    workspace_base: DecisionPath | None,
+) -> DecisionPath:
+    if isinstance(logical_path, PurePath):
+        return cast(DecisionPath, logical_path)
+
+    raw_text = os.fsdecode(os.fspath(logical_path))
+    if isinstance(workspace_base, PureWindowsPath):
+        if raw_text.startswith("/") and not raw_text.startswith("//"):
+            return PurePosixPath(raw_text)
+        return PureWindowsPath(raw_text)
+    return Path(raw_text).expanduser()
+
+
+def _logical_path_from_base(
+    candidate: DecisionPath,
+    *,
+    base: DecisionPath,
+) -> DecisionPath:
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    logical = logical_absolute_path(candidate)
+    assert isinstance(logical, (Path, PurePosixPath, PureWindowsPath))
+    return logical
+
+
 def _looks_like_posix_rooted_text(path: str) -> bool:
     return os.name == "nt" and path.startswith("/") and not path.startswith("//")
 
@@ -90,8 +165,8 @@ def _looks_like_posix_rooted_text(path: str) -> bool:
 def _normalize_decision_path(path: str | os.PathLike[str]) -> DecisionPath:
     if isinstance(path, str) and _looks_like_posix_rooted_text(path):
         return PurePosixPath(path)
-    if isinstance(path, PurePosixPath) and not isinstance(path, Path):
-        return path
+    if isinstance(path, PurePath) and not isinstance(path, Path):
+        return cast(DecisionPath, path)
     return normalize_path(path)
 
 
@@ -110,6 +185,7 @@ def decide_path_access(
     mounts: Iterable[Any] = (),
     write: bool = False,
     profile: FileSystemPermissionProfile | None = None,
+    logical_path: str | os.PathLike[str] | None = None,
 ) -> MountDecision:
     """Return whether *path* is visible in the active sandbox mount view."""
 
@@ -118,10 +194,29 @@ def decide_path_access(
     normalized_text = str(normalized)
     workspace_path = _normalize_decision_path(workspace) if workspace is not None else None
 
-    if profile is not None and isinstance(normalized, Path):
-        effective_access = profile.resolve(normalized)
+    if profile is not None:
+        profile_candidate = (
+            _profile_logical_candidate(logical_path, workspace=workspace)
+            if logical_path is not None
+            else normalized
+        )
+        profile_candidates = tuple(dict.fromkeys((profile_candidate, normalized)))
+        candidate_access = tuple(
+            (candidate, profile.resolve(candidate)) for candidate in profile_candidates
+        )
+        effective_access = min(
+            (candidate[1] for candidate in candidate_access),
+            key={
+                FileSystemAccess.DENY: 0,
+                FileSystemAccess.READ: 1,
+                FileSystemAccess.WRITE: 2,
+            }.__getitem__,
+        )
         if effective_access is FileSystemAccess.DENY:
-            if not profile.is_explicitly_denied(normalized):
+            if not any(
+                access is FileSystemAccess.DENY and profile.is_explicitly_denied(candidate)
+                for candidate, access in candidate_access
+            ):
                 return MountDecision(
                     status="request",
                     normalized_path=normalized_text,
@@ -146,7 +241,10 @@ def decide_path_access(
             access="rw",
             reason=(
                 "protected_metadata"
-                if profile.protected_metadata_root(normalized) is not None
+                if any(
+                    profile.protected_metadata_root(candidate) is not None
+                    for candidate in profile_candidates
+                )
                 else "mount_requires_write_access"
             ),
         )
@@ -197,8 +295,8 @@ def classify_path_for_sandbox(
     normalized = _normalize_decision_path(path)
     normalized_text = str(normalized)
     workspace_path = _normalize_decision_path(workspace) if workspace is not None else None
-    within_workspace = (
-        workspace_path is not None and is_relative_to_path(normalized, workspace_path)
+    within_workspace = workspace_path is not None and is_relative_to_path(
+        normalized, workspace_path
     )
     if _is_blocked_path(normalized, workspace_path):
         return PathRiskClassification(
@@ -234,9 +332,8 @@ def trusted_write_auto_grant_allowed(
     workspace: str | os.PathLike[str] | None,
 ) -> bool:
     classification = classify_path_for_sandbox(path, workspace=workspace)
-    return (
-        not classification.protected
-        and (classification.within_workspace or classification.low_risk_user_area)
+    return not classification.protected and (
+        classification.within_workspace or classification.low_risk_user_area
     )
 
 

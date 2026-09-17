@@ -243,8 +243,7 @@ async def _published_response(
                 "artifact": llm_artifact,
                 "note": (
                     "This generated file is already registered for the current surface "
-                    "in this turn. Do not recreate or paste the file contents; just "
-                    "confirm it is ready."
+                    "in this turn. Unchanged content does not need to be recreated."
                 ),
             },
             ensure_ascii=False,
@@ -269,7 +268,7 @@ async def _published_response(
                 "artifact": llm_artifact,
                 "note": (
                     "This session already has the same generated file registered. "
-                    "Do not recreate or republish it; just confirm it is ready."
+                    "Unchanged content does not need to be recreated or republished."
                 ),
             },
             ensure_ascii=False,
@@ -328,6 +327,7 @@ async def _published_response(
     },
     required=["rows"],
     sandbox=SandboxToolDescriptor.artifact(kind="artifact.create_csv"),
+    allow_string_item_schema_projection=True,
 )
 async def create_csv(rows: list[list[Any]], name: str | None = None) -> str:
     output = io.StringIO(newline="")
@@ -405,7 +405,6 @@ async def create_xlsx(sheets: list[dict[str, Any]], name: str | None = None) -> 
         },
     },
     required=["slides"],
-    exposed_by_default=False,
     sandbox=SandboxToolDescriptor.artifact(kind="artifact.create_pptx"),
 )
 async def create_pptx(slides: list[dict[str, Any]], name: str | None = None) -> str:

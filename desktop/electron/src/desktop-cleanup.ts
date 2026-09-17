@@ -8,7 +8,6 @@ export const DESKTOP_CLEANUP_MODES = [
 ] as const
 
 export type DesktopCleanupMode = typeof DESKTOP_CLEANUP_MODES[number]
-export type DesktopCleanupProfileKind = 'primary' | 'recovery'
 export type DesktopCleanupOutcome = 'ready' | 'blocked' | 'complete' | 'partial'
 
 export interface DesktopCleanupItem {
@@ -31,8 +30,6 @@ export interface DesktopCleanupReport {
 
 export interface DesktopCleanupSelection {
   mode: DesktopCleanupMode
-  profileKind: DesktopCleanupProfileKind
-  recoveryId: string | null
   profileKey: string
 }
 
@@ -123,10 +120,7 @@ export function cleanupSelectorArgs(
 ): string[] {
   return [
     '--mode', selection.mode,
-    '--profile-kind', selection.profileKind,
-    ...(selection.profileKind === 'recovery' && selection.recoveryId
-      ? ['--recovery-id', selection.recoveryId]
-      : []),
+    '--profile-kind', 'primary',
   ]
 }
 

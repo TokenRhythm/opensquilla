@@ -12,6 +12,7 @@ from opensquilla.channels._util import (
     ChannelAccessPolicy,
     ChannelDmAccess,
     evaluate_policy,
+    sender_is_channel_admin,
 )
 from opensquilla.channels.types import (
     AuthenticatedPrincipal,
@@ -33,6 +34,59 @@ AdmissionReason = Literal[
     "pairing_revoked",
     "principal_mismatch",
 ]
+
+
+# This is deliberately a route-internal fact, not an adapter-provided claim.
+# ``build_channel_route_envelope`` removes it from incoming metadata and the
+# dispatch boundary writes it only after checking authenticated provenance.
+CHANNEL_ADMIN_VERIFIED_METADATA_KEY = "channel_admin_verified"
+
+
+def is_authenticated_channel_admin(
+    config: Any,
+    *,
+    channel_name: str | None,
+    msg: IncomingMessage,
+) -> bool:
+    """Return whether this exact authenticated event is a configured admin.
+
+    A configured sender ID is not sufficient on its own: an adapter must have
+    authenticated the transport and established a principal whose provider
+    subject is exactly the normalized event sender.  The configuration lookup
+    is intentionally keyed by the concrete channel entry name, rather than a
+    provider type, so a grant on one configured account cannot apply to
+    another account of the same provider.
+    """
+
+    if not isinstance(channel_name, str) or not channel_name:
+        return False
+    provenance = _message_provenance(msg)
+    principal = provenance.principal
+    if not provenance.authenticated or principal is None:
+        return False
+    if principal.subject_id != msg.sender_id:
+        return False
+    admin_senders = getattr(config, "channel_admin_senders", None)
+    if not isinstance(admin_senders, dict):
+        return False
+    return sender_is_channel_admin(
+        msg.sender_id,
+        configured=admin_senders.get(channel_name),
+    )
+
+
+def has_verified_channel_admin_stamp(envelope: Any) -> bool:
+    """Return the authenticated-admin fact stamped by channel dispatch."""
+
+    metadata = getattr(envelope, "metadata", None)
+    source_kind = getattr(envelope, "source_kind", None)
+    source_kind_value = getattr(source_kind, "value", source_kind)
+    return bool(
+        source_kind_value == "channel"
+        and isinstance(metadata, dict)
+        and metadata.get("principal_is_owner") is True
+        and metadata.get(CHANNEL_ADMIN_VERIFIED_METADATA_KEY) is True
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +176,9 @@ def decide_channel_admission(
     channel: Any,
     msg: IncomingMessage,
     session_key: str,
+    *,
+    config: Any = None,
+    channel_name: str | None = None,
 ) -> ChannelAdmissionDecision:
     """Authenticate identity and evaluate channel access exactly once.
 
@@ -136,6 +193,11 @@ def decide_channel_admission(
     principal = provenance.principal if provenance.authenticated else None
     sender_id = principal.subject_id if principal is not None else msg.sender_id
     is_group = _is_group_event(msg, session_key)
+    authenticated_admin = is_authenticated_channel_admin(
+        config,
+        channel_name=channel_name,
+        msg=msg,
+    )
 
     if principal is not None and msg.sender_id != principal.subject_id:
         return ChannelAdmissionDecision(
@@ -172,7 +234,12 @@ def decide_channel_admission(
     pairing_id: str | None = None
     pairing_notice = False
     if not is_group and policy.dm_access == ChannelDmAccess.PAIRING:
-        if not provenance.authenticated:
+        if authenticated_admin:
+            # A configured administrator has already been authenticated by
+            # the transport. Do not create a redundant pairing row for the
+            # privileged entry path.
+            pairing_status = "approved"
+        elif not provenance.authenticated:
             # Compatibility for custom/legacy adapters that have not adopted
             # authenticated provenance. Supported authenticated adapters still
             # take the fail-closed pairing path below.

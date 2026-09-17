@@ -1,38 +1,50 @@
-import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
+import type {
+  ConversationAnswerReset,
+  ConversationCompactionContent,
+  ConversationCronResult,
+  ConversationEnsembleProgress,
+  ConversationEventContext,
+  ConversationInputDisposition,
+  ConversationProviderActivity,
+  ConversationRoutingDecision,
+  ConversationEventIdentity,
+  ConversationSubagentCompletion,
+  ConversationTextContent,
+  ConversationToolContent,
+  ConversationWarning,
+} from '@/modules/conversationEventContent'
+import { onScopeDispose, ref, watch, type Ref } from 'vue'
 import type {
   ChatMessage,
+  ChatModelCallSegment,
   ChatPendingItem,
   ChatRunStatus,
   ChatRunStatusSource,
-  ChatUsagePayload,
 } from '@/types/chat'
+
+import type { ArtifactPayload } from '@/types/artifacts'
+import type { SessionReadSnapshot } from '@/modules/sessionReadLifecycle'
+import type { ConversationEventData } from '@/modules/conversationEventContent'
 import type {
-  ArtifactPayload,
-  CompactionPayload,
-  CronResultPayload,
-  EnsembleProgressPayload,
-  RouterDecisionPayload,
-  SessionEventPayload,
-  StreamEventEnvelope,
-  SubagentCompletionPayload,
-  TextDeltaPayload,
-  ToolDeltaPayload,
-  ToolResultPayload,
-  ToolUsePayload,
-  WarningPayload,
-} from '@/types/rpc'
-import type { ChatRpcSubscriptionHandlers } from '@/composables/chat/useChatRpcSubscriptions'
-import type { FrameInput } from '@/types/turnlog'
-import type { FoldLiveTurnMode } from '@/composables/chat/useChatTurnLog'
+  ConversationEvent,
+  ConversationSemanticEventKind,
+} from '@/modules/conversationEvents'
+import {
+  isAuthoritativeSessionSubscription,
+  type SessionSubscriptionOutcome,
+} from '@/composables/chat/useChatSessionSubscription'
+import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
+import type { FrameInput, ReasoningBlock } from '@/types/turnlog'
+import type { StatusPart } from '@/types/parts'
+import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
+import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
 import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
-  acceptStreamSeq as decideStreamSeq,
   activeTaskGroupRunState as buildActiveTaskGroupRunState,
   isCurrentSessionPayload as payloadIsCurrentSession,
   isCurrentTaskPayload as payloadIsCurrentTask,
-  isStaleEpoch as payloadIsStaleEpoch,
   payloadTaskId,
   sessionChangeIsTerminal as payloadSessionChangeIsTerminal,
   sessionErrorMessage as eventSessionErrorMessage,
@@ -40,8 +52,19 @@ import {
   taskTerminalAsSessionEvent as normalizeTaskTerminalEvent,
   taskTerminalStatus as eventTaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
-import { stoppedOutputNoticeMessage } from '@/composables/chat/stoppedOutputNotice'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { dedupeTerminalErrorNotices } from '@/utils/chat/terminalErrorNotices'
+import {
+  useChatSteerDelivery,
+  type ChatSteerDeliveryApi,
+} from './useChatSteerDelivery'
+import type { ChatStreamModelCallIdentity } from './useChatStream'
+import {
+  createConversationRuntime,
+  type ConversationRuntime,
+  type ConversationCursorSignal,
+} from '@/modules/conversationRuntime'
+import { conversationCursorSignal } from '@/utils/chat/streamEvents'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -57,31 +80,67 @@ export interface ChatRpcStreamApi {
   isStreaming: Ref<boolean>
   streamBubble: Ref<boolean>
   streamHasVisibleOutput: Ref<boolean>
-  startStreaming: () => void
-  endStreaming: (opts?: { reason?: string }) => void
-  appendDelta: (text: string) => void
+  startStreaming: (
+    activityStartedAt?: number | string | null,
+    recordInitialActivity?: boolean,
+  ) => void
+  endStreaming: (opts?: { reason?: string, suppressed?: boolean }) => void
+  checkpointForUserMessage?: (turnId: string, boundaryKey?: string) => void
+  acknowledgeSteerBoundary?: (
+    boundaryKey: string,
+    modelCallId?: string,
+    iteration?: number,
+  ) => void
+  appendDelta: (
+    text: string,
+    presentation?: 'intermediate' | 'answer',
+    identity?: ChatStreamModelCallIdentity,
+  ) => void
   scheduleRender: () => void
-  appendToolCall: (payload: ToolUsePayload) => void
-  appendToolDelta: (payload: ToolDeltaPayload) => void
-  appendToolResult: (payload: ToolResultPayload) => void
+  appendToolCall: (payload: ConversationToolContent) => void
+  appendToolDelta: (payload: ConversationToolContent) => void
+  appendToolEnd?: (payload: ConversationToolContent) => void
+  appendToolResult: (payload: ConversationToolContent) => void
   appendArtifact: (payload: ArtifactPayload) => void
-  reconcileFinalText: (finalText: string | null | undefined) => void
-  resetStreamIdleTimer: () => void
+  reconcileFinalText: (
+    finalText: string | null | undefined,
+    modelCallSegments?: ChatModelCallSegment[] | null,
+  ) => void
+  resetLiveTurnState?: () => void
+  resetAnswerGeneration?: (options?: {
+    textSnapshot?: string
+    preserveCompletedTools?: boolean
+  }) => void
+  setAssistantMessageId?: (messageId: string) => void
+  resetStreamIdleTimer: (opts?: { progress?: boolean }) => void
   clearStreamIdleTimer: () => void
-  setStreamActivity: (label: string) => void
+  setStreamActivity: (label: string, key?: string) => void
+  recordActivityPhase?: (label: string, key?: string) => void
+  setAcceptedActivityStartedAt?: (value: number | undefined) => void
+  restoreStatusHistory?: (entries: readonly StatusPart[]) => void
+  recordCompactionActivity?: (payload: ConversationCompactionContent) => void
   showThinkingIndicator: () => void
   hideThinkingIndicator: () => void
-  // live-turn shadow log: the thinking ref lives here, so this composable appends
-  // its own thinking frames into the stream-owned log after the legacy mutation.
+  // Accepted reasoning events enter the stream-owned turn log.
   appendFrame: (frame: FrameInput) => void
-  useReducer: Ref<FoldLiveTurnMode>
+  setAcceptedActivityOrder?: (order: number | undefined) => void
+  noteReasoningPresentationDelta?: (text: string) => void
+  getThinkingText?: () => string
 }
 
+type ChatCompactionPlacement = 'activity' | 'standalone'
+type ChatCompactionPresentationResult = boolean | ChatCompactionPlacement | void
+
 export interface UseChatRpcEventHandlersOptions {
+  /** Shared transport-independent conversation cursor policy. */
+  conversationRuntime?: ConversationRuntime
   sessionKey: Ref<string>
   currentEpoch: Ref<number>
   lastStreamSeq: Ref<number>
+  streamGeneration?: Ref<string | null>
+  observeStreamGeneration?: (signal: ConversationCursorSignal) => boolean
   activeTaskGroups: Ref<Set<string>>
+  taskOwnership?: ChatTaskOwnershipApi
   // Task id of the turn whose output the live stream is currently rendering.
   // Empty = unknown (no guard). Set when a fresh turn starts (see useChatSend)
   // and on task.running; reset on session switch.
@@ -92,87 +151,158 @@ export interface UseChatRpcEventHandlersOptions {
   usageAccum: Ref<ChatUsageAccumulator>
   usageModel: Ref<string>
   stream: ChatRpcStreamApi
+  /** Accepted fresh results only; authoritative history/snapshot replay is excluded. */
+  onLiveToolResult?: (payload: ConversationToolContent) => void
   normalizeRunStatus: (status: string) => string
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
-  queueRouterDecision: (payload: RouterDecisionPayload) => void
-  appendEnsembleProgress: (payload: EnsembleProgressPayload) => void
-  markEnsembleHandoff: () => void
+  updateRouterExecutionModel?: (model: string, turnId?: string) => void
+  onTaskSettled?: (taskId: string, epoch?: number) => void
+  queueRouterDecision: (payload: ConversationRoutingDecision, identityStreamSeq?: number) => void
+  bindRouterDecisionToModelCall?: (
+    modelCallId: string,
+    iteration?: number,
+    turnId?: string,
+  ) => void
+  appendEnsembleProgress: (payload: ConversationEnsembleProgress) => void
+  markEnsembleHandoff: (turnId?: string) => void
   flushPendingRouterDecision: () => void
   clearPendingRouterDecision: () => void
-  handleRouterControlReplay: () => void
-  showCompactionToast: (payload: CompactionPayload, meta?: Record<string, unknown>) => void
+  handleRouterControlReplay: (payload: ConversationEventIdentity, identityStreamSeq?: number) => void
+  resetRouterReplayCursor?: () => void
+  showCompactionToast: (
+    payload: ConversationCompactionContent,
+    meta?: Record<string, unknown>,
+  ) => ChatCompactionPresentationResult
+  getCompactionPlacement?: (compactionId: string) => ChatCompactionPlacement | undefined
   showWarningToast: (message: string) => void
-  scheduleHistorySync: () => void
+  supportsTurnCommitted?: () => boolean
+  scheduleHistorySync: (preserveLocalTail?: boolean) => void
   schedulePendingDrainAfterTerminal: () => void
   popAllPendingIntoComposer: () => boolean
+  restoreSteerIntoComposer?: (text: string) => void
+  steerDelivery?: ChatSteerDeliveryApi
   saveWidgetState: () => void
-  subscribeSession: () => void
-  loadHistory: () => void
+  subscribeSession?: () =>
+    | boolean
+    | void
+    | SessionSubscriptionOutcome
+    | Promise<boolean | void | SessionSubscriptionOutcome>
+  onSessionSubscribed?: () => void | Promise<void>
+  loadHistory?: () => void
+  handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
+  refreshRunModePreference?: () => void | Promise<void>
+  /** Register one bounded reconciliation responsibility after local overflow. */
+  onRecoveryRequired?: () => void
 }
 
-type ChatDoneUsageFields = {
-  input_tokens?: number
-  output_tokens?: number
-  cached_tokens?: number
-  cache_write?: number
-  cost_usd?: number
-  model?: string
-  text?: string
-  text_snapshot?: string | null
-  textSnapshot?: string | null
-  model_usage_breakdown?: unknown
-  modelUsageBreakdown?: unknown
-  ensemble_trace?: unknown
-  ensembleTrace?: unknown
-  decision_id?: string
-}
 
-type ChatDoneUsagePayload = SessionEventPayload & ChatDoneUsageFields & {
-  usage?: ChatDoneUsageFields
-}
 
 type BufferedTerminalEvent =
-  | { kind: 'event'; event: string; payload: SessionEventPayload; priority: number }
-  | { kind: 'session-change'; payload: SessionEventPayload; priority: number }
+  | { kind: 'event'; event: ConversationSemanticEventKind; payload: ConversationEventData; priority: number; replayWithoutSeq?: boolean }
+  | { kind: 'session-change'; payload: ConversationEventData; priority: number; replayWithoutSeq?: boolean }
 
 type BufferedTerminalEventInput =
-  | { kind: 'event'; event: string; payload: SessionEventPayload; priority?: number }
-  | { kind: 'session-change'; payload: SessionEventPayload; priority?: number }
+  | { kind: 'event'; event: ConversationSemanticEventKind; payload: ConversationEventData; priority?: number }
+  | { kind: 'session-change'; payload: ConversationEventData; priority?: number }
 
 type BufferedPendingStreamEvent = {
-  event: string
-  payload: SessionEventPayload
+  event: ConversationSemanticEventKind
+  payload: ConversationEventData
+  replayWithoutSeq?: boolean
+  replayed?: boolean
 }
+
+type BufferedPendingReplayEntry =
+  | {
+      kind: 'stream'
+      event: ConversationSemanticEventKind
+      payload: ConversationEventData
+      order: number
+      replayWithoutSeq?: boolean
+      replayed?: boolean
+    }
+  | {
+      kind: 'terminal'
+      terminal: BufferedTerminalEvent
+      payload: ConversationEventData
+      order: number
+    }
 
 const MAX_PENDING_TASK_BUCKETS = 8
 const MAX_PENDING_STREAM_EVENTS_PER_TASK = 64
+const MAX_TRACKED_COMMITTED_TURNS = 64
+const TURN_COMMIT_TIMEOUT_MS = 5_000
+const SERVER_CLOCK_TOLERANCE_MS = 5_000
+const MAX_TRUSTED_REASONING_AGE_MS = 60 * 60 * 1_000
+const PROVIDER_ACTIVITY_PHASES = new Set([
+  'requesting',
+  'reasoning',
+  'retry_wait',
+  'retrying',
+  'fallback',
+])
+const PROVIDER_ACTIVITY_REASONS = new Set([
+  'initial',
+  'rate_limited',
+  'provider_overloaded',
+  'transport_transient',
+  'reasoning_only',
+  'empty_response',
+  'stream_incomplete',
+  'invalid_response',
+  'context_overflow',
+  'unknown',
+])
 
-function doneTextSnapshot(
-  donePayload: ChatDoneUsagePayload,
-  usagePayload: ChatDoneUsageFields,
-): string | null {
-  // A string snapshot is authoritative even when it is empty. Dataclass
-  // serialization includes an unset optional field as null, so null must mean
-  // "absent" and still permit the legacy nonempty `text` fallback.
-  // Prefer any actual string across the outer and nested compatibility shapes.
-  for (const source of [donePayload, usagePayload]) {
-    for (const key of ['text_snapshot', 'textSnapshot'] as const) {
-      if (Object.prototype.hasOwnProperty.call(source, key)) {
-        const value = source[key]
-        if (typeof value === 'string') return value
-      }
-    }
-  }
+const COMPACTION_TERMINAL_STATUSES = new Set([
+  'completed',
+  'skipped',
+  'failed',
+  'error',
+  'cancelled',
+  'timed_out',
+  'stale',
+  'emergency_ephemeral',
+])
 
-  // Older gateways only sent `text`. Preserve their nonempty terminal
-  // reconciliation behavior; legacy empty text always meant "fall back".
-  for (const source of [usagePayload, donePayload]) {
-    if (typeof source.text === 'string' && source.text) return source.text
-  }
-  return null
+const TASK_TERMINAL_STATUSES = new Set([
+  'succeeded',
+  'failed',
+  'cancelled',
+  'timeout',
+  'abandoned',
+  'interrupted',
+])
+
+type LiveThinking = {
+  startedAt: number
+  serverStartedAt: number | null
 }
+
+function trustedReasoningStartedAt(raw: unknown, now: number): number | null {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null
+  if (raw > now + SERVER_CLOCK_TOLERANCE_MS) return null
+  if (raw < now - MAX_TRUSTED_REASONING_AGE_MS) return null
+  return raw
+}
+
+function trustedReasoningDoneAt(
+  raw: unknown,
+  serverStartedAt: number,
+  now: number,
+): number | null {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null
+  if (raw < serverStartedAt) return null
+  if (raw > now + SERVER_CLOCK_TOLERANCE_MS) return null
+  if (raw - serverStartedAt > MAX_TRUSTED_REASONING_AGE_MS) return null
+  return raw
+}
+
+
+
+
 
 // A completed turn's measured thinking duration must survive the
 // chat.history sync that replaces the messages array ~50ms after done.
@@ -187,6 +317,14 @@ interface TurnReasoningRecord {
   text: string
   seconds: number
   messageText: string
+  blocks: ReasoningBlock[]
+}
+
+interface TurnActivityRecord {
+  sessionKey: string
+  turnId?: string
+  messageText: string
+  statusHistory: StatusPart[]
 }
 
 export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions) {
@@ -203,101 +341,618 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     usageModel,
     stream,
   } = options
+  const conversationRuntime = options.conversationRuntime ?? createConversationRuntime()
+  const streamGeneration = options.streamGeneration ?? ref<string | null>(null)
 
-  // Live thinking deltas for the current turn (session.event.thinking).
-  const streamThinking = ref<{ text: string; startedAt: number } | null>(null)
+  function cursor() {
+    return conversationRuntime.createCursor(sessionKey.value, {
+      sessionEpoch: currentEpoch.value,
+      streamGeneration: streamGeneration.value,
+      streamSeq: lastStreamSeq.value,
+    })
+  }
+
+  function syncCursor(next: ReturnType<ConversationRuntime['createCursor']>) {
+    currentEpoch.value = next.sessionEpoch
+    lastStreamSeq.value = next.streamSeq
+    streamGeneration.value = next.streamGeneration
+  }
+  const steerDelivery = options.steerDelivery || useChatSteerDelivery({
+    sessionKey,
+    activeTurnId: activeStreamTaskId,
+    messages,
+    pendingQueue,
+    checkpointForUserMessage: stream.checkpointForUserMessage,
+    acknowledgeSteerBoundary: stream.acknowledgeSteerBoundary,
+    scheduleHistorySync: options.scheduleHistorySync,
+    restoreSteerIntoComposer: options.restoreSteerIntoComposer,
+  })
+
+  // Live thinking deltas for the current turn.
+  const streamThinking = ref<LiveThinking | null>(null)
+  let currentGenerationEpoch: number | null = null
+  let activeAssistantMessageId = ''
+  let terminalGenerationClosed = false
   const turnReasoningLog: TurnReasoningRecord[] = []
+  const turnActivityLog: TurnActivityRecord[] = []
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
-  const settledTaskIds = new Set<string>()
+  let recoveryDirty = false
+  let recoveryFenced = false
+  let recoveryOverflow = false
+  let recoveryRevision = 0
+  const recoveryEvents: ConversationEvent[] = []
+  function markRecoveryDirty() {
+    pendingTerminalEvents.clear()
+    pendingStreamEvents.clear()
+    if (recoveryDirty) return
+    recoveryDirty = true
+    options.onRecoveryRequired?.()
+  }
 
-  function terminalEventPriority(event: string): number {
-    if (event === 'session.event.done' || event === 'chat.done' || event.endsWith('.error')) return 3
+  function beginRecovery() {
+    recoveryRevision++
+    recoveryFenced = true
+    recoveryOverflow = false
+    recoveryEvents.length = 0
+  }
+
+  function finishRecovery(): boolean {
+    if (recoveryOverflow) return false
+    recoveryFenced = false
+    recoveryDirty = false
+    const buffered = recoveryEvents.splice(0)
+    for (const event of buffered) handleConversationEvent(event)
+    return !recoveryDirty
+  }
+
+  function consumeConversationEvent(message: ConversationEvent): 'applied' | 'dirty' {
+    if (message.kind === 'invalid') {
+      markRecoveryDirty()
+      return 'dirty'
+    }
+    if (recoveryFenced) {
+      if (!recoveryOverflow && recoveryEvents.length < MAX_PENDING_STREAM_EVENTS_PER_TASK) {
+        recoveryEvents.push(message)
+      } else {
+        recoveryEvents.length = 0
+        recoveryOverflow = true
+      }
+      return 'dirty'
+    }
+    handleConversationEvent(message)
+    return recoveryDirty ? 'dirty' : 'applied'
+  }
+  const settledTaskIds = new Set<string>()
+  const committedTaskIds = new Set<string>()
+  const taskSucceededSyncedIds = new Set<string>()
+  const awaitingCommitTaskIds = ref(new Set<string>())
+  const awaitingCommitTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  let pendingSuccessorRenderTaskId = ''
+
+  function replaceAwaitingCommitTaskIds(mutator: (taskIds: Set<string>) => void) {
+    const next = new Set(awaitingCommitTaskIds.value)
+    mutator(next)
+    awaitingCommitTaskIds.value = next
+  }
+
+  function clearAwaitingTurnCommit(taskId: string) {
+    const timer = awaitingCommitTimers.get(taskId)
+    if (timer) clearTimeout(timer)
+    awaitingCommitTimers.delete(taskId)
+    replaceAwaitingCommitTaskIds(taskIds => taskIds.delete(taskId))
+  }
+
+  function clearTurnCommitTracking() {
+    for (const timer of awaitingCommitTimers.values()) clearTimeout(timer)
+    awaitingCommitTimers.clear()
+    awaitingCommitTaskIds.value = new Set()
+    committedTaskIds.clear()
+    taskSucceededSyncedIds.clear()
+  }
+
+  function rememberTrackedTask(taskIds: Set<string>, taskId: string): boolean {
+    if (taskIds.has(taskId)) return false
+    if (taskIds.size >= MAX_TRACKED_COMMITTED_TURNS) {
+      const oldestTaskId = taskIds.values().next().value
+      if (typeof oldestTaskId === 'string') taskIds.delete(oldestTaskId)
+    }
+    taskIds.add(taskId)
+    return true
+  }
+
+  function waitForTurnCommit(payload: ConversationEventData): boolean {
+    if (options.supportsTurnCommitted?.() !== true) return false
+    if (payload.reason === 'aborted') return false
+    const taskId = payloadTurnId(payload)
+    if (
+      !taskId
+      || committedTaskIds.has(taskId)
+      || awaitingCommitTaskIds.value.has(taskId)
+    ) return false
+
+    if (awaitingCommitTaskIds.value.size >= MAX_TRACKED_COMMITTED_TURNS) {
+      const oldestTaskId = awaitingCommitTaskIds.value.values().next().value
+      if (typeof oldestTaskId === 'string') clearAwaitingTurnCommit(oldestTaskId)
+    }
+    replaceAwaitingCommitTaskIds(taskIds => taskIds.add(taskId))
+    const expectedSessionKey = sessionKey.value
+    const expectedRevision = recoveryRevision
+    const timer = setTimeout(() => {
+      awaitingCommitTimers.delete(taskId)
+      if (
+        sessionKey.value !== expectedSessionKey
+        || recoveryRevision !== expectedRevision
+        || !awaitingCommitTaskIds.value.has(taskId)
+        || committedTaskIds.has(taskId)
+      ) return
+      options.scheduleHistorySync(true)
+    }, TURN_COMMIT_TIMEOUT_MS)
+    awaitingCommitTimers.set(taskId, timer)
+    return true
+  }
+
+  function handleRpcTurnCommitted(payload: ConversationEventData) {
+    if (options.supportsTurnCommitted?.() !== true) return
+    if (isStaleEpoch(payload)) return
+
+    const committedSessionKey = typeof payload.key === 'string'
+      ? payload.key.trim()
+      : ''
+    const taskId = typeof payload.task_id === 'string' ? payload.task_id.trim() : ''
+    const turnId = typeof payload.turn_id === 'string' ? payload.turn_id.trim() : ''
+    if (
+      !committedSessionKey
+      || committedSessionKey !== sessionKey.value
+      || !taskId
+      || !turnId
+      || payload.status !== 'succeeded'
+      || payload.terminal_reason !== 'completed'
+      || typeof payload.finished_at !== 'number'
+      || !Number.isInteger(payload.finished_at)
+      || payload.finished_at < 0
+    ) return
+    if (!acceptStreamSeq(payload)) return
+    if (!rememberTrackedTask(committedTaskIds, taskId)) return
+
+    clearAwaitingTurnCommit(taskId)
+    taskSucceededSyncedIds.delete(taskId)
+    options.taskOwnership?.noteTerminal(taskId, false)
+    options.scheduleHistorySync(true)
+  }
+
+  function compactionStatus(payload: ConversationCompactionContent): string {
+    const status = String(payload.status || '').toLowerCase()
+    if (status) return status
+    if (Object.prototype.hasOwnProperty.call(payload, 'compacted')) {
+      return payload.compacted ? 'completed' : 'skipped'
+    }
+    return ''
+  }
+
+  function payloadCompactionId(payload: ConversationCompactionContent): string {
+    return String(payload.compaction_id || '').trim()
+  }
+
+  function compactionTerminalActivityState(status: string): StatusPart['state'] | undefined {
+    if (status === 'completed' || status === 'emergency_ephemeral') return 'completed'
+    if (status === 'skipped') return 'skipped'
+    if (status === 'stale' || status === 'cancelled') return 'cancelled'
+    if (status === 'failed' || status === 'error' || status === 'timed_out') return 'failed'
+    return undefined
+  }
+
+  function settleCommittedCompactionActivity(payload: ConversationCompactionContent): boolean {
+    const id = payloadCompactionId(payload)
+    const state = compactionTerminalActivityState(compactionStatus(payload))
+    if (!id || !state) return false
+
+    for (let messageIndex = messages.value.length - 1; messageIndex >= 0; messageIndex -= 1) {
+      const message = messages.value[messageIndex]
+      if (message?.role !== 'assistant' || !message.statusHistory) continue
+      for (let statusIndex = message.statusHistory.length - 1; statusIndex >= 0; statusIndex -= 1) {
+        const marker = message.statusHistory[statusIndex]
+        if (marker?.action !== 'context_compaction' || marker.id !== id) continue
+        message.statusHistory[statusIndex] = {
+          ...marker,
+          state,
+          durability: compactionStatus(payload) === 'emergency_ephemeral'
+            ? 'request_scoped'
+            : String(payload.durability || marker.durability || ''),
+          reason: String(payload.reason || payload.skip_reason || marker.reason || ''),
+          // The lifecycle stays anchored where its started frame first appeared.
+          at: marker.at,
+        }
+        return true
+      }
+    }
+    return false
+  }
+
+  function trackedLateCompactionPlacement(
+    payload: ConversationCompactionContent,
+  ): ChatCompactionPlacement | undefined {
+    if (activeStreamTaskId.value !== FINISHED_STREAM_TASK_ID) return undefined
+    if (!isCurrentSessionPayload(payload)) return undefined
+    if (!COMPACTION_TERMINAL_STATUSES.has(compactionStatus(payload))) return undefined
+    const id = payloadCompactionId(payload)
+    if (!id) return undefined
+    return options.getCompactionPlacement?.(id)
+  }
+
+  function bufferedStreamSeq(payload: ConversationEventData): number | null {
+    const sequence = payload.stream_seq
+    return typeof sequence === 'number' && Number.isFinite(sequence) ? sequence : null
+  }
+
+  function withoutBufferedStreamSeq(payload: ConversationEventData): ConversationEventData {
+    const replayPayload = { ...payload }
+    delete replayPayload.stream_seq
+    return replayPayload
+  }
+
+  // Authoritative snapshots and already-accepted pending frames deliberately
+  // replay without their sequence field so they can rebuild local state even
+  // when the browser cursor is newer. Keep the original order in a synchronous
+  // side channel: the fold needs it for chronology, while downstream legacy
+  // callbacks retain the established sequence-free payload shape.
+  let replayActivityOrder: number | undefined
+
+  function comparePendingReplayEntries(
+    left: BufferedPendingReplayEntry,
+    right: BufferedPendingReplayEntry,
+  ): number {
+    const leftSequence = bufferedStreamSeq(left.payload)
+    const rightSequence = bufferedStreamSeq(right.payload)
+    if (leftSequence !== null && rightSequence !== null && leftSequence !== rightSequence) {
+      return leftSequence - rightSequence
+    }
+    // Mixed-version gateways may omit sequence numbers. Preserve their old
+    // stream-before-terminal behavior while still sorting every numbered frame.
+    if (leftSequence !== null && rightSequence === null) {
+      return right.kind === 'terminal' ? -1 : 1
+    }
+    if (leftSequence === null && rightSequence !== null) {
+      return left.kind === 'terminal' ? 1 : -1
+    }
+    if (leftSequence !== null && leftSequence === rightSequence && left.kind !== right.kind) {
+      // A terminal owns the cursor for a shared sequence, after all visible
+      // frames at that sequence have been applied.
+      return left.kind === 'terminal' ? 1 : -1
+    }
+    return left.order - right.order
+  }
+
+  function terminalEventPriority(event: ConversationSemanticEventKind): number {
+    if (event === 'turn-completed' || event === 'turn-failed') return 3
     if (eventTaskTerminalStatus(event)) return 2
     return 0
   }
 
-  function isTerminalEvent(event: string): boolean {
+  function isTerminalEvent(event: ConversationSemanticEventKind): boolean {
     if (eventTaskTerminalStatus(event)) return true
-    if (event === 'session.event.done' || event === 'chat.done') return true
-    return event.endsWith('.error') && !event.includes('.task_group.')
+    return event === 'turn-completed' || event === 'turn-failed'
   }
 
   function bufferPendingTerminalEvent(
     entry: BufferedTerminalEventInput,
   ): boolean {
-    if (activeStreamTaskId.value !== PENDING_STREAM_TASK_ID) return false
     if (!isCurrentSessionPayload(entry.payload)) return false
     if (isStaleEpoch(entry.payload)) return false
-    const taskId = payloadTaskId(entry.payload)
+    if (recoveryDirty) return true
+    const terminalTask = entry.kind === 'session-change'
+      ? terminalSessionChangeTask(entry.payload)
+      : null
+    const taskId = chatTaskId(terminalTask) || payloadTurnId(entry.payload)
     if (!taskId) return false
+    const activeTaskId = activeStreamTaskId.value
+    const buffersPendingAcceptance = activeTaskId === PENDING_STREAM_TASK_ID
+    const buffersSuccessor = Boolean(
+      stream.isStreaming.value
+      && activeTaskId
+      && activeTaskId !== taskId
+      && (
+        options.taskOwnership?.runningTaskId.value === taskId
+        || pendingSuccessorRenderTaskId === taskId
+      ),
+    )
+    if (!buffersPendingAcceptance && !buffersSuccessor) return false
+    if (buffersSuccessor && !acceptStreamSeq(entry.payload)) return true
     const priority = entry.priority ?? (entry.kind === 'event' ? terminalEventPriority(entry.event) : 1)
     const existing = pendingTerminalEvents.get(taskId)
     if (!existing || priority >= existing.priority) {
       if (!existing && pendingTerminalEvents.size >= MAX_PENDING_TASK_BUCKETS) {
-        const oldestTaskId = pendingTerminalEvents.keys().next().value
-        if (typeof oldestTaskId === 'string') pendingTerminalEvents.delete(oldestTaskId)
+        markRecoveryDirty()
+        return true
       }
-      pendingTerminalEvents.set(taskId, { ...entry, priority } as BufferedTerminalEvent)
+      pendingTerminalEvents.set(taskId, {
+        ...entry,
+        priority,
+        ...(buffersSuccessor ? { replayWithoutSeq: true } : {}),
+      })
     }
     return true
   }
 
-  function markTaskSettled(payload: SessionEventPayload) {
-    const taskId = payloadTaskId(payload)
-    if (taskId) settledTaskIds.add(taskId)
-    pendingTerminalEvents.clear()
-    pendingStreamEvents.clear()
+  function markTaskSettled(payload: ConversationEventData) {
+    const terminalTask = terminalSessionChangeTask(payload)
+    const taskId = chatTaskId(terminalTask) || payloadTurnId(payload)
+    if (taskId) {
+      settledTaskIds.add(taskId)
+      options.onTaskSettled?.(taskId, payload.epoch)
+      pendingTerminalEvents.delete(taskId)
+      pendingStreamEvents.delete(taskId)
+    }
   }
 
   function bufferPendingStreamEvent(
-    event: string,
-    payload: SessionEventPayload,
+    event: ConversationSemanticEventKind,
+    payload: ConversationEventData,
+    replayed = false,
   ): boolean {
-    if (activeStreamTaskId.value !== PENDING_STREAM_TASK_ID) return false
     if (!isCurrentSessionPayload(payload)) return false
     if (isStaleEpoch(payload)) return false
-    const taskId = payloadTaskId(payload)
+    if (recoveryDirty) return true
+    // Match the live admission guard for legacy frames that carry a turn id
+    // before chat.send has supplied the accepted task id.
+    const taskId = payloadTurnId(payload)
     if (!taskId) return false
+    const activeTaskId = activeStreamTaskId.value
+    const buffersPendingAcceptance = activeTaskId === PENDING_STREAM_TASK_ID
+    const buffersSuccessor = Boolean(
+      stream.isStreaming.value
+      && activeTaskId
+      && activeTaskId !== taskId
+      && (
+        options.taskOwnership?.runningTaskId.value === taskId
+        || pendingSuccessorRenderTaskId === taskId
+      ),
+    )
+    if (!buffersPendingAcceptance && !buffersSuccessor) return false
+    if (buffersSuccessor && !acceptStreamSeq(payload)) return true
 
     let buffered = pendingStreamEvents.get(taskId)
     if (!buffered) {
       if (pendingStreamEvents.size >= MAX_PENDING_TASK_BUCKETS) {
-        const oldestTaskId = pendingStreamEvents.keys().next().value
-        if (typeof oldestTaskId === 'string') pendingStreamEvents.delete(oldestTaskId)
+        markRecoveryDirty()
+        return true
       }
       buffered = []
       pendingStreamEvents.set(taskId, buffered)
     }
-    if (buffered.length >= MAX_PENDING_STREAM_EVENTS_PER_TASK) buffered.shift()
-    buffered.push({ event, payload })
+    if (buffered.length >= MAX_PENDING_STREAM_EVENTS_PER_TASK) {
+      markRecoveryDirty()
+      return true
+    }
+    buffered.push({ event, payload, replayed, ...(buffersSuccessor ? { replayWithoutSeq: true } : {}) })
     return true
   }
 
+  function handleRpcAnswerGenerationReset(payload: ConversationAnswerReset) {
+    if (isStaleEpoch(payload)) return
+    if (bufferPendingStreamEvent('answer-generation-reset', payload)) return
+    if (!isCurrentTaskPayload(payload)) return
+
+    const oldGenerationEpoch = numericGenerationEpoch(
+      payload.old_generation_epoch,
+    )
+    const newGenerationEpoch = numericGenerationEpoch(
+      payload.new_generation_epoch,
+    )
+    if (
+      oldGenerationEpoch === null
+      || newGenerationEpoch === null
+      || newGenerationEpoch <= oldGenerationEpoch
+    ) return
+
+    const assistantMessageId = payloadAssistantMessageId(payload)
+    if (
+      assistantMessageId
+      && activeAssistantMessageId
+      && assistantMessageId !== activeAssistantMessageId
+    ) return
+
+    if (
+      currentGenerationEpoch !== null
+      && currentGenerationEpoch !== oldGenerationEpoch
+      && currentGenerationEpoch !== newGenerationEpoch
+    ) return
+    if (!acceptStreamSeq(payload)) return
+
+    // Snapshot replay and duplicate delivery can legitimately present the same
+    // reset more than once. Consume its cursor above, then leave the live
+    // bubble untouched when the requested generation is already active.
+    if (currentGenerationEpoch === newGenerationEpoch) return
+    currentGenerationEpoch = newGenerationEpoch
+    if (assistantMessageId) {
+      activeAssistantMessageId = assistantMessageId
+      stream.setAssistantMessageId?.(assistantMessageId)
+    }
+
+    const authoritativeTextSnapshot = payload.authoritative_text_snapshot ?? ''
+    const authoritativeReasoningSnapshot = payload.authoritative_reasoning_snapshot ?? ''
+    const preserveCompletedTools = payload.preserve_completed_tools ?? true
+
+    // A reset is a local replacement inside the current answer bubble. It must
+    // not call resetLiveTurnState(), which would erase completed tools/artifacts
+    // and create the conditions for a second assistant row on the next done.
+    if (!stream.isStreaming.value && !stream.resetAnswerGeneration) {
+      stream.startStreaming()
+    }
+    stream.resetAnswerGeneration?.({
+      textSnapshot: authoritativeTextSnapshot,
+      preserveCompletedTools,
+    })
+
+    streamThinking.value = null
+    stream.hideThinkingIndicator()
+    if (authoritativeReasoningSnapshot) {
+      const now = Date.now()
+      streamThinking.value = {
+        startedAt: now,
+        serverStartedAt: null,
+      }
+      stream.appendFrame({
+        kind: 'thinking',
+        text: authoritativeReasoningSnapshot,
+        at: now,
+      })
+    }
+    stream.resetStreamIdleTimer()
+
+    if (payload.terminal === true) {
+      const terminalTextSnapshot = payload.terminal_text_snapshot ?? authoritativeTextSnapshot
+      stream.reconcileFinalText(terminalTextSnapshot)
+      stream.endStreaming()
+      terminalGenerationClosed = true
+      markTaskSettled(payload)
+      options.clearPendingRouterDecision()
+      if (activeTaskGroups.value.size > 0) {
+        options.applySessionRunState(activeTaskGroupRunState(payload))
+      } else {
+        options.applySessionRunState({
+          run_status: 'failed',
+          last_task: { ...(payload || {}), status: 'failed' },
+        })
+      }
+      options.scheduleHistorySync()
+      activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      return
+    }
+
+    stream.scheduleRender()
+  }
+
   function replayPendingStreamEvent(entry: BufferedPendingStreamEvent) {
-    const { event, payload } = entry
-    if (event === 'session.event.text_delta') {
-      handleRpcTextDelta(payload as TextDeltaPayload)
-    } else if (event === 'session.event.tool_use_start') {
-      handleRpcToolUseStart(payload as ToolUsePayload)
-    } else if (event === 'session.event.tool_use_delta') {
-      handleRpcToolUseDelta(payload as ToolDeltaPayload)
-    } else if (event === 'session.event.tool_result') {
-      handleRpcToolResult(payload as ToolResultPayload)
-    } else if (event === 'session.event.artifact') {
-      handleRpcArtifact(payload as ArtifactPayload)
-    } else if (event === 'session.event.state_change') {
-      handleRpcStateChange(payload)
-    } else if (event === 'session.event.run_heartbeat') {
-      handleRpcRunHeartbeat(payload)
-    } else if (event === 'session.event.router_decision') {
-      handleRpcRouterDecision(payload as RouterDecisionPayload)
-    } else if (event === 'session.event.ensemble_progress') {
-      handleRpcEnsembleProgress(payload as EnsembleProgressPayload)
-    } else if (event === 'session.event.router_control_replay') {
-      handleRpcRouterControlReplay(payload)
-    } else if (event === 'session.event.thinking') {
-      handleRpcAny(event, payload)
+    const { event } = entry
+    const payload = entry.replayWithoutSeq
+      ? withoutBufferedStreamSeq(entry.payload)
+      : entry.payload
+    const previousReplayOrder = replayActivityOrder
+    replayActivityOrder = entry.replayWithoutSeq
+      ? bufferedStreamSeq(entry.payload) ?? undefined
+      : undefined
+    try {
+      if (event === 'answer-generation-reset') {
+        handleRpcAnswerGenerationReset(payload)
+      } else if (event === 'text-delta') {
+        handleRpcTextDelta(payload)
+      } else if (event === 'tool-use-started') {
+        handleRpcToolUseStart(payload)
+      } else if (event === 'tool-use-delta') {
+        handleRpcToolUseDelta(payload)
+      } else if (event === 'tool-use-ended') {
+        handleRpcToolUseEnd(payload)
+      } else if (event === 'tool-result') {
+        handleRpcToolResult(payload, entry.replayed)
+      } else if (event === 'artifact-created') {
+        handleRpcArtifact(payload)
+      } else if (event === 'state-changed') {
+        handleRpcStateChange(payload)
+      } else if (event === 'run-heartbeat') {
+        handleRpcRunHeartbeat(payload)
+      } else if (event === 'provider-activity') {
+        handleRpcProviderActivity(payload)
+      } else if (event === 'router-decision') {
+        handleRpcRouterDecision(payload)
+      } else if (event === 'ensemble-progress') {
+        handleRpcEnsembleProgress(payload)
+      } else if (event === 'router-control-replay') {
+        handleRpcRouterControlReplay(payload)
+      } else if (event === 'input-disposition') {
+        handleRpcInputDisposition(payload)
+      } else if (event === 'compaction-progress') {
+        // A live snapshot is the authoritative base for the active stream, not
+        // historical replay. Compaction deliberately ignores replayed
+        // non-terminal events, so mark this as live to restore the busy/Stop
+        // state before subscribing from snapshot.current_stream_seq.
+        handleRpcCompaction(payload, {
+          authoritativeLive: true,
+          replayed: false,
+        })
+      } else if (
+        event === 'thinking-started'
+        || event === 'thinking-delta'
+        || event === 'thinking-ended'
+        || event === 'turn-completed'
+        || event === 'turn-failed'
+      ) {
+        handleSemanticEvent(event, payload)
+      }
+    } finally {
+      replayActivityOrder = previousReplayOrder
+    }
+  }
+
+  function restoreLiveTurnSnapshot(snapshot: SessionReadSnapshot) {
+    if (!snapshot || snapshot.sessionKey !== sessionKey.value) return
+
+    recoveryDirty = false
+
+    steerDelivery.resetTransientBoundaries()
+    stream.resetLiveTurnState?.()
+    clearLiveThinking()
+    clearGenerationTracking()
+    pendingTerminalEvents.clear()
+    pendingStreamEvents.clear()
+    settledTaskIds.clear()
+    pendingSuccessorRenderTaskId = ''
+    options.clearPendingRouterDecision()
+    activeStreamTaskId.value = typeof snapshot.taskId === 'string'
+      ? snapshot.taskId
+      : ''
+    options.resetRouterReplayCursor?.()
+
+    const replayEntries: BufferedPendingReplayEntry[] = (snapshot.events || [])
+      .flatMap((entry, order): BufferedPendingReplayEntry[] => {
+        if (!entry || typeof entry.semanticKind !== 'string') return []
+        return [{
+          kind: 'stream',
+          event: entry.semanticKind,
+          payload: { ...(entry.payload || {}) },
+          order,
+        }]
+      })
+      .sort(comparePendingReplayEntries)
+    const restoredStartedAt = replayEntries.reduce<number | undefined>((earliest, entry) => {
+      if (entry.kind !== 'stream') return earliest
+      const startedAt = explicitActivityStartedAt(entry.payload)
+      if (startedAt === undefined) return earliest
+      return earliest === undefined ? startedAt : Math.min(earliest, startedAt)
+    }, undefined)
+    // Open/reset the live reducer before accepting the first authoritative
+    // snapshot frame. startStreaming() clears the prior turn log, including
+    // its accepted activity-order context; doing that from the first event
+    // handler would therefore erase that frame's stream_seq and force the
+    // entire restored turn onto the legacy reordered renderer.
+    if (replayEntries.length > 0 && !stream.isStreaming.value) {
+      stream.startStreaming(restoredStartedAt, false)
+    }
+    for (const entry of replayEntries) {
+      if (entry.kind !== 'stream') continue
+      // Snapshot events retain their original sequence for diagnostics, but
+      // they form an authoritative base rather than fresh deltas. Replaying
+      // them through the normal render handlers without the old sequence
+      // rebuilds the bubble even when this client already had a newer cursor.
+      replayPendingStreamEvent({
+        event: entry.event,
+        payload: { ...entry.payload },
+        replayWithoutSeq: true,
+        replayed: true,
+      })
+    }
+    if (snapshot.streamGeneration && options.streamGeneration) options.streamGeneration.value = snapshot.streamGeneration
+    if (typeof snapshot.currentStreamSeq === 'number') lastStreamSeq.value = snapshot.currentStreamSeq
+  }
+
+  function replayPendingTerminalEvent(entry: BufferedTerminalEvent) {
+    const payload = entry.replayWithoutSeq
+      ? withoutBufferedStreamSeq(entry.payload)
+      : entry.payload
+    if (entry.kind === 'session-change') {
+      handleRpcSessionsChanged(payload)
+    } else {
+      handleSemanticEvent(entry.event, payload)
     }
   }
 
@@ -315,53 +970,94 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       return
     }
     activeStreamTaskId.value = taskId
-    for (const entry of bufferedStream) replayPendingStreamEvent(entry)
-    if (!bufferedTerminal) return
-    if (bufferedTerminal.kind === 'session-change') {
-      handleRpcSessionsChanged(bufferedTerminal.payload)
-    } else {
-      handleRpcAny(bufferedTerminal.event, bufferedTerminal.payload)
+    if (pendingSuccessorRenderTaskId === taskId) pendingSuccessorRenderTaskId = ''
+
+    const replayEntries: BufferedPendingReplayEntry[] = bufferedStream.map(
+      (entry, order) => ({ kind: 'stream', ...entry, order }),
+    )
+    if (bufferedTerminal) {
+      replayEntries.push({
+        kind: 'terminal',
+        terminal: bufferedTerminal,
+        payload: bufferedTerminal.payload,
+        order: bufferedStream.length,
+      })
+    }
+    replayEntries.sort(comparePendingReplayEntries)
+
+    const terminalSequence = bufferedTerminal
+      ? bufferedStreamSeq(bufferedTerminal.payload)
+      : null
+    let taskTerminalReplayed = false
+    for (const entry of replayEntries) {
+      if (entry.kind === 'terminal') {
+        replayPendingTerminalEvent(entry.terminal)
+        taskTerminalReplayed = true
+        continue
+      }
+
+      const sequence = bufferedStreamSeq(entry.payload)
+      const sharesTerminalSequence = terminalSequence !== null && sequence === terminalSequence
+      const maintenanceAfterTerminal = taskTerminalReplayed
+        && entry.event === 'compaction-progress'
+      // Let the terminal own a shared cursor. A tracked compaction terminal may
+      // still close its existing UI after task completion, but it must not move
+      // the task cursor past the terminal that closed the stream.
+      const replayWithoutSeq = Boolean(
+        entry.replayWithoutSeq || sharesTerminalSequence || maintenanceAfterTerminal,
+      )
+      replayPendingStreamEvent({
+        event: entry.event,
+        payload: entry.payload,
+        replayed: entry.replayed,
+        ...(replayWithoutSeq ? { replayWithoutSeq: true } : {}),
+      })
     }
   }
 
-  // 1s ticker so the live "Thinking · Ns" label advances on a clock while
-  // reasoning is open, not only when a new reasoning delta happens to arrive.
-  const elapsedTick = ref(0)
-  let elapsedTimer: ReturnType<typeof setInterval> | null = null
-  watch(
-    () => stream.isStreaming.value && !!streamThinking.value,
-    (active) => {
-      if (active && !elapsedTimer) {
-        elapsedTimer = setInterval(() => { elapsedTick.value++ }, 1000)
-      } else if (!active && elapsedTimer) {
-        clearInterval(elapsedTimer)
-        elapsedTimer = null
-      }
-    },
-  )
-  onScopeDispose(() => { if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null } })
+  function successorTaskId(predecessorTaskId: string): string {
+    const runningTaskId = options.taskOwnership?.runningTaskId.value || ''
+    return runningTaskId && runningTaskId !== predecessorTaskId
+      ? runningTaskId
+      : ''
+  }
 
-  const streamThinkingText = computed(() => streamThinking.value?.text || '')
-  // Recomputed per delta AND on the 1s tick so the label keeps pace between
-  // deltas; the final "Thought for Ns" uses the measured wall clock at done.
-  const streamThinkingElapsedText = computed(() => {
-    elapsedTick.value
-    const current = streamThinking.value
-    if (!current) return ''
-    const seconds = Math.max(0, Math.floor((Date.now() - current.startedAt) / 1000))
-    return `${seconds}s`
-  })
+  function bindSuccessorAfterTerminal(predecessorTaskId: string): boolean {
+    const successor = successorTaskId(predecessorTaskId)
+    if (!successor) return false
+    aborted.value = false
+    // Start the successor bubble before replaying its early frames. The
+    // successor may already have emitted its terminal while A's terminal was
+    // delayed; starting after replay would reopen B after that terminal and
+    // incorrectly restore B as authoritative running work.
+    if (!stream.isStreaming.value) stream.startStreaming()
+    bindActiveStreamTask(successor)
+    return true
+  }
 
-  function appendThinkingDelta(text: string) {
+  function appendThinkingDelta(text: string, payload: ConversationEventData) {
     if (!text) return
     if (!stream.isStreaming.value) stream.startStreaming()
+    stream.noteReasoningPresentationDelta?.(text)
     const current = streamThinking.value
-    streamThinking.value = current
-      ? { text: current.text + text, startedAt: current.startedAt }
-      : { text, startedAt: Date.now() }
-    // The fold concats the same text into its thinkingText. Gating already
-    // passed upstream (handleRpcAny), so this frame mirrors an accepted delta.
-    if (stream.useReducer.value) stream.appendFrame({ kind: 'thinking', text, at: Date.now() })
+    if (!current) {
+      const now = Date.now()
+      const serverStartedAt = trustedReasoningStartedAt(payload.started_at, now)
+      streamThinking.value = {
+        startedAt: serverStartedAt ?? now,
+        serverStartedAt,
+      }
+    }
+    const blockId = payload.block_id
+    const rawBlockIndex = payload.block_index
+    const blockIndex = typeof rawBlockIndex === 'number' ? rawBlockIndex : undefined
+    stream.appendFrame({
+      kind: 'thinking',
+      text,
+      at: trustedReasoningStartedAt(payload.started_at, Date.now()) ?? Date.now(),
+      ...(blockId ? { blockId } : {}),
+      ...(blockIndex !== undefined ? { blockIndex } : {}),
+    })
     // Reasoning growth must re-pin the thread to the bottom just like answer
     // text and tool deltas. Schedule the same batched render/scroll flush so a
     // long thinking phase keeps following the live turn instead of only
@@ -373,6 +1069,43 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     streamThinking.value = null
   }
 
+  function handleThinkingStart(payload: ConversationEventData) {
+    if (!stream.isStreaming.value) stream.startStreaming()
+    const blockId = payload.block_id ?? ''
+    if (!blockId) return
+    const rawBlockIndex = payload.block_index
+    const rawContentKind = payload.content_kind
+    stream.appendFrame({
+      kind: 'thinking-start',
+      blockId,
+      blockIndex: typeof rawBlockIndex === 'number' ? rawBlockIndex : 0,
+      at: trustedReasoningStartedAt(payload.started_at, Date.now()) ?? Date.now(),
+      contentKind: rawContentKind === 'summary' ? 'summary' : 'reasoning',
+    })
+    stream.scheduleRender()
+  }
+
+  function handleThinkingEnd(payload: ConversationEventData) {
+    const blockId = payload.block_id ?? ''
+    if (!blockId) return
+    const rawBlockIndex = payload.block_index
+    const rawStatus = payload.status
+    const status = rawStatus === 'interrupted' || rawStatus === 'error'
+      ? rawStatus
+      : 'completed'
+    const rawEndedAt = payload.ended_at
+    stream.appendFrame({
+      kind: 'thinking-end',
+      blockId,
+      blockIndex: typeof rawBlockIndex === 'number' ? rawBlockIndex : 0,
+      status,
+      at: typeof rawEndedAt === 'number' && Number.isFinite(rawEndedAt)
+        ? rawEndedAt
+        : Date.now(),
+    })
+    stream.scheduleRender()
+  }
+
   // Walk recorded turn reasonings (newest first) and re-bind each to the
   // newest unclaimed assistant message it identifies: a row that already
   // carries this record's reasoning text gets its measured duration
@@ -382,111 +1115,294 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   // showing one turn's reasoning under another turn's answer. Idempotent:
   // safe to run after every history replacement.
   function attachTurnReasoning() {
-    if (turnReasoningLog.length === 0) return
     const list = messages.value
+    if (turnReasoningLog.length > 0) {
+      const claimed = new Set<ChatMessage>()
+      for (let r = turnReasoningLog.length - 1; r >= 0; r--) {
+        const record = turnReasoningLog[r]
+        if (record.sessionKey !== sessionKey.value) continue
+        for (let i = list.length - 1; i >= 0; i--) {
+          const msg = list[i]
+          if (msg.role !== 'assistant' || claimed.has(msg)) continue
+          const carriesRecordReasoning = msg.reasoning?.text === record.text
+          const matchesAnswerText =
+            !msg.reasoning && record.messageText !== '' && msg.text.trim() === record.messageText
+          if (!carriesRecordReasoning && !matchesAnswerText) continue
+          claimed.add(msg)
+          msg.reasoning = { text: record.text, seconds: record.seconds }
+          if (record.blocks.length) {
+            msg.reasoningBlocks = record.blocks.map(block => ({ ...block }))
+          }
+          break
+        }
+      }
+    }
+    attachTurnActivity()
+  }
+
+  // Canonical chat history may not yet persist client activity markers. Keep
+  // the just-finished turn's safe structured phases attached across the
+  // immediate history replacement so its completed disclosure remains a full
+  // process record instead of collapsing back to reasoning-only.
+  function attachTurnActivity() {
+    if (turnActivityLog.length === 0) return
     const claimed = new Set<ChatMessage>()
-    for (let r = turnReasoningLog.length - 1; r >= 0; r--) {
-      const record = turnReasoningLog[r]
+    for (let r = turnActivityLog.length - 1; r >= 0; r--) {
+      const record = turnActivityLog[r]
       if (record.sessionKey !== sessionKey.value) continue
-      for (let i = list.length - 1; i >= 0; i--) {
-        const msg = list[i]
+      for (let i = messages.value.length - 1; i >= 0; i--) {
+        const msg = messages.value[i]
         if (msg.role !== 'assistant' || claimed.has(msg)) continue
-        const carriesRecordReasoning = msg.reasoning?.text === record.text
-        const matchesAnswerText =
-          !msg.reasoning && record.messageText !== '' && msg.text.trim() === record.messageText
-        if (!carriesRecordReasoning && !matchesAnswerText) continue
+        const matchesTurn = Boolean(record.turnId && msg.turnId === record.turnId)
+        const matchesAnswer = (!record.turnId || !msg.turnId)
+          && record.messageText !== ''
+          && msg.text.trim() === record.messageText
+        if (!matchesTurn && !matchesAnswer) continue
         claimed.add(msg)
-        msg.reasoning = { text: record.text, seconds: record.seconds }
+        // A complete terminal v2 snapshot is the canonical chronology. The
+        // local retention log only bridges projections without one; restoring
+        // it here can duplicate a live phase after the durable replacement.
+        if (msg.activitySnapshot?.complete && !msg.activitySnapshotIncomplete) break
+        const existing = msg.statusHistory ?? []
+        const localPhaseKeys = new Set(record.statusHistory.map(step =>
+          `${step.action}\u001f${step.at}\u001f${step.id || ''}`,
+        ))
+        msg.statusHistory = [
+          ...record.statusHistory.map(step => ({ ...step })),
+          ...existing.filter(step => !localPhaseKeys.has(
+            `${step.action}\u001f${step.at}\u001f${step.id || ''}`,
+          )),
+        ]
         break
       }
     }
   }
 
-  function recordTurnReasoning(text: string, seconds: number, messageText: string) {
-    turnReasoningLog.push({ sessionKey: sessionKey.value, text, seconds, messageText })
+  function recordTurnActivity(message: ChatMessage) {
+    if (!message.statusHistory?.length) return
+    turnActivityLog.push({
+      sessionKey: sessionKey.value,
+      turnId: message.turnId,
+      messageText: message.text.trim(),
+      statusHistory: message.statusHistory.map(step => ({ ...step })),
+    })
+    if (turnActivityLog.length > REASONING_LOG_LIMIT) {
+      turnActivityLog.splice(0, turnActivityLog.length - REASONING_LOG_LIMIT)
+    }
+    attachTurnActivity()
+  }
+
+  function recordTurnReasoning(
+    text: string,
+    seconds: number,
+    messageText: string,
+    blocks?: ReasoningBlock[],
+  ) {
+    turnReasoningLog.push({
+      sessionKey: sessionKey.value,
+      text,
+      seconds,
+      messageText,
+      blocks: (blocks ?? []).map(block => ({ ...block })),
+    })
     if (turnReasoningLog.length > REASONING_LOG_LIMIT) {
       turnReasoningLog.splice(0, turnReasoningLog.length - REASONING_LOG_LIMIT)
     }
     attachTurnReasoning()
   }
 
-  function doneUsagePayload(donePayload: ChatDoneUsagePayload): ChatUsagePayload | undefined {
-    const raw = (donePayload.usage || donePayload || {}) as Record<string, unknown>
-    if (!raw || typeof raw !== 'object') return undefined
-    const usage = { ...raw } as ChatUsagePayload
-    const direct = donePayload as Record<string, unknown>
-    if (direct.model_usage_breakdown != null && usage.model_usage_breakdown == null) {
-      usage.model_usage_breakdown = direct.model_usage_breakdown as never
-    }
-    if (direct.modelUsageBreakdown != null && usage.modelUsageBreakdown == null) {
-      usage.modelUsageBreakdown = direct.modelUsageBreakdown as never
-    }
-    if (direct.ensemble_trace != null && usage.ensemble_trace == null) {
-      usage.ensemble_trace = direct.ensemble_trace as never
-    }
-    if (direct.ensembleTrace != null && usage.ensembleTrace == null) {
-      usage.ensembleTrace = direct.ensembleTrace as never
-    }
-    return usage
-  }
 
   watch(sessionKey, () => {
+    recoveryRevision++
+    recoveryDirty = false
+    recoveryFenced = false
+    recoveryOverflow = false
+    recoveryEvents.length = 0
     streamThinking.value = null
+    clearGenerationTracking()
     turnReasoningLog.length = 0
+    turnActivityLog.length = 0
     pendingTerminalEvents.clear()
     pendingStreamEvents.clear()
     settledTaskIds.clear()
+    clearTurnCommitTracking()
+    pendingSuccessorRenderTaskId = ''
     // The newly shown session has its own (possibly running) task; forget the
     // previous session's active task so we stay lenient until it re-asserts.
     activeStreamTaskId.value = ''
   })
-  watch(activeStreamTaskId, (taskId) => {
+  watch(activeStreamTaskId, (taskId, previousTaskId) => {
     if (taskId === PENDING_STREAM_TASK_ID) {
+      clearGenerationTracking()
       pendingTerminalEvents.clear()
       pendingStreamEvents.clear()
       settledTaskIds.clear()
+      pendingSuccessorRenderTaskId = ''
     } else if (!taskId || taskId === FINISHED_STREAM_TASK_ID || taskId === STOPPED_STREAM_TASK_ID) {
       pendingTerminalEvents.clear()
       pendingStreamEvents.clear()
+    } else if (taskId !== previousTaskId) {
+      // A concrete task transition starts a fresh generation ledger. The
+      // PENDING branch above already clears it before normal chat.send replay;
+      // this also covers a task.running/snapshot adoption that skips PENDING.
+      clearGenerationTracking()
     }
   }, { flush: 'sync' })
 
-  function isStaleEpoch(payload: StreamEventEnvelope): boolean {
-    return payloadIsStaleEpoch(payload, currentEpoch.value)
+  onScopeDispose(clearTurnCommitTracking)
+
+  function isStaleEpoch(payload: ConversationEventIdentity): boolean {
+    return conversationRuntime.isStaleEpoch(
+      cursor(),
+      conversationCursorSignal(payload).sessionEpoch,
+    )
   }
 
-  function isCurrentSessionPayload(payload: StreamEventEnvelope): boolean {
+  function isCurrentSessionPayload(payload: ConversationEventIdentity): boolean {
     return payloadIsCurrentSession(payload, sessionKey.value)
   }
 
   // Drop late events tagged with a different task than the one rendering now,
   // so a stale turn's tool_use/error/done can't leak into the current turn
   // (issue #344). Lenient: untagged events and unknown active task pass.
-  function isCurrentTaskPayload(payload: StreamEventEnvelope): boolean {
+  // Content and completion share the accepted turn identity, including older
+  // producers that omit task_id. Scheduler queued/running adoption continues
+  // to require its own task payload through payloadTaskId.
+  function payloadTurnId(payload: ConversationEventIdentity): string {
+    return payloadTaskId(payload) || payload.turn_id || ''
+  }
+
+  function isCurrentTaskPayload(payload: ConversationEventIdentity): boolean {
     return payloadIsCurrentTask(payload, activeStreamTaskId.value)
   }
 
-  function acceptStreamSeq(payload: StreamEventEnvelope): boolean {
-    const decision = decideStreamSeq(payload, sessionKey.value, lastStreamSeq.value)
-    if (decision.accepted) lastStreamSeq.value = decision.nextStreamSeq
+  function acceptStreamSeq(payload: ConversationEventIdentity): boolean {
+    const signal = conversationCursorSignal(payload)
+    options.observeStreamGeneration?.(signal)
+    let current = cursor()
+    if (!options.observeStreamGeneration) {
+      const generation = conversationRuntime.observeGeneration(current, signal)
+      current = generation.cursor
+      if (generation.reset) stream.resetLiveTurnState?.()
+    }
+    const decision = conversationRuntime.acceptEvent(current, signal, {
+      observeGeneration: false,
+    })
+    // The subscription adapter may already have reset the live reducer. Keep
+    // the cursor mirror in sync without triggering a second reset.
+    syncCursor(decision.cursor)
+    if (decision.accepted) {
+      const rawOrder = payload.stream_seq
+      stream.setAcceptedActivityOrder?.(
+        typeof rawOrder === 'number' && Number.isSafeInteger(rawOrder) && rawOrder > 0
+          ? rawOrder
+          : replayActivityOrder,
+      )
+      stream.setAcceptedActivityStartedAt?.(activityStartedAt(payload))
+    }
     return decision.accepted
   }
 
-  function activeTaskGroupRunState(payload: SessionEventPayload = {}) {
+  function activityStartedAt(payload: ConversationEventIdentity): number {
+    return explicitActivityStartedAt(payload) ?? Date.now()
+  }
+
+  function explicitActivityStartedAt(payload: ConversationEventIdentity): number | undefined {
+    return payload.activityStartedAt
+  }
+
+  function recordActivityPhase(label: string, key = label) {
+    if (stream.recordActivityPhase) {
+      stream.recordActivityPhase(label, key)
+    } else {
+      stream.setStreamActivity(label, key)
+    }
+  }
+
+  function numericGenerationEpoch(raw: unknown): number | null {
+    return typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 ? raw : null
+  }
+
+  function payloadGenerationEpoch(payload: ConversationEventIdentity): number | null {
+    return numericGenerationEpoch(payload.generation_epoch)
+  }
+
+  function payloadAssistantMessageId(payload: ConversationEventIdentity): string {
+    const id = payload.assistant_message_id
+    return typeof id === 'string' ? id.trim() : ''
+  }
+
+  function clearGenerationTracking() {
+    currentGenerationEpoch = null
+    activeAssistantMessageId = ''
+    terminalGenerationClosed = false
+    stream.setAssistantMessageId?.('')
+  }
+
+  /**
+   * Generation and assistant-message identity are independent of the session
+   * epoch/stream cursor. Once a reset advances the generation, late provider
+   * frames from the old generation must not reach any live mutator. During the
+   * PENDING window we buffer frames first and infer their generation when they
+   * are replayed against the accepted task.
+   */
+  function isCurrentGenerationPayload(
+    payload: ConversationEventIdentity,
+    adoptIdentity = true,
+  ): boolean {
+    if (!isCurrentSessionPayload(payload)) return false
+    if (activeStreamTaskId.value === PENDING_STREAM_TASK_ID) return true
+
+    const assistantMessageId = payloadAssistantMessageId(payload)
+    if (
+      assistantMessageId
+      && activeAssistantMessageId
+      && assistantMessageId !== activeAssistantMessageId
+    ) return false
+    const generationEpoch = payloadGenerationEpoch(payload)
+    if (
+      generationEpoch !== null
+      && currentGenerationEpoch !== null
+      && generationEpoch !== currentGenerationEpoch
+    ) return false
+
+    // Validate the whole identity before adopting either half. A rejected
+    // frame must not poison the first valid event of the current turn.
+    if (adoptIdentity) {
+      if (assistantMessageId && !activeAssistantMessageId) {
+        activeAssistantMessageId = assistantMessageId
+        stream.setAssistantMessageId?.(assistantMessageId)
+      }
+      if (generationEpoch !== null && currentGenerationEpoch === null) {
+        currentGenerationEpoch = generationEpoch
+      }
+    }
+    return true
+  }
+
+  function activeTaskGroupRunState(payload: ConversationEventData = {}) {
     return buildActiveTaskGroupRunState(payload, activeTaskGroups.value.size)
   }
 
-  function noteTaskGroupActive(payload: SessionEventPayload) {
+  function noteTaskGroupActive(payload: ConversationEventData) {
     const gid = eventTaskGroupId(payload)
     if (gid) activeTaskGroups.value.add(gid)
     options.applySessionRunState(activeTaskGroupRunState(payload))
   }
 
-  function noteTaskGroupTerminal(payload: SessionEventPayload, terminalStatus: string) {
+  function noteTaskGroupTerminal(payload: ConversationEventData, terminalStatus: string) {
     const gid = eventTaskGroupId(payload)
     if (gid) activeTaskGroups.value.delete(gid)
     if (activeTaskGroups.value.size > 0) {
       options.applySessionRunState(activeTaskGroupRunState(payload))
+      return
+    }
+    const runningTaskId = options.taskOwnership?.runningTaskId.value || ''
+    if (runningTaskId) {
+      options.applySessionRunState({
+        run_status: 'running',
+        active_task: { task_id: runningTaskId, status: 'running' },
+      })
       return
     }
     options.applySessionRunState({
@@ -498,162 +1414,420 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
-  function sessionChangeIsTerminal(payload: SessionEventPayload): boolean {
+  function sessionChangeIsTerminal(payload: ConversationEventData): boolean {
     return payloadSessionChangeIsTerminal(payload, options.normalizeRunStatus)
+      || Boolean(terminalSessionChangeTask(payload))
   }
 
-  function isStoppedCancelledTerminalEvent(terminalStatus: string, payload: SessionEventPayload): boolean {
-    return (
-      activeStreamTaskId.value === STOPPED_STREAM_TASK_ID &&
-      isCurrentSessionPayload(payload) &&
-      terminalStatus === 'cancelled'
+  function terminalSessionChangeTask(
+    payload: ConversationEventData,
+  ): ChatRunStatusSource['last_task'] {
+    const lastTask = payload.last_task
+    if (lastTask) return lastTask
+    const changedTask = payload.changed_task
+    return changedTask && TASK_TERMINAL_STATUSES.has(String(changedTask.status || '').toLowerCase())
+      ? changedTask
+      : null
+  }
+
+  function isStoppedCancelledTerminalEvent(terminalStatus: string, payload: ConversationEventData): boolean {
+    const taskId = payloadTurnId(payload)
+    return Boolean(
+      isCurrentSessionPayload(payload)
+      && terminalStatus === 'cancelled'
+      && taskId
+      && options.taskOwnership?.stopRequestedTaskId.value === taskId,
     )
   }
 
-  function isStoppedTerminalSessionChange(payload: SessionEventPayload): boolean {
-    if (activeStreamTaskId.value !== STOPPED_STREAM_TASK_ID) return false
+  function isStoppedTerminalSessionChange(payload: ConversationEventData): boolean {
     if (!isCurrentSessionPayload(payload)) return false
     if (!sessionChangeIsTerminal(payload)) return false
-    const state = options.sessionRunStatus(payload)
-    return state.status === 'cancelled' || state.status === 'interrupted'
+    const terminalTask = terminalSessionChangeTask(payload)
+    const taskId = chatTaskId(terminalTask)
+    if (!taskId || options.taskOwnership?.stopRequestedTaskId.value !== taskId) return false
+    const terminalStatus = String(terminalTask?.status || '').toLowerCase()
+    return terminalStatus === 'cancelled' || terminalStatus === 'abandoned' || terminalStatus === 'interrupted'
   }
 
-  function syncTerminalSessionChange(payload: SessionEventPayload = {}) {
+  function syncTerminalSessionChange(payload: ConversationEventData = {}) {
     if (!isCurrentSessionPayload(payload)) return false
+    const terminalTask = terminalSessionChangeTask(payload)
+    const terminalTaskId = chatTaskId(terminalTask)
+    const hasAuthoritativeProjection = Boolean(
+      'run_status' in payload
+      || 'active_task' in payload
+      || 'last_task' in payload
+    )
+    const snapshotUnavailable = Boolean(terminalTaskId && !hasAuthoritativeProjection)
+    const terminalWasAlreadySettled = Boolean(
+      terminalTaskId && settledTaskIds.has(terminalTaskId),
+    )
+    const settled = terminalTaskId
+      ? options.taskOwnership?.noteTerminal(terminalTaskId)
+      : undefined
+    const activeTask = payload.active_task
+    const activeTaskId = chatTaskId(activeTask)
+    const renderTaskId = activeStreamTaskId.value
+    const runningTaskId = options.taskOwnership?.runningTaskId.value || ''
+    const terminalIsBackground = Boolean(
+      terminalTaskId
+      && terminalTaskId !== renderTaskId
+      && (
+        terminalWasAlreadySettled
+        || (settled?.wasQueued && !settled.wasRunning && !settled.wasStopTarget)
+        || (runningTaskId && runningTaskId !== terminalTaskId && runningTaskId === renderTaskId)
+        || (activeTaskId && activeTaskId !== terminalTaskId && activeTaskId === renderTaskId)
+      )
+    )
+    if (terminalIsBackground) {
+      markTaskSettled(payload)
+      // A snapshot-failure fallback may contain only changed_task. It is
+      // authoritative for B's terminal identity, but it must not project an
+      // implicit idle state over a still-running A.
+      if (activeTaskId) options.applySessionRunState(payload)
+      options.scheduleHistorySync()
+      return true
+    }
     activeTaskGroups.value.clear()
-    const state = options.sessionRunStatus(payload)
-    const interrupted = state.status === 'cancelled' || state.status === 'interrupted'
+    const terminalStatus = String(terminalTask?.status || '').toLowerCase()
+    const interrupted = ['cancelled', 'abandoned', 'interrupted'].includes(terminalStatus)
     if (stream.isStreaming.value) stream.endStreaming(interrupted ? { reason: 'aborted' } : undefined)
+    markTaskSettled(payload)
     options.applySessionRunState(payload)
-    materializeStoppedOutputNotice(state)
+    if (snapshotUnavailable) {
+      // changed_task-only is the Gateway's explicit snapshot-failure shape.
+      // It proves A ended but says nothing about queued/running continuation
+      // B. Fail closed until a fresh authoritative projection arrives instead
+      // of briefly declaring idle and draining C out of order.
+      options.taskOwnership?.beginHydration()
+      const subscription = options.subscribeSession?.()
+      const expectedKey = sessionKey.value
+      const expectedRevision = recoveryRevision
+      void Promise.resolve(subscription)
+        .then((subscribed) => {
+          if (expectedKey === sessionKey.value && expectedRevision === recoveryRevision && isAuthoritativeSessionSubscription(subscribed)) {
+            return options.onSessionSubscribed?.()
+          }
+        })
+        .catch(() => {})
+    }
     options.scheduleHistorySync()
-    if (interrupted) {
-      options.popAllPendingIntoComposer()
-    } else {
+    if (!options.taskOwnership?.hasAuthoritativeWork.value && !interrupted) {
       options.schedulePendingDrainAfterTerminal()
     }
-    activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+    if (!bindSuccessorAfterTerminal(terminalTaskId)) {
+      activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+    }
     return true
   }
 
-  function handleRpcTextDelta(payload: TextDeltaPayload) {
+  function handleRpcTextDelta(payload: ConversationTextContent) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('session.event.text_delta', payload)) return
+    if (bufferPendingStreamEvent('text-delta', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
-    options.markEnsembleHandoff()
-    stream.appendDelta(payload.text || '')
+    const taskId = payloadTaskId(payload) || activeStreamTaskId.value
+    if (taskId && options.taskOwnership?.stopRequestedTaskId.value === taskId) return
+    const modelCallId = String(payload.model_call_id || '').trim()
+    const iteration = Number(payload.iteration || 0)
+    options.bindRouterDecisionToModelCall?.(
+      modelCallId,
+      iteration,
+      String(payload.turn_id || payload.task_id || ''),
+    )
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
+    const identity: ChatStreamModelCallIdentity | undefined = modelCallId || iteration > 0
+      ? { modelCallId, iteration }
+      : undefined
+    const presentation = payload.presentation
+    if (presentation === 'intermediate' || presentation === 'answer') {
+      if (identity) stream.appendDelta(payload.text || '', presentation, identity)
+      else stream.appendDelta(payload.text || '', presentation)
+    } else if (identity) {
+      // Compatibility frames can omit presentation while still carrying the
+      // physical call identity needed for same-turn steer placement.
+      stream.appendDelta(payload.text || '', undefined, identity)
+    } else {
+      // Compatibility with older gateways that predate semantic text roles.
+      stream.appendDelta(payload.text || '')
+    }
   }
 
-  function handleRpcToolUseStart(payload: ToolUsePayload) {
+  function handleRpcToolUseStart(payload: ConversationToolContent) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.tool_use_start', payload)) return
+    if (bufferPendingStreamEvent('tool-use-started', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
-    options.markEnsembleHandoff()
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
     stream.appendToolCall(payload)
   }
 
-  function handleRpcToolUseDelta(payload: ToolDeltaPayload) {
+  function handleRpcToolUseDelta(payload: ConversationToolContent) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.tool_use_delta', payload)) return
+    if (bufferPendingStreamEvent('tool-use-delta', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
-    options.markEnsembleHandoff()
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
     stream.appendToolDelta(payload)
   }
 
-  function handleRpcToolResult(payload: ToolResultPayload) {
+  function handleRpcToolUseEnd(payload: ConversationToolContent) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.tool_result', payload)) return
+    if (bufferPendingStreamEvent('tool-use-ended', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
+    if (!acceptStreamSeq(payload)) return
+    stream.resetStreamIdleTimer()
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
+    stream.appendToolEnd?.(payload)
+  }
+
+  function handleRpcToolResult(payload: ConversationToolContent, replayed = false) {
+    if (isStaleEpoch(payload)) return
+    if (aborted.value) return
+    if (bufferPendingStreamEvent('tool-result', payload, replayed)) return
+    if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
     stream.appendToolResult(payload)
+    if (!replayed) options.onLiveToolResult?.(payload)
   }
 
   function handleRpcArtifact(payload: ArtifactPayload) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.artifact', payload)) return
+    if (bufferPendingStreamEvent('artifact-created', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
     stream.appendArtifact(payload)
   }
 
-  function handleRpcStateChange(payload: SessionEventPayload) {
+  function handleRpcStateChange(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (!payload || aborted.value) return
-    if (bufferPendingStreamEvent('session.event.state_change', payload)) return
+    if (bufferPendingStreamEvent('state-changed', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
-    const to = payload.to_state || payload.toState || ''
+    const to = payload.to_state || ''
     const activeState = ['thinking', 'streaming', 'tool_calling', 'tool_use', 'running'].includes(String(to))
     if (!stream.isStreaming.value && activeState) stream.startStreaming()
     if (!stream.isStreaming.value) return
-    if (activeState) options.markEnsembleHandoff()
+    if (activeState) options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
     if (to === 'thinking') {
       if (stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
-        stream.setStreamActivity('Planning next step')
+        recordActivityPhase('Planning next step')
       } else if (!stream.streamBubble.value) {
         stream.showThinkingIndicator()
       }
     } else if (to === 'streaming' && stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
-      stream.setStreamActivity('Model is generating')
+      recordActivityPhase('Model is generating')
     } else if ((to === 'tool_calling' || to === 'tool_use') && stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
-      stream.setStreamActivity('Preparing tool call')
+      recordActivityPhase('Preparing tool call')
     } else if (to && stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
       stream.setStreamActivity('Still running')
     }
   }
 
-  function handleRpcRunHeartbeat(payload: SessionEventPayload) {
+  function handleRpcRunHeartbeat(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.run_heartbeat', payload)) return
+    if (bufferPendingStreamEvent('run-heartbeat', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     if (!stream.isStreaming.value) stream.startStreaming()
-    stream.resetStreamIdleTimer()
-    if (stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
-      const phase = String(payload.phase || '')
-      if (phase.startsWith('ensemble_proposers')) {
-        stream.setStreamActivity('Generating candidates')
-      } else if (phase.startsWith('ensemble_aggregator')) {
-        stream.setStreamActivity('Synthesizing candidates')
-      } else {
-        stream.setStreamActivity('Planning next step')
-      }
-    } else if (!stream.streamBubble.value) {
+    // Transport heartbeat proves liveness only. It must neither replace the
+    // current structured provider phase nor postpone the 20s no-progress UI.
+    stream.resetStreamIdleTimer({ progress: false })
+    if (!stream.streamBubble.value) {
       stream.showThinkingIndicator()
     }
   }
 
-  function handleRpcCompaction(payload: CompactionPayload, meta: unknown) {
-    if (isStaleEpoch(payload)) return
-    if (!acceptStreamSeq(payload)) return
-    const safeMeta = (meta && typeof meta === 'object' ? meta : {}) as Record<string, unknown>
-    options.showCompactionToast(payload || {}, safeMeta)
+  function providerActivityCounter(raw: unknown, maximum: number): number {
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return 0
+    return Math.min(maximum, Math.max(0, Math.floor(value)))
   }
 
-  function handleRpcWarning(payload: WarningPayload) {
+  function handleRpcProviderActivity(payload: ConversationProviderActivity) {
+    if (isStaleEpoch(payload)) return
+    if (aborted.value) return
+    if (bufferPendingStreamEvent('provider-activity', payload)) return
+    if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
+    if (!acceptStreamSeq(payload)) return
+
+    const phase = String(payload.phase || '')
+    const reason = String(payload.reason || 'unknown')
+    if (!PROVIDER_ACTIVITY_PHASES.has(phase)) return
+    const safeReason = PROVIDER_ACTIVITY_REASONS.has(reason) ? reason : 'unknown'
+    const attempt = providerActivityCounter(payload.retry_attempt, 10_000)
+    const limit = providerActivityCounter(payload.retry_limit, 10_000)
+    const retryAfterMs = providerActivityCounter(payload.retry_after_ms, 900_000)
+    const retryAfterSeconds = Math.ceil(retryAfterMs / 1000)
+    const model = String(payload.model || '').trim()
+    const turnId = String(payload.turn_id || payload.task_id || '').trim() || undefined
+
+    if (!stream.isStreaming.value) stream.startStreaming()
+    stream.resetStreamIdleTimer()
+    options.markEnsembleHandoff(turnId)
+    if (model) options.updateRouterExecutionModel?.(model, turnId)
+
+    if (phase === 'requesting') {
+      recordActivityPhase('Waiting for model', 'provider:requesting')
+    } else if (phase === 'reasoning') {
+      recordActivityPhase('Thinking deeply', 'provider:reasoning')
+    } else if (phase === 'retry_wait' && safeReason === 'rate_limited') {
+      recordActivityPhase(
+        `Rate limited · ${retryAfterSeconds}s`,
+        `provider:rate_limited:${retryAfterSeconds}`,
+      )
+    } else if (phase === 'retry_wait') {
+      recordActivityPhase(
+        `Waiting to retry · ${retryAfterSeconds}s`,
+        `provider:retry_wait:${retryAfterSeconds}`,
+      )
+    } else if (phase === 'retrying') {
+      recordActivityPhase(
+        limit > 0 ? `Retrying ${attempt}/${limit}` : `Retrying · attempt ${attempt}`,
+        `provider:retrying:${attempt}:${limit}`,
+      )
+    } else if (phase === 'fallback') {
+      recordActivityPhase('Switching to backup model', 'provider:fallback')
+    }
+  }
+
+  function handleRpcCompaction(payload: ConversationCompactionContent, meta: ConversationEventContext = {}) {
+    if (isStaleEpoch(payload)) return
+    if (bufferPendingStreamEvent('compaction-progress', payload)) return
+    const trackedPlacement = trackedLateCompactionPlacement(payload)
+    const currentTaskPayload = isCurrentTaskPayload(payload)
+    if (!currentTaskPayload && !trackedPlacement) return
+    if (!isCurrentGenerationPayload(payload, currentTaskPayload)) return
+    if (!acceptStreamSeq(payload)) return
+    const source = String(payload.source || '').toLowerCase()
+    const status = compactionStatus(payload)
+    const userVisible = payload.user_visible ?? true
+    const taskId = payloadTaskId(payload)
+    const ownedByCurrentTask = Boolean(
+      taskId
+      && activeStreamTaskId.value
+      && taskId === activeStreamTaskId.value,
+    )
+    const canOwnActivity = source !== 'manual'
+      && userVisible !== false
+      && !['skipped', 'stale'].includes(status)
+    const prefersActivity = canOwnActivity
+      && (
+        stream.isStreaming.value
+        || meta.authoritativeLive === true
+        || ownedByCurrentTask
+      )
+    const settleCommittedActivity = trackedPlacement === 'activity'
+      && !stream.isStreaming.value
+    // An authoritative snapshot can contain compaction before any state/text
+    // frame. Open the live reducer first so a later startStreaming() cannot
+    // reset and discard the restored maintenance marker.
+    if (prefersActivity && !stream.isStreaming.value && !settleCommittedActivity) {
+      stream.startStreaming()
+    }
+
+    const requestedPlacement: ChatCompactionPlacement = trackedPlacement
+      || (prefersActivity ? 'activity' : 'standalone')
+    const presentation = options.showCompactionToast(payload || {}, {
+      ...meta,
+      placement: requestedPlacement,
+    })
+    if (presentation === false) return
+    const placement: ChatCompactionPlacement = presentation === 'activity'
+      || presentation === 'standalone'
+      ? presentation
+      : requestedPlacement
+    if (placement === 'activity') {
+      if (settleCommittedActivity) {
+        settleCommittedCompactionActivity(payload)
+      } else {
+        if (!stream.isStreaming.value && (meta.authoritativeLive === true || ownedByCurrentTask)) {
+          stream.startStreaming()
+        }
+        stream.recordCompactionActivity?.(payload)
+      }
+    }
+    const compactionId = payloadCompactionId(payload)
+    const durable = String(payload.durability || '').toLowerCase() === 'durable'
+    if (source === 'manual' && status === 'completed' && (durable || compactionId)) {
+      options.scheduleHistorySync()
+    }
+  }
+
+  function handleRpcWarning(payload: ConversationWarning) {
     if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
     // Silent compatibility warnings still own their stream sequence. Consuming
     // it before the display filter prevents a later replay from being accepted.
     if (!acceptStreamSeq(payload)) return
-    if (payload.code === 'provider_reasoning_only_retry') return
+    if (payload.warningVisible === false) return
     // Let the view provide the locale-specific fallback when older gateways
     // omit a warning message.
     options.showWarningToast(String(payload.message || ''))
+  }
+
+  function handleRpcInputDisposition(payload: ConversationInputDisposition) {
+    if (isStaleEpoch(payload)) return
+    if (!isCurrentSessionPayload(payload)) return
+    if (!acceptStreamSeq(payload)) return
+    // Primary sends also publish durable queued/applied disposition events.
+    // Those events describe ingress ownership, not same-turn Steer UX. Older
+    // gateways omitted intent for steer events, so only an explicit non-steer
+    // intent is ignored for compatibility.
+    if (payload.intent && payload.intent !== 'steer') return
+    const disposition = payload.disposition
+    if (!disposition) return
+    const clientRequestId = String(payload.client_request_id || '')
+    const clientMessageId = String(payload.client_message_id || '')
+    const userMessageId = String(payload.user_message_id || '')
+    const rawRevision = Number(payload.revision)
+    const incomingRevision = Number.isInteger(rawRevision) && rawRevision >= 0
+      ? rawRevision
+      : undefined
+    const promotedTurnId = String(payload.promoted_turn_id || '').trim()
+    const recovery = String(payload.recovery || '').trim().toLowerCase()
+    steerDelivery.disposition({
+      clientRequestId,
+      clientMessageId,
+      userMessageId,
+      disposition,
+      revision: incomingRevision,
+      turnId: String(payload.turn_id || payload.target_turn_id || payload.task_id || ''),
+      promotedTurnId,
+      promotedFromTurnId: String(
+        payload.promoted_from_turn_id
+        || payload.target_turn_id
+        || payload.turn_id
+        || '',
+      ),
+      appliedIteration: payload.applied_iteration,
+      modelCallId: String(payload.model_call_id || ''),
+    }, {
+      retryable: payload.retryable === true,
+      hint: recovery,
+    })
   }
 
   function messageAlreadyPresent(candidate: ChatMessage): boolean {
@@ -677,7 +1851,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     options.scheduleHistorySync()
   }
 
-  function handleRpcCronResult(payload: CronResultPayload) {
+  function handleRpcCronResult(payload: ConversationCronResult) {
     if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
@@ -689,50 +1863,61 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       role: typeof message.role === 'string' && message.role ? message.role : 'assistant',
       text,
       ts: message.timestamp ?? new Date().toISOString(),
-      messageId: String(message.messageId || message.message_id || '') || undefined,
+      messageId: message.messageId || undefined,
       provenanceKind: String(message.provenanceKind || 'cron'),
       provenanceSourceTool: String(message.provenanceSourceTool || ''),
       provenanceSourceSessionKey: String(message.provenanceSourceSessionKey || ''),
     })
   }
 
-  function handleRpcSubagentCompletion(payload: SubagentCompletionPayload) {
+  function handleRpcSubagentCompletion(payload: ConversationSubagentCompletion) {
     if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     const durablePayload = { ...payload }
-    delete durablePayload.session_key
-    delete durablePayload.sessionKey
+    delete durablePayload.key
     delete durablePayload.stream_seq
     delete durablePayload.epoch
     // message_id correlates this push with the separately persisted transcript
     // row. It is transport metadata, not part of the subagent business payload
     // stored/rendered as JSON.
     delete durablePayload.message_id
-    delete durablePayload.messageId
     const sourceSessionKey = String(payload.child_session_key || '')
     appendDurableEventMessage({
       role: 'system',
       text: JSON.stringify(durablePayload),
       ts: new Date().toISOString(),
-      messageId: String(payload.message_id || payload.messageId || '') || undefined,
+      messageId: payload.message_id || undefined,
       provenanceKind: 'internal_system',
       provenanceSourceSessionKey: sourceSessionKey,
       provenanceSourceTool: 'subagent_completion',
     })
   }
 
-  function handleRpcEpochChanged(payload: SessionEventPayload) {
-    const ep = payload?.epoch
-    if (typeof ep === 'number' && Number.isFinite(ep) && ep > currentEpoch.value) {
+  function handleRpcEpochChanged(payload: ConversationEventData) {
+    const transition = conversationRuntime.advanceEpoch(
+      cursor(),
+      conversationCursorSignal(payload).sessionEpoch,
+    )
+    if (transition.changed) {
       activeTaskGroups.value.clear()
-      currentEpoch.value = ep
+      syncCursor(transition.cursor)
     }
   }
 
-  function handleRpcSessionsChanged(payload: SessionEventPayload) {
+  function handleRpcSessionsChanged(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
+    const changedTask = payload.changed_task
+    const changedTaskStatus = String(changedTask?.status || '').toLowerCase()
+    if (changedTaskStatus === 'queued') options.taskOwnership?.noteQueued(changedTask || '')
+    // changed_task describes which lifecycle row changed; it is deliberately
+    // non-authoritative when Gateway snapshot generation failed. Only the
+    // direct task.running event or an active_task/run_status projection may
+    // replace the known running owner.
+    // Terminal changed_task is consumed below together with the render
+    // terminal. Clearing it here would erase the exact Stop target before the
+    // cancellation disposition is classified.
     if (isStoppedTerminalSessionChange(payload)) {
       syncTerminalSessionChange(payload)
       return
@@ -741,79 +1926,145 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       sessionChangeIsTerminal(payload) &&
       bufferPendingTerminalEvent({ kind: 'session-change', payload })
     ) return
-    if (!isCurrentTaskPayload(payload)) return
+    const payloadTerminalTask = terminalSessionChangeTask(payload)
+    const payloadTerminalTaskId = chatTaskId(payloadTerminalTask)
+    const activeProjection = payload.active_task
+    const carriesSettledContinuation = Boolean(
+      sessionChangeIsTerminal(payload)
+      && payloadTerminalTaskId
+      && settledTaskIds.has(payloadTerminalTaskId)
+      && chatTaskId(activeProjection),
+    )
+    const terminalMatchesRenderOwner = Boolean(
+      sessionChangeIsTerminal(payload)
+      && payloadTerminalTaskId
+      && payloadTerminalTaskId === activeStreamTaskId.value,
+    )
+    if (
+      !terminalMatchesRenderOwner
+      && !carriesSettledContinuation
+      && !isCurrentTaskPayload(payload)
+    ) return
     if (sessionChangeIsTerminal(payload)) {
-      markTaskSettled(payload)
-      const state = options.sessionRunStatus(payload)
-      const interrupted = state.status === 'cancelled' || state.status === 'interrupted'
+      const terminalStatus = String(payloadTerminalTask?.status || '').toLowerCase()
+      const interrupted = ['cancelled', 'abandoned', 'interrupted'].includes(terminalStatus)
       if (activeTaskGroups.value.size > 0 && !interrupted) {
         if (stream.isStreaming.value) stream.endStreaming()
         options.applySessionRunState(activeTaskGroupRunState(payload))
         options.scheduleHistorySync()
+        const terminalTaskId = chatTaskId(terminalSessionChangeTask(payload))
+        if (terminalTaskId) options.taskOwnership?.noteTerminal(terminalTaskId)
+        if (bindSuccessorAfterTerminal(terminalTaskId)) return
+        activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
         return
       }
       syncTerminalSessionChange(payload)
       return
     }
+    const carriesRunState = (
+      'run_status' in payload
+      || 'active_task' in payload
+      || 'last_task' in payload
+    )
+    // Recents-only changes (for example an asynchronously generated title)
+    // share the sessions.changed event name but carry no task state. They must
+    // not collapse a live task snapshot or discard its steer capability.
+    if (!carriesRunState) return
     options.applySessionRunState(payload)
   }
 
-  function handleRpcTaskQueued(payload: SessionEventPayload) {
+  function handleRpcTaskQueued(payload: ConversationEventData) {
+    // Task lifecycle pushes can arrive after a reconnect has advanced the
+    // session epoch.  They must be rejected before touching the ownership
+    // reducer, otherwise an old queued task can make an authoritative idle or
+    // running session look busy again.
+    if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
+    const taskId = payloadTaskId(payload)
+    if (!taskId) return
+    const queued = options.taskOwnership?.noteQueued({ ...(payload || {}), status: 'queued' })
     // queued can describe another same-session task. Keep the fresh send on
     // PENDING until its chat.send response supplies the accepted task id.
+    if (options.taskOwnership?.runningTaskId.value) return
+    if (activeStreamTaskId.value === PENDING_STREAM_TASK_ID && !queued?.foreground) return
     options.applySessionRunState({ run_status: 'queued', active_task: { ...(payload || {}), status: 'queued' } })
   }
 
-  function handleRpcTaskRunning(payload: SessionEventPayload) {
+  function handleRpcTaskRunning(payload: ConversationEventData) {
+    // Keep lifecycle ownership on the same epoch boundary as stream frames.
+    // In particular, a late task.running from the previous subscription must
+    // not take Stop/render ownership away from the current task.
+    if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
     // task.running is the authoritative "this task now owns the live stream"
     // signal once no chat.send response is pending. While PENDING, another
     // same-session task may start first; only the response can identify which
     // task belongs to this optimistic stream.
     const taskId = payloadTaskId(payload)
-    if (taskId && activeStreamTaskId.value !== PENDING_STREAM_TASK_ID) {
-      activeStreamTaskId.value = taskId
+    if (!taskId) return
+    options.taskOwnership?.noteRunning({ ...(payload || {}), status: 'running' })
+    aborted.value = false
+    const currentRenderTaskId = activeStreamTaskId.value
+    if (
+      currentRenderTaskId !== PENDING_STREAM_TASK_ID
+      && (
+        !stream.isStreaming.value
+        || !currentRenderTaskId
+        || currentRenderTaskId === FINISHED_STREAM_TASK_ID
+        || currentRenderTaskId === STOPPED_STREAM_TASK_ID
+        || currentRenderTaskId === taskId
+      )
+    ) {
+      bindActiveStreamTask(taskId)
+    } else if (currentRenderTaskId !== taskId && currentRenderTaskId !== PENDING_STREAM_TASK_ID) {
+      pendingSuccessorRenderTaskId = taskId
     }
     options.applySessionRunState({ run_status: 'running', active_task: { ...(payload || {}), status: 'running' } })
+    if (stream.isStreaming.value && !stream.streamHasVisibleOutput.value) {
+      stream.setStreamActivity('Running')
+    }
   }
 
-  function handleRpcTaskGroupWaiting(payload: SessionEventPayload) {
+  function handleRpcTaskGroupWaiting(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (!acceptStreamSeq(payload)) return
     noteTaskGroupActive(payload)
   }
 
-  function handleRpcTaskGroupSynthesizing(payload: SessionEventPayload) {
+  function handleRpcTaskGroupSynthesizing(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (!acceptStreamSeq(payload)) return
     noteTaskGroupActive(payload)
   }
 
-  function handleRpcTaskGroupDone(payload: SessionEventPayload) {
+  function handleRpcTaskGroupDone(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (!acceptStreamSeq(payload)) return
     noteTaskGroupTerminal(payload, 'succeeded')
   }
 
-  function handleRpcTaskGroupFailed(payload: SessionEventPayload) {
+  function handleRpcTaskGroupFailed(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (!acceptStreamSeq(payload)) return
     noteTaskGroupTerminal(payload, 'failed')
   }
 
-  function handleRpcRouterDecision(payload: RouterDecisionPayload) {
+  function handleRpcRouterDecision(payload: ConversationRoutingDecision) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('session.event.router_decision', payload)) return
+    if (bufferPendingStreamEvent('router-decision', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
-    options.queueRouterDecision(payload)
+    if (!stream.isStreaming.value) stream.startStreaming()
+    recordActivityPhase('Selecting model', 'router:decided')
+    options.queueRouterDecision(payload, replayActivityOrder)
   }
 
-  function handleRpcEnsembleProgress(payload: EnsembleProgressPayload) {
+  function handleRpcEnsembleProgress(payload: ConversationEnsembleProgress) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('session.event.ensemble_progress', payload)) return
+    if (bufferPendingStreamEvent('ensemble-progress', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     if (!stream.isStreaming.value) stream.startStreaming()
     // A lifecycle frame is a real gateway event. Keep the hard no-event timer
@@ -822,24 +2073,125 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     options.appendEnsembleProgress(payload)
   }
 
-  function handleRpcRouterControlReplay(payload: SessionEventPayload) {
+  function handleRpcRouterControlReplay(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('session.event.router_control_replay', payload)) return
+    if (bufferPendingStreamEvent('router-control-replay', payload)) return
     if (!isCurrentTaskPayload(payload)) return
+    if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
-    options.handleRouterControlReplay()
+    options.handleRouterControlReplay(payload, replayActivityOrder)
   }
 
-  function handleRpcAny(rawEvent: string, rawPayload: unknown) {
-    const payloadObj = (rawPayload && typeof rawPayload === 'object' ? rawPayload : {}) as SessionEventPayload
-    const taskSucceededFallback = rawEvent === 'task.succeeded'
-    const terminalStatus = eventTaskTerminalStatus(rawEvent)
-    const rawStatus = payloadObj.run_status || payloadObj.runStatus || payloadObj.status || ''
+  function handleSemanticEvent(
+    eventKind: ConversationSemanticEventKind,
+    rawPayload: ConversationEventData,
+  ) {
+    if (eventKind === 'unknown') return
+    const payloadObj = rawPayload
+    // The semantic ingress observes approvals and compact task lifecycle
+    // events in addition to ordinary stream frames. Reject an older
+    // subscription epoch before *any* of those branches can mutate run state
+    // or task ownership; per-event guards below remain as defence in depth for
+    // replayed/normalised payloads.
+    if (isStaleEpoch(payloadObj)) return
+    if (!isCurrentSessionPayload(payloadObj)) return
+    if (eventKind === 'turn-committed') {
+      handleRpcTurnCommitted(payloadObj)
+      return
+    }
+    if (eventKind === 'task-succeeded') {
+      const succeededTaskId = payloadTaskId(payloadObj)
+      if (
+        succeededTaskId
+        && (
+          awaitingCommitTaskIds.value.has(succeededTaskId)
+          || committedTaskIds.has(succeededTaskId)
+        )
+      ) {
+        if (!acceptStreamSeq(payloadObj)) return
+        if (
+          awaitingCommitTaskIds.value.has(succeededTaskId)
+          && rememberTrackedTask(taskSucceededSyncedIds, succeededTaskId)
+        ) {
+          options.scheduleHistorySync(true)
+        }
+        return
+      }
+    }
+    if (eventKind === 'answer-generation-reset') {
+      handleRpcAnswerGenerationReset(payloadObj)
+      return
+    }
+    if (
+      terminalGenerationClosed
+      && (eventKind === 'turn-failed' || eventKind === 'turn-completed')
+    ) return
+    // Queued/Stop terminals have separate ownership exceptions below. They
+    // must not teach the current renderer another turn's generation identity.
+    if (!isCurrentGenerationPayload(payloadObj, isCurrentTaskPayload(payloadObj))) return
+    const terminalStatus = eventTaskTerminalStatus(eventKind)
+    const noticeTurnId = payloadObj.terminalOutcome?.turnId || payloadTurnId(payloadObj)
+    if (
+      (eventKind === 'turn-failed' || eventKind === 'task-failed' || eventKind === 'task-timed-out' || eventKind === 'task-abandoned')
+      && noticeTurnId
+      // History may restore a notice before the live owner receives its
+      // terminal. That owner must still pass through normal stream settlement.
+      && !(isCurrentTaskPayload(payloadObj) && stream.isStreaming.value)
+      && messages.value.some(message => message.role === 'error'
+        && message.terminalNotice && message.turnId === noticeTurnId)
+    ) {
+      if (!acceptStreamSeq(payloadObj)) return
+      messages.value = dedupeTerminalErrorNotices([...messages.value, {
+        role: 'error', text: eventSessionErrorMessage(payloadObj),
+        errorCode: payloadObj.error_class ?? payloadObj.code,
+        turnId: noticeTurnId, turnOutcome: payloadObj.terminalOutcome,
+        terminalNotice: true, ts: new Date().toISOString(),
+      }])
+      const mergedOutcome = messages.value.find(message => message.role === 'error'
+        && message.terminalNotice && message.turnId === noticeTurnId)?.turnOutcome
+      if (mergedOutcome) {
+        messages.value = messages.value.map(message => message.role === 'assistant' && message.turnId === noticeTurnId
+          ? { ...message, turnOutcome: { ...message.turnOutcome, ...mergedOutcome } }
+          : message)
+      }
+      // A late receipt may enrich an old notice, never another active turn's
+      // run state. The finished tombstone may still receive its own lifecycle.
+      const latestTurnId = [...messages.value].reverse().find(message => message.turnId)?.turnId
+      const ownsRunState = isCurrentTaskPayload(payloadObj)
+        || (activeStreamTaskId.value === FINISHED_STREAM_TASK_ID
+          && latestTurnId === noticeTurnId
+          && !options.taskOwnership?.hasAuthoritativeWork.value)
+      if (terminalStatus && ownsRunState) {
+        options.applySessionRunState(activeTaskGroups.value.size > 0
+          ? activeTaskGroupRunState(payloadObj)
+          : { run_status: terminalStatus === 'abandoned' ? 'interrupted' : terminalStatus,
+              last_task: { ...payloadObj, status: terminalStatus } })
+      }
+      options.scheduleHistorySync()
+      return
+    }
+    const taskSucceededFallback = eventKind === 'task-succeeded'
+    const terminalEvent = isTerminalEvent(eventKind)
+    // Rich done/error receipts are terminal ownership evidence too, even
+    // though only compact task.* events encode a lifecycle status in the event
+    // name. Without this, a successor whose done frame was buffered behind A
+    // remains marked running after replay and blocks every future drain.
+    const terminalTaskId = terminalEvent ? payloadTurnId(payloadObj) : ''
+    if (
+      terminalStatus
+      && terminalStatus !== 'succeeded'
+      && terminalTaskId
+      && awaitingCommitTaskIds.value.has(terminalTaskId)
+    ) {
+      clearAwaitingTurnCommit(terminalTaskId)
+      taskSucceededSyncedIds.delete(terminalTaskId)
+    }
+    const rawStatus = payloadObj.run_status || payloadObj.status || ''
     const normalizedStatus = options.normalizeRunStatus(String(rawStatus))
     if (
       normalizedStatus === 'approval_pending' ||
-      (typeof rawEvent === 'string' && rawEvent.includes('approval') && isCurrentSessionPayload(payloadObj))
+      eventKind === 'approval-requested'
     ) {
       if (!isCurrentSessionPayload(payloadObj)) return
       options.applySessionRunState({
@@ -849,17 +2201,41 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       return
     }
     if (
-      isTerminalEvent(rawEvent) &&
-      bufferPendingTerminalEvent({ kind: 'event', event: rawEvent, payload: payloadObj })
+      terminalEvent &&
+      bufferPendingTerminalEvent({ kind: 'event', event: eventKind, payload: payloadObj })
     ) return
+    const terminalOwnership = terminalTaskId
+      ? options.taskOwnership?.noteTerminal(terminalTaskId)
+      : undefined
     if (
-      rawEvent === 'session.event.thinking' &&
-      bufferPendingStreamEvent(rawEvent, payloadObj)
+      terminalOwnership?.wasQueued
+      && !terminalOwnership.wasRunning
+      && !terminalOwnership.wasStopTarget
+      && terminalTaskId !== activeStreamTaskId.value
+    ) {
+      markTaskSettled(payloadObj)
+      options.scheduleHistorySync()
+      return
+    }
+    if (
+      (
+        eventKind === 'thinking-started'
+        || eventKind === 'thinking-delta'
+        || eventKind === 'thinking-ended'
+      ) &&
+      bufferPendingStreamEvent(eventKind, payloadObj)
     ) return
     // A stale task's terminal/done/error must not end the current turn's stream
     // or push its "Turn failed" into the live transcript (issue #344). Approvals
     // above stay ungated; everything below mutates the current turn.
-    if (!isStoppedCancelledTerminalEvent(terminalStatus, payloadObj) && !isCurrentTaskPayload(payloadObj)) return
+    const terminalMatchesStop = terminalOwnership?.wasStopTarget === true
+      || isStoppedCancelledTerminalEvent(terminalStatus, payloadObj)
+    const terminalMatchesRenderOwner = Boolean(
+      terminalStatus
+      && terminalTaskId
+      && terminalTaskId === activeStreamTaskId.value,
+    )
+    if (!terminalMatchesStop && !terminalMatchesRenderOwner && !isCurrentTaskPayload(payloadObj)) return
     if (terminalStatus) {
       if (!isCurrentSessionPayload(payloadObj)) return
       const terminalRunStatus = terminalStatus === 'succeeded' ? 'idle' : terminalStatus === 'abandoned' ? 'interrupted' : terminalStatus
@@ -868,42 +2244,66 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       } else {
         const terminalRunState = { run_status: terminalRunStatus, last_task: { ...(payloadObj || {}), status: terminalStatus } }
         options.applySessionRunState(terminalRunState)
-        if (!stream.isStreaming.value) {
-          materializeStoppedOutputNotice(options.sessionRunStatus(terminalRunState))
-        }
       }
     }
 
-    const normalized = normalizeTaskTerminalEvent(rawEvent, payloadObj)
+    const normalized = normalizeTaskTerminalEvent(eventKind, payloadObj)
     if (normalized && isStaleEpoch(payloadObj)) return
-    if (normalized && !stream.isStreaming.value) {
+    if (normalized && !stream.isStreaming.value && normalized.kind !== 'turn-failed') {
       markTaskSettled(payloadObj)
       activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      options.scheduleHistorySync()
       return
     }
 
-    const event = normalized ? normalized.event : rawEvent
+    const event = normalized ? normalized.kind : eventKind
     const payload = normalized ? normalized.payload : payloadObj
 
-    if (typeof event !== 'string') return
-    if (event.startsWith('session.event.') && isStaleEpoch(payload)) return
+    if (isStaleEpoch(payload)) return
     if (!acceptStreamSeq(payload)) return
-    if (event.startsWith('session.event.task_group.')) return
-    if (event === 'sessions.changed') return
+    if (
+      event === 'task-group-waiting'
+      || event === 'task-group-synthesizing'
+      || event === 'task-group-completed'
+      || event === 'task-group-failed'
+    ) return
 
-    if (event === 'session.event.thinking') {
+    if (event === 'thinking-started') {
       if (aborted.value) return
-      const thinkingText = (payload as SessionEventPayload).text
-      if (typeof thinkingText !== 'string' || !thinkingText) return
       stream.resetStreamIdleTimer()
-      appendThinkingDelta(thinkingText)
+      handleThinkingStart(payload)
       return
     }
 
-    if (event.endsWith('.done') || event === 'chat.done') {
+    if (event === 'thinking-delta') {
+      if (aborted.value) return
+      const thinkingPayload = payload
+      const thinkingText = thinkingPayload.text
+      if (typeof thinkingText !== 'string' || !thinkingText) return
+      stream.resetStreamIdleTimer()
+      options.bindRouterDecisionToModelCall?.(
+        String(thinkingPayload.model_call_id || ''),
+        Number(thinkingPayload.iteration || 0),
+        String(thinkingPayload.turn_id || thinkingPayload.task_id || ''),
+      )
+      appendThinkingDelta(thinkingText, payload)
+      return
+    }
+
+    if (event === 'thinking-ended') {
+      if (aborted.value) return
+      stream.resetStreamIdleTimer()
+      handleThinkingEnd(payload)
+      return
+    }
+
+    if (event === 'turn-completed') {
       markTaskSettled(payload)
-      const donePayload = payload as ChatDoneUsagePayload
-      const u = donePayload.usage || donePayload || {}
+      const awaitingDurableCommit = !taskSucceededFallback && waitForTurnCommit(payload)
+      const donePayload = payload
+      const u = donePayload.usage ?? {}
+      const doneSuppressed = payload?.reason !== 'aborted'
+        && donePayload.delivery === 'suppressed'
       if (u.input_tokens || u.output_tokens) {
         usageAccum.value.input += u.input_tokens || 0
         usageAccum.value.output += u.output_tokens || 0
@@ -914,7 +2314,16 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       if (u.model) usageModel.value = u.model
       options.saveWidgetState()
 
-      stream.reconcileFinalText(doneTextSnapshot(donePayload, u))
+      const rawModelCallSegments = donePayload.model_call_segments
+      const terminalText = doneSuppressed ? '' : donePayload.finalText ?? null
+      if (Array.isArray(rawModelCallSegments)) {
+        stream.reconcileFinalText(
+          terminalText,
+          rawModelCallSegments,
+        )
+      } else {
+        stream.reconcileFinalText(terminalText)
+      }
 
       if (payload?.reason === 'aborted') {
         options.clearPendingRouterDecision()
@@ -923,18 +2332,37 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       }
       // Done backfills the turn's reasoning: prefer the authoritative
       // reasoning_content, fall back to accumulated live thinking deltas.
-      const rawReasoningContent = (payload as SessionEventPayload).reasoning_content
+      const rawReasoningContent = payload.reasoning_content
       const doneReasoning = typeof rawReasoningContent === 'string'
         ? rawReasoningContent.trim()
         : ''
       const liveThinking = streamThinking.value
-      const reasoningText = doneReasoning || liveThinking?.text.trim() || ''
-      const reasoningSeconds = liveThinking
-        ? Math.max(0, Math.floor((Date.now() - liveThinking.startedAt) / 1000))
-        : 0
+      const foldedReasoning = stream.getThinkingText?.().trim() || ''
+      const reasoningText = doneReasoning || foldedReasoning
+      const reasoningSeconds = (() => {
+        if (!liveThinking) return 0
+        const now = Date.now()
+        const serverStartedAt = liveThinking.serverStartedAt
+        let elapsedMs = now - liveThinking.startedAt
+        if (serverStartedAt != null) {
+          const serverDoneAt = trustedReasoningDoneAt(
+            payload.emitted_at,
+            serverStartedAt,
+            now,
+          )
+          if (serverDoneAt != null) elapsedMs = serverDoneAt - serverStartedAt
+        }
+        return Math.max(0, Math.floor(elapsedMs / 1000))
+      })()
       clearLiveThinking()
       const messageCountBeforeEnd = messages.value.length
-      stream.endStreaming()
+      stream.endStreaming(
+        payload?.reason === 'aborted'
+          ? { reason: 'aborted' }
+          : doneSuppressed
+            ? { suppressed: true }
+            : undefined,
+      )
       // endStreaming pushes the assistant message only when the turn kept
       // visible output; sentinel/empty bubbles must not record reasoning.
       // Bind reasoning to that exact bubble, then keep a record so the
@@ -943,97 +2371,306 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       const completedAssistant = completedMessage?.role === 'assistant'
         ? completedMessage
         : null
+      if (completedAssistant) {
+        completedAssistant.turnId = donePayload.completedTurnId ?? completedAssistant.turnId
+        recordTurnActivity(completedAssistant)
+      }
       if (completedAssistant && payload?.reason !== 'aborted') {
+        completedAssistant.turnInputMode = donePayload.input_mode
+        completedAssistant.turnRunKind = donePayload.run_kind
         // task.succeeded is a lifecycle-only fallback when the richer done
         // receipt went missing; do not mislabel its task metadata as usage.
-        if (!taskSucceededFallback) completedAssistant.usage = doneUsagePayload(donePayload)
+        if (!taskSucceededFallback) completedAssistant.usage = donePayload.usage
         if (u.model) completedAssistant.model = u.model
         if (u.input_tokens) completedAssistant.input_tokens = u.input_tokens
         if (u.output_tokens) completedAssistant.output_tokens = u.output_tokens
       }
       if (reasoningText && payload?.reason !== 'aborted' && completedAssistant) {
         completedAssistant.reasoning = { text: reasoningText, seconds: reasoningSeconds }
-        recordTurnReasoning(reasoningText, reasoningSeconds, completedAssistant.text.trim())
+        recordTurnReasoning(
+          reasoningText,
+          reasoningSeconds,
+          completedAssistant.text.trim(),
+          completedAssistant.reasoningBlocks,
+        )
       }
-      options.scheduleHistorySync()
+      if (taskSucceededFallback || !awaitingDurableCommit) {
+        options.scheduleHistorySync()
+      }
 
       if (payload?.reason === 'aborted') {
-        options.popAllPendingIntoComposer()
         const cancelledRunState = { run_status: 'cancelled', last_task: { ...(payload || {}), status: 'cancelled' } }
         options.applySessionRunState(cancelledRunState)
-        materializeStoppedOutputNotice(options.sessionRunStatus(cancelledRunState))
       } else if (activeTaskGroups.value.size > 0) {
         options.applySessionRunState(activeTaskGroupRunState({ reason: 'task_group_active' }))
       } else {
         options.applySessionRunState({ run_status: 'idle', last_task: { status: 'succeeded' } })
       }
 
-      if (pendingQueue.value.length > 0 && payload?.reason !== 'aborted') {
+      const terminalTaskId = payloadTurnId(payload)
+      if (
+        pendingQueue.value.length > 0
+        && payload?.reason !== 'aborted'
+        && !options.taskOwnership?.hasAuthoritativeWork.value
+      ) {
         options.schedulePendingDrainAfterTerminal()
       }
-      activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
-    } else if (event.endsWith('.error')) {
+      if (!bindSuccessorAfterTerminal(terminalTaskId)) {
+        activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      }
+    } else if (event === 'turn-failed') {
       markTaskSettled(payload)
       options.clearPendingRouterDecision()
       clearLiveThinking()
+      const turnOutcome = rawPayload.terminalOutcome
+      const terminalTurnId = turnOutcome?.turnId || payloadTurnId(payload)
+      if (turnOutcome?.statusHistory?.length) {
+        stream.restoreStatusHistory?.(turnOutcome.statusHistory)
+      }
+      const messageCountBeforeEnd = messages.value.length
       stream.endStreaming()
-      const rawErrorCode = (payload as { code?: unknown })?.code
-      const errorCode = typeof rawErrorCode === 'string' ? rawErrorCode : undefined
+      const completedMessage = messages.value[messageCountBeforeEnd]
+      if (completedMessage?.role === 'assistant') {
+        completedMessage.turnId = terminalTurnId || completedMessage.turnId
+        completedMessage.turnOutcome = turnOutcome
+      }
+      const errorCode = payload.error_class ?? payload.code
       const serverMessage = eventSessionErrorMessage(payload)
       messages.value.push({
         role: 'error',
-        text: localizedChatErrorMessage(errorCode, serverMessage),
+        text: localizedChatErrorMessage(
+          errorCode,
+          serverMessage,
+          turnOutcome?.replaySafe === true,
+          turnOutcome?.failureKind,
+          turnOutcome?.status,
+        ),
         errorCode,
+        modelCapacity: rawPayload.modelCapacity,
+        turnId: terminalTurnId || undefined,
+        turnOutcome,
         terminalNotice: true,
         ts: new Date().toISOString(),
       })
+      messages.value = dedupeTerminalErrorNotices(messages.value)
+      const mergedOutcome = terminalTurnId
+        ? messages.value.find(message => message.role === 'error'
+          && message.terminalNotice && message.turnId === terminalTurnId)?.turnOutcome
+        : turnOutcome
+      if (completedMessage?.role === 'assistant') completedMessage.turnOutcome = mergedOutcome
       options.scheduleHistorySync()
       if (activeTaskGroups.value.size > 0) {
         options.applySessionRunState(activeTaskGroupRunState(payload))
       } else {
-        options.applySessionRunState({ run_status: 'failed', last_task: { ...(payload || {}), status: 'failed' } })
+        const status = mergedOutcome?.status || terminalStatus || 'failed'
+        options.applySessionRunState({ run_status: status === 'abandoned' ? 'interrupted' : status,
+          last_task: { ...(payload || {}), status } })
       }
-      activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      const terminalTaskId = payloadTurnId(payload)
+      if (
+        pendingQueue.value.length > 0
+        && activeTaskGroups.value.size === 0
+        && !options.taskOwnership?.hasAuthoritativeWork.value
+      ) {
+        options.schedulePendingDrainAfterTerminal()
+      }
+      if (!bindSuccessorAfterTerminal(terminalTaskId)) {
+        activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      }
     }
   }
 
-  function materializeStoppedOutputNotice(state: ChatRunStatus) {
-    const notice = stoppedOutputNoticeMessage(messages.value, state)
-    if (notice) messages.value.push(notice)
+  /**
+   * Consume the single semantic ingress emitted by the private v4 adapter.
+   * Named projections run before cross-cutting cursor/ownership handling, the
+   * same ordering used by the previous listener set, without exposing aliases.
+   */
+  function handleConversationEvent(message: ConversationEvent) {
+    if (message.kind === 'sessions-changed') {
+      handleRpcSessionsChanged(message.payload)
+      return
+    }
+
+    if (message.kind === 'invalid') return
+
+    if (message.kind === 'approval') {
+      handleSemanticEvent(
+        message.action === 'requested' ? 'approval-requested' : 'approval-resolved',
+        message.payload,
+      )
+      return
+    }
+
+    const event = message.event
+    if (event.kind === 'unknown') return
+    if (event.kind === 'known') {
+      switch (event.semanticKind) {
+        case 'answer-generation-reset':
+          handleRpcAnswerGenerationReset(event.payload)
+          break
+        case 'text-delta':
+          handleRpcTextDelta(event.payload)
+          break
+        case 'tool-use-started':
+          handleRpcToolUseStart(event.payload)
+          break
+        case 'tool-use-delta':
+          handleRpcToolUseDelta(event.payload)
+          break
+        case 'tool-use-ended':
+          handleRpcToolUseEnd(event.payload)
+          break
+        case 'tool-result':
+          handleRpcToolResult(event.payload, event.meta.replayed === true)
+          break
+        case 'artifact-created':
+          handleRpcArtifact(event.payload)
+          break
+        case 'state-changed':
+          handleRpcStateChange(event.payload)
+          break
+        case 'run-heartbeat':
+          handleRpcRunHeartbeat(event.payload)
+          break
+        case 'provider-activity':
+          handleRpcProviderActivity(event.payload)
+          break
+        case 'compaction-progress':
+          handleRpcCompaction(event.payload, event.meta)
+          break
+        case 'warning':
+          handleRpcWarning(event.payload)
+          break
+        case 'input-disposition':
+          handleRpcInputDisposition(event.payload)
+          break
+        case 'cron-result':
+          handleRpcCronResult(event.payload)
+          return
+        case 'subagent-completed':
+          handleRpcSubagentCompletion(event.payload)
+          break
+        case 'session-epoch-changed':
+          handleRpcEpochChanged(event.payload)
+          break
+        case 'task-queued':
+          handleRpcTaskQueued(event.payload)
+          break
+        case 'task-running':
+          handleRpcTaskRunning(event.payload)
+          break
+        case 'task-group-waiting':
+          handleRpcTaskGroupWaiting(event.payload)
+          break
+        case 'task-group-synthesizing':
+          handleRpcTaskGroupSynthesizing(event.payload)
+          break
+        case 'task-group-completed':
+          handleRpcTaskGroupDone(event.payload)
+          break
+        case 'task-group-failed':
+          handleRpcTaskGroupFailed(event.payload)
+          break
+        case 'router-decision':
+          handleRpcRouterDecision(event.payload)
+          break
+        case 'ensemble-progress':
+          handleRpcEnsembleProgress(event.payload)
+          break
+        case 'router-control-replay':
+          handleRpcRouterControlReplay(event.payload)
+          break
+        default:
+          // Thinking, terminal and future additive events are handled by the
+          // cross-cutting semantic reducer below.
+          break
+      }
+    }
+
+    handleSemanticEvent(event.semanticKind, event.payload)
   }
 
-  let connectionLostNoted = false
+  let connectionStateGeneration = 0
+
   function handleRpcConnectionState(state: string) {
-    if (state === 'connected' && sessionKey.value) {
-      connectionLostNoted = false
+    const stateGeneration = ++connectionStateGeneration
+    const recovery = options.handleSessionConnectionState?.(state)
+    if (recovery?.deferred) {
+      // Navigation owns only the logical subscription epoch. While its target
+      // is unresolved, physical state changes must not restart source-session
+      // bootstrap, metadata, usage, or run-mode RPCs on a replacement socket.
+      return
+    }
+    if (state === 'connected') {
       stream.hideThinkingIndicator()
-      options.subscribeSession()
-      options.loadCurrentSessionUsage()
-      options.loadHistory()
-      if (stream.isStreaming.value) stream.resetStreamIdleTimer()
+      const subscription = recovery?.live ?? options.subscribeSession?.()
+      const connectedKey = sessionKey.value
+      const connectedRevision = recoveryRevision
+      void Promise.resolve(subscription)
+        .then((subscribed) => {
+          if (connectedKey === sessionKey.value && connectedRevision === recoveryRevision
+            && connectionStateGeneration === stateGeneration && isAuthoritativeSessionSubscription(subscribed)) {
+            return options.onSessionSubscribed?.()
+          }
+        })
+        .catch((error: unknown) => {
+          console.warn(
+            'Session recovery after reconnect failed:',
+            error instanceof Error ? error.message : error,
+          )
+        })
+      if (sessionKey.value) {
+        const connectedSessionKey = sessionKey.value
+        // Preserve critical frame ordering after reconnect without waiting for a
+        // potentially slow history response before refreshing independent UI.
+        const criticalRequestsQueued = recovery?.criticalRequestsQueued
+          ?? Promise.resolve()
+        void criticalRequestsQueued.then(
+          () => {
+            if (
+              connectionStateGeneration === stateGeneration
+              && recoveryRevision === connectedRevision
+              && sessionKey.value === connectedSessionKey
+            ) {
+              options.loadCurrentSessionUsage()
+              void options.refreshRunModePreference?.()
+            }
+          },
+          () => {},
+        )
+      }
+      if (!recovery) {
+        options.loadCurrentSessionUsage()
+        options.loadHistory?.()
+      }
+      // Reconnect restores transport liveness, not model progress. Keep the
+      // 20-second provider-silence clock honest while re-arming the separate
+      // hard-idle watchdog.
+      if (stream.isStreaming.value) stream.resetStreamIdleTimer({ progress: false })
     }
     if (state === 'disconnected' && stream.isStreaming.value) {
-      // Surface the drop instead of silently freezing the work-card, and keep the
-      // idle watchdog ARMED (do not clear it) so a run whose events never resume
-      // still times out honestly instead of spinning forever on a dead socket.
+      // Preserve the current bubble; the composition root owns one delayed,
+      // non-blocking notice instead of injecting connection rows into history.
       stream.showThinkingIndicator()
-      if (!connectionLostNoted) {
-        connectionLostNoted = true
-        messages.value.push({ role: 'system', text: 'Connection lost — trying to reconnect…', ts: new Date().toISOString() })
-      }
     }
   }
 
-  const handlers: ChatRpcSubscriptionHandlers = {
+  // Direct semantic handlers remain a focused unit-test surface. Production
+  // ingress uses `onConversationEvent` below.
+  const handlers = {
+    onAnswerGenerationReset: handleRpcAnswerGenerationReset,
     onTextDelta: handleRpcTextDelta,
     onToolUseStart: handleRpcToolUseStart,
     onToolUseDelta: handleRpcToolUseDelta,
+    onToolUseEnd: handleRpcToolUseEnd,
     onToolResult: handleRpcToolResult,
     onArtifact: handleRpcArtifact,
     onStateChange: handleRpcStateChange,
     onRunHeartbeat: handleRpcRunHeartbeat,
+    onProviderActivity: handleRpcProviderActivity,
     onCompaction: handleRpcCompaction,
     onWarning: handleRpcWarning,
+    onInputDisposition: handleRpcInputDisposition,
     onCronResult: handleRpcCronResult,
     onSubagentCompletion: handleRpcSubagentCompletion,
     onEpochChanged: handleRpcEpochChanged,
@@ -1047,15 +2684,19 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     onRouterDecision: handleRpcRouterDecision,
     onEnsembleProgress: handleRpcEnsembleProgress,
     onRouterControlReplay: handleRpcRouterControlReplay,
-    onAny: handleRpcAny,
+    onSemanticEvent: handleSemanticEvent,
     onConnectionState: handleRpcConnectionState,
   }
 
   return {
     handlers,
+    onConversationEvent: handleConversationEvent,
+    consumeConversationEvent,
+    beginRecovery,
+    finishRecovery,
     bindActiveStreamTask,
-    streamThinkingText,
-    streamThinkingElapsedText,
+    restoreLiveTurnSnapshot,
     attachTurnReasoning,
+    awaitingCommitTaskIds,
   }
 }

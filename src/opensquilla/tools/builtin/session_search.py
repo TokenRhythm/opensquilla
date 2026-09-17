@@ -1,4 +1,4 @@
-"""Session search tool — FTS5-powered transcript full-text search.
+"""Session search tool — transcript search with Unicode substring support.
 
 Registered at boot time when a SessionStorage is available.
 """
@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from opensquilla.tools.registry import ToolRegistry, tool
-from opensquilla.tools.types import ToolError
+from opensquilla.tools.types import PlanAccess, ToolError
 
 if TYPE_CHECKING:
     from opensquilla.session.storage import SessionStorage
@@ -58,6 +58,7 @@ def create_session_search_tool(
         },
         required=["query"],
         owner_only=True,
+        plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def session_search(
@@ -74,7 +75,13 @@ def create_session_search_tool(
         limit = max(1, min(50, limit))
 
         try:
-            results = await active_storage.search_transcript(
+            # Match SessionDirectory's routing: the FTS sanitizer strips non-ASCII.
+            search = (
+                active_storage.search_transcript_like
+                if any(ord(ch) > 127 for ch in query)
+                else active_storage.search_transcript
+            )
+            results = await search(
                 query=query,
                 session_id=session_id,
                 limit=limit,

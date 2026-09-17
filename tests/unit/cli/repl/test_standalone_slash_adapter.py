@@ -16,7 +16,7 @@ class _StandaloneSlashHarness:
         self.create_calls: list[dict[str, str]] = []
         self.truncate_calls: list[tuple[str, int]] = []
         self.compact_calls: list[tuple[str, int, object | None]] = []
-        self.flush_calls: list[dict[str, object]] = []
+        self.checkpoint_calls: list[dict[str, object]] = []
         self.transcripts: dict[str, list[object]] = {}
 
     async def create_session(self, session_key: str, *, agent_id: str = "main") -> object:
@@ -39,26 +39,23 @@ class _StandaloneSlashHarness:
         self.compact_calls.append((session_key, context_window_tokens, config))
         return "summary"
 
-    async def flush_transcript(
+    async def checkpoint_transcript(
         self,
-        transcript: object,
         session_key: str,
+        transcript: object,
         **kwargs: object,
     ) -> object:
-        self.flush_calls.append(
+        self.checkpoint_calls.append(
             {"transcript": transcript, "session_key": session_key, "kwargs": kwargs}
         )
         return SimpleNamespace(
-            mode="llm",
-            error=None,
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
+            scope="checkpoint", status="checkpoint_saved",
+            source_path="memory/.checkpoints/test.jsonl", content_hash="checkpoint-hash",
         )
+
+    async def get_session(self, session_key: str) -> object:
+        return SimpleNamespace(session_id="durable-session-1", epoch=0)
+
 
 
 def _slash_services(harness: _StandaloneSlashHarness):
@@ -66,10 +63,11 @@ def _slash_services(harness: _StandaloneSlashHarness):
 
     return StandaloneSlashServices(
         create_session=harness.create_session,
+        get_session=harness.get_session,
         read_transcript=harness.read_transcript,
         truncate_session=harness.truncate_session,
         compact_session=harness.compact_session,
-        flush_transcript=harness.flush_transcript,
+        checkpoint_transcript=harness.checkpoint_transcript,
     )
 
 
@@ -242,7 +240,7 @@ async def test_standalone_slash_adapter_new_session_uses_typed_create_handle() -
 
 
 @pytest.mark.asyncio
-async def test_standalone_slash_adapter_reset_uses_typed_flush_and_truncate_handles() -> None:
+async def test_standalone_slash_adapter_reset_uses_typed_checkpoint_and_truncate_handles() -> None:
     from opensquilla.cli.repl.standalone_slash_adapter import (
         StandaloneSlashContext,
         handle_standalone_slash_command,
@@ -267,13 +265,12 @@ async def test_standalone_slash_adapter_reset_uses_typed_flush_and_truncate_hand
     handled = await handle_standalone_slash_command("/reset", context)
 
     assert handled is True
-    assert len(harness.flush_calls) == 1
-    assert harness.flush_calls[0]["session_key"] == session_key
-    assert harness.flush_calls[0]["kwargs"] == {
-        "agent_id": "main",
-        "timeout": 30.0,
-        "message_window": 0,
-        "segment_mode": "auto",
+    assert len(harness.checkpoint_calls) == 1
+    assert harness.checkpoint_calls[0]["session_key"] == session_key
+    assert harness.checkpoint_calls[0]["kwargs"] == {
+        "source": "standalone_reset",
+        "expected_session_id": "durable-session-1",
+        "expected_session_epoch": 0,
     }
     assert harness.truncate_calls == [(session_key, 0)]
     assert not state.transcript.to_markdown()
@@ -302,9 +299,10 @@ async def test_standalone_slash_adapter_compact_uses_typed_compact_handles() -> 
         tool_ctx=object(),
         slash_services=StandaloneSlashServices(
             create_session=harness.create_session,
+            get_session=harness.get_session,
             read_transcript=harness.read_transcript,
             compact_session=harness.compact_session,
-            flush_transcript=harness.flush_transcript,
+            checkpoint_transcript=harness.checkpoint_transcript,
             config=config,
             provider_selector=None,
         ),
@@ -316,7 +314,6 @@ async def test_standalone_slash_adapter_compact_uses_typed_compact_handles() -> 
     handled = await handle_standalone_slash_command("/compact", context)
 
     assert handled is True
-    assert len(harness.flush_calls) == 1
     assert len(harness.compact_calls) == 1
     compact_session_key, context_window, compaction_config = harness.compact_calls[0]
     assert compact_session_key == session_key
@@ -325,7 +322,144 @@ async def test_standalone_slash_adapter_compact_uses_typed_compact_handles() -> 
 
 
 @pytest.mark.asyncio
-async def test_standalone_compact_correlates_flush_and_compaction_to_durable_session() -> None:
+async def test_standalone_compact_caps_configured_budget_to_consumer_window() -> None:
+    from opensquilla.cli.repl.standalone_slash_adapter import (
+        StandaloneSlashContext,
+        StandaloneSlashServices,
+        handle_standalone_slash_command,
+    )
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.provider.selector import ProviderConfig
+
+    harness = _StandaloneSlashHarness()
+    session_key = "agent:main:standalone:consumer-window"
+    harness.transcripts[session_key] = [
+        SimpleNamespace(role="user", content="persisted")
+    ]
+    config = GatewayConfig(
+        context_budget_tokens=999_999,
+        llm={
+            "provider": "ollama",
+            "model": "qwen-stable",
+            "base_url": "http://127.0.0.1:11434",
+            "context_window_tokens": 4096,
+            "max_tokens": 512,
+        },
+    )
+    current = ProviderConfig(
+        provider="ollama",
+        model="qwen-stable",
+        base_url="http://127.0.0.1:11434",
+    )
+
+    class _Selector:
+        current_config = current
+
+        def remaining_chain(self) -> list[ProviderConfig]:
+            return [current]
+
+    state = ChatSessionState(session_key=session_key, model=None)
+    context = StandaloneSlashContext(
+        state=state,
+        session_key=session_key,
+        model=None,
+        tool_ctx=object(),
+        slash_services=StandaloneSlashServices(
+            read_transcript=harness.read_transcript,
+            compact_session=harness.compact_session,
+            checkpoint_transcript=harness.checkpoint_transcript,
+            config=config,
+            provider_selector=_Selector(),
+        ),
+        turn_runner=object(),
+        build_tool_ctx=lambda _session_key: object(),
+        replace_session=lambda **_updates: None,
+    )
+
+    assert await handle_standalone_slash_command("/compact", context) is True
+    assert harness.compact_calls[0][1] == 4096
+
+
+@pytest.mark.asyncio
+async def test_standalone_compact_does_not_bypass_unresolved_auth_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.repl.standalone_slash_adapter import (
+        StandaloneSlashContext,
+        StandaloneSlashServices,
+        handle_standalone_slash_command,
+    )
+    from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
+    from opensquilla.provider.selector import ProviderConfig
+
+    harness = _StandaloneSlashHarness()
+    session_key = "agent:main:standalone:auth-profile"
+    harness.transcripts[session_key] = [
+        SimpleNamespace(role="user", content="persisted")
+    ]
+    config = GatewayConfig(context_budget_tokens=4321)
+    config.llm_profiles["openai"] = LlmProviderProfile(
+        api_key="default-profile-must-not-be-guessed",
+    )
+    current = ProviderConfig(
+        provider="ollama",
+        model="qwen-current",
+        base_url="http://127.0.0.1:11434",
+    )
+
+    class _Selector:
+        current_config = current
+
+        def remaining_chain(self) -> list[ProviderConfig]:
+            return [current]
+
+    async def get_session(_session_key: str) -> object:
+        return SimpleNamespace(
+            session_id="durable-auth-profile-session",
+            session_key=session_key,
+            provider_override="openai",
+            model_override="gpt-session",
+            model_provider=None,
+            model=None,
+            auth_profile_override="openai:work",
+        )
+
+    def unexpected_compat_fallback(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an unresolved auth profile must not use selector fallback")
+
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.adapters.slash_standalone._resolve_compaction_provider",
+        unexpected_compat_fallback,
+    )
+    state = ChatSessionState(session_key=session_key, model="openai/gpt-session")
+    context = StandaloneSlashContext(
+        state=state,
+        session_key=session_key,
+        model=state.model,
+        tool_ctx=object(),
+        slash_services=StandaloneSlashServices(
+            get_session=get_session,
+            read_transcript=harness.read_transcript,
+            compact_session=harness.compact_session,
+            checkpoint_transcript=harness.checkpoint_transcript,
+            config=config,
+            provider_selector=_Selector(),
+        ),
+        turn_runner=object(),
+        build_tool_ctx=lambda _session_key: object(),
+        replace_session=lambda **_updates: None,
+    )
+
+    assert await handle_standalone_slash_command("/compact", context) is True
+    assert len(harness.compact_calls) == 1
+    compaction_config = harness.compact_calls[0][2]
+    assert compaction_config is not None
+    assert getattr(compaction_config, "llm_plan") is None
+    assert getattr(compaction_config, "api_key") == ""
+
+
+@pytest.mark.asyncio
+async def test_standalone_compact_correlates_compaction_to_durable_session() -> None:
     from opensquilla.cli.repl.standalone_slash_adapter import (
         StandaloneSlashContext,
         StandaloneSlashServices,
@@ -365,7 +499,7 @@ async def test_standalone_compact_correlates_flush_and_compaction_to_durable_ses
             get_session=get_session,
             read_transcript=harness.read_transcript,
             compact_with_result=compact_with_result,
-            flush_transcript=harness.flush_transcript,
+            checkpoint_transcript=harness.checkpoint_transcript,
             config=SimpleNamespace(context_budget_tokens=100),
         ),
         turn_runner=object(),
@@ -375,18 +509,13 @@ async def test_standalone_compact_correlates_flush_and_compaction_to_durable_ses
 
     assert await handle_standalone_slash_command("/compact", context) is True
 
-    flush_correlation = cast(
-        ProviderRequestCorrelation,
-        harness.flush_calls[0]["kwargs"]["provider_request_correlation"],
-    )
     compact_correlation = cast(
         ProviderRequestCorrelation,
         compact_kwargs["provider_request_correlation"],
     )
-    assert flush_correlation.session_id == "durable-session-1"
     assert compact_correlation.session_id == "durable-session-1"
-    assert flush_correlation.turn_id == compact_correlation.turn_id
     assert compact_kwargs["compaction_id"] == compact_correlation.turn_id
-    assert flush_correlation.execution_id != compact_correlation.execution_id
-    assert flush_correlation.call_kind == "auxiliary.session_flush"
+    assert int(compact_kwargs["context_window_chars"]) > 0
+    assert callable(compact_kwargs["consumer_admission"])
+    assert len(str(compact_kwargs["consumer_admission_fingerprint"])) == 64
     assert compact_correlation.call_kind == "auxiliary.compaction"

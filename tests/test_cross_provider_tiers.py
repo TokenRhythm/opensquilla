@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from opensquilla.engine.selector_override import (
     apply_model_override,
     cross_provider_tier_config,
+    resolve_strict_router_fallback_chain,
     resolve_tier_provider_config,
 )
 from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
@@ -112,6 +113,43 @@ def test_unresolvable_credentials_return_none(monkeypatch) -> None:
     cfg = _config_with_flag()
     assert resolve_tier_provider_config(cfg, "openai", "gpt-5.4-nano") is None
     assert resolve_tier_provider_config(cfg, "no-such-provider", "m") is None
+
+
+def test_shared_deployment_blocks_known_cross_provider_key_shape(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk_tr_abcdefghijklmnop")
+    cfg = _config_with_flag()
+
+    resolution = resolve_provider_deployment(
+        cfg,
+        "openrouter",
+        "openrouter/model",
+    )
+
+    assert resolution.ready is False
+    assert resolution.reason == "credential_provider_mismatch"
+    assert resolution.provider_config is not None
+    assert resolution.provider_config.api_key == ""
+
+
+def test_shared_deployment_blocks_key_for_conflicting_official_endpoint() -> None:
+    cfg = _config_with_flag()
+
+    resolution = resolve_provider_deployment(
+        cfg,
+        "tokenrhythm",
+        "deepseek-v4-pro",
+        overrides=SimpleNamespace(
+            api_key="sk_tr_abcdefghijklmnop",
+            base_url="https://openrouter.ai/api/v1",
+        ),
+    )
+
+    assert resolution.ready is False
+    assert resolution.reason == "credential_endpoint_provider_mismatch"
+    assert resolution.provider_config is not None
+    assert resolution.provider_config.api_key == ""
 
 
 def test_shared_resolution_reports_only_redacted_profile_provenance(monkeypatch) -> None:
@@ -507,6 +545,77 @@ def test_apply_model_override_uses_tier_config() -> None:
     assert metadata["executed_model"] == "gpt-5.4-nano"
     assert selector.active_provider_id == "openai"
     assert all(not cfg.replay_provider_state for cfg in selector.remaining_chain())
+
+
+def test_strict_cross_provider_override_keeps_resolved_router_chain(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda cfg: cfg)
+    cfg = _config_with_flag(
+        openai=LlmProviderProfile(api_key="oa-key"),
+        anthropic=LlmProviderProfile(api_key="an-key"),
+    )
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openrouter",
+                "configured-primary",
+                api_key="or-key",
+            )
+        )
+    )
+    metadata: dict[str, object] = {
+        "routing_applied": True,
+        "routing_source": "image_route",
+        "router_fallback_strict": True,
+        "routed_provider": "openai",
+        "routed_model": "configured-c0",
+        "router_fallback_chain": [
+            {"tier": "c1", "model": "configured-c1"},
+            {
+                "tier": "c2",
+                "provider": "anthropic",
+                "model": "configured-c2",
+            },
+            {
+                "tier": "c3",
+                "provider": "openai",
+                "model": "configured-c3",
+            },
+        ],
+    }
+    active_provider_id = selector.active_provider_id
+    tier_config = cross_provider_tier_config(
+        cfg,
+        metadata,
+        "configured-c0",
+        active_provider_id=active_provider_id,
+    )
+    strict_chain = resolve_strict_router_fallback_chain(
+        cfg,
+        metadata,
+        active_provider_id=active_provider_id,
+    )
+
+    provider = apply_model_override(
+        selector,
+        "configured-c0",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+        tier_provider_config=tier_config,
+        strict_router_fallback_chain=strict_chain,
+    )
+
+    assert provider is not None
+    assert [
+        (item.provider, item.model) for item in selector.remaining_chain()
+    ] == [
+        ("openai", "configured-c0"),
+        ("openrouter", "configured-c1"),
+        ("anthropic", "configured-c2"),
+        ("openai", "configured-c3"),
+    ]
+    assert all(not item.replay_provider_state for item in selector.remaining_chain())
 
 
 def test_return_to_primary_after_foreign_native_state_disables_replay() -> None:

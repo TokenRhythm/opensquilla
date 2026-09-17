@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, inject, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import { useMemoryLearningSettings } from '@/composables/setup/useMemoryLearningSettings'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
 
 // Settings › Advanced "memory & self-learning" pair: dream (the dependency)
 // on top, router self-learning below, joined by a dependency elbow whose copy
@@ -12,7 +14,11 @@ import { useMemoryLearningSettings } from '@/composables/setup/useMemoryLearning
 // opt-in, not a promoted feature.
 
 const { t } = useI18n()
-const ml = useMemoryLearningSettings()
+const appSettings = inject(APP_SETTINGS_KEY)
+if (!appSettings) throw new Error('AppSettings was not provided')
+const observability = inject(OBSERVABILITY_KEY)
+if (!observability) throw new Error('Observability was not provided')
+const ml = useMemoryLearningSettings(appSettings, observability)
 
 onMounted(() => { void ml.load() })
 

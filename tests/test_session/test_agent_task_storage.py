@@ -3,7 +3,53 @@ from __future__ import annotations
 import pytest
 
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, SessionNode, SessionStatus
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StaleEpochError
+
+
+@pytest.mark.asyncio
+async def test_agent_task_create_cas_rejects_replaced_session_owner(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    await storage.connect()
+    key = "agent:main:webchat:task-owner-cas"
+    admitted = SessionNode(
+        session_key=key,
+        session_id="task-owner-old",
+        epoch=0,
+    )
+    try:
+        await storage.upsert_session(admitted)
+        matching = AgentTaskRecord(
+            task_id="matching-owner-task",
+            session_key=key,
+            source_kind="web",
+        )
+        await storage.create_agent_task(
+            matching,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=0,
+        )
+        assert await storage.get_agent_task(matching.task_id) is not None
+
+        replacement = admitted.model_copy(deep=True)
+        replacement.session_id = "task-owner-new"
+        replacement.epoch = 1
+        await storage.upsert_session(replacement)
+        stale = AgentTaskRecord(
+            task_id="stale-owner-task",
+            session_key=key,
+            source_kind="cron",
+        )
+
+        with pytest.raises(StaleEpochError, match="durable admission"):
+            await storage.create_agent_task(
+                stale,
+                expected_session_id=admitted.session_id,
+                expected_session_epoch=0,
+            )
+
+        assert await storage.get_agent_task(stale.task_id) is None
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -59,6 +105,9 @@ async def test_agent_task_ledger_marks_active_tasks_abandoned_after_restart(tmp_
     restarted = SessionStorage(str(db_path))
     await restarted.connect()
     try:
+        assert restarted.restart_abandoned_session_keys == (key,)
+        assert restarted.take_restart_abandoned_session_keys() == (key,)
+        assert restarted.take_restart_abandoned_session_keys() == ()
         rows = await restarted.list_agent_tasks(session_key=key)
     finally:
         await restarted.close()
@@ -67,11 +116,27 @@ async def test_agent_task_ledger_marks_active_tasks_abandoned_after_restart(tmp_
     assert by_id["queued-task"].status == AgentTaskStatus.ABANDONED
     assert by_id["queued-task"].terminal_reason == "process_restart"
     assert by_id["queued-task"].finished_at is not None
+    assert by_id["queued-task"].details == {
+        "turn_outcome": {
+            "kind": "interrupted",
+            "reason": "process_restart",
+            "error_class": "process_restart",
+            "retryable": True,
+        }
+    }
     assert by_id["running-task"].status == AgentTaskStatus.ABANDONED
     assert by_id["running-task"].terminal_reason == "process_restart"
     assert by_id["running-task"].finished_at is not None
+    assert by_id["running-task"].details == by_id["queued-task"].details
     assert by_id["done-task"].status == AgentTaskStatus.SUCCEEDED
     assert by_id["done-task"].terminal_reason is None
+
+    retried = SessionStorage(str(db_path))
+    await retried.connect()
+    try:
+        assert retried.restart_abandoned_session_keys == (key,)
+    finally:
+        await retried.close()
 
 
 @pytest.mark.asyncio
@@ -260,6 +325,13 @@ async def test_list_agent_tasks_for_sessions_groups_visible_session_tasks(tmp_pa
             limit_per_session=1,
         )
         exact = await storage.get_agent_task("one-new")
+        exact_many = await storage.get_agent_tasks_by_ids(
+            ["two-task", "one-new", "missing-task"]
+        )
+        recent = await storage.list_recent_agent_tasks(
+            "agent:main:webchat:one",
+            limit=1,
+        )
     finally:
         await storage.close()
 
@@ -269,6 +341,9 @@ async def test_list_agent_tasks_for_sessions_groups_visible_session_tasks(tmp_pa
     assert grouped["agent:main:webchat:one"][0].details is None
     assert exact is not None
     assert exact.details == {"terminal_assistant_message_content": "x" * 100_000}
+    assert [row.task_id for row in exact_many] == ["two-task", "one-new"]
+    assert [row.task_id for row in recent] == ["one-new"]
+    assert recent[0].details == {"terminal_assistant_message_content": "x" * 100_000}
 
 
 @pytest.mark.asyncio
@@ -322,3 +397,90 @@ async def test_list_sessions_keeps_active_task_session_before_limit(tmp_path) ->
     keys = [row.session_key for row in rows]
     assert old_key in keys
     assert keys[0] == old_key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", list(AgentTaskStatus))
+async def test_activation_failure_updates_only_queued_tasks(tmp_path, status):
+    storage = await SessionStorage.open(str(tmp_path / "activation.sqlite"))
+    key = "agent:main:webchat:activation-state"
+    try:
+        await storage.create_agent_task(AgentTaskRecord(
+            task_id="accepted-task", session_key=key, status=status,
+            terminal_reason="original", finished_at=123,
+        ))
+        result = await storage.fail_queued_agent_task_activation(
+            "accepted-task", session_key=key,
+            error_class="RuntimeError", error_message="synthetic activation failure",
+        )
+        assert result is not None
+        persisted = await storage.get_agent_task("accepted-task")
+        assert persisted is not None and persisted.model_dump() == result.model_dump()
+        if status == AgentTaskStatus.QUEUED:
+            assert result.status == AgentTaskStatus.FAILED
+            assert result.terminal_reason == "activation_failed"
+            assert result.error_class == "RuntimeError"
+        else:
+            assert result.status == status
+            assert result.terminal_reason == "original" and result.finished_at == 123
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_failure_requires_exact_task_and_session(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "activation.sqlite"))
+    key = "agent:main:webchat:activation-identity"
+    try:
+        await storage.create_agent_task(AgentTaskRecord(task_id="accepted-task", session_key=key))
+        for task_id, session_key in [
+            ("missing-task", key), ("accepted-task", "agent:main:webchat:other-session")
+        ]:
+            result = await storage.fail_queued_agent_task_activation(
+                task_id, session_key=session_key,
+                error_class="RuntimeError", error_message="synthetic activation failure",
+            )
+            assert result is None
+        task = await storage.get_agent_task("accepted-task")
+        assert task is not None and task.status == AgentTaskStatus.QUEUED
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_failure_preserves_a_competing_terminal_commit(tmp_path, monkeypatch):
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    storage = await SessionStorage.open(str(tmp_path / "activation.sqlite"))
+    key = "agent:main:webchat:activation-race"
+    entered = asyncio.Event()
+    proceed = asyncio.Event()
+    transaction = storage._write_transaction
+
+    @asynccontextmanager
+    async def delayed_transaction(operation, *args, **kwargs):
+        if operation == "fail_queued_agent_task_activation":
+            entered.set()
+            await proceed.wait()
+        async with transaction(operation, *args, **kwargs) as connection:
+            yield connection
+
+    try:
+        await storage.create_agent_task(AgentTaskRecord(task_id="accepted-task", session_key=key))
+        monkeypatch.setattr(storage, "_write_transaction", delayed_transaction)
+        compensation = asyncio.create_task(storage.fail_queued_agent_task_activation(
+            "accepted-task", session_key=key,
+            error_class="RuntimeError", error_message="synthetic activation failure",
+        ))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        settled = await storage.update_agent_task(
+            "accepted-task", status=AgentTaskStatus.CANCELLED,
+            terminal_reason="user_cancelled", finished_at=123,
+        )
+        proceed.set()
+        result = await asyncio.wait_for(compensation, timeout=2)
+        assert result is not None and result.model_dump() == settled.model_dump()
+    finally:
+        proceed.set()
+        await storage.close()

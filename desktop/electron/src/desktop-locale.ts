@@ -8,6 +8,21 @@ export type DesktopLocale = 'en' | 'zh-Hans' | 'ja' | 'fr' | 'de' | 'es'
 export const DESKTOP_LOCALES: DesktopLocale[] = ['en', 'zh-Hans', 'ja', 'fr', 'de', 'es']
 
 /**
+ * Normalize the Gateway's persisted control-ui locale. This deliberately
+ * mirrors GatewayConfig's compatibility rule rather than the OS-locale
+ * resolver below: Gateway accepts every zh* spelling as Simplified Chinese
+ * and reduces unsupported values to English.
+ */
+export function normalizeGatewayLocale(value: string): DesktopLocale {
+  const normalized = value.trim().toLowerCase()
+  if (normalized.startsWith('zh')) return 'zh-Hans'
+  for (const code of ['ja', 'fr', 'de', 'es'] as const) {
+    if (normalized.startsWith(code)) return code
+  }
+  return 'en'
+}
+
+/**
  * Map the user's ordered BCP-47 language tags to the first bundled locale.
  * First match wins, so a top-preference tag can never lose to a
  * lower-preference one (e.g. en-HK above fr-HK must yield 'en', not 'fr').

@@ -5,9 +5,8 @@ import ControlSwitch from '@/components/ControlSwitch.vue'
 const { t } = useI18n()
 
 interface PrivacyPanelContract {
-  disableNetworkObservability: boolean
-  disableNetworkObservabilityDirty: boolean
-  statusText: string
+  networkReportingEnabled: boolean
+  networkReportingForcedOff: boolean
 }
 
 defineProps<{
@@ -15,30 +14,33 @@ defineProps<{
 }>()
 
 const emit = defineEmits<{
-  updateDisableNetworkObservability: [enabled: boolean]
+  updateNetworkReportingEnabled: [enabled: boolean]
 }>()
 </script>
 
 <template>
-  <section class="control-section">
-    <div class="control-section__head">
-      <h3 class="control-section__title">{{ t('setup.privacy.title') }}</h3>
-      <p class="control-section__desc">{{ panel.statusText }}</p>
-    </div>
-
+  <div class="settings-subsection" id="settings-security-privacy" tabindex="-1">
     <label class="control-row">
       <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('setup.privacy.disableNetworkObservabilityLabel') }}</span>
-        <span class="control-row__desc">{{ t('setup.privacy.disableNetworkObservabilityDesc') }}</span>
+        <span class="control-row__label">{{ t('setup.privacy.networkReportingLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.privacy.networkReportingDesc') }}</span>
+        <span v-if="panel.networkReportingForcedOff" class="control-row__desc">
+          {{ t('setup.privacy.statusDisabledByEnv') }}
+        </span>
       </div>
       <div class="control-row__control">
         <ControlSwitch
-          :checked="panel.disableNetworkObservability"
+          :checked="panel.networkReportingEnabled"
+          :disabled="panel.networkReportingForcedOff"
           name="setup_disable_network_observability"
-          :aria-label="t('setup.privacy.disableNetworkObservabilityLabel')"
-          @change="(value) => emit('updateDisableNetworkObservability', value)"
+          :aria-label="t('setup.privacy.networkReportingLabel')"
+          @change="(value) => emit('updateNetworkReportingEnabled', value)"
         />
       </div>
     </label>
-  </section>
+  </div>
 </template>
+
+<style scoped>
+.settings-subsection:focus { outline: none; }
+</style>

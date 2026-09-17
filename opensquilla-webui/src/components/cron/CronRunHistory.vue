@@ -3,7 +3,7 @@
     <div class="cron-detail__head">
       <div>
         <span class="cron-detail__eyebrow">{{ t('cronSkills.runHistory.eyebrow') }}</span>
-        <strong class="cron-detail__name">{{ job.name || job.id }}</strong>
+        <strong class="cron-detail__name">{{ localizedCronJobName(job.name, job.id, t) }}</strong>
       </div>
       <button type="button" class="cron-iconbtn" :aria-label="t('common.close')" @click="emit('close')">
         <Icon name="x" :size="16" />
@@ -38,6 +38,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { localizedCronJobName } from '@/utils/cron/templateNames'
 import DataTable from '@/components/DataTable.vue'
 import Icon from '@/components/Icon.vue'
 import { relTime } from '@/utils/cron/time'

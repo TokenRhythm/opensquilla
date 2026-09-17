@@ -20,13 +20,6 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Check out bootstrap body linter before first merge
-        if: ${{ hashFiles('.github/scripts/validate_pr_body.py') == '' }}
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-
       - name: Validate PR body fields
         env:
           PR_BODY_LINT_STRICT: "0"

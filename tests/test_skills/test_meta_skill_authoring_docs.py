@@ -23,7 +23,6 @@ def test_meta_skill_user_guide_contains_user_contract_and_retained_catalog() -> 
         "Avoiding Accidental Activation",
         "Reading the Result",
         "Correcting a Bad Run",
-        "meta-kid-project-planner",
         "meta-paper-write",
         "meta-skill-creator",
     ]

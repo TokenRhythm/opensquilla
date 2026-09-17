@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import replace
 
 import pytest
 
 from opensquilla.engine.usage_accounting import (
+    UsageAccountingBusyError,
     UsageAccountingUnavailableError,
     UsageCallItem,
     UsageCallResult,
@@ -17,7 +19,7 @@ from opensquilla.gateway.usage_ledger_runtime import (
     UsageLedgerStorageError,
 )
 from opensquilla.provider.types import ProviderBillingReceipt
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StorageBusyError
 
 
 def _call(**overrides) -> UsageCallStart:
@@ -87,6 +89,8 @@ def test_auto_propose_uses_stable_synthetic_session_and_unique_runs() -> None:
 
 class _Storage:
     def __init__(self) -> None:
+        self.start_attempts = []
+        self.start_failures: list[Exception] = []
         self.started = []
         self.finalized = []
         self.finalized_receipts = []
@@ -94,6 +98,9 @@ class _Storage:
         self.fail_finalize = 0
 
     async def start_usage_event(self, event):
+        self.start_attempts.append(event)
+        if self.start_failures:
+            raise self.start_failures.pop(0)
         self.started.append(event)
 
     async def finalize_usage_event(self, event_id, completion, *, items=(), receipts=()):
@@ -131,6 +138,136 @@ async def test_start_without_durable_session_fails_closed() -> None:
 
     assert storage.started == []
     assert issubclass(UsageLedgerStorageError, UsageAccountingUnavailableError)
+
+
+def _storage_busy() -> StorageBusyError:
+    return StorageBusyError(
+        "start_usage_event",
+        waited_ms=2_000,
+        retry_after_ms=100,
+        stage="begin",
+        resource="sessions.db",
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_retries_one_transient_storage_busy_failure() -> None:
+    storage = _Storage()
+    storage.start_failures = [_storage_busy()]
+    sink = SessionUsageEventSink(storage, start_retry_delays=(0.0,))
+
+    await sink.start(_call())
+
+    assert len(storage.start_attempts) == 2
+    assert storage.start_attempts[0] == storage.start_attempts[1]
+    assert len(storage.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_busy_retry_exhaustion_has_specific_error_code() -> None:
+    storage = _Storage()
+    storage.start_failures = [_storage_busy(), _storage_busy()]
+    sink = SessionUsageEventSink(storage, start_retry_delays=(0.0,))
+
+    with pytest.raises(
+        UsageAccountingBusyError,
+        match="usage ledger is temporarily busy",
+    ) as caught:
+        await sink.start(_call())
+
+    assert len(storage.start_attempts) == 2
+    assert caught.value.code == "usage_accounting_busy"
+    assert caught.value.retry_after_ms == 100
+    assert isinstance(caught.value.__cause__, StorageBusyError)
+    assert storage.started == []
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_retry_permanent_storage_failure() -> None:
+    storage = _Storage()
+    storage.start_failures = [RuntimeError("repro usage ledger start failure")]
+    sink = SessionUsageEventSink(storage, start_retry_delays=(0.0, 0.0))
+
+    with pytest.raises(
+        UsageLedgerStorageError,
+        match="usage ledger is temporarily unavailable",
+    ) as caught:
+        await sink.start(_call())
+
+    assert len(storage.start_attempts) == 1
+    assert type(caught.value) is UsageLedgerStorageError
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert storage.started == []
+
+
+@pytest.mark.asyncio
+async def test_start_retries_real_sqlite_write_lock(tmp_path) -> None:
+    database = tmp_path / "sessions.db"
+    storage = await SessionStorage.open(str(database))
+    storage._busy_budget_seconds = 0.01
+    blocker = sqlite3.connect(database, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    sink = SessionUsageEventSink(storage, start_retry_delays=(0.2,))
+
+    async def release_lock() -> None:
+        await asyncio.sleep(0.15)
+        blocker.rollback()
+
+    release = asyncio.create_task(release_lock())
+    try:
+        await sink.start(_call())
+
+        async with storage.conn.execute(
+            "SELECT status FROM usage_events WHERE event_id = ?",
+            ("event-1",),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row["status"] == "started"
+    finally:
+        await release
+        if blocker.in_transaction:
+            blocker.rollback()
+        blocker.close()
+        await sink.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ledger_writers_fail_closed_under_real_sqlite_lock(tmp_path) -> None:
+    database = tmp_path / "sessions-concurrent.db"
+    first = await SessionStorage.open(str(database))
+    second = await SessionStorage.open(str(database))
+    first._busy_budget_seconds = 0.01
+    second._busy_budget_seconds = 0.01
+    blocker = sqlite3.connect(database, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    sinks = [
+        SessionUsageEventSink(first, start_retry_delays=(0.0,)),
+        SessionUsageEventSink(second, start_retry_delays=(0.0,)),
+    ]
+    try:
+        results = await asyncio.gather(
+            sinks[0].start(_call(event_id="event-concurrent-1", execution_id="turn-1")),
+            sinks[1].start(_call(event_id="event-concurrent-2", execution_id="turn-2")),
+            return_exceptions=True,
+        )
+
+        assert all(isinstance(result, UsageAccountingBusyError) for result in results)
+        assert all(getattr(result, "retry_after_ms", None) == 100 for result in results)
+        blocker.rollback()
+        async with first.conn.execute("SELECT COUNT(*) AS n FROM usage_events") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row["n"] == 0
+    finally:
+        if blocker.in_transaction:
+            blocker.rollback()
+        blocker.close()
+        for sink in sinks:
+            await sink.close()
+        await second.close()
+        await first.close()
 
 
 @pytest.mark.asyncio

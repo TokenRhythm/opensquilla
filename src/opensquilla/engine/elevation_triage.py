@@ -1,4 +1,4 @@
-"""Deterministic policy for exact Managed Execution elevation actions."""
+"""Deterministic policy for exact Safe mode elevation actions."""
 
 from __future__ import annotations
 
@@ -381,7 +381,7 @@ def local_elevation_assessment(
         rationale=(
             "The user explicitly authorized this exact non-critical action."
             if explicit
-            else "No deterministic hard-risk rule matched; Managed Execution defaults to allow."
+            else "No deterministic hard-risk rule matched; Safe mode defaults to allow."
         ),
     )
 

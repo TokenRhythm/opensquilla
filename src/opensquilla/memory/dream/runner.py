@@ -34,6 +34,10 @@ from opensquilla.memory.dream.ranking import rank_promotion_candidates
 from opensquilla.memory.dream.receipts import write_dream_receipt
 from opensquilla.memory.dream.rehydrate import rehydrate_candidate
 from opensquilla.memory.protocols import MemoryProviderCapability
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import Message
 
@@ -52,9 +56,18 @@ async def _run_complete(
     ``provider.chat(messages)`` and concatenating text deltas (real
     providers like OpenAIProvider).
     """
+    budget = resolve_auxiliary_request_budget(
+        provider,
+        max_output_tokens=max_tokens,
+    )
+    ensure_auxiliary_text_fits(
+        messages,
+        max_chars=budget.provider_request_max_chars,
+        max_tokens=budget.max_input_tokens,
+    )
     complete = getattr(provider, "complete", None)
     if callable(complete):
-        resp = await complete(messages=messages, max_tokens=max_tokens)
+        resp = await complete(messages=messages, max_tokens=budget.max_output_tokens)
         return getattr(resp, "content", None) or getattr(resp, "text", "") or ""
     chat = getattr(provider, "chat", None)
     if not callable(chat):
@@ -63,7 +76,14 @@ async def _run_complete(
         )
     from opensquilla.provider.types import ChatConfig
 
-    config = ChatConfig(max_tokens=max_tokens)
+    config = ChatConfig(
+        max_tokens=budget.max_output_tokens,
+        provider_request_max_chars=budget.provider_request_max_chars,
+        provider_context_window_tokens=budget.context_window_tokens,
+        provider_request_max_chars_explicit_cap=(
+            budget.provider_request_max_chars_explicit_cap
+        ),
+    )
     scope = current_usage_accounting_scope()
     close_stream = None
     if scope is None:
@@ -75,7 +95,7 @@ async def _run_complete(
         metadata = provider_metadata(provider)
         stream = account_provider_stream(
             lambda: chat(messages, config=config),
-            provider=metadata.provider_name or metadata.provider_kind,
+            provider=metadata.provider_id or metadata.provider_name or metadata.provider_kind,
             model=metadata.model,
         )
         close_stream = stream

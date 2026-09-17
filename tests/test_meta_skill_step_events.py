@@ -344,6 +344,7 @@ def test_hard_failure_tool_result_includes_rescue_hints(fake_preface):
     rescue = (failure.arguments or {}).get("rescue")
     assert rescue["failed_step_id"] == "render"
     assert rescue["partial_output_step_ids"] == ["intake"]
+    assert [item["step_id"] for item in rescue["prior_outputs"]] == ["intake"]
     action_ids = [item["id"] for item in rescue["actions"]]
     assert "retry-run" in action_ids
     assert "retry-with-partial-context" in action_ids

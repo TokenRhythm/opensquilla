@@ -1,0 +1,45 @@
+{
+  "auth_style": "bearer",
+  "body": {
+    "enable_thinking": true,
+    "max_tokens": 16384,
+    "messages": [
+      {
+        "content": "You are a synthetic assistant used to freeze provider request payloads.",
+        "role": "system"
+      },
+      {
+        "content": "What is the capital of Australia?",
+        "role": "user"
+      },
+      {
+        "content": "Canberra.",
+        "reasoning_content": "The capital is Canberra, not Sydney.",
+        "role": "assistant"
+      },
+      {
+        "content": "Repeat the answer as a single word.",
+        "role": "user"
+      },
+      {
+        "content": "Canberra",
+        "role": "assistant"
+      },
+      {
+        "content": "Now write it in uppercase.",
+        "role": "user"
+      }
+    ],
+    "model": "qwen3.8-max-preview",
+    "preserve_thinking": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "temperature": 0.7,
+    "thinking_budget": 5000
+  },
+  "content_type": "application/json",
+  "method": "POST",
+  "url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+}

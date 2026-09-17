@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from opensquilla.engine import Agent, AgentConfig
-from opensquilla.engine.types import ThinkingEvent
+from opensquilla.engine.types import ThinkingEndEvent, ThinkingEvent, ThinkingStartEvent
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import ReasoningDeltaEvent as ProviderReasoning
@@ -44,6 +44,25 @@ class _ReasoningProvider:
         return []
 
 
+class _EmptyThenReasoningProvider(_ReasoningProvider):
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield ProviderReasoning(text="")
+        yield ProviderReasoning(text="first")
+        yield ProviderReasoning(text=" second")
+        yield ProviderDone(
+            stop_reason="stop",
+            input_tokens=2,
+            output_tokens=2,
+            reasoning_content="first second",
+        )
+
+
+class _ReasoningThenRaiseProvider(_ReasoningProvider):
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield ProviderReasoning(text="partial")
+        raise RuntimeError("synthetic provider failure")
+
+
 def test_agent_reemits_reasoning_as_thinking_event() -> None:
     import asyncio
 
@@ -55,6 +74,14 @@ def test_agent_reemits_reasoning_as_thinking_event() -> None:
 
     thinking = [e for e in events if isinstance(e, ThinkingEvent)]
     assert [t.text for t in thinking] == ["Let me ", "think."]
+    assert thinking[0].started_at > 0
+    assert thinking[1].started_at == thinking[0].started_at
+    starts = [e for e in events if isinstance(e, ThinkingStartEvent)]
+    ends = [e for e in events if isinstance(e, ThinkingEndEvent)]
+    assert len(starts) == len(ends) == 1
+    assert starts[0].block_id == thinking[0].block_id == ends[0].block_id
+    assert starts[0].block_index == thinking[0].block_index == ends[0].block_index == 0
+    assert ends[0].status == "completed"
 
     # reasoning must NOT be folded into the assistant answer text
     answer = "".join(
@@ -62,6 +89,58 @@ def test_agent_reemits_reasoning_as_thinking_event() -> None:
     )
     assert answer == "The answer."
     assert "think" not in answer
+
+
+def test_reasoning_timer_starts_on_first_nonempty_delta() -> None:
+    import asyncio
+
+    async def run() -> list[Any]:
+        agent = Agent(
+            provider=_EmptyThenReasoningProvider(),
+            config=AgentConfig(max_iterations=1, max_provider_retries=0),
+        )
+        return [event async for event in agent.run_turn("hi")]
+
+    thinking = [
+        event
+        for event in asyncio.run(run())
+        if isinstance(event, ThinkingEvent)
+    ]
+
+    assert [event.text for event in thinking] == ["first", " second"]
+    assert thinking[0].started_at > 0
+    assert thinking[1].started_at == thinking[0].started_at
+
+
+def test_thinking_event_keeps_legacy_default_start_time() -> None:
+    assert ThinkingEvent(text="legacy").started_at == 0
+    assert ThinkingEvent(text="legacy").block_id == ""
+    assert ThinkingEvent(text="legacy").block_index == -1
+
+
+def test_reasoning_block_ends_when_provider_stream_raises() -> None:
+    import asyncio
+
+    async def run() -> list[Any]:
+        events: list[Any] = []
+        agent = Agent(
+            provider=_ReasoningThenRaiseProvider(),
+            config=AgentConfig(max_iterations=1),
+        )
+        try:
+            async for event in agent.run_turn("hi"):
+                events.append(event)
+        except RuntimeError as exc:
+            assert str(exc) == "synthetic provider failure"
+        return events
+
+    events = asyncio.run(run())
+    starts = [event for event in events if isinstance(event, ThinkingStartEvent)]
+    ends = [event for event in events if isinstance(event, ThinkingEndEvent)]
+
+    assert len(starts) == len(ends) == 1
+    assert ends[0].block_id == starts[0].block_id
+    assert ends[0].status == "error"
 
 
 from opensquilla.engine import ToolResult  # noqa: E402
@@ -103,6 +182,134 @@ class _TextThenToolThenAnswerProvider:
         # final answer round: no tool
         yield ProviderText(text="Here is the answer.")
         yield ProviderDone(stop_reason="end_turn", input_tokens=6, output_tokens=3)
+
+
+class _ReasoningToolThenReasoningAnswerProvider(_TextThenToolThenAnswerProvider):
+    async def _stream(self, call: int) -> AsyncIterator[Any]:
+        if call == 1:
+            yield ProviderReasoning(text="choose tool")
+            yield ProviderToolStart(tool_use_id="t1", tool_name="read")
+            yield ProviderToolEnd(tool_use_id="t1", tool_name="read", arguments={})
+            yield ProviderDone(
+                stop_reason="tool_use",
+                input_tokens=5,
+                output_tokens=2,
+                reasoning_content="choose tool",
+            )
+            return
+        yield ProviderReasoning(text="review result")
+        yield ProviderText(text="Here is the answer.")
+        yield ProviderDone(
+            stop_reason="end_turn",
+            input_tokens=6,
+            output_tokens=3,
+            reasoning_content="review result",
+        )
+
+
+class _InterleavedReasoningBoundaryProvider(_ReasoningProvider):
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield ProviderReasoning(text="before text")
+        yield ProviderText(text="answer prefix")
+        yield ProviderReasoning(text="before tool")
+        yield ProviderToolStart(tool_use_id="ignored", tool_name="unavailable")
+        yield ProviderToolEnd(
+            tool_use_id="ignored",
+            tool_name="unavailable",
+            arguments={},
+        )
+        yield ProviderReasoning(text="after tool")
+        yield ProviderText(text="answer suffix")
+        yield ProviderDone(
+            stop_reason="end_turn",
+            input_tokens=6,
+            output_tokens=3,
+            reasoning_content="before textbefore toolafter tool",
+        )
+
+
+def test_reasoning_blocks_close_before_text_and_tool_boundaries() -> None:
+    import asyncio
+
+    async def run() -> list[Any]:
+        agent = Agent(
+            provider=_InterleavedReasoningBoundaryProvider(),
+            config=AgentConfig(max_iterations=1),
+        )
+        return [event async for event in agent.run_turn("hi")]
+
+    events = asyncio.run(run())
+    lifecycle = [
+        event
+        for event in events
+        if isinstance(
+            event,
+            (ThinkingStartEvent, ThinkingEvent, ThinkingEndEvent, TextDeltaEvent),
+        )
+    ]
+
+    expected_first_call = [
+        ThinkingStartEvent,
+        ThinkingEvent,
+        ThinkingEndEvent,
+        TextDeltaEvent,
+        ThinkingStartEvent,
+        ThinkingEvent,
+        ThinkingEndEvent,
+        ThinkingStartEvent,
+        ThinkingEvent,
+        ThinkingEndEvent,
+        TextDeltaEvent,
+    ]
+    assert [type(event) for event in lifecycle[: len(expected_first_call)]] == (
+        expected_first_call
+    )
+    assert [
+        event.block_index
+        for event in lifecycle
+        if isinstance(event, ThinkingStartEvent)
+    ][:3] == [0, 1, 2]
+    assert [
+        event.status
+        for event in lifecycle
+        if isinstance(event, ThinkingEndEvent)
+    ][:3] == ["completed", "completed", "completed"]
+
+
+def test_reasoning_blocks_follow_physical_provider_call_boundaries() -> None:
+    import asyncio
+
+    async def tool_handler(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="{}",
+        )
+
+    async def run() -> list[Any]:
+        agent = Agent(
+            provider=_ReasoningToolThenReasoningAnswerProvider(),
+            config=AgentConfig(max_iterations=3),
+            tool_definitions=[
+                ToolDefinition(
+                    name="read",
+                    description="read a file",
+                    input_schema=ToolInputSchema(properties={}, required=[]),
+                )
+            ],
+            tool_handler=tool_handler,
+        )
+        return [event async for event in agent.run_turn("hi")]
+
+    events = asyncio.run(run())
+    starts = [event for event in events if isinstance(event, ThinkingStartEvent)]
+    deltas = [event for event in events if isinstance(event, ThinkingEvent)]
+    ends = [event for event in events if isinstance(event, ThinkingEndEvent)]
+
+    assert [event.block_index for event in starts] == [0, 1]
+    assert [event.block_id for event in starts] == [event.block_id for event in deltas]
+    assert [event.block_id for event in starts] == [event.block_id for event in ends]
+    assert [event.status for event in ends] == ["completed", "completed"]
 
 
 def test_text_streams_live_as_answer_until_a_tool_appears() -> None:

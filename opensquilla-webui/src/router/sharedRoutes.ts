@@ -5,7 +5,6 @@ import { readLastRoute } from './lastRoute'
 const ChatView = () => import('@/views/ChatView.vue')
 const CronView = () => import('@/views/CronView.vue')
 const AgentsView = () => import('@/views/AgentsView.vue')
-const SessionsView = () => import('@/views/SessionsView.vue')
 const ChangelogView = () => import('@/views/ChangelogView.vue')
 const OverviewHubView = () => import('@/views/OverviewHubView.vue')
 const LogsView = () => import('@/views/LogsView.vue')
@@ -15,8 +14,9 @@ export function defaultRootRedirect(): string {
   if (detectPlatformId() === 'desktop') return '/chat'
   const saved = readLastRoute()
   if (saved) return saved
-  const isMobile = window.matchMedia('(max-width: 768px)').matches
-  return isMobile ? '/chat' : '/sessions'
+  // Chat on every form factor: Sessions is no longer a navigation destination,
+  // so landing there would open on a page the sidebar cannot get back to.
+  return '/chat'
 }
 
 export const sharedRoutes: RouteRecordRaw[] = [
@@ -29,21 +29,18 @@ export const sharedRoutes: RouteRecordRaw[] = [
       return defaultRootRedirect()
     },
   },
-  { path: '/chat',      name: 'chat',      component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 10, platforms: ['web', 'desktop'] } },
+  { path: '/chat',      name: 'chat',      component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 10, platforms: ['web', 'desktop'], viewKey: 'chat' } },
   // Draft state: a clean composer with no session key until the first send.
-  { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'] } },
-  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', group: 'Work', icon: 'sessions', nav: 'primary', navOrder: 20, platforms: ['web', 'desktop'], keepAlive: true } },
+  { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'], viewKey: 'chat' } },
+  // Legacy deep link: sessions are managed from the sidebar and chat.
+  { path: '/sessions', redirect: '/chat' },
   // Status and Usage share the Overview destination. Runtime logs remain a
   // kept-alive diagnostic deep link rather than a peer navigation tab.
-  { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', group: 'Work', icon: 'home', nav: 'primary', navOrder: 30, navLabelKey: 'nav.overview', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
-  { path: '/usage',     name: 'usage',     component: OverviewHubView, meta: { title: 'Usage', icon: 'usage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
+  { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', icon: 'home', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
+  { path: '/usage',     name: 'usage',     component: OverviewHubView, meta: { title: 'Usage', group: 'Work', icon: 'usage', nav: 'primary', navOrder: 60, navLabelKey: 'nav.viewUsage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
   { path: '/logs',      name: 'logs',      component: LogsView, meta: { title: 'Logs', icon: 'logs', platforms: ['web', 'desktop'], keepAlive: true } },
-  // Approvals retired as a front-end destination: the pending queue resolves
-  // inline in the chat transcript (ApprovalCard) and via the topbar interrupt
-  // pill. The old deep link redirects to Sessions so bookmarks and the pill
-  // degrade gracefully
-  // (openBlockedApprovalSession() routes straight to the blocked chat first).
-  { path: '/approvals', redirect: '/sessions' },
+  // Approvals resolve inline in the chat transcript and via the topbar pill.
+  { path: '/approvals', redirect: '/chat' },
   // Agent administration remains available as an advanced deep link, but is
   // intentionally absent from primary navigation and cold-start restoration.
   { path: '/agents',    name: 'agents',    component: AgentsView,    meta: { title: 'Agents', icon: 'agents', platforms: ['web', 'desktop'], keepAlive: true } },

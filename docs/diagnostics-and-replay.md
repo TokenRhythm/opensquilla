@@ -58,6 +58,11 @@ transcript. It is read-only: it does not re-run tools.
 opensquilla replay --session <session-key> --turn <turn-id>
 ```
 
+Pipeline steps display `OK`, `SKIPPED`, or `FAIL`. Their outcome is retained
+even when privacy filtering removes exception text. Older logs that no longer
+contain enough information to distinguish a failure from a skip display
+`UNKNOWN` for those steps.
+
 Use replay when:
 
 - a chat has moved on but you need to inspect an earlier turn;
@@ -118,4 +123,4 @@ Read next:
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

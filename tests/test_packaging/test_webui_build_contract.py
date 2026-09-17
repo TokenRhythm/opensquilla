@@ -68,11 +68,12 @@ def _write_verified_artifact(
     assets.mkdir(parents=True)
     (assets / "app.js").write_text("console.log('probe')\n", encoding="utf-8")
     (assets / "app.css").write_text("body{}\n", encoding="utf-8")
-    (dist / "index.html").write_text(
+    synthetic_entrypoint = (
         '<script type="module" src="assets/app.js"></script>'
-        '<link rel="stylesheet" href="assets/app.css">',
-        encoding="utf-8",
+        '<link rel="stylesheet" href="assets/app.css">'
     )
+    for entrypoint_name in ("index.html", "desktop.html"):
+        (dist / entrypoint_name).write_text(synthetic_entrypoint, encoding="utf-8")
     if include_personal_bgm:
         music = dist / "music"
         music.mkdir()

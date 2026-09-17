@@ -35,7 +35,17 @@ export default defineConfig({
         },
       },
       // RpcClient connects to ws://<host>/ws for the live chat/event stream.
-      '/ws': { target: gatewayTarget, ws: true, changeOrigin: true },
+      // Match the HTTP development proxy above: once Vite rewrites Host to the
+      // gateway, forwarding the browser's Vite Origin would fail the gateway's
+      // same-origin WebSocket guard. This proxy is only exposed by `npm run dev`.
+      '/ws': {
+        target: gatewayTarget,
+        ws: true,
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyReqWs', (proxyReq) => proxyReq.removeHeader('origin'))
+        },
+      },
       // Backend-owned static assets (brand mark, share-export images, …) that the
       // app loads from `${base}/static/*`. Scope to /control/static ONLY — the
       // bare /control prefix is the SPA router base and must stay with Vite, or
@@ -44,10 +54,17 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: resolve(__dirname, '../src/opensquilla/gateway/static/dist'),
+    // Keep the generated artifact owned by the WebUI package.  Packaging and
+    // desktop jobs explicitly stage this verified directory into the Python
+    // package; Vite itself must not write into the backend source tree.
+    outDir: resolve(__dirname, 'dist'),
     emptyOutDir: true,
     sourcemap: true,
     rollupOptions: {
+      input: {
+        control: resolve(__dirname, 'index.html'),
+        desktop: resolve(__dirname, 'desktop.html'),
+      },
       output: {
         assetFileNames: (assetInfo) => {
           const info = assetInfo.name?.split('.') || []

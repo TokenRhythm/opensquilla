@@ -15,6 +15,7 @@ from opensquilla.channels.contract import (
     ChannelPlatformCategories,
 )
 from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.channel_status_runtime import status_for as _status_for
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.onboarding.mutations import upsert_channel
@@ -42,6 +43,76 @@ def _admin_ctx() -> RpcContext:
             authenticated=True,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("connected", "enabled", "dispatch_state", "connection_phase", "expected"),
+    [
+        (False, False, None, None, "disabled"),
+        (False, True, "dead", "reconnecting", "dead"),
+        (False, True, "exhausted", "reconnecting", "exhausted"),
+        (False, True, "restarting", "open", "restarting"),
+        (True, True, None, "open", "connected"),
+        (False, True, None, "stopped", "stopped"),
+        (False, True, None, "connecting", "restarting"),
+        (False, True, None, "reconnecting", "restarting"),
+    ],
+)
+def test_channel_status_preserves_wire_vocabulary_and_dispatch_priority(
+    connected: bool,
+    enabled: bool,
+    dispatch_state: str | None,
+    connection_phase: str | None,
+    expected: str,
+) -> None:
+    assert _status_for(
+        connected=connected,
+        enabled=enabled,
+        dispatch_state=dispatch_state,
+        connection_phase=connection_phase,
+    ) == expected
+
+
+@pytest.mark.asyncio
+async def test_channels_status_surfaces_reconnecting_transport_without_new_wire_status():
+    class FakeHealth:
+        connected = False
+        bot_user_id = None
+        extra = {
+            "connection_phase": "reconnecting",
+            "last_error": {
+                "error_class": "transport_unavailable",
+                "message": "Feishu websocket is reconnecting",
+                "retryable": True,
+            },
+        }
+
+    class FakeManager:
+        _channel_types = {"feishu-main": "feishu"}
+
+        async def health(self):
+            return {"feishu-main": FakeHealth()}
+
+        def get(self, name: str):
+            assert name == "feishu-main"
+            return None
+
+    ctx = _read_ctx()
+    ctx.channel_manager = FakeManager()
+
+    rpc_res = await get_dispatcher().dispatch("r-phase", "channels.status", {}, ctx)
+
+    assert rpc_res.error is None, rpc_res.error
+    row = rpc_res.payload["channels"][0]
+    assert row["connected"] is False
+    assert row["status"] == "restarting"
+    assert row["diagnostics"]["connection_phase"] == "reconnecting"
+    assert row["diagnostics"]["last_error"] == {
+        "error_class": "transport_unavailable",
+        "message": "Feishu websocket is reconnecting",
+        "retryable": True,
+        "source": "adapter",
+    }
 
 
 @pytest.mark.asyncio
@@ -660,7 +731,22 @@ async def test_pairing_approve_notifies_sender_on_the_address_it_arrived_on():
     assert res.error is None, res.error
     assert len(adapter.sent) == 1
     assert adapter.sent[0].reply_to == "dm-chat-1"
+    assert adapter.sent[0].content == "Access approved. Send a message to start chatting."
     assert adapter.sent[0].metadata.get("pairing_approved") is True
+
+
+@pytest.mark.asyncio
+async def test_pairing_approve_uses_the_persisted_gateway_notice_locale():
+    adapter = _NoticeAdapter()
+    ctx = _notice_ctx(adapter, _NoticeStore())
+    ctx.config.control_ui.default_locale = "zh-Hans"
+
+    res = await get_dispatcher().dispatch(
+        "r1", "channels.pairing.approve", {"channelName": "work", "pairingId": "p1"}, ctx
+    )
+
+    assert res.error is None, res.error
+    assert adapter.sent[0].content == "访问已获批准。请发送一条消息以开始对话。"
 
 
 @pytest.mark.asyncio
@@ -997,12 +1083,13 @@ async def test_pairing_approve_as_admin_survives_a_failed_grant_and_still_notifi
     ctx = _notice_ctx(adapter, _NoticeStore())
     ctx.config.config_path = str(tmp_path / "config.toml")
 
-    from opensquilla.gateway import rpc_config
+    from opensquilla.gateway import config_persistence
 
     def _boom(_config):
         raise OSError("read-only config")
 
-    monkeypatch.setattr(rpc_config, "_persist_config", _boom)
+    monkeypatch.setattr(config_persistence, "persist_gateway_config", _boom)
+    monkeypatch.setattr(opensquilla.gateway.rpc_channels, "persist_gateway_config", _boom)
 
     res = await get_dispatcher().dispatch(
         "r1",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,13 +17,31 @@ from opensquilla.gateway.usage_backfill import (
 from opensquilla.session.models import SessionNode, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
 from opensquilla.session.usage_ledger import (
+    UsageBackfillBatch,
     UsageBackfillCursor,
+    UsageBackfillEntry,
     UsageBackfillWrite,
     UsageEventCompletion,
     UsageEventItem,
     UsageEventStart,
     UsageLedgerConflictError,
 )
+
+
+def _backfill_state(
+    status: str,
+    *,
+    cursor: UsageBackfillCursor | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        ledger_started_at_ms=1_000,
+        backfill_status=status,
+        cursor_created_at_ms=cursor.created_at_ms if cursor else None,
+        cursor_session_id=cursor.session_id if cursor else None,
+        cursor_message_id=cursor.message_id if cursor else None,
+        last_error_code=None,
+        updated_at_ms=1_000,
+    )
 
 
 def _write(
@@ -51,6 +70,124 @@ def _write(
             cost_source="estimate",
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_usage_backfill_worker_uses_small_default_batches() -> None:
+    class RecordingStorage:
+        def __init__(self) -> None:
+            self.limits: list[int] = []
+
+        async def get_usage_ledger_state(self) -> SimpleNamespace:
+            return _backfill_state("pending")
+
+        async def prepare_usage_backfill_indexes(self) -> None:
+            return None
+
+        async def update_usage_backfill_progress(self, **_kwargs) -> None:
+            return None
+
+        async def get_usage_backfill_batch(
+            self,
+            *,
+            before_ms: int,
+            after: UsageBackfillCursor | None,
+            limit: int,
+        ) -> UsageBackfillBatch:
+            assert before_ms == 1_000
+            assert after is None
+            self.limits.append(limit)
+            return UsageBackfillBatch(entries=(), next_cursor=None, exhausted=True)
+
+        async def apply_usage_backfill_batch(self, *_args, **_kwargs) -> None:
+            return None
+
+    storage = RecordingStorage()
+
+    await run_usage_backfill(storage)
+
+    assert storage.limits == [50]
+
+
+@pytest.mark.asyncio
+async def test_usage_backfill_worker_does_not_repeat_terminal_partial_state() -> None:
+    class PartialStorage:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def get_usage_ledger_state(self) -> SimpleNamespace:
+            self.calls.append("read")
+            return _backfill_state("partial")
+
+        async def prepare_usage_backfill_indexes(self) -> None:
+            self.calls.append("prepare-indexes")
+
+        async def update_usage_backfill_progress(self, **_kwargs) -> None:
+            self.calls.append("update")
+
+        async def get_usage_backfill_batch(self, **_kwargs) -> UsageBackfillBatch:
+            self.calls.append("read-batch")
+            return UsageBackfillBatch(entries=(), next_cursor=None, exhausted=True)
+
+        async def apply_usage_backfill_batch(self, *_args, **_kwargs) -> None:
+            self.calls.append("apply-batch")
+
+    storage = PartialStorage()
+
+    await run_usage_backfill(storage)
+
+    assert storage.calls == ["read"]
+
+
+@pytest.mark.asyncio
+async def test_usage_backfill_failure_keeps_last_committed_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_cursor = UsageBackfillCursor(100, "session-1", "message-1")
+
+    class FailingStorage:
+        def __init__(self) -> None:
+            self.progress: list[dict] = []
+
+        async def get_usage_ledger_state(self) -> SimpleNamespace:
+            return _backfill_state("pending")
+
+        async def prepare_usage_backfill_indexes(self) -> None:
+            return None
+
+        async def update_usage_backfill_progress(self, **kwargs) -> None:
+            self.progress.append(kwargs)
+
+        async def get_usage_backfill_batch(self, **_kwargs) -> UsageBackfillBatch:
+            return UsageBackfillBatch(
+                entries=(
+                    UsageBackfillEntry(
+                        cursor=failed_cursor,
+                        agent_id="main",
+                        session_epoch=0,
+                        forked_from_parent=False,
+                        turn_usage={"input_tokens": 1},
+                        turn_context={"turn_id": "turn-1"},
+                    ),
+                ),
+                next_cursor=failed_cursor,
+                exhausted=True,
+            )
+
+        async def apply_usage_backfill_batch(self, *_args, **_kwargs) -> None:
+            raise RuntimeError("repro backfill batch failure")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.usage_backfill.normalize_usage_backfill_entry",
+        lambda _entry: _write("event-1", "execution-1"),
+    )
+    storage = FailingStorage()
+
+    await run_usage_backfill(storage)
+
+    assert [item["status"] for item in storage.progress] == ["running", "failed"]
+    assert storage.progress[0]["cursor"] is None
+    assert storage.progress[1]["cursor"] is None
 
 
 async def test_backfill_batch_is_canonical_stable_and_marks_forks(tmp_path: Path) -> None:
@@ -250,6 +387,62 @@ async def test_usage_backfill_worker_attributes_valid_history_without_changing_b
         baselines = await storage.list_usage_legacy_baselines()
         assert len(baselines) == 1
         assert baselines[0].cost_nanos == 100_000_000
+    finally:
+        await storage.close()
+
+
+async def test_failed_backfill_retries_from_last_committed_cursor(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(
+            SessionNode(
+                session_key="agent:main:webchat:one",
+                session_id="session-1",
+            )
+        )
+        for index in range(2):
+            await storage.append_transcript_entry(
+                TranscriptEntry(
+                    session_id="session-1",
+                    session_key="agent:main:webchat:one",
+                    message_id=f"assistant-{index}",
+                    role="assistant",
+                    created_at=100 + index,
+                    turn_usage={"input_tokens": 1},
+                    turn_context={"turn_id": f"turn-{index}"},
+                )
+            )
+        await storage.initialize_usage_ledger(1_000)
+        await storage.conn.execute(
+            """
+            CREATE TRIGGER repro_usage_ledger_start_failure
+            BEFORE INSERT ON usage_events
+            BEGIN
+              SELECT RAISE(ABORT, 'repro usage ledger start failure');
+            END
+            """
+        )
+
+        await run_usage_backfill(storage, batch_size=1)
+
+        failed = await storage.get_usage_ledger_state()
+        assert failed is not None
+        assert failed.backfill_status == "failed"
+        assert failed.cursor_created_at_ms is None
+        assert await storage.query_usage_events(None, None) == []
+
+        await storage.conn.execute(
+            "DROP TRIGGER IF EXISTS repro_usage_ledger_start_failure"
+        )
+        await run_usage_backfill(storage, batch_size=1)
+
+        recovered = await storage.get_usage_ledger_state()
+        assert recovered is not None
+        assert recovered.backfill_status == "complete"
+        events = await storage.query_usage_events(None, None)
+        assert len(events) == 2
     finally:
         await storage.close()
 

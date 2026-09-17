@@ -4,6 +4,7 @@
   "description": "Compact git show output while preserving commit summary and diff stat.",
   "match": {
     "argv0": ["git"],
+    "gitSubcommands": ["show"],
     "argvIncludes": [["show"]]
   },
   "transforms": {

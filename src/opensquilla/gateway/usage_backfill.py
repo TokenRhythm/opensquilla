@@ -28,6 +28,9 @@ from opensquilla.session.usage_ledger import (
 
 log = structlog.get_logger(__name__)
 
+_DEFAULT_BACKFILL_BATCH_SIZE = 50
+_TERMINAL_BACKFILL_STATUSES = frozenset({"complete", "partial"})
+
 
 class UsageBackfillAnomalyError(ValueError):
     """A historical row cannot be converted without inventing accounting data."""
@@ -306,19 +309,19 @@ def normalize_usage_backfill_entry(entry: UsageBackfillEntry) -> UsageBackfillWr
 async def run_usage_backfill(
     storage: Any,
     *,
-    batch_size: int = 500,
+    batch_size: int = _DEFAULT_BACKFILL_BATCH_SIZE,
 ) -> None:
     """Resume backfill until the cutover prefix is exhausted.
 
     The storage layer owns the atomic ``events + cursor`` transaction.  Any
-    failure is converted into durable ``partial`` state and never propagates
+    failure is converted into durable ``failed`` state and never propagates
     into gateway readiness.
     """
 
     cursor = None
     try:
         state = await storage.get_usage_ledger_state()
-        if state is None or state.backfill_status == "complete":
+        if state is None or state.backfill_status in _TERMINAL_BACKFILL_STATUSES:
             return
         prepare_indexes = getattr(storage, "prepare_usage_backfill_indexes", None)
         if callable(prepare_indexes):
@@ -347,14 +350,15 @@ async def run_usage_backfill(
                     writes.append(normalize_usage_backfill_entry(entry))
                 except UsageBackfillAnomalyError:
                     anomalies += 1
-            cursor = batch.next_cursor or cursor
+            next_cursor = batch.next_cursor or cursor
             await storage.apply_usage_backfill_batch(
                 writes,
-                cursor=cursor,
+                cursor=next_cursor,
                 exhausted=batch.exhausted,
                 anomaly_delta=anomalies,
                 now_ms=int(time.time() * 1000),
             )
+            cursor = next_cursor
             if batch.exhausted:
                 return
             await asyncio.sleep(0)

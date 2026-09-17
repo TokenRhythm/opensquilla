@@ -2,17 +2,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { KeepAlive, computed, createApp, defineComponent, h, nextTick, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
 
 const rpcMocks = vi.hoisted(() => ({
   call: vi.fn(),
-  waitForConnection: vi.fn(),
+  ready: vi.fn(),
 }))
 
 vi.mock('@/stores/rpc', () => ({
   useRpcStore: () => ({
     client: {},
     call: rpcMocks.call,
-    waitForConnection: rpcMocks.waitForConnection,
+    ready: rpcMocks.ready,
   }),
 }))
 
@@ -129,6 +130,20 @@ async function mountLogs(): Promise<MountedLogs> {
   await router.push('/logs')
   await router.isReady()
   app.use(router)
+  app.provide(OBSERVABILITY_KEY, {
+    logStatus: () => rpcMocks.call('logs.status', {}),
+    async tailLogs(options: { cursor: number; limit?: number; level?: string | null }) {
+      const data = await rpcMocks.call('logs.tail', {
+        cursor: options.cursor,
+        limit: options.limit ?? 500,
+        level: options.level ?? null,
+      })
+      return {
+        entries: data.lines || data.entries || [],
+        cursor: data.cursor ?? null,
+      }
+    },
+  } as never)
   app.mount(el)
   const result: MountedLogs = {
     el,
@@ -154,8 +169,8 @@ function tailCalls() {
 beforeEach(() => {
   vi.useFakeTimers()
   rpcMocks.call.mockReset()
-  rpcMocks.waitForConnection.mockReset()
-  rpcMocks.waitForConnection.mockResolvedValue(undefined)
+  rpcMocks.ready.mockReset()
+  rpcMocks.ready.mockResolvedValue(undefined)
   rpcMocks.call.mockImplementation(async (method: string) => {
     if (method === 'logs.status') return normalStatus()
     if (method === 'logs.tail') return { lines: [], cursor: 0 }
@@ -301,6 +316,45 @@ describe('LogsView states', () => {
 
     expect(el.textContent).toContain('No lines match the current filter.')
     expect(el.textContent).not.toContain('No logs have been recorded yet.')
+  })
+
+  it('uses bracketed log levels before error-like message text', async () => {
+    rpcMocks.call.mockImplementation(async (method: string) => {
+      if (method === 'logs.status') return normalStatus()
+      if (method === 'logs.tail') {
+        return {
+          lines: [
+            '2026-08-10 [INFO] opensquilla: migrations_applied migration=V019__turn_errors',
+            '2026-08-10 [INFO] opensquilla: skill_catalog.refreshed errors=0',
+            '2026-08-10 [WARNING] opensquilla: github.search_failed error="request failed"',
+            '2026-08-10 [ERROR] opensquilla: actual failure',
+          ],
+          cursor: 4,
+        }
+      }
+      throw new Error(`unexpected RPC method: ${method}`)
+    })
+
+    const { el } = await mountLogs()
+
+    expect(Array.from(el.querySelectorAll('.lg-line__lvl'), level => level.textContent)).toEqual([
+      'INFO',
+      'INFO',
+      'WARN',
+      'ERROR',
+    ])
+    expect(el.querySelector('.lg-level-btn--info .lg-level-btn__count')?.textContent).toBe('2')
+    expect(el.querySelector('.lg-level-btn--warn .lg-level-btn__count')?.textContent).toBe('1')
+    expect(el.querySelector('.lg-level-btn--error .lg-level-btn__count')?.textContent).toBe('1')
+
+    el.querySelector<HTMLButtonElement>('.lg-level-btn--debug')?.click()
+    el.querySelector<HTMLButtonElement>('.lg-level-btn--info')?.click()
+    el.querySelector<HTMLButtonElement>('.lg-level-btn--warn')?.click()
+    await flush()
+
+    const visibleLines = Array.from(el.querySelectorAll('.lg-line'), line => line.textContent)
+    expect(visibleLines).toHaveLength(1)
+    expect(visibleLines[0]).toContain('actual failure')
   })
 })
 

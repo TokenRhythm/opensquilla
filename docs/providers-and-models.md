@@ -108,6 +108,167 @@ base URL (`https://api.openai.com/v1`):
 Both read the same key and base URL, so switching between them needs only a
 `provider` change.
 
+### Qwen Token Plan: OpenAI and Anthropic protocols
+
+Token Plan is separate from regular DashScope and Bailian Coding Plan. Use its
+dedicated `sk-sp-...` key; a standard Model Studio key cannot consume Token
+Plan Credits.
+
+OpenSquilla exposes the mainland China service through two verified provider
+ids:
+
+- `qwen_token_plan` — OpenAI-compatible Chat Completions at
+  `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`.
+- `qwen_token_plan_anthropic` — Anthropic Messages at
+  `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic`
+  (+ `/v1/messages`), using bearer authentication.
+
+Both read `QWEN_TOKEN_PLAN_API_KEY` and default to
+`qwen3.8-max-preview`:
+
+```sh
+export QWEN_TOKEN_PLAN_API_KEY="sk-sp-..."
+opensquilla configure provider \
+  --provider qwen_token_plan \
+  --model qwen3.8-max-preview \
+  --api-key-env QWEN_TOKEN_PLAN_API_KEY
+```
+
+The packaged model catalog is the documented team-plan superset. Personal
+plans can use `qwen3.8-max-preview`, `qwen3.7-max`, `qwen3.7-plus`,
+`qwen3.6-flash`, `glm-5.2`, and `deepseek-v4-pro`; team plans additionally
+include `qwen3.6-plus`, DeepSeek V4 Flash / V3.2, Kimi K2.7 / K2.6 / K2.5,
+GLM 5.1 / 5, and MiniMax M2.5. Entitlement is enforced by the service.
+Settings and onboarding query the verified OpenAI-compatible `/models`
+endpoint so suggestions reflect the current key's entitlement. The Anthropic
+profile deliberately uses that same account catalog instead of presenting the
+packaged superset as a live result.
+
+The OpenAI-compatible adapter applies the model-family wire contracts required
+by this mixed catalog: forced thinking and the 0.6 temperature floor for
+Qwen 3.8, DeepSeek V4 effort and reasoning replay, Kimi tool-call reasoning
+replay, GLM `tool_stream`, and thinking-mode tool-choice normalization. The
+Anthropic adapter preserves signed thinking blocks and clamps Qwen 3.8's
+temperature floor. The included inline SquillaRouter preset uses Qwen 3.6
+Flash → Qwen 3.7 Plus → Qwen 3.7 Max → Qwen 3.8 Max Preview, with Qwen 3.7
+Plus as the image route.
+
+Token Plan also exposes native image generation through OpenSquilla's
+`image_generate` tool. This is separate from the router's image route: the
+router image model understands image *inputs*, while Wan creates new image
+artifacts. Configure either `wan2.7-image` or `wan2.7-image-pro`:
+
+```toml
+[image_generation]
+enabled = true
+primary = "qwen_token_plan/wan2.7-image"
+size = "768x768"
+
+[image_generation.providers.qwen_token_plan]
+api_key_env = "QWEN_TOKEN_PLAN_API_KEY"
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
+```
+
+The native adapter uses the documented multimodal-generation request shape,
+converts OpenSquilla's `WIDTHxHEIGHT` size to the service's `WIDTH*HEIGHT`
+form, and securely downloads the temporary signed result URL. When Token Plan
+is also the active LLM provider, the image provider can reuse its credential
+because both official endpoints have the same HTTPS origin; it does not reuse
+the incompatible chat API path.
+
+Token Plan is licensed for supported interactive AI programming and agent
+tools. It is not a replacement credential for unattended application
+backends or generic batch API workloads; follow the current plan terms for
+your subscription.
+
+### Custom OpenAI- and Anthropic-compatible endpoints
+
+Use `custom` for an OpenAI Chat Completions endpoint and
+`custom_anthropic` for an Anthropic Messages endpoint. Both require an
+explicit model and base URL; API keys are optional:
+
+```toml
+[llm]
+provider = "custom_anthropic"
+model = "vendor-model"
+base_url = "https://llm.example.com/anthropic"
+api_key_env = "CUSTOM_ANTHROPIC_API_KEY"
+```
+
+`custom_anthropic` appends `/v1/messages` and sends a bearer token.
+`custom` appends `/chat/completions` to versioned base URLs and reads
+`CUSTOM_LLM_API_KEY`.
+
+Advanced local deployments may add endpoint-specific JSON fields to every
+OpenAI-compatible chat request by editing `config.toml` directly:
+
+```toml
+[llm]
+provider = "custom"
+model = "local-model"
+base_url = "http://127.0.0.1:8000/v1"
+temperature = 0.7
+top_p = 0.9
+thinking = "high"
+
+[llm.extra_body]
+top_k = 40
+min_p = 0.05
+repetition_penalty = 1.1
+
+[llm.extra_body.chat_template_kwargs]
+enable_thinking = true
+```
+
+`extra_body` is available only on the primary `custom` provider. It is a
+local-file-only advanced setting: the Web UI, environment variables,
+`llm_profiles`, and configuration RPCs neither expose nor modify it. Reload
+the configuration or restart OpenSquilla after editing the file. Standard
+fields such as `temperature`, `top_p`, token limits, tools, streaming, and
+reasoning controls remain owned by their first-class settings and cannot be
+overridden through `extra_body`. Nested objects are sent unchanged, while the
+top-level merge is shallow.
+
+Do not store credentials or other secrets in `extra_body`. Older OpenSquilla
+versions that do not recognize this field may reject the configuration, so
+remove the table before downgrading to such a version.
+
+Unknown custom models keep the conservative 8k context default for upgrade
+compatibility. Declare the endpoint's real window under
+`[models.custom."<model>"]` or
+`[models.custom_anthropic."<model>"]`; this is important for both remote
+gateways and local servers with larger windows.
+
+`custom` and `custom_anthropic` default to a zero token-cost estimate. This
+does not mean a remote service, GPU, or other infrastructure is free. To
+estimate a paid endpoint, set both input and output prices for its exact
+provider/model override; cache-read and cache-write prices remain optional:
+
+```toml
+[models.custom."vendor-model"]
+input_cost_per_mtok = 0.5
+output_cost_per_mtok = 2.0
+```
+
+If either main price is omitted, the generic custom endpoint remains at the
+zero-price default and does not inherit a same-named marketplace model's
+price.
+
+The current custom-provider boundary is intentionally explicit:
+
+- protocol selection is available through the two fixed provider ids;
+- provider-scoped model overrides, base URL, proxy, and optional bearer key
+  are supported;
+- arbitrary user-named provider ids and arbitrary request headers are not yet
+  part of the persisted provider contract;
+- custom Anthropic auth is currently optional bearer only (`x-api-key` and
+  custom auth modes are not configurable), and custom protocol choices do not
+  yet include OpenAI Responses or native Gemini;
+- `custom` supports a guarded local-TOML `extra_body`; arbitrary request
+  transforms and custom headers are not exposed;
+- reasoning dialects are never inferred from an untrusted custom host—set
+  provider-scoped model metadata only when the endpoint contract is known.
+
 ### Volcengine Ark: regular vs coding-plan endpoints
 
 Use `volcengine` for regular Ark chat/completions models. Its default base URL
@@ -269,7 +430,7 @@ carries a `basis` label:
 | --- | --- |
 | `cache_aware` | All buckets present in the call have a known rate; the four-bucket math ran. |
 | `cache_blind` | The call used cache tokens but a needed cache rate is unknown, so OpenSquilla fell back to pricing every input token (cache or fresh) at the plain input rate. This is a conservative upper bound, not the real charge — expect it to overstate cost on cache-heavy sessions. |
-| `free` | The model or runtime is zero-priced (see local runtimes below). |
+| `free` | The model or runtime is zero-priced, including generic custom endpoints without complete price overrides. |
 
 ### Price Resolution Order
 
@@ -278,15 +439,19 @@ these layers, first match wins:
 
 1. **Local runtime** — `ollama`, `lm_studio`, `ovms`, `vllm`, and `local` are
    always free, regardless of model id.
-2. **User override** — `[models.<provider_id>."<model_id>"]` in your config
+2. **Generic custom endpoint** — `custom` and `custom_anthropic` use a
+   complete explicit input/output price override when present; otherwise they
+   resolve to zero with `priceSource="custom_free"` and stop before catalog,
+   live, static, or default cloud pricing.
+3. **User override** — `[models.<provider_id>."<model_id>"]` in your config
    (see [`configuration.md`](configuration.md) and `opensquilla.toml.example`).
-3. **Model catalog** — the vendored models.dev snapshot, including per-model
+4. **Model catalog** — the vendored models.dev snapshot, including per-model
    cache-read/cache-write rates where upstream publishes them.
-4. **Live OpenRouter endpoint price** — looked up only when the provider is
+5. **Live OpenRouter endpoint price** — looked up only when the provider is
    `openrouter` or unset (first-party provider ids never query the OpenRouter
    marketplace); falls back to the static table if OpenRouter is unreachable.
-5. **Static table** — a built-in pricing table bundled with OpenSquilla.
-6. **Default** — `$3` / `$15` per million input/output tokens when nothing
+6. **Static table** — a built-in pricing table bundled with OpenSquilla.
+7. **Default** — `$3` / `$15` per million input/output tokens when nothing
    else matched.
 
 If OpenSquilla is estimating a model at the wrong price, add an override
@@ -300,8 +465,10 @@ cache_read_cost_per_mtok = 0.05  # USD per million cached-prompt-read tokens
 cache_write_cost_per_mtok = 0.6  # USD per million cached-prompt-write tokens
 ```
 
-Quote model ids that contain dots or slashes. All four fields are optional —
-set only the ones you need to correct. `config.set`/`patch`/`apply` and
+Quote model ids that contain dots or slashes. For ordinary provider overrides,
+all four fields are optional. For `custom` and `custom_anthropic`, set
+`input_cost_per_mtok` and `output_cost_per_mtok` together to enable a nonzero
+estimate; cache rates remain optional. `config.set`/`patch`/`apply` and
 `opensquilla gateway reload` hot-apply these overrides; see
 `opensquilla.toml.example` for more examples including self-hosted `vllm` and
 `custom` endpoints.
@@ -316,15 +483,15 @@ exposed dual-cased as `cost_source`):
 | `provider_billed` | The full cost came from a real provider-reported bill. |
 | `opensquilla_estimate` | No billed cost was available; the figure is a local estimate. |
 | `mixed` | The same model had both billed and unbilled calls in the aggregated row — the total is billed cost plus an estimate for the rest, not a pure bill. |
-| `unavailable` | No pricing table entry and no billed cost, so no dollar figure could be produced. |
+| `unavailable` | No billed cost or positive local estimate is available. |
 
 Rows also carry two additive fields: `estimateBasis` (the `cache_aware` /
 `cache_blind` / `free` label above, present only when part of the row was
 estimated) and `priceSource` (which resolver layer priced it — `user_override`,
-`catalog`, `live_openrouter`, `static_table`, `default`, or `local_free`). The
-Web UI's by-model usage cards show a small source chip for `costSource` and,
-when the underlying basis is `cache_blind`, a hint that the figure is an
-upper bound rather than the real cache-discounted cost.
+`catalog`, `live_openrouter`, `static_table`, `default`, `local_free`, or
+`custom_free`). The Web UI's by-model usage cards show a small source chip for
+`costSource` and, when the underlying basis is `cache_blind`, a hint that the
+figure is an upper bound rather than the real cache-discounted cost.
 
 ### Which Providers Yield Billed vs. Estimated Cost
 
@@ -334,7 +501,7 @@ upper bound rather than the real cache-discounted cost.
 | Cache-aware estimate possible | `anthropic`, `deepseek`, `minimax` (Anthropic-shaped), ensemble members |
 | Cache-read-aware estimate only (no cache-write rate) | `openai`, `openai_responses`, `azure`, `gemini`, `openai_codex` |
 | Cache-blind estimate (falls back to plain input-rate pricing when cache tokens appear) | other OpenAI-compatible provider kinds |
-| Free | local runtimes (`ollama`, `lm_studio`, `ovms`, `vllm`, `local`) |
+| Zero-priced estimate | local runtimes (`ollama`, `lm_studio`, `ovms`, `vllm`, `local`) and `custom` / `custom_anthropic` without complete input/output price overrides |
 | Subscription (no invoice to compare against) | coding-plan/subscription provider kinds — treat any reported figure as an estimate, not a bill |
 
 Use `opensquilla providers status --probe-models` and `opensquilla cost
@@ -350,9 +517,12 @@ Two per-turn agent budgets exist and behave differently:
   do not rely on it alone outside `openrouter`.
 - `max_turn_cost_usd` gates on the same accumulator used everywhere else in
   this section: billed cost when the provider reports it, otherwise the
-  cache-aware/cache-blind estimate. It works on every provider. When it trips,
-  the error (`turn_cost_budget_exceeded`) states whether the total was billed,
-  estimated, or mixed.
+  cache-aware/cache-blind estimate. It can trip only when a call has billed
+  cost or a nonzero local estimate. A generic custom endpoint without complete
+  input/output price overrides resolves to zero, so configure both rates before
+  relying on this gate for a paid custom endpoint. When it trips, the error
+  (`turn_cost_budget_exceeded`) states whether the total was billed, estimated,
+  or mixed.
 
 SquillaRouter's session budget gate (`[squilla_router.budget]`, see
 [`features/squilla-router.md`](features/squilla-router.md)) logs a
@@ -391,4 +561,4 @@ Check:
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -44,6 +45,12 @@ def test_providers_configure_writes_config(tmp_path, monkeypatch):
     assert "openrouter" in text
     assert "deepseek/deepseek-v4-flash" in text
     assert "sk-test" not in result.stdout
+    config = tomllib.loads(text)
+    assert config["image_generation"] == {
+        "enabled": True,
+        "binding": "follow_llm",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+    }
 
 
 def test_providers_configure_unsupported_fails(tmp_path, monkeypatch):
@@ -95,3 +102,34 @@ def test_providers_configure_vllm_requires_base_url(tmp_path, monkeypatch):
         ],
     )
     assert result.exit_code == 0
+
+
+def test_providers_status_probe_column_surfaces_failure_kind(monkeypatch):
+    monkeypatch.setattr(
+        "opensquilla.cli.providers_cmd.run_gateway_sync",
+        lambda *_args, **_kwargs: {
+            "providers": [
+                {
+                    "providerId": "openrouter",
+                    "active": True,
+                    "configured": True,
+                    "buildable": True,
+                    "model": "openrouter/model",
+                    "error": "",
+                    "modelProbe": {
+                        "status": "error",
+                        "count": 0,
+                        "failureKind": "auth_invalid",
+                        "error": "HTTP 401 invalid credential",
+                    },
+                }
+            ]
+        },
+    )
+
+    result = runner.invoke(app, ["providers", "status", "--probe-models"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "probe" in result.stdout
+    assert "auth_invalid" in result.stdout
+    assert "HTTP 401" in result.stdout

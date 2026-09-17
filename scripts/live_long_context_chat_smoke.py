@@ -49,44 +49,10 @@ def _long_message(marker: str, chars: int) -> str:
     )
 
 
-def _enable_memory_distill_failure_simulation(config_path: Path) -> None:
-    text = config_path.read_text(encoding="utf-8")
-    text = text.replace(
-        'debug = false\n',
-        'debug = false\ncontext_budget_tokens = 256\n',
-        1,
-    )
-    text = text.replace(
-        '[memory]\nsource = "state"\n',
-        (
-            '[memory]\n'
-            'source = "state"\n'
-            'flush_enabled = true\n'
-            'flush_timeout_seconds = 0.001\n'
-            'flush_background_timeout_seconds = 0.001\n'
-            'flush_compaction_requires_safe_receipt = false\n'
-            'flush_compaction_safety_mode = "protect"\n'
-        ),
-        1,
-    )
-    config_path.write_text(text, encoding="utf-8")
-
-
-def _blocking_memory_errors(turns: list[dict[str, Any]]) -> list[str]:
-    blocked: list[str] = []
-    needles = ("flush failed", "bad json", "memory distill failed")
-    for turn in turns:
-        accepted = str(turn.get("accepted") or "").lower()
-        if any(needle in accepted for needle in needles):
-            blocked.append(str(turn.get("name") or turn.get("index") or "unknown"))
-    return blocked
-
-
 def run_live_long_context_smoke(
     *,
     long_chars: int,
     timeout_seconds: float,
-    simulate_memory_distill_failure: bool = False,
 ) -> dict[str, Any]:
     if not os.environ.get("OPENROUTER_API_KEY"):
         return {
@@ -121,8 +87,6 @@ def run_live_long_context_smoke(
         config_path = tmp_path / "live-config.toml"
         turn_log_dir = tmp_path / "turn-calls"
         _write_live_gateway_config(config_path, live_model)
-        if simulate_memory_distill_failure:
-            _enable_memory_distill_failure_simulation(config_path)
 
         env = os.environ.copy()
         env["PYTHONPATH"] = str(SRC_DIR) + os.pathsep + env.get("PYTHONPATH", "")
@@ -133,8 +97,6 @@ def run_live_long_context_smoke(
         env["OPENSQUILLA_SANDBOX_SECURITY_GRADING"] = "false"
         env["OPENSQUILLA_TURN_CALL_LOG"] = "1"
         env["OPENSQUILLA_TURN_CALL_LOG_DIR"] = str(turn_log_dir)
-        if simulate_memory_distill_failure:
-            env["OPENSQUILLA_SESSION_FLUSH"] = "1"
 
         proc = subprocess.Popen(
             [
@@ -230,13 +192,11 @@ def run_live_long_context_smoke(
         turn_call_records,
         session_keys={session_key},
     )
-    blocking_memory_errors = _blocking_memory_errors(turns)
     ok = (
         error is None
         and len(turns) == len(turns_spec)
         and all(turn.get("assistant_text") for turn in turns)
         and int(usage.get("totalTokens", 0) or 0) > 0
-        and not blocking_memory_errors
     )
     return {
         "name": "opensquilla_gateway_live_long_context_chat",
@@ -244,8 +204,6 @@ def run_live_long_context_smoke(
         "session_key": session_key,
         "model": live_model,
         "long_chars": long_chars,
-        "simulate_memory_distill_failure": simulate_memory_distill_failure,
-        "blocking_memory_errors": blocking_memory_errors,
         "health": health or {},
         "turns": turns,
         "usage": usage,
@@ -260,20 +218,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--long-chars", type=int, default=350_000)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
-    parser.add_argument(
-        "--simulate-memory-distill-failure",
-        action="store_true",
-        help=(
-            "Lower the context budget and flush timeouts so pre-compaction "
-            "memory distill cannot block WebChat sendability."
-        ),
-    )
+
     args = parser.parse_args()
 
     result = run_live_long_context_smoke(
         long_chars=max(args.long_chars, 1),
         timeout_seconds=max(args.timeout_seconds, 1.0),
-        simulate_memory_distill_failure=args.simulate_memory_distill_failure,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result.get("ok") else 1

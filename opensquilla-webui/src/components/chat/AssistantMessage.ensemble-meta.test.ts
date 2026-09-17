@@ -74,7 +74,7 @@ describe('AssistantMessage ensemble footer metadata', () => {
     unsafe.app.unmount()
   })
 
-  it('shows the current message token counts in its usage popover', async () => {
+  it('keeps model, cost, and token details behind one info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({
         meta: {
@@ -95,12 +95,131 @@ describe('AssistantMessage ensemble footer metadata', () => {
     el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')?.click()
     await nextTick()
 
-    expect(el.querySelector('.msg-meta-popover__label')?.textContent).toBe('tokens')
-    expect(el.querySelector('.msg-meta-popover__value')?.textContent).toBe('↑120 ↓40')
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
+    expect(el.querySelector('.msg-meta__model')).toBeNull()
+    expect(el.querySelector('.msg-meta__cost')).toBeNull()
+    const rows = Array.from(el.querySelectorAll('.msg-meta-popover__row')).map(row => row.textContent)
+    expect(rows).toContain('modelglm-5.2-20260616')
+    expect(rows).toContain('cost$0.050328')
+    expect(rows).toContain('tokens↑120 ↓40')
     app.unmount()
   })
 
-  it('does not present ensemble aggregate metadata as single-model footer metadata', async () => {
+  it('renders numeric ensemble costs without completeness warnings or dashes', async () => {
+    const { app, el } = await mountMessage(assistantMessage({
+      meta: {
+        model: 'free/ensemble',
+        modelShort: 'ensemble',
+        input: 20,
+        output: 4,
+        hasTokens: true,
+        cachedTokens: 0,
+        reasoningTokens: 0,
+        costUsd: 0.123,
+        hasSaved: false,
+        savedLabel: '',
+        usageUnknown: true,
+        coverageStatus: 'usage_unknown',
+        ensemble: {
+          profile: 'free',
+          modelCount: 2,
+          totalCandidates: 2,
+          requestCount: 2,
+          fallbackUsed: false,
+          fallbackReason: '',
+          costUsd: 0.123,
+          savedUsd: 0,
+          savedPct: 0,
+          models: [
+            {
+              role: 'proposer',
+              label: 'proposer',
+              provider: 'free',
+              model: 'free/proposer',
+              modelShort: 'proposer',
+              input: 10,
+              output: 2,
+              costUsd: 0,
+            },
+            {
+              role: 'aggregator',
+              label: 'aggregator',
+              provider: 'unknown',
+              model: 'unknown/aggregator',
+              modelShort: 'aggregator',
+              input: 10,
+              output: 2,
+              costUsd: 0.123,
+            },
+          ],
+        },
+      },
+    }))
+
+    el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')?.click()
+    await nextTick()
+
+    const rows = Array.from(el.querySelectorAll('.msg-meta-popover__row')).map(row => row.textContent)
+    expect(rows).toContain('cost$0.123')
+    expect(Array.from(el.querySelectorAll('.msg-meta-popover__model-cost')).map(node => node.textContent?.trim())).toEqual([
+      '$0',
+      '$0.123',
+    ])
+    expect(el.textContent).not.toContain('—')
+    expect(el.querySelector('[data-turn-usage-coverage="incomplete"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('supports hover, pinning, Escape, focus exit, and outside dismissal', async () => {
+    const { app, el } = await mountMessage(assistantMessage({
+      meta: {
+        model: 'test/model',
+        modelShort: 'model',
+        input: 120,
+        output: 40,
+        hasTokens: true,
+        cachedTokens: 12,
+        reasoningTokens: 8,
+        costUsd: 0.001,
+        hasSaved: false,
+        savedLabel: '',
+      },
+    }))
+    const root = el.querySelector<HTMLElement>('.msg-meta__more')!
+    const trigger = el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')!
+
+    root.dispatchEvent(new MouseEvent('mouseenter'))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).not.toBeNull()
+    root.dispatchEvent(new MouseEvent('mouseleave'))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).toBeNull()
+
+    trigger.click()
+    await nextTick()
+    expect(trigger.getAttribute('aria-expanded')).toBe('true')
+    root.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).toBeNull()
+    expect(document.activeElement).toBe(trigger)
+
+    trigger.click()
+    await nextTick()
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).toBeNull()
+
+    trigger.click()
+    await nextTick()
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    root.dispatchEvent(new FocusEvent('focusout', { relatedTarget: outside, bubbles: true }))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).toBeNull()
+    app.unmount()
+  })
+
+  it('keeps ensemble metadata behind the same single info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({
         meta: {
@@ -133,7 +252,67 @@ describe('AssistantMessage ensemble footer metadata', () => {
     expect(el.querySelector('.msg-meta__model')).toBeNull()
     expect(el.querySelector('.msg-meta__cost')).toBeNull()
     expect(el.querySelector('.savings-indicator')).toBeNull()
-    expect(el.querySelector('.msg-meta__ensemble')?.textContent).toBe('Ensemble · 5 models')
+    expect(el.querySelector('.msg-meta__ensemble')).toBeNull()
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
+    app.unmount()
+  })
+
+  it('uses only Proposer and Aggregator names in the ensemble model list', async () => {
+    const internalRoles = ['primary', 'contrast', 'fast_check', 'critic', 'aggregator']
+    const { app, el } = await mountMessage(assistantMessage({
+      meta: {
+        model: 'tokenrhythm/model-5',
+        modelShort: 'model-5',
+        input: 100,
+        output: 20,
+        hasTokens: true,
+        cachedTokens: 0,
+        reasoningTokens: 0,
+        costUsd: 0.05,
+        hasSaved: false,
+        savedLabel: '',
+        ensemble: {
+          profile: 'custom_b5',
+          modelCount: 4,
+          totalCandidates: 4,
+          requestCount: 5,
+          fallbackUsed: false,
+          fallbackReason: '',
+          costUsd: 0.05,
+          savedUsd: 0,
+          savedPct: 0,
+          models: internalRoles.map((role, index) => ({
+            role,
+            label: role,
+            provider: 'tokenrhythm',
+            model: `model-${index + 1}`,
+            modelShort: `model-${index + 1}`,
+            input: 10,
+            output: 2,
+            costUsd: 0.01,
+          })),
+        },
+      },
+    }))
+
+    el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')?.click()
+    await nextTick()
+
+    const displayedRoles = Array.from(
+      el.querySelectorAll<HTMLElement>('.msg-meta-popover__model-role'),
+      node => node.textContent?.trim(),
+    )
+    expect(displayedRoles).toEqual([
+      'Proposer ·',
+      'Proposer ·',
+      'Proposer ·',
+      'Proposer ·',
+      'Aggregator ·',
+    ])
+    expect(el.textContent).not.toContain('primary')
+    expect(el.textContent).not.toContain('contrast')
+    expect(el.textContent).not.toContain('fast check')
+    expect(el.textContent).not.toContain('critic')
     app.unmount()
   })
 
@@ -180,7 +359,7 @@ describe('AssistantMessage ensemble footer metadata', () => {
     app.unmount()
   })
 
-  it('keeps the savings badge for non-ensemble optimized messages', async () => {
+  it('does not show a savings badge beside the info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({
         meta: {
@@ -198,13 +377,23 @@ describe('AssistantMessage ensemble footer metadata', () => {
       }),
     )
 
-    expect(el.querySelector('.savings-indicator')?.textContent).toBe('Saved ~92%')
+    expect(el.querySelector('.savings-indicator')).toBeNull()
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
     app.unmount()
   })
 
-  it('keeps the ensemble summary broad enough on compact layouts', () => {
-    expect(source).not.toContain('max-width: 7rem;')
-    expect(source).toContain('max-width: min(14rem, 100%);')
+  it('does not render inline model, cost, ensemble, or savings metadata', () => {
+    expect(source).not.toContain('class="msg-meta__model"')
+    expect(source).not.toContain('class="msg-meta__cost"')
+    expect(source).not.toContain('class="msg-meta__ensemble"')
+    expect(source).not.toContain('class="savings-indicator"')
+  })
+
+  it('opens the info popover inward from the left edge of the message pane', () => {
+    const popoverRule = source.match(/\.msg-meta-popover\s*\{([^}]*)\}/)?.[1] || ''
+
+    expect(popoverRule).toMatch(/\bleft:\s*0;/)
+    expect(popoverRule).not.toContain('translateX(-50%)')
   })
 
   it('does not toggle share selection for stopped-output notices', async () => {

@@ -14,11 +14,13 @@ import subprocess
 import sys
 import threading
 import uuid
+from multiprocessing.connection import Connection
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import opensquilla.recovery.atomic as atomic_module
 from opensquilla.recovery import (
     AtomicStateUnknownError,
     CrossDeviceMoveError,
@@ -32,18 +34,24 @@ from opensquilla.recovery import (
 )
 from opensquilla.recovery.atomic import (
     PathIdentity,
+    _copy_windows_mount_point_no_follow,
     _linux_rename_no_replace,
     _macos_rename_no_replace,
     _manifest_matches_after_move,
+    _validated_windows_mount_point_buffer,
     _windows_extended_path,
     _windows_move_no_replace,
+    _windows_nt_create_relative_directory,
     _windows_rename_info,
     profile_no_follow_manifest,
 )
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.locking import (
     LegacyGatewayLock,
+    acquire_gateway_legacy_lease,
     acquire_legacy_gateway_locks,
+    profile_lock_key,
+    release_gateway_legacy_lease,
     user_state_dir,
 )
 
@@ -57,6 +65,33 @@ def _create_windows_junction(link: Path, target: Path) -> None:
     )
     if completed.returncode != 0:
         pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+
+
+def _mount_point_buffer(
+    substitute_name: str,
+    *,
+    print_name: str = "",
+    nul_terminated: bool = True,
+    reserved: int = 0,
+) -> bytes:
+    substitute = substitute_name.encode("utf-16-le")
+    printable = print_name.encode("utf-16-le")
+    separator = b"\0\0" if nul_terminated else b""
+    path_buffer = substitute + separator + printable + separator
+    print_offset = len(substitute) + len(separator)
+    return (
+        struct.pack(
+            "<IHHHHHH",
+            0xA0000003,
+            8 + len(path_buffer),
+            reserved,
+            0,
+            len(substitute),
+            print_offset,
+            len(printable),
+        )
+        + path_buffer
+    )
 
 
 def _contend_for_lock(home: str, state_root: str, queue: multiprocessing.Queue) -> None:
@@ -93,6 +128,18 @@ def test_user_state_override_is_used_with_the_explicit_test_gate(
     assert user_state_dir() == override
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows native path alias contract")
+def test_profile_lock_key_collapses_extended_length_alias(tmp_path: Path) -> None:
+    logical = tmp_path / "profile"
+    index = 0
+    while len(str(logical)) < 275:
+        logical /= f"profile-segment-{index:02d}-0123456789"
+        index += 1
+    native = Path(_windows_extended_path(logical))
+
+    assert profile_lock_key(logical) == profile_lock_key(native)
+
+
 def test_profile_lock_does_not_require_descriptor_chmod(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -105,17 +152,48 @@ def test_profile_lock_does_not_require_descriptor_chmod(
         assert profile_lock_path(tmp_path / "profile").is_file()
 
 
-def _contend_for_gateway(state_dir: str, queue: multiprocessing.Queue) -> None:
-    from opensquilla.gateway.pidlock import GatewayPidLock
-
-    lock = GatewayPidLock(state_dir)
+def _contend_for_gateway(state_dir: str, result_connection: Connection) -> None:
+    lease = None
     try:
-        lock.acquire()
-    except SystemExit:
-        queue.put("busy")
-    else:
-        queue.put("acquired")
-        lock.release()
+        lease = acquire_gateway_legacy_lease(state_dir)
+        result_connection.send("busy" if lease is None else "acquired")
+    finally:
+        try:
+            release_gateway_legacy_lease(lease)
+        finally:
+            result_connection.close()
+
+
+def _gateway_contention_result(state_dir: Path) -> str:
+    context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
+    result_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_contend_for_gateway,
+        args=(str(state_dir), child_connection),
+    )
+    result_timeout = 15 if sys.platform == "win32" else 10
+    started = False
+    try:
+        process.start()
+        started = True
+        child_connection.close()
+        assert result_connection.poll(result_timeout), (
+            "gateway contender did not report within "
+            f"{result_timeout}s (exitcode={process.exitcode})"
+        )
+        result = result_connection.recv()
+        process.join(timeout=5)
+    finally:
+        child_connection.close()
+        result_connection.close()
+        if started and process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if started and process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+    assert process.exitcode == 0
+    return result
 
 
 def test_profile_lock_is_same_process_reentrant_and_external(
@@ -194,13 +272,13 @@ def test_config_snapshot_rejects_windows_reparse_attribute_before_open(
 ) -> None:
     path = tmp_path / "config.toml"
     path.write_text("synthetic = true\n", encoding="utf-8")
-    original_lstat = Path.lstat
+    original_lstat = os.lstat
     original_open = os.open
     opened = False
 
-    def fake_lstat(candidate: Path):
+    def fake_lstat(candidate: str | bytes | os.PathLike[str] | os.PathLike[bytes]):
         value = original_lstat(candidate)
-        if candidate != path:
+        if not os.path.samefile(candidate, path):
             return value
         return SimpleNamespace(
             st_mode=stat.S_IFREG | 0o600,
@@ -218,7 +296,7 @@ def test_config_snapshot_rejects_windows_reparse_attribute_before_open(
             opened = True
         return original_open(candidate, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "lstat", fake_lstat)
+    monkeypatch.setattr(os, "lstat", fake_lstat)
     monkeypatch.setattr(os, "open", track_open)
 
     with pytest.raises(UnsafePathError):
@@ -335,6 +413,7 @@ def test_macos_primitive_collision_preserves_both_trees(tmp_path: Path) -> None:
     assert (destination / "value.txt").read_text(encoding="utf-8") == "destination"
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows rename")
 def test_windows_primitive_collision_preserves_both_trees(tmp_path: Path) -> None:
     source = tmp_path / "source"
@@ -351,6 +430,7 @@ def test_windows_primitive_collision_preserves_both_trees(tmp_path: Path) -> Non
     assert (destination / "value.txt").read_text(encoding="utf-8") == "destination"
 
 
+@pytest.mark.ci_serial
 def test_native_move_moves_a_regular_tree_between_real_parents(tmp_path: Path) -> None:
     source_parent = tmp_path / "source-parent"
     destination_parent = tmp_path / "destination-parent"
@@ -449,6 +529,7 @@ def test_move_manifest_allows_only_selected_lock_mtime_change() -> None:
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires two native Windows volumes")
 def test_windows_native_move_refuses_real_cross_volume_move() -> None:
     volume_a_value = os.environ.get("OPENSQUILLA_WINDOWS_TEST_VOLUME_A")
@@ -591,9 +672,7 @@ def test_profile_move_preserves_workspace_link_and_opaque_code_task(
     move_profile_no_replace(source, destination)
 
     moved_workspace_link = destination / workspace_relative / "LICENSE"
-    moved_code_task_link = (
-        destination / "code-task" / "run" / "repo" / ".venv" / "bin" / "python"
-    )
+    moved_code_task_link = destination / "code-task" / "run" / "repo" / ".venv" / "bin" / "python"
     assert not source.exists()
     assert os.readlink(moved_workspace_link) == "COPYING"
     assert os.readlink(moved_code_task_link) == "../../../../missing-python"
@@ -619,6 +698,7 @@ def test_profile_move_still_refuses_link_outside_workspace(tmp_path: Path) -> No
     assert not destination.exists()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows long paths")
 def test_windows_native_move_handles_real_path_longer_than_260_characters(
     tmp_path: Path,
@@ -628,23 +708,24 @@ def test_windows_native_move_handles_real_path_longer_than_260_characters(
         long_root /= f"segment-{index}-" + ("x" * 42)
     source_parent = long_root / "source-parent"
     destination_parent = long_root / "destination-parent"
-    source_parent.mkdir(parents=True)
-    destination_parent.mkdir(parents=True)
+    os.makedirs(_windows_extended_path(source_parent))
+    os.makedirs(_windows_extended_path(destination_parent))
     source = source_parent / "candidate-profile"
     destination = destination_parent / "published-profile"
-    source.mkdir()
-    (source / "value.txt").write_text("long-path-preserved", encoding="utf-8")
+    os.mkdir(_windows_extended_path(source))
+    with open(_windows_extended_path(source / "value.txt"), "w", encoding="utf-8") as handle:
+        handle.write("long-path-preserved")
     assert len(str(source)) > 260
     assert len(str(destination)) > 260
 
     native_move_no_replace(source, destination)
 
-    assert not source.exists()
-    assert (destination / "value.txt").read_text(encoding="utf-8") == (
-        "long-path-preserved"
-    )
+    assert not os.path.exists(_windows_extended_path(source))
+    with open(_windows_extended_path(destination / "value.txt"), encoding="utf-8") as handle:
+        assert handle.read() == "long-path-preserved"
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")
 def test_windows_native_move_rejects_real_junction_in_source_tree(tmp_path: Path) -> None:
     source = tmp_path / "source"
@@ -771,9 +852,7 @@ def test_macos_no_replace_binds_source_and_destination_parent_handles(
         restype = None
 
         def __call__(self, source_fd, source_name, destination_fd, destination_name, flags):
-            calls.append(
-                (source_fd, source_name, destination_fd, destination_name, flags)
-            )
+            calls.append((source_fd, source_name, destination_fd, destination_name, flags))
             return 0
 
     monkeypatch.setattr(
@@ -875,16 +954,7 @@ def test_legacy_gateway_lock_creates_and_keeps_absent_lock_in_existing_state(
 
     with LegacyGatewayLock(home):
         assert lock_path.is_file()
-        context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-        queue = context.Queue()
-        process = context.Process(
-            target=_contend_for_gateway,
-            args=(str(state), queue),
-        )
-        process.start()
-        process.join(timeout=10)
-        assert process.exitcode == 0
-        assert queue.get(timeout=1) == "busy"
+        assert _gateway_contention_result(state) == "busy"
 
     # Persistent identity prevents a successor from locking an unlinked inode
     # while a third process creates a new lock path.
@@ -957,16 +1027,7 @@ def test_legacy_gateway_lock_covers_external_effective_state(
 
     with LegacyGatewayLock(home):
         assert (external_state / "gateway.pid.lock").is_file()
-        context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-        queue = context.Queue()
-        process = context.Process(
-            target=_contend_for_gateway,
-            args=(str(external_state), queue),
-        )
-        process.start()
-        process.join(timeout=10)
-        assert process.exitcode == 0
-        assert queue.get(timeout=1) == "busy"
+        assert _gateway_contention_result(external_state) == "busy"
 
 
 def test_multi_root_legacy_acquisition_is_sorted_and_releases_partial_claims(
@@ -1094,6 +1155,7 @@ def test_windows_legacy_lock_handle_allows_share_delete_for_profile_swap(
     assert converted and converted[0][0] == 101
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows share-delete semantics")
 def test_windows_real_legacy_lock_survives_profile_move_and_rebind(tmp_path: Path) -> None:
     source = tmp_path / "source"
@@ -1103,18 +1165,10 @@ def test_windows_real_legacy_lock_survives_profile_move_and_rebind(tmp_path: Pat
     with LegacyGatewayLock(source):
         move_profile_no_replace(source, destination)
         with LegacyGatewayLock(destination):
-            context = multiprocessing.get_context("spawn")
-            queue = context.Queue()
-            process = context.Process(
-                target=_contend_for_gateway,
-                args=(str(destination / "state"), queue),
-            )
-            process.start()
-            process.join(timeout=15)
-            assert process.exitcode == 0
-            assert queue.get(timeout=2) == "busy"
+            assert _gateway_contention_result(destination / "state") == "busy"
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows lock handoff")
 def test_windows_real_replacement_locks_survive_two_profile_moves(tmp_path: Path) -> None:
     target = tmp_path / "target"
@@ -1126,19 +1180,11 @@ def test_windows_real_replacement_locks_survive_two_profile_moves(tmp_path: Path
     with LegacyGatewayLock(target), LegacyGatewayLock(staging):
         move_profile_no_replace(target, backup)
         move_profile_no_replace(staging, target)
-        context = multiprocessing.get_context("spawn")
         for state_root in (backup / "state", target / "state"):
-            queue = context.Queue()
-            process = context.Process(
-                target=_contend_for_gateway,
-                args=(str(state_root), queue),
-            )
-            process.start()
-            process.join(timeout=15)
-            assert process.exitcode == 0
-            assert queue.get(timeout=2) == "busy"
+            assert _gateway_contention_result(state_root) == "busy"
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows lock handoff")
 def test_windows_real_recent_locked_profile_tree_moves_without_metadata_false_positive(
     tmp_path: Path,
@@ -1157,9 +1203,7 @@ def test_windows_real_recent_locked_profile_tree_moves_without_metadata_false_po
         move_profile_no_replace(source, destination)
 
         assert not source.exists()
-        assert (destination / "config.toml").read_text(encoding="utf-8") == (
-            "port = 18791\n"
-        )
+        assert (destination / "config.toml").read_text(encoding="utf-8") == ("port = 18791\n")
         assert (destination / "workspace" / "SOUL.md").read_text(
             encoding="utf-8"
         ) == "synthetic soul\n"
@@ -1336,6 +1380,7 @@ def test_windows_handoff_keeps_external_state_lock_open(
         assert external_claim.fd == external_fd
 
 
+@pytest.mark.ci_serial
 def test_moved_legacy_lock_can_be_rebound_without_dropping_exclusion(
     tmp_path: Path,
 ) -> None:
@@ -1346,18 +1391,7 @@ def test_moved_legacy_lock_can_be_rebound_without_dropping_exclusion(
     with LegacyGatewayLock(staging):
         move_profile_no_replace(staging, target)
         with LegacyGatewayLock(target):
-            context = multiprocessing.get_context(
-                "spawn" if sys.platform == "win32" else "fork"
-            )
-            queue = context.Queue()
-            process = context.Process(
-                target=_contend_for_gateway,
-                args=(str(target / "state"), queue),
-            )
-            process.start()
-            process.join(timeout=10)
-            assert process.exitcode == 0
-            assert queue.get(timeout=1) == "busy"
+            assert _gateway_contention_result(target / "state") == "busy"
 
 
 @pytest.mark.skipif(
@@ -1737,9 +1771,7 @@ def test_windows_no_replace_pins_source_parent_source_and_destination_parent_han
                 202: source_stat,
                 303: destination_parent_stat,
             }[handle]
-            payload = struct.pack("<Q", value.st_dev) + int(value.st_ino).to_bytes(
-                16, "little"
-            )
+            payload = struct.pack("<Q", value.st_dev) + int(value.st_ino).to_bytes(16, "little")
             ctypes.memmove(buffer, payload, len(payload))
         else:  # pragma: no cover - contract assertion
             raise AssertionError(f"unexpected info class {info_class}")
@@ -1828,9 +1860,7 @@ def test_windows_no_replace_pins_source_parent_source_and_destination_parent_han
             0x00000001 | 0x00000002,
         ),
     ]
-    assert rename_calls == [
-        (202, 10, 0, 303, len(destination.name.encode("utf-16-le")))
-    ]
+    assert rename_calls == [(202, 10, 0, 303, len(destination.name.encode("utf-16-le")))]
     assert mapped_statuses == ([native_status] if native_status < 0 else [])
     assert mutation_events == ["guard-enter", "failpoint", "rename", "guard-exit"]
     assert closed == [303, 202, 101]
@@ -1873,6 +1903,7 @@ def test_windows_rename_info_rejects_invalid_leaf_names(destination_name: str) -
         _windows_rename_info(destination_name, 123)
 
 
+@pytest.mark.ci_serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows sharing semantics")
 def test_windows_no_replace_pins_both_parents_during_real_mutation_window(
     tmp_path: Path,
@@ -1912,3 +1943,435 @@ def test_windows_no_replace_pins_both_parents_during_real_mutation_window(
     assert not renamed_destination_parent.exists()
     assert not source.exists()
     assert (destination / "value.txt").read_text(encoding="utf-8") == "preserved\n"
+
+
+def test_windows_junction_directory_create_is_parent_relative_and_exclusive() -> None:
+    calls: list[tuple[object, ...]] = []
+    closed: list[int] = []
+
+    class FakeNtCreateFile:
+        def __call__(self, *args: object) -> int:
+            calls.append(args)
+            args[0]._obj.value = 202  # type: ignore[attr-defined]
+            args[3]._obj.information = 2  # type: ignore[attr-defined]
+            return 0
+
+    handle = _windows_nt_create_relative_directory(
+        FakeNtCreateFile(),
+        lambda _status: 5,
+        lambda value: closed.append(int(value)) or 1,
+        parent_handle=101,
+        name="copied-junction",
+    )
+
+    assert handle == 202
+    assert closed == []
+    assert len(calls) == 1
+    (
+        _handle_out,
+        desired_access,
+        object_attributes_pointer,
+        _io_status,
+        _allocation_size,
+        file_attributes,
+        share_access,
+        create_disposition,
+        create_options,
+        _ea_buffer,
+        _ea_length,
+    ) = calls[0]
+    object_attributes = object_attributes_pointer._obj  # type: ignore[attr-defined]
+    unicode_name = object_attributes.object_name.contents
+    assert object_attributes.root_directory == 101
+    encoded_name = ctypes.string_at(unicode_name.buffer, unicode_name.length)
+    assert encoded_name.decode("utf-16-le") == "copied-junction"
+    assert int(desired_access) == 0x00010000 | 0x00000080 | 0x00000100 | 0x00100000
+    assert int(file_attributes) == 0x10
+    assert int(share_access) == 0
+    assert int(create_disposition) == 2  # FILE_CREATE, never open an existing leaf
+    assert int(create_options) == 0x00000001 | 0x00000020 | 0x00200000
+
+
+@pytest.mark.parametrize(
+    "native_status",
+    [0xC0000035, ctypes.c_int32(0xC0000035).value, 0x40000000],
+)
+def test_windows_junction_directory_create_maps_all_collision_spellings(
+    native_status: int,
+) -> None:
+    class FakeNtCreateFile:
+        def __call__(self, *args: object) -> int:
+            return native_status
+
+    with pytest.raises(FileExistsError):
+        _windows_nt_create_relative_directory(
+            FakeNtCreateFile(),
+            lambda _status: 5,
+            lambda _value: 1,
+            parent_handle=101,
+            name="already-there",
+        )
+
+
+def test_windows_junction_directory_create_reports_mapped_ntstatus() -> None:
+    class FakeNtCreateFile:
+        def __call__(self, *args: object) -> int:
+            return ctypes.c_int32(0xC0000022).value
+
+    with pytest.raises(
+        UnsafePathError,
+        match=r"NTSTATUS 0xc0000022, Windows error 5",
+    ):
+        _windows_nt_create_relative_directory(
+            FakeNtCreateFile(),
+            lambda status: 5 if status == ctypes.c_int32(0xC0000022).value else 317,
+            lambda _value: 1,
+            parent_handle=101,
+            name="denied-junction",
+        )
+
+
+def test_windows_junction_directory_create_rejects_informational_status() -> None:
+    closed: list[int] = []
+
+    class FakeNtCreateFile:
+        def __call__(self, *args: object) -> int:
+            args[0]._obj.value = 202  # type: ignore[attr-defined]
+            args[3]._obj.information = 2  # type: ignore[attr-defined]
+            return 0x00000104  # STATUS_REPARSE is not an unambiguous creation success
+
+    with pytest.raises(AtomicStateUnknownError, match="informational status 0x00000104"):
+        _windows_nt_create_relative_directory(
+            FakeNtCreateFile(),
+            lambda _status: 317,
+            lambda value: closed.append(int(value)) or 1,
+            parent_handle=101,
+            name="ambiguous-junction",
+        )
+
+    assert closed == [202]
+
+
+def test_windows_junction_directory_create_rejects_unknown_provenance() -> None:
+    closed: list[int] = []
+
+    class FakeNtCreateFile:
+        def __call__(self, *args: object) -> int:
+            args[0]._obj.value = 202  # type: ignore[attr-defined]
+            args[3]._obj.information = 1  # type: ignore[attr-defined]
+            return 0
+
+    with pytest.raises(AtomicStateUnknownError, match="did not report a newly created"):
+        _windows_nt_create_relative_directory(
+            FakeNtCreateFile(),
+            lambda _status: 5,
+            lambda value: closed.append(int(value)) or 1,
+            parent_handle=101,
+            name="uncertain-junction",
+        )
+
+    assert closed == [202]
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "nested/name", r"nested\name", "bad\0name"])
+def test_windows_junction_directory_create_rejects_non_leaf_names(name: str) -> None:
+    with pytest.raises(UnsafePathError, match="leaf name"):
+        _windows_nt_create_relative_directory(
+            lambda *_args: 0,
+            lambda _status: 5,
+            lambda _value: 1,
+            parent_handle=101,
+            name=name,
+        )
+
+
+def test_windows_mount_point_buffer_accepts_nonterminated_names_and_clears_reserved() -> None:
+    raw = _mount_point_buffer(
+        r"\??\C:\profile\workspace",
+        nul_terminated=False,
+        reserved=91,
+    )
+
+    validated = _validated_windows_mount_point_buffer(raw)
+
+    assert struct.unpack_from("<H", validated, 6)[0] == 0
+    assert validated[:6] == raw[:6]
+    assert validated[8:] == raw[8:]
+
+
+@pytest.mark.parametrize(
+    "substitute_name",
+    [
+        r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\workspace",
+        r"\??\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\workspace",
+        r"\??\UNC\server\share\workspace",
+        r"\??\C:\safe\..\outside",
+    ],
+)
+def test_windows_mount_point_buffer_rejects_nonlocal_or_dot_targets(
+    substitute_name: str,
+) -> None:
+    with pytest.raises(UnsafePathError):
+        _validated_windows_mount_point_buffer(_mount_point_buffer(substitute_name))
+
+
+def test_windows_mount_point_buffer_rejects_wrong_tag_odd_offsets_and_truncation() -> None:
+    valid = _mount_point_buffer(r"\??\C:\profile\workspace")
+    wrong_tag = bytearray(valid)
+    struct.pack_into("<I", wrong_tag, 0, 0xA000000C)
+    odd_offset = bytearray(valid)
+    struct.pack_into("<H", odd_offset, 8, 1)
+
+    for malformed in (bytes(wrong_tag), bytes(odd_offset), valid[:-1]):
+        with pytest.raises(UnsafePathError):
+            _validated_windows_mount_point_buffer(malformed)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")
+def test_windows_mount_point_copy_preserves_tag_and_never_uses_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("outside\n", encoding="utf-8")
+    source = tmp_path / "source-junction"
+    destination = tmp_path / "copied-junction"
+    _create_windows_junction(source, target)
+    source_target = os.readlink(source)
+
+    monkeypatch.setattr(
+        os,
+        "symlink",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("junction copying must not call os.symlink")
+        ),
+    )
+    monkeypatch.setattr(
+        os,
+        "mkdir",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("junction creation must stay parent-handle-relative")
+        ),
+    )
+
+    _copy_windows_mount_point_no_follow(source, destination)
+
+    assert os.path.isjunction(source)
+    assert os.path.isjunction(destination)
+    assert source.lstat().st_reparse_tag == destination.lstat().st_reparse_tag == 0xA0000003
+    assert os.readlink(destination) == source_target
+    assert os.path.samefile(destination, target)
+    assert sentinel.read_text(encoding="utf-8") == "outside\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")
+def test_windows_mount_point_copy_publishes_complete_temporary_no_replace(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    source = tmp_path / "source-junction"
+    temporary = tmp_path / ".junction-transaction.tmp"
+    destination = tmp_path / "published-junction"
+    _create_windows_junction(source, target)
+
+    _copy_windows_mount_point_no_follow(
+        source,
+        temporary,
+        publish_destination=destination,
+    )
+
+    assert not os.path.lexists(temporary)
+    assert os.path.isjunction(destination)
+    assert os.path.samefile(destination, target)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")
+def test_windows_mount_point_publish_collision_preserves_existing_destination(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    source = tmp_path / "source-junction"
+    temporary = tmp_path / ".junction-transaction.tmp"
+    destination = tmp_path / "existing-destination"
+    _create_windows_junction(source, target)
+    destination.mkdir()
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_text("preserved\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        _copy_windows_mount_point_no_follow(
+            source,
+            temporary,
+            publish_destination=destination,
+        )
+
+    assert not os.path.lexists(temporary)
+    assert destination.is_dir()
+    assert not os.path.isjunction(destination)
+    assert sentinel.read_text(encoding="utf-8") == "preserved\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")
+def test_windows_mount_point_post_publish_failure_never_deletes_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("outside\n", encoding="utf-8")
+    source = tmp_path / "source-junction"
+    temporary = tmp_path / ".junction-transaction.tmp"
+    destination = tmp_path / "published-junction"
+    _create_windows_junction(source, target)
+    real_path_identity = atomic_module.path_identity
+    identity_calls = 0
+
+    def fail_after_publish(path, *, follow_symlinks=False):
+        nonlocal identity_calls
+        identity_calls += 1
+        if identity_calls == 6:
+            raise RuntimeError("injected after atomic junction publish")
+        return real_path_identity(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(atomic_module, "path_identity", fail_after_publish)
+
+    with pytest.raises(AtomicStateUnknownError, match="publish completed or became ambiguous"):
+        _copy_windows_mount_point_no_follow(
+            source,
+            temporary,
+            publish_destination=destination,
+        )
+
+    assert identity_calls == 6
+    assert not os.path.lexists(temporary)
+    assert os.path.isjunction(destination)
+    assert os.path.samefile(destination, target)
+    assert sentinel.read_text(encoding="utf-8") == "outside\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows handle sharing")
+def test_windows_mount_point_copy_binds_source_and_pins_writable_paths_during_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_parent = tmp_path / "source-parent"
+    destination_parent = tmp_path / "destination-parent"
+    source_parent.mkdir()
+    destination_parent.mkdir()
+    target = tmp_path / "outside"
+    target.mkdir()
+    source = source_parent / "source-junction"
+    destination = destination_parent / "copied-junction"
+    _create_windows_junction(source, target)
+
+    real_win_dll = ctypes.WinDLL
+    kernel32 = real_win_dll("kernel32", use_last_error=True)
+    ntdll = real_win_dll("ntdll")
+    real_device_io_control = kernel32.DeviceIoControl
+    blocked: list[str] = []
+    unexpectedly_moved: list[str] = []
+
+    class DeviceIoControlProbe:
+        argtypes = None
+        restype = None
+        probed = False
+
+        def __call__(self, *args: object) -> int:
+            real_device_io_control.argtypes = self.argtypes
+            real_device_io_control.restype = self.restype
+            if int(args[1]) == 0x000900A4 and not self.probed:
+                self.probed = True
+                attempts = (
+                    ("source", source, source_parent / "moved-source"),
+                    ("parent", destination_parent, tmp_path / "moved-parent"),
+                    ("destination", destination, destination_parent / "moved-destination"),
+                )
+                for label, current, moved in attempts:
+                    try:
+                        current.rename(moved)
+                    except OSError:
+                        blocked.append(label)
+                    else:
+                        unexpectedly_moved.append(label)
+                        moved.rename(current)
+            return int(real_device_io_control(*args))
+
+    kernel32_proxy = SimpleNamespace(
+        CreateFileW=kernel32.CreateFileW,
+        DeviceIoControl=DeviceIoControlProbe(),
+        GetFileInformationByHandleEx=kernel32.GetFileInformationByHandleEx,
+        SetFileInformationByHandle=kernel32.SetFileInformationByHandle,
+        CloseHandle=kernel32.CloseHandle,
+    )
+    monkeypatch.setattr(
+        atomic_module.ctypes,
+        "WinDLL",
+        lambda name, **_kwargs: kernel32_proxy if name == "kernel32" else ntdll,
+    )
+
+    _copy_windows_mount_point_no_follow(source, destination)
+
+    assert {"parent", "destination"}.issubset(blocked)
+    assert not {"parent", "destination"}.intersection(unexpectedly_moved)
+    assert os.path.isjunction(source)
+    assert os.path.isjunction(destination)
+    assert os.path.samefile(destination, target)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")
+def test_windows_mount_point_copy_never_replaces_existing_destination(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    source = tmp_path / "source-junction"
+    _create_windows_junction(source, target)
+    destination = tmp_path / "existing-destination"
+    destination.mkdir()
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_text("preserved\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        _copy_windows_mount_point_no_follow(source, destination)
+
+    assert destination.is_dir()
+    assert not os.path.isjunction(destination)
+    assert sentinel.read_text(encoding="utf-8") == "preserved\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")
+def test_windows_mount_point_copy_post_set_failure_deletes_only_its_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("outside\n", encoding="utf-8")
+    source = tmp_path / "source-junction"
+    destination = tmp_path / "failed-junction"
+    _create_windows_junction(source, target)
+    real_path_identity = atomic_module.path_identity
+    identity_calls = 0
+
+    def fail_after_set(path, *, follow_symlinks=False):
+        nonlocal identity_calls
+        identity_calls += 1
+        if identity_calls == 4:
+            raise RuntimeError("injected after FSCTL_SET_REPARSE_POINT")
+        return real_path_identity(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(atomic_module, "path_identity", fail_after_set)
+
+    with pytest.raises(RuntimeError, match="injected after"):
+        _copy_windows_mount_point_no_follow(source, destination)
+
+    assert identity_calls == 4
+    assert not os.path.lexists(destination)
+    assert os.path.isjunction(source)
+    assert sentinel.read_text(encoding="utf-8") == "outside\n"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
@@ -34,6 +35,7 @@ from opensquilla.cli.tui.adapters.slash_common import (
     slash_parts as _slash_parts,
 )
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
+from opensquilla.cli.tui.opentui.context import send_model_routing_state
 from opensquilla.cli.ui import ACCENT, console, error_panel
 from opensquilla.engine.commands import Surface
 from opensquilla.observability.network_policy import (
@@ -41,14 +43,13 @@ from opensquilla.observability.network_policy import (
 )
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
-    derive_provider_request_correlation,
 )
 from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
 )
 from opensquilla.session.compaction_lifecycle import (
-    flush_receipt_is_successful_flush,
+    durable_receipt_allows_destructive_compaction,
     new_compaction_id,
 )
 
@@ -137,13 +138,29 @@ class StandaloneCompactSession(Protocol):
     ) -> Awaitable[str]: ...
 
 
-class StandaloneFlushTranscript(Protocol):
+class StandaloneCheckpointTranscript(Protocol):
     def __call__(
         self,
-        transcript: object,
         session_key: str,
+        transcript: object,
         **kwargs: Any,
     ) -> Awaitable[Any]: ...
+
+
+class StandaloneGetSessionRouting(Protocol):
+    def __call__(self, session_key: str) -> Awaitable[dict[str, Any]] | dict[str, Any]:
+        pass
+
+
+class StandaloneSetSessionRouting(Protocol):
+    def __call__(
+        self,
+        session_key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]:
+        pass
 
 
 @dataclass
@@ -154,7 +171,9 @@ class StandaloneSlashServices:
     truncate_session: StandaloneTruncateSession | None = None
     compact_session: StandaloneCompactSession | None = None
     compact_with_result: CompactWithResult | None = None
-    flush_transcript: StandaloneFlushTranscript | None = None
+    checkpoint_transcript: StandaloneCheckpointTranscript | None = None
+    get_session_routing: StandaloneGetSessionRouting | None = None
+    set_session_routing: StandaloneSetSessionRouting | None = None
     config: object | None = None
     provider_selector: object | None = None
 
@@ -314,84 +333,44 @@ async def _read_standalone_transcript(
     return None
 
 
-async def _flush_before_standalone_rewrite(
+async def _checkpoint_before_standalone_rewrite(
     slash_services: StandaloneSlashServices,
     session_key: str,
     *,
     operation: str,
-    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> bool:
-    """Fail closed before reset; compact can continue on flush degradation."""
-    compaction_operation = operation.strip().lower() == "compact"
+    """Preserve the removed transcript before a standalone reset."""
     transcript = await _read_standalone_transcript_handle(
-        slash_services.read_transcript,
-        session_key,
+        slash_services.read_transcript, session_key,
     )
     if transcript is None:
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: could not inspect durable transcript; "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        console.print(
-            f"[yellow]{operation} aborted: could not inspect the durable transcript.[/yellow]"
-        )
+        console.print(f"[yellow]{operation} aborted: could not inspect the transcript.[/yellow]")
         return False
     if not transcript:
         return True
-
-    flush_transcript = slash_services.flush_transcript
-    if flush_transcript is None:
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: flush service is unavailable; "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
+    checkpoint = slash_services.checkpoint_transcript
+    if checkpoint is None or slash_services.get_session is None:
         console.print(
-            f"[yellow]{operation} aborted: flush service is unavailable and "
-            "the durable transcript is non-empty.[/yellow]"
+            f"[yellow]{operation} aborted: transcript checkpoint is unavailable.[/yellow]"
         )
         return False
-
     try:
-        flush_kwargs: dict[str, Any] = {
-            "agent_id": "main",
-            "timeout": 30.0,
-            "message_window": 0,
-            "segment_mode": "auto",
-        }
-        if provider_request_correlation is not None:
-            flush_kwargs["provider_request_correlation"] = (
-                provider_request_correlation
-            )
-            flush_kwargs["turn_id"] = provider_request_correlation.turn_id
-        receipt = await flush_transcript(
-            transcript,
+        session = await _maybe_await(slash_services.get_session(session_key))
+        if session is None:
+            raise RuntimeError("session is unavailable")
+        receipt = await checkpoint(
             session_key,
-            **flush_kwargs,
+            transcript,
+            source="standalone_reset",
+            expected_session_id=session.session_id,
+            expected_session_epoch=getattr(session, "epoch", None),
         )
-    except Exception as exc:  # noqa: BLE001
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: flush failed ({exc}); "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        console.print(f"[yellow]{operation} aborted: flush failed ({exc}).[/yellow]")
-        return False
-
-    if not flush_receipt_is_successful_flush(receipt):
-        if compaction_operation:
-            error = getattr(receipt, "error", None) or "degraded receipt"
-            console.print(
-                f"[yellow]{operation}: flush failed ({error}); "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        error = getattr(receipt, "error", None) or "unknown error"
-        console.print(f"[yellow]{operation} aborted: flush failed ({error}).[/yellow]")
+        if not durable_receipt_allows_destructive_compaction(receipt):
+            raise RuntimeError("transcript checkpoint failed")
+    except Exception:
+        console.print(
+            f"[yellow]{operation} aborted: transcript checkpoint could not be saved.[/yellow]"
+        )
         return False
     return True
 
@@ -480,6 +459,11 @@ async def _replace_with_new_session(
     if create_session is None:
         raise RuntimeError("standalone chat requires session manager")
     await create_session(session_key, agent_id="main")
+    if context.slash_services.get_session_routing is not None:
+        # Materialize the global default at session creation time.  Without
+        # this read a global change between /new and the first message would
+        # incorrectly change the new session's initial routing mode.
+        await _maybe_await(context.slash_services.get_session_routing(session_key))
     state = ChatSessionState(session_key=session_key, model=context.model)
     tool_ctx = context.build_tool_ctx(session_key)
 
@@ -514,31 +498,66 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         call_kind="auxiliary.compaction",
         turn_id=compaction_id,
     )
-    safe_to_compact = await _flush_before_standalone_rewrite(
-        slash_services,
-        context.session_key,
-        operation="Compact",
-        provider_request_correlation=derive_provider_request_correlation(
-            compaction_correlation,
-            execution_id=uuid4().hex,
-            call_kind="auxiliary.session_flush",
-        ),
-    )
-    if not safe_to_compact:
-        return
-
     console.print(f"[{ACCENT}]compacting context...[/]")
     config = slash_services.config
-    context_window = (
+    configured_context_cap = (
         getattr(config, "context_budget_tokens", 100_000) if config is not None else 100_000
     )
-    compaction_config = build_compaction_config_from_provider(
-        _resolve_compaction_provider(
+    session = None
+    if slash_services.get_session is not None:
+        try:
+            session = await _maybe_await(
+                slash_services.get_session(context.session_key)
+            )
+        except Exception:  # noqa: BLE001 - target fallback remains isolated
+            session = None
+    if session is None:
+        session = SimpleNamespace(
+            session_key=context.session_key,
+            model=context.model,
+            model_override=None,
+            model_provider=None,
+            provider_override=None,
+        )
+    from opensquilla.gateway.compaction_target import (
+        build_gateway_consumer_admission,
+        limit_gateway_consumer_budget,
+        resolve_gateway_compaction_target,
+        resolve_gateway_consumer_budget,
+    )
+
+    gateway_context = SimpleNamespace(
+        config=config,
+        provider_selector=slash_services.provider_selector,
+    )
+    consumer_budget = resolve_gateway_consumer_budget(
+        gateway_context,
+        session,
+    )
+    consumer_budget = limit_gateway_consumer_budget(
+        consumer_budget,
+        max(1, int(configured_context_cap or 1)),
+    )
+    context_window = consumer_budget.context_window_tokens
+    consumer_admission, consumer_admission_fingerprint = (
+        build_gateway_consumer_admission(consumer_budget)
+    )
+    target = resolve_gateway_compaction_target(
+        gateway_context,
+        session,
+    )
+    compaction_provider = target.provider
+    if compaction_provider is None and not target.blocked_reason:
+        compaction_provider = _resolve_compaction_provider(
             slash_services.provider_selector,
             context.model,
-        ),
-        model_override=context.model,
+        )
+    compaction_config = build_compaction_config_from_provider(
+        compaction_provider,
+        model_override=target.model or context.model,
         compaction_config=getattr(config, "compaction", None),
+        compaction_plan=target.plan,
+        context_window_tokens=context_window,
     )
     try:
         if compact_with_result is not None:
@@ -570,6 +589,28 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
                 for parameter in parameters
             ):
                 compact_kwargs["trigger_reason"] = "manual"
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "context_window_chars"
+                for parameter in parameters
+            ):
+                compact_kwargs["context_window_chars"] = (
+                    consumer_budget.provider_request_max_chars
+                )
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "consumer_admission"
+                for parameter in parameters
+            ):
+                compact_kwargs["consumer_admission"] = consumer_admission
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "consumer_admission_fingerprint"
+                for parameter in parameters
+            ):
+                compact_kwargs["consumer_admission_fingerprint"] = (
+                    consumer_admission_fingerprint
+                )
             result = await compact_with_result(
                 context.session_key,
                 context_window,
@@ -634,6 +675,72 @@ async def handle_standalone_slash_command(
         await dispatch_theme_command(cmd, context.tui_output)
         return True
 
+    if parts := _slash_parts(cmd, "/routing"):
+        argument = parts[1].strip().lower() if len(parts) > 1 else ""
+        if argument not in {"", "direct", "router", "ensemble"}:
+            console.print("[red]Usage: /routing [direct|router|ensemble][/red]")
+            return True
+        get_routing = context.slash_services.get_session_routing
+        set_routing = context.slash_services.set_session_routing
+        if get_routing is None or set_routing is None:
+            console.print("[yellow]Session routing service is unavailable.[/yellow]")
+            return True
+        try:
+            snapshot = await _maybe_await(get_routing(context.session_key))
+        except Exception as exc:  # noqa: BLE001 - keep the TUI recoverable.
+            console.print(f"[red]Could not read session routing.[/red] [dim]{exc}[/dim]")
+            return True
+
+        if not argument:
+            send = getattr(context.tui_output, "send_message", None)
+            if bool(
+                getattr(context.tui_output, "supports_send_message", False)
+            ) and callable(send):
+                await send(
+                    "model.routing.picker",
+                    {
+                        "current": snapshot.get("mode", "direct"),
+                        "options": ["direct", "router", "ensemble"],
+                        "command": "/routing",
+                        "title": "session model routing",
+                    },
+                )
+                return True
+            console.print(
+                "[dim]session routing[/dim] "
+                f"[bold]{snapshot.get('mode', 'direct')}[/bold]"
+            )
+            return True
+
+        try:
+            snapshot = await _maybe_await(
+                set_routing(
+                    context.session_key,
+                    argument,
+                    expected_revision=int(snapshot.get("revision") or 0),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the TUI recoverable.
+            console.print(f"[red]Session routing change failed.[/red] [dim]{exc}[/dim]")
+            return True
+
+        mode = str(snapshot.get("mode") or argument)
+        await send_model_routing_state(
+            context.tui_output,
+            {
+                **snapshot,
+                "mode": mode,
+                "router_enabled": mode == "router",
+                "ensemble_enabled": mode == "ensemble",
+                "applies_to": snapshot.get("appliesTo", "next_accepted_turn"),
+            },
+        )
+        console.print(
+            f"[green]session routing:[/green] {mode} "
+            "[dim](applies to the next accepted turn)[/dim]"
+        )
+        return True
+
     if (
         _slash_parts(cmd, "/strategy")
         or _slash_parts(cmd, "/router")
@@ -692,16 +799,8 @@ async def handle_standalone_slash_command(
     if cmd in {"/clear", "/reset"}:
         truncate_session = context.slash_services.truncate_session
         if truncate_session is not None:
-            flush_correlation = await _standalone_maintenance_correlation(
-                context.slash_services,
-                context.session_key,
-                call_kind="auxiliary.session_flush",
-            )
-            safe_to_reset = await _flush_before_standalone_rewrite(
-                context.slash_services,
-                context.session_key,
-                operation="Reset",
-                provider_request_correlation=flush_correlation,
+            safe_to_reset = await _checkpoint_before_standalone_rewrite(
+                context.slash_services, context.session_key, operation="Reset",
             )
             if not safe_to_reset:
                 return True

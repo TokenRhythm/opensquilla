@@ -53,7 +53,10 @@ export function createWebPlatform(): Platform {
     },
     settings: {},
     onboarding: {},
+    migration: {},
+    window: {},
     files: {},
+    workbench: {},
     updates: {
       getState: webUpdateState,
       check: webUpdateState,

@@ -17,7 +17,14 @@ interface FieldSpec {
   required?: boolean
   placeholder?: string
   description?: string
+  descriptionPresentation?: 'inline' | 'info'
   [key: string]: unknown
+}
+
+interface LeadingOption {
+  value: string
+  label: string
+  description?: string
 }
 
 const props = defineProps<{
@@ -33,6 +40,16 @@ const props = defineProps<{
   // Embedded form rows can opt into the shared input chrome without changing
   // compact tier-table cells that already provide their own styling.
   inputClass?: string
+  // Optional status/help text rendered by the parent outside this component.
+  // This keeps compact table cells accessible without duplicating visible copy.
+  externalDescriptionId?: string
+  // Optional semantic choice pinned above provider models. Router C3 uses it
+  // for the shared multi-model plan while retaining free-text model entry.
+  leadingOption?: LeadingOption
+  // Semantic pickers can keep search text local until the user explicitly
+  // chooses a catalog row (or the "use typed value" row). This prevents a
+  // search query from changing the saved processing mode while it is typed.
+  commitOnSelect?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -60,18 +77,44 @@ const listStyle = ref<Record<string, string>>({})
 // dropdown (focus / arrow keys) always shows every model, and the query filter
 // only kicks in once the user edits the text during this open.
 const typedSinceOpen = ref(false)
+const localInputValue = ref('')
 
 const fieldId = computed(() => `setup-provider-${String(props.field.name || 'model')}`)
 const fieldName = computed(() => `setup_provider_${String(props.field.name || 'model')}`)
 const fieldDescriptionId = computed(() => `${fieldId.value}-description`)
+const fieldTooltipId = computed(() => `${fieldId.value}-info-tooltip`)
 
-const query = computed(() => String(props.value || '').trim().toLowerCase())
+const leadingSelected = computed(() => Boolean(
+  props.leadingOption && props.value === props.leadingOption.value,
+))
+const committedDisplayValue = computed(() => (
+  leadingSelected.value ? props.leadingOption?.label || '' : props.value
+))
+const inputDisplayValue = computed(() => (
+  props.commitOnSelect ? localInputValue.value : committedDisplayValue.value
+))
+const typedValue = computed(() => (
+  props.commitOnSelect ? localInputValue.value : String(props.value || '')
+))
+const query = computed(() => (
+  leadingSelected.value && !(props.commitOnSelect && typedSinceOpen.value)
+    ? ''
+    : typedValue.value.trim().toLowerCase()
+))
 const catalogAvailable = computed(() => (
-  !props.disabled && props.modelSource === 'live' && props.models.length > 0
+  !props.disabled
+  && (
+    Boolean(props.leadingOption)
+    || (
+      (props.modelSource === 'live' || props.modelSource === 'catalog')
+      && props.models.length > 0
+    )
+  )
 ))
 const describedBy = computed(() => {
   const ids: string[] = []
   if (!props.cell && props.field.description) ids.push(fieldDescriptionId.value)
+  if (props.externalDescriptionId) ids.push(props.externalDescriptionId)
   if (catalogAvailable.value) ids.push(`${fieldId.value}-catalog-count`)
   return ids.join(' ') || undefined
 })
@@ -79,6 +122,11 @@ const describedBy = computed(() => {
 // The discovered id exactly matching the field's current value, if any.
 const selectedId = computed(() => {
   const typed = String(props.value || '').trim()
+  return typed && props.models.some(model => model.id === typed) ? typed : ''
+})
+
+const typedExactId = computed(() => {
+  const typed = typedValue.value.trim()
   return typed && props.models.some(model => model.id === typed) ? typed : ''
 })
 
@@ -101,27 +149,38 @@ const truncatedCount = computed(() => Math.max(0, matches.value.length - visible
 // The escape hatch: whatever was typed is always usable as-is. Shown whenever
 // there is typed text that is not an exact discovered id.
 const showFreeTextRow = computed(() => {
-  const typed = String(props.value || '').trim()
+  if (leadingSelected.value && !(props.commitOnSelect && typedSinceOpen.value)) return false
+  const typed = typedValue.value.trim()
   if (!typed) return false
-  return !selectedId.value
+  return !typedExactId.value
 })
 
-const optionCount = computed(() => visibleModels.value.length + (showFreeTextRow.value ? 1 : 0))
+const leadingOptionCount = computed(() => props.leadingOption ? 1 : 0)
+const optionCount = computed(() => (
+  leadingOptionCount.value
+  + visibleModels.value.length
+  + (showFreeTextRow.value ? 1 : 0)
+))
+const leadingOptionId = computed(() => `${fieldId.value}-option-leading`)
 const freeTextOptionId = computed(() => `${fieldId.value}-option-custom`)
 const activeOptionId = computed(() => {
   if (!open.value || activeIndex.value < 0) return undefined
-  if (activeIndex.value < visibleModels.value.length) {
-    return modelOptionId(activeIndex.value)
+  if (props.leadingOption && activeIndex.value === 0) return leadingOptionId.value
+  const modelIndex = activeIndex.value - leadingOptionCount.value
+  if (modelIndex >= 0 && modelIndex < visibleModels.value.length) {
+    return modelOptionId(modelIndex)
   }
   return showFreeTextRow.value ? freeTextOptionId.value : undefined
 })
 
-// Muted provenance footer (progressive disclosure): where the list and the
-// per-model metadata came from, once, instead of per-row badges. Empty (and
-// hidden) unless the list really is live and at least one row names a source —
-// the copy asserts "live list from the provider".
+// Muted provenance footer (progressive disclosure): explain metadata sourcing
+// once instead of repeating it in every row. Metadata-aware gateways get the
+// published/catalog copy; older gateways keep the capability-source fallback.
 const provenance = computed(() => {
   if (props.modelSource !== 'live') return ''
+  if (props.models.some(model => model.metadata?.schemaVersion === 1)) {
+    return t('setup.provider.modelMetadataProvenance')
+  }
   const sources = Array.from(new Set(props.models.map(model => model.capabilitySource).filter(Boolean)))
   if (!sources.length) return ''
   return t('setup.provider.modelProvenance', { sources: sources.join(', ') })
@@ -137,16 +196,67 @@ function compactTokens(count: number | null): string {
   return String(count)
 }
 
-function rowMeta(model: DiscoveredModel): string {
-  const parts: string[] = []
-  const ctx = compactTokens(model.contextWindow)
-  if (ctx) parts.push(ctx)
-  const maxOutput = compactTokens(model.maxOutputTokens)
-  if (maxOutput) {
-    parts.push(t('setup.provider.modelMaxOutput', { tokens: maxOutput }))
+interface ModelRowMetric {
+  kind: 'context' | 'output'
+  tokens: string
+  shortLabel: string
+  accessibleLabel: string
+}
+
+const NORMAL_MODEL_STATUSES = new Set(['active', 'available', 'online', 'ready'])
+
+function rowMetrics(model: DiscoveredModel): ModelRowMetric[] {
+  const metrics: ModelRowMetric[] = []
+  const published = model.metadata?.schemaVersion === 1 ? model.metadata.published : null
+  const publishedContext = compactTokens(published?.contextWindow ?? null)
+  const ctx = publishedContext || compactTokens(model.contextWindow)
+  if (ctx) {
+    metrics.push({
+      kind: 'context',
+      tokens: ctx,
+      shortLabel: t('setup.provider.modelContextShort'),
+      accessibleLabel: t(
+        publishedContext
+          ? 'setup.provider.modelPublishedContext'
+          : 'setup.provider.modelCatalogContext',
+        { tokens: ctx },
+      ),
+    })
   }
-  parts.push(...model.capabilities.filter(cap => cap !== 'chat').slice(0, 3))
-  return parts.join(' · ')
+  const publishedMaxOutput = compactTokens(published?.maxOutputTokens ?? null)
+  const maxOutput = publishedMaxOutput || compactTokens(model.maxOutputTokens)
+  if (maxOutput) {
+    metrics.push({
+      kind: 'output',
+      tokens: maxOutput,
+      shortLabel: t('setup.provider.modelOutputShort'),
+      accessibleLabel: t(
+        publishedMaxOutput
+          ? 'setup.provider.modelPublishedMaxOutput'
+          : 'setup.provider.modelCatalogMaxOutput',
+        { tokens: maxOutput },
+      ),
+    })
+  }
+  return metrics
+}
+
+function rowStatus(model: DiscoveredModel): string {
+  const metadata = model.metadata?.schemaVersion === 1 ? model.metadata : null
+  const status = String(metadata?.published?.status || metadata?.declared?.status || '').trim()
+  const normalized = status.toLowerCase()
+  if (!normalized || NORMAL_MODEL_STATUSES.has(normalized)) return ''
+  if (normalized === 'testing') return t('setup.provider.modelStatusTesting')
+  if (normalized === 'offline') return t('setup.provider.modelStatusOffline')
+  return status
+}
+
+function modelSupportsMultimodalInput(model: DiscoveredModel): boolean {
+  return model.capabilities.includes('vision')
+}
+
+function usesCatalogOnlyMetadata(model: DiscoveredModel): boolean {
+  return model.metadata?.schemaVersion === 1 && model.metadata.published === null
 }
 
 function modelOptionId(index: number): string {
@@ -162,7 +272,9 @@ function scrollActiveOptionIntoView() {
 }
 
 function onInput(event: Event) {
-  emit('update', (event.target as HTMLInputElement).value)
+  const value = (event.target as HTMLInputElement).value
+  if (props.commitOnSelect && catalogAvailable.value) localInputValue.value = value
+  else emit('update', value)
   if (!catalogAvailable.value) return
   open.value = true
   typedSinceOpen.value = true
@@ -173,9 +285,13 @@ function onInput(event: Event) {
 // text edit must go through it so the filter never leaks across opens.
 function openList() {
   if (!catalogAvailable.value) return
+  if (props.commitOnSelect) localInputValue.value = committedDisplayValue.value
   open.value = true
   typedSinceOpen.value = false
   activeIndex.value = -1
+  if (leadingSelected.value) {
+    void nextTick(() => inputEl.value?.select())
+  }
 }
 
 function onClick() {
@@ -188,32 +304,57 @@ function onClick() {
 function toggleList() {
   if (!catalogAvailable.value) return
   if (open.value) {
-    close()
+    close(true)
     return
   }
   openList()
   inputEl.value?.focus()
 }
 
-function close() {
+function close(restoreCommitted = true) {
   open.value = false
   typedSinceOpen.value = false
   activeIndex.value = -1
+  if (props.commitOnSelect && restoreCommitted) {
+    localInputValue.value = committedDisplayValue.value
+  }
 }
 
 watch(catalogAvailable, available => {
-  if (!available) close()
+  if (!available) close(true)
 })
 
-function selectModel(id: string) {
+watch(committedDisplayValue, value => {
+  // Parent updates following an explicit selection become the next committed
+  // display. Do not overwrite an in-progress local search query.
+  if (!open.value || !typedSinceOpen.value) localInputValue.value = value
+}, { immediate: true })
+
+function selectModel(id: string, displayValue = id) {
+  if (props.commitOnSelect) localInputValue.value = displayValue
   emit('update', id)
-  close()
+  close(false)
+}
+
+function selectTypedValue() {
+  if (!props.commitOnSelect) {
+    close()
+    return
+  }
+  const value = localInputValue.value.trim()
+  if (!value) return
+  selectModel(value)
 }
 
 function selectAt(index: number) {
   if (index < 0 || index >= optionCount.value) return
-  if (index < visibleModels.value.length) selectModel(visibleModels.value[index].id)
-  else close() // free-text row: the typed value is already the field value
+  if (props.leadingOption && index === 0) {
+    selectModel(props.leadingOption.value, props.leadingOption.label)
+  }
+  else if (index - leadingOptionCount.value < visibleModels.value.length) {
+    selectModel(visibleModels.value[index - leadingOptionCount.value].id)
+  }
+  else selectTypedValue()
 }
 
 // Anchor the teleported listbox to the input: below by default, flipped above
@@ -268,7 +409,7 @@ function onKeydown(event: KeyboardEvent) {
     if (open.value) {
       event.preventDefault()
       event.stopPropagation()
-      close()
+      close(true)
     }
     return
   }
@@ -294,16 +435,41 @@ function onKeydown(event: KeyboardEvent) {
 <template>
   <div :class="cell ? 'setup-model-combobox--cellwrap' : 'control-row control-row--stack'" :data-name="cell ? undefined : field.name" :data-scope="cell ? undefined : 'provider'">
     <div v-if="!cell" class="control-row__label-block">
-      <label class="control-row__label" :for="fieldId">{{ field.label }}{{ field.required ? ' *' : '' }}</label>
+      <label
+        class="control-row__label"
+        :class="{ 'setup-model-combobox__label--with-info': field.description && field.descriptionPresentation === 'info' }"
+        :for="fieldId"
+      >
+        {{ field.label }}{{ field.required ? ' *' : '' }}
+        <span
+          v-if="field.description && field.descriptionPresentation === 'info'"
+          class="setup-model-combobox__info"
+          :aria-label="field.description"
+          :aria-describedby="fieldTooltipId"
+          tabindex="0"
+        >
+          <Icon name="info" :size="14" aria-hidden="true" />
+          <span
+            :id="fieldTooltipId"
+            class="setup-model-combobox__info-tooltip"
+            role="tooltip"
+          >
+            {{ field.description }}
+          </span>
+        </span>
+      </label>
       <span
         v-if="field.description"
         :id="fieldDescriptionId"
-        class="control-row__desc"
+        :class="field.descriptionPresentation === 'info'
+          ? 'setup-model-combobox__sr-only'
+          : 'control-row__desc'"
       >{{ field.description }}</span>
     </div>
+    <div :class="$slots.actions ? 'setup-model-combobox__control-group control-row__control' : 'setup-model-combobox__passthrough'">
     <div
       class="setup-model-combobox"
-      :class="[cell ? undefined : 'control-row__control', { 'has-catalog': catalogAvailable }]"
+      :class="[cell || $slots.actions ? undefined : 'control-row__control', { 'has-catalog': catalogAvailable }]"
     >
       <input
         :id="fieldId"
@@ -318,18 +484,25 @@ function onKeydown(event: KeyboardEvent) {
         :aria-activedescendant="catalogAvailable ? activeOptionId : undefined"
         :aria-describedby="describedBy"
         :aria-label="cell ? field.label : undefined"
-        autocomplete="off"
+        autocomplete="one-time-code"
+        autocapitalize="off"
+        data-1p-ignore
+        data-bwignore
+        data-form-type="other"
+        data-lpignore="true"
+        data-protonpass-ignore="true"
+        spellcheck="false"
         :disabled="disabled"
-        :value="value"
+        :value="inputDisplayValue"
         :placeholder="field.placeholder || t('setup.provider.modelSearchOrCustom')"
         @input="onInput"
         @focus="openList"
         @click="onClick"
-        @blur="close"
+        @blur="close(true)"
         @keydown="onKeydown"
       >
       <span v-if="catalogAvailable" :id="`${fieldId}-catalog-count`" class="setup-model-combobox__sr-only">
-        {{ t('setup.provider.modelOptionsToggle', { count: models.length }) }}
+        {{ t('setup.provider.modelOptionsToggle', { count: models.length + leadingOptionCount }) }}
       </span>
       <button
         v-if="catalogAvailable"
@@ -337,7 +510,7 @@ function onKeydown(event: KeyboardEvent) {
         class="setup-model-combobox__trigger"
         data-testid="setup-model-options-toggle"
         tabindex="-1"
-        :aria-label="t('setup.provider.modelOptionsToggle', { count: models.length })"
+        :aria-label="t('setup.provider.modelOptionsToggle', { count: models.length + leadingOptionCount })"
         :aria-controls="`${fieldId}-listbox`"
         :aria-expanded="open ? 'true' : 'false'"
         @mousedown.prevent
@@ -357,7 +530,7 @@ function onKeydown(event: KeyboardEvent) {
           :style="listStyle"
           @mousedown.prevent
         >
-          <div :id="`${fieldId}-catalog-readout`" class="setup-model-combobox__readout">
+          <div v-if="models.length" :id="`${fieldId}-catalog-readout`" class="setup-model-combobox__readout">
             <span>{{ t('setup.provider.modelListReadout', { count: models.length }) }}</span>
             <span v-if="modelSource === 'live'" class="setup-model-combobox__live-source">
               <span class="setup-model-combobox__live-dot" aria-hidden="true"></span>
@@ -369,15 +542,39 @@ function onKeydown(event: KeyboardEvent) {
             class="setup-model-combobox__list"
             role="listbox"
             :aria-label="t('setup.provider.modelListLabel')"
-            :aria-describedby="`${fieldId}-catalog-readout`"
+            :aria-describedby="models.length ? `${fieldId}-catalog-readout` : undefined"
           >
+            <button
+              v-if="leadingOption"
+              :id="leadingOptionId"
+              type="button"
+              class="setup-model-combobox__row setup-model-combobox__row--leading"
+              :class="{ 'is-active': activeIndex === 0 }"
+              role="option"
+              :aria-selected="leadingSelected ? 'true' : 'false'"
+              @mousedown.prevent
+              @click="selectModel(leadingOption.value, leadingOption.label)"
+            >
+              <span class="setup-model-combobox__identity">
+                <span class="setup-model-combobox__id">{{ leadingOption.label }}</span>
+                <span v-if="leadingOption.description" class="setup-model-combobox__name">
+                  {{ leadingOption.description }}
+                </span>
+              </span>
+              <span v-if="leadingSelected" class="setup-model-combobox__selected">
+                <Icon name="check" :size="12" aria-hidden="true" />
+                <span class="setup-model-combobox__sr-only">
+                  {{ t('setup.provider.modelSelected') }}
+                </span>
+              </span>
+            </button>
             <button
               v-for="(model, index) in visibleModels"
               :key="model.id"
               :id="modelOptionId(index)"
               type="button"
               class="setup-model-combobox__row"
-              :class="{ 'is-active': index === activeIndex }"
+              :class="{ 'is-active': index + leadingOptionCount === activeIndex }"
               role="option"
               :aria-selected="model.id === selectedId ? 'true' : 'false'"
               @mousedown.prevent
@@ -385,19 +582,61 @@ function onKeydown(event: KeyboardEvent) {
             >
               <span class="setup-model-combobox__identity">
                 <span class="setup-model-combobox__id" :title="model.id">{{ model.id }}</span>
-                <span
-                  v-if="model.name && model.name !== model.id"
-                  class="setup-model-combobox__name"
-                  :title="model.name"
-                >
-                  {{ model.name }}
+                <span class="setup-model-combobox__subline">
+                  <span
+                    v-if="model.name && model.name !== model.id"
+                    class="setup-model-combobox__name"
+                    :title="model.name"
+                  >
+                    {{ model.name }}
+                  </span>
+                  <span
+                    v-if="rowStatus(model)"
+                    class="setup-model-combobox__badge setup-model-combobox__badge--status"
+                  >
+                    {{ rowStatus(model) }}
+                  </span>
+                  <span
+                    v-if="modelSupportsMultimodalInput(model)"
+                    class="setup-model-combobox__badge setup-model-combobox__badge--multimodal"
+                    :title="t('setup.provider.modelMultimodalTitle')"
+                  >
+                    {{ t('setup.provider.modelMultimodal') }}
+                  </span>
+                  <span
+                    v-if="usesCatalogOnlyMetadata(model)"
+                    class="setup-model-combobox__badge setup-model-combobox__badge--catalog"
+                  >
+                    {{ t('setup.provider.modelCatalogValue') }}
+                  </span>
                 </span>
               </span>
               <span class="setup-model-combobox__aside">
-                <span v-if="rowMeta(model)" class="setup-model-combobox__meta">{{ rowMeta(model) }}</span>
+                <span v-if="rowMetrics(model).length" class="setup-model-combobox__meta">
+                  <template v-for="(metric, metricIndex) in rowMetrics(model)" :key="metric.kind">
+                    <span
+                      v-if="metricIndex > 0"
+                      class="setup-model-combobox__metric-separator"
+                      aria-hidden="true"
+                    >·</span>
+                    <span class="setup-model-combobox__metric" :title="metric.accessibleLabel">
+                      <span class="setup-model-combobox__sr-only">
+                        {{ metric.accessibleLabel }}
+                      </span>
+                      <span class="setup-model-combobox__metric-label" aria-hidden="true">
+                        {{ metric.shortLabel }}
+                      </span>
+                      <span class="setup-model-combobox__metric-value" aria-hidden="true">
+                        {{ metric.tokens }}
+                      </span>
+                    </span>
+                  </template>
+                </span>
                 <span v-if="model.id === selectedId" class="setup-model-combobox__selected">
-                  <Icon name="check" :size="12" />
-                  {{ t('setup.provider.modelSelected') }}
+                  <Icon name="check" :size="12" aria-hidden="true" />
+                  <span class="setup-model-combobox__sr-only">
+                    {{ t('setup.provider.modelSelected') }}
+                  </span>
                 </span>
               </span>
             </button>
@@ -406,16 +645,16 @@ function onKeydown(event: KeyboardEvent) {
               :id="freeTextOptionId"
               type="button"
               class="setup-model-combobox__row setup-model-combobox__row--freetext"
-              :class="{ 'is-active': activeIndex === visibleModels.length }"
+              :class="{ 'is-active': activeIndex === visibleModels.length + leadingOptionCount }"
               role="option"
               aria-selected="false"
               @mousedown.prevent
-              @click="close()"
+              @click="selectTypedValue"
             >
-              <span class="setup-model-combobox__id" :title="String(value || '').trim()">{{ t('setup.provider.modelUseTyped', { value: String(value || '').trim() }) }}</span>
+              <span class="setup-model-combobox__id" :title="typedValue.trim()">{{ t('setup.provider.modelUseTyped', { value: typedValue.trim() }) }}</span>
             </button>
           </div>
-          <div v-if="!visibleModels.length && !showFreeTextRow" class="setup-model-combobox__footer">
+          <div v-if="!leadingOption && !visibleModels.length && !showFreeTextRow" class="setup-model-combobox__footer">
             {{ t('setup.provider.modelNoMatches') }}
           </div>
           <div v-if="truncatedCount" class="setup-model-combobox__footer">
@@ -425,10 +664,19 @@ function onKeydown(event: KeyboardEvent) {
         </div>
       </Teleport>
     </div>
+    <span v-if="$slots.actions" class="setup-model-combobox__actions"><slot name="actions" /></span>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.setup-model-combobox__passthrough { display: contents; }
+.setup-model-combobox__control-group { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.setup-model-combobox__control-group > .setup-model-combobox { flex: 1; min-width: 0; }
+.setup-model-combobox__control-group input { width: 100%; box-sizing: border-box; }
+.setup-model-combobox__actions { display: flex; align-items: center; gap: var(--sp-1); flex-shrink: 0; }
+@media (max-width: 760px) { .setup-model-combobox__actions { flex-direction: column; align-items: flex-end; } }
+
 /* Cell mode: the wrapper is a grid/table cell — the input fills it. No label
    chrome. The dropdown is teleported to <body>, so the cell never clips it. */
 .setup-model-combobox--cellwrap {
@@ -448,6 +696,69 @@ function onKeydown(event: KeyboardEvent) {
 
 .setup-model-combobox.has-catalog input {
   padding-right: 36px;
+}
+
+.setup-model-combobox__label--with-info {
+  align-items: center;
+  display: inline-flex;
+  gap: 5px;
+}
+
+.setup-model-combobox__info {
+  align-items: center;
+  color: var(--text-dim);
+  display: inline-flex;
+  justify-content: center;
+  position: relative;
+}
+
+.setup-model-combobox__info:hover {
+  color: var(--text);
+}
+
+.setup-model-combobox__info-tooltip {
+  background: var(--text);
+  border-radius: var(--radius-sm);
+  bottom: calc(100% + 9px);
+  box-shadow: var(--shadow-md);
+  color: var(--bg-elevated);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  left: 50%;
+  line-height: 1.45;
+  max-width: min(300px, 70vw);
+  opacity: 0;
+  padding: 7px 9px;
+  pointer-events: none;
+  position: absolute;
+  text-align: left;
+  transform: translateX(-50%);
+  visibility: hidden;
+  white-space: normal;
+  width: max-content;
+  z-index: 40;
+}
+
+.setup-model-combobox__info-tooltip::after {
+  border: 5px solid transparent;
+  border-top-color: var(--text);
+  content: '';
+  left: 50%;
+  position: absolute;
+  top: 100%;
+  transform: translateX(-50%);
+}
+
+.setup-model-combobox__info:hover .setup-model-combobox__info-tooltip,
+.setup-model-combobox__info:focus-visible .setup-model-combobox__info-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+
+.setup-model-combobox__info:focus-visible {
+  border-radius: var(--radius-full);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .setup-model-combobox__trigger {
@@ -504,10 +815,11 @@ function onKeydown(event: KeyboardEvent) {
   flex-direction: column;
   overflow: hidden;
   /* Teleported to <body>; left/top/bottom/width/max-height come from the
-     inline style computed off the input's viewport rect. Sits above the
-     settings dialog (z-index 300). */
+     inline style computed off the input's viewport rect. Keep this above both
+     the settings dialog (300) and its nested provider modal overlay (420), so
+     the list remains interactive and is never visually clipped by the modal. */
   position: fixed;
-  z-index: 400;
+  z-index: 440;
 }
 
 .setup-model-combobox__list {
@@ -599,25 +911,40 @@ function onKeydown(event: KeyboardEvent) {
   min-width: 0;
 }
 
+.setup-model-combobox__subline {
+  align-items: center;
+  display: flex;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.setup-model-combobox__subline:empty {
+  display: none;
+}
+
 .setup-model-combobox__name {
   color: var(--text-dim);
   display: block;
+  flex: 0 1 auto;
   font-size: var(--fs-xs);
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .setup-model-combobox__meta {
+  align-items: center;
   color: var(--text-dim);
+  display: inline-flex;
   font-size: var(--fs-xs);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  gap: var(--sp-1);
+  min-width: 0;
 }
 
 .setup-model-combobox__aside,
-.setup-model-combobox__selected {
+.setup-model-combobox__selected,
+.setup-model-combobox__metric {
   align-items: center;
   display: inline-flex;
   gap: var(--sp-1);
@@ -625,14 +952,49 @@ function onKeydown(event: KeyboardEvent) {
 
 .setup-model-combobox__aside {
   justify-self: end;
-  max-width: 230px;
   min-width: 0;
 }
 
 .setup-model-combobox__selected {
   color: var(--accent);
+  flex: 0 0 auto;
   font-size: var(--fs-xs);
+}
+
+.setup-model-combobox__metric,
+.setup-model-combobox__metric-value {
   white-space: nowrap;
+}
+
+.setup-model-combobox__metric-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.setup-model-combobox__metric-separator {
+  color: var(--border-strong);
+}
+
+.setup-model-combobox__badge {
+  border-radius: var(--radius-pill);
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  padding: 1px var(--sp-1);
+  white-space: nowrap;
+}
+
+.setup-model-combobox__badge--status {
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+}
+
+.setup-model-combobox__badge--catalog {
+  background: var(--bg-hover);
+  color: var(--text-dim);
+}
+
+.setup-model-combobox__badge--multimodal {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
 }
 
 .setup-model-combobox__footer {
@@ -641,6 +1003,12 @@ function onKeydown(event: KeyboardEvent) {
   font-size: var(--fs-xs);
   padding: var(--sp-1) var(--sp-3);
   flex-shrink: 0;
+}
+
+@media (max-width: 520px) {
+  .setup-model-combobox__metric-label {
+    display: none;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

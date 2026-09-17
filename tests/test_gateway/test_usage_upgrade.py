@@ -222,8 +222,7 @@ async def test_v020_database_reaches_service_ready_with_live_sink(
         control_ui={"enabled": False},
         channels={"channels": []},
         mcp={"enabled": False},
-        memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
+        memory={},
     )
 
     services = await build_services(
@@ -260,7 +259,7 @@ def test_usage_query_is_advertised_without_protocol_or_legacy_rpc_breakage() -> 
     dispatcher = get_dispatcher()
     features = _build_features(dispatcher)
 
-    assert PROTOCOL_VERSION == 3
+    assert PROTOCOL_VERSION == 4
     assert {"usage.status", "usage.cost", "usage.query"} <= set(features.methods)
     for method in ("usage.status", "usage.cost", "usage.query"):
         entry = dispatcher.get_entry(method)

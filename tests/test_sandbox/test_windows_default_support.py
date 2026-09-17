@@ -70,6 +70,8 @@ def test_support_probe_accepts_current_setup_marker(
     monkeypatch.setattr(mod, "_ctypes_available", lambda: True)
     monkeypatch.setattr(mod, "_token_api_available", lambda: True)
     monkeypatch.setattr(mod, "_acl_api_available", lambda: True)
+    monkeypatch.setattr(mod, "_offline_identity_ready", lambda _path: True)
+    monkeypatch.setattr(mod, "_persistent_storage_ready", lambda _path: True)
     monkeypatch.setattr(mod, "default_setup_marker_path", lambda home=None: marker)
 
     support = mod.probe_windows_default_support(home=tmp_path)
@@ -77,6 +79,54 @@ def test_support_probe_accepts_current_setup_marker(
     assert support.setup_ready is True
     assert support.default_backend_available is True
     assert support.proxy_allowlist_enforced is False
+
+
+def test_support_probe_rejects_stale_offline_identity(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_support as mod
+    from opensquilla.sandbox.backend.windows_default_setup import write_setup_marker
+
+    marker = tmp_path / "setup_marker.json"
+    write_setup_marker(marker)
+
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(mod, "_ctypes_available", lambda: True)
+    monkeypatch.setattr(mod, "_token_api_available", lambda: True)
+    monkeypatch.setattr(mod, "_acl_api_available", lambda: True)
+    monkeypatch.setattr(mod, "_offline_identity_ready", lambda _path: False)
+    monkeypatch.setattr(mod, "default_setup_marker_path", lambda home=None: marker)
+
+    support = mod.probe_windows_default_support(home=tmp_path)
+
+    assert support.setup_ready is True
+    assert support.identity_ready is False
+    assert support.default_backend_available is False
+
+
+def test_support_probe_rejects_unwritable_persistent_storage(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_support as mod
+    from opensquilla.sandbox.backend.windows_default_setup import write_setup_marker
+
+    marker = tmp_path / "setup_marker.json"
+    write_setup_marker(marker)
+
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(mod, "_ctypes_available", lambda: True)
+    monkeypatch.setattr(mod, "_token_api_available", lambda: True)
+    monkeypatch.setattr(mod, "_acl_api_available", lambda: True)
+    monkeypatch.setattr(mod, "_offline_identity_ready", lambda _path: True)
+    monkeypatch.setattr(mod, "_persistent_storage_ready", lambda _path: False)
+    monkeypatch.setattr(mod, "default_setup_marker_path", lambda home=None: marker)
+
+    support = mod.probe_windows_default_support(home=tmp_path)
+
+    assert support.storage_ready is False
+    assert support.default_backend_available is False
 
 
 def test_persistent_sandbox_dirs_remove_inheritance_and_limit_control(
@@ -104,6 +154,11 @@ def test_persistent_sandbox_dirs_remove_inheritance_and_limit_control(
     assert "*S-1-5-18:(OI)(CI)F" in flattened
     assert "*S-1-5-32-544:(OI)(CI)F" in flattened
     assert "/remove:g *S-1-offline" in flattened
+    assert len(calls) == 9
+    for index in range(0, len(calls), 3):
+        assert "/inheritance:r" in calls[index]
+        assert "/grant:r" in calls[index + 1]
+        assert "/remove:g" in calls[index + 2]
 
 
 def test_support_probe_requires_network_marker_for_proxy_enforcement(
@@ -120,6 +175,8 @@ def test_support_probe_requires_network_marker_for_proxy_enforcement(
     monkeypatch.setattr(mod, "_ctypes_available", lambda: True)
     monkeypatch.setattr(mod, "_token_api_available", lambda: True)
     monkeypatch.setattr(mod, "_acl_api_available", lambda: True)
+    monkeypatch.setattr(mod, "_offline_identity_ready", lambda _path: True)
+    monkeypatch.setattr(mod, "_persistent_storage_ready", lambda _path: True)
     monkeypatch.setattr(mod, "default_setup_marker_path", lambda home=None: marker)
 
     support = mod.probe_windows_default_support(home=tmp_path, proxy_ports=(43128,))
@@ -156,6 +213,8 @@ def test_support_probe_accepts_current_network_marker(
     monkeypatch.setattr(mod, "_ctypes_available", lambda: True)
     monkeypatch.setattr(mod, "_token_api_available", lambda: True)
     monkeypatch.setattr(mod, "_acl_api_available", lambda: True)
+    monkeypatch.setattr(mod, "_offline_identity_ready", lambda _path: True)
+    monkeypatch.setattr(mod, "_persistent_storage_ready", lambda _path: True)
     monkeypatch.setattr(mod, "default_setup_marker_path", lambda home=None: marker)
 
     support = mod.probe_windows_default_support(home=tmp_path)
@@ -190,6 +249,8 @@ def test_support_probe_rejects_legacy_firewall_network_marker(
     monkeypatch.setattr(mod, "_ctypes_available", lambda: True)
     monkeypatch.setattr(mod, "_token_api_available", lambda: True)
     monkeypatch.setattr(mod, "_acl_api_available", lambda: True)
+    monkeypatch.setattr(mod, "_offline_identity_ready", lambda _path: True)
+    monkeypatch.setattr(mod, "_persistent_storage_ready", lambda _path: True)
     monkeypatch.setattr(mod, "default_setup_marker_path", lambda home=None: marker)
 
     support = mod.probe_windows_default_support(home=tmp_path)

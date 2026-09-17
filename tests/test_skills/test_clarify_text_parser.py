@@ -326,8 +326,7 @@ def test_bool_field_accepts_cjk_and_conversational_synonyms(value, expected) -> 
     to "not a bool" and triggered a re-prompt, surfacing as the
     "information not understood" symptom. ``_TRUE_VALUES`` /
     ``_FALSE_VALUES`` in ``clarify_text.py`` must accept the full
-    conversational set; ``clarify_form.py`` mirrors the same table so
-    multi-surface skills do not diverge."""
+    conversational set."""
     schema = _schema(ClarifyField(name="ok", type="bool", required=True))
     fields, errors = parse_clarify_reply(f"ok: {value}", schema, surface="cli")
     assert errors == [], f"unexpected errors for {value!r}: {errors}"

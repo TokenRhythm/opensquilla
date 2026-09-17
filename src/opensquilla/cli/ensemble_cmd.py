@@ -148,8 +148,12 @@ def ensemble_bench(
         else:
             # Config loading is a CLI concern; the eval harness owns provider coupling.
             from opensquilla.onboarding.config_store import load_config
+            from opensquilla.provider.tokenrhythm_correlation import (
+                prewarm_tokenrhythm_install_id,
+            )
 
             config = load_config(config_path)
+            prewarm_tokenrhythm_install_id(config=config)
             report = asyncio.run(
                 run_config_benchmark(
                     prompts=prompts,

@@ -1,7 +1,7 @@
 services:
   gateway:
     # Defaults to a self-built image; to use a prebuilt release image instead:
-    #   OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/opensquilla/opensquilla:latest docker compose up -d
+    #   OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/tokenrhythm/opensquilla:latest docker compose up -d
     # Full container guide: docs/docker.md
     image: ${OPENSQUILLA_GATEWAY_IMAGE:-opensquilla:local}
     environment:

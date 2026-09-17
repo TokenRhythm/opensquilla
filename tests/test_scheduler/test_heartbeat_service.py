@@ -27,6 +27,7 @@ async def test_empty_heartbeat_summary_is_not_delivered(monkeypatch: pytest.Monk
         turn_runner=None,
         session_storage=None,
         channel_manager_ref=lambda: None,
+        prepare_tool_context=AsyncMock(return_value=None),
     )
     collect_output = AsyncMock(return_value="")
     send_delivery = AsyncMock(return_value=None)
@@ -67,6 +68,7 @@ async def test_streaming_fallback_removes_think_before_delivery(
         ),
         session_storage=None,
         channel_manager_ref=lambda: None,
+        prepare_tool_context=AsyncMock(return_value=None),
     )
     send_delivery = AsyncMock(return_value=None)
     infer_delivery = AsyncMock(
@@ -103,6 +105,7 @@ async def test_streaming_fallback_ack_is_not_delivered(
         ),
         session_storage=None,
         channel_manager_ref=lambda: None,
+        prepare_tool_context=AsyncMock(return_value=None),
     )
     send_delivery = AsyncMock(return_value=None)
     infer_delivery = AsyncMock()

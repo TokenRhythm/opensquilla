@@ -37,6 +37,7 @@ RPC_STATUS_KEYS = frozenset(
         "imageGenerationProvider",
         "imageGenerationPrimary",
         "imageGenerationEnvKey",
+        "imageGenerationState",
         "audioConfigured",
         "audioEnabled",
         "audioSource",
@@ -50,6 +51,7 @@ RPC_STATUS_KEYS = frozenset(
         "memoryEmbeddingProvider",
         "memoryEmbeddingSource",
         "memoryEmbeddingEnvKey",
+        "capabilityConfiguration",
         "channelCount",
         "channelsConfigured",
         "ensembleCredentialStatus",
@@ -108,6 +110,7 @@ def test_status_json_is_a_superset_of_the_rpc_payload(tmp_path, monkeypatch):
     missing = set(rpc_payload) - set(cli_payload)
     assert not missing, f"CLI status --json lost RPC keys: {sorted(missing)}"
     assert set(cli_payload) - set(rpc_payload) == {"sectionAliases"}
+    assert cli_payload["capabilityConfiguration"] == rpc_payload["capabilityConfiguration"]
 
 
 def test_status_json_new_keys_carry_the_expected_values(tmp_path, monkeypatch):
@@ -126,6 +129,10 @@ def test_status_json_new_keys_carry_the_expected_values(tmp_path, monkeypatch):
     assert profiles[0]["ready"] is False
     assert profiles[0]["credentialSource"] == "none"
     assert "apiKey" not in profiles[0]
+    assert payload["imageGenerationState"]["mode"] == "unconfigured"
+    assert payload["imageGenerationState"]["recommendation"]["providerId"] == (
+        "openrouter"
+    )
     assert payload["audioConfigured"] is False
     assert payload["audioEnabled"] is False
     # Default search provider (duckduckgo) needs no key, so the section is

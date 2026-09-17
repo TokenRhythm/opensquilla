@@ -14,7 +14,11 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from opensquilla.cli.gateway_rpc import default_gateway_url, gateway_url_from_config
+from opensquilla.cli.gateway_rpc import (
+    GatewayTarget,
+    default_gateway_target,
+    gateway_url_from_config,
+)
 from opensquilla.cli.output import print_json
 from opensquilla.cli.url_utils import normalize_gateway_url
 from opensquilla.health.model import (
@@ -481,13 +485,21 @@ async def _fetch_report(
     gateway_url: str,
     agent_id: str,
     deep: bool,
+    probe_providers: bool = False,
 ) -> dict[str, Any]:
     from opensquilla.cli import gateway_client as gateway_client_module
 
     client = gateway_client_module.GatewayClient()
     try:
         await client.connect(gateway_url)
-        payload = await client.call("doctor.status", {"agentId": agent_id, "deep": deep})
+        payload = await client.call(
+            "doctor.status",
+            {
+                "agentId": agent_id,
+                "deep": deep,
+                "probeProviders": probe_providers,
+            },
+        )
         return dict(payload)
     finally:
         await client.close()
@@ -701,18 +713,21 @@ def _implicit_existing_config_path() -> Path | None:
     return None
 
 
-def _target_url_for_doctor(
+def _target_for_doctor(
     *,
     gateway_url: str | None,
     config_path: Path | None,
-) -> str:
+) -> GatewayTarget:
     if gateway_url is not None:
-        return normalize_gateway_url(gateway_url)
+        return GatewayTarget(normalize_gateway_url(gateway_url))
     if config_path is not None:
-        return gateway_url_from_config(config_path)
-    if implicit_config_path := _implicit_existing_config_path():
-        return gateway_url_from_config(implicit_config_path)
-    return default_gateway_url()
+        return GatewayTarget(
+            gateway_url_from_config(config_path),
+            config_path,
+            config_owns_target=True,
+        )
+    return default_gateway_target()
+
 
 def _requested_config_path(
     config_path: Path | None,
@@ -739,6 +754,11 @@ def doctor_command(
         "--deep/--quick",
         help="Include deeper memory diagnostics; use --quick for shallow checks.",
     ),
+    probe_providers: bool = typer.Option(
+        False,
+        "--probe-providers",
+        help="Opt in to live provider model-list probes.",
+    ),
     gateway_url: str | None = typer.Option(None, "--gateway", envvar="OPENSQUILLA_GATEWAY_URL"),
     config_path: Path | None = typer.Option(
         None,
@@ -760,11 +780,25 @@ def doctor_command(
         else normalize_gateway_url("ws://localhost:18791/ws")
     )
     try:
-        target_url = _target_url_for_doctor(
+        target = _target_for_doctor(
             gateway_url=gateway_url,
             config_path=config_path,
         )
-        report = asyncio.run(_fetch_report(gateway_url=target_url, agent_id=agent_id, deep=deep))
+        target_url = target.url
+        requested_config_path = (
+            str(target.config_path)
+            if target.config_path is not None
+            else _requested_config_path(config_path, gateway_url=gateway_url)
+        )
+        config_owns_gateway_target = target.config_owns_target
+        report = asyncio.run(
+            _fetch_report(
+                gateway_url=target_url,
+                agent_id=agent_id,
+                deep=deep,
+                probe_providers=probe_providers,
+            )
+        )
     except SystemExit as exc:
         report = _offline_report(
             exc,

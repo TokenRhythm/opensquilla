@@ -187,7 +187,15 @@ class SandboxPolicy:
             "file_system": (
                 {
                     "entries": [
-                        {"path": str(entry.path), "access": entry.access.value}
+                        {
+                            "path": str(entry.path),
+                            "access": entry.access.value,
+                            **(
+                                {"logicalPath": str(entry.logical_path)}
+                                if entry.logical_path is not None
+                                else {}
+                            ),
+                        }
                         for entry in self.file_system.entries
                     ],
                     "denied_read_globs": list(self.file_system.denied_read_globs),
@@ -266,6 +274,10 @@ class SandboxBackendError(RuntimeError):
     surface it as a denial or propagate — *never* fall back to unsandboxed
     host execution.
     """
+
+
+class SandboxSetupRequiredError(SandboxBackendError):
+    """The host supports the backend, but its first-time setup has not run."""
 
 
 class DenialReason(StrEnum):
@@ -354,11 +366,22 @@ class _AllowSentinel:
 
 ALLOW: _AllowSentinel = _AllowSentinel()
 
-ApprovalDecision = _AllowSentinel | DenialResult
+
+@dataclass(frozen=True)
+class ApprovedHostExecution:
+    """One consumed L3 approval authorizing the waiting call to run on host."""
+
+    approval_id: str
+    action_fingerprint: str
+    level: SecurityLevel
+
+
+ApprovalDecision = _AllowSentinel | ApprovedHostExecution | DenialResult
 
 
 __all__ = [
     "ALLOW",
+    "ApprovedHostExecution",
     "ApprovalDecision",
     "DenialReason",
     "DenialResult",
@@ -370,6 +393,7 @@ __all__ = [
     "ResourceLimits",
     "SANDBOX_WORKSPACE_PATH",
     "SandboxBackendError",
+    "SandboxSetupRequiredError",
     "SandboxPolicy",
     "SandboxRequest",
     "SandboxResult",

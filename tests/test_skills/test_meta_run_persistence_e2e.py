@@ -34,10 +34,25 @@ def writer_db(tmp_path: Path, _writer_db_template: Path):
 def _stub_runner_for(outputs: dict[str, str]):
     from opensquilla.skills.meta.events import _StepDone
 
-    async def _runner(step, effective_skill, inputs, outputs_so_far):
+    async def _runner(
+        step,
+        effective_skill,
+        inputs,
+        outputs_so_far,
+        *,
+        on_execution_started=None,
+    ):
         text = outputs.get(step.id, f"output-of-{step.id}")
+        if on_execution_started is not None:
+            on_execution_started()
         if text == "__FAIL__":
             raise RuntimeError(f"{step.id} exploded")
+        if text == "__SAFE_PAID_FAIL__":
+            from opensquilla.skills.meta.replay_safety import encode_paid_replay_safety
+
+            raise RuntimeError(
+                encode_paid_replay_safety("pre-submit validation failed", safe_no_submit=True)
+            )
         yield _StepDone(text=text)
     return _runner
 
@@ -90,7 +105,16 @@ async def _drive_orchestrator_with_usage(writer, plan: MetaPlan) -> MetaResult:
         usage_tracker=tracker,
     )
 
-    async def dispatch(step, effective_skill, inputs, outputs_so_far):
+    async def dispatch(
+        step,
+        effective_skill,
+        inputs,
+        outputs_so_far,
+        *,
+        on_execution_started=None,
+    ):
+        if on_execution_started is not None:
+            on_execution_started()
         tracker.add(
             "sess-test",
             input_tokens=31,
@@ -177,6 +201,305 @@ async def test_manual_command_trigger_writes_run(writer_db) -> None:
 
 
 @pytest.mark.asyncio
+async def test_new_meta_run_notifies_usage_recorder_once(writer_db) -> None:
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+
+    plan = MetaPlan(
+        name="usage-notification",
+        triggers=("t",),
+        priority=10,
+        steps=(
+            MetaStep(id="s1", skill="alpha", kind="agent"),
+            MetaStep(id="s2", skill="beta", kind="agent"),
+        ),
+    )
+    observed: list[str] = []
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=writer_db,
+        triggered_by="manual_command",
+        session_key="sess-test",
+        turn_id="turn-test",
+        metaskill_usage_recorder=observed.append,
+    )
+    orch._dispatch_step_stream = _stub_runner_for(  # type: ignore[assignment]
+        {"s1": "A", "s2": "B"}
+    )
+
+    async def empty_preface(step_id, effective_skill):
+        if False:
+            yield None
+        return
+
+    orch._yield_skill_view_preface = empty_preface  # type: ignore[assignment]
+
+    async for _ in orch.iter_events(MetaMatch(plan=plan, inputs={"user_message": "/meta"})):
+        pass
+
+    [row] = writer_db.list_runs(name="usage-notification")
+    assert observed == [row.run_id]
+
+
+@pytest.mark.asyncio
+async def test_metaskill_announcement_without_step_execution_is_not_counted(writer_db) -> None:
+    from opensquilla.skills.meta.events import _StepDone
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+
+    plan = MetaPlan(
+        name="usage-not-started",
+        triggers=("t",),
+        priority=10,
+        steps=(MetaStep(id="s1", skill="alpha", kind="agent"),),
+    )
+    observed: list[str] = []
+    dispatched = False
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=writer_db,
+        metaskill_usage_recorder=observed.append,
+    )
+
+    async def dispatch(*args, **kwargs):
+        nonlocal dispatched
+        dispatched = True
+        yield _StepDone(text="done")
+
+    orch._dispatch_step_stream = dispatch  # type: ignore[assignment]
+    stream = orch.iter_events(MetaMatch(plan=plan, inputs={"user_message": "run"}))
+    await anext(stream)
+    await stream.aclose()
+
+    assert observed == []
+    assert dispatched is False
+
+
+@pytest.mark.asyncio
+async def test_metaskill_cancelled_during_step_persistence_is_not_counted(writer_db) -> None:
+    from opensquilla.skills.meta.events import _StepDone
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+
+    plan = MetaPlan(
+        name="usage-persistence-cancelled",
+        triggers=("t",),
+        priority=10,
+        steps=(MetaStep(id="s1", skill="alpha", kind="agent"),),
+    )
+    observed: list[str] = []
+    persistence_started = asyncio.Event()
+    wait_forever = asyncio.Event()
+    dispatched = False
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=writer_db,
+        metaskill_usage_recorder=observed.append,
+    )
+
+    async def blocked_step_begin(*args, **kwargs):
+        persistence_started.set()
+        await wait_forever.wait()
+
+    def persistence_hooks(**kwargs):
+        return blocked_step_begin, None, None
+
+    async def dispatch(*args, on_execution_started=None, **kwargs):
+        nonlocal dispatched
+        dispatched = True
+        if on_execution_started is not None:
+            on_execution_started()
+        yield _StepDone(text="done")
+
+    orch._step_persistence_hooks = persistence_hooks  # type: ignore[method-assign]
+    orch._dispatch_step_stream = dispatch  # type: ignore[assignment]
+
+    async def consume() -> None:
+        async for _ in orch.iter_events(
+            MetaMatch(plan=plan, inputs={"user_message": "run"})
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(persistence_started.wait(), timeout=2.0)
+    assert observed == []
+    assert dispatched is False
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_empty_metaskill_plan_is_not_counted(writer_db) -> None:
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+
+    observed: list[str] = []
+    plan = MetaPlan(name="empty-usage", triggers=("t",), priority=10, steps=())
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=writer_db,
+        metaskill_usage_recorder=observed.append,
+    )
+
+    result = await orch.run(MetaMatch(plan=plan, inputs={"user_message": "run"}))
+
+    assert result.ok is True
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_nonpersistent_run_uses_internal_key_and_recorder_failure_is_nonfatal() -> None:
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+
+    observed: list[str] = []
+
+    def recorder(run_id: str) -> None:
+        observed.append(run_id)
+        raise RuntimeError("telemetry unavailable")
+
+    plan = MetaPlan(
+        name="usage-no-writer",
+        triggers=("t",),
+        priority=10,
+        steps=(MetaStep(id="s1", skill="alpha", kind="agent"),),
+    )
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=None,
+        metaskill_usage_recorder=recorder,
+    )
+    orch._dispatch_step_stream = _stub_runner_for({"s1": "done"})  # type: ignore[assignment]
+
+    result = await orch.run(
+        MetaMatch(plan=plan, inputs={"user_message": "run"}, run_id="supplied-run")
+    )
+
+    assert result.ok is True
+    [usage_key] = observed
+    assert usage_key != "supplied-run"
+    assert usage_key.startswith("run-")
+
+
+@pytest.mark.asyncio
+async def test_nonpersistent_unsafe_supplied_run_uses_internal_safe_usage_key() -> None:
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+
+    observed: list[str] = []
+    plan = MetaPlan(
+        name="usage-safe-key",
+        triggers=("t",),
+        priority=10,
+        steps=(MetaStep(id="s1", skill="alpha", kind="agent"),),
+    )
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=None,
+        metaskill_usage_recorder=observed.append,
+    )
+    orch._dispatch_step_stream = _stub_runner_for({"s1": "done"})  # type: ignore[assignment]
+
+    unsafe_external_run_id = "../../user supplied run id"
+    result = await orch.run(
+        MetaMatch(
+            plan=plan,
+            inputs={"user_message": "run"},
+            run_id=unsafe_external_run_id,
+        )
+    )
+
+    assert result.ok is True
+    [usage_key] = observed
+    assert usage_key != unsafe_external_run_id
+    assert usage_key.startswith("run-")
+    assert len(usage_key) <= 64
+    assert all(character.isalnum() or character in "_-" for character in usage_key)
+
+
+@pytest.mark.asyncio
+async def test_nonpersistent_user_input_without_dao_is_not_counted() -> None:
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+
+    observed: list[str] = []
+    plan = MetaPlan(
+        name="usage-user-input-no-dao",
+        triggers=("t",),
+        priority=10,
+        steps=(MetaStep(id="ask", skill="ask", kind="user_input"),),
+    )
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=None,
+        metaskill_usage_recorder=observed.append,
+    )
+
+    result = await orch.run(MetaMatch(plan=plan, inputs={"user_message": "run"}))
+
+    assert result.ok is False
+    assert "requires a DAO and a run_id" in str(result.error)
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_preflight_preview_is_not_counted_until_confirmation(writer_db) -> None:
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+
+    plan = MetaPlan(
+        name="usage-preflight",
+        triggers=("t",),
+        priority=10,
+        steps=(MetaStep(id="s1", skill="alpha", kind="agent"),),
+        request_template={
+            "mode": "confirm",
+            "fields": [{"name": "audience", "required": True}],
+        },
+    )
+    observed: list[str] = []
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=writer_db,
+        triggered_by="soft_meta_invoke",
+        session_key="sess-test",
+        turn_id="turn-test",
+        metaskill_usage_recorder=observed.append,
+    )
+    orch._dispatch_step_stream = _stub_runner_for({"s1": "A"})  # type: ignore[assignment]
+
+    async def empty_preface(step_id, effective_skill):
+        if False:
+            yield None
+        return
+
+    orch._yield_skill_view_preface = empty_preface  # type: ignore[assignment]
+
+    paused = await orch.run(
+        MetaMatch(plan=plan, inputs={"user_message": "write a brief"}),
+    )
+    assert paused.paused is True
+    assert observed == []
+
+    [paused_row] = writer_db.list_runs(name="usage-preflight")
+    confirmed = await orch.run(
+        MetaMatch(
+            plan=plan,
+            inputs={
+                "user_message": "write a brief",
+                "audience": "decision owner",
+                "meta_preflight_confirmed": True,
+                "meta_preflight_run_id": paused_row.run_id,
+            },
+        ),
+    )
+    assert confirmed.ok is True
+    assert observed == [paused_row.run_id]
+
+
+@pytest.mark.asyncio
 async def test_live_run_persists_scoped_step_usage(writer_db) -> None:
     plan = MetaPlan(
         name="usage-linear",
@@ -251,7 +574,16 @@ async def test_on_failure_persists_failed_step_usage(writer_db) -> None:
         usage_tracker=tracker,
     )
 
-    async def dispatch(step, effective_skill, inputs, outputs_so_far):
+    async def dispatch(
+        step,
+        effective_skill,
+        inputs,
+        outputs_so_far,
+        *,
+        on_execution_started=None,
+    ):
+        if on_execution_started is not None:
+            on_execution_started()
         if step.id == "primary":
             tracker.add(
                 "sess-test",
@@ -314,6 +646,47 @@ async def test_hard_failure_marks_step_failed(writer_db) -> None:
     # Critical: step row must be 'failed' not 'running'
     assert run.steps[0].status == "failed"
     assert run.steps[0].error  # non-empty
+
+
+@pytest.mark.asyncio
+async def test_hard_paid_failure_persists_replay_safety_marker(writer_db) -> None:
+    from opensquilla.skills.meta.replay_safety import paid_replay_is_safe
+    from opensquilla.skills.meta.run_reports import build_recovery_events
+
+    plan = MetaPlan(
+        name="hard-paid-fail",
+        triggers=("t",),
+        priority=10,
+        steps=(
+            MetaStep(
+                id="paid",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                side_effect="external_paid_submit",
+            ),
+        ),
+    )
+    await _drive_orchestrator(
+        writer_db,
+        plan,
+        outputs={"paid": "__SAFE_PAID_FAIL__"},
+    )
+    [summary] = writer_db.list_runs(name="hard-paid-fail")
+    run = writer_db.get_run(summary.run_id)
+
+    assert run is not None
+    assert run.steps[0].status == "failed"
+    assert paid_replay_is_safe(run.steps[0].error) is True
+    recovery = build_recovery_events(run)
+    assert recovery is not None
+    failed_state = next(
+        state
+        for state in recovery["step_states"]
+        if state["step_id"] == "paid"
+    )
+    action_ids = {action["id"] for action in failed_state["rescue"]["actions"]}
+    assert "retry-step" in action_ids
+    assert "retry-run" not in action_ids
 
 
 @pytest.mark.asyncio

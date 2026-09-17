@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -18,7 +19,7 @@ def reset_setup_runtime_state():
 
 
 @pytest.mark.asyncio
-async def test_status_reports_setting_up_while_auto_setup_is_running(monkeypatch) -> None:
+async def test_status_reports_setting_up_while_setup_is_running(monkeypatch) -> None:
     from opensquilla.sandbox import setup_runtime
 
     entered = asyncio.Event()
@@ -37,6 +38,7 @@ async def test_status_reports_setting_up_while_auto_setup_is_running(monkeypatch
         )
 
     monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", blocked_setup)
+    monkeypatch.setattr("opensquilla.sandbox.integration.initialize_runtime_backend", AsyncMock())
 
     task = asyncio.create_task(setup_runtime.ensure_sandbox_setup_auto(config))
     await asyncio.wait_for(entered.wait(), timeout=1.0)
@@ -52,7 +54,7 @@ async def test_status_reports_setting_up_while_auto_setup_is_running(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_auto_setup_failure_remains_visible_after_setup_finishes(monkeypatch) -> None:
+async def test_setup_failure_remains_visible_after_setup_finishes(monkeypatch) -> None:
     from opensquilla.sandbox import setup_runtime
 
     config = SimpleNamespace()
@@ -69,7 +71,9 @@ async def test_auto_setup_failure_remains_visible_after_setup_finishes(monkeypat
         )
 
     monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", fail_setup)
-    monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_state.current_sandbox_setup_status", current_probe
+    )
 
     result = await setup_runtime.ensure_sandbox_setup_auto(config)
     status = await setup_runtime.current_sandbox_setup_runtime_status(config)
@@ -80,7 +84,7 @@ async def test_auto_setup_failure_remains_visible_after_setup_finishes(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_windows_auto_setup_promotes_runtime_backend_after_setup(monkeypatch) -> None:
+async def test_windows_setup_promotes_runtime_backend_after_setup(monkeypatch) -> None:
     from opensquilla.sandbox import integration, setup_runtime
 
     config = SimpleNamespace()
@@ -97,8 +101,8 @@ async def test_windows_auto_setup_promotes_runtime_backend_after_setup(monkeypat
     monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", ready_setup)
     monkeypatch.setattr(
         integration,
-        "refresh_runtime_backend_after_setup",
-        lambda: promotions.append("promoted"),
+        "initialize_runtime_backend",
+        AsyncMock(side_effect=lambda: promotions.append("promoted")),
         raising=False,
     )
 
@@ -109,7 +113,41 @@ async def test_windows_auto_setup_promotes_runtime_backend_after_setup(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_windows_auto_setup_reports_failed_when_runtime_cannot_be_promoted(
+async def test_ready_setup_is_idempotent_after_a_client_loses_the_response(monkeypatch) -> None:
+    from opensquilla.sandbox import integration, setup_runtime
+
+    config = SimpleNamespace()
+    setup_calls = 0
+    promotions = []
+
+    async def ready_setup(_config):
+        nonlocal setup_calls
+        setup_calls += 1
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="win32",
+            message="Windows default sandbox is ready.",
+            requires_admin=False,
+        )
+
+    monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", ready_setup)
+    monkeypatch.setattr(
+        integration,
+        "initialize_runtime_backend",
+        AsyncMock(side_effect=lambda: promotions.append("promoted")),
+        raising=False,
+    )
+
+    first = await setup_runtime.ensure_sandbox_setup_auto(config)
+    second = await setup_runtime.ensure_sandbox_setup_auto(config)
+
+    assert second is first
+    assert setup_calls == 1
+    assert promotions == ["promoted"]
+
+
+@pytest.mark.asyncio
+async def test_windows_setup_reports_failed_when_runtime_cannot_be_promoted(
     monkeypatch,
 ) -> None:
     from opensquilla.sandbox import integration, setup_runtime
@@ -125,8 +163,8 @@ async def test_windows_auto_setup_reports_failed_when_runtime_cannot_be_promoted
     monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", ready_setup)
     monkeypatch.setattr(
         integration,
-        "refresh_runtime_backend_after_setup",
-        lambda: (_ for _ in ()).throw(RuntimeError("backend still unavailable")),
+        "initialize_runtime_backend",
+        AsyncMock(side_effect=RuntimeError("backend still unavailable")),
         raising=False,
     )
 
@@ -138,7 +176,9 @@ async def test_windows_auto_setup_reports_failed_when_runtime_cannot_be_promoted
 
 
 @pytest.mark.asyncio
-async def test_reset_setup_runtime_state_delegates_to_current_probe_again(monkeypatch) -> None:
+async def test_reset_setup_runtime_state_returns_to_uninitialized_without_probe(
+    monkeypatch,
+) -> None:
     from opensquilla.sandbox import setup_runtime
 
     config = SimpleNamespace()
@@ -155,11 +195,14 @@ async def test_reset_setup_runtime_state_delegates_to_current_probe_again(monkey
         )
 
     monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", fail_setup)
-    monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_state.current_sandbox_setup_status", current_probe
+    )
+    monkeypatch.setattr("opensquilla.sandbox.integration.get_runtime", lambda: None)
     await setup_runtime.ensure_sandbox_setup_auto(config)
 
     setup_runtime.reset_sandbox_setup_runtime_state()
     status = await setup_runtime.current_sandbox_setup_runtime_status(config)
 
     assert status.state is SandboxSetupState.NOT_SETUP
-    assert status.message == "Sandbox setup has not been completed."
+    assert status.message == "Sandbox is not initialized."

@@ -219,7 +219,16 @@ async def test_next_message_tolerates_malformed_line_logging_failure(monkeypatch
     def raise_closed_file(*_args: object, **_kwargs: object) -> None:
         raise ValueError("I/O operation on closed file")
 
-    monkeypatch.setattr(bridge_module.log, "warning", raise_closed_file)
+    real_log = bridge_module.log
+
+    class _WarningLog:
+        def warning(self, *args: object, **kwargs: object) -> None:
+            raise_closed_file(*args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(real_log, name)
+
+    monkeypatch.setattr(bridge_module, "log", _WarningLog())
 
     bridge = OpenTuiBridge(
         connection=_FakeConnection(

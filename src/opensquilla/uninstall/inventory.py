@@ -50,7 +50,7 @@ class DataBucket:
 
     name: str
     path: Path
-    category: str  # user-data | config | service | cache | desktop-data
+    category: str  # user-data | runtime-data | config | service | cache | desktop-data
     purge_flag: str  # PURGE_STATE | PURGE_CONFIG | PURGE_ALL_ONLY
     sidecars: tuple[str, ...] = ()  # suffixes, e.g. ("-wal", "-shm")
     glob: bool = False  # treat path.name as a glob pattern in path.parent
@@ -320,6 +320,12 @@ def build_data_buckets(home: Path, config: Any | None) -> list[DataBucket]:
         DataBucket("install receipt", home / "install-receipt.json", "config", PURGE_CONFIG),
         # --- state / runtime data ---
         DataBucket("state directory", state, "user-data", PURGE_STATE),
+        DataBucket(
+            "managed toolchains",
+            state / "toolchains",
+            "runtime-data",
+            PURGE_STATE,
+        ),
         DataBucket("logs", home / "logs", "desktop-data", PURGE_STATE),
         DataBucket("cache", home / "cache", "cache", PURGE_STATE),
         DataBucket("media / artifacts", home / "media", "user-data", PURGE_STATE),
@@ -329,7 +335,6 @@ def build_data_buckets(home: Path, config: Any | None) -> list[DataBucket]:
         DataBucket("workspace", home / "workspace", "user-data", PURGE_STATE),
         DataBucket("session archive", home / "session-archive", "user-data", PURGE_STATE),
         DataBucket("code-task runs", home / "code-task", "user-data", PURGE_STATE),
-        DataBucket("swebench artifacts", home / "swebench", "user-data", PURGE_STATE),
         DataBucket("migration backups", home / "migration", "user-data", PURGE_STATE),
     ]
 
@@ -342,7 +347,6 @@ def build_data_buckets(home: Path, config: Any | None) -> list[DataBucket]:
         ("log dir", _env_path("OPENSQUILLA_LOG_DIR")),
         ("turn-call log dir", _env_path("OPENSQUILLA_TURN_CALL_LOG_DIR")),
         ("session archive dir", _env_path("OPENSQUILLA_SESSION_ARCHIVE_DIR")),
-        ("swebench artifacts dir", _env_path("OPENSQUILLA_SWEBENCH_ARTIFACTS_DIR")),
     ]
     if config is not None:
         try:

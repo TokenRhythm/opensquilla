@@ -7,6 +7,9 @@ from typing import Any, cast
 import pytest
 
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.turn_runner.attachment_stage import (
+    AttachmentMaterializationStats,
+)
 from opensquilla.engine.turn_runner.harness import _TurnRunnerPipelineExecutionAdapter
 from opensquilla.engine.turn_runner.input_stage import (
     ExtraContextResolver,
@@ -137,6 +140,55 @@ async def test_pipeline_execution_adapter_forwards_normalization_metadata() -> N
 
 
 @pytest.mark.asyncio
+async def test_attachment_materialization_threads_into_sanitized_pipeline_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_pipeline(ctx, steps):  # noqa: ANN001, ARG001
+        captured["metadata"] = ctx.metadata
+        return ctx
+
+    monkeypatch.setattr("opensquilla.engine.pipeline.run_pipeline", fake_run_pipeline)
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(
+            squilla_router=SimpleNamespace(routing_timeout_seconds=5.0)
+        ),
+    )
+    stats = AttachmentMaterializationStats(
+        attachment_count=3,
+        estimated_tokens=45_123,
+        generated_normalization_estimated_tokens=2_000,
+        parse_failure_count=1,
+        provider_visible_text_chars=180_000,
+        image_count=1,
+    )
+
+    await runner._run_pipeline(
+        message="runtime",
+        session_key="agent:main:s1",
+        provider=None,
+        cloned_selector=None,
+        tool_defs=[],
+        base_prompt="base",
+        attachments=[],
+        attachment_materialization=stats,
+    )
+
+    assert captured["metadata"] | {
+        "had_attachments": True,
+        "attachment_count": 3,
+        "attachment_material_estimated_tokens": 45_123,
+        "attachment_generated_normalization_estimated_tokens": 2_000,
+        "attachment_parse_failure_count": 1,
+        "attachment_provider_visible_text_chars": 180_000,
+        "attachment_image_count": 1,
+    } == captured["metadata"]
+    assert not any("name" in key or "content" in key for key in captured["metadata"])
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_seeds_turn_context_with_normalization_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -232,6 +284,7 @@ class _RecordingPromptAssembler(PromptAssemblerPort):
         prompt_metadata,
         bootstrap_context_mode,  # noqa: ANN001, ARG002
         fresh_user_session=False,  # noqa: ANN001, ARG002
+        workspace_dir=None,  # noqa: ANN001, ARG002
     ):
         prompt_metadata["prompt_key"] = "prompt_value"
         return "base"
@@ -239,7 +292,12 @@ class _RecordingPromptAssembler(PromptAssemblerPort):
 
 class _RecordingRouterContext(RouterContextPort):
     async def fetch_router_context(
-        self, session_key, *, exclude_last_user, bound_user_message_id=None  # noqa: ANN001, ARG002
+        self,
+        session_key,
+        *,
+        exclude_last_user,
+        bound_user_message_id=None,
+        include_capacity=False,  # noqa: ANN001, ARG002
     ):
         return {}
 

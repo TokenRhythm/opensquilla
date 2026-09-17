@@ -4,6 +4,7 @@
   "description": "Compact Jest output while preserving failures and summary counts.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["jest"],
     "commandIncludes": ["jest"]
   },
   "transforms": {

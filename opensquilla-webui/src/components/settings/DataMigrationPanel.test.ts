@@ -25,8 +25,8 @@ async function mountPanel(options: MountOptions = {}) {
   setDesktopApi(options.desktopApi)
 
   const rpc = {
-    waitForConnection: vi.fn(async () => {}),
-    supportsMethod: vi.fn(() => true),
+    ready: vi.fn(async () => {}),
+    hasRpcMethod: vi.fn(() => true),
     call: vi.fn(),
     ...options.rpc,
   }
@@ -38,10 +38,70 @@ async function mountPanel(options: MountOptions = {}) {
   const i18n = (await import('@/i18n')).default
   i18n.global.locale.value = 'en'
   const Component = (await import('./DataMigrationPanel.vue')).default
+  const {
+    MIGRATION_OPERATIONS_KEY,
+    MigrationOperationsError,
+  } = await import('@/modules/migrationOperations')
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(Component)
   app.use(i18n)
+  app.provide(MIGRATION_OPERATIONS_KEY, {
+    listSources: async () => {
+      const hasRpcMethod = (rpc as { hasRpcMethod?: (method: string) => boolean }).hasRpcMethod
+      if (hasRpcMethod && !hasRpcMethod('migration.sources.list')) {
+        throw new MigrationOperationsError('unsupported', 'Migration discovery is unsupported.')
+      }
+      const result = await rpc.call('migration.sources.list', {}) as {
+        schemaVersion: 1
+        mode: 'preview_only'
+        capabilities: { discover: boolean; preview: boolean; apply: boolean; manualSource: boolean }
+        candidates: Array<Record<string, unknown>>
+      }
+      return {
+        ...result,
+        candidates: result.candidates.map(candidate => ({
+          id: String(candidate.candidateId),
+          sourceKind: String(candidate.sourceKind),
+          version: typeof candidate.version === 'string' ? candidate.version : null,
+          estimatedActivityAt: typeof candidate.estimatedActivityAt === 'string' ? candidate.estimatedActivityAt : null,
+          sessionCount: typeof candidate.sessionCount === 'number' ? candidate.sessionCount : null,
+          sizeBytes: typeof candidate.sizeBytes === 'number' ? candidate.sizeBytes : null,
+          previouslyImported: candidate.previouslyImported === true,
+        })),
+      }
+    },
+    preview: async (candidateId: string) => {
+      const hasRpcMethod = (rpc as { hasRpcMethod?: (method: string) => boolean }).hasRpcMethod
+      if (hasRpcMethod && !hasRpcMethod('migration.sources.preview')) {
+        throw new MigrationOperationsError('unsupported', 'Migration preview is unsupported.')
+      }
+      const result = await rpc.call('migration.sources.preview', { candidateId }) as Record<string, unknown>
+      const summary = result.summary as Record<string, unknown> | undefined
+      return {
+        ...result,
+        candidate: result.candidate ?? {
+          candidateId,
+          sourceKind: 'cli-home',
+          version: null,
+          estimatedActivityAt: null,
+          sessionCount: null,
+          sizeBytes: null,
+          previouslyImported: false,
+        },
+        summary: {
+          sessionCount: typeof summary?.sessionCount === 'number' ? summary.sessionCount : null,
+          itemCounts: summary?.itemCounts ?? { planned: 0, skipped: 0, error: 0 },
+          pausedJobCount: typeof summary?.pausedJobCount === 'number' ? summary.pausedJobCount : 0,
+          diskRequiredBytes: typeof summary?.diskRequiredBytes === 'number' ? summary.diskRequiredBytes : 0,
+          diskFreeBytes: typeof summary?.diskFreeBytes === 'number' ? summary.diskFreeBytes : 0,
+        },
+        blockers: Array.isArray(result.blockers) ? result.blockers : [],
+        notices: Array.isArray(result.notices) ? result.notices : [],
+        execution: result.execution ?? { canApply: false, supportedBy: ['desktop', 'host_cli'] },
+      }
+    },
+  } as unknown as import('@/modules/migrationOperations').MigrationOperations)
   app.mount(el)
   mounted.push({ app, el })
   await settle()
@@ -126,7 +186,6 @@ function cleanupReport(
 
 function desktopMaintenanceApi(overrides: Record<string, unknown> = {}) {
   return {
-    getDesktopProfileKind: async () => 'primary',
     getRecoveryState: async () => ({ inspection: { outcome: 'ready', stable_code: 'ready' } }),
     migrationSummary: vi.fn(async () => ({ ok: true, candidates: [], candidate: null, report: null })),
     migrationRun: vi.fn(),
@@ -144,7 +203,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         getRecoveryState: async () => ({ inspection: { outcome: 'ready', stable_code: 'ready' } }),
         migrationSummary,
         migrationRun: vi.fn(),
@@ -185,7 +243,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         getRecoveryState: async () => ({
           inspection: { outcome: 'attention', stable_code: 'workspace_conflict' },
         }),
@@ -206,6 +263,46 @@ describe('DataMigrationPanel desktop provider', () => {
       .not.toContain('/synthetic/legacy-agent-data')
   })
 
+  it('keeps deferred profile maintenance non-blocking and offers one-click repair', async () => {
+    const retryProfileConsolidation = vi.fn(async () => ({ ok: true }))
+    const { el } = await mountPanel({
+      desktopApi: {
+        getOsLocale: async () => 'en',
+        getRecoveryState: async () => ({
+          inspection: { outcome: 'ready', stable_code: 'ready' },
+          maintenance: {
+            kind: 'profile-consolidation',
+            stable_code: 'unsafe_path',
+            retryable: true,
+            recovery_profile_count: 2,
+          },
+        }),
+        retryProfileConsolidation,
+        migrationSummary: vi.fn(async () => ({
+          ok: true,
+          candidates: [],
+          candidate: null,
+          report: null,
+        })),
+        migrationRun: vi.fn(),
+      },
+    })
+
+    const maintenance = el.querySelector('[data-testid="profile-consolidation-maintenance"]')
+    expect(maintenance?.textContent).toContain('Historical data is safely preserved')
+    expect(maintenance?.textContent).toContain('OpenSquilla is ready to use')
+    expect(maintenance?.textContent).toContain('unsafe_path')
+    expect(maintenance?.textContent).not.toContain('/synthetic/')
+
+    maintenance?.querySelector<HTMLButtonElement>(
+      '[data-testid="profile-consolidation-repair"]',
+    )?.click()
+    await settle()
+
+    expect(retryProfileConsolidation).toHaveBeenCalledTimes(1)
+    expect(el.querySelector('[data-testid="profile-consolidation-maintenance"]')).toBeNull()
+  })
+
   it('confirms an empty-target copy and sends only the opaque preview approval', async () => {
     const candidate = desktopCandidate()
     const migrationRun = vi.fn(async () => ({ ok: true, migrationApplied: true, restartOk: true }))
@@ -221,7 +318,6 @@ describe('DataMigrationPanel desktop provider', () => {
       confirm,
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         migrationSummary,
         migrationRun,
       },
@@ -254,7 +350,6 @@ describe('DataMigrationPanel desktop provider', () => {
       confirm,
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         migrationSummary,
         migrationRun,
       },
@@ -287,7 +382,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         migrationSummary: vi.fn(async () => ({ ok: true, candidates: [], candidate: null, report: null })),
         migrationRun: vi.fn(),
         migrationPeekLastResult,
@@ -316,7 +410,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         retryStartup,
         migrationPeekLastResult: async () => ({
           ok: false,
@@ -350,7 +443,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         getGatewayStatus,
         retryStartup,
         migrationPeekLastResult: async () => ({
@@ -444,7 +536,7 @@ describe('DataMigrationPanel desktop cleanup', () => {
           ok: false,
           previewId: null,
           report,
-          profile: { kind: 'recovery' as const, recoveryId: '01234567-89ab-4cde-8fab-0123456789ab' },
+          profile: { kind: 'primary' as const, recoveryId: null },
         })),
         discardDesktopCleanup: vi.fn(async () => true),
         applyDesktopCleanup: vi.fn(),
@@ -458,7 +550,7 @@ describe('DataMigrationPanel desktop cleanup', () => {
     const summary = el.querySelector('[data-testid="data-migration-cleanup-summary"]')
     expect(summary?.getAttribute('aria-labelledby')).toBe('cleanup-summary-title')
     expect(summary?.textContent).toContain('cleanup_history_invalid')
-    expect(summary?.textContent).toContain('Recovery profile')
+    expect(summary?.textContent).toContain('Primary profile')
     expect(el.querySelector('[data-testid="data-migration-cleanup-apply"]')).toBeNull()
     expect(summary?.querySelector('input[type="checkbox"]')).toBeNull()
     expect(summary?.querySelector('input[type="text"]')).toBeNull()
@@ -603,7 +695,7 @@ describe('DataMigrationPanel gateway preview provider', () => {
     const call = vi.fn()
     const { el } = await mountPanel({
       rpc: {
-        supportsMethod: vi.fn(() => false),
+        hasRpcMethod: vi.fn(() => false),
         call,
       },
     })

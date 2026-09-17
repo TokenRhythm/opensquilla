@@ -16,6 +16,28 @@ OpenSquilla reads configuration in this order:
 Use `--config ./opensquilla.toml` when you want to write or inspect a
 project-local config file.
 
+## Task Runtime Concurrency
+
+Fresh installations allow up to eight cross-session turns to run at once:
+
+```toml
+[task_runtime]
+max_concurrency = 8
+max_pending_per_session = 64
+```
+
+Eight is the desktop default because it matches the built-in channel in-flight
+budget and leaves enough capacity for interactive tasks, Goal continuations,
+Cron runs, and subagents without bypassing TaskRuntime's global queue. Turns in
+the same session remain serialized. Provider pressure is still handled by the
+configured credential pool, provider health/fallback policy, and `Retry-After`
+cooldowns; this setting does not manufacture extra credentials or disable
+provider rate limiting.
+
+This is a default change, not a migration. An existing TOML value such as
+`max_concurrency = 4`, or an explicit
+`OPENSQUILLA_TASK_MAX_CONCURRENCY=4`, remains authoritative after upgrade.
+
 ## Secret Handling
 
 Prefer environment-variable references for secrets:
@@ -283,7 +305,6 @@ opensquilla memory list
 opensquilla memory search "project preference"
 opensquilla memory show <path>
 opensquilla memory dream
-opensquilla memory flush-session <session-key>
 ```
 
 Configure embedding behavior:
@@ -350,7 +371,50 @@ Only subnets of `198.18.0.0/15` are accepted in this setting. Loopback, RFC
 hard-blocked even if configured. If a public hostname resolves to one of those
 hard-blocked ranges, fix the DNS or proxy setup instead of bypassing the guard.
 
+## Environment Proxies
+
+Outbound HTTP clients ignore `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` by
+default so a stray proxy in a parent shell cannot reroute agent traffic. Set
+`OPENSQUILLA_TRUST_ENV=1` (for example in `~/.opensquilla/.env`) to opt in.
+That gate is shared by channel adapters, providers, `http_request`, and
+`web_fetch`.
+
+`web_search` has a separate `search_use_env_proxy` / `OPENSQUILLA_GATEWAY_SEARCH_USE_ENV_PROXY`
+switch; it does not enable `web_fetch`.
+
+`web_fetch` pins direct and environment-proxied requests to the locally
+SSRF-vetted address by default. With trust-env enabled, `SSL_CERT_FILE` and
+`SSL_CERT_DIR` remain available for custom TLS certificate authorities.
+
+If local DNS is poisoned or intercepted and your proxy needs to resolve the
+original hostname, explicitly enable both options:
+
+```dotenv
+OPENSQUILLA_TRUST_ENV=1
+OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS=1
+HTTPS_PROXY=http://127.0.0.1:7890
+```
+
+`OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS` is off by default. It only applies when
+an environment proxy is selected for that URL. It delegates DNS resolution
+and **final destination access control to the proxy**. A local SSRF check
+cannot prevent that proxy from subsequently resolving a hostname to a private,
+loopback, or link-local address. Use this mode only when you trust the proxy's
+destination policy; a proxy being on localhost does not itself provide that
+protection.
+
+Local URL/DNS checks still run before fetching and on every redirect, so URLs
+that locally resolve to blocked addresses remain blocked, and local DNS must
+still succeed. `NO_PROXY` matches continue to use direct, pinned connections.
+This option does not change sandbox-managed proxy routing or permissions.
+Restart the gateway after changing these environment settings.
+
 ## Gateway Binding
+
+The desktop application always owns a loopback-only child Gateway bound to
+`127.0.0.1`. Desktop settings do not change its listener address or expose it
+to the LAN. The settings below apply to a separately launched standalone
+Gateway.
 
 Foreground:
 
@@ -376,6 +440,93 @@ Bind precedence:
 5. config host
 6. `127.0.0.1`
 
+When listening on the LAN, OpenSquilla accepts only loopback, RFC 1918, and
+IPv6 ULA socket peers. `auth.allowed_client_cidrs` can narrow that built-in
+range but cannot add public networks:
+
+```toml
+host = "0.0.0.0"
+
+[auth]
+mode = "token"
+allowed_client_cidrs = ["192.168.50.0/24"]
+```
+
+Missing, malformed, and incorrect tokens receive guest-safe authority only.
+A valid named token with `host.execute` may select Full Access without gaining
+owner-only settings authority.
+
+For a remote Web guest, the server ignores any client-supplied workspace and
+uses the configured default workspace. All file-capable tools follow the same
+non-bypassable policy:
+
+- ordinary host files are readable;
+- the built-in credential paths and OpenSquilla authority/recovery data are
+  not readable;
+- writes are allowed only inside the configured default workspace;
+- workspace creation, selection, and other owner-only lifecycle operations are
+  unavailable.
+
+These restrictions also apply to Shell, Python, Node.js, Git Bash, and their
+child processes. Guests cannot access the global approval queue, and approvals
+cannot elevate a guest past this boundary. The Gateway refuses Guest Safe
+startup when the configured default workspace is inside a protected credential
+or authority path.
+
+## Safe Mode Policy
+
+Settings -> Sandbox persists a versioned policy snapshot for each new task.
+Ordinary host files are readable and writable in Safe mode, except OpenSquilla
+authority/recovery data and the built-in or custom deny-write paths. Mutating a
+deny-write path requires an exact user approval.
+
+Recursive directory deletion always requires a dedicated irreversible-action
+confirmation. Backups are enabled by default with a 3 GiB quota; oldest
+backups are evicted first. A target larger than the quota requires a second,
+explicit confirmation to delete without a backup.
+
+Commands run automatically unless a built-in high-risk rule or a configured
+approval prefix matches. An auto-allow prefix takes precedence over approval
+rules. Network access is public by default through the managed boundary, with
+SSRF and local metadata protections; operators can deny domains, allow
+exceptions, or block all network access.
+
+## Goal Mode (`[goal]`)
+
+Session-level `/goal` mode drives the agent toward a fixed goal turn after turn
+until it completes, blocks, pauses, reaches a provider usage limit, or hits a
+guardrail. Automatic turns use the same TaskRuntime, TurnRunner, sandbox,
+approval, provider, and usage-accounting path as ordinary turns. All fields
+below are optional; absent keys keep the defaults.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `execution_enabled` | `true` | Emergency kill switch. When false, no new Goal execution is accepted and unfinished active Goals pause. |
+| `max_turns` | `50` | Per-resume-window turn limit (`1`-`500`). The current turn finishes first; an otherwise active Goal then pauses with `turn_limit`. |
+| `runtime_budget_seconds` | `3600` | Per-resume-window active running-time limit (`60`-`86400` seconds). Queue time, pauses, and Gateway downtime do not count. An otherwise active Goal pauses with `runtime_limit`. |
+
+```toml
+[goal]
+execution_enabled = true
+max_turns = 50
+runtime_budget_seconds = 3600
+```
+
+`/goal resume` resets the current guardrail window while retaining lifetime
+turn, active-time, and token totals. Goal mode does not replay a failed or timed
+out whole turn: tools may already have produced side effects. Provider/core
+request retries remain governed by their existing policies.
+
+An execution lease belongs to the subscribed Web UI or CLI connection that
+started or resumed the Goal. Losing that client connection detaches the lease:
+the Goal stays active, its current accepted turn may finish, and no new
+automatic continuation starts until an authorized client reattaches. A Web UI
+refresh reattaches with a tab-local continuity token; an explicit takeover is
+available when that token was lost. Disabling execution or restarting the
+Gateway still pauses unattended work. Read the complete workflow, state model,
+Plan-mode interaction, upgrade notes, and recovery guidance in
+[`goal-mode.md`](goal-mode.md).
+
 ## Raw Config Editing
 
 For advanced settings, inspect `opensquilla.toml.example` and edit the active
@@ -391,4 +542,4 @@ opensquilla gateway status
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

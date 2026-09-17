@@ -10,11 +10,21 @@ dependencies. No additional packages needed.
 
 ## Engine API terms
 
-Brave, Tavily, and SerpAPI each have their own terms of service. Users
-must comply with those terms when using their respective API keys. The
-HTML-scraping engines (DuckDuckGo, Bing, Baidu, Sogou, 360) are subject
-to those sites' robots.txt and terms — the skill respects rate limiting
-hints but does not enforce per-site policies.
+Crossref's public REST API provides scholarly metadata without an API key;
+use is subject to Crossref's REST API etiquette and rate limits. The optional
+`CROSSREF_MAILTO` parameter identifies the client for polite-pool use. See:
+
+- <https://www.crossref.org/documentation/retrieve-metadata/rest-api/>
+- <https://www.crossref.org/documentation/retrieve-metadata/rest-api/rest-api-metadata-retrieval/>
+
+Brave and Tavily each have their own terms of service. Users must comply with
+those terms when using their respective API keys. DuckDuckGo HTML access is
+subject to its robots.txt and terms. The client uses bounded retries for
+timeout, HTTP 429, and transient HTTP 5xx failures, but callers remain
+responsible for keeping request volume reasonable.
+
+Crossref support reuses the existing `httpx` runtime dependency and adds no
+package or vendored code.
 
 ## License
 

@@ -28,7 +28,7 @@ LEGACY_PRESET_IDS = (
 )
 # Curated-inline presets also ship packaged TOML, but never persist as a
 # tier_profile id (applied as inline tiers instead).
-CURATED_INLINE_PRESET_IDS = ("tokenrhythm",)
+CURATED_INLINE_PRESET_IDS = ("qwen_token_plan", "tokenrhythm")
 PACKAGED_PRESET_IDS = LEGACY_PRESET_IDS + CURATED_INLINE_PRESET_IDS
 
 

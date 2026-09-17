@@ -20,14 +20,21 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import pytest
 
 from opensquilla.engine.hooks.types import CompactionState
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.turn_runner import (
+    AttachmentMaterializationStats,
+    AttachmentStageOutput,
+)
+from opensquilla.engine.turn_runner.outcome import StageOutcome
 from opensquilla.engine.types import ErrorEvent
+from opensquilla.provider import Message
+from opensquilla.provider.types import ContentBlockImage
 
 # Reuse upstream patch helpers from's equivalence harness — this
 # stage sits AFTER AgentBootstrapStage's slice so the same upstream
@@ -98,12 +105,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
     def _max_iter(self, session_key, mi):  # noqa: ARG001, ARG002
         return mi if mi is not None else 10
 
-    def _iter_t(self, session_key, it):  # noqa: ARG001, ARG002
-        return it if it is not None else 30.0
-
-    def _tool_t(self, session_key, tt):  # noqa: ARG001, ARG002
-        return tt if tt is not None else 20.0
-
     def _req_t(self, session_key, rt):  # noqa: ARG001, ARG002
         return rt if rt is not None else 120.0
 
@@ -112,8 +113,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
 
     runner._resolve_agent_runtime_timeout = _runtime.__get__(runner, TurnRunner)
     runner._resolve_agent_max_iterations = _max_iter.__get__(runner, TurnRunner)
-    runner._resolve_agent_iteration_timeout = _iter_t.__get__(runner, TurnRunner)
-    runner._resolve_agent_tool_timeout = _tool_t.__get__(runner, TurnRunner)
     runner._resolve_agent_request_timeout = _req_t.__get__(runner, TurnRunner)
     runner._resolve_agent_max_provider_retries = _retries.__get__(runner, TurnRunner)
 
@@ -177,13 +176,35 @@ def _patch_load_history(runner, *, return_value=None, raises=None, calls=None):
 
 
 def _patch_post_slice_probe(runner):
-    """Hook _build_attachment_messages (first call past the slice)."""
+    """Stop at Agent.run_turn, after compaction/history output is installed."""
 
-    def _probe(self, *args, **kwargs):  # noqa: ARG001, ARG002
-        snapshot = _capture_locals_at_post_slice()
-        raise _SliceCapture(snapshot)
+    factory = runner._agent_bootstrap_stage._agent_factory
+    original_build = factory.build
 
-    runner._build_attachment_messages = _probe.__get__(runner, TurnRunner)
+    class _ProbeAgentFactory:
+        def build(self, **kwargs: Any):
+            agent = original_build(**kwargs)
+
+            async def _probe_run_turn(
+                probe_agent: Any,
+                *_args: Any,
+                **_kwargs: Any,
+            ):
+                snapshot = {
+                    "outcome": "success",
+                    "agent_request_context_prompt_after": getattr(
+                        getattr(probe_agent, "config", None),
+                        "request_context_prompt",
+                        None,
+                    ),
+                }
+                raise _SliceCapture(snapshot)
+                yield  # pragma: no cover
+
+            agent.run_turn = MethodType(_probe_run_turn, agent)
+            return agent
+
+    runner._agent_bootstrap_stage._agent_factory = _ProbeAgentFactory()
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +261,6 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
         session_key="cron:tick:s1",
         t3_return="not_applicable",
     ),
-    _case("t3_flush_failed_preflight_fallthrough", t3_return="flush_failed"),
     _case("compaction_circuit_open", t3_return="handled"),
     _case(
         "durable_summaries_exist",
@@ -280,7 +300,7 @@ def _build_runner() -> TurnRunner:
         model_catalog=_StubModelCatalog(),
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,
@@ -417,7 +437,7 @@ async def test_compaction_and_history_stage_snapshot(
         assert isinstance(yielded[0], ErrorEvent)
         assert yielded[0].code == "agent_error"
         assert len(call_log["t3"]) == 1
-        if case["t3_return"] in {"not_applicable", "flush_failed"}:
+        if case["t3_return"] == "not_applicable":
             assert len(call_log["preflight"]) == 1
         # And history must have been attempted once before raising.
         assert len(call_log["history"]) == 1
@@ -440,7 +460,7 @@ async def test_compaction_and_history_stage_snapshot(
     # Routing assertions: t3 always invoked exactly once.
     assert len(call_log["t3"]) == 1, f"{case_id}: t3 calls"
     # Preflight invoked only on fall-through sentinels.
-    fall_through = case["t3_return"] in {"not_applicable", "flush_failed"}
+    fall_through = case["t3_return"] == "not_applicable"
     expected_pre_calls = 1 if fall_through else 0
     assert len(call_log["preflight"]) == expected_pre_calls, (
         f"{case_id}: preflight calls"
@@ -451,6 +471,35 @@ async def test_compaction_and_history_stage_snapshot(
         call_log["history"][0]["trim_last_user"]
         is case["history_has_persisted_user"]
     )
+
+
+@pytest.mark.asyncio
+async def test_unknown_vision_capability_does_not_skip_compaction() -> None:
+    case = dict(_CASE_BASE)
+    runner, call_log = _setup_runner(case)
+    image_message = Message(
+        role="user",
+        content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+    )
+
+    async def _attachment_run(_inp: Any) -> StageOutcome[AttachmentStageOutput]:
+        return StageOutcome.success(
+            AttachmentStageOutput(
+                extra_messages=[image_message],
+                turn_input="",
+                stats=AttachmentMaterializationStats(image_count=1),
+            )
+        )
+
+    runner._attachment_stage = SimpleNamespace(run=_attachment_run)
+
+    captured, _yielded, raised = await _drive(runner, case)
+
+    assert raised is None
+    assert captured is not None
+    assert len(call_log["t3"]) == 1
+    assert len(call_log["preflight"]) == 1
+    assert len(call_log["history"]) == 1
 
 
 @pytest.mark.asyncio
@@ -489,3 +538,50 @@ async def test_raising_hook_does_not_break_turn(
     assert captured is not None
     assert len(call_log["t3"]) == 1
     assert len(call_log["preflight"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["t3", "preflight"])
+@pytest.mark.parametrize("supports_resolver", [False, True])
+async def test_attachment_path_adapter_preserves_legacy_runner_signatures(
+    phase: str, supports_resolver: bool,
+) -> None:
+    from opensquilla.engine.turn_runner.harness import (
+        _TurnRunnerPreflightCompactionAdapter,
+        _TurnRunnerT3UpgradeCompactionAdapter,
+    )
+
+    seen: dict[str, Any] = {}
+
+    def resolver(attachment: dict[str, Any], session_key: str) -> str | None:
+        return "assets/sample.png"
+
+    async def modern(*args: Any, attachment_path_resolver=None, **kwargs: Any) -> str:
+        seen["resolver"] = attachment_path_resolver
+        return "not_applicable"
+
+    async def legacy(*args: Any, compaction_provider=None, compaction_model=None) -> str:
+        seen["legacy_called"] = True
+        return "not_applicable"
+
+    runner = SimpleNamespace(
+        _maybe_compact_on_t3_upgrade=modern if supports_resolver else legacy,
+        _maybe_preflight_compact=modern if supports_resolver else legacy,
+    )
+    adapter = (
+        _TurnRunnerT3UpgradeCompactionAdapter(runner)
+        if phase == "t3" else _TurnRunnerPreflightCompactionAdapter(runner)
+    )
+    kwargs: dict[str, Any] = {
+        "session_key": "agent:main:synthetic-compaction",
+        "context_window_tokens": 64_000,
+        "compaction_provider": None,
+        "compaction_model": None,
+        "attachment_path_resolver": resolver,
+    }
+    if phase == "t3":
+        kwargs["turn"] = SimpleNamespace()
+
+    await adapter.maybe_compact(**kwargs)
+
+    assert seen == ({"resolver": resolver} if supports_resolver else {"legacy_called": True})

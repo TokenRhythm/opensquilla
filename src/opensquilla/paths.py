@@ -21,6 +21,16 @@ _PROFILES_ROOT_ENV = "OPENSQUILLA_HOME"
 _PROFILE_ENV = "OPENSQUILLA_PROFILE"
 _DEFAULT_PROFILE = "default"
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_DESKTOP_PROFILE_KINDS = frozenset({"desktop-primary", "desktop-recovery"})
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def desktop_profile_lifecycle_active() -> bool:
+    """Return whether lifecycle bookkeeping belongs to a Desktop profile."""
+    profile_kind = os.environ.get("OPENSQUILLA_PROFILE_KIND", "").strip().lower()
+    if profile_kind:
+        return profile_kind in _DESKTOP_PROFILE_KINDS
+    return os.environ.get("OPENSQUILLA_DESKTOP", "").strip().lower() in _TRUTHY
 
 
 def _home_dir() -> Path:
@@ -36,6 +46,24 @@ def _expand_user(path: str) -> Path:
     if path.startswith("~/") or path.startswith("~\\"):
         return _home_dir() / path[2:]
     return Path(path).expanduser()
+
+
+def native_io_path(path: str | Path) -> Path:
+    """Return an internal path spelling that bypasses Windows ``MAX_PATH``.
+
+    Callers must keep their public/configured path logical and use this value
+    only at the filesystem or SQLite boundary.
+    """
+
+    logical = Path(path).expanduser()
+    if os.name != "nt":
+        return logical
+    absolute = os.path.abspath(os.fspath(logical))
+    if absolute.startswith("\\\\?\\"):
+        return Path(absolute)
+    if absolute.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{absolute[2:]}")
+    return Path(f"\\\\?\\{absolute}")
 
 
 def is_valid_profile_name(name: str) -> bool:

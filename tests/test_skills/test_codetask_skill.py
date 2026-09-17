@@ -31,6 +31,7 @@ def test_codetask_skill_loads(loader):
 def test_codetask_skill_declares_requirements(loader):
     spec = loader.get_by_name("code-task")
     assert spec is not None
+    assert set(spec.requires_tools) == {"background_process", "exec_command", "process"}
     meta = spec.metadata
     assert meta is not None
     assert meta.requires is not None

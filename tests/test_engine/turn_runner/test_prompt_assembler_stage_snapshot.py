@@ -61,6 +61,7 @@ class _StubSelector:
 
     def override_model(self, model: str) -> None:
         self.overridden_models.append(model)
+        self.current_model = model
 
     def resolve(self):
         return self.resolve_returns or _StubProvider("resolved-after-override")
@@ -182,7 +183,7 @@ def _patch_assemble_prompt(runner, base_prompt, prompt_metadata):
     def _assemble_prompt(
         self, agent_id, tool_defs, *, session_key=None, semantic_message=None,
         extra_context=None, prompt_metadata=None, bootstrap_context_mode=None,
-        fresh_user_session=False,
+        fresh_user_session=False, workspace_dir=None,
     ):  # noqa: ARG001
         if prompt_metadata is not None:
             prompt_metadata.update(pm_to_emit)
@@ -283,7 +284,7 @@ def _build_runner() -> TurnRunner:
         model_catalog=None,
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,
@@ -522,7 +523,7 @@ async def test_prompt_assembler_stage_snapshot(
         "cache_breakpoints": case["cache_breakpoints"],
         "request_context_prompt": case["request_context_prompt"],
         "resolved_model": expected_resolved_model,
-        "selector_model": "claude-sonnet-4.5",
+        "selector_model": case.get("model") or "claude-sonnet-4.5",
         "session_id_for_log": case["session_id"],
         "trace_context_session_id": case["session_id"],
         "prompt_report_chars": len(case["final_prompt"]),

@@ -19,9 +19,10 @@ corrections ladder (a relay's streaming dialect is not listing data).
 
 from __future__ import annotations
 
-import math
+import asyncio
+import json
 from collections.abc import Callable, Iterable, Mapping
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -30,9 +31,17 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 
 from .app_attribution import provider_app_headers
+from .error_redaction import redacted_httpx_error
 from .fx import TOKENRHYTHM_CNY_PER_USD
-from .model_catalog import DEFAULT_MAX_TOKENS as _NEAR_WINDOW_MARGIN
 from .registry import UnknownProviderError, get_provider_spec
+from .tokenrhythm_catalog import (
+    parse_tokenrhythm_published,
+    tokenrhythm_published_catalog_entries,
+)
+from .tokenrhythm_correlation import (
+    redact_tokenrhythm_install_ids,
+    tokenrhythm_install_id_headers,
+)
 
 if TYPE_CHECKING:
     from .model_catalog import ModelCatalog
@@ -47,73 +56,6 @@ LIVE_CATALOG_TIMEOUT_SECONDS = 5.0
 # corrections rows use (catalog_overrides.toml) and the billing receipts
 # record — one canonical rate in ``provider/fx.py``.
 _TOKENRHYTHM_CNY_PER_USD = float(TOKENRHYTHM_CNY_PER_USD)
-_TOKENRHYTHM_CNY_PER_USD_DECIMAL = TOKENRHYTHM_CNY_PER_USD
-_TOKENS_PER_MTOK = Decimal("1000000")
-
-
-def _coerce_positive_int(value: object) -> int:
-    """Positive int from listing data; 0 for anything unusable.
-
-    Listings serve numbers loosely (TokenRhythm already serves prices as
-    strings), so integral floats and digit strings coerce rather than
-    silently zeroing the platform's published budget fields.
-    """
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, float):
-        if not value.is_integer():
-            return 0
-        value = int(value)
-    elif isinstance(value, str):
-        try:
-            value = int(value.strip())
-        except ValueError:
-            return 0
-    if not isinstance(value, int):
-        return 0
-    return value if value > 0 else 0
-
-
-def _tokenrhythm_cost_per_mtok(value: object, billing_unit: object) -> float | None:
-    """CNY-per-``billing_unit``-tokens (string or number) → USD per-Mtok."""
-    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-        return None
-    if not isinstance(billing_unit, (str, int, float)) or isinstance(billing_unit, bool):
-        return None
-    try:
-        price = Decimal(str(value).strip())
-        unit = Decimal(str(billing_unit).strip())
-    except (InvalidOperation, ValueError):
-        return None
-    if not price.is_finite() or not unit.is_finite() or price < 0 or unit <= 0:
-        return None
-    converted = (price * (_TOKENS_PER_MTOK / unit)) / _TOKENRHYTHM_CNY_PER_USD_DECIMAL
-    try:
-        result = float(converted)
-    except (OverflowError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
-
-
-def _tokenrhythm_bucket_cost(
-    row: Mapping[str, Any],
-    *,
-    effective_key: str,
-    discount_key: str,
-    standard_key: str,
-    billing_unit: object,
-) -> float | None:
-    keys = [effective_key]
-    if row.get("hasDiscount") is True:
-        keys.append(discount_key)
-    keys.append(standard_key)
-    for key in keys:
-        if key not in row:
-            continue
-        cost = _tokenrhythm_cost_per_mtok(row.get(key), billing_unit)
-        if cost is not None:
-            return cost
-    return None
 
 
 def parse_tokenrhythm_models(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -123,84 +65,13 @@ def parse_tokenrhythm_models(payload: Mapping[str, Any]) -> dict[str, dict[str, 
     ``context_window`` (``contextWindow``), ``max_output_tokens``
     (``maxOutputTokens``), ``display_name``, ``supports_tools`` /
     ``supports_vision`` (the listing's capability booleans are
-    authoritative both ways), and CNY→USD converted costs. Models not
-    ``online`` and malformed rows are skipped — live data degrades, it
-    never crashes resolution or grants fields it does not know.
+    authoritative both ways), and CNY→USD converted costs. Public ``testing``
+    rows are retained as metadata (only the authenticated listing grants
+    entitlement); offline, non-chat, and malformed rows do not enter the
+    runtime compatibility table.
     """
-    entries: dict[str, dict[str, Any]] = {}
-    data = payload.get("data")
-    if not isinstance(data, list):
-        return entries
-    for row in data:
-        if not isinstance(row, Mapping):
-            continue
-        model_id = str(row.get("id") or "").strip()
-        if not model_id:
-            continue
-        status = str(row.get("status") or "").strip().lower()
-        if status not in ("", "online"):
-            continue
-        fields: dict[str, Any] = {}
-        context_window = _coerce_positive_int(row.get("contextWindow"))
-        if context_window:
-            fields["context_window"] = context_window
-        max_output = _coerce_positive_int(row.get("maxOutputTokens"))
-        # The platform publishes near-window output caps for some models
-        # (input + output share the window). Passing such a cap through as
-        # max_tokens would trip resolve_max_tokens' request-safety clamp
-        # straight down to 8192; halving to the engine's own output-reserve
-        # ceiling (ContextBudgetGovernor reserves at most window/2 for
-        # output) keeps the budget generous AND leaves genuine input room.
-        if max_output and context_window and max_output >= context_window - _NEAR_WINDOW_MARGIN:
-            max_output = context_window // 2
-        if max_output:
-            fields["max_output_tokens"] = max_output
-        display_name = row.get("name")
-        if isinstance(display_name, str) and display_name.strip():
-            fields["display_name"] = display_name.strip()
-        capabilities = row.get("capabilities")
-        if isinstance(capabilities, Mapping):
-            for listing_key, field_name in (
-                ("tools", "supports_tools"),
-                ("vision", "supports_vision"),
-            ):
-                flag = capabilities.get(listing_key)
-                if isinstance(flag, bool):
-                    fields[field_name] = flag
-        if str(row.get("currency") or "").strip().upper() == "CNY":
-            billing_unit = row.get("billingUnit")
-            for effective_key, discount_key, listing_key, field_name in (
-                (
-                    "effectiveInputPrice",
-                    "discountInputPrice",
-                    "inputPrice",
-                    "input_cost_per_mtok",
-                ),
-                (
-                    "effectiveOutputPrice",
-                    "discountOutputPrice",
-                    "outputPrice",
-                    "output_cost_per_mtok",
-                ),
-                (
-                    "effectiveCacheReadPrice",
-                    "discountCacheReadPrice",
-                    "cacheReadPrice",
-                    "cache_read_cost_per_mtok",
-                ),
-            ):
-                cost = _tokenrhythm_bucket_cost(
-                    row,
-                    effective_key=effective_key,
-                    discount_key=discount_key,
-                    standard_key=listing_key,
-                    billing_unit=billing_unit,
-                )
-                if cost is not None:
-                    fields[field_name] = cost
-        if fields:
-            entries[model_id] = fields
-    return entries
+    published = parse_tokenrhythm_published(payload)
+    return tokenrhythm_published_catalog_entries(published)
 
 
 LiveCatalogParser = Callable[[Mapping[str, Any]], dict[str, dict[str, Any]]]
@@ -221,13 +92,90 @@ async def fetch_live_catalog_entries(
     parser = _LIVE_CATALOG_PARSERS.get(shape)
     if parser is None:
         raise ValueError(f"unknown live catalog shape: {shape!r}")
-    async with httpx.AsyncClient(
-        timeout=timeout, trust_env=_trust_env(), proxy=proxy or None
-    ) as client:
-        resp = await client.get(url, headers=provider_app_headers(url))
-        resp.raise_for_status()
-        payload = resp.json()
-    return parser(payload if isinstance(payload, Mapping) else {})
+    safe_request_error: Exception | None = None
+    cancelled_request_error: asyncio.CancelledError | None = None
+    headers: dict[str, str] = {}
+    client: Any = None
+    resp: Any = None
+    payload: Any = None
+    parsed: dict[str, dict[str, Any]] | None = None
+    raw_message = ""
+    raw_state = ""
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=_trust_env(),
+            proxy=proxy or None,
+            follow_redirects=False,
+        ) as client:
+            headers = provider_app_headers(url)
+            headers.update(
+                tokenrhythm_install_id_headers(shape, url, proxy=proxy or None)
+            )
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            payload = (
+                resp.json(parse_float=Decimal)
+                if shape == "tokenrhythm"
+                else resp.json()
+            )
+            parsed = parser(payload if isinstance(payload, Mapping) else {})
+    except asyncio.CancelledError:
+        cancelled_request_error = asyncio.CancelledError()
+    except httpx.HTTPError as exc:
+        safe_request_error = redacted_httpx_error(exc, api_key="")
+    except json.JSONDecodeError as exc:
+        if redact_tokenrhythm_install_ids(exc.doc) == exc.doc:
+            exc.__cause__ = None
+            exc.__context__ = None
+            exc.__traceback__ = None
+            safe_request_error = exc
+        else:
+            safe_request_error = RuntimeError(
+                "Live provider catalog returned invalid JSON"
+            )
+    except Exception as exc:
+        raw_message = str(exc)
+        safe_message = redact_tokenrhythm_install_ids(raw_message)
+        raw_state = repr(getattr(exc, "__dict__", {}))
+        if (
+            safe_message != raw_message
+            or redact_tokenrhythm_install_ids(raw_state) != raw_state
+        ):
+            safe_request_error = RuntimeError(
+                safe_message
+                if safe_message != raw_message
+                else "Live provider catalog parsing failed"
+            )
+        else:
+            exc.__cause__ = None
+            exc.__context__ = None
+            exc.__traceback__ = None
+            safe_request_error = exc
+
+    if cancelled_request_error is not None:
+        headers.clear()
+        client = None
+        resp = None
+        payload = None
+        parsed = None
+        raw_message = ""
+        raw_state = ""
+        url = redact_tokenrhythm_install_ids(url)
+        proxy = redact_tokenrhythm_install_ids(proxy)
+        raise cancelled_request_error
+    if safe_request_error is not None:
+        headers.clear()
+        client = None
+        resp = None
+        payload = None
+        parsed = None
+        raw_message = ""
+        raw_state = ""
+        url = redact_tokenrhythm_install_ids(url)
+        proxy = redact_tokenrhythm_install_ids(proxy)
+        raise safe_request_error
+    return parsed or {}
 
 
 async def warm_live_provider_catalogs(
@@ -261,5 +209,9 @@ async def warm_live_provider_catalogs(
             counts[provider_id] = len(entries)
             log.info("live_catalog.ready", provider=provider_id, count=len(entries))
         except Exception as exc:  # noqa: BLE001 - a live listing degrades, never blocks boot
-            log.warning("live_catalog.failed", provider=provider_id, error=str(exc))
+            log.warning(
+                "live_catalog.failed",
+                provider=provider_id,
+                error=redact_tokenrhythm_install_ids(str(exc)),
+            )
     return counts

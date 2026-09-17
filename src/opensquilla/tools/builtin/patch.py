@@ -13,13 +13,20 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.identity.workspace import BOOTSTRAP_FILENAMES
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
+from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.integration import active_file_system_profile
 from opensquilla.sandbox.operation_runtime import (
     FilesystemOperationRequest,
     SandboxOperation,
     SandboxToolDescriptor,
 )
+from opensquilla.sandbox.path_validation import logical_tool_path
 from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
@@ -122,10 +129,7 @@ _BOOTSTRAP_SOURCE_FILENAMES_FALLBACK = frozenset(
         "AGENTS.md",
         "SOUL.md",
         "IDENTITY.md",
-        "TOOLS.md",
         "USER.md",
-        "BOOTSTRAP.md",
-        "HEARTBEAT.md",
     }
 )
 
@@ -267,9 +271,7 @@ def _patch_file_read_roots(root: Path) -> list[Path]:
 def _read_patch_text_from_file(path: str, root: Path) -> str:
     raw = Path(path).expanduser()
     resolved = (
-        (root / raw).resolve(strict=False)
-        if not raw.is_absolute()
-        else raw.resolve(strict=False)
+        (root / raw).resolve(strict=False) if not raw.is_absolute() else raw.resolve(strict=False)
     )
     allowed_roots = _patch_file_read_roots(root)
     if not full_host_access_active() and not any(
@@ -308,6 +310,10 @@ def _validate_path(
     resolved = _resolve_path(path, root)
     if allow_outside_root is None:
         allow_outside_root = full_host_access_active()
+    if authorized_paths and resolved not in authorized_paths:
+        raise ValueError(
+            f"Path authorization changed after validation: {path!r} resolves to {resolved}"
+        )
     if not resolved.is_relative_to(root) and not allow_outside_root:
         if resolved in authorized_paths:
             return resolved
@@ -413,13 +419,11 @@ def _workspace_write_note_summary(
     *,
     allow_outside_root: bool = False,
 ) -> str:
-    paths = [
-        _validate_path(op.path, root, allow_outside_root=allow_outside_root) for op in ops
-    ]
+    paths = [_validate_path(op.path, root, allow_outside_root=allow_outside_root) for op in ops]
     return summarize_workspace_write_notes(paths)
 
 
-def _gate_patch_ops(
+async def _gate_patch_ops(
     ops: list[PatchOp],
     root: Path,
     approval_id: str | None,
@@ -428,8 +432,8 @@ def _gate_patch_ops(
     sandbox_permissions: str = "use_default",
     justification: str = "",
     prefix_rule: list[str] | None = None,
-) -> tuple[dict[str, object] | None, bool]:
-    """Return ``(block, elevated)`` for a canonical multi-path patch."""
+) -> tuple[dict[str, object] | None, bool, tuple[BackupReceiptSummary, ...]]:
+    """Return ``(block, elevated, backups)`` for a canonical multi-path patch."""
 
     from opensquilla.sandbox.sensitive_paths import build_block_envelope, sensitive_path_marker
     from opensquilla.tools.builtin import filesystem
@@ -440,12 +444,12 @@ def _gate_patch_ops(
 
     elevated_full = full_host_access_active()
     workspace = filesystem._workspace_root()
-    boundary_targets: list[tuple[Path, PatchOp]] = []
+    boundary_targets: list[tuple[Path, PatchOp, str]] = []
 
     if elevated_full:
         for op in ops:
             _resolve_path(op.path, root)
-        return None, False
+        return None, False, ()
 
     if sandbox_permissions not in {"use_default", "require_escalated"}:
         return (
@@ -454,10 +458,12 @@ def _gate_patch_ops(
                 "reason": "invalid_sandbox_permissions",
             },
             False,
+            (),
         )
 
     for op in ops:
         resolved = _resolve_path(op.path, root)
+        logical = logical_tool_path(op.path, base=root)
         if not elevated_full and not filesystem._sandbox_path_access_enabled():
             sensitive = sensitive_path_marker(str(resolved), workspace=workspace)
             if sensitive is not None:
@@ -468,6 +474,7 @@ def _gate_patch_ops(
                         tool_name="apply_patch",
                     ),
                     False,
+                    (),
                 )
 
         filesystem._gate_workspace_lockdown_write("apply_patch", resolved, op.path)
@@ -477,7 +484,7 @@ def _gate_patch_ops(
             workspace=workspace,
         )
         if deny_match is not None:
-            return workspace_write_deny_block("apply_patch", deny_match), False
+            return workspace_write_deny_block("apply_patch", deny_match), False, ()
 
         if filesystem._memory_source_rel_path(resolved) is not None:
             continue
@@ -491,11 +498,12 @@ def _gate_patch_ops(
                 mounts=filesystem._active_sandbox_mounts(),
                 write=True,
                 profile=active_file_system_profile(workspace),
+                logical_path=logical,
             )
             if decision.status == "blocked":
-                return filesystem._path_access_blocked_envelope(decision), False
+                return filesystem._path_access_blocked_envelope(decision), False, ()
             if decision.status == "request":
-                boundary_targets.append((resolved, op))
+                boundary_targets.append((resolved, op, decision.reason))
             continue
 
         if filesystem._is_outside_workspace(resolved):
@@ -512,16 +520,21 @@ def _gate_patch_ops(
                     op.path,
                 ),
                 False,
+                (),
             )
 
     if not boundary_targets:
-        return None, False
+        return None, False, ()
     if sandbox_permissions == "use_default":
+        reasons = {reason for _path, _op, reason in boundary_targets}
+        reason = (
+            "protected_metadata" if reasons == {"protected_metadata"} else "outside_writable_roots"
+        )
         return (
             {
                 "status": "elevation_required",
-                "reason": "outside_writable_roots",
-                "paths": [str(path) for path, _op in boundary_targets],
+                "reason": reason,
+                "paths": [str(path) for path, _op, _reason in boundary_targets],
                 "message": (
                     "This patch writes outside the sandbox's writable roots. Retry "
                     "the exact patch only if the user's request warrants it, using "
@@ -529,6 +542,7 @@ def _gate_patch_ops(
                 ),
             },
             False,
+            (),
         )
     if not justification.strip():
         return (
@@ -538,6 +552,7 @@ def _gate_patch_ops(
                 "message": "A precise justification is required for elevated execution.",
             },
             False,
+            (),
         )
 
     target_paths: list[tuple[str, str]] = []
@@ -557,16 +572,50 @@ def _gate_patch_ops(
         target_paths=tuple(target_paths),
         content_digest=patch_digest,
         prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(
+            kind=(
+                "delete"
+                if any(isinstance(op, DeleteFile) for op in ops)
+                else "modify"
+                if any(
+                    _resolve_path(op.path, root).exists()
+                    or _resolve_path(op.path, root).is_symlink()
+                    for op in ops
+                )
+                else "create"
+            ),
+            target="\n".join(str(path) for path, _access in target_paths),
+        ),
     )
     ctx = current_tool_context.get()
+    existing_targets = tuple(
+        dict.fromkeys(
+            resolved
+            for resolved, _op, _reason in boundary_targets
+            if resolved.exists() or resolved.is_symlink()
+        )
+    )
+    if existing_targets:
+        config = getattr(ctx, "sandbox_gateway_config", None) if ctx else None
+        destructive = await DestructiveBackupGate().evaluate(
+            action,
+            approval_id=approval_id,
+            targets=existing_targets,
+            policy=filesystem.active_sandbox_policy(),
+            state_dir=str(getattr(config, "state_dir", "") or ""),
+            session_key=ctx.session_key if ctx is not None else None,
+        )
+        if not destructive.allowed:
+            return destructive.envelope, False, ()
+        return None, True, summarize_backup_receipts(destructive.receipts)
     gate = gate_elevated_action(
         action,
         approval_id=approval_id,
         session_key=ctx.session_key if ctx is not None else None,
     )
     if not gate.allowed:
-        return gate.to_envelope(), False
-    return None, True
+        return gate.to_envelope(), False, ()
+    return None, True, ()
 
 
 # ---------------------------------------------------------------------------
@@ -574,16 +623,27 @@ def _gate_patch_ops(
 # ---------------------------------------------------------------------------
 
 
-def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
-    """Apply a single hunk to file_lines (0-indexed list of lines with newlines).
+def _match_line(actual: str, expected: str) -> bool:
+    """Return whether hunk anchor lines differ only by trailing space or tab.
 
-    Returns the new list of lines.
+    Prefer an exact match.  The fallback keeps leading, non-ASCII, and other
+    whitespace significant while tolerating ASCII horizontal whitespace at
+    the end of context and delete lines.
     """
-    # old_start is 1-indexed; convert to 0-indexed
-    pos = hunk.old_start - 1
-    result = list(file_lines)
+    if actual == expected:
+        return True
+    return actual.rstrip("\r\n").rstrip(" \t") == expected.rstrip("\r\n").rstrip(" \t")
 
-    # Verify context and deleted lines match
+
+def _hunk_verify_error(
+    file_lines: list[str], pos: int, hunk: Hunk
+) -> RetryableToolInputError | None:
+    """Return the anchoring error for hunk at 0-indexed pos, None when it fits."""
+    if not 0 <= pos <= len(file_lines):
+        return RetryableToolInputError(
+            f"apply_patch hunk starts outside the file at line {pos + 1}. "
+            "Read the current file content and retry with matching line numbers and context."
+        )
     check_pos = pos
     for raw in hunk.lines:
         if not raw:
@@ -591,21 +651,58 @@ def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
         prefix = raw[0]
         content = raw[1:]
         if prefix in (" ", "-"):
-            if check_pos >= len(result):
-                raise RetryableToolInputError(
+            if check_pos >= len(file_lines):
+                return RetryableToolInputError(
                     "apply_patch hunk context/delete exceeds file length at "
                     f"line {check_pos + 1}. Read the current file content and retry "
                     "with hunk line numbers and context that match the file."
                 )
-            actual = result[check_pos].rstrip("\n")
-            expected = content.rstrip("\n")
-            if actual != expected:
-                raise RetryableToolInputError(
+            if not _match_line(file_lines[check_pos], content):
+                return RetryableToolInputError(
                     f"apply_patch context mismatch at line {check_pos + 1}: "
-                    f"expected {expected!r}, got {actual!r}. Read the current file "
+                    f"expected {content.rstrip('\n')!r}, "
+                    f"got {file_lines[check_pos].rstrip('\n')!r}. Read the current file "
                     "content and retry with exact surrounding context."
                 )
             check_pos += 1
+    return None
+
+
+def _relocate_hunk(file_lines: list[str], hunk: Hunk) -> int:
+    """Keep a valid declared anchor, otherwise require a unique content match."""
+    old_count = sum(bool(raw) and raw[0] in (" ", "-") for raw in hunk.lines)
+    if old_count != hunk.old_count:
+        raise RetryableToolInputError(
+            f"apply_patch hunk declares {hunk.old_count} old lines but contains {old_count} "
+            "context/delete lines. Regenerate the hunk with matching line counts."
+        )
+    declared = max(0, hunk.old_start - 1)
+    error = _hunk_verify_error(file_lines, declared, hunk)
+    if error is None:
+        return declared
+    if not old_count:
+        # An insertion has no content anchor from which to infer a new position.
+        raise error
+    found: int | None = None
+    # Scan only real file positions, even if the model supplied a huge line number.
+    for candidate in range(len(file_lines) - old_count + 1):
+        if _hunk_verify_error(file_lines, candidate, hunk) is not None:
+            continue
+        if found is not None:
+            raise RetryableToolInputError(
+                f"apply_patch hunk context is ambiguous: matches at lines {found + 1} "
+                f"and {candidate + 1}. Read the current file and include more surrounding "
+                "context to uniquely identify the target."
+            )
+        found = candidate
+    if found is None:
+        raise error
+    return found
+
+
+def _apply_hunk(file_lines: list[str], hunk: Hunk, pos: int) -> list[str]:
+    """Apply a hunk at its already validated position in the original file."""
+    result = list(file_lines)
 
     # Now build new lines
     new_lines: list[str] = []
@@ -644,10 +741,24 @@ def _fingerprint_content(content: str | None) -> dict[str, Any]:
 
 def _apply_update_content(content: str, hunks: list[Hunk]) -> str:
     lines = content.splitlines(keepends=True)
+    # Resolve every anchor before editing, so a hunk cannot match text introduced
+    # by another hunk. Actual positions can differ from the declared ordering.
+    planned = sorted(
+        ((_relocate_hunk(lines, hunk), hunk) for hunk in hunks), key=lambda item: item[0]
+    )
+    previous_pos = -1
+    previous_end = 0
+    for pos, hunk in planned:
+        if pos < previous_end or pos == previous_pos:
+            raise RetryableToolInputError(
+                f"apply_patch hunks overlap at line {pos + 1}. "
+                "Combine overlapping edits into one hunk using the current file content."
+            )
+        previous_pos = pos
+        previous_end = pos + hunk.old_count
 
-    # Apply hunks in reverse order so earlier line numbers stay valid
-    for hunk in sorted(hunks, key=lambda h: h.old_start, reverse=True):
-        lines = _apply_hunk(lines, hunk)
+    for pos, hunk in reversed(planned):
+        lines = _apply_hunk(lines, hunk, pos)
 
     return "".join(lines)
 
@@ -848,6 +959,8 @@ def _preflight_write_parent(path: Path, states: dict[Path, str]) -> None:
 def _preflight_planned_writes(planned: list[PlannedPatchWrite]) -> None:
     states: dict[Path, str] = {}
     for item in planned:
+        if item.after_content is not None:
+            item.after_content.encode("utf-8")
         state = states.get(item.resolved)
         if item.after_content is None:
             if state is None:
@@ -1014,7 +1127,7 @@ async def apply_patch(
             "directory and pass its `path`."
         )
     ops = _parse_patch(patch)
-    blocked, elevated = _gate_patch_ops(
+    blocked, elevated, backup_summaries = await _gate_patch_ops(
         ops,
         root,
         approval_id,
@@ -1055,7 +1168,9 @@ async def apply_patch(
         )
         _notify_memory_source_writes(ops, root)
         _notify_bootstrap_source_writes(ops, root)
-        return str(getattr(sandbox_result, "message"))
+        return str(getattr(sandbox_result, "message")) + filesystem._backup_receipt_note(
+            backup_summaries
+        )
 
     def _run() -> tuple[int, int, int, list[PlannedPatchWrite]]:
         if outside_root_authorized:
@@ -1122,7 +1237,6 @@ async def apply_patch(
         parts.append(f"{deleted} file(s) deleted")
     summary = ", ".join(parts) if parts else "no changes"
     return (
-        f"Applied patch: {summary}"
-        f"{write_note_summary}"
-        f"{write_progress_note}"
+        f"Applied patch: {summary}{write_note_summary}{write_progress_note}"
+        f"{filesystem._backup_receipt_note(backup_summaries)}"
     )

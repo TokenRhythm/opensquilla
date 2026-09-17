@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 
 from opensquilla.gateway import pidlock
 from opensquilla.gateway.pidlock import GatewayPidLock
+from opensquilla.recovery.atomic import _native_io_path
 
 
 def test_pid_file_in_state_dir_not_parent(tmp_path: Path) -> None:
@@ -96,6 +98,47 @@ def test_pid_lock_release_keeps_lock_file_identity_for_successors(
         assert exc_info.value.code == 1
     finally:
         second.release()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_pid_lock_supports_extended_length_state_directory(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    long_root = tmp_path / "long-state"
+    state_dir = long_root
+    native_root = _native_io_path(long_root)
+
+    def cleanup() -> None:
+        if os.path.exists(native_root):
+            shutil.rmtree(native_root)
+
+    request.addfinalizer(cleanup)
+    index = 0
+    while len(str(state_dir)) < 275:
+        state_dir /= f"state-segment-{index:02d}-0123456789"
+        index += 1
+    pid_path = state_dir / "gateway.pid"
+    lock_path = state_dir / "gateway.pid.lock"
+    first = GatewayPidLock(state_dir)
+
+    first.acquire()
+    try:
+        assert os.path.isfile(_native_io_path(pid_path))
+        assert os.path.isfile(_native_io_path(lock_path))
+        with open(_native_io_path(pid_path), encoding="utf-8") as handle:
+            payload = json.load(handle)
+        assert payload["pid"] == os.getpid()
+
+        second = GatewayPidLock(state_dir)
+        with pytest.raises(SystemExit) as exc_info:
+            second.acquire()
+        assert exc_info.value.code == 1
+    finally:
+        first.release()
+
+    assert not os.path.exists(_native_io_path(pid_path))
+    assert os.path.isfile(_native_io_path(lock_path))
 
 
 def test_windows_is_alive_rejects_opened_process_with_non_active_exit_code(

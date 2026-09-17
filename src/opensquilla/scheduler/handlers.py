@@ -7,7 +7,7 @@ import inspect
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, is_dataclass
+from dataclasses import replace
 from typing import Any
 
 import structlog
@@ -29,6 +29,7 @@ from opensquilla.scheduler.types import (
     SessionTarget,
 )
 from opensquilla.session.keys import build_main_key
+from opensquilla.session.storage import StaleEpochError
 from opensquilla.session.terminal_reply import (
     build_terminal_reply,
     is_context_payload_too_large,
@@ -40,6 +41,57 @@ log = structlog.get_logger(__name__)
 
 WorkspaceResolver = Callable[[str], tuple[str | None, bool]]
 DefaultElevatedResolver = Callable[[], str | None]
+
+
+class _ExactOwnerCapabilityError(RuntimeError):
+    """Raised when a modern owner cannot cross a compatibility surface."""
+
+
+def _durable_session_owner(value: Any) -> tuple[str, int] | None:
+    """Extract an exact owner from SessionManager lifecycle return values."""
+
+    candidate = value[0] if isinstance(value, tuple) and value else value
+    if isinstance(candidate, dict):
+        session_id = candidate.get("session_id")
+        session_epoch = candidate.get("epoch")
+    else:
+        session_id = getattr(candidate, "session_id", None)
+        session_epoch = getattr(candidate, "epoch", None)
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        return None
+    return session_id, session_epoch
+
+
+def _accepts_keyword_arg(
+    call: Any,
+    name: str,
+    *,
+    allow_var_keyword: bool = True,
+) -> bool:
+    """Return whether a compatibility adapter accepts one keyword."""
+
+    try:
+        parameters = inspect.signature(call).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get(name)
+    accepts_named_keyword = parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+    return accepts_named_keyword or (
+        allow_var_keyword
+        and any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
 
 
 def _resolve_default_elevated(
@@ -122,6 +174,7 @@ def _build_cron_tool_context(
     *,
     session_key: str | None = None,
     workspace_resolver: WorkspaceResolver | None = None,
+    workspace_dir_override: str | None = None,
     default_elevated: str | DefaultElevatedResolver | None = None,
 ) -> ToolContext:
     from opensquilla.scheduler.routing import build_cron_route_envelope, tool_context_from_envelope
@@ -141,13 +194,17 @@ def _build_cron_tool_context(
         session_key=resolved_session_key,
         agent_id=agent_id,
     )
-    workspace_dir = None
-    workspace_strict = False
-    if workspace_resolver is not None:
+    workspace_dir = workspace_dir_override
+    workspace_strict = workspace_dir_override is not None
+    if workspace_dir is None and workspace_resolver is not None:
         workspace_dir, workspace_strict = workspace_resolver(agent_id)
     return tool_context_from_envelope(
         envelope,
-        is_owner=bool(getattr(job, "creator_is_owner", False)),
+        is_owner=(
+            bool(getattr(job, "creator_is_owner", False))
+            and bool(getattr(job, "creator_host_execute", False))
+        ),
+        host_execute_allowed=bool(getattr(job, "creator_host_execute", False)),
         workspace_dir=workspace_dir,
         workspace_strict=workspace_strict,
         default_elevated=_resolve_default_elevated(default_elevated),
@@ -191,19 +248,6 @@ def _resolve_system_event_heartbeat_delivery_override(job: CronJob) -> dict[str,
     return None
 
 
-def _event_payload(event: Any) -> dict[str, Any]:
-    if is_dataclass(event):
-        payload = asdict(event)  # type: ignore[arg-type]
-    else:
-        payload = {
-            key: value
-            for key, value in getattr(event, "__dict__", {}).items()
-            if not key.startswith("_")
-        }
-    payload.pop("kind", None)
-    return payload
-
-
 def make_agent_run_handler(
     delivery_chain: DeliveryChain,
     turn_runner_ref: Callable[[], Any] | None = None,
@@ -234,17 +278,132 @@ def make_agent_run_handler(
             log.warning("agent_run_handler.empty_task", job_id=job.id)
             return HandlerResult()
 
+        route_envelope = None
+        session_owner: tuple[str, int] | None = None
+        persisted_user_message_id: str | None = None
+        if task_runtime is not None:
+            from opensquilla.scheduler.routing import build_cron_route_envelope
+
+            route_envelope = build_cron_route_envelope(
+                job,
+                session_key=session_key,
+                agent_id=agent_id,
+            )
+            validate_acceptance = getattr(task_runtime, "validate_acceptance", None)
+            if callable(validate_acceptance):
+                await validate_acceptance(route_envelope)
+
         # Session setup
+        bound_workspace_dir: str | None = None
+        workspace_id = job.payload.get("_workspace_id")
+        if isinstance(workspace_id, str) and workspace_id and sm is None:
+            raise RuntimeError("project workspace storage is unavailable")
         if sm is not None:
             try:
-                await sm.get_or_create(
+                session_result = await sm.get_or_create(
                     session_key=session_key,
                     agent_id=agent_id,
                     display_name=f"Cron: {job.name[:50]}",
                 )
-                _persisted = await sm.append_message(session_key, role="user", content=task)
+                session_owner = _durable_session_owner(session_result)
+                if session_owner is not None and route_envelope is not None:
+                    route_envelope = replace(
+                        route_envelope,
+                        session_id=session_owner[0],
+                        session_epoch=session_owner[1],
+                    )
+                if isinstance(workspace_id, str) and workspace_id:
+                    storage = getattr(sm, "_storage", None)
+                    if storage is None or not hasattr(storage, "bind_session_workspace"):
+                        raise RuntimeError("project workspace storage is unavailable")
+                    if hasattr(storage, "get_project_workspace"):
+                        from opensquilla.project_workspaces import (
+                            resolve_validated_project_workspace,
+                        )
+
+                        validated = await resolve_validated_project_workspace(
+                            storage,
+                            workspace_id,
+                        )
+                        bound_workspace_dir = str(validated.canonical_path)
+                    bind_workspace = storage.bind_session_workspace
+                    bind_kwargs: dict[str, Any] = {}
+                    if session_owner is not None:
+                        if not all(
+                            _accepts_keyword_arg(
+                                bind_workspace,
+                                name,
+                                allow_var_keyword=False,
+                            )
+                            for name in (
+                                "expected_session_id",
+                                "expected_session_epoch",
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Project workspace binding cannot enforce the "
+                                "admitted session owner"
+                            )
+                        bind_kwargs = {
+                            "expected_session_id": session_owner[0],
+                            "expected_session_epoch": session_owner[1],
+                        }
+                    await bind_workspace(
+                        session_key,
+                        workspace_id,
+                        **bind_kwargs,
+                    )
+                append_message = sm.append_message
+                append_kwargs: dict[str, Any] = {}
+                if session_owner is not None:
+                    if not all(
+                        _accepts_keyword_arg(
+                            append_message,
+                            name,
+                            allow_var_keyword=False,
+                        )
+                        for name in (
+                            "expected_session_id",
+                            "expected_session_epoch",
+                        )
+                    ):
+                        raise _ExactOwnerCapabilityError(
+                            "Cron session writer cannot enforce the admitted session owner"
+                        )
+                    append_kwargs = {
+                        "expected_session_id": session_owner[0],
+                        "expected_session_epoch": session_owner[1],
+                    }
+                _persisted = await append_message(
+                    session_key,
+                    role="user",
+                    content=task,
+                    provenance={
+                        "kind": "cron",
+                        "source_session_key": session_key,
+                        "source_tool": f"cron:{job.id}",
+                    },
+                    **append_kwargs,
+                )
                 if _persisted is not None and isinstance(_persisted.content, str):
                     task = _persisted.content
+                persisted_message_id = getattr(_persisted, "message_id", None)
+                if isinstance(persisted_message_id, str) and persisted_message_id:
+                    persisted_user_message_id = persisted_message_id
+            except StaleEpochError:
+                log.warning(
+                    "agent_run_handler.stale_session_owner",
+                    job_id=job.id,
+                    session_key=session_key,
+                )
+                raise
+            except _ExactOwnerCapabilityError:
+                log.warning(
+                    "agent_run_handler.owner_capability_unavailable",
+                    job_id=job.id,
+                    session_key=session_key,
+                )
+                raise
             except Exception:
                 log.warning(
                     "agent_run_handler.session_setup_failed",
@@ -252,6 +411,8 @@ def make_agent_run_handler(
                     session_key=session_key,
                     exc_info=True,
                 )
+                if isinstance(workspace_id, str) and workspace_id:
+                    raise
 
         # Emit cron.run.start (pre-execution notification, best-effort)
         await delivery_chain.notify_start(job, task)
@@ -275,20 +436,26 @@ def make_agent_run_handler(
         summary: str | None = None
         try:
             if task_runtime is not None:
-                from opensquilla.scheduler.routing import build_cron_route_envelope
                 from opensquilla.session.models import AgentTaskStatus
 
-                transcript_watermark = await _transcript_watermark(sm, session_key)
-                route_envelope = build_cron_route_envelope(
-                    job,
-                    session_key=session_key,
-                    agent_id=agent_id,
-                )
+                assert route_envelope is not None
+                enqueue_kwargs: dict[str, Any] = {}
+                if (
+                    persisted_user_message_id is not None
+                    and _accepts_keyword_arg(
+                        task_runtime.enqueue,
+                        "persisted_user_message_id",
+                    )
+                ):
+                    enqueue_kwargs["persisted_user_message_id"] = (
+                        persisted_user_message_id
+                    )
                 handle = await task_runtime.enqueue(
                     route_envelope,
                     task,
                     mode="followup",
                     run_kind="cron_turn",
+                    **enqueue_kwargs,
                 )
                 try:
                     record = await task_runtime.wait(handle.task_id, timeout=job.timeout_seconds)
@@ -306,11 +473,20 @@ def make_agent_run_handler(
                 else:
                     success = getattr(record, "status", None) == AgentTaskStatus.SUCCEEDED
                     if success:
-                        result_text = await _latest_assistant_text_after(
-                            sm,
-                            session_key,
-                            transcript_watermark,
+                        task_details = getattr(record, "details", None)
+                        terminal_content = (
+                            task_details.get("terminal_assistant_message_content")
+                            if isinstance(task_details, dict)
+                            else None
                         )
+                        if isinstance(terminal_content, str):
+                            result_text = terminal_content
+                        elif isinstance(task_details, dict) and (
+                            "session_epoch" in task_details
+                        ):
+                            raise RuntimeError(
+                                "Cron task completed without durable terminal output"
+                            )
                     else:
                         error_message = (
                             getattr(record, "error_message", None)
@@ -328,17 +504,40 @@ def make_agent_run_handler(
                     job,
                     session_key=session_key,
                     workspace_resolver=workspace_resolver,
+                    workspace_dir_override=bound_workspace_dir,
                     default_elevated=default_elevated,
                 )
+                run_kwargs: dict[str, Any] = {
+                    "tool_context": tool_context,
+                    "agent_id": agent_id,
+                    "timeout": job.timeout_seconds,
+                    "run_kind": "cron_turn",
+                    "input_provenance": {"kind": "cron_job", "job_id": job.id},
+                }
+                if session_owner is not None:
+                    if not all(
+                        _accepts_keyword_arg(
+                            turn_runner.run,
+                            name,
+                            allow_var_keyword=False,
+                        )
+                        for name in (
+                            "expected_session_id",
+                            "expected_session_epoch",
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Cron turn runner cannot enforce the admitted session owner"
+                        )
+                    run_kwargs.update(
+                        expected_session_id=session_owner[0],
+                        expected_session_epoch=session_owner[1],
+                    )
                 async for event in wrap_stream(
                     turn_runner.run(
                         message=task,
                         session_key=session_key,
-                        tool_context=tool_context,
-                        agent_id=agent_id,
-                        timeout=job.timeout_seconds,
-                        run_kind="cron_turn",
-                        input_provenance={"kind": "cron_job", "job_id": job.id},
+                        **run_kwargs,
                     ),
                     idle_timeout=None,
                 ):
@@ -420,7 +619,11 @@ def make_agent_run_handler(
     return agent_run_handler
 
 
-def make_static_message_handler(delivery_chain: DeliveryChain) -> Callable:
+def make_static_message_handler(
+    delivery_chain: DeliveryChain,
+    session_manager_ref: Callable[[], Any] | None = None,
+    session_event_emitter: Callable[[str, str, dict[str, Any]], Any] | None = None,
+) -> Callable:
     """Factory for reminder cron jobs that only deliver static text."""
 
     async def static_message_handler(job: CronJob) -> HandlerResult:
@@ -430,6 +633,56 @@ def make_static_message_handler(delivery_chain: DeliveryChain) -> Callable:
             log.warning("static_message_handler.empty_text", job_id=job.id)
             return HandlerResult(session_key=session_key)
 
+        session_persisted = False
+        sm = session_manager_ref() if session_manager_ref else None
+        if sm is not None:
+            try:
+                await sm.get_or_create(
+                    session_key=session_key,
+                    agent_id=payload_agent_id(job.payload),
+                    display_name=f"Cron: {job.name[:50]}",
+                )
+                await sm.append_message(
+                    session_key,
+                    role="assistant",
+                    content=text,
+                    provenance={
+                        "kind": "cron",
+                        "source_tool": f"cron:{job.id}",
+                    },
+                )
+                session_persisted = True
+            except Exception:
+                log.warning(
+                    "static_message_handler.session_setup_failed",
+                    job_id=job.id,
+                    session_key=session_key,
+                    exc_info=True,
+                )
+
+        async def emit_session_status(status: str) -> None:
+            if not session_persisted or session_event_emitter is None:
+                return
+            try:
+                await session_event_emitter(
+                    session_key,
+                    "sessions.changed",
+                    {
+                        "key": session_key,
+                        "reason": "cron_static_message",
+                        "taskId": session_key,
+                        "status": status,
+                    },
+                )
+            except Exception:
+                log.warning(
+                    "static_message_handler.session_event_failed",
+                    job_id=job.id,
+                    session_key=session_key,
+                    status=status,
+                    exc_info=True,
+                )
+
         await delivery_chain.notify_start(job, text)
         log.info(
             "static_message_handler.start",
@@ -437,17 +690,23 @@ def make_static_message_handler(delivery_chain: DeliveryChain) -> Callable:
             session_target=str(job.session_target),
             session_key=session_key,
         )
-        report = await delivery_chain.deliver(
-            job,
-            result_text=text,
-            success=True,
-            summary=text[:500],
-            session_key=session_key,
-            route_envelope=build_reply_rendezvous_envelope(job, session_key),
-        )
-        delivery_error = _required_delivery_error(job, report)
-        if delivery_error:
-            raise RuntimeError(delivery_error)
+        try:
+            report = await delivery_chain.deliver(
+                job,
+                result_text=text,
+                success=True,
+                summary=text[:500],
+                session_key=session_key,
+                route_envelope=build_reply_rendezvous_envelope(job, session_key),
+            )
+            delivery_error = _required_delivery_error(job, report)
+            if delivery_error:
+                raise RuntimeError(delivery_error)
+        except Exception:
+            await emit_session_status("failed")
+            raise
+
+        await emit_session_status("succeeded")
         return HandlerResult(
             summary=text[:500],
             session_key=session_key,
@@ -457,38 +716,6 @@ def make_static_message_handler(delivery_chain: DeliveryChain) -> Callable:
         )
 
     return static_message_handler
-
-
-async def _read_transcript_rows(sm: Any, session_key: str) -> list[Any]:
-    if sm is None:
-        return []
-    read_transcript = getattr(sm, "read_transcript", None)
-    if not callable(read_transcript):
-        return []
-    try:
-        rows = await read_transcript(session_key)
-    except Exception:
-        log.warning("agent_run_handler.read_transcript_failed", session_key=session_key)
-        return []
-    return list(rows or [])
-
-
-async def _transcript_watermark(sm: Any, session_key: str) -> int:
-    return len(await _read_transcript_rows(sm, session_key))
-
-
-async def _latest_assistant_text_after(sm: Any, session_key: str, start_index: int) -> str:
-    rows = await _read_transcript_rows(sm, session_key)
-    for row in reversed(rows[start_index:]):
-        role = row.get("role") if isinstance(row, dict) else getattr(row, "role", None)
-        content = row.get("content") if isinstance(row, dict) else getattr(row, "content", None)
-        if role == "assistant" and isinstance(content, str):
-            return content
-    return ""
-
-
-async def _latest_assistant_text(sm: Any, session_key: str) -> str:
-    return await _latest_assistant_text_after(sm, session_key, 0)
 
 
 async def _cancel_runtime_task(task_runtime: Any, task_id: str) -> None:

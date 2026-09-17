@@ -7,15 +7,27 @@ live invocation and is not covered here.
 
 from __future__ import annotations
 
+import inspect
 import json
 import textwrap
 from pathlib import Path
 
 from typer.testing import CliRunner
 
+from opensquilla.cli import ensemble_cmd
 from opensquilla.cli.main import app
 
 runner = CliRunner()
+
+
+def test_live_bench_prewarms_install_id_after_loading_config() -> None:
+    source = inspect.getsource(ensemble_cmd.ensemble_bench)
+
+    config_load = source.index("config = load_config(config_path)")
+    prewarm = source.index("prewarm_tokenrhythm_install_id(config=config)")
+    benchmark = source.index("run_config_benchmark(")
+
+    assert config_load < prewarm < benchmark
 
 
 def test_bench_dry_run_json_shape() -> None:

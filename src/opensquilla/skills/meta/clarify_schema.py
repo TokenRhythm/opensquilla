@@ -76,8 +76,6 @@ _CHOICE_LABELS_ZH: dict[str, str] = {
     "general": "普通读者",
     "FULL_MANUSCRIPT": "完整论文",
     "COMPACT_SKELETON": "快速草稿",
-    "REPAIR_EXISTING": "修复已有稿件",
-    "COMPILE_ONLY": "仅编译",
     "readable_pdf": "可读取 PDF",
     "inline_excerpts_only": "仅使用粘贴摘录",
     "reference_only": "只有引用/文件名",

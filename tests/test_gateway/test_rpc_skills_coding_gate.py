@@ -25,9 +25,9 @@ def _reset_gate():
     eligibility.set_live_skills_config_getter(saved)
 
 
-def _gate(coding_mode: bool):
+def _gate(coding_mode: bool, *, disabled: list[str] | None = None):
     eligibility.set_live_skills_config_getter(
-        lambda: SimpleNamespace(disabled=[], coding_mode=coding_mode)
+        lambda: SimpleNamespace(disabled=disabled or [], coding_mode=coding_mode)
     )
 
 
@@ -63,6 +63,42 @@ async def test_skills_list_shows_codetask_when_on(tmp_path: Path) -> None:
     out = await rpc_skills._handle_skills_list(None, _ctx(tmp_path))
     names = {s["name"] for s in out["skills"]}
     assert "code-task" in names
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_list_and_doctor_keep_managed_disabled_skill_gated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    managed = tmp_path / "managed"
+    _write_skill(managed, "git-diff")
+    loader = SkillLoader(
+        managed_dir=managed,
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+    skills_config = SimpleNamespace(disabled=["git-diff"], coding_mode=False)
+    _gate(coding_mode=False, disabled=["git-diff"])
+    ctx = RpcContext(
+        conn_id="test",
+        config=SimpleNamespace(skills=skills_config),
+        skill_loader=loader,
+    )
+
+    lifecycle = await rpc_skills._handle_skills_list(
+        {"includeLifecycle": True},
+        ctx,
+    )
+    row = next(item for item in lifecycle["skills"] if item["name"] == "git-diff")
+    doctor = await rpc_skills._handle_skills_doctor({"name": "git-diff"}, ctx)
+    doctor_row = doctor["skills"][0]
+
+    assert row["lifecycle"]["selection_state"] == "disabled"
+    assert row["active"] is False
+    assert row["instruction_usable"] is False
+    assert doctor_row["lifecycle"]["selection_state"] == "disabled"
+    assert doctor_row["active"] is False
+    assert doctor_row["instruction_usable"] is False
 
 
 @pytest.mark.asyncio

@@ -57,17 +57,13 @@ def test_interactive_ensemble_configure_persists(tmp_path, monkeypatch):
             calls.append(message)
             if message == "Ensemble selection mode":
                 assert kwargs.get("choices") == [
-                    "router_dynamic",
                     "static_openrouter_b5",
                     "static_tokenrhythm_b5",
                     "custom_b5",
+                    "router_dynamic",
                 ]
                 assert kwargs.get("default") == "static_openrouter_b5"
                 return _Answer("router_dynamic")
-            if message == "Policy when all proposers fail":
-                assert kwargs.get("choices") == ["fallback_single", "error"]
-                assert kwargs.get("default") == "fallback_single"
-                return _Answer("error")
             raise AssertionError(f"unexpected select prompt: {message}")
 
         def text(self, message: str, **kwargs: Any) -> _Answer:
@@ -93,7 +89,10 @@ def test_interactive_ensemble_configure_persists(tmp_path, monkeypatch):
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["model_options"] == ["prov/model-a", "prov/model-b"]
     assert ensemble["min_successful_proposers"] == 2
-    assert ensemble["all_failed_policy"] == "error"
+    # The sole supported policy is the schema default, so a fresh interactive
+    # save does not need to persist a redundant key.
+    assert "all_failed_policy" not in ensemble
+    assert "Policy when all proposers fail" not in calls
 
 
 def test_interactive_ensemble_blank_model_options_keep_current(
@@ -121,7 +120,7 @@ def test_interactive_ensemble_blank_model_options_keep_current(
 
         def select(self, message: str, **kwargs: Any) -> _Answer:
             # Accepting the stored defaults must be a no-op edit.
-            if message in {"Ensemble selection mode", "Policy when all proposers fail"}:
+            if message == "Ensemble selection mode":
                 assert kwargs.get("default")
                 return _Answer(kwargs["default"])
             raise AssertionError(f"unexpected select prompt: {message}")
@@ -310,7 +309,7 @@ def test_interactive_ensemble_min_proposers_garbage_reprompts(tmp_path, monkeypa
             raise AssertionError(f"unexpected confirm prompt: {message}")
 
         def select(self, message: str, **kwargs: Any) -> _Answer:
-            if message in {"Ensemble selection mode", "Policy when all proposers fail"}:
+            if message == "Ensemble selection mode":
                 return _Answer(kwargs["default"])
             raise AssertionError(f"unexpected select prompt: {message}")
 

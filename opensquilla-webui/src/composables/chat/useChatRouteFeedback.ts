@@ -1,15 +1,9 @@
-import { reactive } from 'vue'
+import { hasInjectionContext, inject, reactive } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import { useRpcStore } from '@/stores/rpc'
+import { ROUTE_FEEDBACK_KEY, type RouteFeedback } from '@/modules/routeFeedback'
 
 export type RouteFeedbackRating = 'up' | 'down'
-
-interface FeedbackSubmitResponse {
-  accepted?: boolean
-  recorded?: string
-  reason?: string
-}
 
 // Per-decision selected state for the whole view. Keyed by decisionId (not
 // message index) so history reloads and regenerates keep ratings attached to
@@ -18,8 +12,15 @@ interface FeedbackSubmitResponse {
 const selected = reactive(new Map<string, RouteFeedbackRating>())
 const inFlight = reactive(new Set<string>())
 
-export function useChatRouteFeedback() {
+export function useChatRouteFeedback(feedback?: RouteFeedback) {
   const { pushToast } = useToasts()
+  const routeFeedback = feedback
+    ?? (hasInjectionContext() ? inject(ROUTE_FEEDBACK_KEY, null) : null)
+
+  function resolveFeedback(): RouteFeedback {
+    if (routeFeedback) return routeFeedback
+    throw new Error('RouteFeedback was not provided')
+  }
 
   function ratingFor(decisionId: string | undefined): RouteFeedbackRating | undefined {
     return decisionId ? selected.get(decisionId) : undefined
@@ -41,13 +42,7 @@ export function useChatRouteFeedback() {
 
     inFlight.add(decisionId)
     try {
-      // Resolved lazily: message components mount in Pinia-free contexts
-      // (share view, unit fixtures) where no rating can ever be cast.
-      const rpc = useRpcStore()
-      const res = await rpc.call<FeedbackSubmitResponse>('router.feedback.submit', {
-        decisionId,
-        rating: effective,
-      })
+      const res = await resolveFeedback().submit(decisionId, effective)
       if (!res?.accepted) {
         rollback(decisionId, previous)
         pushToast(

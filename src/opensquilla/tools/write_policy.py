@@ -4,11 +4,79 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+from opensquilla.git_runtime import GitRunState, run_git
 from opensquilla.tools.types import SafeToolError, ToolContext, current_tool_context
+
+# Env levers in the workspace-write-deny family. Values are read at dispatch
+# time (tools layer, no AgentConfig field); validate_workspace_write_deny_env
+# gives deployments a strict bootstrap-time check so a typo fails the run at
+# startup instead of silently disabling enforcement.
+_WRITE_DENY_EFFECT_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_EFFECT"
+_WRITE_DENY_EFFECT_MODES = ("off", "warn", "revert")
+_WRITE_DENY_TRACKED_ONLY_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_TRACKED_ONLY"
+_WRITE_DENY_SYMLINK_GUARD_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_SYMLINK_GUARD"
+_WRITE_DENY_BOOL_ENVS = (
+    _WRITE_DENY_TRACKED_ONLY_ENV,
+    _WRITE_DENY_SYMLINK_GUARD_ENV,
+    "OPENSQUILLA_WORKSPACE_WRITE_DENY_HOST_SHELL",
+    "OPENSQUILLA_WORKSPACE_WRITE_DENY_COMMAND_TARGETS",
+    "OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS",
+)
+_WRITE_DENY_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
+_WRITE_DENY_FALSE_VALUES = frozenset({"", "0", "false", "no", "off", "disabled"})
+
+
+def workspace_write_deny_effect_mode() -> str:
+    """Post-execution effect enforcement mode: off (default), warn, or revert.
+
+    Dispatch-time reads fail safe (unrecognized -> off); strict rejection of
+    unrecognized values happens once at bootstrap via
+    validate_workspace_write_deny_env.
+    """
+
+    raw = os.environ.get(_WRITE_DENY_EFFECT_ENV, "").strip().lower()
+    if raw in _WRITE_DENY_EFFECT_MODES:
+        return raw
+    return "off"
+
+
+def workspace_write_deny_tracked_only() -> bool:
+    raw = os.environ.get(_WRITE_DENY_TRACKED_ONLY_ENV, "").strip().lower()
+    return raw in _WRITE_DENY_TRUE_VALUES
+
+
+def workspace_write_deny_symlink_guard() -> bool:
+    raw = os.environ.get(_WRITE_DENY_SYMLINK_GUARD_ENV, "").strip().lower()
+    return raw in _WRITE_DENY_TRUE_VALUES
+
+
+def validate_workspace_write_deny_env() -> None:
+    """Strictly validate the write-deny env lever family; raise on typos.
+
+    Called from engine bootstrap so an unrecognized value stops the run at
+    startup. The tools layer itself stays lenient (fail-safe to off) because
+    it can run outside the engine.
+    """
+
+    raw = os.environ.get(_WRITE_DENY_EFFECT_ENV, "").strip().lower()
+    if raw and raw not in _WRITE_DENY_EFFECT_MODES:
+        raise ValueError(
+            f"{_WRITE_DENY_EFFECT_ENV} must be one of "
+            f"{', '.join(_WRITE_DENY_EFFECT_MODES)}; got {raw!r}"
+        )
+    for name in _WRITE_DENY_BOOL_ENVS:
+        value = os.environ.get(name, "").strip().lower()
+        if value not in _WRITE_DENY_TRUE_VALUES | _WRITE_DENY_FALSE_VALUES:
+            raise ValueError(
+                f"{name} must be a boolean flag "
+                f"(one of {sorted(_WRITE_DENY_TRUE_VALUES | _WRITE_DENY_FALSE_VALUES)}); "
+                f"got {value!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -105,12 +173,21 @@ def match_workspace_write_deny(
         return None
     resolved = path.expanduser().resolve(strict=False)
     workspace = workspace if workspace is not None else _workspace_root(ctx)
+    original = original_path if original_path is not None else str(path)
     if workspace is not None:
         try:
             resolved.relative_to(workspace)
         except ValueError:
-            return None
-    original = original_path if original_path is not None else str(path)
+            # A workspace-internal spelling can resolve outside the workspace
+            # when a path component is a symlink. The symlink guard keeps
+            # matching against the lexical (non-resolved) view so a protected
+            # name cannot be dodged by routing the write through a link.
+            if not workspace_write_deny_symlink_guard():
+                return None
+            lexical = _lexical_workspace_path(original, workspace)
+            if lexical is None:
+                return None
+            resolved = lexical
     candidates = _candidate_strings(resolved, original, workspace, as_directory=as_directory)
 
     for pattern in patterns:
@@ -120,12 +197,87 @@ def match_workspace_write_deny(
             if fnmatchcase(normalized_candidate, normalized_pattern) or fnmatchcase(
                 f"/{normalized_candidate}", normalized_pattern
             ):
+                if (
+                    workspace is not None
+                    and workspace_write_deny_tracked_only()
+                    and not _workspace_path_is_git_tracked(
+                        resolved, workspace, as_directory=as_directory
+                    )
+                ):
+                    # Tracked-only mode: deny globs protect files under
+                    # version control; files the agent created itself stay
+                    # writable. Tracked-ness is a property of the path, so
+                    # one untracked verdict settles every pattern.
+                    return None
                 return WorkspaceWriteDenyMatch(
                     pattern=pattern,
                     path=original,
                     resolved_path=str(resolved),
                 )
     return None
+
+
+def _lexical_workspace_path(original: str, workspace: Path) -> Path | None:
+    """Lexical (symlink-free) workspace view of a path spelling, or None.
+
+    normpath collapses ``..`` without resolving symlinks, so ``tests/link``
+    keeps its workspace spelling even when the link target lives elsewhere.
+    Relative spellings are joined against the workspace root, which matches
+    how the shell and filesystem tools run in practice.
+    """
+
+    raw = os.path.expanduser(original.replace("\\", "/"))
+    if not os.path.isabs(raw):
+        raw = os.path.join(str(workspace), raw)
+    lexical = Path(os.path.normpath(raw))
+    try:
+        lexical.relative_to(workspace)
+    except ValueError:
+        return None
+    return lexical
+
+
+def _workspace_path_is_git_tracked(
+    resolved: Path, workspace: Path, *, as_directory: bool = False
+) -> bool:
+    """Whether git tracks the path; lookup failures fail closed (tracked).
+
+    Tracked-only mode narrows deny enforcement to files under version
+    control, so anything other than an authoritative "untracked" answer from
+    git must not widen the allow set.
+    """
+
+    try:
+        relative = resolved.relative_to(workspace).as_posix()
+    except ValueError:
+        return True
+    if not relative or relative == ".":
+        return True
+    if as_directory:
+        completed = run_git(
+            ("ls-files", "--", f"{relative}/"),
+            cwd=workspace,
+            timeout=2.0,
+        )
+        if not completed.ok:
+            return True
+        return bool(completed.stdout.strip())
+    completed = run_git(
+        ("ls-files", "--error-unmatch", "--", relative),
+        cwd=workspace,
+        timeout=2.0,
+    )
+    if completed.state in {
+        GitRunState.UNAVAILABLE,
+        GitRunState.NOT_REPOSITORY,
+        GitRunState.TIMED_OUT,
+    }:
+        return True
+    if completed.ok:
+        return True
+    # --error-unmatch exits 1 for a valid repo with no matching tracked file;
+    # any other status (e.g. 128 outside a repo) is a lookup failure.
+    return completed.returncode != 1
 
 
 def match_workspace_scratch_artifact(
@@ -216,7 +368,11 @@ def gate_workspace_scratch_artifact(
     )
     if match is None:
         return
-    raise SafeToolError(str(workspace_scratch_artifact_block(tool_name, match)["message"]))
+    # The mark lets opensquilla.tools.envelope apply the policy-deny
+    # user_message cap override to this error; str(error) is unaffected.
+    error = SafeToolError(str(workspace_scratch_artifact_block(tool_name, match)["message"]))
+    error.policy_gate_denial = True
+    raise error
 
 
 def workspace_write_deny_block(
@@ -255,7 +411,35 @@ def gate_workspace_write_deny(
     match = match_workspace_write_deny(path, original_path=original_path, workspace=workspace)
     if match is None:
         return
-    raise SafeToolError(str(workspace_write_deny_block(tool_name, match)["message"]))
+    error = SafeToolError(str(workspace_write_deny_block(tool_name, match)["message"]))
+    error.policy_gate_denial = True
+    raise error
+
+
+def attachment_workspace_write_authorizer(context: ToolContext) -> Callable[[Path], None]:
+    """Bind attachment writes to the turn that authorized their retention."""
+
+    def authorize_write(target: Path) -> None:
+        from opensquilla.tools.builtin import filesystem
+
+        token = current_tool_context.set(context)
+        try:
+            if not context.workspace_dir:
+                raise SafeToolError("Attachment workspace is unavailable")
+            workspace = Path(context.workspace_dir).expanduser().resolve()
+            filesystem._gate_workspace_lockdown_write("image", target, str(target))
+            block = filesystem._sandbox_path_access_envelope(target, write=True)
+            if block is None:
+                block = filesystem._cross_session_attachment_block("image", target, str(target))
+            if block is not None:
+                raise SafeToolError(
+                    str(block.get("message") or "Attachment workspace is not writable")
+                )
+            gate_workspace_write_deny("image", target, workspace=workspace)
+        finally:
+            current_tool_context.reset(token)
+
+    return authorize_write
 
 
 def _deny_retry_guidance(ctx: ToolContext | None = None) -> str:

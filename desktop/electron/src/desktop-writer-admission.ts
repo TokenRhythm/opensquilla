@@ -71,13 +71,26 @@ export class DesktopWriterAdmission {
     }
   }
 
-  waitForAtMost(maximumActive: number): Promise<void> {
+  waitForAtMost(maximumActive: number, signal?: AbortSignal): Promise<void> {
     if (!Number.isSafeInteger(maximumActive) || maximumActive < 0) {
       throw new Error('Desktop writer drain threshold must be a non-negative integer.')
     }
+    if (signal?.aborted) return Promise.reject(signal.reason)
     if (this.active <= maximumActive) return Promise.resolve()
-    return new Promise((resolve) => {
-      this.waiters.add({ maximumActive, resolve })
+    return new Promise((resolve, reject) => {
+      const waiter: DesktopWriterWaiter = {
+        maximumActive,
+        resolve: () => {
+          signal?.removeEventListener('abort', abort)
+          resolve()
+        },
+      }
+      const abort = () => {
+        this.waiters.delete(waiter)
+        reject(signal?.reason)
+      }
+      this.waiters.add(waiter)
+      signal?.addEventListener('abort', abort, { once: true })
     })
   }
 

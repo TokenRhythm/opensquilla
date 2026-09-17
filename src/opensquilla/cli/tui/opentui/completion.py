@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import shutil
-import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from opensquilla.engine.commands import CommandPresentation, Surface
+from opensquilla.git_runtime import run_git
+from opensquilla.skills.catalog_policy import is_public_ordinary
+from opensquilla.skills.eligibility import live_eligibility_context
 from opensquilla.tools.builtin.filesystem import _is_sensitive_access_path
 
 from .messages import (
@@ -26,6 +28,15 @@ _SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "__pycache__"})
 
 class SkillCompletionLoader(Protocol):
     def get_user_invocable(self) -> Sequence[Any]: ...
+
+
+@dataclass(frozen=True)
+class _ConfiguredSkillCompletionLoader:
+    loader: SkillCompletionLoader
+    skills_config: object
+
+    def get_user_invocable(self) -> Sequence[Any]:
+        return self.loader.get_user_invocable()
 
 
 def fuzzy_rank(query: str, candidates: Sequence[str]) -> list[tuple[int, float]]:
@@ -214,25 +225,18 @@ def _is_segment_start(text: str, position: int) -> bool:
 
 
 def _git_files(root: Path) -> list[str] | None:
-    if not (root / ".git").exists() or shutil.which("git") is None:
-        return None
-
-    try:
-        # -z: NUL-separated verbatim paths, so core.quotePath never C-quotes a
-        # non-ASCII name into an octal-escape string that matches nothing on
-        # disk. Keep the platform's normal filesystem decoding first, then fall
-        # back to surrogateescape because Windows' surrogatepass handler can
-        # raise for malformed UTF-8 bytes. Completion must remain available for
-        # every Git path without changing valid Windows path decoding.
-        result = subprocess.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            cwd=root,
-            capture_output=True,
-            check=False,
-        )
-    except (OSError, ValueError):
-        return None
-    if result.returncode != 0:
+    # -z: NUL-separated verbatim paths, so core.quotePath never C-quotes a
+    # non-ASCII name into an octal-escape string that matches nothing on disk.
+    # Keep the platform's normal filesystem decoding first, then fall back to
+    # surrogateescape because Windows' surrogatepass handler can raise for
+    # malformed UTF-8 bytes. Completion must remain available for every Git
+    # path without changing valid Windows path decoding.
+    result = run_git(
+        ("ls-files", "-z", "--cached", "--others", "--exclude-standard"),
+        cwd=root,
+        timeout=2.0,
+    )
+    if not result.ok:
         return None
     return [
         Path(_decode_git_path(entry)).as_posix() for entry in result.stdout.split(b"\0") if entry
@@ -387,15 +391,18 @@ def _skill_candidates(
             else _build_skill_loader(workspace_dir=workspace_dir)
         )
         skills = loader.get_user_invocable()
+        eligibility = live_eligibility_context(getattr(loader, "skills_config", None))
     except Exception:
         return []
 
     candidates: list[CompletionCandidate] = []
     for skill in sorted(skills, key=lambda item: getattr(item, "name", "")):
-        if getattr(skill, "disable_model_invocation", False):
+        if not is_public_ordinary(
+            skill, coding_mode="code-task" not in eligibility.disabled_set
+        ):
             continue
         name = str(getattr(skill, "name", "")).strip()
-        if not name:
+        if not name or name in eligibility.disabled_set:
             continue
         candidates.append(
             CompletionCandidate(
@@ -432,13 +439,16 @@ def _build_skill_loader(*, workspace_dir: Path | None = None) -> SkillCompletion
         managed_override=config.skills.managed_dir,
         extra_dirs=[Path(d) for d in config.skills.extra_dirs],
     )
-    return SkillLoader(
-        bundled_dir=layer_dirs.bundled_dir,
-        workspace_dir=layer_dirs.workspace_dir,
-        managed_dir=layer_dirs.managed_dir,
-        personal_agents_dir=layer_dirs.personal_agents_dir,
-        project_agents_dir=layer_dirs.project_agents_dir,
-        extra_dirs=layer_dirs.extra_dirs,
+    return _ConfiguredSkillCompletionLoader(
+        loader=SkillLoader(
+            bundled_dir=layer_dirs.bundled_dir,
+            workspace_dir=layer_dirs.workspace_dir,
+            managed_dir=layer_dirs.managed_dir,
+            personal_agents_dir=layer_dirs.personal_agents_dir,
+            project_agents_dir=layer_dirs.project_agents_dir,
+            extra_dirs=layer_dirs.extra_dirs,
+        ),
+        skills_config=config.skills,
     )
 
 

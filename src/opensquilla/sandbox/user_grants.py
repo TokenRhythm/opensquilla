@@ -10,7 +10,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from opensquilla.paths import state_dir
+from opensquilla.paths import native_io_path, state_dir
 
 _STATE_FILE = "sandbox_user_grants.sqlite"
 _LEGACY_STATE_FILE = "sandbox_user_grants.json"
@@ -79,7 +79,7 @@ def _legacy_state_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
-    path = _state_path()
+    path = native_io_path(_state_path())
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(os.fspath(path), timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -134,10 +134,11 @@ def _legacy_key(kind: str, payload: dict[str, Any]) -> str:
 
 def _migrate_legacy_json(conn: sqlite3.Connection) -> None:
     legacy_path = _legacy_state_path()
-    if not legacy_path.exists():
+    native_legacy_path = native_io_path(legacy_path)
+    if not native_legacy_path.exists():
         return
     try:
-        parsed = json.loads(legacy_path.read_text(encoding="utf-8"))
+        parsed = json.loads(native_legacy_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
     if not isinstance(parsed, dict):
@@ -158,7 +159,7 @@ def _migrate_legacy_json(conn: sqlite3.Connection) -> None:
             _upsert_row(conn, kind=kind, grant_key=key, payload=payload)
     conn.commit()
     try:
-        legacy_path.unlink()
+        native_legacy_path.unlink()
     except FileNotFoundError:
         pass
 

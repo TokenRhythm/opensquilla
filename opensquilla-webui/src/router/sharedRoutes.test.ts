@@ -25,7 +25,7 @@ beforeEach(() => {
 describe('defaultRootRedirect', () => {
   it('opens the desktop app on Chat even when a previous route was saved', () => {
     window.opensquillaDesktop = {} as never
-    localStorage.setItem(LAST_ROUTE_KEY, '/sessions')
+    localStorage.setItem(LAST_ROUTE_KEY, '/chat')
 
     expect(defaultRootRedirect()).toBe('/chat')
   })
@@ -50,6 +50,15 @@ describe('route hubs', () => {
     if (!route) throw new Error(`route not found: ${path}`)
     return route
   }
+
+  it('keeps the same Chat view instance while a draft materializes', () => {
+    const chat = routeAt('/chat')
+    const draft = routeAt('/chat/new')
+
+    expect(draft.component).toBe(chat.component)
+    expect(chat.meta?.viewKey).toBe('chat')
+    expect(draft.meta?.viewKey).toBe('chat')
+  })
 
   it('hosts Skills and Channels in one kept-alive destination', () => {
     const skills = routeAt('/skills')
@@ -80,7 +89,8 @@ describe('route hubs', () => {
     expect(logs.meta?.viewKey).toBeUndefined()
     expect(logs.meta?.keepAlive).toBe(true)
     expect(overview.meta?.titleKey).toBe('nav.status')
-    expect(overview.meta?.navLabelKey).toBe('nav.overview')
+    expect(overview.meta?.navLabelKey).toBeUndefined()
+    expect(usage.meta?.navLabelKey).toBe('nav.viewUsage')
     expect(channels.component).not.toBe(overview.component)
     expect(channels.meta?.viewKey).not.toBe('overview-hub')
   })
@@ -92,5 +102,11 @@ describe('route hubs', () => {
     })
 
     expect(titles).toEqual(['Status', 'Usage', 'Logs'])
+  })
+
+  it('keeps the removed sessions page as a chat compatibility redirect', () => {
+    const sessions = routeAt('/sessions')
+    expect(sessions.redirect).toBe('/chat')
+    expect(sessions.component).toBeUndefined()
   })
 })

@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue'
+import { usageSession } from '@/testing/usage.test-helper'
 import { describe, expect, it } from 'vitest'
 import { formatUsageCost } from './nativeBilling'
 import { useUsageChartRows } from './useUsageChartRows'
@@ -24,25 +25,25 @@ function totals(input: number, output: number, cost: number): UsageTotals {
 }
 
 describe('usage ledger day chart', () => {
-  it('uses server calendar-day buckets and does not turn them into session links', () => {
+  it('shows server calendar-day buckets newest first without turning them into session links', () => {
     const chartMode = ref<'tokens' | 'cost'>('tokens')
     const { chartCaption, chartRows } = useUsageChartRows({
-      visibleSessions: computed(() => [{ sessionKey: 'should-not-drive-chart', inputTokens: 999 }]),
+      visibleSessions: computed(() => [{ sessionKey: 'should-not-drive-chart', inputTokens: 999 }].map(usageSession)),
       serverDays: computed(() => [
         { date: '2026-07-19', fromMs: 1, toMs: 2, totals: totals(10, 5, 0.1) },
         { date: '2026-07-20', fromMs: 2, toMs: 3, totals: totals(20, 10, 0.2) },
       ]),
       chartMode,
-      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
       fmtCost: value => `$${Number(value || 0).toFixed(2)}`,
       fmtNum: value => String(value || 0),
+      taskName: row => String(row.title || 'Untitled task'),
     })
 
     expect(chartCaption.value).toBe('Daily usage')
-    expect(chartRows.value.map(row => row.label)).toEqual(['2026-07-19', '2026-07-20'])
+    expect(chartRows.value.map(row => row.label)).toEqual(['2026-07-20', '2026-07-19'])
     expect(chartRows.value.every(row => row.sessionKey === null)).toBe(true)
-    expect(chartRows.value[1].valueLabel).toBe('30')
-    expect(chartRows.value[1].totalPct).toBeCloseTo(100)
+    expect(chartRows.value[0].valueLabel).toBe('30')
+    expect(chartRows.value[0].totalPct).toBeCloseTo(100)
   })
 
   it('uses native billing context for exact CNY daily costs', () => {
@@ -60,22 +61,43 @@ describe('usage ledger day chart', () => {
     day.nativeBillingExpectedReceiptCount = 1
     day.nativeBillingMissingConfirmedReceiptCount = 0
     const { chartRows } = useUsageChartRows({
-      visibleSessions: computed(() => []),
+      visibleSessions: computed(() => [].map(usageSession)),
       serverDays: computed(() => [
         { date: '2026-07-20', fromMs: 1, toMs: 2, totals: day },
       ]),
       chartMode,
-      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
       fmtCost: (value, options) => formatUsageCost(
         value,
         'CNY',
         7.25,
         4,
-        options?.source as Record<string, unknown> | undefined,
+        options?.source,
       ),
       fmtNum: value => String(value || 0),
+      taskName: row => String(row.title || 'Untitled task'),
     })
 
     expect(chartRows.value[0].valueLabel).toBe('¥6.9750')
+  })
+
+  it('uses the shared task name without shortening it in data', () => {
+    const chartMode = ref<'tokens' | 'cost'>('tokens')
+    const title = 'A task name long enough to require visual truncation in the chart label'
+    const { chartRows } = useUsageChartRows({
+      visibleSessions: computed(() => [{
+        sessionKey: 'agent:main:webchat:private-id',
+        title,
+        inputTokens: 10,
+        outputTokens: 2,
+      }].map(usageSession)),
+      serverDays: computed(() => null),
+      chartMode,
+      fmtCost: value => `$${Number(value || 0).toFixed(2)}`,
+      fmtNum: value => String(value || 0),
+      taskName: row => String(row.title || 'Untitled task'),
+    })
+
+    expect(chartRows.value[0].label).toBe(title)
+    expect(chartRows.value[0].sessionKey).toBe('agent:main:webchat:private-id')
   })
 })

@@ -491,6 +491,7 @@ class ChannelPlatformManifest:
         profile: ChannelCapabilityProfile,
         *,
         has_send_file: bool = False,
+        has_artifact_delivery: bool = False,
         has_inbound_attachment_resolver: bool = False,
     ) -> ChannelPlatformManifest:
         def row(
@@ -509,6 +510,7 @@ class ChannelPlatformManifest:
             return ChannelPlatformCapability(category=category, status=status, notes=notes)
 
         file_capable = profile.native_file_upload or profile.artifact_delivery or profile.media
+        has_file_delivery = has_send_file or has_artifact_delivery
         thread_capable = profile.threads or profile.thread_reply or profile.thread_messages
         card_capable = profile.cards or profile.interactive_cards or profile.card_actions
         chat_capable = bool(
@@ -525,8 +527,8 @@ class ChannelPlatformManifest:
                 row(ChannelPlatformCategories.CHAT, chat_capable),
                 row(
                     ChannelPlatformCategories.FILES,
-                    file_capable and has_send_file,
-                    config_required=file_capable and not has_send_file,
+                    file_capable and has_file_delivery,
+                    config_required=file_capable and not has_file_delivery,
                 ),
                 row(ChannelPlatformCategories.MEDIA, profile.media),
                 row(
@@ -613,6 +615,7 @@ def channel_platform_manifest(channel: Any) -> ChannelPlatformManifest | None:
     return ChannelPlatformManifest.from_channel_profile(
         profile,
         has_send_file=callable(getattr(channel, "send_file", None)),
+        has_artifact_delivery=callable(getattr(channel, "deliver_artifact", None)),
         has_inbound_attachment_resolver=callable(
             getattr(channel, "resolve_inbound_attachment", None)
         ),
@@ -621,7 +624,8 @@ def channel_platform_manifest(channel: Any) -> ChannelPlatformManifest | None:
 
 _CAPABILITY_METHOD_EVIDENCE: dict[str, tuple[str, ...]] = {
     ChannelCapabilities.TYPING_INDICATOR: ("send_typing",),
-    ChannelCapabilities.NATIVE_FILE_UPLOAD: ("send_file",),
+    ChannelCapabilities.ARTIFACT_DELIVERY: ("deliver_artifact", "send_file"),
+    ChannelCapabilities.NATIVE_FILE_UPLOAD: ("deliver_artifact", "send_file"),
     ChannelCapabilities.REPLY: ("build_reply_message",),
     ChannelCapabilities.THREAD_REPLY: ("build_reply_message",),
     ChannelCapabilities.EDIT: ("edit",),

@@ -7,6 +7,10 @@ import platform
 import shutil
 from dataclasses import dataclass, field
 
+from opensquilla.skills.toolchains import (
+    resolve_managed_binary,
+    resolve_managed_binary_passive,
+)
 from opensquilla.skills.types import SkillInstallSpec, SkillSpec
 
 
@@ -19,6 +23,7 @@ class EligibilityContext:
     env_cache: dict[str, str | None] = field(default_factory=dict)
     enabled_set: set[str] | None = None  # None = all enabled
     disabled_set: set[str] = field(default_factory=set)
+    passive_managed_bins: bool = False
 
     @staticmethod
     def auto(
@@ -36,17 +41,56 @@ class EligibilityContext:
 def _has_bin(name: str, ctx: EligibilityContext) -> bool:
     if name in ctx.has_bin_cache:
         return ctx.has_bin_cache[name]
-    result = shutil.which(name) is not None
+    # Binary requirements are names, never manifest-controlled filesystem paths.
+    # resolve_managed_binary consults only code-catalogued, validated managed
+    # activation receipts in addition to the legacy system lookup below.
+    safe_name = bool(
+        name
+        and name not in {".", ".."}
+        and "\x00" not in name
+        and "/" not in name
+        and "\\" not in name
+    )
+    result = False
+    if safe_name:
+        if name.casefold() == "git":
+            try:
+                from opensquilla.git_runtime import resolve_git_capability
+
+                result = resolve_git_capability().available
+            except Exception:
+                # The system Git path may be an unusable platform shim. Treat
+                # capability-resolution failures as missing rather than
+                # advertising a skill that cannot run.
+                result = False
+            ctx.has_bin_cache[name] = result
+            return result
+        # Keep the long-standing system lookup seam (and system PATH priority)
+        # before consulting validated OpenSquilla activation receipts.
+        result = shutil.which(name) is not None
+        if not result:
+            try:
+                resolver = (
+                    resolve_managed_binary_passive
+                    if ctx.passive_managed_bins
+                    else resolve_managed_binary
+                )
+                result = resolver(name) is not None
+            except (OSError, TypeError, ValueError):
+                # Managed state is an optional enhancement. Corrupt/unreadable
+                # receipts must fail closed without breaking the whole catalog.
+                result = False
     ctx.has_bin_cache[name] = result
     return result
 
 
 def _has_env(name: str, ctx: EligibilityContext) -> bool:
     if name in ctx.env_cache:
-        return ctx.env_cache[name] is not None
+        cached = ctx.env_cache[name]
+        return isinstance(cached, str) and bool(cached.strip())
     val = os.environ.get(name)
     ctx.env_cache[name] = val
-    return val is not None
+    return isinstance(val, str) and bool(val.strip())
 
 
 def check_eligibility(spec: SkillSpec, ctx: EligibilityContext) -> bool:
@@ -103,7 +147,7 @@ def check_eligibility(spec: SkillSpec, ctx: EligibilityContext) -> bool:
 class InstallHint:
     """Display-only install command, decoupled from dependency execution logic."""
 
-    kind: str  # "brew", "uv", "npm", "go", "download"
+    kind: str  # "brew", "uv", "npm", "go", "download", "toolchain"
     label: str  # "Install himalaya (brew)"
     command: str  # "brew install himalaya"
 
@@ -268,6 +312,21 @@ def effective_disabled(disabled: set[str] | list[str] | None, coding_mode: bool)
     return result
 
 
+def eligibility_context_for_skills_config(config: object | None) -> EligibilityContext:
+    """Build an eligibility context from one ``SkillsConfig``-shaped object.
+
+    Keeping this conversion beside :func:`effective_disabled` prevents read-only
+    lifecycle and Doctor surfaces from silently dropping the operator gate while
+    the invocation path still enforces it.
+    """
+
+    disabled = getattr(config, "disabled", None) if config is not None else None
+    coding_mode = bool(getattr(config, "coding_mode", False)) if config is not None else False
+    return EligibilityContext.auto(
+        disabled_set=effective_disabled(disabled, coding_mode),
+    )
+
+
 def is_skill_available(
     name: str, *, disabled: set[str] | list[str] | None, coding_mode: bool
 ) -> bool:
@@ -309,3 +368,19 @@ def is_skill_available_live(name: str) -> bool:
     disabled = getattr(cfg, "disabled", None) or []
     coding_mode = bool(getattr(cfg, "coding_mode", False))
     return is_skill_available(name, disabled=disabled, coding_mode=coding_mode)
+
+
+def live_eligibility_context(
+    fallback_config: object | None = None,
+) -> EligibilityContext:
+    """Build an eligibility context from the current live operator config.
+
+    ``fallback_config`` is used by unit-test and offline-style composition roots
+    that have not registered the Gateway getter. With neither source present,
+    the normal default (coding mode off) still fails closed for ``code-task``.
+    """
+
+    config = fallback_config
+    if _live_skills_cfg_getter is not None:
+        config = _live_skills_cfg_getter()  # type: ignore[operator]
+    return eligibility_context_for_skills_config(config)

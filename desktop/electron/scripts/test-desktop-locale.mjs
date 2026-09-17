@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict'
 
-import { resolveLocaleFromTags } from '../dist/desktop-locale.js'
+import { normalizeGatewayLocale, resolveLocaleFromTags } from '../dist/desktop-locale.js'
+
+// Gateway compatibility normalization is intentionally different from OS
+// language selection: persisted zh* values always map to the bundled
+// Simplified Chinese locale, and unknown persisted values map to English.
+assert.equal(normalizeGatewayLocale('zh-CN'), 'zh-Hans')
+assert.equal(normalizeGatewayLocale('zh-Hant-TW'), 'zh-Hans')
+assert.equal(normalizeGatewayLocale('ja-JP'), 'ja')
+assert.equal(normalizeGatewayLocale('fr_CA'), 'fr')
+assert.equal(normalizeGatewayLocale('unknown'), 'en')
 
 // --- preference order: first bundled match wins ---
 

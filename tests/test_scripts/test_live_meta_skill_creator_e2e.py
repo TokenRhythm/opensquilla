@@ -39,8 +39,8 @@ def test_live_meta_skill_creator_script_runs_full_flow_with_stub_llm(
                 },
                 {
                     "id": "summary",
-                    "skill": "summarize",
-                    "task": "summarize history",
+                    "skill": "docx",
+                    "task": "create an operational brief",
                     "with_keys": {},
                 },
             ],
@@ -53,7 +53,7 @@ def test_live_meta_skill_creator_script_runs_full_flow_with_stub_llm(
         model="stub-live-model",
         provider="stub-provider",
         auto_enable=True,
-        auto_enable_max_risk="low",
+        auto_enable_max_risk="medium",
     )
 
     assert out["ok"] is True

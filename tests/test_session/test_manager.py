@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
 from pathlib import Path
@@ -13,20 +14,45 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from opensquilla.session.compaction import CompactionConfig
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
+from opensquilla.session import manager as session_manager_module
+from opensquilla.session.attachment_manifest import (
+    ATTACHMENT_MANIFEST_STATE_KIND,
+    attachment_manifest_from_context_state,
+    build_attachment_manifest,
+    manifest_context_state,
+)
+from opensquilla.session.compaction import CompactionConfig, CompactionResult
+from opensquilla.session.compaction_lifecycle import ConsumerAdmissionStaleError
+from opensquilla.session.compaction_state import StructuredCompactionSummary
+from opensquilla.session.context_view import (
+    build_compaction_context_records,
+    compaction_replay_is_complete,
+    format_compaction_summary_context,
+)
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    PlanRunRecord,
     SessionContextState,
     SessionIntent,
     SessionStatus,
     SessionSummary,
     TranscriptEntry,
 )
+from opensquilla.session.plans import new_plan_revision
 from opensquilla.session.storage import (
     CANONICAL_FORK_PROOF_SCHEMA_VERSION,
     SessionStorage,
     StaleEpochError,
 )
+from opensquilla.turn_outcome_projection import (
+    attach_fork_terminal_outcome_projection,
+    build_fork_terminal_outcome_projection,
+    extract_fork_terminal_outcome_projection,
+)
+from tests.helpers.compaction import synthetic_compaction_config
 
 
 @pytest_asyncio.fixture
@@ -128,6 +154,35 @@ async def test_apply_intent_reset_same_key_rotates_identity_and_clears_state(
     node.cache_read = 7
     node.cache_write = 8
     await manager._storage.upsert_session(node)
+    revision = await manager._storage.create_plan_revision(
+        new_plan_revision(
+            source_session_key=node.session_key,
+            source_session_id=node.session_id,
+            source_epoch=int(node.epoch or 0),
+            title="Old task plan",
+            markdown="## Old task plan",
+            steps=[{"step_id": "old", "title": "Old step"}],
+        ),
+        expected_parent_revision_id=None,
+    )
+    current = await manager.get_session(node.session_key)
+    assert current is not None
+    await manager._storage.set_collaboration_mode(
+        node.session_key,
+        "plan",
+        expected_revision=int(current.collaboration_revision or 0),
+    )
+    old_run = await manager._storage.start_plan_run(
+        PlanRunRecord(
+            run_id="old-task-run",
+            session_key=node.session_key,
+            session_id=node.session_id,
+            session_epoch=int(node.epoch or 0),
+            plan_revision_id=revision.revision_id,
+            driver_kind="manual",
+            status="queued",
+        )
+    )
     await manager.append_message("agent:main:main", "user", "hello")
     await manager._storage.save_summary(
         SessionSummary(
@@ -172,6 +227,13 @@ async def test_apply_intent_reset_same_key_rotates_identity_and_clears_state(
     assert applied.missing_cost_entries == 0
     assert applied.cache_read == 0
     assert applied.cache_write == 0
+    assert applied.collaboration_mode == "default"
+    assert applied.collaboration_revision == 0
+    assert applied.active_plan_revision_id is None
+    superseded = await manager._storage.get_plan_run(old_run.run_id)
+    assert superseded is not None
+    assert superseded.status == "superseded"
+    assert superseded.terminal_reason == "session_reset"
     archive_files = list((tmp_path / "archives").glob("*.json"))
     assert len(archive_files) == 1
     archived = json.loads(archive_files[0].read_text(encoding="utf-8"))
@@ -279,21 +341,318 @@ async def test_apply_intent_reset_same_key_missing_creates_session(manager):
 
 
 @pytest.mark.asyncio
-async def test_apply_intent_reset_same_key_archive_failure_does_not_block(
+async def test_apply_intent_reset_same_key_archive_failure_preserves_history(
     manager, tmp_path, monkeypatch
 ):
     archive_file = tmp_path / "not-a-directory"
     archive_file.write_text("occupied", encoding="utf-8")
     monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_file))
     node = await manager.create("agent:main:main")
+    old_epoch = int(node.epoch or 0)
+    manager.set_cached_epoch(node.session_key, old_epoch)
     old_session_id = node.session_id
     await manager.append_message("agent:main:main", "user", "hello")
+    await manager._storage.save_summary(
+        SessionSummary(
+            session_id=old_session_id,
+            session_key="agent:main:main",
+            summary_text="preserve me",
+        )
+    )
 
-    applied, rotated = await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
+    with pytest.raises(OSError):
+        await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
 
-    assert rotated is True
-    assert applied.session_id != old_session_id
-    assert await manager._storage.count_transcript_entries(old_session_id) == 0
+    persisted = await manager.get_session("agent:main:main")
+    assert persisted is not None
+    assert persisted.session_id == old_session_id
+    assert persisted.epoch == old_epoch
+    assert manager.get_cached_epoch(node.session_key) == old_epoch
+    assert await manager._storage.count_transcript_entries(old_session_id) == 1
+    summaries = await manager._storage.get_all_summaries(old_session_id)
+    assert [summary.summary_text for summary in summaries] == ["preserve me"]
+
+
+@pytest.mark.asyncio
+async def test_reset_storage_failure_preserves_identity_history_and_cache(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    node = await manager.create("agent:main:main")
+    old_session_id = node.session_id
+    old_epoch = int(node.epoch or 0)
+    manager.set_cached_epoch(node.session_key, old_epoch)
+    await manager.append_message("agent:main:main", "user", "hello")
+    monkeypatch.setattr(
+        manager._storage,
+        "reset_session",
+        AsyncMock(side_effect=OSError("reset unavailable")),
+    )
+
+    with pytest.raises(OSError, match="reset unavailable"):
+        await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
+
+    persisted = await manager.get_session("agent:main:main")
+    assert persisted is not None
+    assert persisted.session_id == old_session_id
+    assert persisted.epoch == old_epoch
+    assert node.session_id == old_session_id
+    assert node.epoch == old_epoch
+    assert manager.get_cached_epoch(node.session_key) == old_epoch
+    assert await manager._storage.count_transcript_entries(old_session_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_capture_failure_preserves_identity_and_history(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    node = await manager.create("agent:main:main")
+    old_session_id = node.session_id
+    await manager.append_message("agent:main:main", "user", "hello")
+    monkeypatch.setattr(
+        manager._storage,
+        "_select_canonical_transcript",
+        AsyncMock(side_effect=OSError("transcript unavailable")),
+    )
+
+    with pytest.raises(OSError, match="transcript unavailable"):
+        await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
+
+    persisted = await manager.get_session("agent:main:main")
+    assert persisted is not None
+    assert persisted.session_id == old_session_id
+    assert await manager._storage.count_transcript_entries(old_session_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_mid_delete_failure_rolls_back_every_database_change(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    node = await manager.create("agent:main:main")
+    old_session_id = node.session_id
+    old_epoch = int(node.epoch or 0)
+    manager.set_cached_epoch(node.session_key, old_epoch)
+    await manager.append_message("agent:main:main", "user", "preserve transcript")
+    await manager._storage.save_summary(
+        SessionSummary(
+            session_id=old_session_id,
+            session_key=node.session_key,
+            summary_text="preserve summary",
+        )
+    )
+    await manager.save_context_state(
+        SessionContextState(
+            session_id=old_session_id,
+            session_key=node.session_key,
+            provider="portable",
+            state_kind="structured_summary_v1",
+            payload={"current_status": "preserve context"},
+            covered_through_id=1,
+            valid=True,
+        )
+    )
+
+    async def fail_after_transcript_delete(conn, session_id: str) -> None:
+        await conn.execute(
+            "DELETE FROM transcript_entries WHERE session_id = ?",
+            (session_id,),
+        )
+        await conn.execute(
+            "DELETE FROM compacted_transcript_entries WHERE session_id = ?",
+            (session_id,),
+        )
+        raise OSError("injected mid-delete failure")
+
+    monkeypatch.setattr(
+        manager._storage,
+        "_delete_reset_history",
+        fail_after_transcript_delete,
+    )
+
+    with pytest.raises(OSError, match="injected mid-delete failure"):
+        await manager.apply_intent(node.session_key, SessionIntent.RESET_SAME_KEY)
+
+    persisted = await manager.get_session(node.session_key)
+    assert persisted is not None
+    assert persisted.session_id == old_session_id
+    assert persisted.epoch == old_epoch
+    assert node.session_id == old_session_id
+    assert node.epoch == old_epoch
+    assert manager.get_cached_epoch(node.session_key) == old_epoch
+    transcript = await manager._storage.get_transcript(old_session_id)
+    assert [entry.content for entry in transcript] == ["preserve transcript"]
+    summaries = await manager._storage.get_all_summaries(old_session_id)
+    assert [summary.summary_text for summary in summaries] == ["preserve summary"]
+    context_states = await manager.get_context_states(node.session_key)
+    assert len(context_states) == 1
+    assert context_states[0].valid is True
+
+    archive_files = list(archive_dir.glob("*.json"))
+    assert len(archive_files) == 1
+    archived = json.loads(archive_files[0].read_text(encoding="utf-8"))
+    assert archived["session_id"] == old_session_id
+    assert archived["transcript_entries"][0]["content"] == "preserve transcript"
+    assert archived["summaries"][0]["summary_text"] == "preserve summary"
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_fsyncs_before_atomic_publish_and_avoids_collisions(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.session import manager as manager_module
+
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    monkeypatch.setattr(manager_module, "_now_ms", lambda: 123456789)
+    node = await manager.create("agent:main:main")
+    await manager.append_message(node.session_key, "user", "durable archive")
+    entries = await manager._storage.get_canonical_transcript(node.session_id)
+
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def tracking_replace(source, destination) -> None:
+        assert "fsync" in events
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(manager_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(manager_module.os, "replace", tracking_replace)
+
+    await manager.write_session_archive(node, entries, [])
+    await manager.write_session_archive(node, entries, [])
+
+    assert events.count("replace") == 2
+    assert events[0] == "fsync"
+    archives = list(archive_dir.glob("*.json"))
+    assert len(archives) == 2
+    assert archives[0].name != archives[1].name
+    assert list(archive_dir.glob("*.tmp")) == []
+    for archive in archives:
+        payload = json.loads(archive.read_text(encoding="utf-8"))
+        assert payload["transcript_entries"][0]["content"] == "durable archive"
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_publish_failure_removes_temporary_file(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.session import manager as manager_module
+
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    node = await manager.create("agent:main:main")
+    await manager.append_message(node.session_key, "user", "keep source")
+    entries = await manager._storage.get_canonical_transcript(node.session_id)
+
+    def fail_replace(_source, _destination) -> None:
+        raise OSError("replace unavailable")
+
+    monkeypatch.setattr(manager_module.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace unavailable"):
+        await manager.write_session_archive(node, entries, [])
+
+    assert list(archive_dir.iterdir()) == []
+    persisted = await manager.get_session(node.session_key)
+    assert persisted is not None
+    assert persisted.session_id == node.session_id
+    transcript = await manager._storage.get_transcript(node.session_id)
+    assert [entry.content for entry in transcript] == ["keep source"]
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_bounds_filename_but_preserves_full_session_key(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.paths import native_io_path
+
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    node = await manager.create("agent:main:main")
+    await manager.append_message(node.session_key, "user", "long key archive")
+    entries = await manager._storage.get_canonical_transcript(node.session_id)
+    long_key = "agent:main:" + ("long-key-" * 80)
+    archive_node = node.model_copy(deep=True)
+    archive_node.session_key = long_key
+
+    await manager.write_session_archive(archive_node, entries, [])
+
+    archives = list(archive_dir.glob("*.json"))
+    assert len(archives) == 1
+    archive = archives[0]
+    assert len(archive.name) <= 255
+    payload = json.loads(native_io_path(archive).read_text(encoding="utf-8"))
+    assert payload["session_key"] == long_key
+    assert payload["transcript_entries"][0]["content"] == "long key archive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+async def test_reset_archive_supports_long_windows_path(
+    manager,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.paths import native_io_path
+
+    long_root = tmp_path / "long-session-archive"
+    archive_root = long_root
+    index = 0
+    while len(str(archive_root)) <= 280:
+        archive_root /= f"segment-{index:02d}-" + ("a" * 40)
+        index += 1
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_root))
+
+    try:
+        node = await manager.create("agent:main:main")
+        old_session_id = node.session_id
+        await manager.append_message("agent:main:main", "user", "long archive")
+        await manager._storage.save_summary(
+            SessionSummary(
+                session_id=old_session_id,
+                session_key="agent:main:main",
+                summary_text="long archive summary",
+            )
+        )
+
+        applied, rotated = await manager.apply_intent(
+            "agent:main:main",
+            SessionIntent.RESET_SAME_KEY,
+        )
+
+        assert rotated is True
+        assert applied.session_id != old_session_id
+        archive_files = list(native_io_path(archive_root).glob("*.json"))
+        assert len(archive_files) == 1
+        archived = json.loads(archive_files[0].read_text(encoding="utf-8"))
+        assert archived["session_id"] == old_session_id
+        assert archived["transcript_entries"][0]["content"] == "long archive"
+        assert archived["summaries"][0]["summary_text"] == "long archive summary"
+    finally:
+        native_root = native_io_path(long_root)
+        if native_root.exists():
+            shutil.rmtree(native_root)
 
 
 @pytest.mark.asyncio
@@ -313,12 +672,69 @@ async def test_resume_missing_raises(manager):
         await manager.resume("agent:main:nope")
 
 
+@pytest.mark.parametrize("operation", ["resume", "update", "finish"])
+@pytest.mark.asyncio
+async def test_existing_session_mutations_do_not_recreate_deleted_generation(
+    manager,
+    monkeypatch,
+    operation,
+):
+    key = "agent:main:generation-race"
+    await manager.create(key)
+    original_upsert = manager._storage.upsert_session
+
+    async def delete_before_upsert(node, **kwargs):
+        await manager._storage.delete_session(key)
+        return await original_upsert(node, **kwargs)
+
+    monkeypatch.setattr(manager._storage, "upsert_session", delete_before_upsert)
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        if operation == "resume":
+            await manager.resume(key)
+        elif operation == "update":
+            await manager.update(key, derived_title="Late title")
+        else:
+            await manager.finish(key)
+
+    assert await manager._storage.get_session(key) is None
+
+
 @pytest.mark.asyncio
 async def test_update_fields(manager):
     await manager.create("agent:main:main")
     updated = await manager.update("agent:main:main", model="claude-opus-4-6", channel="telegram")
     assert updated.model == "claude-opus-4-6"
     assert updated.channel == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_update_expected_owner_rejects_epoch_change_before_write(
+    manager,
+    monkeypatch,
+):
+    key = "agent:main:update-owner-race"
+    admitted = await manager.create(key)
+    original_upsert = manager._storage.upsert_session
+
+    async def advance_epoch_before_upsert(node, **kwargs):
+        await manager._storage.increment_epoch(key)
+        return await original_upsert(node, **kwargs)
+
+    monkeypatch.setattr(manager._storage, "upsert_session", advance_epoch_before_upsert)
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        await manager.update(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+            display_name="Late title",
+        )
+
+    persisted = await manager.get_session(key)
+    assert persisted is not None
+    assert persisted.epoch == 1
+    assert persisted.display_name != "Late title"
 
 
 @pytest.mark.asyncio
@@ -343,6 +759,135 @@ async def test_append_message(manager):
     entry = await manager.append_message("agent:main:main", "user", "Hello!")
     assert entry.role == "user"
     assert entry.content == "Hello!"
+
+
+def _submit_plan_segments(
+    *,
+    tool_use_id: str = "submit-plan-1",
+    title: str = "Implement Plan mode",
+    markdown: str = "## Plan\n\nImplement and verify the collaboration flow.",
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "tool_use",
+            "tool_use_id": tool_use_id,
+            "name": "submit_plan",
+            "input": {
+                "title": title,
+                "markdown": markdown,
+                "steps": [
+                    {"step_id": "inspect", "title": "Inspect the current flow"},
+                    {"step_id": "implement", "title": "Implement and verify"},
+                ],
+            },
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "name": "submit_plan",
+            "result": json.dumps(
+                {
+                    "status": "plan_submitted",
+                    "title": title,
+                    "step_count": 2,
+                }
+            ),
+            "is_error": False,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_submit_plan_atomically_creates_typed_revision(manager):
+    await manager.create("agent:main:main")
+    await manager._storage.set_collaboration_mode(
+        "agent:main:main",
+        "plan",
+        expected_revision=0,
+    )
+
+    entry = await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "Plan ready.",
+        tool_calls=_submit_plan_segments(),
+    )
+
+    node = await manager.get_session("agent:main:main")
+    assert node is not None
+    assert node.collaboration_mode == "plan"
+    assert node.collaboration_revision == 2
+    assert node.active_plan_revision_id is not None
+    revision = await manager._storage.get_current_plan_revision("agent:main:main")
+    assert revision is not None
+    assert revision.revision_id == node.active_plan_revision_id
+    assert revision.generation == 1
+    assert [step["step_id"] for step in revision.steps] == ["inspect", "implement"]
+    assert entry.turn_context is not None
+    assert entry.turn_context["plan_revision_id"] == revision.revision_id
+    plan_segments = [
+        segment for segment in entry.tool_calls or [] if segment.get("type") == "plan"
+    ]
+    assert plan_segments == [
+        {
+            "type": "plan",
+            "snapshot": {
+                **plan_segments[0]["snapshot"],
+                "current": True,
+            },
+        }
+    ]
+    assert plan_segments[0]["snapshot"]["revisionId"] == revision.revision_id
+
+
+@pytest.mark.asyncio
+async def test_replan_is_full_immutable_replacement_with_parent_link(manager):
+    await manager.create("agent:main:main")
+    first_entry = await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "First plan.",
+        tool_calls=_submit_plan_segments(),
+    )
+    first = await manager._storage.get_current_plan_revision("agent:main:main")
+    assert first is not None
+
+    second_entry = await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "Revised plan.",
+        tool_calls=_submit_plan_segments(
+            tool_use_id="submit-plan-2",
+            title="Revised Plan mode",
+            markdown="## Revised plan\n\nUse a complete replacement.",
+        ),
+    )
+    second = await manager._storage.get_current_plan_revision("agent:main:main")
+
+    assert second is not None
+    assert second.revision_id != first.revision_id
+    assert second.plan_id == first.plan_id
+    assert second.parent_revision_id == first.revision_id
+    assert second.generation == 2
+    assert first_entry.message_id != second_entry.message_id
+    persisted_first = await manager._storage.get_plan_revision(first.revision_id)
+    assert persisted_first == first
+
+
+@pytest.mark.asyncio
+async def test_failed_submit_plan_result_does_not_create_revision(manager):
+    await manager.create("agent:main:main")
+    segments = _submit_plan_segments()
+    segments[-1]["is_error"] = True
+
+    await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "Submission failed.",
+        tool_calls=segments,
+    )
+
+    assert await manager._storage.get_current_plan_revision("agent:main:main") is None
 
 
 @pytest.mark.asyncio
@@ -701,6 +1246,581 @@ async def test_branch_before_message_missing_id_does_not_create_child(manager):
 
 
 @pytest.mark.asyncio
+async def test_branch_through_terminal_turn_is_inclusive_and_excludes_promoted_future_input(
+    manager,
+):
+    parent = await manager.create("agent:main:main")
+    turn_id = "turn-complete"
+    promoted_turn_id = "turn-promoted-next"
+    entries = [
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="question",
+            turn_context={"turn_id": turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="future promoted input must not leak",
+            turn_context={
+                "disposition": "promoted",
+                "promoted_turn_id": promoted_turn_id,
+                "turn_id": turn_id,
+                "target_turn_id": turn_id,
+            },
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="calling tool",
+            tool_calls=[{"id": "call-1", "name": "lookup", "arguments": {}}],
+            turn_context={"turn_id": turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="tool",
+            content="tool result",
+            tool_call_id="call-1",
+            turn_context={"turn_id": turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="final answer",
+            turn_context={"turn_id": turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="system",
+            content="unscoped trailing system row must not be guessed into the turn",
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="later answer must not leak",
+            turn_context={"turn_id": promoted_turn_id},
+        ),
+    ]
+    for entry in entries:
+        await manager._storage.append_transcript_entry(entry)
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    parent.compaction_count = 1
+    await manager._storage.upsert_session(parent)
+    await manager._storage.save_summary(
+        SessionSummary(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            compaction_id="zero-row-compaction",
+            summary_text="must not be inherited by a historical prefix",
+        )
+    )
+    await manager.save_context_state(
+        SessionContextState(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            provider="portable",
+            state_kind="structured_summary_v1",
+            payload={"user_goal": "later parent state"},
+            portable=True,
+            cacheable=True,
+        )
+    )
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:through-turn",
+        fork_transcript=True,
+        fork_through_turn_id=turn_id,
+    )
+
+    assert child.forked_from_parent is True
+    assert [
+        (entry.role, entry.content)
+        for entry in await manager.get_transcript(child.session_key)
+    ] == [
+        ("user", "question"),
+        ("assistant", "calling tool"),
+        ("tool", "tool result"),
+        ("assistant", "final answer"),
+    ]
+    assert [entry.content for entry in await manager.get_transcript(parent.session_key)] == [
+        "question",
+        "future promoted input must not leak",
+        "calling tool",
+        "tool result",
+        "final answer",
+        "unscoped trailing system row must not be guessed into the turn",
+        "later answer must not leak",
+    ]
+    assert await manager.get_summaries(child.session_key) == []
+    assert await manager.get_context_states(child.session_key) == []
+
+
+@pytest.mark.asyncio
+async def test_branch_through_promoted_turn_uses_promoted_turn_identity(manager):
+    parent = await manager.create("agent:main:main")
+    first_turn_id = "turn-first"
+    promoted_turn_id = "turn-promoted"
+    entries = [
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="first question",
+            turn_context={"turn_id": first_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="promoted question",
+            turn_context={
+                "disposition": "promoted",
+                "promoted_turn_id": promoted_turn_id,
+                "turn_id": first_turn_id,
+                "target_turn_id": first_turn_id,
+            },
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="first answer finishes after promotion",
+            turn_context={"turn_id": first_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="promoted answer",
+            turn_context={"turn_id": promoted_turn_id},
+        ),
+    ]
+    for entry in entries:
+        await manager._storage.append_transcript_entry(entry)
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=promoted_turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:promoted-turn",
+        fork_transcript=True,
+        fork_through_turn_id=promoted_turn_id,
+    )
+
+    assert [entry.content for entry in await manager.get_transcript(child.session_key)] == [
+        "first question",
+        "promoted question",
+        "first answer finishes after promotion",
+        "promoted answer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_materializes_target_from_canonical_archive(manager):
+    parent = await manager.create("agent:main:main")
+    target_turn_id = "turn-in-archive"
+    later_turn_id = "turn-active-tail"
+    entries = [
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="archived question",
+            turn_context={"turn_id": target_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="archived tool request",
+            tool_calls=[{"id": "archived-call", "name": "lookup", "arguments": {}}],
+            turn_context={"turn_id": target_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="tool",
+            content="archived tool output",
+            tool_call_id="archived-call",
+            turn_context={"turn_id": target_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="archived final answer",
+            turn_context={"turn_id": target_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="active later question",
+            turn_context={"turn_id": later_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="active later answer",
+            turn_context={"turn_id": later_turn_id},
+        ),
+    ]
+    for entry in entries:
+        await manager._storage.append_transcript_entry(entry)
+    installed = await manager.persist_compaction_result(
+        parent.session_key,
+        "Archived target turn summary",
+        [
+            {"role": "user", "content": "active later question"},
+            {"role": "assistant", "content": "active later answer"},
+        ],
+        compaction_id="cmp-archived-through-turn",
+    )
+    assert installed is True
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=target_turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    async with manager._storage.conn.execute(
+        "SELECT COUNT(*) FROM compacted_transcript_entries "
+        "WHERE session_id = ? AND compaction_id = ?",
+        (parent.session_id, "cmp-archived-through-turn"),
+    ) as cursor:
+        archived_target_count = int((await cursor.fetchone())[0])
+    assert archived_target_count == 4
+    assert [entry.content for entry in await manager.get_transcript(parent.session_key)] == [
+        "active later question",
+        "active later answer",
+    ]
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:archived-through-turn",
+        fork_transcript=True,
+        fork_through_turn_id=target_turn_id,
+    )
+
+    assert [entry.content for entry in await manager.get_transcript(child.session_key)] == [
+        "archived question",
+        "archived tool request",
+        "archived tool output",
+        "archived final answer",
+    ]
+    child_page = await manager.get_canonical_transcript_page(child.session_key, limit=20)
+    assert child_page.canonical_complete is True
+    assert child.compaction_count == 0
+    assert await manager.get_summaries(parent.session_key)
+    assert await manager.get_context_states(parent.session_key)
+    assert await manager.get_summaries(child.session_key) == []
+    assert await manager.get_context_states(child.session_key) == []
+
+
+@pytest.mark.asyncio
+async def test_full_fork_rebinds_archived_terminal_outcome_for_later_nested_fork(manager):
+    parent = await manager.create("agent:main:archived-outcome-parent")
+    turn_id = "turn-archived-outcome"
+    later_turn_id = "turn-archived-outcome-later"
+    for role, content, entry_turn_id in (
+        ("user", "archived question", turn_id),
+        ("assistant", "archived answer", turn_id),
+        ("user", "active question", later_turn_id),
+    ):
+        await manager._storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=parent.session_id,
+                session_key=parent.session_key,
+                role=role,
+                content=content,
+                turn_context={"turn_id": entry_turn_id},
+            )
+        )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+            details={
+                "turn_id": turn_id,
+                "activity_snapshot": {
+                    "version": 2,
+                    "task_id": turn_id,
+                    "turn_id": turn_id,
+                    "complete": True,
+                    "reasoning_utf16_length": 0,
+                    "entries": [{
+                        "type": "phase",
+                        "id": "provider:requesting:4",
+                        "order": 4,
+                        "kind": "provider",
+                        "phase": "requesting",
+                        "at": 1_000,
+                        "ended_at": 2_000,
+                    }],
+                },
+            },
+        )
+    )
+    assert await manager.persist_compaction_result(
+        parent.session_key,
+        "archived outcome summary",
+        [
+            {
+                "role": "user",
+                "content": "active question",
+                "turn_context": {"turn_id": later_turn_id},
+            }
+        ],
+        compaction_id="cmp-archived-outcome",
+    )
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:archived-outcome-child",
+        fork_transcript=True,
+    )
+    child_page = await manager.get_canonical_transcript_page(child.session_key, limit=20)
+    child_entries = child_page.entries
+    child_projection = extract_fork_terminal_outcome_projection(
+        child_entries[1].turn_context,
+        session_id=child.session_id,
+        session_key=child.session_key,
+        turn_id=turn_id,
+    )
+    assert child_projection is not None
+    assert child_projection["activity_snapshot"]["entries"][0]["order"] == 4
+    await manager._storage.delete_session(parent.session_key)
+    assert await manager._storage.get_agent_task(turn_id) is None
+
+    nested = await manager.branch(
+        child.session_key,
+        "agent:main:archived-outcome-grandchild",
+        fork_transcript=True,
+        fork_through_turn_id=turn_id,
+    )
+    assert [entry.content for entry in await manager.get_transcript(nested.session_key)] == [
+        "archived question",
+        "archived answer",
+    ]
+    nested_entries = await manager.get_transcript(nested.session_key)
+    nested_projection = extract_fork_terminal_outcome_projection(
+        nested_entries[1].turn_context,
+        session_id=nested.session_id,
+        session_key=nested.session_key,
+        turn_id=turn_id,
+    )
+    assert nested_projection is not None
+    assert nested_projection["activity_snapshot"] == child_projection["activity_snapshot"]
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_rejects_missing_active_and_incomplete_history(manager):
+    parent = await manager.create("agent:main:main")
+    active_turn_id = "turn-active"
+    await manager._storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="still running",
+            turn_context={"turn_id": active_turn_id},
+        )
+    )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=active_turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.RUNNING,
+        )
+    )
+
+    with pytest.raises(KeyError, match="Transcript turn not found"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:missing-turn",
+            fork_transcript=True,
+            fork_through_turn_id="turn-without-id",
+        )
+    with pytest.raises(ValueError, match="active transcript turn"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:active-turn",
+            fork_transcript=True,
+            fork_through_turn_id=active_turn_id,
+        )
+
+    active = await manager._storage.get_agent_task(active_turn_id)
+    assert active is not None
+    await manager._storage.update_agent_task(
+        active_turn_id,
+        status=AgentTaskStatus.SUCCEEDED,
+    )
+    parent.compaction_count = 1
+    await manager._storage.upsert_session(parent)
+    with pytest.raises(ValueError, match="canonical transcript history is incomplete"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:incomplete-history",
+            fork_transcript=True,
+            fork_through_turn_id=active_turn_id,
+        )
+
+    for child_key in (
+        "agent:main:direct:missing-turn",
+        "agent:main:direct:active-turn",
+        "agent:main:direct:incomplete-history",
+    ):
+        assert await manager.get_session(child_key) is None
+
+
+@pytest.mark.asyncio
+async def test_branch_rejects_conflicting_history_anchors(manager):
+    await manager.create("agent:main:main")
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        await manager.branch(
+            "agent:main:main",
+            "agent:main:direct:conflicting-anchor",
+            fork_transcript=True,
+            fork_before_message_id="message-1",
+            fork_through_turn_id="turn-1",
+        )
+
+    assert await manager.get_session("agent:main:direct:conflicting-anchor") is None
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_rejects_completion_state_owned_by_another_session(manager):
+    parent = await manager.create("agent:main:main")
+    other = await manager.create("agent:main:other")
+    turn_id = "turn-owned-elsewhere"
+    await manager._storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="copied-looking row",
+            turn_context={"turn_id": turn_id},
+        )
+    )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=turn_id,
+            session_key=other.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+
+    with pytest.raises(KeyError, match="Completion state not found"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:wrong-task-owner",
+            fork_transcript=True,
+            fork_through_turn_id=turn_id,
+        )
+
+    assert await manager.get_session("agent:main:direct:wrong-task-owner") is None
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_rejects_forged_projection_on_unrelated_session(manager):
+    unrelated = await manager.create("agent:main:unrelated-projection")
+    turn_id = "turn-forged-projection"
+    forged_projection = build_fork_terminal_outcome_projection(
+        session_id=unrelated.session_id,
+        session_key=unrelated.session_key,
+        turn_id=turn_id,
+        task_id=turn_id,
+        status="succeeded",
+        started_at=10,
+        finished_at=20,
+        outcome={"kind": "completed", "reason": "succeeded"},
+    )
+    await manager._storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=unrelated.session_id,
+            session_key=unrelated.session_key,
+            role="assistant",
+            content="copied projection-shaped row",
+            turn_context=attach_fork_terminal_outcome_projection(
+                {"turn_id": turn_id},
+                forged_projection,
+            ),
+        )
+    )
+
+    with pytest.raises(KeyError, match="Completion state not found"):
+        await manager.branch(
+            unrelated.session_key,
+            "agent:main:direct:forged-projection-child",
+            fork_transcript=True,
+            fork_through_turn_id=turn_id,
+        )
+
+    assert await manager.get_session("agent:main:direct:forged-projection-child") is None
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_rejects_unscoped_row_inside_target_turn(manager):
+    parent = await manager.create("agent:main:main")
+    turn_id = "turn-with-ambiguous-middle"
+    for role, content, turn_context in (
+        ("user", "question", {"turn_id": turn_id}),
+        ("tool", "unscoped tool output", None),
+        ("assistant", "answer", {"turn_id": turn_id}),
+    ):
+        await manager._storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=parent.session_id,
+                session_key=parent.session_key,
+                role=role,
+                content=content,
+                turn_context=turn_context,
+            )
+        )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+
+    with pytest.raises(ValueError, match="unscoped canonical rows"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:ambiguous-middle",
+            fork_transcript=True,
+            fork_through_turn_id=turn_id,
+        )
+
+    assert await manager.get_session("agent:main:direct:ambiguous-middle") is None
+
+
+@pytest.mark.asyncio
 async def test_branch_fork_transcript_copies_compaction_summaries(manager):
     parent = await manager.create("agent:main:main")
     await manager.append_message("agent:main:main", "user", "kept tail", token_count=5)
@@ -722,7 +1842,6 @@ async def test_branch_fork_transcript_copies_compaction_summaries(manager):
             removed_count=3,
             kept_count=1,
             chunk_count=2,
-            flush_receipt_status="safe",
             covered_through_id=123,
         )
     )
@@ -758,7 +1877,6 @@ async def test_branch_fork_transcript_copies_compaction_summaries(manager):
     assert child_summaries[0].removed_count == 3
     assert child_summaries[0].kept_count == 1
     assert child_summaries[0].chunk_count == 2
-    assert child_summaries[0].flush_receipt_status == "safe"
     assert child_summaries[0].covered_through_id == 123
     assert child_summaries[0].session_id == child.session_id
     assert child_summaries[0].session_key == "agent:main:direct:u1"
@@ -804,6 +1922,341 @@ async def test_branch_fork_transcript_copies_compacted_archive(manager):
         limit=10,
     )
     assert child_page.canonical_complete is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fork_mode", ["before_message", "through_turn", "prepared"])
+@pytest.mark.parametrize("archived", [False, True])
+async def test_prefix_forks_preserve_legacy_attachment_ids_with_new_message_identity(
+    manager,
+    fork_mode: str,
+    archived: bool,
+) -> None:
+    parent = await manager.create("agent:main:prefix-attachment-parent")
+    image_content = json.dumps(
+        {
+            "text": "inspect the attachments",
+            "attachments": [
+                {"type": "image/png", "name": "first.png", "data": "cG5n"},
+                {"type": "image/png", "name": "duplicate.png", "data": "cG5n"},
+                {
+                    "attachment_id": "att_existing_prefix_123",
+                    "type": "image/png",
+                    "sha256_ref": "a" * 64,
+                    "name": "stored.png",
+                },
+            ],
+        }
+    )
+    image_entry = TranscriptEntry(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        role="user",
+        content=image_content,
+        turn_context={"turn_id": "prefix-attachment-turn"},
+    )
+    await manager._storage.append_transcript_entry(image_entry)
+    parent_manifest = build_attachment_manifest(
+        [image_entry],
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+    )
+    attachment_ids = [item.attachment_id for item in parent_manifest.occurrences]
+    assert len(set(attachment_ids)) == 3
+    reference_text = "Attachment references: " + ", ".join(attachment_ids)
+    answer_entry = TranscriptEntry(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        role="assistant",
+        content=reference_text,
+        turn_context={"turn_id": "prefix-attachment-turn"},
+    )
+    await manager._storage.append_transcript_entry(answer_entry)
+    future = await manager.append_message(parent.session_key, "user", "later request")
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id="prefix-attachment-turn",
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    if archived:
+        assert await manager.persist_compaction_result(
+            parent.session_key,
+            reference_text,
+            [{"role": "user", "content": future.content}],
+            compaction_id="cmp-prefix-attachment-parent",
+        )
+
+    child_key = "agent:main:prefix-attachment-child"
+    if fork_mode == "prepared":
+        plan = await manager.prepare_prefix_branch(
+            parent.session_key,
+            child_key,
+            fork_before_message_id=future.message_id,
+        )
+        child = plan.node
+        await manager._storage.upsert_session(child)
+        for entry in plan.initial_transcript_entries:
+            await manager._storage.append_transcript_entry(entry)
+    else:
+        options = (
+            {"fork_before_message_id": future.message_id}
+            if fork_mode == "before_message"
+            else {"fork_through_turn_id": "prefix-attachment-turn"}
+        )
+        child = await manager.branch(
+            parent.session_key,
+            child_key,
+            fork_transcript=True,
+            **options,
+        )
+
+    child_entries = await manager.get_canonical_transcript(child.session_key)
+    assert len(child_entries) == 2
+    assert {entry.message_id for entry in child_entries}.isdisjoint(
+        {image_entry.message_id, answer_entry.message_id, future.message_id}
+    )
+    assert child_entries[1].content == reference_text
+    copied_envelope = json.loads(child_entries[0].content)
+    original_envelope = json.loads(image_content)
+    for original, copied, attachment_id in zip(
+        original_envelope["attachments"],
+        copied_envelope["attachments"],
+        attachment_ids,
+        strict=True,
+    ):
+        assert copied == {**original, "attachment_id": attachment_id}
+    parent_entries = await manager.get_canonical_transcript(parent.session_key)
+    assert next(
+        entry.content for entry in parent_entries if entry.message_id == image_entry.message_id
+    ) == image_content
+    child_manifest = build_attachment_manifest(
+        child_entries,
+        session_id=child.session_id,
+        session_key=child.session_key,
+    )
+    assert [item.attachment_id for item in child_manifest.occurrences] == attachment_ids
+    assert all(
+        item.source_message_id == child_entries[0].message_id
+        for item in child_manifest.occurrences
+    )
+
+    child_tail = await manager.append_message(child.session_key, "user", "child continuation")
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        reference_text,
+        [{"role": "user", "content": child_tail.content}],
+        compaction_id="cmp-prefix-attachment-child",
+    )
+    states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    compacted_manifest = attachment_manifest_from_context_state(
+        max(states, key=lambda state: (state.created_at, state.id or 0))
+    )
+    assert [item.attachment_id for item in compacted_manifest.occurrences] == attachment_ids
+    nested = await manager.branch(
+        child.session_key,
+        "agent:main:prefix-attachment-nested",
+        fork_transcript=True,
+        fork_before_message_id=child_tail.message_id,
+    )
+    nested_entries = await manager.get_canonical_transcript(nested.session_key)
+    nested_manifest = build_attachment_manifest(
+        nested_entries,
+        session_id=nested.session_id,
+        session_key=nested.session_key,
+    )
+    assert [item.attachment_id for item in nested_manifest.occurrences] == attachment_ids
+    assert nested_entries[0].message_id != child_entries[0].message_id
+
+
+@pytest.mark.asyncio
+async def test_full_fork_preserves_attachment_message_id_for_manifest_rebuild(
+    manager,
+) -> None:
+    parent = await manager.create("agent:main:attachment-fork-parent")
+    await manager.append_message(parent.session_key, "user", "old request")
+    await manager.append_message(parent.session_key, "assistant", "old answer")
+    image_content = json.dumps(
+        {
+            "text": "inspect this image",
+            "attachments": [
+                {
+                    "attachment_id": "att_full_fork_image_123",
+                    "type": "image/png",
+                    "name": "fork.png",
+                    "data": "Zm9yay1pbWFnZQ==",
+                }
+            ],
+        }
+    )
+    parent_image = await manager.append_message(
+        parent.session_key,
+        "user",
+        image_content,
+        message_id="message-full-fork-image",
+    )
+    assert await manager.persist_compaction_result(
+        parent.session_key,
+        "older parent context",
+        [{"role": "user", "content": image_content}],
+        compaction_id="cmp-parent-attachment-fork",
+    )
+    parent_states = await manager.get_context_states(parent.session_key)
+    parent_manifest_state = next(
+        state
+        for state in parent_states
+        if state.state_kind == ATTACHMENT_MANIFEST_STATE_KIND
+    )
+    [parent_occurrence] = attachment_manifest_from_context_state(
+        parent_manifest_state
+    ).occurrences
+    assert parent_occurrence.source_message_id == parent_image.message_id
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:attachment-fork-child",
+        fork_transcript=True,
+    )
+    [child_image] = await manager.get_transcript(child.session_key)
+    assert child_image.message_id == parent_image.message_id
+    await manager.append_message(child.session_key, "assistant", "child latest")
+
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        "child image context",
+        [{"role": "assistant", "content": "child latest"}],
+        compaction_id="cmp-child-attachment-fork",
+    )
+    child_states = await manager.get_context_states(child.session_key)
+    child_manifest_state = next(
+        state
+        for state in child_states
+        if state.state_kind == ATTACHMENT_MANIFEST_STATE_KIND
+    )
+    [child_occurrence] = attachment_manifest_from_context_state(
+        child_manifest_state
+    ).occurrences
+    assert child_occurrence.attachment_id == "att_full_fork_image_123"
+    assert child_occurrence.source_message_id == parent_image.message_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archived", [False, True])
+async def test_full_fork_preserves_legacy_attachment_id_from_compacted_archive(
+    manager,
+    archived: bool,
+) -> None:
+    parent = await manager.create("agent:main:legacy-attachment-fork-parent")
+    image_content = json.dumps(
+        {
+            "text": "inspect this legacy image",
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "name": "legacy-fork.png",
+                    "data": "bGVnYWN5LWZvcms=",
+                }
+            ],
+        }
+    )
+    parent_image = await manager.append_message(
+        parent.session_key,
+        "user",
+        image_content,
+        message_id="message-legacy-full-fork-image",
+    )
+    await manager.append_message(parent.session_key, "assistant", "old answer")
+    await manager.append_message(parent.session_key, "user", "active tail")
+    parent_manifest = build_attachment_manifest(
+        await manager.get_canonical_transcript(parent.session_key),
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+    )
+    [parent_occurrence] = parent_manifest.occurrences
+
+    await manager.save_context_state(manifest_context_state(parent_manifest))
+    if archived:
+        assert await manager.persist_compaction_result(
+            parent.session_key,
+            f"legacy image attachment_id={parent_occurrence.attachment_id}",
+            [{"role": "user", "content": "active tail"}],
+            compaction_id="cmp-parent-legacy-attachment-fork",
+        )
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:legacy-attachment-fork-child",
+        fork_transcript=True,
+    )
+
+    child_canonical = await manager.get_canonical_transcript(child.session_key)
+    child_image = next(
+        entry for entry in child_canonical if entry.message_id == parent_image.message_id
+    )
+    assert child_image.message_id == parent_image.message_id
+    assert json.loads(child_image.content)["attachments"][0]["attachment_id"] == (
+        parent_occurrence.attachment_id
+    )
+    parent_canonical = await manager.get_canonical_transcript(parent.session_key)
+    unchanged_parent_image = next(
+        entry for entry in parent_canonical if entry.message_id == parent_image.message_id
+    )
+    assert unchanged_parent_image.content == image_content
+    child_manifest = build_attachment_manifest(
+        child_canonical,
+        session_id=child.session_id,
+        session_key=child.session_key,
+    )
+
+    assert [item.attachment_id for item in child_manifest.occurrences] == [
+        parent_occurrence.attachment_id
+    ]
+    child_states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    copied_manifest = attachment_manifest_from_context_state(
+        max(child_states, key=lambda state: (state.created_at, state.id or 0))
+    )
+    assert copied_manifest.by_id(parent_occurrence.attachment_id) is not None
+
+    await manager.append_message(child.session_key, "assistant", "child answer")
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        f"legacy image attachment_id={parent_occurrence.attachment_id}",
+        [{"role": "assistant", "content": "child answer"}],
+        compaction_id="cmp-child-legacy-attachment-fork",
+    )
+    compacted_child_states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    compacted_child_manifest = attachment_manifest_from_context_state(
+        max(
+            compacted_child_states,
+            key=lambda state: (state.created_at, state.id or 0),
+        )
+    )
+    assert [
+        (
+            item.attachment_id,
+            item.source_message_id,
+            item.ordinal,
+        )
+        for item in compacted_child_manifest.occurrences
+    ] == [
+        (
+            parent_occurrence.attachment_id,
+            parent_image.message_id,
+            0,
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -1145,7 +2598,6 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
             "removed_count",
             "kept_count",
             "chunk_count",
-            "flush_receipt_status",
         }.issubset(columns)
 
         summary = await storage.get_latest_summary("legacy-session")
@@ -1164,9 +2616,98 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
         assert summary.removed_count == 0
         assert summary.kept_count == 0
         assert summary.chunk_count == 0
-        assert summary.flush_receipt_status == "unknown"
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_summary_database_compacts_and_replays_after_restart(tmp_path):
+    """A pre-metadata summary survives upgrade, replacement, and a cold restart."""
+    db_path = tmp_path / "legacy-summary-upgrade.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE session_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                compaction_index INTEGER NOT NULL DEFAULT 0,
+                summary_text TEXT NOT NULL,
+                covered_through_id INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO session_summaries (
+                session_id, session_key, compaction_index, summary_text,
+                covered_through_id, created_at, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-session-placeholder",
+                "agent:main:legacy-upgrade",
+                0,
+                "legacy checkpoint before metadata columns",
+                0,
+                123,
+                1,
+            ),
+        )
+
+    storage = SessionStorage(str(db_path))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    node = await manager.create("agent:main:legacy-upgrade")
+    await storage.conn.execute(
+        "UPDATE session_summaries SET session_id = ? WHERE session_key = ?",
+        (node.session_id, node.session_key),
+    )
+    await storage.conn.commit()
+    for index in range(20):
+        await manager.append_message(
+            node.session_key,
+            "user",
+            f"legacy-upgrade message {index} " + ("x" * 500),
+            token_count=200,
+        )
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1000,
+        compaction_id="cmp-legacy-upgrade-replacement",
+        config=synthetic_compaction_config(),
+    )
+    assert result.removed_count > 0
+    assert result.summary_payload is not None
+    assert result.summary_payload["source_coverage"]["replaces_prior_context"] is True
+    replacement_compaction_id = "cmp-legacy-upgrade-replacement"
+    await storage.close()
+
+    reopened = SessionStorage(str(db_path))
+    await reopened.connect()
+    try:
+        restarted = SessionManager(reopened, inject_time_prefix=False)
+        summaries = await restarted.get_summaries(node.session_key)
+        states = await restarted.get_context_states(node.session_key)
+
+        assert len(summaries) == 2
+        assert summaries[0].summary_format == "text"
+        assert summaries[0].summary_payload is None
+        assert summaries[1].summary_payload is not None
+        assert summaries[1].summary_payload["source_coverage"]["replaces_prior_context"] is True
+
+        active_records = build_compaction_context_records(
+            context_states=states,
+            summaries=summaries,
+        )
+        assert len(active_records) == 1
+        assert active_records[0].compaction_id == replacement_compaction_id
+        assert active_records[0].covered_through_id == summaries[1].covered_through_id
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio
@@ -1276,13 +2817,166 @@ async def test_compact_no_op_small_context(manager):
     assert summary == ""
 
 
+def test_compaction_payload_suppresses_split_goal_marker_around_tool_pair() -> None:
+    raw_segments = [
+        {"type": "text", "text": "NO_"},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-split",
+            "name": "read_status",
+            "input": {"id": "job-split"},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-split",
+            "name": "read_status",
+            "result": "pending",
+            "is_error": False,
+        },
+        {"type": "text", "text": "REPLY"},
+    ]
+    entry = TranscriptEntry(
+        session_id="session-split",
+        session_key="agent:main:split",
+        role="assistant",
+        content="NO_REPLY",
+        tool_calls=raw_segments,
+        turn_context={"intent": "goal_continuation"},
+    )
+
+    payload = session_manager_module._compaction_entry_payloads([entry])[0]
+
+    assert payload["content"] == ""
+    assert payload["tool_calls"] == [raw_segments[1], raw_segments[2]]
+    assert payload["turn_context"] == {"intent": "goal_continuation"}
+    assert "NO_" not in str(payload["tool_calls"])
+    assert "REPLY" not in str(payload["tool_calls"])
+    assert entry.content == "NO_REPLY"
+    assert entry.tool_calls == raw_segments
+
+
+@pytest.mark.asyncio
+async def test_compaction_payload_sanitizes_silent_replies_without_rewriting_storage(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:main")
+    raw_segments = [
+        {"type": "text", "text": "NO_REPLY\nWaiting for an external update."},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+        {"type": "text", "text": "HEARTBEAT_OK"},
+    ]
+    goal_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "HEARTBEAT_OK\nWaiting for an external update.\nNO_REPLY",
+        tool_calls=raw_segments,
+        turn_context={"intent": "goal_continuation"},
+    )
+    await manager._storage.append_transcript_entry(
+        goal_entry,
+        expected_epoch=expected_epoch,
+    )
+    unattributed_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "NO_REPLY\nQuoted protocol example.",
+        tool_calls=[
+            {"type": "text", "text": "HEARTBEAT_OK\nQuoted segment example."}
+        ],
+        turn_context={},
+    )
+    await manager._storage.append_transcript_entry(
+        unattributed_entry,
+        expected_epoch=expected_epoch,
+    )
+    exact_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "NO_REPLY",
+        turn_context={},
+    )
+    await manager._storage.append_transcript_entry(
+        exact_entry,
+        expected_epoch=expected_epoch,
+    )
+
+    captured_payloads: list[dict[str, Any]] = []
+
+    async def capture_compaction_request(request):
+        captured_payloads.extend(request.entries)
+        return CompactionResult(
+            summary="",
+            kept_entries=request.entries,
+            removed_count=0,
+            chunks_processed=0,
+            summary_source="skipped",
+            skip_reason="within_compaction_budget",
+        )
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "compact_context",
+        capture_compaction_request,
+    )
+    stored_before = await manager._storage.get_transcript(node.session_id)
+
+    await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=100_000,
+    )
+
+    payloads = captured_payloads
+
+    assert len(payloads) == len(stored_before) == 3
+    assert payloads[0]["content"] == "Waiting for an external update."
+    assert payloads[0]["tool_calls"] == [
+        {"type": "text", "text": "Waiting for an external update."},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+    ]
+    assert payloads[1]["content"] == "NO_REPLY\nQuoted protocol example."
+    assert payloads[1]["tool_calls"][0]["text"] == (
+        "HEARTBEAT_OK\nQuoted segment example."
+    )
+    assert payloads[2]["content"] == ""
+    assert payloads[2]["tool_calls"] is None
+
+    stored_after = await manager._storage.get_transcript(node.session_id)
+    assert [entry.content for entry in stored_after] == [
+        "HEARTBEAT_OK\nWaiting for an external update.\nNO_REPLY",
+        "NO_REPLY\nQuoted protocol example.",
+        "NO_REPLY",
+    ]
+    assert stored_after[0].tool_calls == raw_segments
+
+
+def test_durable_summary_replay_matches_runtime_formatter() -> None:
+    summary = "portable checkpoint"
+    rendered = format_compaction_summary_context([summary])
+
+    assert rendered is not None
+    assert session_manager_module._durable_summary_replay(summary) == f"{rendered}\n\n"
+
+
 @pytest.mark.asyncio
 async def test_compact_reduces_transcript(manager):
     await manager.create("agent:main:main")
     # Add many large messages
     for i in range(20):
         await manager.append_message("agent:main:main", "user", "x" * 500, token_count=200)
-    summary = await manager.compact("agent:main:main", context_window_tokens=1000)
+    summary = await manager.compact(
+        "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+    )
     assert summary != ""
     node = await manager._storage.get_session("agent:main:main")
     assert node.compaction_count == 1
@@ -1305,10 +2999,12 @@ async def test_compact_with_result_returns_source_and_persists(manager):
         )
     original_contents = [entry.content for entry in await manager.get_transcript("agent:main:main")]
 
-    result = await manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+    result = await manager.compact_with_result(
+        "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+    )
 
     assert result.summary
-    assert result.summary_source == "fallback"
+    assert result.summary_source == "llm"
     node = await manager._storage.get_session("agent:main:main")
     assert node.compaction_count == 1
     transcript = await manager.get_transcript("agent:main:main")
@@ -1332,6 +3028,267 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     ]
     assert canonical_contents == original_contents
     assert [entry.content for entry in transcript] == original_contents[-len(transcript) :]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected_protected_recent_messages"),
+    [
+        pytest.param(
+            CompactionConfig(protected_recent_messages=1),
+            2,
+            id="explicit-protection",
+        ),
+        pytest.param(
+            CompactionConfig(compaction_profile="coding"),
+            12,
+            id="profile-protection",
+        ),
+    ],
+)
+async def test_compact_with_result_recomputes_bound_to_tail_protection(
+    manager,
+    monkeypatch,
+    config,
+    expected_protected_recent_messages,
+):
+    node = await manager.create("agent:main:protected-boundary")
+    await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    await manager.append_message(node.session_key, "user", "queued request")
+    observed: dict[str, Any] = {}
+
+    async def compact_context_spy(request):
+        observed["protected_recent_messages"] = request.config.protected_recent_messages
+        return CompactionResult(
+            summary="",
+            kept_entries=request.entries,
+            removed_count=0,
+            chunks_processed=0,
+            summary_source="skipped",
+        )
+
+    monkeypatch.setattr(session_manager_module, "compact_context", compact_context_spy)
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1_000,
+        config=config,
+        protected_boundary_message_id=active_user.message_id,
+    )
+
+    assert result.removed_count == 0
+    assert observed["protected_recent_messages"] == expected_protected_recent_messages
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_missing_protected_boundary_fails_closed(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:missing-protected-boundary")
+    entry = await manager.append_message(node.session_key, "user", "active request")
+
+    async def unexpected_compact_context(request):  # noqa: ARG001
+        raise AssertionError("compaction must not run without the protected boundary")
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "compact_context",
+        unexpected_compact_context,
+    )
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1_000,
+        protected_boundary_message_id="missing-message-id",
+    )
+
+    assert result.summary == ""
+    assert result.removed_count == 0
+    assert result.skip_reason == "protected_boundary_missing"
+    transcript = await manager.get_transcript(node.session_key)
+    assert [candidate.message_id for candidate in transcript] == [entry.message_id]
+    current = await manager.get_session(node.session_key)
+    assert current is not None
+    assert current.compaction_count == 0
+
+
+def test_compaction_singleflight_target_fingerprint_is_credential_aware():
+    first = CompactionConfig(provider="provider-a", model="model-a", api_key="secret-a")
+    same_deployment_and_credentials = CompactionConfig(
+        provider="provider-a",
+        model="model-a",
+        api_key="secret-a",
+    )
+    other_credentials = CompactionConfig(
+        provider="provider-a",
+        model="model-a",
+        api_key="secret-b",
+    )
+    other_model = CompactionConfig(provider="provider-a", model="model-b", api_key="secret-a")
+
+    first_fingerprint = session_manager_module._compaction_target_fingerprint(first)
+
+    assert (
+        session_manager_module._compaction_target_fingerprint(same_deployment_and_credentials)
+        == first_fingerprint
+    )
+    assert (
+        session_manager_module._compaction_target_fingerprint(other_credentials)
+        != first_fingerprint
+    )
+    assert (
+        session_manager_module._compaction_target_fingerprint(other_model)
+        != first_fingerprint
+    )
+    assert "secret-a" not in first_fingerprint
+    assert "secret-b" not in session_manager_module._compaction_target_fingerprint(
+        other_credentials
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_singleflight_shares_generation_and_commit(
+    manager,
+    monkeypatch,
+):
+    await manager.create("agent:main:main")
+    for i in range(20):
+        await manager.append_message(
+            "agent:main:main",
+            "user",
+            f"singleflight msg {i} " + ("x" * 500),
+            token_count=200,
+        )
+
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+    waiter_joined = asyncio.Event()
+    generation_calls = 0
+    original_compact_context = session_manager_module.compact_context
+    original_acquire = session_manager_module._acquire_compaction_singleflight
+
+    async def slow_compact_context(request):
+        nonlocal generation_calls
+        generation_calls += 1
+        generation_started.set()
+        await release_generation.wait()
+        return await original_compact_context(request)
+
+    def track_acquire(*args, **kwargs):
+        flight, is_owner = original_acquire(*args, **kwargs)
+        if not is_owner:
+            waiter_joined.set()
+        return flight, is_owner
+
+    monkeypatch.setattr(session_manager_module, "compact_context", slow_compact_context)
+    monkeypatch.setattr(
+        session_manager_module,
+        "_acquire_compaction_singleflight",
+        track_acquire,
+    )
+    shared_config = synthetic_compaction_config()
+
+    owner = asyncio.create_task(
+        manager.compact_with_result(
+            "agent:main:main",
+            context_window_tokens=1000,
+            config=shared_config,
+        )
+    )
+    await asyncio.wait_for(generation_started.wait(), timeout=1)
+    waiter = asyncio.create_task(
+        manager.compact_with_result(
+            "agent:main:main",
+            context_window_tokens=1000,
+            config=shared_config,
+        )
+    )
+    await asyncio.wait_for(waiter_joined.wait(), timeout=1)
+    release_generation.set()
+
+    owner_result, waiter_result = await asyncio.gather(owner, waiter)
+
+    assert owner_result is waiter_result
+    assert generation_calls == 1
+    assert shared_config.operation_id is None
+    assert shared_config.deadline_at_monotonic is None
+    node = await manager.get_session("agent:main:main")
+    assert node is not None
+    assert node.compaction_count == 1
+    assert len(await manager.get_summaries("agent:main:main")) == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_singleflight_waiter_cancel_does_not_cancel_owner(
+    manager,
+    monkeypatch,
+):
+    await manager.create("agent:main:main")
+    for i in range(20):
+        await manager.append_message(
+            "agent:main:main",
+            "user",
+            f"cancel waiter msg {i} " + ("x" * 500),
+            token_count=200,
+        )
+
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+    waiter_joined = asyncio.Event()
+    generation_calls = 0
+    original_compact_context = session_manager_module.compact_context
+    original_acquire = session_manager_module._acquire_compaction_singleflight
+
+    async def slow_compact_context(request):
+        nonlocal generation_calls
+        generation_calls += 1
+        generation_started.set()
+        await release_generation.wait()
+        return await original_compact_context(request)
+
+    def track_acquire(*args, **kwargs):
+        flight, is_owner = original_acquire(*args, **kwargs)
+        if not is_owner:
+            waiter_joined.set()
+        return flight, is_owner
+
+    monkeypatch.setattr(session_manager_module, "compact_context", slow_compact_context)
+    monkeypatch.setattr(
+        session_manager_module,
+        "_acquire_compaction_singleflight",
+        track_acquire,
+    )
+
+    owner = asyncio.create_task(
+        manager.compact_with_result(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
+    )
+    await asyncio.wait_for(generation_started.wait(), timeout=1)
+    waiter = asyncio.create_task(
+        manager.compact_with_result(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
+    )
+    await asyncio.wait_for(waiter_joined.wait(), timeout=1)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not owner.done()
+
+    release_generation.set()
+    result = await owner
+
+    assert result.summary
+    assert generation_calls == 1
+    node = await manager.get_session("agent:main:main")
+    assert node is not None
+    assert node.compaction_count == 1
+    assert len(await manager.get_summaries("agent:main:main")) == 1
 
 
 @pytest.mark.asyncio
@@ -1364,6 +3321,7 @@ async def test_compact_with_result_skips_rewrite_when_transcript_changes(manager
         "agent:main:main",
         context_window_tokens=1000,
         mutation_context=mutation_context,
+        config=synthetic_compaction_config(),
     )
 
     assert result.summary == ""
@@ -1378,7 +3336,63 @@ async def test_compact_with_result_skips_rewrite_when_transcript_changes(manager
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(manager):
+@pytest.mark.parametrize(
+    ("rotate_on_entry", "operation"),
+    [(1, "compaction snapshot"), (2, "compaction commit")],
+)
+async def test_compact_with_result_rejects_owner_rotated_at_exact_boundaries(
+    manager,
+    tmp_path,
+    monkeypatch,
+    rotate_on_entry,
+    operation,
+):
+    key = "agent:main:main"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await manager.create(key)
+    for i in range(20):
+        await manager.append_message(
+            key,
+            "user",
+            f"msg {i} " + ("x" * 500),
+            token_count=200,
+        )
+    context_entries = 0
+    replacement = None
+
+    @contextlib.asynccontextmanager
+    async def mutation_context():
+        nonlocal context_entries, replacement
+        context_entries += 1
+        if context_entries == rotate_on_entry:
+            replacement, rotated = await manager.apply_intent(
+                key,
+                SessionIntent.RESET_SAME_KEY,
+            )
+            assert rotated is True
+        yield
+
+    with pytest.raises(StaleEpochError, match=operation):
+        await manager.compact_with_result(
+            key,
+            context_window_tokens=1000,
+            mutation_context=mutation_context,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+            config=synthetic_compaction_config(),
+        )
+
+    assert replacement is not None
+    current = await manager.get_session(key)
+    assert current is not None
+    assert current.session_id == replacement.session_id
+    assert current.compaction_count == 0
+    assert await manager.get_transcript(key) == []
+    assert await manager.get_summaries(key) == []
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_preserves_canonical_history(manager):
     await manager.create("agent:main:main")
     for i in range(20):
         await manager.append_message(
@@ -1392,12 +3406,10 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1000,
-        flush_receipt_status="unsafe",
+        config=synthetic_compaction_config(),
     )
 
     assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "degraded_forensic"
     canonical_contents = [
         entry.content for entry in await manager.get_canonical_transcript("agent:main:main")
     ]
@@ -1405,110 +3417,35 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
 
 
 @pytest.mark.asyncio
-async def test_degraded_compaction_preimage_can_be_listed_for_repair(manager):
+async def test_compaction_archive_remains_readable(manager):
     await manager.create("agent:main:main")
     for i in range(20):
         await manager.append_message(
             "agent:main:main",
             "user",
-            f"repair msg {i} " + ("x" * 500),
+            f"archived msg {i} " + ("x" * 500),
             token_count=200,
         )
 
     await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1000,
-        flush_receipt_status="degraded_forensic",
+        config=synthetic_compaction_config(),
     )
 
-    pending = await manager.list_degraded_compactions(agent_id="main")
-    assert len(pending) == 1
-    assert pending[0].flush_receipt_status == "degraded_forensic"
-    preimage = await manager.get_compaction_preimage(pending[0])
-    assert preimage
-    assert preimage[0].content.startswith("repair msg 0")
-    await manager.mark_compaction_repair_status(pending[0], "repaired")
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_compaction_flush_status_can_be_backfilled_by_compaction_id(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"background flush msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        compaction_id="cmp-bg-flush",
-        flush_receipt_status="degraded_forensic",
-    )
-
-    updated = await manager.mark_compaction_flush_receipt_status(
-        "agent:main:main",
-        "cmp-bg-flush",
-        "safe",
-    )
-
-    assert updated == 1
     summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "safe"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_noop_memory_flush_compaction_status_does_not_enter_repair_queue(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"noop msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    result = await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        flush_receipt_status="noop_no_memory",
+    assert len(summaries) == 1
+    assert summaries[0].compaction_id is not None
+    archived = await manager._storage.get_compacted_transcript_entries(
+        session_id=summaries[0].session_id,
+        compaction_id=summaries[0].compaction_id,
     )
-
-    assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "noop_no_memory"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
+    assert archived
+    assert archived[0].content.startswith("archived msg 0")
 
 
 @pytest.mark.asyncio
-async def test_archive_only_memory_flush_compaction_status_does_not_enter_repair_queue(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"archive msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    result = await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        flush_receipt_status="archive_only",
-    )
-
-    assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "archive_only"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_compact_with_result_reports_and_backfills_missing_obligations(manager):
+async def test_compact_with_result_summarizes_completed_tool_round(manager):
     await manager.create("agent:main:main")
     await manager.append_message(
         "agent:main:main",
@@ -1518,7 +3455,19 @@ async def test_compact_with_result_reports_and_backfills_missing_obligations(man
             "Constraint: do not enable coverage blocking by default.\n"
             "Keep src/opensquilla/session/models.py and docs/Long Task Report.md."
         ),
-        token_count=250,
+        token_count=500,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "I will preserve those constraints and continue the continuity work.",
+        token_count=500,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "user",
+        "Run the focused session test now.",
+        token_count=20,
     )
     await manager.append_message(
         "agent:main:main",
@@ -1548,8 +3497,8 @@ async def test_compact_with_result_reports_and_backfills_missing_obligations(man
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=500,
-        config=CompactionConfig(safety_margin=1.0),
+        context_window_tokens=1_200,
+        config=synthetic_compaction_config(safety_margin=1.2),
     )
 
     assert result.removed_count > 0
@@ -1558,16 +3507,33 @@ async def test_compact_with_result_reports_and_backfills_missing_obligations(man
     assert summary.summary_text == result.summary
     assert summary.summary_format == "structured_v1"
     assert summary.summary_payload is not None
-    assert summary.coverage_status == "pass_with_backfill"
-    assert summary.missing_obligations
-    assert summary.critical_carry_forward
-    assert "src/opensquilla/session/models.py" in str(summary.summary_payload)
-    assert any("call_exec_1" in item for item in summary.critical_carry_forward)
-    assert await manager.get_transcript("agent:main:main")
+    assert summary.coverage_status == "pass"
+    assert summary.missing_obligations == []
+    assert summary.critical_carry_forward == []
+    payload = summary.summary_payload
+    assert payload is not None
+    assert "src/opensquilla/session/models.py" in str(payload)
+    assert {"id": "call_exec_1"} in payload["tool_results_to_remember"]
+    assert any(
+        "missing summary_payload column" in failure.get("detail", "")
+        for failure in payload["known_failures"]
+    )
+    assert any(
+        "pytest tests/test_session/test_manager.py" in command
+        for command in payload["executed_commands_and_tests"]
+    )
+    assert "call_exec_1" not in payload["pending_tool_and_approval_ids"]
+    transcript = await manager.get_transcript("agent:main:main")
+    assert not any(entry.tool_call_id == "call_exec_1" for entry in transcript)
+    assert not any(
+        entry.tool_calls and entry.tool_calls[0]["id"] == "call_exec_1"
+        for entry in transcript
+    )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
-async def test_compact_with_result_strict_coverage_blocks_destructive_rewrite(manager):
+async def test_compact_with_result_strict_coverage_installs_verified_backfill(manager):
     node = await manager.create("agent:main:main")
     late_critical_path = "src/opensquilla/session/critical_continuity.py"
     await manager.append_message(
@@ -1588,30 +3554,46 @@ async def test_compact_with_result_strict_coverage_blocks_destructive_rewrite(ma
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=300,
-        config=CompactionConfig(safety_margin=1.0, coverage_blocking=True),
+        config=synthetic_compaction_config(safety_margin=1.0, coverage_blocking=True),
     )
 
-    assert result.removed_count == 0
-    assert result.skip_reason == "coverage_blocked"
-    assert result.coverage_status == "fail_blocked"
-    assert any(late_critical_path in item for item in result.missing_obligations or [])
-    assert await manager.get_transcript("agent:main:main") == original_transcript
-    assert await manager.get_summaries("agent:main:main") == []
-    assert await manager.get_context_states("agent:main:main") == []
+    assert result.removed_count > 0
+    assert result.skip_reason is None
+    assert result.coverage_status == "pass"
+    assert result.missing_obligations == []
+    assert late_critical_path in str(result.summary_payload)
+    assert len(await manager.get_transcript("agent:main:main")) < len(
+        original_transcript
+    )
+    summaries = await manager.get_summaries("agent:main:main")
+    assert len(summaries) == 1
+    assert late_critical_path in str(summaries[0].summary_payload)
+    assert await manager.get_context_states("agent:main:main")
     current_node = await manager._storage.get_session("agent:main:main")
     assert current_node is not None
     assert current_node.session_id == node.session_id
-    assert current_node.compaction_count == 0
+    assert current_node.compaction_count == 1
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_writes_portable_context_state(manager):
+@pytest.mark.parametrize("fallback_tokenizer", [False, True])
+async def test_compact_with_result_writes_portable_context_state(
+    manager, monkeypatch, fallback_tokenizer,
+):
+    from opensquilla import token_estimation
+
+    if fallback_tokenizer:
+        monkeypatch.setattr(
+            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
+        )
+    # Keep pressure above the window while allowing the portable payload to fit
+    # with either the normal tokenizer or the conservative offline estimator.
     await manager.create("agent:main:main")
     await manager.append_message(
         "agent:main:main",
         "user",
         "Goal: keep portable state. File src/opensquilla/session/models.py.",
-        token_count=250,
+        token_count=1500,
     )
     for i in range(8):
         await manager.append_message(
@@ -1623,8 +3605,8 @@ async def test_compact_with_result_writes_portable_context_state(manager):
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=300,
-        config=CompactionConfig(safety_margin=1.0),
+        context_window_tokens=1000,
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
 
     states = await manager.get_context_states("agent:main:main")
@@ -1650,7 +3632,24 @@ async def test_compact_with_result_writes_portable_context_state(manager):
 @pytest.mark.asyncio
 async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(manager):
     await manager.create("agent:main:main")
-    await manager.append_message("agent:main:main", "user", "old context", token_count=300)
+    await manager.append_message(
+        "agent:main:main",
+        "user",
+        "ancient request",
+        token_count=500,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "ancient answer",
+        token_count=500,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "user",
+        "tool request",
+        token_count=3,
+    )
     await manager.append_message(
         "agent:main:main",
         "assistant",
@@ -1670,18 +3669,22 @@ async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(mana
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=100,
-        config=CompactionConfig(safety_margin=1.0),
+        context_window_tokens=500,
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
 
-    assert result.removed_count == 1
-    assert result.kept_entries[0]["role"] == "assistant"
-    assert result.kept_entries[0]["tool_calls"] == [{"id": "call_1", "type": "function"}]
+    assert result.removed_count == 2
+    assert result.kept_entries[0]["role"] == "user"
+    assert result.kept_entries[0]["content"] == "tool request"
+    assert result.kept_entries[1]["role"] == "assistant"
+    assert result.kept_entries[1]["tool_calls"] == [{"id": "call_1", "type": "function"}]
     transcript = await manager.get_transcript("agent:main:main")
-    assert transcript[0].role == "assistant"
-    assert transcript[0].tool_calls == [{"id": "call_1", "type": "function"}]
-    assert transcript[1].role == "tool"
-    assert transcript[1].tool_call_id == "call_1"
+    assert transcript[0].role == "user"
+    assert transcript[0].content == "tool request"
+    assert transcript[1].role == "assistant"
+    assert transcript[1].tool_calls == [{"id": "call_1", "type": "function"}]
+    assert transcript[2].role == "tool"
+    assert transcript[2].tool_call_id == "call_1"
 
 
 @pytest.mark.asyncio
@@ -1705,8 +3708,13 @@ async def test_compact_counts_tool_calls_when_token_count_is_underreported(manag
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=50,
-        config=CompactionConfig(safety_margin=1.0),
+        context_window_tokens=300,
+        config=synthetic_compaction_config(
+            safety_margin=1.0,
+            # This test isolates the wire-token estimator. Default production
+            # policy correctly retains the unresolved tool call as raw state.
+            protect_semantic_tail=False,
+        ),
     )
 
     assert result.removed_count == 1
@@ -1734,6 +3742,24 @@ def _fail_next_transcript_insert(monkeypatch: pytest.MonkeyPatch, storage: Sessi
     monkeypatch.setattr(storage.conn, "execute", execute)
 
 
+def _fail_next_summary_insert(monkeypatch: pytest.MonkeyPatch, storage: SessionStorage) -> None:
+    original_execute = storage.conn.execute
+    failed = False
+
+    def execute(sql: str, params: Any = ()):
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(sql, str)
+            and sql.lstrip().upper().startswith("INSERT INTO SESSION_SUMMARIES")
+        ):
+            failed = True
+            raise RuntimeError("rewrite insert failed")
+        return original_execute(sql, params)
+
+    monkeypatch.setattr(storage.conn, "execute", execute)
+
+
 @pytest.mark.asyncio
 async def test_compact_rewrite_failure_keeps_session_state_atomic(
     manager,
@@ -1747,10 +3773,12 @@ async def test_compact_rewrite_failure_keeps_session_state_atomic(
     original_summaries = await manager.get_summaries("agent:main:main")
     original_node = await manager._storage.get_session("agent:main:main")
 
-    _fail_next_transcript_insert(monkeypatch, manager._storage)
+    _fail_next_summary_insert(monkeypatch, manager._storage)
 
     with pytest.raises(RuntimeError, match="rewrite insert failed"):
-        await manager.compact("agent:main:main", context_window_tokens=1000)
+        await manager.compact(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
 
     assert await manager.get_transcript("agent:main:main") == original_transcript
     assert (
@@ -1772,7 +3800,26 @@ async def test_persist_compaction_result_rewrite_failure_keeps_session_state_ato
     monkeypatch: pytest.MonkeyPatch,
 ):
     node = await manager.create("agent:main:main")
-    for index in range(4):
+    await manager.append_message(
+        node.session_key,
+        "user",
+        json.dumps(
+            {
+                "text": "image before failed rewrite",
+                "attachments": [
+                    {
+                        "attachment_id": "att_atomic_rollback_123",
+                        "type": "image/png",
+                        "name": "rollback.png",
+                        "data": "aW1hZ2U=",
+                    }
+                ],
+            }
+        ),
+        message_id="message-atomic-image",
+        token_count=5,
+    )
+    for index in range(1, 4):
         await manager.append_message("agent:main:main", "user", f"msg {index}", token_count=5)
     original_transcript = await manager.get_transcript("agent:main:main")
     original_canonical_transcript = await manager.get_canonical_transcript("agent:main:main")
@@ -2006,6 +4053,677 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
 
 
 @pytest.mark.asyncio
+async def test_compaction_atomically_persists_attachment_manifest_with_summary(
+    manager,
+) -> None:
+    node = await manager.create("agent:main:attachment-compaction")
+    image_data = "aW1hZ2UtYnl0ZXM="
+    await manager.append_message(
+        node.session_key,
+        "user",
+        json.dumps(
+            {
+                "text": "inspect this image",
+                "attachments": [
+                    {
+                        "attachment_id": "att_compaction_image_123",
+                        "path": "/private/tmp/material/image.png",
+                        "type": "image/png",
+                        "name": "diagram.png",
+                        "data": image_data,
+                    }
+                ],
+            }
+        ),
+        message_id="message-image",
+    )
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    await manager.append_message(node.session_key, "user", "follow up")
+    await manager.append_message(node.session_key, "assistant", "latest reply")
+
+    await manager.persist_compaction_result(
+        node.session_key,
+        "image discussion summary",
+        [{"role": "assistant", "content": "latest reply"}],
+        compaction_id="cmp-image",
+    )
+
+    active = await manager.get_transcript(node.session_key)
+    canonical = await manager.get_canonical_transcript(node.session_key)
+    states = await manager.get_context_states(node.session_key)
+    states_by_kind = {state.state_kind: state for state in states}
+
+    assert [entry.content for entry in active] == ["latest reply"]
+    assert any(image_data in entry.content for entry in canonical)
+    assert "structured_summary_v1" in states_by_kind
+    assert ATTACHMENT_MANIFEST_STATE_KIND in states_by_kind
+    manifest = attachment_manifest_from_context_state(
+        states_by_kind[ATTACHMENT_MANIFEST_STATE_KIND]
+    )
+    [occurrence] = manifest.occurrences
+    assert occurrence.attachment_id == "att_compaction_image_123"
+    assert occurrence.source_message_id == "message-image"
+    summaries = await manager.get_summaries(node.session_key)
+    assert len(summaries) == 1
+    assert summaries[0].summary_payload is not None
+    assert summaries[0].summary_payload["files_and_artifacts"] == []
+    assert occurrence.attachment_id in summaries[0].summary_payload[
+        "important_identifiers"
+    ]
+    serialized_summary = json.dumps(summaries[0].summary_payload, sort_keys=True)
+    assert "/private/tmp" not in serialized_summary
+    assert image_data not in serialized_summary
+    serialized_manifest = json.dumps(
+        states_by_kind[ATTACHMENT_MANIFEST_STATE_KIND].payload,
+        sort_keys=True,
+    )
+    assert image_data not in serialized_manifest
+    assert '"data"' not in serialized_manifest
+    assert '"path"' not in serialized_manifest
+
+
+@pytest.mark.asyncio
+async def test_attachment_manifest_build_failure_aborts_compaction_atomically(
+    manager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = await manager.create("agent:main:attachment-compaction-failure")
+    for index in range(4):
+        await manager.append_message(
+            node.session_key,
+            "user" if index % 2 == 0 else "assistant",
+            f"message {index}",
+        )
+    original_transcript = await manager.get_transcript(node.session_key)
+    original_canonical = await manager.get_canonical_transcript(node.session_key)
+    original_node = await manager.get_session(node.session_key)
+
+    def fail_manifest(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        raise ValueError("manifest collision")
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "_merge_attachment_manifest_state",
+        fail_manifest,
+    )
+
+    with pytest.raises(ValueError, match="manifest collision"):
+        await manager.persist_compaction_result(
+            node.session_key,
+            "summary must not commit",
+            [{"role": "assistant", "content": "message 3"}],
+            compaction_id="cmp-manifest-failure",
+        )
+
+    assert await manager.get_transcript(node.session_key) == original_transcript
+    assert await manager.get_canonical_transcript(node.session_key) == original_canonical
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    current_node = await manager.get_session(node.session_key)
+    assert current_node is not None
+    assert original_node is not None
+    assert current_node.compaction_count == original_node.compaction_count
+
+
+@pytest.mark.asyncio
+async def test_persist_compaction_result_preserves_structured_tail_metadata(manager):
+    node = await manager.create("agent:main:structured-tail")
+    await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    await manager.append_message(
+        node.session_key,
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": "tool-live",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"x"}'},
+            }
+        ],
+        reasoning_content="signed reasoning",
+    )
+    await manager.append_message(
+        node.session_key,
+        "tool",
+        "result",
+        tool_call_id="tool-live",
+    )
+
+    await manager.persist_compaction_result(
+        node.session_key,
+        "older context",
+        [
+            {"role": "assistant", "content": "[flattened tool request]"},
+            {"role": "tool", "content": "[flattened tool result]"},
+        ],
+        compaction_id="cmp-structured-tail",
+    )
+
+    transcript = await manager.get_transcript(node.session_key)
+    assert len(transcript) == 2
+    assert transcript[0].tool_calls is not None
+    assert transcript[0].tool_calls[0]["id"] == "tool-live"
+    assert transcript[0].reasoning_content == "signed reasoning"
+    assert transcript[1].tool_call_id == "tool-live"
+    assert transcript[1].content == "result"
+
+
+@pytest.mark.asyncio
+async def test_capture_compaction_source_uses_supplied_transcript_entries(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:capture-snapshot")
+    await manager.append_message(node.session_key, "user", "old question")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    transcript = await manager.get_transcript(node.session_key)
+    get_transcript = AsyncMock(side_effect=AssertionError("unexpected transcript reread"))
+    monkeypatch.setattr(manager, "get_transcript", get_transcript)
+
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+        transcript_entries=transcript,
+    )
+
+    get_transcript.assert_not_awaited()
+    assert source.entries == tuple(transcript)
+    assert source.boundary_message_id == active_user.message_id
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_preserves_queued_append_only_suffix(manager):
+    node = await manager.create("agent:main:inline-queued-suffix")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    old_assistant = await manager.append_message(
+        node.session_key,
+        "assistant",
+        "old answer",
+    )
+    active_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "active request",
+    )
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    queued_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "queued request",
+    )
+    entries_before = {
+        entry.message_id: entry
+        for entry in await manager.get_transcript(node.session_key)
+    }
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "summary of the old exchange",
+        [
+            {"role": "user", "content": "[Available skills for this turn]"},
+            {"role": "user", "content": "active request"},
+        ],
+        compaction_id="cmp-inline-queued",
+        removed_count=2,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is True
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        active_user.message_id,
+        queued_user.message_id,
+    ]
+    assert [entry.id for entry in transcript] == [
+        entries_before[active_user.message_id].id,
+        entries_before[queued_user.message_id].id,
+    ]
+    assert transcript[0].content == "active request"
+    assert transcript[1].content == "queued request"
+    queued_before = entries_before[queued_user.message_id]
+    assert queued_before.id is not None
+    page_before_queued, _ = await manager._storage.get_canonical_transcript_page(
+        node.session_id,
+        limit=1,
+        before=(queued_before.created_at, queued_before.id),
+    )
+    assert [entry.message_id for entry in page_before_queued] == [
+        active_user.message_id,
+    ]
+    async with manager._storage.conn.execute(
+        "SELECT message_id FROM compacted_transcript_entries "
+        "WHERE session_id = ? ORDER BY original_entry_id",
+        (node.session_id,),
+    ) as cur:
+        archived = await cur.fetchall()
+    assert [row[0] for row in archived] == [
+        old_user.message_id,
+        old_assistant.message_id,
+    ]
+    summaries = await manager._storage.get_all_summaries(node.session_id)
+    assert len(summaries) == 1
+    assert summaries[0].removed_count == 2
+    assert summaries[0].kept_count == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_preserves_metadata_from_concurrent_suffix_append(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:inline-concurrent-metadata")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    before = await manager._storage.get_session(node.session_key)
+    assert before is not None
+    before.total_tokens = 100
+    before.total_tokens_fresh = True
+    await manager._storage.upsert_session(before)
+
+    original_rewrite = manager._storage.rewrite_compacted_session
+    append_metadata: dict[str, Any] = {}
+
+    async def rewrite_after_concurrent_append(**kwargs):
+        appended = await manager.append_message(
+            node.session_key,
+            "user",
+            "queued after compaction snapshot",
+            token_count=17,
+        )
+        concurrent = await manager._storage.get_session(node.session_key)
+        assert concurrent is not None
+        append_metadata["updated_at"] = concurrent.updated_at
+        append_metadata["message_id"] = appended.message_id
+        return await original_rewrite(**kwargs)
+
+    monkeypatch.setattr(
+        manager._storage,
+        "rewrite_compacted_session",
+        rewrite_after_concurrent_append,
+    )
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "summary of the old exchange",
+        [{"role": "user", "content": "active request"}],
+        compaction_id="cmp-inline-concurrent-metadata",
+        removed_count=2,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is True
+    current = await manager._storage.get_session(node.session_key)
+    assert current is not None
+    assert current.total_tokens == 117
+    assert current.total_tokens_fresh is False
+    assert current.updated_at >= append_metadata["updated_at"]
+    assert current.compaction_count == 1
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        active_user.message_id,
+        append_metadata["message_id"],
+    ]
+    assert old_user.message_id not in {entry.message_id for entry in transcript}
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_rejects_stale_source_without_partial_install(manager):
+    node = await manager.create("agent:main:inline-stale-source")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    active_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "active request",
+    )
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    assert await manager.update_message_turn_context(
+        node.session_key,
+        old_user.message_id,
+        {"status": "changed-after-source-capture"},
+    )
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "stale summary",
+        [{"role": "user", "content": "active request"}],
+        compaction_id="cmp-inline-stale",
+        removed_count=1,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is False
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        old_user.message_id,
+        active_user.message_id,
+    ]
+    assert transcript[0].turn_context == {
+        "status": "changed-after-source-capture",
+    }
+    assert await manager._storage.get_all_summaries(node.session_id) == []
+    assert await manager.get_context_states(node.session_key) == []
+    current_node = await manager.get_session(node.session_key)
+    assert current_node is not None
+    assert current_node.compaction_count == 0
+    async with manager._storage.conn.execute(
+        "SELECT COUNT(*) FROM compacted_transcript_entries WHERE session_id = ?",
+        (node.session_id,),
+    ) as cur:
+        assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_transcript_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-transcript-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-transcript-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader.append_message(key, "user", "retired owner input")
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_transcript = reader_storage.get_transcript
+
+    async def paused_get_transcript(*args: Any, **kwargs: Any):
+        rows = await original_get_transcript(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(reader_storage, "get_transcript", paused_get_transcript)
+    read_task = asyncio.create_task(
+        reader.get_transcript(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await resetter.append_message(key, "user", "replacement input")
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="transcript read"):
+            await read_task
+
+        current = await resetter.get_session(key)
+        assert current is not None
+        assert current.session_id == replacement.session_id
+        assert [entry.content for entry in await resetter.get_transcript(key)] == [
+            "replacement input"
+        ]
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_summary_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-summary-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-summary-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader_storage.save_summary(
+        SessionSummary(
+            session_id=admitted.session_id,
+            session_key=key,
+            summary_text="retired owner summary",
+        )
+    )
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_all_summaries = reader_storage.get_all_summaries
+
+    async def paused_get_all_summaries(*args: Any, **kwargs: Any):
+        rows = await original_get_all_summaries(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(
+        reader_storage,
+        "get_all_summaries",
+        paused_get_all_summaries,
+    )
+    read_task = asyncio.create_task(
+        reader.get_summaries(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_summary(
+            SessionSummary(
+                session_id=replacement.session_id,
+                session_key=key,
+                summary_text="replacement owner summary",
+            )
+        )
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="summary read"):
+            await read_task
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_context_state_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-context-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-context-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader_storage.save_context_state(
+        SessionContextState(
+            session_id=admitted.session_id,
+            session_key=key,
+            state_kind="structured_summary_v1",
+            payload={"owner": "retired"},
+            portable=True,
+        )
+    )
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_context_states = reader_storage.get_context_states
+
+    async def paused_get_context_states(*args: Any, **kwargs: Any):
+        rows = await original_get_context_states(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(
+        reader_storage,
+        "get_context_states",
+        paused_get_context_states,
+    )
+    read_task = asyncio.create_task(
+        reader.get_context_states(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_context_state(
+            SessionContextState(
+                session_id=replacement.session_id,
+                session_key=key,
+                state_kind="structured_summary_v1",
+                payload={"owner": "replacement"},
+                portable=True,
+            )
+        )
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="context-state read"):
+            await read_task
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_exact_owner_rejects_reset_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "inline-compaction-owner-reset.db"
+    writer_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    await reset_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:inline-owner-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await writer.create(key)
+    await writer.append_message(key, "user", "old question")
+    active = await writer.append_message(key, "user", "active request")
+    source = await writer.capture_compaction_source(
+        key,
+        boundary_message_id=active.message_id,
+        expected_session_id=admitted.session_id,
+        expected_session_epoch=int(admitted.epoch or 0),
+    )
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_rewrite = writer_storage.rewrite_compacted_session
+
+    async def paused_rewrite(**kwargs: Any):
+        commit_started.set()
+        await release_commit.wait()
+        return await original_rewrite(**kwargs)
+
+    monkeypatch.setattr(writer_storage, "rewrite_compacted_session", paused_rewrite)
+    persist_task = asyncio.create_task(
+        writer.persist_compaction_result(
+            key,
+            "retired owner summary",
+            [{"role": "user", "content": "active request"}],
+            removed_count=1,
+            source_entries=source.entries,
+            source_preimage=source.preimage,
+            source_boundary_message_id=source.boundary_message_id,
+            source_boundary_entry_id=source.boundary_entry_id,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(commit_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await resetter.append_message(key, "user", "replacement input")
+        release_commit.set()
+
+        with pytest.raises(StaleEpochError, match="owner mismatch"):
+            await persist_task
+
+        current = await resetter.get_session(key)
+        assert current is not None
+        assert current.session_id == replacement.session_id
+        assert current.compaction_count == 0
+        assert [entry.content for entry in await resetter.get_transcript(key)] == [
+            "replacement input"
+        ]
+        assert await reset_storage.get_all_summaries(replacement.session_id) == []
+    finally:
+        release_commit.set()
+        if not persist_task.done():
+            persist_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await persist_task
+        await reset_storage.close()
+        await writer_storage.close()
+
+
+@pytest.mark.asyncio
 async def test_canonical_transcript_page_crosses_multiple_compaction_boundaries(manager):
     node = await manager.create("agent:main:main")
     for index in range(10):
@@ -2180,6 +4898,129 @@ async def test_canonical_transcript_page_reads_one_snapshot_during_compaction(
         "snapshot-2",
         "snapshot-3",
     ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_page_rejects_unknown_and_cross_session_cursors(manager):
+    first = await manager.create("agent:main:webchat:cursor-a")
+    second = await manager.create("agent:main:webchat:cursor-b")
+    await manager.append_message(first.session_key, "user", "first")
+    await manager.append_message(second.session_key, "user", "second")
+    anchor = (await manager.get_transcript(first.session_key))[0]
+    assert anchor.id is not None
+
+    for cursor in ((anchor.created_at, anchor.id), (9_999_999, 9_999_999)):
+        with pytest.raises(HistoryCursorInvalidatedError):
+            await manager.get_canonical_transcript_page(
+                second.session_key,
+                limit=10,
+                before=cursor,
+            )
+
+
+@pytest.mark.asyncio
+async def test_canonical_page_keeps_unaddressable_legacy_archive_rows(manager):
+    node = await manager.create("agent:main:webchat:legacy-cursor")
+    await manager._storage.conn.execute(
+        """
+        INSERT INTO compacted_transcript_entries (
+            session_id, session_key, original_entry_id, message_id, role,
+            content, created_at, archived_at, schema_version
+        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node.session_id,
+            node.session_key,
+            "legacy-message",
+            "user",
+            "legacy content",
+            10,
+            20,
+            1,
+        ),
+    )
+    await manager._storage.conn.commit()
+
+    page = await manager.get_canonical_transcript_page(node.session_key, limit=10)
+
+    assert [entry.content for entry in page.entries] == ["legacy content"]
+    assert page.entries[0].id is None
+    assert page.canonical_complete is False
+
+
+@pytest.mark.asyncio
+async def test_cursor_validation_and_page_share_one_sqlite_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "history-cursor-snapshot.db"
+    writer_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    node = await writer.create("agent:main:webchat:cursor-snapshot")
+    for index in range(3):
+        await writer_storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id=f"snapshot-{index}",
+                role="user",
+                content=f"message {index}",
+                created_at=1_000 + index,
+            )
+        )
+    anchor = (await writer.get_transcript(node.session_key))[0]
+    assert anchor.id is not None
+
+    reader_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    original_execute = reader_storage.conn.execute
+    deletion_injected = False
+
+    async def delete_after_snapshot() -> None:
+        nonlocal deletion_injected
+        if deletion_injected:
+            return
+        await writer_storage.delete_transcript(node.session_id)
+        deletion_injected = True
+
+    class DeleteAfterFetch:
+        def __init__(self, delegate: Any) -> None:
+            self._delegate = delegate
+            self._cursor: Any = None
+
+        async def __aenter__(self):
+            self._cursor = await self._delegate.__aenter__()
+            return self
+
+        async def fetchall(self):
+            rows = await self._cursor.fetchall()
+            await delete_after_snapshot()
+            return rows
+
+        async def __aexit__(self, *args: Any):
+            return await self._delegate.__aexit__(*args)
+
+    def execute(sql: str, params: Any = ()):
+        result = original_execute(sql, params)
+        if "WITH cursor_anchor AS" in " ".join(sql.split()):
+            return DeleteAfterFetch(result)
+        return result
+
+    monkeypatch.setattr(reader_storage.conn, "execute", execute)
+    try:
+        entries, has_more = await reader_storage.get_canonical_transcript_page(
+            node.session_id,
+            limit=10,
+            after=(anchor.created_at, anchor.id),
+        )
+    finally:
+        await reader_storage.close()
+        await writer_storage.close()
+
+    assert deletion_injected is True
+    assert has_more is False
+    assert [entry.message_id for entry in entries] == ["snapshot-1", "snapshot-2"]
 
 
 @pytest.mark.asyncio
@@ -2374,3 +5215,351 @@ async def test_archive(manager):
     await manager.archive("agent:main:main")
     node = await manager._storage.get_session("agent:main:main")
     assert node.status == SessionStatus.DONE
+
+
+@pytest.mark.parametrize("failure", [None, "empty", "length", "missing_done", "oversized", "error"])
+async def test_suffix_manual_compaction_preserves_sqlite_source_until_valid_summary(
+    manager, monkeypatch, failure
+):
+    from opensquilla.provider.types import (
+        ChatConfig,
+        DoneEvent,
+        ErrorEvent,
+        TextDeltaEvent,
+        ToolDefinition,
+    )
+    from opensquilla.session.compaction import CompactionRequestContext
+    from opensquilla.session.compaction_deployment import (
+        CompactionExecutionPlan,
+        CompactionExecutionTarget,
+    )
+
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    node = await manager.create("agent:test:suffix-manual")
+    for index in range(12):
+        await manager.append_message(
+            node.session_key,
+            "user" if index % 2 == 0 else "assistant",
+            f"Historical exchange {index}. " + "Routine context. " * 50,
+            token_count=250,
+        )
+    before = await manager.get_transcript(node.session_key)
+    requests = []
+
+    class CapturingProvider:
+        async def chat(self, messages, tools=None, config=None):
+            requests.append((messages, tools, config))
+            if failure == "error":
+                yield ErrorEvent(message="synthetic provider failure")
+                return
+            if failure != "empty":
+                yield TextDeltaEvent(
+                    text=("Long summary. " * 2000 if failure == "oversized" else
+                          "The historical exchanges are complete. No outstanding work.")
+                )
+            if failure != "missing_done":
+                yield DoneEvent(
+                    stop_reason="length" if failure == "length" else "end_turn",
+                    output_tokens=32,
+                )
+
+    config = CompactionConfig(
+        llm_plan=CompactionExecutionPlan(candidates=(CompactionExecutionTarget(
+            provider=CapturingProvider(), provider_id="test", model="current-model",
+            context_window_tokens=20_000,
+        ),)),
+        request_context=CompactionRequestContext(
+            chat_config=ChatConfig(system="Current system", max_tokens=4096, thinking=True),
+            tools=(ToolDefinition(name="lookup", description="Find facts", input_schema={}),),
+        ),
+        protected_recent_messages=2,
+    )
+    result = await manager.compact_with_result(
+        node.session_key, context_window_tokens=1000, config=config, trigger_reason="manual",
+    )
+    assert len(requests) == 1
+    messages, tools, sent_config = requests[0]
+    assert sent_config.system == "Current system"
+    assert sent_config.max_tokens == 4096
+    assert tools[0].name == "lookup"
+    assert "portable checkpoint" in messages[-1].content
+    after = await manager.get_transcript(node.session_key)
+    summaries = await manager.get_summaries(node.session_key)
+    async with manager._storage.conn.execute(
+        "SELECT message_id, content FROM compacted_transcript_entries "
+        "WHERE session_id = ? ORDER BY original_entry_id", (node.session_id,),
+    ) as cursor:
+        archived = await cursor.fetchall()
+    if failure:
+        assert result.removed_count == 0
+        assert [entry.model_dump() for entry in after] == [entry.model_dump() for entry in before]
+        assert summaries == []
+        assert archived == []
+    else:
+        assert result.removed_count > 0
+        assert [message.content for message in messages[:-1]] == [
+            entry.content for entry in before[:result.removed_count]
+        ]
+        assert [entry.message_id for entry in after] == [
+            entry.message_id for entry in before[result.removed_count:]
+        ]
+        assert [(row[0], row[1]) for row in archived] == [
+            (entry.message_id, entry.content) for entry in before[:result.removed_count]
+        ]
+        assert len(summaries) == 1
+        replay = format_compaction_summary_context([summaries[0].summary_text])
+        assert "historical exchanges are complete" in replay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["missing_fact", "oversized", "malformed", "empty", "header"])
+async def test_precomputed_compaction_revalidates_claimed_pass_without_removing_rows(
+    manager, invalid,
+):
+    node = await manager.create("agent:main:untrusted-candidate")
+    content = (
+        "Preserve src/required_checkpoint.py." if invalid == "missing_fact" else "Earlier work."
+    )
+    await manager.append_message(node.session_key, "user", content)
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Continue current work.")
+    before = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    payload = StructuredCompactionSummary(
+        current_status="x" * 16_553 if invalid == "oversized" else "Earlier work complete.",
+        source_coverage={"status": "pass", "checked_obligations": 0},
+    ).model_dump(mode="json")
+    if invalid == "malformed":
+        payload["files_and_artifacts"] = "invalid-list"
+    if invalid == "header":
+        payload["current_status"] = ""
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        " " if invalid == "empty" else "Claimed complete summary.",
+        [{"role": "user", "content": "Continue current work."}],
+        summary_payload=payload, summary_format="structured_v1", coverage_status="pass",
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+
+    assert installed is False
+    assert await manager.get_transcript(node.session_key) == before
+    assert await manager.get_canonical_transcript(node.session_key) == before
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    assert (await manager.get_session(node.session_key)).compaction_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["none", "missing_proof", "before_persist", "at_commit", "lost_fact"],
+)
+async def test_precomputed_summary_replacement_checks_source_context_and_commit_cas(
+    manager, monkeypatch, change,
+):
+    node = await manager.create("agent:main:replace-checkpoint")
+    prior = "Earlier work touched src/required_checkpoint.py."
+    old_summary = await manager._storage.save_summary(SessionSummary(
+        session_id=node.session_id, session_key=node.session_key,
+        summary_text=prior, covered_through_id=0,
+    ))
+    await manager.append_message(node.session_key, "user", "Earlier exchange.")
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Continue current work.")
+    source = await manager.capture_compaction_source(node.session_key)
+    before = await manager.get_transcript(node.session_key)
+    payload = StructuredCompactionSummary(
+        current_status="Earlier work complete." if change == "lost_fact" else prior,
+        source_coverage={"status": "pass", "replaces_prior_context": True},
+    ).model_dump(mode="json")
+
+    async def change_context():
+        await manager._storage.save_summary(SessionSummary(
+            session_id=node.session_id, session_key=node.session_key,
+            summary_text="Concurrent checkpoint.", covered_through_id=0,
+        ))
+
+    if change == "before_persist":
+        await change_context()
+    if change == "at_commit":
+        rewrite = manager._storage.rewrite_compacted_session
+
+        async def concurrent_rewrite(**kwargs):
+            await change_context()
+            return await rewrite(**kwargs)
+
+        monkeypatch.setattr(manager._storage, "rewrite_compacted_session", concurrent_rewrite)
+
+    installed = await manager.persist_compaction_result(
+        node.session_key, payload["current_status"],
+        [{"role": "user", "content": "Continue current work."}],
+        summary_payload=payload, summary_format="structured_v1", coverage_status="pass",
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=(
+            None if change == "missing_proof" else source.context_fingerprint
+        ),
+    )
+
+    assert installed is (change == "none")
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[0].id == old_summary.id
+    assert summaries[0].summary_text == prior
+    assert await manager.get_canonical_transcript(node.session_key) == before
+    if installed:
+        assert await manager.get_transcript(node.session_key) == before[2:]
+        assert len(summaries) == 2
+        assert summaries[-1].coverage_status == "pass"
+        assert summaries[-1].summary_payload["source_coverage"]["checked_obligations"] > 0
+        assert "src/required_checkpoint.py" in summaries[-1].summary_text
+    else:
+        assert await manager.get_transcript(node.session_key) == before
+        assert len(summaries) == (2 if change in {"before_persist", "at_commit"} else 1)
+        assert await manager.get_context_states(node.session_key) == []
+        assert (await manager.get_session(node.session_key)).compaction_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exceeds_total_replay_budget", [False, True])
+async def test_precomputed_append_validates_all_final_checkpoints(
+    manager, exceeds_total_replay_budget,
+):
+    node = await manager.create("agent:main:checkpoint-append-budget")
+    repeats = 650 if exceeds_total_replay_budget else 20
+    old_summary = await manager._storage.save_summary(SessionSummary(
+        session_id=node.session_id, session_key=node.session_key,
+        summary_text="old checkpoint " * repeats,
+    ))
+    await manager.append_message(node.session_key, "user", "Earlier task.")
+    await manager.append_message(node.session_key, "assistant", "Earlier answer.")
+    await manager.append_message(node.session_key, "user", "Current task.")
+    original = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    candidate = StructuredCompactionSummary(
+        current_status="new checkpoint " * 600,
+        source_coverage={"status": "pass", "replaces_prior_context": False},
+    )
+    installed = await manager.persist_compaction_result(
+        node.session_key, candidate.current_status,
+        [{"role": "user", "content": "Current task."}],
+        summary_payload=candidate.model_dump(mode="json"), summary_format="structured_v1",
+        coverage_status="pass", removed_count=2, source_entries=source.entries,
+        source_preimage=source.preimage, source_context_fingerprint=source.context_fingerprint,
+    )
+
+    assert installed is not exceeds_total_replay_budget
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[0] == old_summary
+    records = build_compaction_context_records(
+        context_states=await manager.get_context_states(node.session_key), summaries=summaries,
+    )
+    texts = [record.text for record in records]
+    assert compaction_replay_is_complete(texts, format_compaction_summary_context(texts))
+    assert len(summaries) == (1 if exceeds_total_replay_budget else 2)
+    assert await manager.get_transcript(node.session_key) == (
+        original if exceeds_total_replay_budget else original[2:]
+    )
+    assert await manager.get_canonical_transcript(node.session_key) == original
+    assert (await manager.get_session(node.session_key)).compaction_count == int(installed)
+
+
+@pytest.mark.asyncio
+async def test_precomputed_summary_only_replacement_preserves_coverage_boundary(manager):
+    node = await manager.create("agent:main:summary-only-replacement")
+    await manager.append_message(node.session_key, "user", "Earlier work.")
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Current request.")
+    original = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    assert await manager.persist_compaction_result(
+        node.session_key, "Earlier work complete.",
+        [{"role": "user", "content": "Current request."}],
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+    prior_boundary = (await manager.get_summaries(node.session_key))[-1].covered_through_id
+    assert prior_boundary > 0
+
+    source = await manager.capture_compaction_source(node.session_key)
+    replacement = StructuredCompactionSummary(
+        current_status="Earlier work complete; continue the current request.",
+        source_coverage={"replaces_prior_context": True},
+    )
+    assert await manager.persist_compaction_result(
+        node.session_key, replacement.current_status,
+        [{"role": "user", "content": "Current request."}],
+        summary_format="structured_v1", summary_payload=replacement.model_dump(mode="json"),
+        removed_count=0, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[-1].covered_through_id == prior_boundary
+    records = build_compaction_context_records(
+        summaries=summaries, context_states=await manager.get_context_states(node.session_key),
+    )
+    assert len(records) == 1
+    assert replacement.current_status in records[0].text
+    assert await manager.get_transcript(node.session_key) == original[2:]
+    assert await manager.get_canonical_transcript(node.session_key) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid", "expected_reason"),
+    [
+        ("empty", "empty_summary"),
+        ("missing_fact", "coverage_blocked"),
+        ("oversized", "summary_replay_incomplete"),
+        ("boundary", "invalid_source_boundary"),
+        ("overrun", "invalid_source_boundary"),
+        ("tail", "invalid_source_boundary"),
+        ("consumer_reject", "consumer_admission_failed"),
+        ("consumer_stale", "consumer_admission_stale"),
+    ],
+)
+async def test_manager_final_candidate_gate_preserves_original_context(
+    manager, monkeypatch, invalid, expected_reason,
+):
+    node = await manager.create("agent:main:final-candidate")
+    content = (
+        "Preserve src/required_checkpoint.py." if invalid == "missing_fact" else "Earlier work."
+    )
+    await manager.append_message(node.session_key, "user", content)
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Current request.")
+    before = await manager.get_transcript(node.session_key)
+
+    async def candidate(request):
+        removed = 4 if invalid == "overrun" else 2
+        summary = (
+            "" if invalid == "empty"
+            else "x" * 16_553 if invalid == "oversized"
+            else "Earlier work complete."
+        )
+        return CompactionResult(
+            summary=summary,
+            kept_entries=[] if invalid == "tail" else request.entries[removed:],
+            removed_count=removed, kept_start_index=1 if invalid == "boundary" else removed,
+            chunks_processed=1, summary_source="llm", coverage_status="pass",
+        )
+
+    def admission(*_):
+        if invalid == "consumer_stale":
+            raise ConsumerAdmissionStaleError("consumer changed")
+        return False
+
+    monkeypatch.setattr(session_manager_module, "compact_context", candidate)
+    result = await manager.compact_with_result(
+        node.session_key, context_window_tokens=100_000,
+        consumer_admission=admission if invalid.startswith("consumer_") else None,
+    )
+
+    assert result.skip_reason == expected_reason
+    assert result.summary == ""
+    assert result.removed_count == result.kept_start_index == 0
+    assert result.replaced_previous_summary is False
+    assert await manager.get_transcript(node.session_key) == before
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    assert (await manager.get_session(node.session_key)).compaction_count == 0

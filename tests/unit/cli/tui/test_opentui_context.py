@@ -8,6 +8,7 @@ import pytest
 from opensquilla.cli.tui.opentui.context import (
     context_update_from_bootstrap,
     send_context_patch,
+    send_context_update,
 )
 from opensquilla.engine.commands import Surface
 
@@ -87,3 +88,38 @@ async def test_context_patch_is_additive_and_sanitized() -> None:
             {"model": "gpt-5.4", "permission": "workspace-write"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_context_update_prefers_session_routing_over_global_runtime_mode() -> None:
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    class Output:
+        async def send_message(self, kind: str, payload: dict[str, Any]) -> None:
+            sent.append((kind, payload))
+
+    await send_context_update(
+        Output(),
+        {
+            "session": {"session_key": "agent:main:test:session"},
+            "routing": {
+                "mode": "ensemble",
+                "revision": 4,
+                "appliesTo": "next_accepted_turn",
+            },
+            "runtime": {"model_routing": {"mode": "direct"}},
+        },
+    )
+
+    assert sent[-1] == (
+        "model.routing.state",
+        {
+            "mode": "ensemble",
+            "router_enabled": False,
+            "ensemble_enabled": True,
+            "selection_mode": "",
+            "rollout_phase": "observe",
+            "applies_to": "next_accepted_turn",
+            "busy": False,
+        },
+    )

@@ -7,7 +7,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .jobs import HandlerFn, apply_reserved_result, execute_with_timeout
+from .jobs import (
+    HandlerFn,
+    apply_reserved_result,
+    execute_with_timeout,
+    notify_terminal_result,
+)
 from .ops import SchedulerOps
 from .parser import CronExpression
 from .persistence import JobStore
@@ -116,6 +121,7 @@ class SchedulerEngine:
         schedule_kind: ScheduleKind | str,
         schedule_value: str,
         schedule_tz: str = "",
+        enabled: bool = True,
         handler_key: str = "agent_run",
         payload: dict | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
@@ -131,6 +137,9 @@ class SchedulerEngine:
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        creator_host_execute: bool = False,
+        run_mode: str = "",
+        idempotency_key: str = "",
     ) -> CronJob:
         """Create and persist a new job; compute initial next_run_at.
 
@@ -140,6 +149,7 @@ class SchedulerEngine:
         """
         job = await self._ops.add(
             name=name,
+            enabled=enabled,
             handler_key=handler_key,
             payload=payload,
             session_target=session_target,
@@ -155,6 +165,9 @@ class SchedulerEngine:
             creator_session_key=creator_session_key,
             creator_sender_id=creator_sender_id,
             creator_is_owner=creator_is_owner,
+            creator_host_execute=creator_host_execute,
+            run_mode=run_mode,
+            idempotency_key=idempotency_key,
             schedule_kind=schedule_kind,
             schedule_value=schedule_value,
             schedule_tz=schedule_tz,
@@ -174,7 +187,7 @@ class SchedulerEngine:
         return result
 
     async def pause_job(self, job_id: str) -> CronJob | None:
-        """Pause a job."""
+        """Pause future scheduling without interrupting an active run."""
         return await self._ops.pause(job_id)
 
     async def resume_job(self, job_id: str) -> CronJob | None:
@@ -185,8 +198,7 @@ class SchedulerEngine:
         return result
 
     async def delete_job(self, job_id: str) -> bool:
-        """Delete a job and cancel it if running."""
-        self._timer.cancel_running(job_id)
+        """Delete future scheduling without interrupting an active run."""
         result = await self._ops.remove(job_id)
         if result:
             self._timer.nudge()
@@ -224,6 +236,7 @@ class SchedulerEngine:
         exe = await execute_with_timeout(job, handler)
         await self._store.save_execution(exe)
         await apply_reserved_result(job.id, reservation.token, exe, self._store)
+        await notify_terminal_result(job, exe)
         return ManualRunResult(status=ManualRunStatus.ACCEPTED, execution=exe)
 
     # ------------------------------------------------------------------

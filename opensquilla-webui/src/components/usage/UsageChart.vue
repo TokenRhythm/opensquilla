@@ -48,7 +48,8 @@
         class="usage-bar-row"
         :class="{ 'is-static': !row.sessionKey }"
         :type="row.sessionKey ? 'button' : undefined"
-        :title="row.sessionKey ? t('usageLogs.chart.openSession', { session: row.sessionKey }) : row.label"
+        :title="row.sessionKey ? t('usageLogs.chart.openTask', { task: row.label }) : row.label"
+        :aria-label="row.sessionKey ? t('usageLogs.chart.openTask', { task: row.label }) : undefined"
         :style="`--i:${i}`"
         @click="row.sessionKey && emit('openSession', row.sessionKey)"
       >
@@ -60,7 +61,6 @@
             class="usage-bar-row__fill usage-bar-row__fill--output"
             :style="`width:${row.outputPct.toFixed(1)}%`"
           />
-          <span class="usage-bar-row__cap" :style="`left:${Math.min(100, row.totalPct).toFixed(1)}%`" />
         </span>
         <span class="usage-bar-row__value usage-mono">{{ row.valueLabel }}</span>
       </component>

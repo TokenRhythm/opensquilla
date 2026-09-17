@@ -38,7 +38,7 @@ from opensquilla.memory.types import (
     normalize_memory_source_filter,
 )
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
 
 if TYPE_CHECKING:
     from opensquilla.memory.retrieval import MemoryRetriever
@@ -364,8 +364,10 @@ def create_memory_tools(
         if memory_source == "workspace":
             from opensquilla.agents.scope import resolve_agent_workspace_dir
 
-            if ctx and ctx.workspace_dir:
-                wd: str | None = str(Path(ctx.workspace_dir).expanduser().resolve())
+            if ctx and ctx.memory_source_dir:
+                # Runtime resolves this from the Agent's memory configuration.
+                # A task execution directory is not a new long-term memory root.
+                wd: str | None = str(Path(ctx.memory_source_dir).expanduser().resolve())
             elif workspace_base:
                 wd = str(
                     resolve_agent_workspace_dir(
@@ -386,6 +388,13 @@ def create_memory_tools(
         else:
             md = memory_dir
             wd = memory_dir  # fallback: use memory_dir as workspace in test/legacy mode
+        # These paths stay inside the tool closures. Keep user-facing results
+        # relative while bypassing legacy Windows MAX_PATH for every read,
+        # write, rollback, retention, and delete operation.
+        from opensquilla.memory.manager import _native_io_path
+
+        md = str(_native_io_path(md)) if md is not None else None
+        wd = str(_native_io_path(wd)) if wd is not None else None
         return ResolvedAgent(store=s, retriever=r, memory_dir=md, workspace_dir=wd)
 
     @dataclass(frozen=True)
@@ -642,6 +651,7 @@ def create_memory_tools(
             },
         },
         required=["query"],
+        plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def memory_search(
@@ -691,7 +701,9 @@ def create_memory_tools(
             "for ordinary task deliverables such as reports, JSON outputs, or "
             "result files. Use MEMORY.md for long-term facts (mode=replace) and "
             "memory/YYYY-MM-DD.md for daily notes (mode=append). Profile/bootstrap "
-            "files such as USER.md are edited with filesystem tools, not memory_save."
+            "files such as USER.md are edited with filesystem tools, not memory_save. "
+            "Before replacing an existing file, read its complete contents and preserve "
+            "unrelated facts."
         ),
         params={
             "content": {"type": "string", "description": "Content to save"},
@@ -710,7 +722,7 @@ def create_memory_tools(
             },
         },
         required=["content"],
-        exposed_by_default=False,
+        default_access="deny",
         registry=registry,
     )
     async def memory_save(content: str, path: str = "", mode: str = "append") -> str:
@@ -757,6 +769,7 @@ def create_memory_tools(
             "lines": {"type": "integer", "description": "Number of lines to return (optional)"},
         },
         required=["path"],
+        plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def memory_get(
@@ -803,7 +816,8 @@ def create_memory_tools(
         name="memory_delete",
         description=(
             "Delete a memory source file and remove it from the search index. "
-            "Use to correct wrong memories or remove outdated information."
+            "Use only when the user requests deletion of the entire memory file. "
+            "To forget or correct one fact, edit the file and preserve its other contents."
         ),
         params={
             "path": {
@@ -812,7 +826,7 @@ def create_memory_tools(
             },
         },
         required=["path"],
-        exposed_by_default=False,
+        default_access="deny",
         registry=registry,
     )
     async def memory_delete(path: str) -> str:

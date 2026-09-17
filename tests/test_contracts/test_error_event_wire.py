@@ -21,16 +21,27 @@ NORMALIZED_ERROR_KEYS = frozenset(
         "message",
         "code",
         "error_id",
+        "failure_kind",
+        "generation_epoch",
         "terminal_message",
         "terminal_reason",
         "error_message",
         "turn_outcome",
+        "retry_after_ms",
+        "usage_call_index",
+        "no_prior_provider_dispatch",
+        "replay_safe",
     }
 )
 
 
 def _synthetic_error_payload() -> dict:
-    event = ErrorEvent(message="Agent error", code="agent_error", error_id="abcd1234")
+    event = ErrorEvent(
+        message="Agent error",
+        code="agent_error",
+        error_id="abcd1234",
+        failure_kind="transport_transient",
+    )
     payload = asdict(event)
     payload.pop("kind")
     return payload
@@ -39,6 +50,8 @@ def _synthetic_error_payload() -> dict:
 def test_error_event_dataclass_carries_error_id() -> None:
     payload = _synthetic_error_payload()
     assert payload["error_id"] == "abcd1234"
+    assert payload["failure_kind"] == "transport_transient"
+    assert payload["generation_epoch"] == 0
 
 
 def test_normalized_error_payload_keys_are_frozen() -> None:
@@ -46,6 +59,19 @@ def test_normalized_error_payload_keys_are_frozen() -> None:
         "session.event.error", _synthetic_error_payload()
     )
     assert set(normalized) == NORMALIZED_ERROR_KEYS
+
+
+def test_normalized_error_payload_preserves_explicit_model_capacity() -> None:
+    capacity = {
+        "provider": "custom",
+        "model": "synthetic-model",
+        "contextWindow": 8192,
+        "source": "default",
+    }
+    payload = {**_synthetic_error_payload(), "model_capacity": capacity}
+    normalized = _normalize_terminal_event_payload("session.event.error", payload)
+    assert set(normalized) == NORMALIZED_ERROR_KEYS | {"model_capacity"}
+    assert normalized["model_capacity"] == capacity
 
 
 def test_normalized_error_payload_message_carries_ref() -> None:

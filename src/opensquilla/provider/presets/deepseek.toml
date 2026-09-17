@@ -6,26 +6,26 @@ id = "deepseek"
 provider = "deepseek"
 label = "DeepSeek"
 description = "Curated DeepSeek router tier ladder (c0-c3)."
-default_model = "deepseek-v4-flash"
+default_model = "deepseek-flash"
 
 [tiers.c0]
 provider = "deepseek"
-model = "deepseek-v4-flash"
-description = "DeepSeek fast route: V4 Flash with no router-requested thinking; request ID pending live smoke."
+model = "deepseek-flash"
+description = "DeepSeek fast route: V4.1 Flash with no router-requested thinking."
 thinking_level = "off"
-supports_image = false
+supports_image = true
 
 [tiers.c1]
 provider = "deepseek"
-model = "deepseek-v4-flash"
-description = "DeepSeek balanced route: V4 Flash with thinking enabled; request ID pending live smoke."
+model = "deepseek-flash"
+description = "DeepSeek balanced route: V4.1 Flash with thinking enabled."
 thinking_level = "low"
-supports_image = false
+supports_image = true
 
 [tiers.c2]
 provider = "deepseek"
 model = "deepseek-v4-pro"
-description = "DeepSeek strong route: V4 Pro with thinking enabled; request ID pending live smoke."
+description = "DeepSeek strong route: V4 Pro with thinking enabled."
 thinking_level = "medium"
 supports_image = false
 

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from yoyo import get_backend, read_migrations
 
 from opensquilla.persistence.meta_run_writer import (
     AwaitingPeek,
@@ -16,15 +16,14 @@ from opensquilla.persistence.meta_run_writer import (
 
 
 @pytest.fixture
-def writer(tmp_path: Path) -> MetaRunWriter:
-    db = tmp_path / "test.sqlite"
-    backend = get_backend(f"sqlite:///{db}")
-    backend.apply_migrations(read_migrations("migrations"))
-    conn = sqlite3.connect(db, check_same_thread=False)
+def writer(migrated_db: Path) -> Iterator[MetaRunWriter]:
+    conn = sqlite3.connect(migrated_db, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    return MetaRunWriter(conn)
+    result = MetaRunWriter(conn)
+    yield result
+    result.close()
 
 
 def _seed_awaiting(writer: MetaRunWriter, *, run_id: str, session_key: str,
@@ -207,13 +206,9 @@ def test_increment_parse_failures_returns_new_count(writer):
     assert writer.increment_parse_failures(run_id="r1") == 3
 
 
-def test_increment_parse_failures_atomic_across_connections(tmp_path):
-    db = tmp_path / "test.sqlite"
-    backend = get_backend(f"sqlite:///{db}")
-    backend.apply_migrations(read_migrations("migrations"))
-
+def test_increment_parse_failures_atomic_across_connections(migrated_db: Path):
     def _open():
-        c = sqlite3.connect(db, check_same_thread=False, timeout=30.0)
+        c = sqlite3.connect(migrated_db, check_same_thread=False, timeout=30.0)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
@@ -221,15 +216,19 @@ def test_increment_parse_failures_atomic_across_connections(tmp_path):
 
     w1 = _open()
     w2 = _open()
-    _seed_awaiting(w1, run_id="r1", session_key="S1")
+    try:
+        _seed_awaiting(w1, run_id="r1", session_key="S1")
 
-    seen = []
-    for w in (w1, w2, w1, w2, w1):
-        seen.append(w.increment_parse_failures(run_id="r1"))
+        seen = []
+        for w in (w1, w2, w1, w2, w1):
+            seen.append(w.increment_parse_failures(run_id="r1"))
 
-    assert seen == [1, 2, 3, 4, 5], (
-        f"increment_parse_failures must be atomic per connection; got {seen}"
-    )
+        assert seen == [1, 2, 3, 4, 5], (
+            f"increment_parse_failures must be atomic per connection; got {seen}"
+        )
+    finally:
+        w2.close()
+        w1.close()
 
 
 def test_increment_parse_failures_zero_for_non_awaiting(writer):

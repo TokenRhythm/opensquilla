@@ -901,6 +901,7 @@ async def test_completion_failure_does_not_kill_the_input_loop(
     assert bridge.sent == []
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_open_opentui_surface_uses_explicit_workspace_for_completion_context(
     monkeypatch: pytest.MonkeyPatch,

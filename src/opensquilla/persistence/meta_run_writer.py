@@ -55,6 +55,16 @@ _SECRET_KEY_RE = re.compile(
 _SECRET_PREFIX_RE = re.compile(
     r"^(sk-|pk-|ghp_|gho_|ghu_|ghs_|ghr_|xoxb-|xoxp-|Bearer )"
 )
+_REPLAY_INPUTS_MODIFIED_FIELD = "inputs_json_modified"
+_LEGACY_REDACTION_OVERFLOW_KEY = "_redaction_overflow"
+_REDACTION_MARKER = "[REDACTED]"
+_REDACTION_CLIP_SUFFIX = "…"
+_CURRENT_RUN_ONLY_INPUT_KEYS = frozenset(
+    {
+        "paid_submission_receipt_proofs",
+        "__opensquilla_paid_submission_receipt_proofs_v1__",
+    }
+)
 # Crockford Base32 — no I, L, O, U
 _BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -64,6 +74,22 @@ _BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _ULID_LOCK = threading.Lock()
 _ULID_LAST_TS_MS: int = -1
 _ULID_LAST_RAND: int = 0
+
+
+def _drop_current_run_machine_evidence(value: Any) -> Any:
+    """Remove ephemeral receipt proof material from persistence payloads."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _drop_current_run_machine_evidence(item)
+            for key, item in value.items()
+            if str(key) not in _CURRENT_RUN_ONLY_INPUT_KEYS
+        }
+    if isinstance(value, list):
+        return [_drop_current_run_machine_evidence(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_drop_current_run_machine_evidence(item) for item in value)
+    return value
 _ULID_RAND_MAX = (1 << 80) - 1
 
 
@@ -373,7 +399,11 @@ def _gen_ulid() -> str:
     return "".join(out_chars[:26])
 
 
-def _redact_inputs_json(raw: Mapping[str, Any], *, max_bytes: int) -> str:
+def _redact_inputs_json_with_status(
+    raw: Mapping[str, Any],
+    *,
+    max_bytes: int,
+) -> tuple[str, bool]:
     """Recursive redactor for arbitrary inputs mapping.
 
     Rules:
@@ -381,45 +411,109 @@ def _redact_inputs_json(raw: Mapping[str, Any], *, max_bytes: int) -> str:
     * Value prefix match against secret prefix regex → ``[REDACTED]``
     * Per-string clip to ``_REDACTOR_PER_STRING_BYTES``
     * Total JSON ≤ ``max_bytes``; drops fields in reverse-key order on overflow
+
+    Returns the serialized value plus a durable-safety signal indicating
+    whether any persisted value differs from the caller's exact input. Replay
+    uses that signal to fail closed instead of executing with redacted or
+    clipped request data.
     """
 
+    modified = False
+
     def _walk(node: Any, key_hint: str | None) -> Any:
+        nonlocal modified
         if isinstance(node, Mapping):
             return {k: _walk(v, key_hint=str(k)) for k, v in node.items()}
         if isinstance(node, (list, tuple)):
             return [_walk(item, key_hint=key_hint) for item in node]
         if isinstance(node, str):
             if key_hint and _SECRET_KEY_RE.search(key_hint):
-                return "[REDACTED]"
+                modified = True
+                return _REDACTION_MARKER
             if _SECRET_PREFIX_RE.match(node):
-                return "[REDACTED]"
+                modified = True
+                return _REDACTION_MARKER
             encoded = node.encode("utf-8")
             if len(encoded) > _REDACTOR_PER_STRING_BYTES:
+                modified = True
                 clipped = encoded[:_REDACTOR_PER_STRING_BYTES].decode(
                     "utf-8", errors="ignore"
                 )
                 # Keep suffix tiny (1 char) so total stays within
                 # ``_REDACTOR_PER_STRING_BYTES + 4`` chars; callers asserting
                 # the budget would fail with a verbose suffix.
-                return f"{clipped}…"
+                return f"{clipped}{_REDACTION_CLIP_SUFFIX}"
             return node
         return node
 
     redacted = _walk(dict(raw), key_hint=None)
     text = json.dumps(redacted, sort_keys=True, ensure_ascii=False)
     if len(text.encode("utf-8")) <= max_bytes:
-        return text
+        return text, modified
 
     # Overflow — drop fields in reverse-key order
+    modified = True
     keys = sorted(redacted.keys(), reverse=True)
     while keys:
         dropped = keys.pop(0)
         redacted.pop(dropped, None)
-        redacted["_redaction_overflow"] = True
+        redacted[_LEGACY_REDACTION_OVERFLOW_KEY] = True
         text = json.dumps(redacted, sort_keys=True, ensure_ascii=False)
         if len(text.encode("utf-8")) <= max_bytes:
-            return text
-    return json.dumps({"_redaction_overflow": True}, sort_keys=True)
+            return text, modified
+    return (
+        json.dumps({_LEGACY_REDACTION_OVERFLOW_KEY: True}, sort_keys=True),
+        modified,
+    )
+
+
+def _redact_inputs_json(raw: Mapping[str, Any], *, max_bytes: int) -> str:
+    """Return the bounded redacted JSON representation used by step records."""
+    return _redact_inputs_json_with_status(raw, max_bytes=max_bytes)[0]
+
+
+def replay_inputs_are_modified(record: RunRecord) -> bool:
+    """Return whether a live failed-step replay cannot reuse exact inputs.
+
+    New rows carry an explicit ``inputs_json_modified`` marker in
+    ``truncated_fields``. Older databases predate that marker, so recursively
+    detect every value emitted by the historical redactor as well. Malformed
+    or non-object input JSON is also unsafe: treating it as an empty request
+    would silently change workflow semantics.
+    """
+
+    truncated_fields = getattr(record, "truncated_fields", None)
+    if isinstance(truncated_fields, (tuple, list, set, frozenset)):
+        if (
+            _REPLAY_INPUTS_MODIFIED_FIELD in truncated_fields
+            or "inputs_json" in truncated_fields
+        ):
+            return True
+    elif truncated_fields is not None:
+        return True
+
+    raw = getattr(record, "inputs_json", None)
+    if not isinstance(raw, str):
+        return True
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not isinstance(payload, Mapping):
+        return True
+
+    def _contains_legacy_marker(node: Any) -> bool:
+        if isinstance(node, Mapping):
+            if node.get(_LEGACY_REDACTION_OVERFLOW_KEY) is True:
+                return True
+            return any(_contains_legacy_marker(value) for value in node.values())
+        if isinstance(node, (list, tuple)):
+            return any(_contains_legacy_marker(value) for value in node)
+        if isinstance(node, str):
+            return _REDACTION_MARKER in node or node.endswith(_REDACTION_CLIP_SUFFIX)
+        return False
+
+    return _contains_legacy_marker(payload)
 
 
 def _serialize_plan(plan: MetaPlan) -> tuple[str, str]:
@@ -526,7 +620,11 @@ class MetaRunWriter:
     ) -> str | None:
         run_id = self._id_gen()
         snapshot_json, digest = _serialize_plan(meta_plan)
-        inputs_json = _redact_inputs_json(inputs, max_bytes=self._max_field_bytes)
+        inputs_json, inputs_modified = _redact_inputs_json_with_status(
+            inputs,
+            max_bytes=self._max_field_bytes,
+        )
+        truncated_fields = _REPLAY_INPUTS_MODIFIED_FIELD if inputs_modified else ""
         try:
             with self._lock:
                 self._conn.execute(
@@ -534,13 +632,13 @@ class MetaRunWriter:
                     INSERT INTO meta_skill_runs (
                         run_id, meta_skill_name, meta_skill_digest, plan_snapshot_json,
                         triggered_by, session_key, turn_id, owner_pid, status,
-                        started_at_ms, inputs_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
+                        started_at_ms, inputs_json, truncated_fields
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
                     """,
                     (
                         run_id, meta_skill_name, digest, snapshot_json,
                         triggered_by, session_key, turn_id, self._pid_fn(),
-                        self._clock(), inputs_json,
+                        self._clock(), inputs_json, truncated_fields,
                     ),
                 )
                 self._conn.commit()
@@ -595,7 +693,10 @@ class MetaRunWriter:
         effective_skill: str,
         rendered_inputs: Mapping[str, Any],
     ) -> None:
-        rendered_json = _redact_inputs_json(rendered_inputs, max_bytes=self._max_field_bytes)
+        rendered_json = _redact_inputs_json(
+            _drop_current_run_machine_evidence(rendered_inputs),
+            max_bytes=self._max_field_bytes,
+        )
         try:
             with self._lock:
                 self._conn.execute(
@@ -720,6 +821,20 @@ class MetaRunWriter:
             with self._lock:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
+                    existing_row = self._conn.execute(
+                        "SELECT truncated_fields FROM meta_skill_runs WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                    merged_truncated = [
+                        field
+                        for field in (
+                            (existing_row["truncated_fields"] if existing_row else "") or ""
+                        ).split(",")
+                        if field
+                    ]
+                    for field in truncated:
+                        if field not in merged_truncated:
+                            merged_truncated.append(field)
                     cur = self._conn.execute(
                         """
                         UPDATE meta_skill_runs
@@ -731,7 +846,7 @@ class MetaRunWriter:
                         """,
                         (
                             status, self._clock(), final_text,
-                            failed_step_id, error, ",".join(truncated),
+                            failed_step_id, error, ",".join(merged_truncated),
                             run_id,
                         ),
                     )

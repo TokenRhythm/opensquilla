@@ -62,6 +62,8 @@ _PROVIDER_LABELS: dict[str, str] = {
     "dashscope": "Aliyun DashScope",
     "bailian_coding": "Bailian Coding (International)",
     "bailian_coding_cn": "Bailian Coding (Mainland China)",
+    "qwen_token_plan": "Qwen Token Plan",
+    "qwen_token_plan_anthropic": "Qwen Token Plan (Anthropic)",
     "moonshot": "Moonshot AI",
     "kimi_coding_openai": "Kimi Coding OpenAI-compatible",
     "kimi_coding_anthropic": "Kimi Coding Anthropic-compatible",
@@ -89,6 +91,7 @@ _PROVIDER_LABELS: dict[str, str] = {
     "tokenrhythm": "TokenRhythm",
     "vllm": "vLLM (self-hosted)",
     "custom": "Custom OpenAI-compatible endpoint",
+    "custom_anthropic": "Custom Anthropic-compatible endpoint",
     "litellm_proxy": "LiteLLM Proxy",
     "lm_studio": "LM Studio (local)",
     "ovms": "OpenVINO Model Server",
@@ -136,6 +139,8 @@ _ONBOARDING_VERIFIED_PROVIDER_IDS = frozenset(
         "deepseek",
         "gemini",
         "dashscope",
+        "qwen_token_plan",
+        "qwen_token_plan_anthropic",
         "moonshot",
         "zhipu",
         "qianfan",
@@ -148,9 +153,15 @@ _ONBOARDING_VERIFIED_PROVIDER_IDS = frozenset(
 _LOCAL_PROVIDER_IDS = frozenset({"ollama", "vllm", "lm_studio", "ovms"})
 _OAUTH_PROVIDER_IDS = frozenset({"openai_codex", "github_copilot"})
 _BAILIAN_CODING_PROVIDER_IDS = frozenset({"bailian_coding", "bailian_coding_cn"})
+_DEDICATED_SK_SP_PROVIDER_IDS = _BAILIAN_CODING_PROVIDER_IDS | {
+    "qwen_token_plan",
+    "qwen_token_plan_anthropic",
+}
 _DIRECT_MODEL_DEFAULTS = {
     "bailian_coding": "qwen3.7-plus",
     "bailian_coding_cn": "qwen3.7-plus",
+    "qwen_token_plan": "qwen3.8-max-preview",
+    "qwen_token_plan_anthropic": "qwen3.8-max-preview",
 }
 
 
@@ -190,8 +201,8 @@ def _what_you_need(spec: ProviderSpec) -> tuple[str, ...]:
             else "A provider model id."
         )
     if spec.requires_api_key():
-        if spec.provider_id in _BAILIAN_CODING_PROVIDER_IDS:
-            needs.append("A dedicated Coding Plan API key starting with sk-sp-.")
+        if spec.provider_id in _DEDICATED_SK_SP_PROVIDER_IDS:
+            needs.append("A dedicated plan API key starting with sk-sp-.")
         else:
             needs.append(
                 f"API key via {spec.env_key} or a one-time paste."
@@ -239,10 +250,10 @@ def _fields_for(spec: ProviderSpec) -> tuple[ProviderSetupField, ...]:
     router_supported = _is_router_supported_provider(spec.provider_id)
     api_key_description = (
         (
-            "Use the dedicated Coding Plan API key starting with sk-sp-. "
+            "Use the dedicated plan API key starting with sk-sp-. "
             "Standard Model Studio keys are not interchangeable. "
         )
-        if spec.provider_id in _BAILIAN_CODING_PROVIDER_IDS
+        if spec.provider_id in _DEDICATED_SK_SP_PROVIDER_IDS
         else ""
     )
     api_key_description += (

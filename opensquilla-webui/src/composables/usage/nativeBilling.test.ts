@@ -6,7 +6,8 @@ import {
   nativeBillingDisplay,
   serializeNativeBilling,
 } from './nativeBilling'
-import type { UsageSnapshot, UsageTotals } from '@/types/usage'
+import type { UsageSnapshot } from '@/types/usage'
+import { usageSnapshot, usageTotals } from '@/testing/usage.test-helper'
 
 function receipt(
   currency: string,
@@ -58,7 +59,7 @@ describe('native billing display contract', () => {
       exactCny: null,
       useCanonicalUsd: true,
     })
-    expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('$1.0000')
+    expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('¥7.2500')
   })
 
   it('requires one confirmed CNY receipt for every billed physical request', () => {
@@ -70,7 +71,7 @@ describe('native billing display contract', () => {
       exactCny: null,
       useCanonicalUsd: true,
     })
-    expect(formatUsageCost(0, 'CNY', 7.25, 4, source)).toBe('$0.0000')
+    expect(formatUsageCost(0, 'CNY', 7.25, 4, source)).toBe('¥0.0000')
   })
 
   it('accepts multiple physical B5 receipts for one billed envelope', () => {
@@ -92,10 +93,10 @@ describe('native billing display contract', () => {
     delete source.nativeBillingMissingConfirmedReceiptCount
 
     expect(nativeBillingDisplay(source, 1).exactCny).toBeNull()
-    expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('$1.0000')
+    expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('¥7.2500')
   })
 
-  it('keeps pending and mixed-currency totals in canonical USD', () => {
+  it('converts pending and mixed-currency totals from canonical USD for CNY display', () => {
     const pending = {
       costSource: 'opensquilla_estimate',
       pendingBillingReceiptCount: 1,
@@ -120,13 +121,13 @@ describe('native billing display contract', () => {
       },
     }
 
-    expect(formatUsageCost(0.5, 'CNY', 7.25, 4, pending)).toBe('$0.5000')
+    expect(formatUsageCost(0.5, 'CNY', 7.25, 4, pending)).toBe('¥3.6250')
     expect(nativeBillingDisplay(mixed, 3)).toMatchObject({
       exactCny: null,
       useCanonicalUsd: true,
       subtotalText: '¥6.975 · $2',
     })
-    expect(formatUsageCost(3, 'CNY', 7.25, 4, mixed)).toBe('$3.0000')
+    expect(formatUsageCost(3, 'CNY', 7.25, 4, mixed)).toBe('¥21.7500')
   })
 
   it('retains the legacy approximate conversion when no receipt exists', () => {
@@ -147,7 +148,7 @@ function snapshot(overrides: {
   fxRatesNativePerUsd?: Record<string, string>
   cnyReceiptRates?: string[]
 }): UsageSnapshot {
-  const totals = {
+  const totals = usageTotals({
     nativeBilledByCurrency: overrides.cnyReceiptRates
       ? {
         CNY: {
@@ -159,13 +160,13 @@ function snapshot(overrides: {
         },
       }
       : {},
-  } as unknown as UsageTotals
-  return {
+  })
+  return usageSnapshot({
     totals,
     ...(overrides.fxRatesNativePerUsd
       ? { fxRatesNativePerUsd: overrides.fxRatesNativePerUsd }
       : {}),
-  } as UsageSnapshot
+  })
 }
 
 describe('effective CNY-per-USD rate', () => {

@@ -4,6 +4,7 @@
   "description": "Compact Biome output while preserving diagnostics.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["biome"],
     "commandIncludes": ["biome"]
   },
   "transforms": {

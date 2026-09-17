@@ -1,10 +1,9 @@
 """LocalAdapter: run an OpenSquilla agent as a host subprocess.
 
-Unlike the swebench OpenSquillaAdapter (which crosses a Docker boundary via
-``docker exec``), this runs ``opensquilla agent`` directly on the host with
-the repo as the working directory. Provider credentials are inherited from
-the runner's environment — no env-file is needed because there is no
-container boundary to cross (codex review #3).
+This runs ``opensquilla agent`` directly on the host with the repo as the
+working directory. Provider credentials are inherited from the runner's
+environment, so no env-file is needed because there is no container boundary
+to cross (codex review #3).
 """
 
 from __future__ import annotations
@@ -32,7 +31,6 @@ from opensquilla.contrib.codetask.agent_config import (
 )
 from opensquilla.contrib.codetask.config import (
     DEFAULT_AGENT_TIMEOUT,
-    DEFAULT_ITERATION_TIMEOUT,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MAX_PROVIDER_RETRIES,
     agent_python,
@@ -48,6 +46,7 @@ POLL_INTERVAL_SECONDS = 0.5
 
 _JSON_OBJECT_RE = re.compile(r"\{(?:[^{}]|(?:\{[^{}]*\}))*\}")
 StatusCallback = Callable[[dict[str, Any]], None]
+AgentStartedCallback = Callable[[], None]
 
 # code-task inherits the operator's runtime environment for credentials,
 # proxies, PATH, and packaged-runtime discovery. Persistent/profile-scoped
@@ -75,6 +74,10 @@ _PROFILE_SCOPED_CHILD_ENV = frozenset(
         "OPENSQUILLA_SCHEDULER_DB",
         "OPENSQUILLA_META_RUNS_DB",
         "OPENSQUILLA_ROUTER_DECISIONS_DB",
+        # Runtime-only proof that the parent turn actually had Coding Mode
+        # enabled. It must not leak into the isolated coding child.
+        "OPENSQUILLA_CODING_MODE_ACTIVE",
+        "OPENSQUILLA_CODING_MODE_CONFIG_PATH",
     }
 )
 
@@ -83,17 +86,17 @@ def _agent_access_arguments(bundle: AgentConfigBundle) -> list[str]:
     """Return child CLI access flags matching the effective sandbox run mode."""
 
     from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.run_mode import RunMode, normalize_run_mode
 
     config = GatewayConfig(**copy.deepcopy(bundle.payload))
-    run_mode = config.effective_run_mode
-    if run_mode == "full":
+    run_mode = normalize_run_mode(config.effective_run_mode)
+    if run_mode is RunMode.FULL:
         return ["--no-workspace-strict", "--permissions", "full"]
-    permission_profile = "restricted" if run_mode == "standard" else "bypass"
     return [
         "--workspace-strict",
         "--workspace-lockdown",
         "--permissions",
-        permission_profile,
+        "restricted",
     ]
 
 
@@ -123,6 +126,7 @@ class LocalAdapter:
         scratch_dir: Path,
         artifact_dir: Path,
         status_callback: StatusCallback | None = None,
+        on_agent_started: AgentStartedCallback | None = None,
         quiet_timeout: int | None = None,
     ) -> AgentOutcome:
         """Run one agent turn with ``repo`` as the workspace.
@@ -167,8 +171,6 @@ class LocalAdapter:
             str(self.timeout),
             "--max-iterations",
             str(self.max_iterations),
-            "--iteration-timeout-seconds",
-            str(DEFAULT_ITERATION_TIMEOUT),
             "--max-provider-retries",
             str(DEFAULT_MAX_PROVIDER_RETRIES),
             "--transcript-path",
@@ -240,6 +242,16 @@ class LocalAdapter:
             proc = subprocess.Popen(cmd, **popen_kwargs)
         except FileNotFoundError as exc:
             raise RuntimeError(f"could not launch agent interpreter: {exc}") from exc
+
+        # This is Coding Mode's demonstrated-use boundary: all command gates,
+        # provider preflight, workspace preparation, and subprocess setup have
+        # passed, and the coding agent now exists. Observation remains strictly
+        # non-load-bearing.
+        if on_agent_started is not None:
+            try:
+                on_agent_started()
+            except Exception:
+                logger.debug("coding mode usage observation failed", exc_info=True)
 
         if status_callback is not None:
             status_callback(
@@ -344,6 +356,9 @@ def _agent_environment(
                 scratch_dir.expanduser().resolve() / "profile"
             ),
             "OPENSQUILLA_GATEWAY_CONFIG_PATH": str(per_run_config),
+            # A coding subprocess is implementation work for its parent turn,
+            # not a separate user-launched CLI client. Keep diagnostics enabled.
+            "OPENSQUILLA_CODETASK_CHILD": "1",
         }
     )
     return environment
@@ -610,9 +625,3 @@ def _parse_json_envelope(stdout: str) -> dict | None:
         except json.JSONDecodeError:
             continue
     return None
-
-
-def _decode(data) -> str:
-    if isinstance(data, bytes):
-        return data.decode(errors="replace")
-    return data or ""

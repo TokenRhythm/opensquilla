@@ -1,9 +1,14 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 
-import { useChatDraftPersistence } from './useChatDraftPersistence'
+import {
+  RECENT_DRAFT_SESSION_KEY,
+  recentDraftSessionKey,
+  recoverableDraftSessionKey,
+  useChatDraftPersistence,
+} from './useChatDraftPersistence'
 
 function mount(sessionKey: ReturnType<typeof ref<string>>, inputText: ReturnType<typeof ref<string>>) {
   const scope = effectScope()
@@ -17,6 +22,7 @@ function mount(sessionKey: ReturnType<typeof ref<string>>, inputText: ReturnType
 }
 
 afterEach(() => {
+  vi.unstubAllGlobals()
   localStorage.clear()
 })
 
@@ -37,6 +43,35 @@ describe('useChatDraftPersistence', () => {
     await nextTick()
 
     expect(inputText2.value).toBe('half-written instruction')
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBe('agent:main:webchat:a')
+  })
+
+  it('preserves a fresh draft during namespace binding even when storage is unavailable', async () => {
+    const sessionKey = ref('agent:main:webchat:provisional')
+    const inputText = ref('Typing while Hello is delayed')
+    const { api, scope } = mount(sessionKey, inputText)
+    const denied = () => { throw new Error('storage denied') }
+    vi.stubGlobal('localStorage', { getItem: denied, setItem: denied, removeItem: denied })
+    try {
+      api.rebindCurrentDraft(`agent:main:webchat:guest:${'a'.repeat(64)}:provisional`)
+      inputText.value += ', then continuing'
+      await nextTick()
+      expect(inputText.value).toBe('Typing while Hello is delayed, then continuing')
+    } finally { scope.stop() }
+  })
+
+  it('does not carry a namespace rebind into an intervening history navigation', async () => {
+    const sessionKey = ref('agent:main:webchat:provisional')
+    const inputText = ref('Fresh draft')
+    const { api, scope } = mount(sessionKey, inputText)
+    const historyKey = 'agent:main:webchat:history'
+    api.saveDraft(historyKey, 'Existing history reply')
+    try {
+      api.rebindCurrentDraft(`agent:main:webchat:guest:${'a'.repeat(64)}:provisional`)
+      sessionKey.value = historyKey
+      await nextTick()
+      expect(inputText.value).toBe('Existing history reply')
+    } finally { scope.stop() }
   })
 
   it('keeps drafts isolated per session and does not clobber typed text', async () => {
@@ -58,6 +93,11 @@ describe('useChatDraftPersistence', () => {
     sessionKey.value = 'agent:main:webchat:a'
     await nextTick()
     expect(inputText.value).toBe('draft for A')
+
+    // Repeated navigation restores B's untouched editor draft.
+    sessionKey.value = 'agent:main:webchat:b'
+    await nextTick()
+    expect(inputText.value).toBe('draft for B')
   })
 
   it('clears the persisted draft once the composer is emptied (after send)', async () => {
@@ -72,6 +112,98 @@ describe('useChatDraftPersistence', () => {
     inputText.value = '' // send path empties the composer
     await nextTick()
     expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:a')).toBeNull()
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBeNull()
+  })
+
+  it('points to only the most recently edited non-empty draft', async () => {
+    const sessionKey = ref('agent:main:webchat:a')
+    const inputText = ref('')
+    mount(sessionKey, inputText)
+
+    inputText.value = 'draft A'
+    await nextTick()
+    sessionKey.value = 'agent:main:webchat:b'
+    await nextTick()
+    inputText.value = 'draft B'
+    await nextTick()
+
+    expect(recentDraftSessionKey()).toBe('agent:main:webchat:b')
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:a')).toBe('draft A')
+  })
+
+  it('validates a scoped draft without changing the recent pointer', () => {
+    const scopedKey = 'agent:main:webchat:scoped'
+    const recentKey = 'agent:main:webchat:recent'
+    localStorage.setItem(`opensquilla.chat.draft:${scopedKey}`, 'scoped draft')
+    localStorage.setItem(`opensquilla.chat.draft:${recentKey}`, 'recent draft')
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, recentKey)
+
+    expect(recoverableDraftSessionKey(scopedKey)).toBe(scopedKey)
+    expect(recoverableDraftSessionKey('agent:main:webchat:missing')).toBe('')
+    expect(recoverableDraftSessionKey('not-a-session')).toBe('')
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBe(recentKey)
+  })
+
+  it('explicitly discards the recoverable draft without scanning other drafts', async () => {
+    localStorage.setItem('opensquilla.chat.draft:agent:main:webchat:older', 'older draft')
+    const sessionKey = ref('agent:main:webchat:recent')
+    const inputText = ref('')
+    const { api } = mount(sessionKey, inputText)
+    inputText.value = 'discard me'
+    await nextTick()
+
+    api.discardRecentDraft()
+
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBeNull()
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:recent')).toBeNull()
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:older')).toBe('older draft')
+  })
+
+  it('does not recreate a discarded pointer while an explicit new task changes session', async () => {
+    const sessionKey = ref('agent:main:webchat:discarded')
+    const inputText = ref('')
+    const { api } = mount(sessionKey, inputText)
+    inputText.value = 'discard before switching'
+    await nextTick()
+
+    // Match ChatView's explicit-new ordering: empty and discard before the
+    // provisional session key changes.
+    inputText.value = ''
+    api.clearDraft(sessionKey.value)
+    api.discardRecentDraft()
+    sessionKey.value = 'agent:main:webchat:fresh'
+    await nextTick()
+
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBeNull()
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:discarded')).toBeNull()
+  })
+
+  it('does not delete another session draft when the current session starts a new task', () => {
+    const otherKey = 'agent:main:webchat:other'
+    localStorage.setItem(`opensquilla.chat.draft:${otherKey}`, 'keep this draft')
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, otherKey)
+    const sessionKey = ref('agent:main:webchat:current')
+    const inputText = ref('')
+    const { api } = mount(sessionKey, inputText)
+
+    api.clearDraft(sessionKey.value)
+
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBe(otherKey)
+    expect(localStorage.getItem(`opensquilla.chat.draft:${otherKey}`)).toBe('keep this draft')
+  })
+
+  it('retires a corrupt or stale recovery pointer', () => {
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, '')
+    expect(recentDraftSessionKey()).toBe('')
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBeNull()
+
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, 'not-a-session')
+    expect(recentDraftSessionKey()).toBe('')
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBeNull()
+
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, 'agent:main:webchat:missing')
+    expect(recentDraftSessionKey()).toBe('')
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBeNull()
   })
 
   it('does not overwrite text already typed in the newly-active session', async () => {

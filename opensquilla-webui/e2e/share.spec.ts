@@ -1,5 +1,7 @@
 import { test, expect, type Page } from '@playwright/test'
 
+import { chatHistoryPayload } from './support/session-read-fixtures'
+
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eshare'
 const SYSTEM_ONLY_SESSION_KEY = 'agent:main:webchat:e2esharesysonly'
@@ -18,6 +20,9 @@ type SeededMessage = {
     output_tokens: number
     cost_usd: number
   }
+  turn_context?: {
+    turn_id: string
+  }
 }
 
 interface ShareStageProbe {
@@ -32,6 +37,7 @@ interface ShareStageProbe {
   roles: string[]
   costEls: number
   modelEls: number
+  usageDetailEls: number
   finalVisibleContentRole: string | null
   finalVisibleContentSelector: string | null
   finalVisibleContentBottomGap: number | null
@@ -43,6 +49,7 @@ interface ShareStageProbe {
 
 interface SeedHistoryOptions {
   includeAssistantMeta?: boolean
+  includeTurnOutcome?: boolean
   trailingUser?: boolean
 }
 
@@ -52,6 +59,9 @@ interface SeedHistoryOptions {
 // withMessages=false the thread holds a single system message: the header
 // renders but no bubble is shareable.
 async function seedHistory(page: Page, withMessages: boolean, options: SeedHistoryOptions = {}) {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
   await page.routeWebSocket(/\/ws$/, ws => {
     const server = ws.connectToServer()
     const historyIds = new Set<string>()
@@ -96,6 +106,9 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
                       },
                     }
                   : {}),
+                ...(options.includeTurnOutcome
+                  ? { turn_context: { turn_id: 'turn-share-assistant' } }
+                  : {}),
               },
             ]
             : [
@@ -114,10 +127,25 @@ async function seedHistory(page: Page, withMessages: boolean, options: SeedHisto
               timestamp: now - 60,
             })
           }
-          frame.payload = {
+          const upstreamPayload = frame.payload && typeof frame.payload === 'object'
+            ? frame.payload as Record<string, unknown>
+            : {}
+          frame.payload = chatHistoryPayload(messages, {
+            ...upstreamPayload,
             messages,
-            has_more: false,
-          }
+            loaded_count: messages.length,
+            ...(options.includeTurnOutcome
+              ? {
+                  turn_outcomes: [{
+                    turn_id: 'turn-share-assistant',
+                    status: 'completed',
+                    started_at: now - 122,
+                    finished_at: now - 120,
+                    outcome: { kind: 'completed' },
+                  }],
+                }
+              : {}),
+          })
           ws.send(JSON.stringify(frame))
           return
         }
@@ -189,6 +217,9 @@ async function installShareStageProbe(page: Page) {
               roles: clones.map(cloneRole).filter(Boolean) as string[],
               costEls: node.querySelectorAll('.msg-meta__cost').length,
               modelEls: node.querySelectorAll('.msg-meta__model').length,
+              usageDetailEls: node.querySelectorAll(
+                '.turn-usage-details, [data-turn-usage-details]',
+              ).length,
               finalVisibleContentRole: cloneRole(lastClone),
               finalVisibleContentSelector: final.selector,
               finalVisibleContentBottomGap: finalBox ? stageBox.bottom - finalBox.bottom : null,
@@ -448,10 +479,17 @@ test.describe('Share mode interaction shell', () => {
 
   test('Save opens the preview modal; Escape closes only the modal and keeps share mode', async ({ page }) => {
     await installShareStageProbe(page)
-    await openSeededSession(page, SESSION_KEY, true, { includeAssistantMeta: true })
+    await openSeededSession(page, SESSION_KEY, true, {
+      includeAssistantMeta: true,
+      includeTurnOutcome: true,
+    })
+    const usageTrigger = page.locator('.msg-ai .msg-meta__more-btn')
+    await expect(usageTrigger).toBeVisible()
+    await usageTrigger.click()
+    const usagePopover = page.locator('.msg-ai .msg-meta-popover')
+    await expect(usagePopover).toContainText(SEEDED_MODEL)
+    await expect(usagePopover).toContainText(SEEDED_COST)
     await enterShareMode(page)
-    await expect(page.locator('.chat-thread .msg-meta__model')).toContainText(SEEDED_MODEL)
-    await expect(page.locator('.chat-thread .msg-meta__cost')).toContainText(SEEDED_COST)
 
     // Select both bubbles, then Save renders the PNG and opens the preview.
     await page.locator('.msg-user-bubble').first().click()
@@ -490,13 +528,16 @@ test.describe('Share mode interaction shell', () => {
     expect(probe!.stageWidth).toBe(probe!.metrics.contentWidth)
     expect(probe!.roles).toEqual(['user', 'assistant'])
     expect(probe!.finalVisibleContentRole).toBe('assistant')
-    expect(probe!.finalVisibleContentSelector).toBe('.msg-ai-meta')
+    expect(probe!.finalVisibleContentSelector).toBe('.msg-ai-ending')
     expectBottomSafeArea(probe!)
     expectNoExtraInterMessageGap(probe!)
     expect(probe!.costEls).toBe(0)
-    expect(probe!.modelEls).toBeGreaterThan(0)
-    expect(probe!.text).toContain(SEEDED_MODEL)
+    expect(probe!.modelEls).toBe(0)
+    expect(probe!.usageDetailEls).toBe(0)
+    expect(probe!.text).not.toContain(SEEDED_MODEL)
     expect(probe!.text).not.toContain(SEEDED_COST)
+    expect(probe!.text).not.toContain('321')
+    expect(probe!.text).not.toContain('45')
     expect(probe!.text).not.toMatch(/\$\d/)
 
     // Escape closes the preview but leaves share mode active (the banner stays),

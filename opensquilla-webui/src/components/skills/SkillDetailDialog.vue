@@ -2,6 +2,7 @@
   <dialog
     ref="dialogRef"
     class="sk-dialog"
+    :aria-label="dialogLabel"
     @click="onBackdropClick"
     @cancel.prevent="requestClose"
     @close="onNativeClose"
@@ -21,7 +22,7 @@
         </button>
       </header>
       <section class="sk-detail__body">
-        <p class="sk-detail__desc">{{ skill.description || '' }}</p>
+        <p class="sk-detail__desc">{{ localizedSkillDescription(skill, String(locale)) }}</p>
 
         <div v-if="isMetaSkill(skill) && skill.triggers && skill.triggers.length" class="sk-detail__section">
           <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.triggers') }}</div>
@@ -142,11 +143,20 @@
 
         <div v-if="installActions.length" class="sk-detail__section">
           <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.install') }}</div>
-          <div v-for="i in installActions" :key="i.id" class="sk-detail__install-row">
+          <div
+            v-for="i in installActions"
+            :key="i.id"
+            class="sk-detail__install-row"
+            :class="{ 'sk-detail__install-row--toolchain': usesMetaToolchainSetup(i.kind) }"
+          >
             <span>{{ i.label || t('cronSkills.skillDetail.installVia', { kind: i.kind }) }}{{ i.bins?.length ? ` (${i.bins.join(', ')})` : '' }}</span>
+            <span v-if="usesMetaToolchainSetup(i.kind)" class="sk-dim sk-detail__toolchain-guidance">
+              {{ t('cronSkills.skillDetail.toolchainSetupGuidance') }}
+            </span>
             <button
+              v-else
               class="btn btn--primary btn--sm"
-              :disabled="installingDepsId === i.id"
+              :disabled="mutationDisabled || installingDepsId === i.id"
               @click="emit('installDeps', skill.name, i.id)"
             >
               {{ installingDepsId === i.id ? t('cronSkills.skillDetail.installing') : t('cronSkills.skillDetail.installVia', { kind: i.kind }) }}
@@ -167,7 +177,7 @@
       </section>
       <footer class="sk-detail__foot">
         <small v-if="skill.file_path" class="sk-dim sk-detail__path">{{ skill.file_path }}</small>
-        <button v-if="skill.layer === 'managed'" class="btn btn--sm" :disabled="uninstallingName === skill.name" @click="emit('uninstall', skill.name)">
+        <button v-if="skill.layer === 'managed'" class="btn btn--sm" :disabled="mutationDisabled || uninstallingName === skill.name" @click="emit('uninstall', skill.name, skill.install_id || '')">
           {{ uninstallingName === skill.name ? t('cronSkills.skillDetail.removing') : t('cronSkills.skillDetail.remove') }}
         </button>
       </footer>
@@ -186,6 +196,7 @@ import type { Proposal, Skill } from '@/types/skills'
 import {
   isMetaSkill,
   installActionsForCurrentDependencies,
+  localizedSkillDescription,
   skillDependencyCounts,
   skillDependencySummary,
   skillLayerHelp,
@@ -194,7 +205,7 @@ import {
   skillStatusChipText,
 } from '@/composables/skills/useSkillsCatalog'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 const props = defineProps<{
   skill: Skill | null
@@ -204,15 +215,33 @@ const props = defineProps<{
   installFeedback: string
   installingDepsId: string | null
   uninstallingName: string | null
+  mutationDisabled?: boolean
 }>()
 
 const emit = defineEmits<{
   close: []
   installDeps: [name: string, installId: string]
-  uninstall: [name: string]
+  uninstall: [name: string, installId: string]
 }>()
 
 const dialogRef = ref<HTMLDialogElement | null>(null)
+const dialogLabel = computed(() => {
+  if (props.skill) {
+    return t('cronSkills.skillDetail.dialogLabel', { name: props.skill.name })
+  }
+  if (props.proposal) {
+    return t('cronSkills.proposalDetail.dialogLabel', { id: props.proposal.proposal_id })
+  }
+  return undefined
+})
+
+function isToolchainInstall(kind: string | undefined) {
+  return kind?.trim().toLowerCase() === 'toolchain'
+}
+
+function usesMetaToolchainSetup(kind: string | undefined) {
+  return Boolean(props.skill && isMetaSkill(props.skill) && isToolchainInstall(kind))
+}
 
 const dependencySummary = computed(() => props.skill
   ? skillDependencySummary(props.skill)
@@ -257,6 +286,8 @@ function syncDialog(key = selectionKey()) {
   const dialog = dialogRef.value
   if (!dialog) return
   if (key) {
+    // Watch the selected identity rather than a boolean so a different card
+    // can reopen a dialog that the browser closed independently.
     if (!dialog.open) dialog.showModal()
     return
   }
@@ -271,6 +302,8 @@ function requestClose() {
 }
 
 function onNativeClose() {
+  // Keep parent selection in sync with native close paths so the same card can
+  // be selected again without leaving stale truthy state in the parent.
   if (props.skill || props.proposal) requestClose()
 }
 

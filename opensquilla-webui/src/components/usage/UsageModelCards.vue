@@ -16,8 +16,7 @@
       >
         <header class="usage-model-card__head">
           <div class="usage-model-card__id">
-            <span v-if="m.provider" class="usage-model-card__provider">{{ m.provider }}</span>
-            <span class="usage-model-card__name" :title="m.model">{{ m.name }}</span>
+            <span class="usage-model-card__name" :title="m.model">{{ m.model }}</span>
           </div>
           <span class="usage-model-card__share" :title="t('usageLogs.models.shareOfTotalCost')">{{ m.share.toFixed(1) }}%</span>
         </header>
@@ -25,12 +24,20 @@
           <span class="usage-model-card__share-fill" :style="`width:${m.share.toFixed(1)}%`" />
         </div>
         <dl class="usage-model-card__rows">
-          <div><dt>{{ t('usageLogs.metrics.tokens') }}</dt><dd class="usage-mono">{{ m.totalTokens.toLocaleString() }}</dd></div>
+          <div class="usage-model-card__total">
+            <div class="usage-model-card__metric">
+              <dt>{{ t('usageLogs.metrics.tokens') }}</dt>
+              <dd class="usage-mono">{{ m.totalTokens.toLocaleString() }}</dd>
+            </div>
+            <div class="usage-model-card__metric">
+              <dt>{{ t('usageLogs.metrics.sessions') }}</dt>
+              <dd>{{ m.sessions }}</dd>
+            </div>
+          </div>
           <div><dt>{{ t('usageLogs.metrics.input') }}</dt><dd class="usage-mono usage-dim">{{ m.inputTokens.toLocaleString() }}</dd></div>
           <div><dt>{{ t('usageLogs.metrics.output') }}</dt><dd class="usage-mono usage-dim">{{ m.outputTokens.toLocaleString() }}</dd></div>
-          <div v-if="m.cacheReadTokens > 0"><dt>{{ t('usageLogs.metrics.cacheRead') }}</dt><dd class="usage-mono usage-dim">{{ m.cacheReadTokens.toLocaleString() }}</dd></div>
-          <div v-if="m.cacheWriteTokens > 0"><dt>{{ t('usageLogs.metrics.cacheWrite') }}</dt><dd class="usage-mono usage-dim">{{ m.cacheWriteTokens.toLocaleString() }}</dd></div>
-          <div><dt>{{ t('usageLogs.metrics.sessions') }}</dt><dd>{{ m.sessions }}</dd></div>
+          <div><dt>{{ t('usageLogs.metrics.cacheRead') }}</dt><dd class="usage-mono usage-dim">{{ m.cacheReadTokens.toLocaleString() }}</dd></div>
+          <div><dt>{{ t('usageLogs.metrics.cacheWrite') }}</dt><dd class="usage-mono usage-dim">{{ m.cacheWriteTokens.toLocaleString() }}</dd></div>
           <div class="usage-model-card__cost-row">
             <dt>{{ t('usageLogs.metrics.cost') }}</dt>
             <dd class="usage-mono usage-cost">

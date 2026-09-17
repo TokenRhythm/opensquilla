@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sessions/sessions-messages-snapshot-read.schema.json",
+  "title": "OpenSquilla sessions.messages.snapshot.read Contract",
+  "description": "Bounded connection-scoped frozen snapshot segments; the existing snapshot result is unchanged.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/SessionsMessagesSnapshotReadRequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/SessionsMessagesSnapshotReadResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.75.1",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "15.0.4"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.17.1",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.messages.snapshot.read",
+    "kind": "query",
+    "scope": "operator.read",
+    "guestAllowed": true,
+    "idempotency": "read-only",
+    "timeout": {
+      "policy": "caller"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "sessions.messages.snapshot.read"
+    },
+    "request": "#/$defs/SessionsMessagesSnapshotReadRequestFrame",
+    "params": "#/$defs/SessionsMessagesSnapshotReadParams",
+    "response": "#/$defs/SessionsMessagesSnapshotReadResponseFrame",
+    "result": "#/$defs/SessionsMessagesSnapshotReadResult",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "SNAPSHOT_BUSY"
+      },
+      {
+        "code": "SNAPSHOT_EXPIRED"
+      },
+      {
+        "code": "SNAPSHOT_STALE"
+      },
+      {
+        "code": "SNAPSHOT_TOO_LARGE"
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "SessionsMessagesSnapshotReadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "sync_revision"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "sync_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "snapshot_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "segment_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 133
+        }
+      }
+    },
+    "SessionsMessagesSnapshotReadResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "sync_revision",
+        "snapshot_id",
+        "segment_index",
+        "segment_count",
+        "byte_length",
+        "encoding",
+        "data",
+        "stream_generation",
+        "current_stream_seq",
+        "task_id",
+        "session_id",
+        "session_epoch"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "sync_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "snapshot_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "segment_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 133
+        },
+        "segment_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 134
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 26214400
+        },
+        "encoding": {
+          "const": "base64-json-utf8"
+        },
+        "data": {
+          "type": "string",
+          "maxLength": 262144
+        },
+        "stream_generation": {
+          "type": "string"
+        },
+        "current_stream_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session_id": { "type": ["string", "null"] },
+        "session_epoch": { "type": ["integer", "null"], "minimum": 0 },
+        "delivery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["delivery_epoch", "delivery_id"],
+          "properties": {
+            "delivery_epoch": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "delivery_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+          }
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "accepted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "SessionsMessagesSnapshotReadRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "sessions.messages.snapshot.read"
+        },
+        "params": {
+          "$ref": "#/$defs/SessionsMessagesSnapshotReadParams"
+        }
+      }
+    },
+    "SessionsMessagesSnapshotReadOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/SessionsMessagesSnapshotReadResult"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "SessionsMessagesSnapshotReadErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "SessionsMessagesSnapshotReadResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SessionsMessagesSnapshotReadOkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/SessionsMessagesSnapshotReadErrorResponseFrame"
+        }
+      ]
+    }
+  }
+}

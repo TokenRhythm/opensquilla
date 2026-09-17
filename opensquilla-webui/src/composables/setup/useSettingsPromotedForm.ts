@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue'
+import type { ConfigureAudio } from '@/modules/setupWorkflow'
 
 // Curated keys promoted into Settings beyond the classic wizard fields.
 // Timeout and memory capture persist through the config.patch RPC as
@@ -75,6 +76,12 @@ export function useSettingsPromotedForm() {
   }
 
   function initFromConfig(config: PromotedConfigData) {
+    initProviderFromConfig(config)
+    initMemoryCaptureFromConfig(config)
+    initAudioFromConfig(config)
+  }
+
+  function initProviderFromConfig(config: PromotedConfigData) {
     const timeout = Number(config.llm_request_timeout_seconds)
     llmTimeoutSeconds.value = Number.isFinite(timeout) && timeout >= 1 ? timeout : DEFAULT_LLM_TIMEOUT_SECONDS
     // Seed the context-window field from the saved provider+model override.
@@ -83,7 +90,15 @@ export function useSettingsPromotedForm() {
       String(config.llm?.provider || ''),
       String(config.llm?.model || ''),
     )
+    commitProviderBaselines()
+  }
+
+  function initMemoryCaptureFromConfig(config: PromotedConfigData) {
     memoryAutoCapture.value = config.memory?.auto_capture_enabled !== false
+    captureBaseline.value = memoryAutoCapture.value
+  }
+
+  function initAudioFromConfig(config: PromotedConfigData) {
     audioEnabled.value = config.audio?.enabled === true
     const audioProvider = config.audio?.providers?.[audioProviderId] || {}
     audioApiKeyEnv.value = audioProvider.api_key_env || ''
@@ -96,10 +111,12 @@ export function useSettingsPromotedForm() {
     audioKeyConfigured.value = Boolean(audioProvider.api_key)
     audioApiKey.value = ''
 
+    audioBaseline.value = audioSerialized.value
+  }
+
+  function commitProviderBaselines() {
     timeoutBaseline.value = llmTimeoutSeconds.value
     contextWindowBaseline.value = contextWindowTokens.value
-    captureBaseline.value = memoryAutoCapture.value
-    audioBaseline.value = audioSerialized.value
   }
 
   function setLlmTimeoutSeconds(value: number) {
@@ -157,11 +174,13 @@ export function useSettingsPromotedForm() {
     return { 'memory.auto_capture_enabled': memoryAutoCapture.value }
   }
 
-  function audioPayload(): Record<string, unknown> {
-    const params: Record<string, unknown> = { providerId: audioProviderId, enabled: audioEnabled.value }
+  function audioPayload(): ConfigureAudio {
+    // Configuration implies enablement for new clients. Older clients may
+    // continue sending an explicit `enabled` field to the compatible RPC.
+    const params: ConfigureAudio = { providerId: audioProviderId }
     // One-time paste only; never echo the redacted stored key back.
     if (audioApiKey.value) params.apiKey = audioApiKey.value
-    if (audioApiKeyEnv.value.trim()) params.apiKeyEnv = audioApiKeyEnv.value.trim()
+    else if (audioApiKeyEnv.value.trim()) params.apiKeyEnv = audioApiKeyEnv.value.trim()
     // Empty is "keep current" backend-side, so only send populated tuning fields.
     if (audioBaseUrl.value.trim()) params.baseUrl = audioBaseUrl.value.trim()
     if (audioTtsVoice.value.trim()) params.ttsVoice = audioTtsVoice.value.trim()
@@ -187,6 +206,9 @@ export function useSettingsPromotedForm() {
     captureDirty,
     audioDirty,
     initFromConfig,
+    initProviderFromConfig,
+    initMemoryCaptureFromConfig,
+    initAudioFromConfig,
     setLlmTimeoutSeconds,
     setContextWindowTokens,
     reseedContextWindow,

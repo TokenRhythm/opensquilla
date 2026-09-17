@@ -13,7 +13,9 @@ DEFAULT_DENYLIST: list[str] = [
     r"dd\s+if=",  # raw disk writes
     r"shutdown\b",  # system shutdown
     r"reboot\b",  # system reboot
-    r"halt\b",  # system halt
+    # Match the executable token, but not benign option names such as
+    # XeLaTeX's ``-halt-on-error``.
+    r"(?<!-)\bhalt\b",  # system halt
     r":\(\)\s*\{.*:\|:.*\}",  # fork bomb
     r">\s*/dev/sda",  # overwrite block device
     r"chmod\s+-R\s+777\s+/",  # world-writable root
@@ -86,6 +88,84 @@ class PolicyResult:
     needs_approval: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Gateway self-termination guard
+# ---------------------------------------------------------------------------
+# Builtin tools execute inside the gateway process, so os.getpid() here IS the
+# gateway PID. Agents that fall back to shell commands after a failed config
+# attempt have been observed running `Stop-Process -Id <gateway pid> -Force`
+# (and the taskkill/kill equivalents), killing the very process that hosts
+# them. This guard is structural: it runs before the allow/deny/warn layers,
+# cannot be disabled through the OPENSQUILLA_SAFE_BIN_* environment knobs, and
+# applies in every host mode, including full/auto host access. Other PIDs and
+# process names remain the user's business.
+
+_SELF_KILL_GUIDANCE = (
+    "the gateway process may not be terminated from a tool: restarts are "
+    "managed by the desktop supervisor (or your service manager). Do not kill "
+    "the gateway or edit its config.toml through shell commands — use the "
+    "dedicated configuration tools or the Settings UI for configuration "
+    "changes."
+)
+
+# Process-name fragments that unambiguously refer to the gateway.
+_GATEWAY_NAME_FRAGMENT = re.compile(r"opensquilla", re.IGNORECASE)
+
+# PID-bearing kill invocations. Each pattern captures the argument tail that
+# carries PIDs; digits found there are compared against the gateway PID.
+_PID_KILL_PATTERNS: list[re.Pattern[str]] = [
+    # PowerShell: Stop-Process -Id 123[,456]  (also the spps alias)
+    re.compile(r"\b(?:stop-process|spps)\b(?P<tail>[^|;\n&]*)", re.IGNORECASE),
+    # Windows: taskkill /PID 123 [/PID 456]
+    re.compile(r"\btaskkill\b(?P<tail>[^|;\n&]*)", re.IGNORECASE),
+    # POSIX: kill [-9|-SIGTERM] 123 456 — also path-invoked (/bin/kill), but
+    # not words merely ending in "kill" (taskkill has its own pattern above).
+    re.compile(r"(?<![\w.-])(?:[^\s|;&]*[/\\])?kill\b(?P<tail>[^|;\n&]*)", re.IGNORECASE),
+]
+
+# Name-targeting kill invocations (no PID needed to hit the gateway).
+_NAME_KILL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?:stop-process|spps)\b[^|;\n&]*-(?:name|processname)\s+(?P<name>[^\s|;&]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\btaskkill\b[^|;\n&]*/im\s+(?P<name>[^\s|;&]+)", re.IGNORECASE),
+    re.compile(r"\b(?:pkill|killall)\b(?P<name>[^|;\n&]*)", re.IGNORECASE),
+]
+
+_PID_TOKEN = re.compile(r"(?<![\w.-])(\d{2,})(?![\w.-])")
+
+
+def check_gateway_self_kill(command: str, *, gateway_pid: int | None = None) -> str | None:
+    """Return a refusal reason when ``command`` targets the gateway process.
+
+    ``gateway_pid`` is injectable for tests; it defaults to the current
+    process, which is the gateway for in-process builtin tools.
+    """
+    pid = os.getpid() if gateway_pid is None else gateway_pid
+    for pattern in _PID_KILL_PATTERNS:
+        for match in pattern.finditer(command):
+            tail = match.group("tail") or ""
+            # `kill` as a substring of e.g. `taskkill` is prevented by the
+            # lookbehind; `kill -0` style signal flags are digits too, so
+            # only compare tokens that stand alone as candidate PIDs and are
+            # not signal numbers attached to a dash.
+            tail_wo_signals = re.sub(r"-\s*\d+", " ", tail)
+            for token in _PID_TOKEN.findall(tail_wo_signals):
+                if int(token) == pid:
+                    return (
+                        f"command targets the gateway process (pid {pid}): {_SELF_KILL_GUIDANCE}"
+                    )
+    for pattern in _NAME_KILL_PATTERNS:
+        for match in pattern.finditer(command):
+            target = match.group("name") or ""
+            if _GATEWAY_NAME_FRAGMENT.search(target):
+                return (
+                    f"command targets the gateway by process name: {_SELF_KILL_GUIDANCE}"
+                )
+    return None
+
+
 @dataclass
 class SafeBinPolicy:
     denylist: list[str]  # regex patterns — if any match, command is denied
@@ -114,6 +194,12 @@ class SafeBinPolicy:
 
     def check(self, command: str) -> PolicyResult:
         """Check command against policy layers: allowlist → denylist → warnlist."""
+        # Structural guard first: killing the gateway from inside a tool is
+        # never valid, regardless of how the env-configurable layers are set.
+        self_kill = check_gateway_self_kill(command)
+        if self_kill is not None:
+            return PolicyResult(allowed=False, reason=self_kill)
+
         # Allowlist check: if non-empty, command must match at least one pattern
         if self.allowlist:
             matched = any(

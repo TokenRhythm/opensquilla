@@ -39,13 +39,20 @@ def _make_openclaw_source(root: Path) -> Path:
     return source
 
 
+@pytest.mark.parametrize("old_defaults", [False, True])
 def test_pristine_bootstrap_templates_do_not_block_migration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    old_defaults: bool,
 ) -> None:
     source = _make_openclaw_source(tmp_path)
     home = tmp_path / "opensquilla-home"
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
     ensure_agent_workspace(home / "workspace")
+    if old_defaults:
+        fixtures = Path(__file__).parents[1] / "fixtures" / "workspace_md_retirement"
+        for name in ("AGENTS", "SOUL"):
+            (home / "workspace" / f"{name}.md").write_bytes((fixtures / f"{name}.txt").read_bytes())
     # Confirm the templates were seeded (precondition for the bug).
     for filename in ("SOUL.md", "USER.md", "AGENTS.md", "MEMORY.md"):
         assert (home / "workspace" / filename).is_file()
@@ -58,7 +65,7 @@ def test_pristine_bootstrap_templates_do_not_block_migration(
     for kind in ("soul", "user-profile", "workspace-agents", "memory"):
         assert statuses.get(kind) == "migrated", (
             f"kind={kind} expected migrated, got {statuses.get(kind)!r}. "
-            f"items: {[i for i in report['items'] if i['kind']==kind]}"
+            f"items: {[i for i in report['items'] if i['kind'] == kind]}"
         )
 
     # Bootstrap-template replacement is announced via the details flag so the

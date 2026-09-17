@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -13,6 +14,10 @@ from typer.testing import CliRunner
 from opensquilla.cli.main import app as root_app
 from opensquilla.cli.recovery_cmd import recovery_app
 from opensquilla.recovery.cleanup import cleanup_inspect
+from opensquilla.recovery.locking import ProfileOperationLock
+
+# Keep the contract bounded while allowing for cold CLI imports on saturated CI runners.
+_RECOVERY_SUBPROCESS_TIMEOUT_SECONDS = 30
 
 
 def _workspace(path: Path, marker: str) -> Path:
@@ -46,11 +51,15 @@ def test_recovery_command_surface_is_registered_with_complete_offline_actions() 
         "choose-workspace",
         "apply-settings",
         "recover-settings",
+        "recover-config",
         "restore-profile",
         "recover-transaction",
+        "consolidate-profiles",
+        "acknowledge-profile-credential",
         "abandon-cleanup",
         "cleanup-inspect",
         "cleanup-apply",
+        "sandbox-upgrade-status",
     }
 
 
@@ -107,6 +116,63 @@ def test_recovery_subprocess_routes_before_cwd_or_profile_dotenv(
     assert payload["effective_workspace"] == str(workspace)
 
 
+def test_packaged_recovery_entry_avoids_runtime_imports(tmp_path: Path) -> None:
+    home = tmp_path / "opensquilla"
+    workspace = _workspace(home / "workspace", "lightweight recovery")
+    (home / "state").mkdir(parents=True)
+    (home / "config.toml").write_text(
+        'state_dir = "state"\nworkspace_dir = "workspace"\n',
+        encoding="utf-8",
+    )
+    repository = Path(__file__).resolve().parents[2]
+    entry = repository / "desktop" / "electron" / "scripts" / "gateway-entry.py"
+    environment = os.environ.copy()
+    environment["OPENSQUILLA_RECOVERY_OFFLINE"] = "1"
+    environment["OPENSQUILLA_USER_STATE_DIR"] = str(tmp_path / "user-state")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(repository / "src"), environment.get("PYTHONPATH", "")) if value
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, runpy, sys\n"
+                "entry, home = sys.argv[1:]\n"
+                "sys.argv = ['gateway-entry.py', 'recovery', 'inspect', "
+                "'--home', home, '--json']\n"
+                "try:\n"
+                "    runpy.run_path(entry, run_name='__main__')\n"
+                "except SystemExit as exc:\n"
+                "    if exc.code not in (None, 0):\n"
+                "        raise\n"
+                "modules = sorted(sys.modules)\n"
+                "print('MODULES=' + json.dumps(modules), file=sys.stderr)\n"
+            ),
+            str(entry),
+            str(home),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=repository,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["effective_workspace"] == str(workspace)
+    modules_line = next(
+        line for line in completed.stderr.splitlines() if line.startswith("MODULES=")
+    )
+    modules = json.loads(modules_line.removeprefix("MODULES="))
+    assert not any(
+        name == prefix or name.startswith(prefix + ".")
+        for prefix in ("opensquilla.gateway", "opensquilla.engine", "sqlalchemy", "numpy")
+        for name in modules
+    )
+
+
 def test_inspect_command_emits_fixed_json_protocol(tmp_path: Path) -> None:
     home = tmp_path / "opensquilla"
     workspace = _workspace(home / "workspace", "current identity")
@@ -133,9 +199,120 @@ def test_inspect_command_emits_fixed_json_protocol(tmp_path: Path) -> None:
         "allowed_actions",
         "transaction_id",
         "revision",
+        "detail",
     }
     assert payload["outcome"] == "ready"
     assert payload["effective_workspace"] == str(workspace)
+
+
+def test_sandbox_upgrade_status_treats_missing_snapshot_as_non_blocking(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "opensquilla"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        '[sandbox]\nrun_mode = "safe"\n',
+        encoding="utf-8",
+    )
+    (home / ".sandbox-upgrade-v2.json").write_text(
+        json.dumps({"migrationVersion": 2, "status": "committed"}),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        recovery_app,
+        ["sandbox-upgrade-status", "--home", str(home), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["status"] == "legacy_artifacts_present"
+    assert payload["snapshotPath"] is None
+    assert payload["error"] is None
+
+
+def test_recover_config_command_repairs_corrupt_config_over_json_protocol(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace", "current identity")
+    (home / "state").mkdir(parents=True)
+    good = 'state_dir = "state"\nworkspace_dir = "workspace"\n'
+    (home / "config.toml.backup.20260101000000000000").write_text(good, encoding="utf-8")
+    (home / "config.toml").write_text("workspace_dir = [\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        recovery_app,
+        ["recover-config", "--home", str(home), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "ready"
+    assert (home / "config.toml").read_text(encoding="utf-8") == good
+    assert list(home.glob("config.toml.corrupt.*"))
+
+
+def test_mutating_command_lock_timeout_waits_out_a_transient_writer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """--lock-timeout rides out a short-lived writer instead of failing closed.
+
+    Desktop startup passes a small bound so a predecessor still releasing its
+    lease resolves silently; the default stays 0.0 (immediate
+    profile_lock_busy).
+    """
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace", "current identity")
+    (home / "state").mkdir(parents=True)
+    good = 'state_dir = "state"\nworkspace_dir = "workspace"\n'
+    (home / "config.toml.backup.20260101000000000000").write_text(good, encoding="utf-8")
+    (home / "config.toml").write_text("workspace_dir = [\n", encoding="utf-8")
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_profile_lock() -> None:
+        # The profile lock is reentrant per thread, so contention needs a
+        # separate writer thread.
+        with ProfileOperationLock(home):
+            held.set()
+            release.wait(timeout=30)
+
+    writer = threading.Thread(target=hold_profile_lock)
+    writer.start()
+    try:
+        assert held.wait(timeout=10)
+
+        busy = CliRunner().invoke(
+            recovery_app,
+            ["recover-config", "--home", str(home), "--json"],
+        )
+        assert busy.exit_code == 2, busy.output
+        assert json.loads(busy.stdout)["stable_code"] == "profile_lock_busy"
+
+        releaser = threading.Timer(0.3, release.set)
+        releaser.start()
+        try:
+            result = CliRunner().invoke(
+                recovery_app,
+                ["recover-config", "--home", str(home), "--lock-timeout", "10", "--json"],
+            )
+        finally:
+            releaser.cancel()
+    finally:
+        release.set()
+        writer.join(timeout=10)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["outcome"] == "ready"
+    assert (home / "config.toml").read_text(encoding="utf-8") == good
 
 
 def test_cleanup_inspect_command_emits_complete_read_only_inventory(tmp_path: Path) -> None:
@@ -319,7 +496,7 @@ def test_delete_all_helper_waits_for_parent_pipe_eof_before_reinspection(
         process.stdin.write(_cleanup_approval(inspected))
         process.stdin.flush()
         process.stdin.close()
-        assert process.wait(timeout=10) == 0
+        assert process.wait(timeout=_RECOVERY_SUBPROCESS_TIMEOUT_SECONDS) == 0
         assert process.stdout is not None
         payload = json.loads(process.stdout.read())
         assert payload["outcome"] == "complete"
@@ -391,7 +568,7 @@ def test_delete_all_helper_allows_confirmed_chromium_entry_to_disappear_at_exit(
         process.stdin.write(_cleanup_approval(inspected))
         process.stdin.flush()
         process.stdin.close()
-        assert process.wait(timeout=10) == 0
+        assert process.wait(timeout=_RECOVERY_SUBPROCESS_TIMEOUT_SECONDS) == 0
         assert process.stdout is not None
         payload = json.loads(process.stdout.read())
         assert payload["outcome"] == "complete"
@@ -463,7 +640,7 @@ def test_delete_all_helper_refuses_a_new_unconfirmed_scope_after_parent_exit(
         process.stdin.write(_cleanup_approval(inspected))
         process.stdin.flush()
         process.stdin.close()
-        assert process.wait(timeout=10) == 2
+        assert process.wait(timeout=_RECOVERY_SUBPROCESS_TIMEOUT_SECONDS) == 2
         assert process.stdout is not None
         payload = json.loads(process.stdout.read())
         assert payload["outcome"] == "blocked"

@@ -12,6 +12,7 @@ Three contracts:
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -478,6 +479,597 @@ async def test_run_dag_emits_three_callback_types() -> None:
     assert ("b", "ok") in finish_calls
     assert len(failover_calls) == 1
     assert failover_calls[0][:2] == ("a", "b")
+
+
+@pytest.mark.asyncio
+async def test_failed_fallback_replay_skips_paid_primary_and_runs_only_fallback() -> None:
+    from types import SimpleNamespace
+
+    from opensquilla.engine.agent import _trusted_meta_replay_seed_outputs
+    from opensquilla.skills.meta.events import _StepDone
+    from opensquilla.skills.meta.replay_safety import encode_paid_replay_safety
+    from opensquilla.skills.meta.scheduler import run_dag
+    from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult, MetaStep
+
+    plan = MetaPlan(
+        name="paid-fallback-replay",
+        triggers=("x",),
+        priority=10,
+        steps=(
+            MetaStep(
+                id="paid",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                on_failure="local_fallback",
+                side_effect="external_paid_submit",
+            ),
+            MetaStep(id="local_fallback", skill="local-renderer", kind="agent"),
+            MetaStep(
+                id="deliver",
+                skill="delivery",
+                kind="agent",
+                # Real workflows normally depend on the primary alias only;
+                # successful failover resolves that alias for downstream work.
+                depends_on=("paid",),
+            ),
+        ),
+    )
+    persisted = (
+        SimpleNamespace(
+            step_id="paid",
+            status="substituted",
+            substitute_step_id="local_fallback",
+            output_text=None,
+            error=encode_paid_replay_safety("lost POST response", safe_no_submit=False),
+            truncated_fields=(),
+        ),
+        SimpleNamespace(
+            step_id="local_fallback",
+            status="failed",
+            substitute_step_id=None,
+            output_text=None,
+            error="ffmpeg failed",
+            truncated_fields=(),
+        ),
+    )
+    aliases: dict[str, str] = {}
+    seeds = _trusted_meta_replay_seed_outputs(
+        plan=plan,
+        persisted_steps=persisted,
+        failed_step_id="local_fallback",
+        replay_failover_aliases=aliases,
+    )
+    calls: list[str] = []
+    fallback_completed = False
+
+    async def dispatch_stub(step, effective_skill, inputs, outputs):
+        nonlocal fallback_completed
+        calls.append(step.id)
+        if step.id == "paid":
+            raise AssertionError("paid primary must never be resubmitted")
+        if step.id == "local_fallback":
+            # With parallel scheduling, an empty primary seed used to release
+            # `deliver` during this await. The primary must stay dependency-
+            # pending until this fallback has produced the aliased output.
+            await asyncio.sleep(0.02)
+            fallback_completed = True
+        if step.id == "deliver":
+            assert fallback_completed is True
+            assert outputs["paid"] == "output:local_fallback"
+        yield _StepDone(text=f"output:{step.id}")
+
+    async def preface_stub(step_id: str, effective_skill: str):
+        if False:
+            yield None
+
+    result: MetaResult | None = None
+    async for event in run_dag(
+        MetaMatch(plan=plan, inputs={}),
+        dispatch_step_stream=dispatch_stub,
+        yield_skill_view_preface=preface_stub,
+        seed_outputs=seeds,
+        replay_failover_aliases=aliases,
+        trusted_preflight_replay=True,
+        max_parallelism=2,
+    ):
+        if isinstance(event, MetaResult):
+            result = event
+
+    assert seeds == {"paid": ""}
+    assert aliases == {"local_fallback": "paid"}
+    assert calls == ["local_fallback", "deliver"]
+    assert result is not None and result.ok is True
+    assert result.step_outputs["paid"] == "output:local_fallback"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("safe_no_submit", "expected_disposition"),
+    [(True, "safe_no_submit"), (False, "maybe_accepted")],
+)
+async def test_scheduler_exposes_only_parent_owned_paid_disposition_to_audit(
+    safe_no_submit: bool,
+    expected_disposition: str,
+) -> None:
+    from opensquilla.skills.meta.events import _StepDone
+    from opensquilla.skills.meta.replay_safety import (
+        PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY,
+        encode_paid_replay_safety,
+    )
+    from opensquilla.skills.meta.scheduler import run_dag
+    from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult, MetaStep
+
+    plan = MetaPlan(
+        name="paid-disposition-channel",
+        triggers=("x",),
+        priority=10,
+        steps=(
+            MetaStep(
+                id="shot1_video",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                on_failure="shot1_video_fallback",
+                side_effect="external_paid_submit",
+            ),
+            MetaStep(
+                id="shot1_video_fallback",
+                skill="video-still-animator",
+                kind="skill_exec",
+            ),
+            MetaStep(
+                id="delivery_audit",
+                skill="short-drama-delivery-audit",
+                kind="skill_exec",
+                depends_on=("shot1_video", "shot1_video_fallback"),
+            ),
+        ),
+    )
+    observed: dict[str, str] = {}
+
+    async def dispatch_stub(step, effective_skill, inputs, outputs):
+        del effective_skill, inputs
+        if step.id == "shot1_video":
+            raise RuntimeError(
+                encode_paid_replay_safety(
+                    "raw provider detail sk-secret must not cross",
+                    safe_no_submit=safe_no_submit,
+                )
+            )
+        if step.id == "delivery_audit":
+            observed.update(
+                json.loads(outputs[PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY])
+            )
+        yield _StepDone(text=f"output:{step.id}")
+
+    async def preface_stub(step_id: str, effective_skill: str):
+        del step_id, effective_skill
+        if False:
+            yield None
+
+    result: MetaResult | None = None
+    async for event in run_dag(
+        MetaMatch(plan=plan, inputs={}),
+        dispatch_step_stream=dispatch_stub,
+        yield_skill_view_preface=preface_stub,
+        max_parallelism=2,
+    ):
+        if isinstance(event, MetaResult):
+            result = event
+
+    assert observed == {"shot1_video": expected_disposition}
+    assert "raw provider detail" not in json.dumps(observed)
+    assert "sk-secret" not in json.dumps(observed)
+    assert result is not None and result.ok is True
+    assert PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY not in result.step_outputs
+
+
+@pytest.mark.asyncio
+async def test_scheduler_exposes_current_run_receipt_proof_only_to_runtime() -> None:
+    from opensquilla.skills.meta.events import _StepDone
+    from opensquilla.skills.meta.replay_safety import (
+        PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY,
+        PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY,
+        PaidReceiptProofText,
+    )
+    from opensquilla.skills.meta.scheduler import run_dag
+    from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult, MetaStep
+
+    proof = "sha256:" + "a" * 64
+    plan = MetaPlan(
+        name="paid-receipt-proof-channel",
+        triggers=("x",),
+        priority=10,
+        steps=(
+            MetaStep(
+                id="shot1_video",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                side_effect="external_paid_submit",
+            ),
+            MetaStep(
+                id="delivery_audit",
+                skill="short-drama-delivery-audit",
+                kind="skill_exec",
+                depends_on=("shot1_video",),
+                with_args={
+                    "proofs": (
+                        "{{ outputs.get("
+                        "'__opensquilla_paid_submission_receipt_proofs_v1__', "
+                        "'{}') }}"
+                    ),
+                },
+            ),
+        ),
+    )
+    observed: dict[str, dict[str, str]] = {}
+    observed_begin: list[dict[str, Any]] = []
+
+    async def dispatch_stub(step, effective_skill, inputs, outputs):
+        del effective_skill, inputs
+        if step.id == "shot1_video":
+            yield _StepDone(text=PaidReceiptProofText("clip.mp4", proof))
+            return
+        observed["dispositions"] = json.loads(
+            outputs[PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY]
+        )
+        observed["proofs"] = json.loads(
+            outputs[PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY]
+        )
+        yield _StepDone(text="audited")
+
+    async def preface_stub(step_id: str, effective_skill: str):
+        del step_id, effective_skill
+        if False:
+            yield None
+
+    async def begin_stub(
+        step_id: str,
+        effective_skill: str,
+        rendered_inputs: dict[str, Any],
+    ) -> None:
+        del effective_skill
+        if step_id == "delivery_audit":
+            observed_begin.append(rendered_inputs)
+
+    result: MetaResult | None = None
+    async for event in run_dag(
+        MetaMatch(plan=plan, inputs={}),
+        dispatch_step_stream=dispatch_stub,
+        yield_skill_view_preface=preface_stub,
+        on_step_begin=begin_stub,
+    ):
+        if isinstance(event, MetaResult):
+            result = event
+
+    assert observed == {
+        "dispositions": {"shot1_video": "receipt"},
+        "proofs": {"shot1_video": proof},
+    }
+    assert observed_begin == [{"proofs": "{}"}]
+    assert result is not None and result.ok is True
+    assert result.step_outputs["shot1_video"] == "clip.mp4"
+    assert type(result.step_outputs["shot1_video"]) is str
+    assert PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY not in result.step_outputs
+    assert PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY not in result.step_outputs
+
+
+@pytest.mark.asyncio
+async def test_scheduler_preserves_current_receipt_proof_across_paid_failover() -> None:
+    from opensquilla.skills.meta.events import _StepDone
+    from opensquilla.skills.meta.replay_safety import (
+        PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY,
+        PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY,
+        PaidReceiptProofError,
+        encode_paid_replay_safety,
+    )
+    from opensquilla.skills.meta.scheduler import run_dag
+    from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaStep
+
+    proof = "sha256:" + "b" * 64
+    plan = MetaPlan(
+        name="paid-policy-receipt-failover",
+        triggers=("x",),
+        priority=10,
+        steps=(
+            MetaStep(
+                id="shot1_video",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                side_effect="external_paid_submit",
+                on_failure="shot1_video_fallback",
+            ),
+            MetaStep(
+                id="shot1_video_fallback",
+                skill="video-still-animator",
+                kind="skill_exec",
+            ),
+            MetaStep(
+                id="delivery_audit",
+                skill="short-drama-delivery-audit",
+                kind="skill_exec",
+                depends_on=("shot1_video", "shot1_video_fallback"),
+            ),
+        ),
+    )
+    observed: dict[str, dict[str, str]] = {}
+
+    async def dispatch_stub(step, effective_skill, inputs, outputs):
+        del effective_skill, inputs
+        if step.id == "shot1_video":
+            raise PaidReceiptProofError(
+                encode_paid_replay_safety(
+                    "provider policy rejection recorded",
+                    safe_no_submit=False,
+                ),
+                receipt_proof=proof,
+            )
+        if step.id == "delivery_audit":
+            observed["dispositions"] = json.loads(
+                outputs[PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY]
+            )
+            observed["proofs"] = json.loads(
+                outputs[PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY]
+            )
+        yield _StepDone(text=f"output:{step.id}")
+
+    async def preface_stub(step_id: str, effective_skill: str):
+        del step_id, effective_skill
+        if False:
+            yield None
+
+    async for _event in run_dag(
+        MetaMatch(plan=plan, inputs={}),
+        dispatch_step_stream=dispatch_stub,
+        yield_skill_view_preface=preface_stub,
+    ):
+        pass
+
+    assert observed == {
+        "dispositions": {"shot1_video": "maybe_accepted"},
+        "proofs": {"shot1_video": proof},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reserved_key",
+    [
+        "__opensquilla_paid_submission_dispositions_v1__",
+        "__opensquilla_paid_submission_receipt_proofs_v1__",
+    ],
+)
+async def test_paid_runtime_key_cannot_be_claimed_as_a_plan_step(
+    reserved_key: str,
+) -> None:
+    from opensquilla.skills.meta.replay_safety import (
+        PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY,
+        PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY,
+    )
+    from opensquilla.skills.meta.scheduler import run_dag
+    from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult, MetaStep
+
+    plan = MetaPlan(
+        name="reserved-runtime-step",
+        triggers=("x",),
+        priority=1,
+        steps=(
+            MetaStep(
+                id=reserved_key,
+                skill="untrusted-child",
+                kind="skill_exec",
+            ),
+        ),
+    )
+    dispatched = False
+
+    async def dispatch_stub(step, effective_skill, inputs, outputs):
+        nonlocal dispatched
+        del step, effective_skill, inputs, outputs
+        dispatched = True
+        if False:
+            yield None
+
+    async def preface_stub(step_id: str, effective_skill: str):
+        del step_id, effective_skill
+        if False:
+            yield None
+
+    result: MetaResult | None = None
+    async for event in run_dag(
+        MetaMatch(plan=plan, inputs={}),
+        dispatch_step_stream=dispatch_stub,
+        yield_skill_view_preface=preface_stub,
+    ):
+        if isinstance(event, MetaResult):
+            result = event
+
+    assert dispatched is False
+    assert reserved_key in {
+        PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY,
+        PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY,
+    }
+    assert result is not None and result.ok is False
+    assert result.error == "meta-skill plan uses a reserved runtime step id"
+
+
+def test_paid_disposition_encoder_is_bounded_and_rejects_free_form_values() -> None:
+    from opensquilla.skills.meta.replay_safety import (
+        encode_paid_submission_dispositions,
+    )
+
+    dispositions = {
+        f"paid_{index:03d}_{'x' * 80}": "receipt"
+        for index in range(100)
+    }
+    dispositions["provider_error"] = "HTTP 429 sk-secret raw provider prose"
+
+    encoded = encode_paid_submission_dispositions(dispositions)
+    decoded = json.loads(encoded)
+
+    assert len(encoded.encode("utf-8")) <= 8_000
+    assert len(decoded) == 64
+    assert set(decoded.values()) == {"receipt"}
+    assert "HTTP 429" not in encoded
+    assert "sk-secret" not in encoded
+
+
+def test_paid_receipt_proof_encoder_accepts_only_canonical_digests() -> None:
+    from opensquilla.skills.meta.replay_safety import (
+        encode_paid_submission_receipt_proofs,
+    )
+
+    encoded = encode_paid_submission_receipt_proofs(
+        {
+            "shot1_video": "sha256:" + "a" * 64,
+            "shot2_video": "sha256:not-a-digest",
+            "provider_error": "sk-secret raw provider prose",
+        }
+    )
+
+    assert json.loads(encoded) == {"shot1_video": "sha256:" + "a" * 64}
+    assert "sk-secret" not in encoded
+
+
+def test_paid_failure_rescue_requires_review_unless_pre_submit_is_proven() -> None:
+    from opensquilla.skills.meta.replay_safety import encode_paid_replay_safety
+    from opensquilla.skills.meta.scheduler import _failure_rescue_payload
+    from opensquilla.skills.meta.types import MetaStep
+
+    step = MetaStep(
+        id="paid",
+        skill="seedance-2-prompt",
+        kind="skill_exec",
+        side_effect="external_paid_submit",
+    )
+    unsafe = _failure_rescue_payload(
+        plan_name="short-drama",
+        step=step,
+        error=encode_paid_replay_safety("lost response", safe_no_submit=False),
+        outputs={},
+        has_substitute=False,
+        plan_has_external_paid_steps=True,
+    )
+    safe = _failure_rescue_payload(
+        plan_name="short-drama",
+        step=step,
+        error=encode_paid_replay_safety("bad local input", safe_no_submit=True),
+        outputs={},
+        has_substitute=False,
+        plan_has_external_paid_steps=True,
+    )
+
+    assert {action["id"] for action in unsafe["actions"]} == {
+        "review-paid-submit",
+        "switch-meta-skill",
+        "continue-text-only",
+    }
+    assert "retry-step" in {action["id"] for action in safe["actions"]}
+    assert "retry-run" not in {action["id"] for action in safe["actions"]}
+
+
+@pytest.mark.parametrize("record_shape", ["missing", "duplicate", "wrong-status", "wrong-link"])
+def test_paid_fallback_replay_blocks_without_exact_substituted_primary(
+    record_shape: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from opensquilla.skills.meta.replay_safety import paid_live_replay_block_reason
+    from opensquilla.skills.meta.types import MetaPlan, MetaStep
+
+    plan = MetaPlan(
+        name="paid-fallback",
+        triggers=("x",),
+        priority=1,
+        steps=(
+            MetaStep(
+                id="paid",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                on_failure="fallback",
+                side_effect="external_paid_submit",
+            ),
+            MetaStep(id="fallback", skill="local", kind="agent"),
+        ),
+    )
+    valid = SimpleNamespace(
+        step_id="paid",
+        status="substituted",
+        substitute_step_id="fallback",
+        error="possibly accepted",
+    )
+    if record_shape == "missing":
+        records = ()
+    elif record_shape == "duplicate":
+        records = (valid, valid)
+    elif record_shape == "wrong-status":
+        records = (SimpleNamespace(**{**vars(valid), "status": "failed"}),)
+    else:
+        records = (SimpleNamespace(**{**vars(valid), "substitute_step_id": "other"}),)
+
+    reason = paid_live_replay_block_reason(
+        plan=plan,
+        persisted_steps=records,
+        failed_step_id="fallback",
+    )
+
+    assert reason is not None
+    assert "paid" in reason.lower() or "provider" in reason.lower()
+
+
+@pytest.mark.parametrize("evidence", ["missing-output", "truncated-output", "duplicate"])
+def test_live_replay_blocks_unseedable_successful_paid_sibling(evidence: str) -> None:
+    from types import SimpleNamespace
+
+    from opensquilla.skills.meta.replay_safety import paid_live_replay_block_reason
+    from opensquilla.skills.meta.types import MetaPlan, MetaStep
+
+    plan = MetaPlan(
+        name="paid-sibling",
+        triggers=("x",),
+        priority=1,
+        steps=(
+            MetaStep(
+                id="paid",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                side_effect="external_paid_submit",
+            ),
+            MetaStep(id="later", skill="audit", kind="agent", depends_on=("paid",)),
+        ),
+    )
+    paid = SimpleNamespace(
+        step_id="paid",
+        status="ok",
+        substitute_step_id=None,
+        output_text=(None if evidence == "missing-output" else "video.mp4"),
+        error=None,
+        truncated_fields=("output_text",) if evidence == "truncated-output" else (),
+    )
+    records = (paid, paid) if evidence == "duplicate" else (paid,)
+
+    reason = paid_live_replay_block_reason(
+        plan=plan,
+        persisted_steps=records,
+        failed_step_id="later",
+    )
+
+    assert reason is not None
+    assert "paid" in reason.lower()
+
+
+def test_paid_plan_failed_fallback_recovery_omits_fresh_run_retry() -> None:
+    from opensquilla.skills.meta.run_reports import _recovery_actions
+    from opensquilla.skills.meta.types import MetaStep
+
+    actions = _recovery_actions(
+        MetaStep(id="local_fallback", skill="local-renderer", kind="skill_exec"),
+        "local ffmpeg failed",
+        plan_has_external_paid_steps=True,
+    )
+    action_ids = {action["id"] for action in actions}
+
+    assert "retry-run" not in action_ids
+    assert "retry-step" in action_ids
 
 
 @pytest.mark.asyncio

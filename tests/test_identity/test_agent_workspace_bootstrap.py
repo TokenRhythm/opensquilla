@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+import os
+import shutil
+from pathlib import Path
+
+import pytest
+
 from opensquilla.identity.bootstrap import ensure_agent_workspace
+from opensquilla.identity.workspace import load_workspace_files
+
+
+def _windows_native_path(path: Path) -> str:
+    value = os.path.abspath(path)
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{value[2:]}"
+    return f"\\\\?\\{value}"
 
 
 def test_fresh_workspace_seeds_agents_template(tmp_path) -> None:
@@ -10,7 +26,15 @@ def test_fresh_workspace_seeds_agents_template(tmp_path) -> None:
     assert (tmp_path / "SOUL.md").is_file()
     assert (tmp_path / "USER.md").is_file()
     assert (tmp_path / "MEMORY.md").is_file()
-    assert (tmp_path / "BOOTSTRAP.md").is_file()
+    assert (tmp_path / "AGENTS.md").read_bytes() == b""
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "AGENTS.md",
+        "SOUL.md",
+        "IDENTITY.md",
+        "USER.md",
+        "MEMORY.md",
+        "memory",
+    }
     assert (tmp_path / "memory").is_dir()
     assert "AGENTS.md" in result.created_files
     assert "MEMORY.md" in result.created_files
@@ -33,3 +57,38 @@ def test_seed_templates_false_does_not_create_agents_template(tmp_path) -> None:
 
     assert not (tmp_path / "AGENTS.md").exists()
     assert result.created_files == ()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows long paths")
+def test_extended_length_workspace_bootstrap_keeps_logical_paths(tmp_path: Path) -> None:
+    long_root = tmp_path / "long-workspace"
+    workspace = long_root
+    index = 0
+    while len(str(workspace)) <= 275:
+        workspace /= f"segment-{index:02d}-" + ("x" * 42)
+        index += 1
+    assert len(str(workspace)) > 260
+
+    try:
+        result = ensure_agent_workspace(workspace)
+
+        assert result.workspace_dir == workspace
+        assert not str(result.workspace_dir).startswith("\\\\?\\")
+        assert os.path.isfile(_windows_native_path(workspace / "AGENTS.md"))
+        assert not os.path.exists(_windows_native_path(workspace / "BOOTSTRAP.md"))
+        assert os.path.isdir(_windows_native_path(workspace / "memory"))
+        assert not os.path.exists(
+            _windows_native_path(workspace / ".opensquilla" / "workspace-state.json")
+        )
+
+        loaded = load_workspace_files(workspace)
+        assert "AGENTS.md" in loaded
+        assert "USER.md" in loaded
+
+        repeated = ensure_agent_workspace(workspace)
+        assert repeated.workspace_dir == workspace
+        assert repeated.created_files == ()
+    finally:
+        native_root = _windows_native_path(long_root)
+        if os.path.exists(native_root):
+            shutil.rmtree(native_root)

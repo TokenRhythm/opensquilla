@@ -6,6 +6,7 @@ from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
 from opensquilla.provider.openai import _build_openai_wire_messages
+from opensquilla.provider.request_proof import project_final_request_payload
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ChatConfig, Message, ModelCapabilities
 
@@ -20,11 +21,14 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.selection_mode == "static_openrouter_b5"
     assert ensemble.proposer_tools is False
     assert ensemble.min_successful_proposers == 1
+    assert ensemble.target_successful_proposers is None
+    assert ensemble.proposer_max_retries == 0
     assert ensemble.model_options == []
     assert ensemble.candidates == []
     assert ensemble.candidate_max_chars == 24_000
     assert ensemble.proposer_timeout_seconds == 3600.0
     assert ensemble.aggregator_timeout_seconds == 3600.0
+    assert ensemble.total_timeout_seconds is None
     assert ensemble.shuffle_candidates is True
     assert ensemble.record_candidates is False
 
@@ -43,17 +47,22 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     )
     assert provider.profile_name == "static_openrouter_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
-    assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
-    assert provider.min_successful_proposers == 3
-    assert provider.proposer_timeout_seconds == 300.0
-    assert provider.aggregator_timeout_seconds == 480.0
+    assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
+    assert {member.thinking for member in provider.proposers} == {"high"}
+    assert provider.aggregator.thinking == "high"
+    # The fresh/default shared policy is a one-draft admission floor.
+    assert provider.min_successful_proposers == 1
+    assert provider.target_successful_proposers == 1
+    assert provider.proposer_max_retries == 0
+    assert provider.proposer_timeout_seconds == 120.0
+    assert provider.aggregator_timeout_seconds == 180.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 10.0
+    assert provider.quorum_grace_seconds == 0.0
 
 
 def test_static_openrouter_b5_does_not_need_model_options() -> None:
@@ -78,15 +87,15 @@ def test_static_openrouter_b5_does_not_need_model_options() -> None:
 
     assert provider.profile_name == "static_openrouter_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
-    assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+    assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
 
 
-def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
+def test_static_tokenrhythm_b5_keeps_its_provider_specific_lineup() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
@@ -107,22 +116,24 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
 
     assert provider.profile_name == "static_tokenrhythm_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek-v4-pro",
-        "glm-5.2",
-        "kimi-k2.7-code",
-        "qwen3.7-max",
+        "deepseek-flash",
+        "glm-5.3-flash",
+        "qwen3.8-flash",
+        "qwen3.8-max",
     ]
     assert all(
         member.provider_config.provider == "tokenrhythm" for member in provider.proposers
     )
+    assert all(member.thinking == "high" for member in provider.proposers)
     assert provider.aggregator.provider_config.provider == "tokenrhythm"
-    assert provider.aggregator.provider_config.model == "glm-5.2"
+    assert provider.aggregator.provider_config.model == "deepseek-flash"
+    assert provider.aggregator.thinking == "high"
     # Same aggregation defaults as the static OpenRouter profile.
-    assert provider.min_successful_proposers == 3
-    assert provider.proposer_timeout_seconds == 300.0
-    assert provider.aggregator_timeout_seconds == 480.0
+    assert provider.min_successful_proposers == 1
+    assert provider.proposer_timeout_seconds == 120.0
+    assert provider.aggregator_timeout_seconds == 180.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 10.0
+    assert provider.quorum_grace_seconds == 0.0
 
 
 def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
@@ -147,6 +158,17 @@ def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
         "custom_b5",
         *STATIC_B5_SELECTION_MODE_PROVIDERS,
     }
+
+
+def test_legacy_candidate_roles_alias_stays_importable_from_gateway_config() -> None:
+    # Released extensions import this name directly. It is an alias, not a
+    # second table, so it tracks the canonical two-role contract instead of
+    # resurrecting the retired advisory proposer labels.
+    from opensquilla.gateway.config import LLM_ENSEMBLE_CANDIDATE_ROLES
+    from opensquilla.router_tiers import ENSEMBLE_CANDIDATE_ROLES
+
+    assert LLM_ENSEMBLE_CANDIDATE_ROLES is ENSEMBLE_CANDIDATE_ROLES
+    assert LLM_ENSEMBLE_CANDIDATE_ROLES == ("proposer", "aggregator")
 
 
 def test_router_dynamic_ensemble_allows_empty_custom_model_options() -> None:
@@ -354,6 +376,8 @@ def test_router_dynamic_ensemble_uses_small_c0_slot_template() -> None:
         "deepseek/deepseek-v4-flash"
     )
     assert len(provider.proposers) == 2
+    # A dynamic C0 plan only has two slots, so an otherwise-valid configured
+    # floor is bounded by the concrete lineup and both drafts are required.
     assert provider.min_successful_proposers == 2
     assert provider.selection_plan["slot_template"] == ["anchor", "cheap_contrast"]
     assert provider.selection_plan["aggregator_slot"] == "aggregator_fast"
@@ -423,10 +447,10 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
         provider_routing={"z-ai/glm-5.2": "z-ai"},
     )
     expected_proposers = [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
 
     for tier in ("c0", "c1", "c2", "c3"):
@@ -439,28 +463,33 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
 
         assert provider.profile_name == "static_openrouter_b5"
         assert [member.provider_config.model for member in provider.proposers] == expected_proposers
-        assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+        assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
         assert provider.selection_plan == {
             "strategy": "static_openrouter_b5",
             "profile": "static_openrouter_b5",
             "proposer_models": expected_proposers,
-            "aggregator_model": "z-ai/glm-5.2",
+            "aggregator_model": "deepseek/deepseek-v4.1-flash",
             "proposer_count": 4,
             "configured_min_successful_proposers": 9,
             "effective_min_successful_proposers": 4,
             "configured_proposer_timeout_seconds": 3600.0,
-            "effective_proposer_timeout_seconds": 300.0,
+            "effective_proposer_timeout_seconds": 120.0,
             "configured_aggregator_timeout_seconds": 3600.0,
-            "effective_aggregator_timeout_seconds": 480.0,
+            "effective_aggregator_timeout_seconds": 180.0,
             "configured_shuffle_candidates": False,
             "effective_shuffle_candidates": False,
-            "quorum_grace_seconds": 10.0,
+            "configured_quorum_grace_seconds": 10.0,
+            "effective_quorum_grace_seconds": 0.0,
+            "quorum_grace_seconds": 0.0,
+            "configured_proposer_max_retries": 0,
+            "effective_proposer_max_retries": 0,
+            "proposer_max_retries_source": "configured",
         }
         assert provider.min_successful_proposers == 4
-        assert provider.proposer_timeout_seconds == 300.0
-        assert provider.aggregator_timeout_seconds == 480.0
+        assert provider.proposer_timeout_seconds == 120.0
+        assert provider.aggregator_timeout_seconds == 180.0
         assert provider.shuffle_candidates is False
-        assert provider.quorum_grace_seconds == 10.0
+        assert provider.quorum_grace_seconds == 0.0
         members = [*provider.proposers, provider.aggregator]
         assert all(member.provider_config.provider == "openrouter" for member in members)
         assert all(member.provider_config.api_key == "fake" for member in members)
@@ -496,12 +525,13 @@ def test_static_openrouter_b5_ensemble_uses_profile_effective_defaults() -> None
     assert cfg.llm_ensemble.min_successful_proposers == 1
     assert cfg.llm_ensemble.proposer_timeout_seconds == 3600.0
     assert cfg.llm_ensemble.aggregator_timeout_seconds == 3600.0
+    assert cfg.llm_ensemble.total_timeout_seconds is None
     assert cfg.llm_ensemble.shuffle_candidates is True
-    assert provider.min_successful_proposers == 3
-    assert provider.proposer_timeout_seconds == 300.0
-    assert provider.aggregator_timeout_seconds == 480.0
+    assert provider.min_successful_proposers == 1
+    assert provider.proposer_timeout_seconds == 120.0
+    assert provider.aggregator_timeout_seconds == 180.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 10.0
+    assert provider.quorum_grace_seconds == 0.0
 
 
 def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> None:
@@ -532,6 +562,84 @@ def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> No
     assert provider.shuffle_candidates is False
 
 
+def test_legacy_total_timeout_is_readable_but_has_no_runtime_effect() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+            "total_timeout_seconds": 1.0,
+        }
+    )
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="routed/model",
+            api_key="fake",
+            base_url="https://openrouter.example/api/v1",
+        ),
+        fallback_provider=None,
+    )
+
+    assert cfg.llm_ensemble.total_timeout_seconds == 1.0
+    assert not hasattr(provider, "total_timeout_seconds")
+    assert "configured_total_timeout_seconds" not in provider.selection_plan
+    assert "effective_total_timeout_seconds" not in provider.selection_plan
+
+
+def test_static_b5_honors_explicit_floor_target_retry_and_failure_policy() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+            "min_successful_proposers": 3,
+            "target_successful_proposers": 4,
+            "proposer_max_retries": 2,
+            "all_failed_policy": "error",
+        }
+    )
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="routed/model",
+            api_key="fake",
+            base_url="https://openrouter.example/api/v1",
+        ),
+        fallback_provider=None,
+    )
+
+    assert provider.min_successful_proposers == 3
+    assert provider.target_successful_proposers == 4
+    assert provider.proposer_max_retries == 2
+    assert provider.all_failed_policy == "error"
+    assert provider.selection_plan["configured_target_successful_proposers"] == 4
+    assert provider.selection_plan["effective_target_successful_proposers"] == 4
+    assert provider.selection_plan["configured_proposer_max_retries"] == 2
+    assert provider.selection_plan["effective_proposer_max_retries"] == 2
+    assert provider.selection_plan["proposer_max_retries"] == 2
+
+
+def test_success_target_cannot_be_below_floor() -> None:
+    with pytest.raises(Exception, match="target_successful_proposers"):
+        GatewayConfig(
+            llm_ensemble={
+                "min_successful_proposers": 3,
+                "target_successful_proposers": 2,
+            }
+        )
+
+
+def test_static_success_target_cannot_exceed_fixed_lineup() -> None:
+    with pytest.raises(Exception, match="static B5 proposer count"):
+        GatewayConfig(
+            llm_ensemble={
+                "selection_mode": "static_openrouter_b5",
+                "target_successful_proposers": 5,
+            }
+        )
+
+
 def _custom_b5_config(**overrides: object) -> GatewayConfig:
     payload: dict[str, object] = {
         "enabled": True,
@@ -556,7 +664,7 @@ def _volcengine_inherited() -> ProviderConfig:
     )
 
 
-def test_custom_b5_builds_role_labelled_proposers_and_single_aggregator() -> None:
+def test_custom_b5_builds_canonical_proposers_and_single_aggregator() -> None:
     provider = build_ensemble_provider_from_config(
         config=_custom_b5_config(),
         inherited_provider_config=_volcengine_inherited(),
@@ -565,9 +673,9 @@ def test_custom_b5_builds_role_labelled_proposers_and_single_aggregator() -> Non
 
     assert provider.profile_name == "custom_b5"
     assert [member.label for member in provider.proposers] == [
-        "primary",
-        "fast_check",
-        "contrast",
+        "proposer_1",
+        "proposer_2",
+        "proposer_3",
     ]
     assert [member.provider_config.model for member in provider.proposers] == [
         "doubao-2.0-pro",
@@ -575,6 +683,11 @@ def test_custom_b5_builds_role_labelled_proposers_and_single_aggregator() -> Non
         "kimi-k2.6",
     ]
     assert provider.aggregator.provider_config.model == "deepseek-v4-pro"
+    assert [row["role"] for row in provider.selection_plan["proposers"]] == [
+        "proposer",
+        "proposer",
+        "proposer",
+    ]
     assert provider.selection_plan["aggregator"]["source"] == "candidate_role"
 
 
@@ -586,14 +699,13 @@ def test_custom_b5_uses_fixed_lineup_effective_defaults_with_auto_quorum() -> No
         fallback_provider=None,
     )
 
-    # Stored legacy defaults are replaced by the fixed-lineup family; quorum
-    # is derived as N-1 for the 3-proposer lineup.
+    # The visible default is the runtime admission floor.
     assert cfg.llm_ensemble.min_successful_proposers == 1
-    assert provider.min_successful_proposers == 2
+    assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 10.0
+    assert provider.quorum_grace_seconds == 0.0
 
 
 def test_custom_b5_preserves_explicit_quorum_and_timeouts() -> None:
@@ -704,8 +816,8 @@ def test_candidate_roles_normalize_and_reject_dual_aggregators() -> None:
         }
     )
     assert cfg.llm_ensemble.candidates[0].role == "aggregator"
-    # Unknown roles coerce to unassigned instead of failing gateway boot.
-    assert cfg.llm_ensemble.candidates[1].role == ""
+    # Unknown non-aggregator roles remain safe proposers instead of failing boot.
+    assert cfg.llm_ensemble.candidates[1].role == "proposer"
 
     with pytest.raises(Exception, match="at most one"):
         GatewayConfig(
@@ -716,6 +828,27 @@ def test_candidate_roles_normalize_and_reject_dual_aggregators() -> None:
                 ],
             }
         )
+
+
+def test_released_advisory_roles_normalize_to_proposer() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "candidates": [
+                {"provider": "a", "model": f"m{index}", "role": role}
+                for index, role in enumerate(
+                    ("primary", "contrast", "fast_check", "critic"),
+                    start=1,
+                )
+            ],
+        }
+    )
+
+    assert [candidate.role for candidate in cfg.llm_ensemble.candidates] == [
+        "proposer",
+        "proposer",
+        "proposer",
+        "proposer",
+    ]
 
 
 def test_custom_b5_lineup_ready_gates_on_member_credentials(
@@ -814,6 +947,50 @@ def test_custom_b5_resolves_each_non_primary_member_from_its_profile(
     assert by_provider["deepseek"].api_key == "deepseek-profile-key"
     assert by_provider["deepseek"].base_url == "https://deepseek-profile.example/v1"
     assert by_provider["deepseek"].replay_provider_state is False
+
+
+def test_shared_custom_plan_does_not_use_the_c3_fallback_as_its_aggregator() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "plan-aggregator",
+            "api_key": "plan-key",
+        },
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "tokenrhythm", "model": "plan-proposer-1"},
+                {"provider": "tokenrhythm", "model": "plan-proposer-2"},
+            ],
+        },
+    )
+    plan_config = ProviderConfig(
+        provider="tokenrhythm",
+        model="plan-aggregator",
+        api_key="plan-key",
+    )
+    c3_fallback = ProviderConfig(
+        provider="groq",
+        model="groq-c3",
+        api_key="fallback-key",
+    )
+
+    ensemble = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=c3_fallback,
+        fallback_provider=None,
+        _plan_provider_config=plan_config,
+    )
+
+    assert ensemble.aggregator.provider_config.provider == "tokenrhythm"
+    assert ensemble.aggregator.provider_config.model == "plan-aggregator"
+    assert ensemble.aggregator.provider_config.api_key == "plan-key"
+    assert ensemble.fallback_provider_name == "groq"
+    assert ensemble.fallback_model == "groq-c3"
+    assert {
+        member.provider_config.api_key for member in ensemble.proposers
+    } == {"plan-key"}
 
 
 def test_cross_provider_ensemble_disables_replay_on_internal_fallback_adapters() -> None:
@@ -923,6 +1100,11 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
         def disable_provider_state_replay(self) -> None:
             self.replay_provider_state = False
 
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            yield TextDeltaEvent(text="fixed answer")
+            yield DoneEvent(model="primary-model", input_tokens=1, output_tokens=1)
+
     class _FallbackAdapter:
         provider_name = "anthropic"
 
@@ -956,6 +1138,33 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
                 return
             yield TextDeltaEvent(text="candidate")
             yield DoneEvent(model=self.model, input_tokens=1, output_tokens=1)
+
+        def project_final_request(
+            self,
+            messages,
+            tools=None,
+            config=None,
+            *,
+            message_limit=None,
+        ):
+            cfg = config or ChatConfig()
+            payload = {
+                "model": self.model,
+                "messages": [
+                    message.model_dump(mode="json", exclude_none=True)
+                    for message in messages
+                ],
+                "tools": [
+                    tool.model_dump(mode="json", exclude_none=True)
+                    for tool in (tools or [])
+                ],
+            }
+            return project_final_request_payload(
+                payload,
+                projection_adapter="synthetic_ensemble_member",
+                proof_budget=cfg.provider_request_max_chars or 1_000_000,
+                message_limit=message_limit,
+            )
 
     monkeypatch.setattr(
         "opensquilla.provider.ensemble._build_provider",
@@ -1014,11 +1223,11 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
     ]
 
     assert any(
-        isinstance(event, TextDeltaEvent) and event.text == "fallback answer"
+        isinstance(event, TextDeltaEvent) and event.text == "fixed answer"
         for event in events
     )
-    assert selector_builds[-1].model == "plugin-fallback"
-    assert selector_builds[-1].replay_provider_state is False
+    assert selector_builds
+    assert all(config.model == "primary-model" for config in selector_builds)
     assert turn_selector.current_config.replay_provider_state is False
     assert direct_fallback.replay_provider_state is False
     assert plugin_fallback_config.replay_provider_state is True

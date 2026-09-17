@@ -230,7 +230,7 @@ def _result_from_item(item: dict[str, Any], response_data: dict[str, Any]) -> Se
 
 
 def _safe_metadata(item: dict[str, Any], response_data: dict[str, Any]) -> dict[str, Any]:
-    metadata = {
+    metadata: dict[str, Any] = {
         key: response_data[key]
         for key in ("log_id", "msg")
         if key in response_data

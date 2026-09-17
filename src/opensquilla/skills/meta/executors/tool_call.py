@@ -18,6 +18,25 @@ from opensquilla.skills.meta.templating import render_with_args
 from opensquilla.skills.meta.types import MetaStep
 
 
+class ToolInvocationResult(str):
+    """String-compatible direct-tool output carrying canonical artifacts."""
+
+    artifacts: tuple[dict[str, Any], ...]
+
+    def __new__(
+        cls,
+        text: str,
+        artifacts: tuple[dict[str, Any], ...] = (),
+    ) -> ToolInvocationResult:
+        instance = super().__new__(cls, text)
+        instance.artifacts = artifacts
+        return instance
+
+    @property
+    def text(self) -> str:
+        return str(self)
+
+
 async def run_tool_call_step(
     step: MetaStep,
     inputs: dict[str, Any],
@@ -25,7 +44,7 @@ async def run_tool_call_step(
     *,
     tool_invoker: Callable[[str, dict[str, Any]], Awaitable[str]] | None,
     agent_runner: Callable[[str, str], AsyncIterator[AgentEvent]],
-) -> str:
+) -> ToolInvocationResult:
     """Direct tool invocation — bypasses the LLM entirely.
 
     ``step.tool_args`` are Jinja-rendered against ``inputs`` + ``outputs``
@@ -54,11 +73,18 @@ async def run_tool_call_step(
             "returns, reply with its result as plain text."
         )
         user_message = f"Tool: {step.tool}\nArguments: {args_blob}"
-        return await _drain_agent_runner(
-            system_prompt, user_message, agent_runner=agent_runner,
+        return ToolInvocationResult(
+            await _drain_agent_runner(
+                system_prompt,
+                user_message,
+                agent_runner=agent_runner,
+            ),
         )
 
-    return await tool_invoker(step.tool, rendered_args)
+    result = await tool_invoker(step.tool, rendered_args)
+    if isinstance(result, ToolInvocationResult):
+        return result
+    return ToolInvocationResult(str(result))
 
 
-__all__ = ["run_tool_call_step"]
+__all__ = ["ToolInvocationResult", "run_tool_call_step"]

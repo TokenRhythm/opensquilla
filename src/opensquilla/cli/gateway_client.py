@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import math
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -12,6 +13,13 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla.contracts.adapters.sessions_list_contract import call_sessions_list
+from opensquilla.contracts.adapters.sessions_resolve_contract import call_sessions_resolve
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+    GATEWAY_CLIENT_MAX_QUEUE,
+)
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 
@@ -25,11 +33,17 @@ class GatewayRPCError(Exception):
         code: str | None = None,
         message: str = "RPC failed",
         data: dict | None = None,
+        retryable: bool | None = None,
+        retry_after_ms: int | None = None,
+        accepted: bool | None = None,
     ) -> None:
         self.method = method
         self.code = code
         self.message = message
         self.data = data
+        self.retryable = retryable
+        self.retry_after_ms = retry_after_ms
+        self.accepted = accepted
         super().__init__(self.__str__())
 
     def __str__(self) -> str:
@@ -196,6 +210,16 @@ def gateway_base_is_local(base_url: str | None) -> bool:
 
 
 _SUBSCRIPTION_CLOSED = object()
+# These synchronous maintenance operations have no aggregate server deadline.
+# Preserve their existing completion waits; an explicit call(timeout_s=...) can
+# bound them. Chat admission, abort and event subscriptions remain time-limited.
+_SYNCHRONOUS_MAINTENANCE_METHODS = frozenset({
+    "sessions.reset",
+    "skills.install",
+    "skills.update",
+    "skills.deps.install",
+    "memory.index",
+})
 
 
 @dataclass
@@ -342,7 +366,8 @@ class GatewayEventSubscription:
 class GatewayClient:
     """WebSocket client for connecting to OpenSquilla gateway daemon."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, request_timeout_s: float | None = 30.0) -> None:
+        self.request_timeout_s = request_timeout_s
         self._ws: Any = None
         self._recv_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._pending: dict[str, asyncio.Future[dict]] = {}
@@ -359,6 +384,17 @@ class GatewayClient:
         self._server_session_subscriptions: set[str] = set()
         self._subscription_lock = asyncio.Lock()
         self._session_event_backlog: dict[str, deque[dict[str, Any]]] = {}
+        # ``sessions.steer.v2`` deliberately targets one exact logical turn.
+        # Keep the identity returned by ``sessions.send`` while its stream is
+        # active so the TUI can prefer the versioned protocol without asking
+        # the Gateway to retarget a late steer implicitly.
+        self._active_turn_ids: dict[str, str] = {}
+        # A missing ``sessions.steer.v2`` response is ambiguous: the Gateway
+        # may already have durably accepted the request.  Preserve the exact
+        # request until a definitive response arrives so a TUI retry keeps the
+        # original turn target and idempotency identity even if the active
+        # stream has completed in the meantime.
+        self._pending_steer_v2: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def connect(
         self,
@@ -382,7 +418,11 @@ class GatewayClient:
             raise SystemExit("websockets package is required: uv pip install websockets")
 
         try:
-            self._ws = await websockets.connect(url)
+            self._ws = await websockets.connect(
+                url,
+                max_size=GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+                max_queue=GATEWAY_CLIENT_MAX_QUEUE,
+            )
         except Exception as exc:
             raise SystemExit(
                 f"Cannot connect to OpenSquilla gateway at {url}\n"
@@ -425,6 +465,7 @@ class GatewayClient:
         params: dict[str, Any] = {
             "minProtocol": 1,
             "maxProtocol": 3,
+            "caps": [ANSWER_GENERATION_RESET_CAPABILITY],
             "role": "operator",
             "scopes": ["operator.admin"],
         }
@@ -600,10 +641,31 @@ class GatewayClient:
             raise ConnectionError("WebSocket is not connected")
         await target.send('{"type":"ping"}')
 
-    async def _call(self, method: str, params: dict | None = None) -> Any:
-        """Send a JSON-RPC request and await its response."""
+    def _discard_pending_response(
+        self,
+        req_id: str,
+        fut: asyncio.Future[dict],
+    ) -> None:
+        """Remove one request without disturbing a newer entry for the same id."""
+
+        if self._pending.get(req_id) is fut:
+            self._pending.pop(req_id, None)
+        if not fut.done():
+            fut.cancel()
+
+    async def _start_call(
+        self,
+        method: str,
+        params: dict | None = None,
+    ) -> tuple[str, asyncio.Future[dict]]:
+        """Send one RPC request and return the future for its response."""
+
         if self._connection_error is not None:
             raise self._connection_error
+        if self._closing:
+            raise ConnectionError(
+                "Gateway connection is closing; reconnect before sending another command."
+            )
         if self._ws is None:
             raise ConnectionError(
                 "Gateway connection lost; restart chat or reconnect before sending another command."
@@ -617,13 +679,38 @@ class GatewayClient:
                 json.dumps({"type": "req", "id": req_id, "method": method, "params": params})
             )
         except asyncio.CancelledError:
-            self._pending.pop(req_id, None)
+            self._discard_pending_response(req_id, fut)
             raise
         except Exception as exc:
-            self._pending.pop(req_id, None)
+            self._discard_pending_response(req_id, fut)
             err = self._mark_connection_failed(exc)
             raise err from exc
-        res = await fut
+        return req_id, fut
+
+    async def _await_call_response(
+        self,
+        method: str,
+        req_id: str,
+        fut: asyncio.Future[dict],
+        *,
+        timeout_s: float | None,
+    ) -> Any:
+        """Await and decode one response with the configured RPC deadline."""
+
+        try:
+            if timeout_s is None:
+                res = await fut
+            else:
+                res = await asyncio.wait_for(fut, timeout=timeout_s)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"{method} timed out after {timeout_s:g}s"
+            ) from exc
+        finally:
+            # The listener normally pops the entry first. Timeout and caller
+            # cancellation arrive without a response, so clean those paths here.
+            self._discard_pending_response(req_id, fut)
+
         if not res.get("ok"):
             err = res.get("error", {})
             raw_details = err.get("data")
@@ -634,13 +721,64 @@ class GatewayClient:
                 code=err.get("code"),
                 message=err.get("message") or "RPC failed",
                 data=raw_details if isinstance(raw_details, dict) else None,
+                retryable=err.get("retryable"),
+                retry_after_ms=err.get("retry_after_ms"),
+                accepted=err.get("accepted"),
             )
         payload = res.get("payload")
         return {} if payload is None else payload
 
-    async def call(self, method: str, params: dict | None = None) -> Any:
+    async def _operation_response_timeout(self, method: str, params: dict | None) -> float | None:
+        if self.request_timeout_s is None:
+            return None
+        if method in _SYNCHRONOUS_MAINTENANCE_METHODS:
+            return None
+        if method == "sessions.contextCompact" and (params or {}).get("wait", True):
+            # Synchronous compaction runs until the Gateway's absolute deadline
+            # (120 seconds by default). Let its terminal result arrive before
+            # applying a client timeout, including an ordinary response margin.
+            server_budget = 120.0
+            try:
+                configured = await self.get_config("compaction.total_timeout_seconds")
+            except GatewayRPCError:
+                # Older/restricted Gateways may not expose the configuration;
+                # preserve their default compaction budget in that case.
+                configured = None
+        elif method == "cron.run":
+            # This RPC waits for the job's completion, not just its admission.
+            server_budget = 600.0
+            try:
+                job = await self._call("cron.status", {"id": (params or {}).get("id")})
+            except GatewayRPCError:
+                job = None
+            configured = job.get("timeout_seconds") if isinstance(job, dict) else None
+        else:
+            return self.request_timeout_s
+        try:
+            parsed = float(configured) if not isinstance(configured, bool) else server_budget
+        except (TypeError, ValueError):
+            parsed = server_budget
+        if math.isfinite(parsed) and parsed > 0:
+            server_budget = parsed
+        return server_budget + max(30.0, self.request_timeout_s)
+
+    async def _call(
+        self, method: str, params: dict | None = None, *, timeout_s: float | None = None,
+    ) -> Any:
+        """Send one RPC using its operation policy or an explicit response deadline."""
+
+        if timeout_s is None:
+            timeout_s = await self._operation_response_timeout(method, params)
+        req_id, fut = await self._start_call(method, params)
+        return await self._await_call_response(method, req_id, fut, timeout_s=timeout_s)
+
+    async def call(
+        self, method: str, params: dict | None = None, *, timeout_s: float | None = None,
+    ) -> Any:
         """Public thin wrapper for CLI commands that intentionally use RPC names."""
 
+        if timeout_s is not None:
+            return await self._call(method, params, timeout_s=timeout_s)
         return await self._call(method, params)
 
     async def create_session(
@@ -659,7 +797,7 @@ class GatewayClient:
         return cast(str, result["key"])
 
     async def list_sessions(self, limit: int = 50) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.list", {"limit": limit}))
+        return await call_sessions_list(self._call, limit=limit)
 
     async def preview_sessions(
         self,
@@ -672,7 +810,7 @@ class GatewayClient:
         return cast(dict[str, Any], await self._call("sessions.preview", params))
 
     async def resolve_session(self, key: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.resolve", {"key": key}))
+        return await call_sessions_resolve(self._call, key=key)
 
     async def bootstrap_session(
         self,
@@ -759,33 +897,84 @@ class GatewayClient:
     async def abort_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
 
-    async def steer_session(self, key: str, message: str) -> dict[str, Any]:
+    async def steer_session(
+        self,
+        key: str,
+        message: str,
+        *,
+        expected_turn_id: str | None = None,
+    ) -> dict[str, Any]:
         from opensquilla.cli.tui.backend.input_identity import (
             current_tui_client_message_id,
         )
 
         client_message_id = current_tui_client_message_id() or uuid.uuid4().hex
-        return cast(
-            dict[str, Any],
-            await self._call(
-                "sessions.steer",
-                {
+        retry_key = (key, client_message_id)
+        source = {
+            "caller_kind": "cli",
+            "channel_kind": "cli",
+            "channel_id": "cli:chat",
+            "source_kind": "cli",
+            "source_name": "chat",
+            "client_message_id": client_message_id,
+            "surface_id": self.surface_id,
+        }
+        v2_params = self._pending_steer_v2.get(retry_key)
+        if v2_params is None:
+            target_turn_id = expected_turn_id or self._active_turn_ids.get(key)
+            if target_turn_id:
+                v2_params = {
                     "key": key,
                     "message": message,
+                    "expected_turn_id": target_turn_id,
+                    # The composer identity is stable for the lifetime
+                    # of one accepted input. Prefix it so its receipt
+                    # cannot collide with a normal sessions.send using
+                    # the same client_message_id.
+                    "client_request_id": f"steer:{client_message_id}",
                     "client_message_id": client_message_id,
                     "surface_id": self.surface_id,
-                    "_source": {
-                        "caller_kind": "cli",
-                        "channel_kind": "cli",
-                        "channel_id": "cli:chat",
-                        "source_kind": "cli",
-                        "source_name": "chat",
-                        "client_message_id": client_message_id,
-                        "surface_id": self.surface_id,
-                    },
-                },
-            ),
-        )
+                    "_source": source,
+                }
+                self._pending_steer_v2[retry_key] = v2_params
+        if v2_params is not None:
+            try:
+                result = cast(
+                    dict[str, Any],
+                    await self._call(
+                        "sessions.steer.v2",
+                        v2_params,
+                    ),
+                )
+                self._pending_steer_v2.pop(retry_key, None)
+                return result
+            except GatewayRPCError as exc:
+                error_code = str(exc.code or "").upper()
+                fallback_safe = bool(
+                    isinstance(exc.data, dict) and exc.data.get("fallback_safe") is True
+                )
+                should_retry = exc.retryable is True or not fallback_safe
+                if error_code != "METHOD_NOT_FOUND" and should_retry:
+                    raise
+                self._pending_steer_v2.pop(retry_key, None)
+                if error_code != "METHOD_NOT_FOUND":
+                    raise
+
+        # A new CLI must never fall back to the unversioned steer endpoint:
+        # it has no expected-turn fence, and older Gateways may implement it
+        # by cancelling/restarting the active task. Returning an explicit
+        # queue-only disposition lets the TUI retain the input visibly and
+        # submit it as the next ordinary turn.
+        return {
+            "accepted": False,
+            "replayed": False,
+            "key": key,
+            "turn_id": expected_turn_id or self._active_turn_ids.get(key),
+            "client_message_id": client_message_id,
+            "disposition": "queue_only",
+            "failure_code": "STEER_V2_UNAVAILABLE",
+            "fallback_safe": True,
+        }
 
     async def patch_session(self, key: str, **fields: Any) -> dict[str, Any]:
         params: dict[str, Any] = {"key": key, **fields}
@@ -812,6 +1001,27 @@ class GatewayClient:
         result = await self._call("models.routing.set", {"mode": mode})
         return result if isinstance(result, dict) else {}
 
+    async def get_session_routing(self, key: str) -> dict[str, Any]:
+        result = await self._call("sessions.routing.get", {"sessionKey": key})
+        return result if isinstance(result, dict) else {}
+
+    async def set_session_routing(
+        self,
+        key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        result = await self._call(
+            "sessions.routing.set",
+            {
+                "sessionKey": key,
+                "mode": mode,
+                "expectedRevision": expected_revision,
+            },
+        )
+        return result if isinstance(result, dict) else {}
+
     async def usage_status(self) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("usage.status", {}))
 
@@ -834,17 +1044,6 @@ class GatewayClient:
     async def patch_config_safe(self, patches: dict[str, Any]) -> dict[str, Any]:
         result = await self._call("config.patch.safe", {"patches": patches})
         return result if isinstance(result, dict) else {}
-
-    async def forget_approvals(self, target: str | None = None) -> dict[str, Any]:
-        """Wipe cached intent approvals on the server.
-
-        ``target`` selects a specific path/command; omit to clear all.
-        Returns the scope reported by the server.
-        """
-        params: dict[str, Any] = {}
-        if target:
-            params["target"] = target
-        return cast(dict[str, Any], await self._call("exec.approval.forget", params))
 
     async def approvals_snapshot(self) -> dict[str, Any]:
         """Return current approval mode + cache contents (diagnostic)."""
@@ -991,16 +1190,42 @@ class GatewayClient:
             return
         if any(item.session_key == session_key for item in self._event_subscriptions.values()):
             return
+        pending_unsubscribe: tuple[str, asyncio.Future[dict]] | None = None
         async with self._subscription_lock:
+            # A replacement subscription may have been registered while this
+            # coroutine waited for the lock. In that case the server subscription
+            # must remain active.
+            if any(
+                item.session_key == session_key
+                for item in self._event_subscriptions.values()
+            ):
+                return
             if session_key not in self._server_session_subscriptions:
                 return
             self._server_session_subscriptions.discard(session_key)
             if self._closing or self._connection_error is not None or self._ws is None:
                 return
             try:
-                await self._call("sessions.messages.unsubscribe", {"key": session_key})
-            except (ConnectionError, GatewayRPCError):
+                # Send under the lock so a replacement subscribe is ordered after
+                # this frame, but release the lock before waiting for its response.
+                pending_unsubscribe = await self._start_call(
+                    "sessions.messages.unsubscribe",
+                    {"key": session_key},
+                )
+            except ConnectionError:
                 return
+        if pending_unsubscribe is None:
+            return
+        req_id, fut = pending_unsubscribe
+        try:
+            await self._await_call_response(
+                "sessions.messages.unsubscribe",
+                req_id,
+                fut,
+                timeout_s=self.request_timeout_s,
+            )
+        except (ConnectionError, GatewayRPCError, TimeoutError):
+            return
 
     def _preserve_foreign_event(
         self,
@@ -1026,7 +1251,7 @@ class GatewayClient:
         """Send message and yield session events until done.
 
         ``elevated`` is a legacy surface kept for older clients. ``off``
-        clears the override, ``on``/``bypass`` map to Managed Execution, and
+        clears the override, ``on``/``bypass`` map to Safe mode, and
         ``full`` maps to Full Host Access.
         """
         # Register the local queue before send. Replay/live frames are broadcast
@@ -1081,6 +1306,7 @@ class GatewayClient:
             or client_message_id
         )
         if accepted_turn_id is not None:
+            self._active_turn_ids[session_key] = accepted_turn_id
             from opensquilla.cli.tui.backend.input_identity import (
                 notify_tui_turn_identity,
             )
@@ -1118,11 +1344,19 @@ class GatewayClient:
                 if terminal:
                     break
         finally:
+            if (
+                accepted_turn_id is not None
+                and self._active_turn_ids.get(session_key) == accepted_turn_id
+            ):
+                self._active_turn_ids.pop(session_key, None)
             await subscription.close()
 
     async def close(self) -> None:
         """Close the WebSocket connection."""
         self._closing = True
+        self._fail_pending_requests(
+            ConnectionError("Gateway connection closed before the RPC response was received")
+        )
         for task in (self._heartbeat_task, self._listener_task):
             if task is None:
                 continue
@@ -1138,9 +1372,18 @@ class GatewayClient:
         self._listener_task = None
         self._server_session_subscriptions.clear()
         self._session_event_backlog.clear()
+        self._active_turn_ids.clear()
+        self._pending_steer_v2.clear()
         for subscription in tuple(self._event_subscriptions.values()):
             subscription._close_from_client()
         self._event_subscriptions.clear()
+
+    def _fail_pending_requests(self, error: BaseException) -> None:
+        pending = tuple(self._pending.values())
+        self._pending.clear()
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(error)
 
     def _mark_connection_failed(self, exc: BaseException) -> ConnectionError:
         if isinstance(exc, ConnectionError) and str(exc).startswith("Gateway connection lost"):
@@ -1155,10 +1398,7 @@ class GatewayClient:
             self._connection_error = err
         else:
             err = self._connection_error
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(err)
-        self._pending.clear()
+        self._fail_pending_requests(err)
         for subscription in tuple(self._event_subscriptions.values()):
             subscription._fail(err)
         current_task = asyncio.current_task()
@@ -1210,6 +1450,16 @@ def _advance_gateway_turn_event(
         payload = _normalize_session_error_payload(payload)
     if task_terminal := _task_terminal_as_session_event(event_name, payload):
         return task_terminal, not active_task_groups
+
+    # A terminal generation reset is already the canonical visible failure.
+    # Stop this turn subscription on that frame so the TaskRuntime's later
+    # task.failed bookkeeping event cannot be projected as a second generic
+    # session.error that overwrites the reset result.
+    if (
+        event_name == "session.event.answer_generation_reset"
+        and payload.get("terminal") is True
+    ):
+        return {"event": event_name, **payload}, True
 
     group_id = payload.get("group_id")
     active_group_event = event_name in {

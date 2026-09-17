@@ -7,6 +7,7 @@ import pytest
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.tools.builtin import skill_tools
 from opensquilla.tools.registry import get_default_registry
+from opensquilla.tools.types import ToolContext, ToolError, current_tool_context
 
 
 @pytest.fixture()
@@ -79,3 +80,25 @@ async def test_skill_edit_preserves_description_needing_quotes(loader):
     assert spec is not None
     assert spec.description == "Notes: capture and file them"
     assert spec.content == "New body."
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs"),
+    [
+        ("skill_list", {}),
+        ("skill_view", {"name": "secret"}),
+        (
+            "skill_create",
+            {"name": "guest-skill", "description": "guest", "content": "guest"},
+        ),
+        ("skill_edit", {"name": "secret", "content": "guest"}),
+        ("skill_delete", {"name": "secret"}),
+    ],
+)
+async def test_guest_direct_skill_handler_calls_are_denied(loader, name, kwargs):
+    token = current_tool_context.set(ToolContext(guest_safe=True))
+    try:
+        with pytest.raises(ToolError, match="GUEST_TOOL_UNAVAILABLE"):
+            await _handler(name)(**kwargs)
+    finally:
+        current_tool_context.reset(token)

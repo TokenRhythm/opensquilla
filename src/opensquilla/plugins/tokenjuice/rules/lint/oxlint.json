@@ -4,6 +4,7 @@
   "description": "Compact Oxlint output while preserving diagnostics.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["oxlint"],
     "commandIncludes": ["oxlint"]
   },
   "transforms": {

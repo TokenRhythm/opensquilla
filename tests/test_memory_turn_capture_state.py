@@ -67,6 +67,62 @@ async def test_turn_capture_writes_raw_turn_without_memory_store(tmp_path):
     )
 
 
+@pytest.mark.asyncio
+async def test_turn_capture_follows_replaced_live_root_memory_config(tmp_path):
+    def memory_config(*, enabled: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            auto_capture_enabled=enabled,
+            capture_mode="turn_pair",
+            capture_user=True,
+            capture_assistant=False,
+            capture_max_chars=2000,
+            capture_roll_max_chars=50_000,
+        )
+
+    root_config = SimpleNamespace(memory=memory_config(enabled=True))
+    turns_dir = tmp_path / "state" / "agents" / "main" / "turns"
+    service = TurnCaptureService(
+        workspace_dir=tmp_path / "workspace",
+        turns_dir=turns_dir,
+        memory_config=root_config,
+    )
+
+    captured = await service.capture_turn(
+        session_key="agent:main:main",
+        session_id="sess-1",
+        user_text="capture before the live toggle",
+        assistant_text="ignored",
+        captured_at=datetime(2026, 5, 14, 3, 2, tzinfo=UTC),
+    )
+    assert captured == "turns/agent-main-main/2026-05-14.md"
+    capture_file = turns_dir / "agent-main-main" / "2026-05-14.md"
+    before_disable = capture_file.read_text(encoding="utf-8")
+
+    # Gateway config patches preserve the root object but replace its nested
+    # memory model. The already-running service must observe that replacement.
+    root_config.memory = memory_config(enabled=False)
+    skipped = await service.capture_turn(
+        session_key="agent:main:main",
+        session_id="sess-1",
+        user_text="do not capture after the live toggle",
+        assistant_text="ignored",
+        captured_at=datetime(2026, 5, 14, 3, 3, tzinfo=UTC),
+    )
+    assert skipped is None
+    assert capture_file.read_text(encoding="utf-8") == before_disable
+
+    root_config.memory = memory_config(enabled=True)
+    resumed = await service.capture_turn(
+        session_key="agent:main:main",
+        session_id="sess-1",
+        user_text="capture after re-enabling",
+        assistant_text="ignored",
+        captured_at=datetime(2026, 5, 14, 3, 4, tzinfo=UTC),
+    )
+    assert resumed == "turns/agent-main-main/2026-05-14.md"
+    assert "capture after re-enabling" in capture_file.read_text(encoding="utf-8")
+
+
 def test_migrate_legacy_turn_archives_moves_only_system_captures(tmp_path):
     workspace = tmp_path / "workspace"
     memory = workspace / "memory"

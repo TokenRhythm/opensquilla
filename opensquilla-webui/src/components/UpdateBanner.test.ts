@@ -1,8 +1,10 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, type App as VueApp } from 'vue'
+import { createApp, nextTick, reactive, type App as VueApp } from 'vue'
 import i18n from '@/i18n'
 import UpdateBanner from './UpdateBanner.vue'
+import { OBSERVABILITY_KEY, type UpdateNotice } from '@/modules/observability'
+import { GATEWAY_ACCESS_KEY, type GatewayAvailability } from '@/modules/gatewayAccess'
 
 const platformMocks = vi.hoisted(() => ({
   desktopUpdateManaged: vi.fn(),
@@ -19,6 +21,7 @@ const POLL_INTERVAL_MS = 15 * 60 * 1000
 const REQUEST_TIMEOUT_MS = 5 * 1000
 const apps = new Set<VueApp>()
 let fetchMock: ReturnType<typeof vi.fn>
+let access: { availability: GatewayAvailability }
 
 interface UpdatePayload {
   current: string
@@ -75,6 +78,40 @@ async function mountBanner(): Promise<{ app: VueApp; el: HTMLDivElement }> {
   document.body.appendChild(el)
   const app = createApp(UpdateBanner)
   app.use(i18n)
+  app.provide(GATEWAY_ACCESS_KEY, access as never)
+  app.provide(OBSERVABILITY_KEY, {
+    async updateNotice(options?: { signal?: AbortSignal }): Promise<UpdateNotice | null | undefined> {
+      const headers: Record<string, string> = {}
+      const token = sessionStorage.getItem('opensquilla.wsToken') || ''
+      if (token) headers.Authorization = `Bearer ${token}`
+      try {
+        const response = await fetch('/api/system/update', {
+          cache: 'no-store',
+          headers,
+          signal: options?.signal,
+        })
+        if (!response.ok) return undefined
+        const raw = await response.json() as Partial<UpdatePayload>
+        if (
+          typeof raw.current !== 'string'
+          || typeof raw.available !== 'boolean'
+          || (raw.latest !== null && typeof raw.latest !== 'string')
+          || (raw.url !== null && typeof raw.url !== 'string')
+          || (raw.checkedAt !== null && typeof raw.checkedAt !== 'string')
+        ) return undefined
+        if (!raw.available) return null
+        if (typeof raw.latest !== 'string' || !raw.latest.trim()) return undefined
+        return {
+          current: raw.current,
+          latest: raw.latest,
+          available: true,
+          url: typeof raw.url === 'string' && raw.url ? raw.url : undefined,
+        }
+      } catch {
+        return undefined
+      }
+    },
+  } as never)
   app.mount(el)
   apps.add(app)
   await flushAsync()
@@ -92,6 +129,7 @@ beforeEach(() => {
   localStorage.clear()
   sessionStorage.clear()
   setVisibility('visible')
+  access = reactive({ availability: 'available' })
   i18n.global.locale.value = 'en'
   platformMocks.desktopUpdateManaged.mockReset().mockResolvedValue(false)
   fetchMock = vi.fn()
@@ -107,27 +145,82 @@ afterEach(() => {
 })
 
 describe('UpdateBanner live update polling', () => {
-  it('shows a newly published release on the next poll without remounting', async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse(payload()))
-      .mockResolvedValueOnce(jsonResponse(payload({
-        latest: '0.5.0rc5',
-        available: true,
-        url: 'https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0rc5',
-      })))
+  it('waits for the Gateway and resumes once per connection without polling offline', async () => {
+    access.availability = 'preparing'
+    injectBootstrap()
+    fetchMock.mockResolvedValue(jsonResponse(payload()))
+    const { app, el } = await mountBanner()
+    expect(el.querySelector('[data-testid="update-banner"]')?.textContent).toContain('0.5.0rc5')
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 2)
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(fetchMock).not.toHaveBeenCalled()
 
-    const { el } = await mountBanner()
-    expect(el.querySelector('[data-testid="update-banner"]')).toBeNull()
-
-    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS)
+    access.availability = 'available'
     await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    access.availability = 'unavailable'
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 2)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    access.availability = 'available'
+    await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
 
-    const banner = el.querySelector('[data-testid="update-banner"]')
-    expect(banner?.textContent).toContain('0.5.0rc5')
-    expect(el.querySelector('.update-banner__link')?.getAttribute('href')).toBe(
-      'https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0rc5',
-    )
+    unmount(app)
+    access.availability = 'unavailable'
+    access.availability = 'available'
+    await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
+
+  it('aborts offline work and ignores its late result after reconnect', async () => {
+    let resolveOld!: (response: Response) => void
+    fetchMock.mockImplementationOnce(() => new Promise<Response>(resolve => { resolveOld = resolve }))
+      .mockResolvedValue(jsonResponse(payload()))
+    const { el } = await mountBanner()
+    const oldSignal = fetchMock.mock.calls[0]?.[1]?.signal as AbortSignal
+    access.availability = 'preparing'
+    expect(oldSignal.aborted).toBe(true)
+    access.availability = 'available'
+    await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    resolveOld(jsonResponse(payload({ available: true, latest: 'obsolete' })))
+    await flushAsync()
+    expect(el.querySelector('[data-testid="update-banner"]')).toBeNull()
+  })
+
+  it('keeps desktop-managed updates suppressed when the Gateway becomes ready', async () => {
+    access.availability = 'preparing'
+    platformMocks.desktopUpdateManaged.mockResolvedValue(true)
+    await mountBanner()
+    access.availability = 'available'
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 2)
+    await flushAsync()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['TokenRhythm', 'opensquilla'])(
+    'shows a newly published %s release on the next poll without remounting',
+    async (owner) => {
+      const releaseUrl = `https://github.com/${owner}/opensquilla/releases/tag/v0.5.0rc5`
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(payload()))
+        .mockResolvedValueOnce(jsonResponse(payload({
+          latest: '0.5.0rc5',
+          available: true,
+          url: releaseUrl,
+        })))
+
+      const { el } = await mountBanner()
+      expect(el.querySelector('[data-testid="update-banner"]')).toBeNull()
+
+      await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS)
+      await flushAsync()
+
+      const banner = el.querySelector('[data-testid="update-banner"]')
+      expect(banner?.textContent).toContain('0.5.0rc5')
+      expect(el.querySelector('.update-banner__link')?.getAttribute('href')).toBe(releaseUrl)
+    },
+  )
 
   it('reads the current session token for every same-origin request', async () => {
     sessionStorage.setItem('opensquilla.wsToken', 'first-token')
@@ -333,7 +426,7 @@ describe('UpdateBanner live update polling', () => {
     const { el } = await mountBanner()
 
     expect(el.querySelector('.update-banner__link')?.getAttribute('href')).toBe(
-      'https://github.com/opensquilla/opensquilla/releases',
+      'https://github.com/TokenRhythm/opensquilla/releases',
     )
   })
 

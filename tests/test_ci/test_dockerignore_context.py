@@ -12,6 +12,15 @@ import pytest
 _ROOT = Path(__file__).parents[2]
 
 
+def test_dockerfile_copies_runtime_catalog_required_by_wheel_build() -> None:
+    dockerfile = (_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert (
+        "COPY desktop/electron/runtime/runtime-pack-catalog.json "
+        "./desktop/electron/runtime/runtime-pack-catalog.json"
+    ) in dockerfile
+
+
 def _write(path: Path, contents: str = "probe\n") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(contents, encoding="utf-8")
@@ -41,6 +50,10 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
     _write(
         context / "src/opensquilla/gateway/static/dist/assets/stale-hash.js",
         "stale bundle\n",
+    )
+    _write(
+        context / "opensquilla-webui/dist/assets/stale-hash.js",
+        "stale source bundle\n",
     )
 
     # Nested dotfiles and private BGM remain supported inputs. The former is
@@ -79,3 +92,4 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
     assert not (copied / "config/tls/server.pem").exists()
     assert not (copied / "config/tls/server.key").exists()
     assert not (copied / "src/opensquilla/gateway/static/dist").exists()
+    assert not (copied / "opensquilla-webui/dist").exists()

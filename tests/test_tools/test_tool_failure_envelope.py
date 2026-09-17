@@ -4,6 +4,7 @@ import json
 
 import httpx
 
+from opensquilla.sandbox.types import SandboxBackendError
 from opensquilla.tools.envelope import build_tool_failure_envelope
 from opensquilla.tools.types import RetryableToolInputError, SafeToolError
 
@@ -56,6 +57,19 @@ def test_json_decode_error_has_specific_message() -> None:
     assert envelope["retry_allowed"] is False
     assert "invalid response payload" in envelope["user_message"]
     assert "secret payload" not in envelope["user_message"]
+
+
+def test_sandbox_backend_failure_is_terminal_and_tells_model_not_to_fallback() -> None:
+    envelope = build_tool_failure_envelope(
+        SandboxBackendError("secret ACL or lease diagnostics"),
+        "list_dir",
+    )
+
+    assert envelope["error_class"] == "SandboxBackendError"
+    assert envelope["retry_allowed"] is False
+    assert "sandbox environment could not run" in envelope["user_message"].lower()
+    assert "do not retry with another tool" in envelope["user_message"].lower()
+    assert "secret ACL or lease diagnostics" not in envelope["user_message"]
 
 
 def test_policy_denial_envelope_has_exactly_five_keys() -> None:

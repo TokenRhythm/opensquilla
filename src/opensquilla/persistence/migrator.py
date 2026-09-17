@@ -18,13 +18,19 @@ import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
+import structlog
 from yoyo import exceptions, get_backend, read_migrations
 from yoyo import migrations as yoyo_migrations
 
 log = logging.getLogger(__name__)
+#: Separate structured logger: migration-directory resolution emits an
+#: operator-facing event whose fields are asserted by contract tests, while the
+#: rest of this module logs through the standard library.
+_structured_log = structlog.get_logger(__name__)
 
 #: PROCESS_QUERY_LIMITED_INFORMATION — the minimal access right needed to
 #: probe whether a Windows process exists.
@@ -45,6 +51,30 @@ _FALLBACK_AUDIT_HOST = "localhost"
 # authority for older binaries that do not know this external lock.
 _MIGRATION_PROCESS_LOCK_TIMEOUT_SECONDS = 120.0
 
+# PR #1222 originally used V036-V039 before V036__session_model_routing landed
+# on main. Development profiles may therefore already record the old ids even
+# though the released migration chain must use unique V037-V040 prefixes. Each
+# alias is accepted only when its exact historical hash matches; the replacement
+# is then marked under yoyo's lock without replaying the already-applied schema.
+_LEGACY_MIGRATION_ALIASES: dict[str, tuple[str, str]] = {
+    "V036__artifact_sessions": (
+        "V037__artifact_sessions",
+        "629c36c68995c8ad03b3ede54698658fa4ca1885bc66bca257b2961d5e01df4e",
+    ),
+    "V037__artifact_prompt_annotations": (
+        "V038__artifact_prompt_annotations",
+        "adeb19ffbc8c3dd64921b8282daec79e8cbf875ef010dacf00a41cbcee637ce7",
+    ),
+    "V038__artifact_mutation_attempts": (
+        "V039__artifact_mutation_attempts",
+        "9775f8aa161c6172d3f0010a6016d2881894f7b0bc504c59ca79f3e67138b11c",
+    ),
+    "V039__document_resources": (
+        "V040__document_resources",
+        "d3c739ce2989470f11cd8a8d8aef811a1e12fa7ac6dbc4dfccd5ce7323762390",
+    ),
+}
+
 
 class SchemaAheadError(RuntimeError):
     """The database records migrations the running code does not know about.
@@ -57,6 +87,55 @@ class SchemaAheadError(RuntimeError):
     """
 
 
+def resolve_migrations_dir() -> Path:
+    """Locate yoyo migrations in env override, installed package, or checkout.
+
+    Lives beside :func:`apply_pending` because every caller that applies
+    migrations needs it, including offline profile consolidation.  Keeping it in
+    the gateway would force lower layers to import the gateway back.
+    """
+
+    env_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
+    if env_dir:
+        candidate = Path(env_dir)
+        if any(candidate.glob("V*.py")):
+            return candidate
+        # A pinned-but-unusable override silently falling through to a
+        # different migration set is a misconfiguration operators must see.
+        # Structured rather than this module's stdlib logger: the event name and
+        # its ``path``/``reason`` fields are a pinned operator-facing contract.
+        _structured_log.warning(
+            "resolve_migrations_dir.env_override_ignored",
+            path=str(candidate),
+            reason=(
+                "directory does not exist"
+                if not candidate.is_dir()
+                else "no V*.py migration files found"
+            ),
+        )
+
+    try:
+        from importlib import resources as importlib_resources
+
+        package_dir = importlib_resources.files("opensquilla").joinpath("_migrations")
+        if package_dir.is_dir():
+            path = Path(str(package_dir))
+            if any(path.glob("V*.py")):
+                return path
+    except Exception:
+        pass
+
+    repo_dir = Path(__file__).resolve().parents[3] / "migrations"
+    if any(repo_dir.glob("V*.py")):
+        return repo_dir
+
+    raise RuntimeError(
+        "opensquilla migrations directory not found "
+        "(checked OPENSQUILLA_MIGRATIONS_DIR, opensquilla/_migrations, "
+        "and repo migrations/)"
+    )
+
+
 def _adapt_sqlite_datetime(value: datetime) -> str:
     return value.isoformat(" ")
 
@@ -65,6 +144,28 @@ def _ensure_sqlite_datetime_adapter() -> None:
     """Register the Python 3.12 replacement for sqlite3's deprecated default."""
 
     sqlite3.register_adapter(datetime, _adapt_sqlite_datetime)
+
+
+def _native_sqlite_path(path: str | Path) -> str:
+    """Return a local SQLite spelling that bypasses legacy Windows MAX_PATH."""
+
+    value = os.fspath(Path(path).expanduser())
+    if os.name != "nt":
+        return value
+    absolute = os.path.abspath(value)
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{absolute[2:]}"
+    return f"\\\\?\\{absolute}"
+
+
+def _sqlite_path(path: str | Path) -> Path:
+    """Return one absolute local path, native on Windows and logical elsewhere."""
+
+    if os.name == "nt":
+        return Path(_native_sqlite_path(path))
+    return Path(path).expanduser().resolve()
 
 
 def _to_yoyo_url(db_url: str) -> str:
@@ -80,12 +181,34 @@ def _to_yoyo_url(db_url: str) -> str:
     drive letters survive.
     """
     if "://" in db_url:
-        return db_url
+        if os.name != "nt":
+            return db_url
+        local_path = _sqlite_path_from_db_url(db_url)
+        if local_path is None:
+            return db_url
+        parsed = urlparse(db_url)
+        normalized = "sqlite:///" + quote(str(local_path), safe="/:")
+        if parsed.query:
+            normalized += f"?{parsed.query}"
+        if parsed.fragment:
+            normalized += f"#{parsed.fragment}"
+        return normalized
     if db_url == ":memory:":
         return "sqlite:///:memory:"
     # bare filesystem path — normalise to absolute so yoyo opens the same db
     # regardless of the worker cwd.
-    return "sqlite:///" + quote(Path(db_url).expanduser().resolve().as_posix(), safe="/:")
+    # On Windows always select the extended namespace. Gateway boot passes a
+    # logical path, while consolidation may already pass ``\\?\``; both must
+    # resolve to the same database without depending on LongPathsEnabled.
+    normalized = _native_sqlite_path(db_url) if os.name == "nt" else _sqlite_path(db_url).as_posix()
+    return "sqlite:///" + quote(normalized, safe="/:")
+
+
+def _sqlite_read_only_uri(db_path: Path) -> str:
+    value = str(db_path)
+    if os.name == "nt" and value.startswith("\\\\?\\"):
+        return f"file:{quote(value, safe='/:')}?mode=ro"
+    return f"{db_path.as_uri()}?mode=ro"
 
 
 def _sqlite_path_from_db_url(db_url: str) -> Path | None:
@@ -94,7 +217,7 @@ def _sqlite_path_from_db_url(db_url: str) -> Path | None:
     if db_url == ":memory:":
         return None
     if "://" not in db_url:
-        return Path(db_url).expanduser().resolve()
+        return _sqlite_path(db_url)
 
     parsed = urlparse(db_url)
     if parsed.scheme != "sqlite" or parsed.netloc:
@@ -103,11 +226,13 @@ def _sqlite_path_from_db_url(db_url: str) -> Path | None:
         return None
 
     path = unquote(parsed.path)
+    if os.name == "nt" and path.startswith("/\\\\?\\"):
+        path = path[1:]
     if os.name == "nt" and len(path) >= 3 and path[0] == "/" and path[2] == ":":
         path = path[1:]
     if os.name != "nt" and path.startswith("//") and not path.startswith("///"):
         path = path[1:]
-    return Path(path).expanduser().resolve()
+    return _sqlite_path(path)
 
 
 @contextlib.contextmanager
@@ -197,7 +322,7 @@ def _is_pid_alive(pid: int) -> bool:
 
 def _read_yoyo_lock_pids(db_path: Path) -> list[int] | None:
     try:
-        connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         log.warning(
             "migrator.lock_inspect_failed",
@@ -362,7 +487,7 @@ def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
     database), or ``None`` when the database cannot be inspected.
     """
     try:
-        connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         log.warning(
             "migrator.applied_inspect_failed",
@@ -433,6 +558,11 @@ def assert_schema_not_ahead(db_url: str, migrations_dir: Path) -> None:
         return
     with _yoyo_utf8_open():
         known = {migration.id for migration in _discover_migrations(path)}
+    known.update(
+        legacy_id
+        for legacy_id, (replacement_id, _legacy_hash) in _LEGACY_MIGRATION_ALIASES.items()
+        if replacement_id in known
+    )
     unknown = sorted(applied - known)
     if not unknown:
         return
@@ -621,6 +751,89 @@ def _verify_ledger_after_apply(db_path: Path | None, applied_ids: list[str]) -> 
         )
 
 
+def _mark_legacy_migration_aliases(backend: Any, migrations: Any) -> list[str]:
+    """Atomically replace exact historical ids with their released equivalents.
+
+    The old V036-V039 chain overlaps the released V036-V039 ids, so adding the
+    replacement rows is impossible until every exact legacy row has first been
+    removed. Both operations run in one transaction while the caller holds
+    yoyo's migration lock; no other process can observe the temporary gap.
+    """
+
+    migration_by_id = {str(migration.id): migration for migration in migrations}
+    relevant_aliases = {
+        legacy_id: (replacement_id, legacy_hash)
+        for legacy_id, (replacement_id, legacy_hash) in _LEGACY_MIGRATION_ALIASES.items()
+        if replacement_id in migration_by_id
+    }
+    if not relevant_aliases:
+        return []
+
+    backend.ensure_internal_schema_updated()
+    rows = backend.execute(
+        f"SELECT migration_id, migration_hash FROM {backend.migration_table_quoted}"
+    ).fetchall()
+    recorded = {
+        str(migration_id): str(migration_hash)
+        for migration_id, migration_hash in rows
+        if migration_id
+    }
+
+    legacy_rows: dict[str, tuple[str, str]] = {}
+    for legacy_id, (replacement_id, expected_hash) in relevant_aliases.items():
+        recorded_hash = recorded.get(legacy_id)
+        if recorded_hash is None:
+            continue
+        if recorded_hash == expected_hash:
+            legacy_rows[legacy_id] = (replacement_id, expected_hash)
+            continue
+        current = migration_by_id.get(legacy_id)
+        if current is not None and recorded_hash == str(current.hash):
+            continue
+        if recorded_hash != expected_hash:
+            raise SchemaAheadError(
+                f"Migration {legacy_id} in this database does not match the exact "
+                "historical OpenSquilla migration that was renamed; update from the "
+                "matching build or restore a compatible backup."
+            )
+
+    if not legacy_rows:
+        return []
+
+    marked_ids: list[str] = []
+    with backend.transaction():
+        for legacy_id, (_replacement_id, legacy_hash) in reversed(legacy_rows.items()):
+            backend.unmark_one(SimpleNamespace(id=legacy_id, hash=legacy_hash))
+        for legacy_id, (replacement_id, _legacy_hash) in legacy_rows.items():
+            replacement = migration_by_id[replacement_id]
+            replacement_hash = str(replacement.hash)
+            if (
+                recorded.get(replacement_id) == replacement_hash
+                and replacement_id not in legacy_rows
+            ):
+                continue
+            backend.mark_one(replacement)
+            marked_ids.append(replacement_id)
+
+    marked = {
+        str(migration_id): str(migration_hash)
+        for migration_id, migration_hash in backend.execute(
+            f"SELECT migration_id, migration_hash FROM {backend.migration_table_quoted}"
+        ).fetchall()
+        if migration_id
+    }
+    mismatched = [
+        migration_id
+        for migration_id in marked_ids
+        if marked.get(migration_id) != str(migration_by_id[migration_id].hash)
+    ]
+    if mismatched:
+        raise RuntimeError(
+            "Migration alias registration did not persist: " + ", ".join(mismatched)
+        )
+    return marked_ids
+
+
 def apply_pending(db_url: str, migrations_dir: Path) -> list[str]:
     """Apply every migration in *migrations_dir* not yet recorded in *db_url*.
 
@@ -707,6 +920,12 @@ def _apply_pending_once(
             log.debug("migrator.lock_wait_started")
             with backend.lock():
                 log.debug("migrator.lock_acquired")
+                marked_aliases = _mark_legacy_migration_aliases(backend, migrations)
+                if marked_aliases:
+                    log.info(
+                        "migrator.aliases_marked",
+                        extra={"ids": marked_aliases},
+                    )
                 pending = backend.to_apply(migrations)
                 ids = [m.id for m in pending]
                 if not ids:

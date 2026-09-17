@@ -19,6 +19,7 @@ from opensquilla.onboarding.probe import (
     discover_selectable_provider_models,
 )
 from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.protocol import ProviderModelListingResponseError
 
 
 def _patch_response(monkeypatch: Any, response_factory) -> list[httpx.Request]:
@@ -95,7 +96,14 @@ def test_selectable_discovery_fails_closed_before_credentials_or_provider_build(
     assert result == ProviderModelsDiscoverResult(ok=True, provider_id="openai")
 
 
-@pytest.mark.parametrize("provider_id", ["openrouter", "tokenrhythm"])
+@pytest.mark.parametrize(
+    "provider_id",
+    [
+        "deepseek",
+        "openrouter",
+        "qwen_token_plan",
+    ],
+)
 def test_selectable_discovery_delegates_verified_official_hosts(
     monkeypatch: Any, provider_id: str
 ) -> None:
@@ -127,11 +135,132 @@ def test_selectable_discovery_delegates_verified_official_hosts(
     ]
 
 
+def test_tokenrhythm_selectable_discovery_uses_catalog_coordinator(
+    monkeypatch: Any,
+) -> None:
+    from opensquilla.gateway import model_catalog_refresh
+
+    calls: list[dict[str, Any]] = []
+    catalog_config = object()
+
+    async def _fake_catalog(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True,
+            provider_id="tokenrhythm",
+            source="live",
+            models=[{"id": "verified-model"}],
+            catalog={"lastSyncedAt": "2026-08-03T12:00:00+00:00", "stale": False},
+        )
+
+    monkeypatch.setattr(
+        model_catalog_refresh,
+        "discover_tokenrhythm_models",
+        _fake_catalog,
+        raising=False,
+    )
+
+    result = _discover_selectable(
+        provider_id="tokenrhythm",
+        api_key="synthetic-key",
+        force_refresh=True,
+        persist_catalog=True,
+        catalog_config=catalog_config,
+    )
+
+    assert result.source == "live"
+    assert result.models == [{"id": "verified-model"}]
+    assert calls == [
+        {
+            "provider_id": "tokenrhythm",
+            "api_key": "synthetic-key",
+            "base_url": "https://tokenrhythm.studio/v1",
+            "proxy": "",
+            "force": True,
+            "persist_entitlement": True,
+            "config": catalog_config,
+        }
+    ]
+
+
+def test_token_plan_anthropic_discovers_account_entitlements_through_openai_profile(
+    monkeypatch: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_raw(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True,
+            provider_id=kwargs["provider_id"],
+            source="live",
+            models=[{"id": "qwen3.7-plus"}],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", _fake_raw)
+
+    result = _discover_selectable(
+        provider_id="qwen_token_plan_anthropic",
+        api_key="synthetic-key",
+    )
+
+    assert result == ProviderModelsDiscoverResult(
+        ok=True,
+        provider_id="qwen_token_plan_anthropic",
+        source="live",
+        models=[{"id": "qwen3.7-plus"}],
+    )
+    assert calls == [
+        {
+            "provider_id": "qwen_token_plan",
+            "api_key": "synthetic-key",
+            "api_key_env": "",
+            "base_url": "",
+            "proxy": "",
+        }
+    ]
+
+
+def test_token_plan_anthropic_discovery_never_reuses_its_messages_path(
+    monkeypatch: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_raw(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True,
+            provider_id=kwargs["provider_id"],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", _fake_raw)
+
+    result = _discover_selectable(
+        provider_id="qwen_token_plan_anthropic",
+        api_key="synthetic-key",
+        base_url="https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+    )
+
+    assert result.provider_id == "qwen_token_plan_anthropic"
+    assert calls[0]["provider_id"] == "qwen_token_plan"
+    assert calls[0]["base_url"] == ""
+
+
 @pytest.mark.parametrize(
     ("provider_id", "base_url"),
     [
+        ("deepseek", "https://api.deepseek.com.attacker.example/v1"),
+        ("deepseek", "https://custom.example/v1"),
         ("openrouter", "https://openrouter.ai.attacker.example/v1"),
         ("tokenrhythm", "https://tokenrhythm.studio.attacker.example/v1"),
+        (
+            "qwen_token_plan",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com.attacker.example/v1",
+        ),
+        (
+            "qwen_token_plan_anthropic",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com.attacker.example/v1",
+        ),
     ],
 )
 def test_selectable_discovery_rejects_non_official_base_url_before_raw_discovery(
@@ -154,8 +283,17 @@ def test_selectable_discovery_rejects_non_official_base_url_before_raw_discovery
 @pytest.mark.parametrize(
     ("provider_id", "base_url"),
     [
+        ("deepseek", "http://api.deepseek.com/v1"),
         ("openrouter", "http://openrouter.ai/api/v1"),
         ("tokenrhythm", "http://tokenrhythm.studio/v1"),
+        (
+            "qwen_token_plan",
+            "http://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        (
+            "qwen_token_plan_anthropic",
+            "http://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+        ),
     ],
 )
 def test_selectable_discovery_rejects_plain_http_before_credentials_or_raw_discovery(
@@ -187,14 +325,26 @@ def test_selectable_discovery_still_validates_unknown_provider() -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider_id", "base_url"),
+    ("provider_id", "base_url", "discovery_base_url"),
     [
-        ("openrouter", "https://api.openrouter.ai/v1"),
-        ("tokenrhythm", "https://api.tokenrhythm.studio/v1"),
+        ("openrouter", "https://api.openrouter.ai/v1", "https://api.openrouter.ai/v1"),
+        (
+            "qwen_token_plan",
+            "https://api.token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            "https://api.token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        (
+            "qwen_token_plan_anthropic",
+            "https://api.token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            "",
+        ),
     ],
 )
 def test_selectable_discovery_accepts_official_subdomains(
-    monkeypatch: Any, provider_id: str, base_url: str
+    monkeypatch: Any,
+    provider_id: str,
+    base_url: str,
+    discovery_base_url: str,
 ) -> None:
     calls: list[str] = []
 
@@ -207,7 +357,127 @@ def test_selectable_discovery_accepts_official_subdomains(
     result = _discover_selectable(provider_id=provider_id, base_url=base_url)
 
     assert result.ok is True
-    assert calls == [base_url]
+    assert calls == [discovery_base_url]
+
+
+def test_tokenrhythm_subdomain_discovery_uses_isolated_live_listing(
+    monkeypatch: Any,
+) -> None:
+    from opensquilla.gateway import model_catalog_refresh
+
+    calls: list[dict[str, Any]] = []
+
+    async def _unexpected_catalog(**_kwargs: Any) -> ProviderModelsDiscoverResult:
+        raise AssertionError("a non-production origin must not enter the catalog coordinator")
+
+    async def _fake_raw(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True,
+            provider_id="tokenrhythm",
+            source="live",
+            models=[{"id": "uat-model"}],
+        )
+
+    monkeypatch.setattr(
+        model_catalog_refresh,
+        "discover_tokenrhythm_models",
+        _unexpected_catalog,
+        raising=False,
+    )
+    monkeypatch.setattr(probe_module, "discover_provider_models", _fake_raw)
+
+    result = _discover_selectable(
+        provider_id="tokenrhythm",
+        api_key="synthetic-key",
+        base_url="https://uat.tokenrhythm.studio/v1",
+        force_refresh=True,
+        persist_catalog=True,
+        catalog_config=object(),
+    )
+
+    assert result.ok is True
+    assert result.source == "live"
+    assert result.models == [{"id": "uat-model"}]
+    assert calls == [
+        {
+            "provider_id": "tokenrhythm",
+            "api_key": "synthetic-key",
+            "api_key_env": "",
+            "base_url": "https://uat.tokenrhythm.studio/v1",
+            "proxy": "",
+        }
+    ]
+
+
+def test_tokenrhythm_uat_listing_does_not_inherit_production_metadata(
+    monkeypatch: Any,
+) -> None:
+    from opensquilla.gateway import model_catalog_refresh
+
+    async def _unexpected_catalog(**_kwargs: Any) -> ProviderModelsDiscoverResult:
+        raise AssertionError("UAT must not enter the production catalog coordinator")
+
+    monkeypatch.setattr(
+        model_catalog_refresh,
+        "discover_tokenrhythm_models",
+        _unexpected_catalog,
+        raising=False,
+    )
+    seen = _patch_response(monkeypatch, _models_response)
+
+    result = _discover_selectable(
+        provider_id="tokenrhythm",
+        api_key="synthetic-uat-key",
+        base_url="https://uat.tokenrhythm.studio/v1",
+    )
+
+    assert result.ok is True
+    assert result.source == "live"
+    assert [model["id"] for model in result.models] == ["test-model-a"]
+    assert str(seen[0].url) == "https://uat.tokenrhythm.studio/v1/models"
+    assert seen[0].headers["authorization"] == "Bearer synthetic-uat-key"
+    metadata = result.models[0]["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["published"] is None
+    assert metadata["declared"] is not None
+
+
+@pytest.mark.parametrize("base_url", ["", "https://api.deepseek.com/v1"])
+def test_deepseek_picker_lists_only_endpoint_models(monkeypatch: Any, base_url: str) -> None:
+    seen = _patch_response(
+        monkeypatch,
+        lambda: httpx.Response(
+            200,
+            json={"data": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]},
+        ),
+    )
+
+    result = _discover_selectable(
+        provider_id="deepseek", api_key="synthetic-key", base_url=base_url,
+    )
+
+    assert result.ok is True
+    assert result.source == "live"
+    assert [model["id"] for model in result.models] == ["deepseek-flash", "deepseek-v4-pro"]
+    assert str(seen[0].url) == "https://api.deepseek.com/v1/models"
+    assert seen[0].headers["authorization"] == "Bearer synthetic-key"
+    flash = result.models[0]
+    assert flash["contextWindow"] == 1_000_000
+    assert flash["maxOutputTokens"] == 384_000
+    assert set(flash["capabilities"]) == {"chat", "tools", "reasoning", "vision"}
+    assert flash["pricing"] == {"inputPer1k": 0.0003, "outputPer1k": 0.0012}
+
+
+def test_deepseek_picker_surfaces_auth_failure(monkeypatch: Any) -> None:
+    _patch_response(
+        monkeypatch,
+        lambda: httpx.Response(401, json={"error": {"message": "Invalid API key"}}),
+    )
+    result = _discover_selectable(provider_id="deepseek", api_key="synthetic-invalid-key")
+    assert result.ok is False
+    assert result.failure_kind == ProviderFailureKind.AUTH_INVALID.value
+    assert result.models == []
 
 
 def test_discover_reports_missing_key_without_network(monkeypatch: Any) -> None:
@@ -279,6 +549,31 @@ def test_discover_classifies_connection_failure_as_transport_transient(
     assert result.models == []
 
 
+def test_discover_classifies_unparseable_model_listing_as_malformed_response(
+    monkeypatch: Any,
+) -> None:
+    class _Provider:
+        async def list_models(self, *, raise_on_error: bool = False) -> list[Any]:
+            assert raise_on_error is True
+            raise ProviderModelListingResponseError(
+                "Model listing response was not valid JSON",
+                status_code=200,
+            )
+
+    monkeypatch.setattr(
+        probe_module,
+        "build_provider",
+        lambda *args, **kwargs: _Provider(),
+    )
+
+    result = _discover(provider_id="openai", api_key="sk-test")
+
+    assert result.ok is False
+    assert result.failure_kind == ProviderFailureKind.MALFORMED_RESPONSE.value
+    assert result.source == "none"
+    assert result.models == []
+
+
 def test_discover_empty_catalog_stays_ok_with_no_live_source(monkeypatch: Any) -> None:
     # Distinguishable from the auth failure above: the provider answered
     # successfully but lists nothing.
@@ -335,6 +630,113 @@ async def test_discover_rpc_reuses_stored_credentials_when_blank(
 
     assert payload["ok"] is True
     assert seen[0].headers["authorization"] == "Bearer sk-stored"
+
+
+async def test_discover_rpc_propagates_force_and_persists_only_active_identity(
+    tmp_path, monkeypatch: Any
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_discover(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        captured.update(kwargs)
+        return ProviderModelsDiscoverResult(ok=True, provider_id="openrouter")
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.discover_selectable_provider_models",
+        fake_discover,
+    )
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        llm=LlmProviderConfig(provider="openrouter", model="m", api_key="sk-stored"),
+    )
+
+    payload = await rpc_onboarding._models_discover(
+        {"providerId": "openrouter", "forceRefresh": True},
+        RpcContext(conn_id="t", config=cfg),
+    )
+
+    assert payload["ok"] is True
+    assert captured["force_refresh"] is True
+    assert captured["persist_catalog"] is True
+    assert captured["catalog_config"] is cfg
+
+
+async def test_discover_rpc_explicit_saved_connection_is_not_treated_as_draft(
+    tmp_path, monkeypatch: Any
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_discover(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        captured.update(kwargs)
+        return ProviderModelsDiscoverResult(ok=True, provider_id="tokenrhythm")
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.discover_selectable_provider_models",
+        fake_discover,
+    )
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        llm=LlmProviderConfig(
+            provider="tokenrhythm",
+            model="qwen3.8-max",
+            api_key="sk-synthetic",
+            base_url="https://tokenrhythm.studio/v1",
+            proxy="http://127.0.0.1:9876",
+        ),
+    )
+
+    payload = await rpc_onboarding._models_discover(
+        {
+            "providerId": "tokenrhythm",
+            "baseUrl": "https://tokenrhythm.studio/v1/",
+            "proxy": "http://127.0.0.1:9876",
+            "forceRefresh": True,
+        },
+        RpcContext(conn_id="t", config=cfg),
+    )
+
+    assert payload["ok"] is True
+    assert captured["force_refresh"] is True
+    assert captured["persist_catalog"] is True
+    assert captured["catalog_config"] is cfg
+
+
+async def test_discover_rpc_changed_connection_remains_ephemeral(
+    tmp_path, monkeypatch: Any
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_discover(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        captured.update(kwargs)
+        return ProviderModelsDiscoverResult(ok=True, provider_id="tokenrhythm")
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.discover_selectable_provider_models",
+        fake_discover,
+    )
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        llm=LlmProviderConfig(
+            provider="tokenrhythm",
+            model="qwen3.8-max",
+            api_key="sk-synthetic",
+            base_url="https://api.tokenrhythm.studio/v1",
+            proxy="http://127.0.0.1:9876",
+        ),
+    )
+
+    payload = await rpc_onboarding._models_discover(
+        {
+            "providerId": "tokenrhythm",
+            "baseUrl": "https://api.tokenrhythm.studio/v1",
+            "proxy": "http://127.0.0.1:9877",
+            "forceRefresh": True,
+        },
+        RpcContext(conn_id="t", config=cfg),
+    )
+
+    assert payload["ok"] is True
+    assert captured["persist_catalog"] is False
 
 
 async def test_discover_rpc_reuses_stored_key_for_same_origin_path_change(
@@ -465,6 +867,9 @@ async def test_discover_rpc_custom_cross_origin_never_passes_stored_key(
     assert captured["api_key_env"] == ""
     assert captured["base_url"] == "https://b.example.test/v1"
     assert captured["allow_default_api_key_env"] is False
+    assert captured["force_refresh"] is False
+    assert captured["persist_catalog"] is False
+    assert captured["catalog_config"] is cfg
 
 
 async def test_discover_rpc_does_not_leak_stored_credentials_across_providers(

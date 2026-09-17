@@ -19,12 +19,109 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Literal
+from urllib.parse import urlsplit
 
-TextToolDialect = Literal["qwen_tag", "minimax_xml", "plain_json"]
+from opensquilla.endpoint_identity import base_url_matches_official_api
+
+from .model_identity import DEEPSEEK_DIRECT_REASONING_MODEL_IDS, DEEPSEEK_V4_MODEL_IDS
+from .qwen_token_plan import (
+    QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS,
+    QWEN_TOKEN_PLAN_FORCE_THINKING_MODEL_IDS,
+    QWEN_TOKEN_PLAN_GLM_MODEL_IDS,
+    QWEN_TOKEN_PLAN_IMAGE_MODEL_IDS,
+    QWEN_TOKEN_PLAN_KIMI_MODEL_IDS,
+    QWEN_TOKEN_PLAN_PRESERVE_THINKING_MODEL_IDS,
+)
+
+TextToolDialect = Literal["qwen_tag", "minimax_xml", "plain_json", "deepseek_dsml"]
+ReasoningReplayScope = Literal["all_assistant", "tool_call_assistant"]
 
 TEXT_TOOL_DIALECT_QWEN_TAG: TextToolDialect = "qwen_tag"
 TEXT_TOOL_DIALECT_MINIMAX_XML: TextToolDialect = "minimax_xml"
 TEXT_TOOL_DIALECT_PLAIN_JSON: TextToolDialect = "plain_json"
+TEXT_TOOL_DIALECT_DEEPSEEK_DSML: TextToolDialect = "deepseek_dsml"
+
+
+# DSML is executable syntax, so its authorization stays independent from
+# reasoning/model-family helpers and names every trusted wire identity exactly.
+_DEEPSEEK_DSML_MODEL_IDS = (
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-0731",
+    "deepseek-v4-pro",
+)
+_TOKENRHYTHM_DSML_MODEL_IDS = (
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-0731",
+    "deepseek-v4-pro",
+    "tokenrhythm/deepseek-v4-flash",
+    "tokenrhythm/deepseek-v4-flash-0731",
+    "tokenrhythm/deepseek-v4-pro",
+)
+_TOKENRHYTHM_0813_MODEL_IDS = frozenset(
+    {
+        "deepseek-v4-pro-0813",
+        "tokenrhythm/deepseek-v4-pro-0813",
+    }
+)
+_TOKENRHYTHM_LEGACY_CUSTOM_REPLAY_MODEL_IDS = frozenset(
+    {
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro",
+        "tokenrhythm/deepseek-v4-flash",
+        "tokenrhythm/deepseek-v4-flash-0731",
+        "tokenrhythm/deepseek-v4-pro",
+    }
+)
+_TOKENRHYTHM_V4_MODEL_IDS = (
+    _TOKENRHYTHM_LEGACY_CUSTOM_REPLAY_MODEL_IDS | _TOKENRHYTHM_0813_MODEL_IDS
+)
+_TOKENRHYTHM_V4_LOW_EFFORT_MODEL_IDS = frozenset(
+    {
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro-0813",
+        "tokenrhythm/deepseek-v4-flash",
+        "tokenrhythm/deepseek-v4-flash-0731",
+        "tokenrhythm/deepseek-v4-pro-0813",
+    }
+)
+_OPENROUTER_DSML_MODEL_IDS = (
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+)
+
+
+def _matches_exact_https_endpoint(
+    base_url: str,
+    *,
+    endpoint_hosts: frozenset[str],
+    endpoint_paths: frozenset[str],
+) -> bool:
+    """Whether *base_url* is one of a rule's exact trusted API roots."""
+
+    if not endpoint_hosts:
+        return True
+    normalized_url = str(base_url or "").strip()
+    if "?" in normalized_url or "#" in normalized_url:
+        return False
+    try:
+        parsed = urlsplit(normalized_url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return False
+    path = parsed.path.rstrip("/")
+    return bool(
+        parsed.scheme.lower() == "https"
+        and host in endpoint_hosts
+        and (port is None or port == 443)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and path in endpoint_paths
+    )
 
 
 @dataclass(frozen=True)
@@ -33,10 +130,20 @@ class TextToolModelRule:
 
     model_patterns: tuple[str, ...]
     dialects: frozenset[TextToolDialect]
+    endpoint_hosts: frozenset[str] = frozenset()
+    endpoint_paths: frozenset[str] = frozenset()
 
-    def matches(self, model: str) -> bool:
+    def matches(self, model: str, base_url: str = "") -> bool:
         normalized = model.strip().lower()
-        return any(fnmatchcase(normalized, pattern.lower()) for pattern in self.model_patterns)
+        if not any(
+            fnmatchcase(normalized, pattern.lower()) for pattern in self.model_patterns
+        ):
+            return False
+        return _matches_exact_https_endpoint(
+            base_url,
+            endpoint_hosts=self.endpoint_hosts,
+            endpoint_paths=self.endpoint_paths,
+        )
 
 
 @dataclass(frozen=True)
@@ -52,16 +159,51 @@ class TextToolCompatProfile:
     dialects: frozenset[TextToolDialect] = frozenset()
     model_rules: tuple[TextToolModelRule, ...] = ()
 
-    def dialects_for_model(self, model: str) -> frozenset[TextToolDialect]:
+    def dialects_for_model(
+        self,
+        model: str,
+        base_url: str = "",
+    ) -> frozenset[TextToolDialect]:
         enabled = set(self.dialects)
         for rule in self.model_rules:
-            if rule.matches(model):
+            if rule.matches(model, base_url):
                 enabled.update(rule.dialects)
         return frozenset(enabled)
 
     @property
     def enabled(self) -> bool:
         return bool(self.dialects or self.model_rules)
+
+
+@dataclass(frozen=True)
+class ReasoningModelRule:
+    """Exact, endpoint-scoped reasoning request compatibility.
+
+    Reasoning history is provider state, but it is still untrusted request
+    data with provider-specific wire limits.  These rules only shape the
+    physical request view; callers retain the original ``Message`` objects.
+    """
+
+    model_ids: frozenset[str]
+    endpoint_hosts: frozenset[str] = frozenset()
+    endpoint_paths: frozenset[str] = frozenset()
+    replay_scope: ReasoningReplayScope = "all_assistant"
+    require_reasoning_content: bool = False
+    max_reasoning_content_utf16_units: int | None = None
+    reasoning_format: str = ""
+    low_effort_model_ids: frozenset[str] = frozenset()
+    thinking_tool_choice_auto_only: bool = False
+
+    def matches(self, model: str, base_url: str) -> bool:
+        """Match only a trusted raw model id and an exact HTTPS API root."""
+
+        if model.strip().lower() not in self.model_ids:
+            return False
+        return _matches_exact_https_endpoint(
+            base_url,
+            endpoint_hosts=self.endpoint_hosts,
+            endpoint_paths=self.endpoint_paths,
+        )
 
 
 @dataclass(frozen=True)
@@ -91,6 +233,30 @@ class OpenAICompatPolicy:
 
     # JSON Schema keywords the upstream rejects in tool definitions.
     tool_schema_unsupported_keywords: frozenset[str] = frozenset()
+
+    # Tool names whose itemless arrays may be projected to string items on
+    # this provider's official endpoint. This is deliberately allowlisted:
+    # an itemless JSON Schema array accepts arbitrary values, so a string
+    # fallback is safe only when the tool's wire semantics are textual.
+    tool_schema_string_item_fallback_tools: frozenset[str] = frozenset()
+
+    # Exact API root where the string-item projection is required. A tool
+    # allowlist alone is not sufficient evidence for custom endpoints that
+    # happen to use the same provider kind or hostname.
+    tool_schema_string_item_fallback_api_root: str = ""
+
+    # Whether the chat-completions endpoint reliably supports native
+    # ``response_format.type=json_schema``.  When false, the OpenAI-compatible
+    # adapter keeps the same provider/model and places the authoritative
+    # schema in the system prompt instead; callers still validate the returned
+    # artifact locally.
+    supports_native_json_schema_output: bool = True
+
+    # Whether the endpoint supports the less expressive
+    # ``response_format.type=json_object`` mode.  This is useful when native
+    # JSON Schema is unavailable: the schema remains in the trusted system
+    # prompt while the request still asks the upstream for a JSON object.
+    supports_json_object_output: bool = False
 
     # Text-to-tool execution is deliberately dialect- and model-scoped.  This
     # record is trusted packaged metadata: an online model catalog must never
@@ -126,6 +292,12 @@ class OpenAICompatPolicy:
     # validates their location but never treats them as response content.
     post_terminal_metadata_keys: frozenset[str] = frozenset()
 
+    # Some self-hosted OpenAI-compatible servers (notably llama.cpp) emit an
+    # empty ``choices`` frame after the terminal choice and before ``[DONE]``
+    # without a usage trailer.  It carries no response state, so custom local
+    # endpoints may opt into accepting that exact inert frame.
+    allow_post_terminal_empty_choices: bool = False
+
     # Gateway proxies with their own routing (LiteLLM): pin the requested
     # model by disabling the gateway's cross-model fallbacks per request, so
     # SquillaRouter stays the single routing authority.
@@ -139,8 +311,19 @@ class OpenAICompatPolicy:
     # capabilities declare this reasoning format.
     replay_reasoning_format: str = ""
 
+    # Exact model/endpoint rules take precedence over the legacy basename
+    # fields below.  They are used when an aggregator has a narrower replay
+    # contract than the upstream model family it exposes.
+    reasoning_model_rules: tuple[ReasoningModelRule, ...] = ()
+
     # Reasoning format assumed when no model capabilities are available.
     default_reasoning_format: str = ""
+
+    # One provider-native reasoning dialect may be valid only at an exact API
+    # root. A custom endpoint using another explicitly configured dialect is
+    # unaffected, and an empty pair leaves compatible relays unrestricted.
+    official_reasoning_dialect: str = ""
+    official_reasoning_api_root: str = ""
 
     # Models that need an explicit thinking enable/disable payload even when
     # no capability profile is available (exact ids, lowercase).
@@ -154,17 +337,99 @@ class OpenAICompatPolicy:
     # when thinking is off (exact ids, lowercase).
     disable_reasoning_by_default_models: frozenset[str] = frozenset()
 
+    # Model id prefixes that reject enable_thinking=False (forced-thinking
+    # endpoints). When a disable-thinking payload would be emitted for a model
+    # matching one of these prefixes, the off-payload is omitted entirely so
+    # the request still succeeds. Checked at the single wire emitter in
+    # openai.py so every explicit thinking-off request follows the same model
+    # constraint.
+    thinking_required_model_prefixes: tuple[str, ...] = ()
+
+    # Exact forced-thinking ids for multi-family endpoints where a prefix
+    # would be too broad. These models receive enable_thinking=True even
+    # when the local preference is off.
+    force_thinking_model_ids: frozenset[str] = frozenset()
+
+    # Models whose reasoning history can be replayed and whose request must
+    # opt into that continuity with preserve_thinking=True.
+    preserve_thinking_model_ids: frozenset[str] = frozenset()
+
+    # Reasoning models that require an assistant reasoning_content key only
+    # while thinking is enabled. The tool-call set is narrower: some models
+    # require the key only on assistant tool-call turns.
+    require_reasoning_content_when_thinking_model_ids: frozenset[str] = frozenset()
+    require_tool_call_reasoning_content_when_thinking_model_ids: frozenset[str] = (
+        frozenset()
+    )
+
+    # Thinking-mode tool choice accepts only auto/none on this endpoint.
+    thinking_tool_choice_auto_only: bool = False
+    # Models that are reasoning-only upstream even when the endpoint does not
+    # accept or emit an explicit enable_thinking toggle.  Their tool selector
+    # follows the same auto/none restriction as an explicitly enabled request.
+    implicit_thinking_tool_choice_model_ids: frozenset[str] = frozenset()
+    # Models that require tool_stream=True whenever tools are present.
+    tool_stream_model_ids: frozenset[str] = frozenset()
+
+    # A thinking-only model may impose a minimum sampling temperature.
+    temperature_floor_model_ids: frozenset[str] = frozenset()
+    temperature_floor: float = 0.0
+
+    # Provider listings can mix non-chat products into the same /models
+    # response. Keep picker filtering declarative rather than branching in
+    # the generic OpenAI transport.
+    model_listing_excluded_ids: frozenset[str] = frozenset()
+
+    # Omit a framework-default thinking budget so the service can apply its
+    # own model default; an explicitly configured budget is still sent.
+    omit_implicit_thinking_budget: bool = False
+
     @property
     def text_tool_synthesis(self) -> bool:
         """Deprecated read-only compatibility view.
 
         Older diagnostics inspected one provider-wide boolean.  Keep that
         observation surface without letting the boolean control execution;
-        callers that need an answer for one model must use
-        ``text_tool_profile.dialects_for_model(model)``.
+        callers that need an answer for one deployment must use
+        ``text_tool_profile.dialects_for_model(model, base_url)``.
         """
 
         return self.text_tool_profile.enabled
+
+    def allows_string_item_schema_projection(self, tool_name: str, base_url: str) -> bool:
+        """Return whether a trusted tool may use the lossy wire projection."""
+
+        candidate_base_url = str(base_url or "")
+        if not candidate_base_url or candidate_base_url != candidate_base_url.strip():
+            return False
+        return bool(
+            tool_name in self.tool_schema_string_item_fallback_tools
+            and self.tool_schema_string_item_fallback_api_root
+            and base_url_matches_official_api(
+                self.tool_schema_string_item_fallback_api_root,
+                candidate_base_url,
+            )
+        )
+
+
+def effective_reasoning_format(
+    policy: OpenAICompatPolicy,
+    reasoning_format: str,
+    base_url: str,
+) -> str:
+    """Suppress a provider-native dialect outside its exact official API root."""
+
+    restricted_dialect = policy.official_reasoning_dialect.strip().lower()
+    if (
+        restricted_dialect
+        and reasoning_format.strip().lower() == restricted_dialect
+        and not base_url_matches_official_api(
+            policy.official_reasoning_api_root,
+            base_url,
+        )
+    ):
+        return ""
+    return reasoning_format
 
 
 _ARK_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = frozenset(
@@ -177,8 +442,6 @@ _ARK_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = frozenset(
         "maxContains",
     }
 )
-
-_DEEPSEEK_V4_MODEL_IDS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 
 # TokenHub's hy3 family documents interleaved thinking: assistant turns must
 # carry reasoning_content back (an empty string when there is none), or the
@@ -215,6 +478,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                     model_patterns=("minimax/*",),
                     dialects=frozenset({TEXT_TOOL_DIALECT_MINIMAX_XML}),
                 ),
+                TextToolModelRule(
+                    model_patterns=_OPENROUTER_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                ),
             ),
         ),
         trust_billed_cost=True,
@@ -232,13 +499,31 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "azure": OpenAICompatPolicy(display_name="Azure OpenAI"),
     "deepseek": OpenAICompatPolicy(
         display_name="DeepSeek",
+        official_host="api.deepseek.com",
         default_reasoning_format="deepseek",
-        # Reasoning replay is gated on the exact V4 ids (below), not on the
-        # capability format: non-V4 DeepSeek models must not get replay.
-        thinking_toggle_model_ids=_DEEPSEEK_V4_MODEL_IDS,
-        require_reasoning_content_model_ids=_DEEPSEEK_V4_MODEL_IDS,
+        supports_native_json_schema_output=False,
+        supports_json_object_output=True,
+        text_tool_profile=TextToolCompatProfile(
+            model_rules=(
+                TextToolModelRule(
+                    model_patterns=_DEEPSEEK_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                ),
+            ),
+        ),
+        # Replay follows confirmed direct-API model ids and aliases, rather
+        # than every model with the generic DeepSeek capability format.
+        thinking_toggle_model_ids=DEEPSEEK_DIRECT_REASONING_MODEL_IDS,
+        require_reasoning_content_model_ids=DEEPSEEK_DIRECT_REASONING_MODEL_IDS,
     ),
-    "gemini": OpenAICompatPolicy(display_name="Gemini"),
+    "gemini": OpenAICompatPolicy(
+        display_name="Gemini",
+        official_host="generativelanguage.googleapis.com",
+        tool_schema_string_item_fallback_tools=frozenset({"create_csv"}),
+        tool_schema_string_item_fallback_api_root=(
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        ),
+    ),
     "dashscope": OpenAICompatPolicy(
         display_name="DashScope",
         text_tool_profile=TextToolCompatProfile(
@@ -251,8 +536,38 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         ),
         supports_explicit_prompt_cache=True,
         stream_timeout_fallback=True,
+        thinking_required_model_prefixes=("qwen3.8-",),
+        thinking_tool_choice_auto_only=True,
+        implicit_thinking_tool_choice_model_ids=DEEPSEEK_V4_MODEL_IDS,
     ),
     "bailian_coding": OpenAICompatPolicy(display_name="Bailian Coding"),
+    "qwen_token_plan": OpenAICompatPolicy(
+        display_name="Qwen Token Plan",
+        official_host="token-plan.cn-beijing.maas.aliyuncs.com",
+        text_tool_profile=TextToolCompatProfile(
+            model_rules=(
+                TextToolModelRule(
+                    model_patterns=("qwen*",),
+                    dialects=frozenset({TEXT_TOOL_DIALECT_QWEN_TAG}),
+                ),
+            ),
+        ),
+        stream_timeout_fallback=True,
+        force_thinking_model_ids=QWEN_TOKEN_PLAN_FORCE_THINKING_MODEL_IDS,
+        preserve_thinking_model_ids=QWEN_TOKEN_PLAN_PRESERVE_THINKING_MODEL_IDS,
+        require_reasoning_content_when_thinking_model_ids=(
+            QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS
+        ),
+        require_tool_call_reasoning_content_when_thinking_model_ids=(
+            QWEN_TOKEN_PLAN_KIMI_MODEL_IDS
+        ),
+        thinking_tool_choice_auto_only=True,
+        tool_stream_model_ids=QWEN_TOKEN_PLAN_GLM_MODEL_IDS,
+        temperature_floor_model_ids=frozenset({"qwen3.8-max-preview"}),
+        temperature_floor=0.6,
+        model_listing_excluded_ids=frozenset(QWEN_TOKEN_PLAN_IMAGE_MODEL_IDS),
+        omit_implicit_thinking_budget=True,
+    ),
     "moonshot": OpenAICompatPolicy(
         display_name="Moonshot",
         fixed_sampling_model_prefixes=("kimi-k2.5", "kimi-k2.6", "kimi-k2.7"),
@@ -267,7 +582,12 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "mimo": OpenAICompatPolicy(display_name="MiMo"),
     "mistral": OpenAICompatPolicy(display_name="Mistral"),
     "groq": OpenAICompatPolicy(display_name="Groq"),
-    "zhipu": OpenAICompatPolicy(display_name="Zhipu"),
+    "zhipu": OpenAICompatPolicy(
+        display_name="Zhipu",
+        official_host="open.bigmodel.cn",
+        official_reasoning_dialect="zai",
+        official_reasoning_api_root="https://open.bigmodel.cn/api/paas/v4",
+    ),
     "qianfan": OpenAICompatPolicy(display_name="Qianfan"),
     "siliconflow": OpenAICompatPolicy(display_name="SiliconFlow"),
     "aihubmix": OpenAICompatPolicy(display_name="AiHubMix"),
@@ -284,17 +604,16 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         replay_reasoning_format="tencent_tokenhub",
         require_reasoning_content_model_ids=_TOKENHUB_HY3_MODEL_IDS,
     ),
-    # TokenRhythm relays the DeepSeek/GLM/MiniMax/Kimi/MiMo/Qwen families
-    # behind one host, and every served model streams DeepSeek-style
-    # reasoning_content unconditionally (the parse side needs no config).
-    # The endpoint rejects unknown request fields — a DeepSeek ``thinking``
-    # toggle is an UNKNOWN_FIELD 400 — so no default_reasoning_format and no
-    # thinking_toggle_model_ids here, and the packaged catalog rows pin
-    # reasoning_format="none" to keep dialect injection off. The V4 ids keep
-    # only the reasoning_content replay requirement (live-verified accepted).
+    # TokenRhythm relays several model families behind one host.  Its V4
+    # request contract is deliberately endpoint- and raw-id-scoped: ordinary
+    # assistant reasoning is withheld, tool-call reasoning is echoed only
+    # within the gateway's field limit, and controls use the DeepSeek-shaped
+    # wire dialect without changing catalog capabilities.
     "tokenrhythm": OpenAICompatPolicy(
         display_name="TokenRhythm",
         official_host="tokenrhythm.studio",
+        supports_explicit_prompt_cache=True,
+        supports_native_json_schema_output=False,
         text_tool_profile=TextToolCompatProfile(
             model_rules=(
                 TextToolModelRule(
@@ -305,9 +624,43 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                     model_patterns=("qwen*",),
                     dialects=frozenset({TEXT_TOOL_DIALECT_QWEN_TAG}),
                 ),
+                TextToolModelRule(
+                    model_patterns=_TOKENRHYTHM_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                ),
+                TextToolModelRule(
+                    model_patterns=tuple(sorted(_TOKENRHYTHM_0813_MODEL_IDS)),
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                    endpoint_hosts=frozenset({"tokenrhythm.studio"}),
+                    endpoint_paths=frozenset({"", "/v1"}),
+                ),
             ),
         ),
-        require_reasoning_content_model_ids=_DEEPSEEK_V4_MODEL_IDS,
+        reasoning_model_rules=(
+            ReasoningModelRule(
+                model_ids=_TOKENRHYTHM_V4_MODEL_IDS,
+                endpoint_hosts=frozenset({"tokenrhythm.studio"}),
+                endpoint_paths=frozenset({"", "/v1"}),
+                replay_scope="tool_call_assistant",
+                require_reasoning_content=True,
+                max_reasoning_content_utf16_units=50_000,
+                reasoning_format="deepseek",
+                low_effort_model_ids=_TOKENRHYTHM_V4_LOW_EFFORT_MODEL_IDS,
+                thinking_tool_choice_auto_only=True,
+            ),
+            # Custom endpoints keep the previous exact-id replay behavior but
+            # do not inherit TokenRhythm's official controls or field limit.
+            ReasoningModelRule(
+                model_ids=_TOKENRHYTHM_LEGACY_CUSTOM_REPLAY_MODEL_IDS,
+                require_reasoning_content=True,
+            ),
+        ),
+        # TokenRhythm rejects a required selector for 0813 even when thinking
+        # is explicitly disabled. The request constraint compares basenames,
+        # so this exact entry covers both raw and provider-qualified ids.
+        implicit_thinking_tool_choice_model_ids=frozenset(
+            {"deepseek-v4-pro-0813"}
+        ),
         allow_post_terminal_noop_choice=True,
         allow_post_terminal_null_usage_noop_choice=True,
         post_terminal_metadata_keys=frozenset(
