@@ -81,7 +81,7 @@
     "smol-toml": "1.8.0"
   },
   "devDependencies": {
-    "@types/node": "^24.13.5",
+    "@types/node": "^26.5.1",
     "electron": "^42.5.1",
     "electron-builder": "^26.15.3",
     "gsap": "^3.15.0",
