@@ -115,6 +115,55 @@ max_output_tokens = 16384
 context_window = 256000
 max_output_tokens = 16384
 
+# C5 ensemble models. Budgets, capabilities, and base prices mirror
+# OpenRouter's public catalog; live catalog data remains authoritative.
+
+[openrouter."deepseek/deepseek-v4.1-flash"]
+context_window = 1048576
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "openrouter"
+input_cost_per_mtok = 0.15
+output_cost_per_mtok = 0.6
+cache_read_cost_per_mtok = 0.003
+
+[openrouter."z-ai/glm-5.3-flash"]
+context_window = 1310720
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "openrouter"
+input_cost_per_mtok = 0.09
+output_cost_per_mtok = 0.3
+cache_read_cost_per_mtok = 0.018
+
+[openrouter."qwen/qwen3.8-flash"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "openrouter"
+input_cost_per_mtok = 0.15
+output_cost_per_mtok = 0.47
+cache_read_cost_per_mtok = 0.016
+cache_write_cost_per_mtok = 0.2
+
+[openrouter."qwen/qwen3.8-max-0902"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "openrouter"
+input_cost_per_mtok = 2.0
+output_cost_per_mtok = 6.0
+cache_read_cost_per_mtok = 0.25
+cache_write_cost_per_mtok = 2.5
+
 # Official https://openrouter.ai/api/v1/models, verified 2026-09-17.
 # Use the smaller catalog/top-provider context when both are published.
 [openrouter."deepseek/deepseek-v4-flash"]
@@ -726,6 +775,42 @@ reasoning_format = "qwen_token_plan"
 # compatibility rules own their thinking controls and bounded replay without
 # changing this neutral catalog shape. Vision is published for the kimi rows
 # and qwen3.8-max; explicit API declarations remain authoritative.
+
+[tokenrhythm."deepseek-flash"]
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+status = "testing"
+input_cost_per_mtok = 0.2867383512544803
+output_cost_per_mtok = 1.1469534050179212
+cache_read_cost_per_mtok = 0.005734767025089606
+
+[tokenrhythm."glm-5.3-flash"]
+context_window = 1048576
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+status = "testing"
+input_cost_per_mtok = 0.11469534050179211
+output_cost_per_mtok = 0.4014336917562724
+cache_read_cost_per_mtok = 0.03297491039426523
+
+[tokenrhythm."qwen3.8-flash"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+status = "testing"
+input_cost_per_mtok = 0.11469534050179211
+output_cost_per_mtok = 0.3870967741935484
+cache_read_cost_per_mtok = 0.014336917562724014
 
 [tokenrhythm."deepseek-v4-flash"]
 context_window = 1000000

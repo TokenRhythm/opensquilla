@@ -259,7 +259,11 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     expect(aggregators[0]!.model).toBe(OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR)
     const proposers = f.candidates.value.filter(c => c.role !== 'aggregator')
     expect(proposers.map(c => c.model)).toEqual([...OPENROUTER_FIXED_ENSEMBLE_PROPOSERS])
+    expect(f.candidates.value.map(c => c.thinking_level)).toEqual(Array(5).fill('high'))
     expect(f.payload().selectionMode).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.payload().candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ thinking_level: 'high' }),
+    ]))
   })
 
   it('switching to custom seeds from the TokenRhythm lineup for tokenrhythm', () => {
@@ -276,6 +280,7 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     expect(proposers.map(c => c.model)).toEqual([...TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS])
     expect(f.candidates.value.find(c => c.role === 'aggregator')!.model)
       .toBe(TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR)
+    expect(f.candidates.value.map(c => c.thinking_level)).toEqual(Array(5).fill('high'))
   })
 
   it('switching back to preset restores the baseline candidate inputs', () => {
@@ -294,15 +299,12 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
-  it('activateForProvider materializes a legacy preset-provider plan as custom', () => {
+  it('activateForProvider selects the provider preset for a legacy plan', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({ selection_mode: 'router_dynamic' })
     f.activateForProvider('tokenrhythm')
-    expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
-    expect(f.candidates.value.filter(c => c.role !== 'aggregator').map(c => c.model))
-      .toEqual([...TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS])
-    expect(f.candidates.value.find(c => c.role === 'aggregator')?.model)
-      .toBe(TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR)
+    expect(f.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(f.candidates.value).toEqual([])
   })
 
   it('activateForProvider gives other providers an explicit custom lineup seeded from tiers', () => {

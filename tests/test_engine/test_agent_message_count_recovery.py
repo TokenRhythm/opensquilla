@@ -464,10 +464,10 @@ class _AssistantTailLimitProvider:
 
 class _EnsembleBudgetCatalog:
     _WINDOWS = {
-        "deepseek-v4-pro": 1_000_000,
-        "glm-5.2": 1_000_000,
-        "kimi-k2.7-code": 256_000,
-        "qwen3.7-max": 1_000_000,
+        "deepseek-flash": 1_000_000,
+        "glm-5.3-flash": 1_048_576,
+        "qwen3.8-flash": 1_000_000,
+        "qwen3.8-max": 1_000_000,
     }
 
     def resolve_context_window_with_source(
@@ -1829,18 +1829,17 @@ async def test_member_budget_rebinding_and_exact_count_recovery_compose_once(
     assert sum(call["wire_messages"] > 100 for call in member_calls) == 4
     assert sum(call["wire_messages"] <= 90 for call in member_calls) == 5
     assert sum(call["aggregator"] for call in member_calls) == 1
-    assert any(
-        call["model"] == "kimi-k2.7-code"
-        and call["max_tokens"] == 16_000
-        and call["request_cap"] == 880_000
+    # Failed drafts, compacted retries, and aggregation must retain C5 member
+    # budgets instead of inheriting the outer Kimi route's 256k context limit.
+    assert {
+        (call["model"], call["max_tokens"], call["request_cap"])
         for call in member_calls
-    )
-    assert any(
-        call["model"] == "glm-5.2"
-        and call["max_tokens"] == 128_000
-        and call["request_cap"] == 3_408_000
-        for call in member_calls
-    )
+    } == {
+        ("deepseek-flash", 384_000, 2_384_000),
+        ("glm-5.3-flash", 131_072, 3_590_016),
+        ("qwen3.8-flash", 131_072, 3_395_712),
+        ("qwen3.8-max", 131_072, 3_395_712),
+    }
     assert any(getattr(event, "kind", None) == "done" for event in events)
     assert not any(
         isinstance(event, ErrorEvent)

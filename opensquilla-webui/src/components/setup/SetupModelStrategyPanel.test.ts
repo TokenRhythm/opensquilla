@@ -1587,19 +1587,19 @@ describe('SetupModelStrategyPanel', () => {
         fixedProfile: {
           providerLabel: 'OpenRouter',
           proposers: [
-            { key: 'openrouter-fixed:proposer:openrouter:deepseek/deepseek-v4-pro', provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', source: 'openrouter_fixed', enabled: true, role: '' },
-            { key: 'openrouter-fixed:proposer:openrouter:z-ai/glm-5.2', provider: 'openrouter', model: 'z-ai/glm-5.2', source: 'openrouter_fixed', enabled: true, role: '' },
-            { key: 'openrouter-fixed:proposer:openrouter:moonshotai/kimi-k2.7-code', provider: 'openrouter', model: 'moonshotai/kimi-k2.7-code', source: 'openrouter_fixed', enabled: true, role: '' },
-            { key: 'openrouter-fixed:proposer:openrouter:qwen/qwen3.7-max', provider: 'openrouter', model: 'qwen/qwen3.7-max', source: 'openrouter_fixed', enabled: true, role: '' },
+            { key: 'openrouter-fixed:proposer:openrouter:deepseek/deepseek-v4.1-flash', provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', source: 'openrouter_fixed', enabled: true, role: '' },
+            { key: 'openrouter-fixed:proposer:openrouter:z-ai/glm-5.3-flash', provider: 'openrouter', model: 'z-ai/glm-5.3-flash', source: 'openrouter_fixed', enabled: true, role: '' },
+            { key: 'openrouter-fixed:proposer:openrouter:qwen/qwen3.8-flash', provider: 'openrouter', model: 'qwen/qwen3.8-flash', source: 'openrouter_fixed', enabled: true, role: '' },
+            { key: 'openrouter-fixed:proposer:openrouter:qwen/qwen3.8-max-0902', provider: 'openrouter', model: 'qwen/qwen3.8-max-0902', source: 'openrouter_fixed', enabled: true, role: '' },
           ],
-          aggregator: { key: 'openrouter-fixed:aggregator:openrouter:z-ai/glm-5.2', provider: 'openrouter', model: 'z-ai/glm-5.2', source: 'openrouter_fixed', enabled: true, role: 'aggregator' },
+          aggregator: { key: 'openrouter-fixed:aggregator:openrouter:deepseek/deepseek-v4.1-flash', provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', source: 'openrouter_fixed', enabled: true, role: 'aggregator' },
         },
         showCandidateEditor: false,
       },
     }, { onUpdateEnsembleScheme })
 
-    expect(el.textContent).toContain('deepseek/deepseek-v4-pro')
-    expect(el.textContent).toContain('moonshotai/kimi-k2.7-code')
+    expect(el.textContent).toContain('deepseek/deepseek-v4.1-flash')
+    expect(el.textContent).toContain('qwen/qwen3.8-max-0902')
     expect(el.textContent).toContain('Aggregator')
     expect(el.querySelector('.setup-model-strategy__ensemble > .control-section__head')).toBeNull()
     expect(el.textContent).not.toContain('Models draft in parallel')

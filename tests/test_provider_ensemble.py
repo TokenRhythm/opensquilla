@@ -499,10 +499,11 @@ class _BudgetCatalog:
         windows: dict[str, tuple[int, str] | Exception] | None = None,
     ) -> None:
         self.windows = windows or {
-            "deepseek-v4-pro": (1_000_000, "catalog"),
-            "glm-5.2": (1_000_000, "catalog"),
+            "deepseek-flash": (1_000_000, "catalog"),
+            "glm-5.3-flash": (1_048_576, "catalog"),
+            "qwen3.8-flash": (1_000_000, "catalog"),
+            "qwen3.8-max": (1_000_000, "catalog"),
             "kimi-k2.7-code": (256_000, "catalog"),
-            "qwen3.7-max": (1_000_000, "catalog"),
         }
 
     def _resolve(self, model_id: str) -> tuple[int, str]:
@@ -573,7 +574,7 @@ def test_ensemble_budget_uses_each_tokenrhythm_authority_window(
 
 
 def _tokenrhythm_budget_registry() -> _FakeRegistry:
-    models = ("deepseek-v4-pro", "glm-5.2", "kimi-k2.7-code", "qwen3.7-max")
+    models = ("deepseek-flash", "glm-5.3-flash", "qwen3.8-flash", "qwen3.8-max")
     return _FakeRegistry(
         {
             model: _FakePlan(
@@ -3386,28 +3387,35 @@ async def test_tokenrhythm_ensemble_rebinds_request_cap_per_member_context(
     ]
 
     calls_by_model = {call["model"]: call["config"] for call in registry.calls}
-    # Kimi's 256k window and 16k output yield 880,000 chars; GLM's 1m window yields
-    # 3,408,000. Parameterizing the inherited cap pins both widening and
-    # tightening instead of relying on the outer route's model.
-    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 880_000
-    assert calls_by_model["glm-5.2"].provider_request_max_chars == 3_408_000
+    # The models share roughly 1m context windows but reserve different output
+    # budgets plus the static profile's explicit high-thinking allowance.
+    # Parameterizing the inherited cap pins both widening and tightening
+    # instead of relying on the outer route's model.
+    assert calls_by_model["qwen3.8-flash"].provider_request_max_chars == 3_375_712
+    assert calls_by_model["deepseek-flash"].provider_request_max_chars == 2_364_000
+    assert all(call["config"].thinking is True for call in registry.calls)
+    assert all(call["config"].thinking_level == "high" for call in registry.calls)
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
-    kimi_trace = next(
+    qwen_trace = next(
         candidate["execution"]
         for candidate in done.ensemble_trace["candidates"]
-        if candidate["model"] == "kimi-k2.7-code"
+        if candidate["model"] == "qwen3.8-flash"
     )
-    assert kimi_trace["effective_context_window_tokens"] == 256_000
-    assert kimi_trace["effective_context_window_source"] == "catalog"
-    assert kimi_trace["effective_provider_request_max_chars"] == 880_000
-    assert kimi_trace["provider_request_max_chars_source"] == "member_context"
+    assert qwen_trace["effective_context_window_tokens"] == 1_000_000
+    assert qwen_trace["effective_context_window_source"] == "catalog"
+    assert qwen_trace["effective_provider_request_max_chars"] == 3_375_712
+    assert qwen_trace["provider_request_max_chars_source"] == "member_context"
+    assert qwen_trace["effective_thinking"] is True
+    assert qwen_trace["effective_thinking_level"] == "high"
     aggregator_trace = done.ensemble_trace["final_request"]["execution"]
     assert aggregator_trace["effective_context_window_tokens"] == 1_000_000
     assert aggregator_trace["effective_context_window_source"] == "catalog"
-    assert aggregator_trace["effective_provider_request_max_chars"] == 3_408_000
+    assert aggregator_trace["effective_provider_request_max_chars"] == 2_364_000
     assert aggregator_trace["provider_request_max_chars_source"] == "member_context"
+    assert aggregator_trace["effective_thinking"] is True
+    assert aggregator_trace["effective_thinking_level"] == "high"
 
 
 @pytest.mark.parametrize(
@@ -3507,10 +3515,10 @@ async def test_ensemble_member_context_precedence_is_override_then_global_then_c
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
     catalog = _BudgetCatalog(
         {
-            "deepseek-v4-pro": (1_000_000, "catalog"),
-            "glm-5.2": (1_000_000, "catalog"),
-            "kimi-k2.7-code": (300_000, "override"),
-            "qwen3.7-max": (1_000_000, "catalog"),
+            "deepseek-flash": (1_000_000, "catalog"),
+            "glm-5.3-flash": (1_048_576, "catalog"),
+            "qwen3.8-flash": (300_000, "override"),
+            "qwen3.8-max": (1_000_000, "catalog"),
         }
     )
     provider = _build_tokenrhythm_budget_provider(
@@ -3531,17 +3539,17 @@ async def test_ensemble_member_context_precedence_is_override_then_global_then_c
     ]
 
     calls_by_model = {call["model"]: call["config"] for call in registry.calls}
-    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 1_056_000
-    assert calls_by_model["glm-5.2"].provider_request_max_chars == 1_408_000
+    assert calls_by_model["qwen3.8-flash"].provider_request_max_chars == 575_712
+    assert calls_by_model["deepseek-flash"].provider_request_max_chars == 364_000
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
-    kimi_trace = next(
+    qwen_trace = next(
         candidate["execution"]
         for candidate in done.ensemble_trace["candidates"]
-        if candidate["model"] == "kimi-k2.7-code"
+        if candidate["model"] == "qwen3.8-flash"
     )
-    assert kimi_trace["effective_context_window_source"] == "override"
-    assert kimi_trace["effective_context_window_tokens"] == 300_000
+    assert qwen_trace["effective_context_window_source"] == "override"
+    assert qwen_trace["effective_context_window_tokens"] == 300_000
     aggregator_trace = done.ensemble_trace["final_request"]["execution"]
     assert aggregator_trace["effective_context_window_source"] == "config"
     assert aggregator_trace["effective_context_window_tokens"] == 500_000
@@ -4142,10 +4150,10 @@ async def test_ensemble_default_context_rebinds_but_catalog_failure_retains_oute
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
     catalog = _BudgetCatalog(
         {
-            "deepseek-v4-pro": (1_000_000, "catalog"),
-            "glm-5.2": RuntimeError("catalog unavailable"),
-            "kimi-k2.7-code": (256_000, "default"),
-            "qwen3.7-max": (1_000_000, "catalog"),
+            "deepseek-flash": RuntimeError("catalog unavailable"),
+            "glm-5.3-flash": (1_048_576, "catalog"),
+            "qwen3.8-flash": (1_000_000, "default"),
+            "qwen3.8-max": (1_000_000, "catalog"),
         }
     )
     provider = _build_tokenrhythm_budget_provider(catalog=catalog)
@@ -4163,20 +4171,20 @@ async def test_ensemble_default_context_rebinds_but_catalog_failure_retains_oute
     ]
 
     calls_by_model = {call["model"]: call["config"] for call in registry.calls}
-    # Automatic output follows this deployment's fallback, without borrowing
-    # a different authority's catalog. The member's context is still rebound.
-    assert calls_by_model["kimi-k2.7-code"].max_tokens == 16_000
-    assert calls_by_model["kimi-k2.7-code"].provider_request_max_chars == 880_000
-    assert calls_by_model["glm-5.2"].provider_request_max_chars == 555_555
+    # The C5 member keeps its model-specific output ceiling while rebinding
+    # the default context; a catalog error still preserves the outer cap.
+    assert calls_by_model["qwen3.8-flash"].max_tokens == 131_072
+    assert calls_by_model["qwen3.8-flash"].provider_request_max_chars == 3_375_712
+    assert calls_by_model["deepseek-flash"].provider_request_max_chars == 555_555
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
-    kimi_trace = next(
+    qwen_trace = next(
         candidate["execution"]
         for candidate in done.ensemble_trace["candidates"]
-        if candidate["model"] == "kimi-k2.7-code"
+        if candidate["model"] == "qwen3.8-flash"
     )
-    assert kimi_trace["effective_context_window_source"] == "default"
-    assert kimi_trace["provider_request_max_chars_source"] == "member_context"
+    assert qwen_trace["effective_context_window_source"] == "default"
+    assert qwen_trace["provider_request_max_chars_source"] == "member_context"
     aggregator_trace = done.ensemble_trace["final_request"]["execution"]
     assert aggregator_trace["effective_context_window_source"] == "error"
     assert aggregator_trace["provider_request_max_chars_source"] == "inherited"
@@ -4186,7 +4194,7 @@ async def test_ensemble_default_context_rebinds_but_catalog_failure_retains_oute
 async def test_rebinding_rebinds_fallback_chat_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    models = ("deepseek-v4-pro", "glm-5.2", "kimi-k2.7-code", "qwen3.7-max")
+    models = ("deepseek-flash", "glm-5.3-flash", "qwen3.8-flash", "qwen3.8-max")
     registry = _FakeRegistry(
         {
             model: _FakePlan([ErrorEvent(message="synthetic failure", code="500")])

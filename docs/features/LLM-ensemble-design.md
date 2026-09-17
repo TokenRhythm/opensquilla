@@ -95,15 +95,16 @@ Source: `_build_static_b5_members`, `STATIC_B5_PROFILES`
 Each preset is a `StaticB5Profile` — four fixed proposers plus one aggregator,
 all bound to a single provider:
 
-| Profile | Provider | Proposers | Aggregator |
-|---------|----------|-----------|------------|
-| `static_openrouter_b5` | `openrouter` | `deepseek/deepseek-v4-pro`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.7-code`, `qwen/qwen3.7-max` | `z-ai/glm-5.2` |
-| `static_tokenrhythm_b5` | `tokenrhythm` | `deepseek-v4-pro`, `glm-5.2`, `kimi-k2.7-code`, `qwen3.7-max` | `glm-5.2` |
+| Profile | Provider | Proposers | Aggregator | Thinking |
+|---------|----------|-----------|------------|----------|
+| `static_openrouter_b5` | `openrouter` | `deepseek/deepseek-v4.1-flash`, `z-ai/glm-5.3-flash`, `qwen/qwen3.8-flash`, `qwen/qwen3.8-max-0902` | `deepseek/deepseek-v4.1-flash` | `high` for every member |
+| `static_tokenrhythm_b5` | `tokenrhythm` | `deepseek-flash`, `glm-5.3-flash`, `qwen3.8-flash`, `qwen3.8-max` | `deepseek-flash` | `high` for every member |
 
-The TokenRhythm profile is a mirror of the OpenRouter one: same aggregation
-shape and defaults, the same four models, only the provider and the model-id
-naming differ (OpenRouter-style `vendor/model` slugs vs. TokenRhythm's bare
-names).
+The OpenRouter profile uses the C5 lineup selected by the full DRACO evaluation.
+The TokenRhythm profile maps the same C5 model families to model IDs published
+by TokenRhythm. Both profiles explicitly set `high` thinking on all four
+proposers and the aggregator and use the same aggregation runtime defaults,
+while their model-ID conventions remain provider-specific.
 
 `_build_static_b5_members` simply materializes the profile: each proposer model
 becomes an `EnsembleMemberConfig` labeled `proposer_1..N`, the aggregator model

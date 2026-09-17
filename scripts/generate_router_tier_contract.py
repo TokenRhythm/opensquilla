@@ -63,6 +63,7 @@ def _profile_block() -> str:
             + f"    proposers: {_json(list(profile.proposer_models))} as const,\n"
             + f"    aggregator: {_json(profile.aggregator_model)},\n"
             + f"    apiKeyEnv: {_json(profile.api_key_env)},\n"
+            + f"    thinkingLevel: {_json(profile.thinking_level)},\n"
             + f"    ownershipRole: {_json(profile.ownership_role)},\n"
             + "  },"
         )
@@ -111,6 +112,7 @@ export interface StaticB5Profile {{
   proposers: readonly string[]
   aggregator: string
   apiKeyEnv: string
+  thinkingLevel: string | null
   ownershipRole: string
 }}
 
