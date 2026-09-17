@@ -1551,13 +1551,6 @@
       "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
     },
     {
-      "path": "tests/test_gateway/test_project_workspace_execution.py",
-      "from": "gateway-sqlite",
-      "to": "desktop-installer-contracts",
-      "affinity_exception": true,
-      "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
-    },
-    {
       "path": "tests/test_gateway/test_rpc_meta_runs.py",
       "from": "gateway-sqlite",
       "to": "desktop-installer-contracts",

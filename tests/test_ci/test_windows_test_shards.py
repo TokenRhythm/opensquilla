@@ -681,7 +681,6 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
 
     expected_moved_paths = {
         "tests/test_gateway/test_goal_rpc.py",
-        "tests/test_gateway/test_project_workspace_execution.py",
         "tests/test_gateway/test_rpc_meta_runs.py",
         "tests/test_gateway/test_rpc_router_decisions.py",
         "tests/test_live_long_task_case_driver.py",
@@ -698,7 +697,7 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     assert moved_paths == expected_moved_paths
     assert set(assignments) == set(historical_test_weights())
     assert {str(override["path"]) for override in overrides} == expected_moved_paths
-    assert sum(override.get("affinity_exception") is True for override in overrides) == 6
+    assert sum(override.get("affinity_exception") is True for override in overrides) == 5
     assert guardrails == {
         "max_moved_files": 10,
         "max_moved_fraction": 0.02,
@@ -881,9 +880,6 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
         "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
-        "tests/test_gateway/test_project_workspace_execution.py": (
-            "desktop-installer-contracts"
-        ),
         "tests/test_gateway/test_rpc_meta_runs.py": "desktop-installer-contracts",
         "tests/test_gateway/test_rpc_router_decisions.py": (
             "desktop-installer-contracts"
