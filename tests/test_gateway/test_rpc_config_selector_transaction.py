@@ -492,15 +492,15 @@ async def test_empty_merge_patch_is_sparse_noop_and_preserves_disk_drift(tmp_pat
     ctx = RpcContext(conn_id="test", config=config)
 
     drifted = tomllib.loads(path.read_text())
-    drifted["memory"] = {"flush_enabled": True}
+    drifted["memory"] = {"capture_assistant": True}
     path.write_text(tomli_w.dumps(drifted))
 
     response = await _handle_config_patch({"patch": {"memory": {}}}, ctx)
 
     persisted = tomllib.loads(path.read_text())
     assert response["patched"] == ["(merge)"]
-    assert persisted["memory"] == {"flush_enabled": True}
-    assert config.memory.flush_enabled is False
+    assert persisted["memory"] == {"capture_assistant": True}
+    assert config.memory.capture_assistant is False
 
 
 async def test_merge_patch_force_path_preserves_dotted_dynamic_key(tmp_path) -> None:

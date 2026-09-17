@@ -26,6 +26,7 @@ TABLES = (
     "transcript_entries",
     "compacted_transcript_entries",
     "session_summaries",
+    "memory_durable_receipts",
     "usage_events",
     "usage_event_items",
     "usage_item_billing_receipts",

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 LOCK_PATH = ROOT / "desktop" / "electron" / "package-lock.json"
 
@@ -22,7 +24,7 @@ def _version_tuple(value: object) -> tuple[int, int, int]:
     return major, minor, patch
 
 
-def test_electron_runtime_yaml_parser_includes_merge_chain_dos_fix() -> None:
+def test_electron_runtime_yaml_parser_includes_empty_merge_source_dos_fix() -> None:
     packages = _packages()
     root = packages[""]
     updater = packages["node_modules/electron-updater"]
@@ -31,7 +33,43 @@ def test_electron_runtime_yaml_parser_includes_merge_chain_dos_fix() -> None:
     assert "electron-updater" in root["dependencies"]
     assert "js-yaml" in updater["dependencies"]
     assert js_yaml.get("dev") is not True
-    assert _version_tuple(js_yaml["version"]) >= (4, 3, 0)
+    assert _version_tuple(js_yaml["version"]) >= (4, 3, 2)
+
+
+@pytest.mark.parametrize(
+    ("name", "minimum"),
+    [
+        ("js-yaml", (4, 3, 2)),
+        ("@xmldom/xmldom", (0, 8, 15)),
+        ("fast-uri", (3, 1, 6)),
+        ("electron", (42, 5, 1)),
+    ],
+)
+def test_all_locked_parser_and_session_copies_include_security_fixes(
+    name: str, minimum: tuple[int, int, int]
+) -> None:
+    versions = [
+        _version_tuple(package["version"])
+        for path, package in _packages().items()
+        if path == f"node_modules/{name}" or path.endswith(f"/node_modules/{name}")
+    ]
+    assert versions, f"Missing expected dependency: {name}"
+    assert all(version >= minimum for version in versions), (name, versions)
+
+
+def test_undici_security_floors_preserve_supported_parent_major_versions() -> None:
+    versions = [
+        _version_tuple(package["version"])
+        for path, package in _packages().items()
+        if path == "node_modules/undici" or path.endswith("/node_modules/undici")
+    ]
+    assert versions
+    for version in versions:
+        # node-gyp still uses 6.x; forcing it onto 7.x would bypass its contract.
+        if version[0] == 6:
+            assert version >= (6, 28, 0)
+        else:
+            assert version >= (7, 29, 0)
 
 
 def test_electron_build_dependencies_include_resource_exhaustion_fixes() -> None:

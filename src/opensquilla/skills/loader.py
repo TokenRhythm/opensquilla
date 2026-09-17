@@ -24,6 +24,7 @@ from opensquilla.skills.manifest import (
     _string_list,
     _validated_skill_name,
     compile_skill_manifest,
+    normalize_skill_triggers,
     skill_instance_id,
 )
 from opensquilla.skills.meta.sop_compiler import (
@@ -848,7 +849,7 @@ class SkillLoader:
                     description_zh=s.get("description_zh", "") or "",
                     layer=layer,
                     always=s.get("always", False),
-                    triggers=s.get("triggers", []),
+                    triggers=normalize_skill_triggers(s.get("triggers", [])),
                     content=s.get("content", ""),
                     path=Path(base_dir),
                     file_path=file_path,

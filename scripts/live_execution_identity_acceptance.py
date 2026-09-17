@@ -216,7 +216,6 @@ async def run_case(*, model: str, question: str, placeholder: str, fallback: boo
             max_tokens=4096,
             context_window_tokens=128_000,
             request_timeout=120.0,
-            flush_enabled=False,
         ),
     )
     events = [event async for event in agent.run_turn(QUESTIONS[question])]

@@ -347,7 +347,7 @@
       "lifecycle": "stable",
       "name": "chat.history",
       "schema": "conversation/chat-history.schema.json",
-      "schemaSha256": "1e03b12ae015c0875c29d943c0f8d1969bd225b69978c2a8a36e0135785cab85"
+      "schemaSha256": "8e280ed656a595a3d9cf4fafd1d6c9ec064c5f648a94b529c43cbb13d1a688a8"
     },
     {
       "lifecycle": "stable",
@@ -842,7 +842,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.draft.probe",
       "schema": "platform/onboarding-llm-profile-draft-probe.schema.json",
-      "schemaSha256": "b87c847bb7a4116bad627baafb3d17b205d59bc46b6cceaf2cafcfee1e0e4e06"
+      "schemaSha256": "e02caab5c5cc592ba57b0f2205912f9400b1d0eb31c322ceef7a72ab4350c51f"
     },
     {
       "lifecycle": "stable",
@@ -854,7 +854,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.probe",
       "schema": "platform/onboarding-llm-profile-probe.schema.json",
-      "schemaSha256": "1d906e26d4631a43464c148552c8372555b91c6a51b8ddeb233db083c9c3a6f0"
+      "schemaSha256": "8e552abda066add5f5275b42a313746f80c7757d1f345d22762b039f6b8b007b"
     },
     {
       "lifecycle": "stable",
@@ -908,7 +908,7 @@
       "lifecycle": "stable",
       "name": "onboarding.provider.probe",
       "schema": "platform/onboarding-provider-probe.schema.json",
-      "schemaSha256": "4bba8e8fbca95f2c8343a94dde1000b1b9724d447992d7b391317ca0469e565e"
+      "schemaSha256": "ffa4d9b4a0f662c2660de521b9bc7c27f9373c762c8cd4eafb2127b872c54e66"
     },
     {
       "lifecycle": "stable",
@@ -1109,7 +1109,7 @@
       "lifecycle": "stable",
       "name": "sessions.contextCompact",
       "schema": "sessions/sessions-context-compact.schema.json",
-      "schemaSha256": "a9bcba2772be22bf06c9cfe11b7162afe60d77a1d7bfb2df39656bc83dc637f0"
+      "schemaSha256": "6be69d63530aa63b4ef254aa1d0d0dd9330b320c2e41c96dbf7cb9e7ce917a1f"
     },
     {
       "lifecycle": "stable",
@@ -1247,7 +1247,7 @@
       "lifecycle": "stable",
       "name": "sessions.reset",
       "schema": "sessions/sessions-reset.schema.json",
-      "schemaSha256": "43ce0304359b7c4e81fa9d5b0edabab53d468c710b6c4522be93724262ac4587"
+      "schemaSha256": "c41b3764243186609a3e31c47aa2d63f5508f2fcb7e5bb4420a3f8bda7048d1d"
     },
     {
       "lifecycle": "stable",
@@ -1466,7 +1466,7 @@
     "generatorSha256": "f781c6d8e31b336c2d2e342784935b3d327c9947cb35e56de8e44a0a83bffae6",
     "methodCount": 215,
     "schemaCount": 225,
-    "schemaTreeSha256": "182cd4e1f6016ec223a6bdcf9e76cd6e734764b581e35a4f6c9efc21aeb173a6"
+    "schemaTreeSha256": "840fa1aabc2cf9ec62fb500bbe7771c49a00a5f54e367cabc3865fa57fb63579"
   },
   "wireVersion": 4
 }

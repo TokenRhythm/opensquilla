@@ -12,8 +12,6 @@ import pytest
 from opensquilla.application.session_maintenance import (
     CompactSession,
     SessionCompactionDeadlineError,
-    SessionCompactionFlushSafetyError,
-    SessionCompactionMemoryAssessment,
     SessionCompactionResult,
 )
 from opensquilla.gateway.adapters.session_maintenance import (
@@ -141,7 +139,6 @@ async def test_adapter_projects_terminal_domain_result() -> None:
         critical_carry_forward_count=1,
         state_kind="structured",
         quality_report={"score": 1},
-        flush_receipt_status="flushed",
     )
 
     response = await adapter.compact({"key": "canonical"})
@@ -151,7 +148,6 @@ async def test_adapter_projects_terminal_domain_result() -> None:
     assert response["summary_len"] == 12
     assert response["coverage_status"] == "complete"
     assert response["quality_report"] == {"score": 1}
-    assert response["flush_receipt_status"] == "flushed"
 
 
 async def test_adapter_maps_deadline_to_wire_error() -> None:
@@ -167,29 +163,6 @@ async def test_adapter_maps_deadline_to_wire_error() -> None:
 
     assert raised.value.code == "COMPACTION_TIMEOUT"
     assert raised.value.details["phase"] == "summarizing"
-
-
-async def test_adapter_maps_flush_safety_to_wire_error() -> None:
-    adapter, application = _adapter()
-    application.error = SessionCompactionFlushSafetyError(
-        session_key="canonical",
-        session_id="session-1",
-        receipt=None,
-        receipt_status="missing",
-        assessment=SessionCompactionMemoryAssessment(
-            allows_destructive_compaction=False,
-            safety_status="unsafe",
-            semantic_status="missing",
-        ),
-    )
-
-    with pytest.raises(RpcHandlerError) as raised:
-        await adapter.compact({"key": "canonical"})
-
-    assert raised.value.code == "CONTEXT_FLUSH_FAILED"
-    assert raised.value.details["reason"] == (
-        "destructive_manual_compact_requires_safe_flush"
-    )
 
 
 def test_manual_plan_keeps_generation_budget_without_fabricating_active_request() -> None:

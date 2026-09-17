@@ -49,6 +49,7 @@ from opensquilla.provider.selector import (  # noqa: E402
 from opensquilla.session.manager import SessionManager  # noqa: E402
 from opensquilla.session.storage import SessionStorage  # noqa: E402
 from opensquilla.session.terminal_reply import safe_provider_failure_code  # noqa: E402
+from opensquilla.token_estimation import estimate_tokens_with_source  # noqa: E402
 from opensquilla.tools.registry import ToolRegistry  # noqa: E402
 from opensquilla.tools.types import ToolContext, ToolSpec  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
@@ -649,7 +650,6 @@ def _config(
     config.memory.retrieval_mode = "fts_only"
     config.memory.auto_capture_enabled = False
     config.memory.capture_mode = "off"
-    config.memory.repair_enabled = False
     config.memory.dream.enabled = False
     config.meta_skill.enabled = False
     config.heartbeat.enabled = False
@@ -1251,7 +1251,12 @@ async def _run_compaction_case(
     prefix_counts: list[int] = []
     message_json_prefix_chars: list[int] = []
     source_entry_marker_counts: list[int] = []
-    seed_repetitions = 45
+    _, token_estimate_source = estimate_tokens_with_source(COMPACTION_PADDING)
+    conservative_estimate = token_estimate_source == "utf8_unicode_conservative"
+    # Match the ordinary fixture's estimated source pressure when the optional
+    # tokenizer is unavailable (this prose estimates about 86 rather than 30
+    # tokens per repetition). Physical request limits remain unchanged.
+    seed_repetitions = 16 if conservative_estimate else 45
     seed_padding = " log 17;" if options.native_pressure else COMPACTION_PADDING
     if options.native_pressure:
         from opensquilla.context_budget import ContextBudgetGovernor
@@ -1301,7 +1306,13 @@ async def _run_compaction_case(
     first_prompt = "SYNTHETIC_COMPACTION_ENTRY_5_USER\n" + first_prompt
     # Keep one whole current turn large enough to occupy the recent-tail target;
     # the preceding generated fact/tool round must genuinely enter the summary.
-    tail_padding = " log 17;" * (1800 if variant == "long_reasoning" else 1000)
+    # Conservative estimation also charges more for the ledger and fixed
+    # instructions. Keep this protocol fixture's protected request sendable;
+    # native-pressure fixtures retain their original workload.
+    long_tail = variant == "long_reasoning" and (
+        not conservative_estimate or options.native_pressure
+    )
+    tail_padding = " log 17;" * (1800 if long_tail else 1000)
     tail_prompt = (
         "SYNTHETIC_COMPACTION_ENTRY_6_USER\n"
         f"{COMPACTION_TAIL_MARKER}\n{tail_padding}\n"
@@ -1407,7 +1418,7 @@ async def _run_compaction_case(
                     if options.preflight_ratio is None and not options.native_pressure:
                         # Small protocol cases exercise a deliberate early trigger.
                         # Native-pressure cases retain the production threshold.
-                        config.preflight_compact_ratio = 0.1
+                        config.preflight_compact_ratio = 0.2 if conservative_estimate else 0.1
                     if variant == "model_switch":
                         config.llm.model = next_model
                     if variant == "truncated":

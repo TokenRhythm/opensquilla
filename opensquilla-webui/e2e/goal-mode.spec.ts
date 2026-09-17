@@ -15,6 +15,8 @@ const SESSION_KEY = 'agent:main:webchat:e2e-goal-mode'
 const SESSION_ID = 'session-e2e-goal-mode'
 const GOAL_ID = 'goal-e2e-mocked-snapshots'
 const GOAL_SOURCE_MESSAGE_ID = 'message-goal-source'
+const GOAL_TERMINAL_TURN_ID = 'turn-goal-terminal'
+const GOAL_TERMINAL_REPLY = 'The synthetic Goal report is complete.'
 const OBJECTIVE = 'Produce and verify a deterministic release report'
 const REAL_FIRST_REPLY = 'The release inputs are inspected; final verification still remains.'
 const REAL_FINAL_REPLY = 'The deterministic release report is complete and verified.'
@@ -41,9 +43,11 @@ type GoalFixture = ReturnType<typeof goalSnapshot>
 
 type MockGoalGateway = {
   acceptGoal: () => void
+  acceptClear: () => void
   emitGoal: (goal: GoalFixture) => void
   methods: string[]
   setParams: Array<Record<string, unknown>>
+  clearParams: Array<Record<string, unknown>>
 }
 
 function response(id: string | number | undefined, payload: unknown) {
@@ -116,15 +120,22 @@ async function installStableHttpStubs(page: Page): Promise<void> {
 
 async function installFakeGoalGateway(
   page: Page,
-  options: { sessionRouting?: boolean } = {},
+  options: {
+    sessionRouting?: boolean
+    goalRemoval?: boolean
+    history?: Array<Record<string, unknown>>
+  } = {},
 ): Promise<MockGoalGateway> {
   const methods: string[] = []
   const setParams: Array<Record<string, unknown>> = []
+  const clearParams: Array<Record<string, unknown>> = []
   let sendFrame: ((frame: string) => void) | null = null
   let pendingGoalRequest: {
     id: string | number | undefined
     params: Record<string, unknown>
   } | null = null
+  let pendingClearRequest: { id: string | number | undefined } | null = null
+  let currentGoal: GoalFixture | null = null
   let streamSeq = 0
 
   await page.addInitScript(() => {
@@ -156,6 +167,7 @@ async function installFakeGoalGateway(
             methods: [
               'goals.capabilities',
               'goals.set',
+              ...(options.goalRemoval ? ['goals.clear'] : []),
               ...(options.sessionRouting
                 ? ['sessions.routing.get', 'sessions.routing.set']
                 : []),
@@ -187,10 +199,15 @@ async function installFakeGoalGateway(
         }
         return
       }
+      if (method === 'goals.clear' && options.goalRemoval) {
+        clearParams.push(frame.params as Record<string, unknown>)
+        pendingClearRequest = { id: frame.id as string | number | undefined }
+        return
+      }
 
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
-        'chat.history': chatHistoryPayload(),
+        'chat.history': chatHistoryPayload(options.history),
         'commands.list_for_surface': {
           commands: [{
             name: '/goal',
@@ -211,17 +228,18 @@ async function installFakeGoalGateway(
           executionEnabled: true,
           maxTurns: 50,
           runtimeBudgetSeconds: 3_600,
-          methods: ['goals.set'],
+          methods: ['goals.set', ...(options.goalRemoval ? ['goals.clear'] : [])],
         },
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY, {
-          current_stream_seq: 0,
+          current_stream_seq: options.goalRemoval ? streamSeq : 0,
         }),
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, {
           sessionId: SESSION_ID,
           epoch: 1,
+          current_stream_seq: options.goalRemoval ? streamSeq : 0,
           hydration_complete: false,
           goal: null,
           goalSnapshotStreamSeq: null,
@@ -230,8 +248,8 @@ async function installFakeGoalGateway(
         'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY, {
           sessionId: SESSION_ID,
           epoch: 1,
-          goal: null,
-          goalSnapshotStreamSeq: 0,
+          goal: options.goalRemoval ? currentGoal : null,
+          goalSnapshotStreamSeq: options.goalRemoval ? streamSeq : 0,
         }),
         'sessions.routing.get': {
           sessionKey: SESSION_KEY,
@@ -250,12 +268,14 @@ async function installFakeGoalGateway(
   return {
     methods,
     setParams,
+    clearParams,
     acceptGoal() {
       if (!sendFrame || !pendingGoalRequest) {
         throw new Error('fake Goal gateway has no pending goals.set request')
       }
       const { id, params } = pendingGoalRequest
       pendingGoalRequest = null
+      currentGoal = goalSnapshot()
       sendFrame(response(id, {
         accepted: true,
         clientRequestId: params.clientRequestId,
@@ -265,11 +285,46 @@ async function installFakeGoalGateway(
         taskId: 'task-goal-first-turn',
         userMessageId: GOAL_SOURCE_MESSAGE_ID,
         previousGoalId: null,
-        goal: goalSnapshot(),
+        goal: currentGoal,
+      }))
+    },
+    acceptClear() {
+      if (!sendFrame || !pendingClearRequest || !currentGoal) {
+        throw new Error('fake Goal gateway has no pending goals.clear request')
+      }
+      const { id } = pendingClearRequest
+      const previousGoal = currentGoal
+      pendingClearRequest = null
+      currentGoal = null
+      streamSeq += 1
+      sendFrame(JSON.stringify({
+        type: 'event',
+        event: 'session.event.goal',
+        payload: {
+          session_key: SESSION_KEY,
+          session_id: SESSION_ID,
+          epoch: 1,
+          stream_seq: streamSeq,
+          event_type: 'cleared',
+          state_revision: previousGoal.stateRevision + 1,
+          progress_revision: previousGoal.progressRevision,
+          previous_goal_id: previousGoal.goalId,
+          goal: null,
+        },
+      }))
+      sendFrame(response(id, {
+        accepted: true,
+        sessionKey: SESSION_KEY,
+        sessionId: SESSION_ID,
+        epoch: 1,
+        previousGoalId: previousGoal.goalId,
+        stateRevision: previousGoal.stateRevision + 1,
+        goal: null,
       }))
     },
     emitGoal(goal) {
       if (!sendFrame) throw new Error('fake Goal gateway is not connected')
+      currentGoal = goal
       streamSeq += 1
       sendFrame(JSON.stringify({
         type: 'event',
@@ -449,6 +504,162 @@ test('Goal mode renders mocked continuation snapshots without correctness pollin
   await expect(outcome).toContainText('3 turns')
   await expect(outcome).toContainText('360 tokens')
   expect(gateway.methods.filter(method => forbiddenGoalMethods.includes(method))).toEqual([])
+})
+
+for (const placement of ['tail fallback', 'inline assistant outcome'] as const) {
+  test(`Completed Goal removal works from the ${placement}`, async ({ page }) => {
+    const inline = placement === 'inline assistant outcome'
+    const history = inline ? [
+      {
+        role: 'user',
+        text: OBJECTIVE,
+        id: GOAL_SOURCE_MESSAGE_ID,
+        message_id: GOAL_SOURCE_MESSAGE_ID,
+        timestamp: 1_800_000_000,
+        turn_context: { turn_id: GOAL_TERMINAL_TURN_ID },
+      },
+      {
+        role: 'assistant',
+        text: GOAL_TERMINAL_REPLY,
+        id: 'message-goal-terminal',
+        message_id: 'message-goal-terminal',
+        timestamp: 1_800_000_001,
+        turn_context: { turn_id: GOAL_TERMINAL_TURN_ID },
+      },
+    ] : []
+    const gateway = await installFakeGoalGateway(page, { goalRemoval: true, history })
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+    if (inline) {
+      await expect(page.locator('.msg-ai').filter({ hasText: GOAL_TERMINAL_REPLY }))
+        .toHaveCount(1)
+    }
+
+    gateway.emitGoal(goalSnapshot())
+    const ribbon = page.locator('.goal-ribbon')
+    await expect(ribbon).toHaveAttribute('data-status', 'active')
+
+    // The model's completion decision arrives before the final task settles.
+    // Removal belongs to the settled outcome, not this transient ribbon.
+    gateway.emitGoal(goalSnapshot({ status: 'complete', stateRevision: 2 }))
+    await expect(ribbon).toHaveAttribute('data-status', 'complete')
+    await expect(page.locator('.goal-outcome')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Remove goal', exact: true })).toHaveCount(0)
+
+    gateway.emitGoal(goalSnapshot({
+      status: 'complete',
+      stateRevision: 3,
+      activeTaskId: null,
+      executionState: 'idle',
+      turnsSettled: 1,
+      terminalTurnId: inline ? GOAL_TERMINAL_TURN_ID : null,
+      terminalReason: 'complete',
+      finishedAt: 4_000,
+    }))
+    await expect(ribbon).toHaveCount(0)
+    const outcome = page.locator(inline
+      ? '.msg-ai .goal-outcome--inline'
+      : '.goal-outcome:not(.goal-outcome--inline)')
+    await expect(page.locator('.goal-outcome')).toHaveCount(1)
+    await expect(outcome).toBeVisible()
+    const removeButton = outcome.getByRole('button', { name: 'Remove goal', exact: true })
+    await expect(removeButton).toBeEnabled()
+
+    // The inline footer also carries message actions. On narrow screens it
+    // must leave enough room for the complete removal label and touch target.
+    await page.setViewportSize({ width: 390, height: 844 })
+    await expect(removeButton).toBeInViewport()
+    await expect.poll(async () => removeButton.evaluate(button => {
+      const bounds = button.getBoundingClientRect()
+      const label = button.querySelector('span')!
+      const range = document.createRange()
+      range.selectNodeContents(label)
+      return {
+        fits: bounds.left >= 0 && bounds.right <= window.innerWidth,
+        touchTarget: bounds.width >= 44 && bounds.height >= 44,
+        labelLines: range.getClientRects().length,
+      }
+    })).toEqual({ fits: true, touchTarget: true, labelLines: 1 })
+
+    // Exercise keyboard access through the full ChatView confirmation path.
+    await removeButton.focus()
+    await page.keyboard.press('Enter')
+    const dialog = page.getByRole('dialog', { name: 'Remove this goal?' })
+    await expect(dialog).toBeVisible()
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+    await expect(dialog).toHaveCount(0)
+    await expect(outcome).toBeVisible()
+    expect(gateway.clearParams).toEqual([])
+
+    await removeButton.click()
+    await dialog.getByRole('button', { name: 'Remove goal', exact: true }).click()
+    await expect.poll(() => gateway.clearParams).toHaveLength(1)
+    expect(gateway.clearParams[0]).toMatchObject({
+      sessionKey: SESSION_KEY,
+      expectedGoalId: GOAL_ID,
+      expectedStateRevision: 3,
+    })
+    expect(gateway.clearParams[0]?.clientRequestId).toMatch(/^[0-9a-f-]{36}$/)
+    await expect(removeButton).toBeDisabled()
+
+    gateway.acceptClear()
+    await expect(page.locator('.goal-outcome')).toHaveCount(0)
+    await expect(ribbon).toHaveCount(0)
+    expect(gateway.methods.filter(method => method === 'goals.clear')).toHaveLength(1)
+    if (inline) {
+      await expect(page.locator('.msg-ai').filter({ hasText: GOAL_TERMINAL_REPLY }))
+        .toHaveCount(1)
+    }
+
+    // The mock retains the cleared authoritative state across the new socket.
+    // A fresh hydration must not revive the completed Goal or remove history.
+    const hydrateCount = gateway.methods.filter(method => method === 'sessions.messages.hydrate').length
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect.poll(() => gateway.methods.filter(method => method === 'sessions.messages.hydrate').length)
+      .toBeGreaterThan(hydrateCount)
+    await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+    await expect(page.locator('.goal-outcome')).toHaveCount(0)
+    await expect(ribbon).toHaveCount(0)
+    expect(gateway.clearParams).toHaveLength(1)
+    if (inline) {
+      await expect(page.locator('.msg-ai').filter({ hasText: GOAL_TERMINAL_REPLY }))
+        .toHaveCount(1)
+    }
+  })
+}
+
+test('Completed Goal removal confirmation cannot clear a replacement Goal', async ({ page }) => {
+  const gateway = await installFakeGoalGateway(page, { goalRemoval: true })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+  gateway.emitGoal(goalSnapshot({
+    status: 'complete',
+    stateRevision: 3,
+    activeTaskId: null,
+    executionState: 'idle',
+    turnsSettled: 1,
+    terminalReason: 'complete',
+    finishedAt: 4_000,
+  }))
+  await page.locator('.goal-outcome')
+    .getByRole('button', { name: 'Remove goal', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Remove this goal?' })
+  await expect(dialog).toBeVisible()
+
+  const replacementObjective = 'Verify a new synthetic report'
+  gateway.emitGoal(goalSnapshot({
+    goalId: 'goal-e2e-replacement',
+    objective: replacementObjective,
+    stateRevision: 1,
+  }))
+  await expect(page.locator('.goal-ribbon')).toContainText(replacementObjective)
+  await dialog.getByRole('button', { name: 'Remove goal', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.locator('.goal-ribbon')).toContainText(replacementObjective)
+  expect(gateway.clearParams).toEqual([])
 })
 
 test('Composer Add menu stays above active Goal progress across responsive layouts', async ({ page }) => {

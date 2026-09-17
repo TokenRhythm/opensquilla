@@ -29,17 +29,17 @@ def test_default_bootstrap_templates_define_distinct_file_roles() -> None:
     agents = (template_dir / "AGENTS.md").read_text(encoding="utf-8")
     soul = (template_dir / "SOUL.md").read_text(encoding="utf-8")
     identity = (template_dir / "IDENTITY.md").read_text(encoding="utf-8")
-    tools = (template_dir / "TOOLS.md").read_text(encoding="utf-8")
     memory = (template_dir / "MEMORY.md").read_text(encoding="utf-8")
 
-    assert "operating rules" in agents
-    assert "Do not store user profile facts here" in agents
+    assert agents == ""
     assert "voice, tone, and interaction style" in soul
     assert "Do not store user profile facts, task history, or tool inventories here" in soul
     assert "agent's public-facing name" in identity
     assert "If the user asks to rename the assistant" in identity
-    assert "local tool conventions" in tools
-    assert "does not register tools, grant permissions, or change tool policy" in tools
+    assert "`AGENTS.md`" in soul
+    for retired in ("TOOLS.md", "HEARTBEAT.md", "BOOTSTRAP.md"):
+        assert not (template_dir / retired).exists()
+        assert retired not in soul
     assert "durable non-profile facts" in memory
     assert "Agent name, tone, and persona belong in IDENTITY.md or SOUL.md" in memory
 

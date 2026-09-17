@@ -4,7 +4,6 @@ import asyncio
 import builtins
 from dataclasses import fields
 from pathlib import Path
-from threading import Event
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,7 +16,7 @@ from opensquilla.channels.types import (
     IngressVerification,
 )
 from opensquilla.engine.runtime import TurnRunner
-from opensquilla.engine.types import AgentConfig, DoneEvent
+from opensquilla.engine.types import DoneEvent
 from opensquilla.gateway import boot as boot_module
 from opensquilla.gateway.boot import (
     _configured_agent_ids,
@@ -27,7 +26,6 @@ from opensquilla.gateway.boot import (
     _task_runtime_envelope_owner,
     _task_runtime_turn_hard_deadline_s,
     _warn_workspace_state_mismatch,
-    build_flush_service,
     build_services,
     build_task_runtime_run_kwargs,
     dispatch_task_runtime_turn,
@@ -57,17 +55,16 @@ from opensquilla.project_workspaces import (
     ProjectWorkspaceStateError,
     project_path_key,
 )
-from opensquilla.provider import Message, ProviderRequestCorrelation
+from opensquilla.provider import ProviderRequestCorrelation
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.scheduler.types import CronJob, JobStatus
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import SessionIntent
 from opensquilla.session.storage import SessionStorage, StaleEpochError
 from opensquilla.tools.registry import ToolRegistry
-from opensquilla.tools.types import CallerKind, ToolContext, ToolSpec
+from opensquilla.tools.types import CallerKind, ToolContext
 
 
 def test_route_envelope_session_epoch_is_append_only_for_positional_callers() -> None:
@@ -1086,14 +1083,9 @@ def test_static_openrouter_b5_webui_grace_stays_above_custom_stream_idle() -> No
 
 def test_compaction_time_budget_defaults_allow_long_chain_work() -> None:
     gateway_config = GatewayConfig()
-    agent_config = AgentConfig()
     compaction_config = CompactionConfig()
 
-    assert gateway_config.memory.flush_timeout_seconds == 15.0
-    assert gateway_config.memory.flush_background_timeout_seconds == 120.0
     assert gateway_config.compaction.timeout_seconds == 90.0
-    assert agent_config.flush_timeout_seconds == 15.0
-    assert agent_config.flush_background_timeout_seconds == 120.0
     assert compaction_config.timeout_seconds == 90.0
 
 
@@ -1252,7 +1244,6 @@ async def test_build_services_defers_sandbox_startup_until_gateway_ready(
         control_ui={"enabled": False},
         channels={"channels": []},
         mcp={"enabled": False},
-        memory={"flush_enabled": False},
         sandbox={
             "run_mode": "trusted",
             "sandbox": True,
@@ -1322,7 +1313,6 @@ async def test_embedded_gateway_defers_sandbox_until_inprocess_ready(
         control_ui={"enabled": False},
         channels={"channels": []},
         mcp={"enabled": False},
-        memory={"flush_enabled": False},
     )
 
     server = await boot.start_gateway_server(config=config, run=False)
@@ -1406,7 +1396,6 @@ async def test_bare_full_default_boots_full_capability(
         control_ui={"enabled": False},
         channels={"channels": []},
         mcp={"enabled": False},
-        memory={"flush_enabled": False},
     )
 
     services = await boot.build_services(
@@ -1466,7 +1455,6 @@ def test_build_turn_runner_from_services_wires_memory_services(
         memory_sync_managers={"main": object()},
         memory_retrievers={"main": object()},
         turn_capture_services={"main": object()},
-        flush_service=object(),
         model_catalog=object(),
     )
 
@@ -1476,7 +1464,6 @@ def test_build_turn_runner_from_services_wires_memory_services(
     assert captured["memory_sync_managers"] is services.memory_sync_managers
     assert captured["memory_retrievers"] is services.memory_retrievers
     assert captured["turn_capture_services"] is services.turn_capture_services
-    assert captured["session_flush_service"] is services.flush_service
     assert captured["model_catalog"] is services.model_catalog
 
 
@@ -1539,7 +1526,6 @@ async def test_start_gateway_server_shares_diagnostics_state_between_app_and_tur
             model_catalog=None,
             memory_retrievers={},
             turn_capture_services={},
-            flush_service=None,
             cron_scheduler=None,
             task_runtime=None,
             agent_registry=None,
@@ -1621,7 +1607,6 @@ async def test_start_gateway_server_creates_default_subscription_manager(
             model_catalog=None,
             memory_retrievers={},
             turn_capture_services={},
-            flush_service=None,
             cron_scheduler=None,
             task_runtime=None,
             agent_registry=None,
@@ -1710,7 +1695,6 @@ async def test_start_gateway_server_schedules_router_preload_after_channels(
             model_catalog=None,
             memory_retrievers={},
             turn_capture_services={},
-            flush_service=None,
             cron_scheduler=None,
             task_runtime=None,
             agent_registry=None,
@@ -1805,7 +1789,6 @@ def test_start_gateway_server_passes_tls_files_to_uvicorn(
             model_catalog=None,
             memory_retrievers={},
             turn_capture_services={},
-            flush_service=None,
             cron_scheduler=None,
             task_runtime=None,
             agent_registry=None,
@@ -1920,7 +1903,6 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
             model_catalog=None,
             memory_retrievers={},
             turn_capture_services={},
-            flush_service=None,
             cron_scheduler=cron_sched,
             task_runtime=None,
             agent_registry=None,
@@ -2059,7 +2041,6 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
             model_catalog=None,
             memory_retrievers={},
             turn_capture_services={},
-            flush_service=None,
             cron_scheduler=cron_sched,
             task_runtime=None,
             agent_registry=None,
@@ -2176,348 +2157,6 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
         reset_runtime_for_test()
 
 
-def test_build_flush_service_respects_memory_flush_enabled_config() -> None:
-    service = build_flush_service(
-        tool_registry=ToolRegistry(),
-        provider_selector=SimpleNamespace(resolve=lambda: object()),
-        config=GatewayConfig(memory={"flush_enabled": False}),
-    )
-
-    assert service is None
-
-
-def test_build_flush_service_uses_configured_background_memory_timeout() -> None:
-    service = build_flush_service(
-        tool_registry=ToolRegistry(),
-        provider_selector=SimpleNamespace(resolve=lambda: object()),
-        config=GatewayConfig(
-            memory={
-                "flush_enabled": True,
-                "flush_timeout_seconds": 0.25,
-                "flush_background_timeout_seconds": 42.0,
-            }
-        ),
-    )
-
-    assert service is not None
-    assert service._default_timeout == 42.0
-
-
-@pytest.mark.asyncio
-async def test_build_flush_service_archive_workspace_falls_back_to_main_workspace(
-    tmp_path: Path,
-) -> None:
-    registry = ToolRegistry()
-    main_workspace = tmp_path / "main-workspace"
-    matching_memory_dir = tmp_path / "matching-memory"
-    service = build_flush_service(
-        tool_registry=registry,
-        provider_selector=SimpleNamespace(resolve=lambda: None),
-        config=GatewayConfig(memory={"flush_enabled": True}),
-        memory_managers={
-            "side": SimpleNamespace(workspace_dir=None, memory_dir=matching_memory_dir),
-            "main": SimpleNamespace(
-                workspace_dir=main_workspace,
-                memory_dir=tmp_path / "main-memory",
-            ),
-        },
-    )
-
-    receipt = await service.execute(
-        [Message(role="user", content="temporary transcript")],
-        "agent:side:webchat:s1",
-        agent_id="side",
-    )
-
-    assert receipt.mode == "raw"
-    assert (main_workspace / receipt.flushed_paths[0]).exists()
-    assert not (matching_memory_dir / receipt.flushed_paths[0]).exists()
-
-
-@pytest.mark.asyncio
-async def test_build_flush_service_wires_durable_receipt_writer(tmp_path: Path) -> None:
-    storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
-    session_manager = SessionManager(storage)
-    registry = ToolRegistry()
-
-    async def memory_save(path: str, content: str, mode: str) -> str:
-        assert mode == "append"
-        assert content.startswith("# Raw flush")
-        return f"Saved to {path} (0 chunks indexed)."
-
-    registry.register(
-        ToolSpec(
-            name="memory_save",
-            description="Save memory",
-            parameters={
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-                "mode": {"type": "string"},
-            },
-            required=["path", "content", "mode"],
-        ),
-        memory_save,
-    )
-    try:
-        session_key = "agent:main:webchat:s1"
-        session = await session_manager.create(session_key)
-        service = build_flush_service(
-            tool_registry=registry,
-            provider_selector=SimpleNamespace(resolve=lambda: None),
-            config=GatewayConfig(memory={"flush_enabled": True}),
-            session_manager=session_manager,
-            memory_managers={"main": SimpleNamespace(workspace_dir=tmp_path)},
-        )
-
-        receipt = await service.execute(
-            [Message(role="user", content="temporary transcript")],
-            session_key,
-            agent_id="main",
-        )
-        rows = await storage.list_memory_durable_receipts(session_key=session_key)
-
-        assert receipt.result_status == "ok_archive_only"
-        assert len(rows) == 2
-        assert rows[0].scope == "preimage"
-        repair_row = rows[1]
-        assert repair_row.session_id == session.session_id
-        assert repair_row.scope == "repair"
-        assert repair_row.status == "repair_pending"
-        assert repair_row.reason == "ok_archive_only"
-        assert repair_row.target_path == receipt.flushed_paths[0]
-        assert repair_row.source_path == f"session:{session_key}:flush:1-1"
-        assert repair_row.content_hash == receipt.content_hash
-        assert repair_row.turn_id == "flush:1-1"
-        assert repair_row.idempotency_key.startswith(
-            f"flush-receipt:repair:{session_key}:{session.session_id}:flush:1-1:"
-        )
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_build_flush_service_skips_receipt_after_session_rotation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
-    session_manager = SessionManager(storage)
-    registry = ToolRegistry()
-    archive_started = Event()
-    allow_archive = Event()
-
-    from opensquilla.memory import session_flush as session_flush_module
-
-    real_archive_writer = session_flush_module.write_raw_fallback_archive
-
-    def archive_writer(*args: Any, **kwargs: Any) -> Any:
-        archive_started.set()
-        assert allow_archive.wait(timeout=2.0)
-        return real_archive_writer(*args, **kwargs)
-
-    monkeypatch.setattr(
-        session_flush_module,
-        "write_raw_fallback_archive",
-        archive_writer,
-    )
-    try:
-        session_key = "agent:main:webchat:s1"
-        original = await session_manager.create(session_key)
-        service = build_flush_service(
-            tool_registry=registry,
-            provider_selector=SimpleNamespace(resolve=lambda: None),
-            config=GatewayConfig(memory={"flush_enabled": True}),
-            session_manager=session_manager,
-            memory_managers={"main": SimpleNamespace(workspace_dir=tmp_path)},
-        )
-
-        task = asyncio.create_task(
-            service.execute(
-                [Message(role="user", content="temporary transcript")],
-                session_key,
-                agent_id="main",
-            )
-        )
-        await asyncio.wait_for(asyncio.to_thread(archive_started.wait), timeout=2.0)
-        rotated, did_rotate = await session_manager.apply_intent(
-            session_key,
-            SessionIntent.RESET_SAME_KEY,
-        )
-        allow_archive.set()
-        receipt = await task
-        rows = await storage.list_memory_durable_receipts(session_key=session_key)
-
-        assert did_rotate
-        assert rotated.session_id != original.session_id
-        assert receipt.session_id == original.session_id
-        assert rows == []
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_build_flush_service_skips_receipt_after_session_delete(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
-    session_manager = SessionManager(storage)
-    registry = ToolRegistry()
-    archive_started = Event()
-    allow_archive = Event()
-
-    from opensquilla.memory import session_flush as session_flush_module
-
-    real_archive_writer = session_flush_module.write_raw_fallback_archive
-
-    def archive_writer(*args: Any, **kwargs: Any) -> Any:
-        archive_started.set()
-        assert allow_archive.wait(timeout=2.0)
-        return real_archive_writer(*args, **kwargs)
-
-    monkeypatch.setattr(
-        session_flush_module,
-        "write_raw_fallback_archive",
-        archive_writer,
-    )
-    try:
-        session_key = "agent:main:webchat:deleted-during-flush"
-        original = await session_manager.create(session_key)
-        service = build_flush_service(
-            tool_registry=registry,
-            provider_selector=SimpleNamespace(resolve=lambda: None),
-            config=GatewayConfig(memory={"flush_enabled": True}),
-            session_manager=session_manager,
-            memory_managers={"main": SimpleNamespace(workspace_dir=tmp_path)},
-        )
-
-        task = asyncio.create_task(
-            service.execute(
-                [Message(role="user", content="temporary transcript")],
-                session_key,
-                agent_id="main",
-            )
-        )
-        await asyncio.wait_for(asyncio.to_thread(archive_started.wait), timeout=2.0)
-        await storage.delete_session(session_key)
-        allow_archive.set()
-        receipt = await task
-
-        assert receipt.session_id == original.session_id
-        assert await storage.get_session(session_key) is None
-        assert await storage.list_memory_durable_receipts(session_key=session_key) == []
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_build_flush_service_receipts_distinguish_same_window_different_content(
-    tmp_path: Path,
-) -> None:
-    storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
-    session_manager = SessionManager(storage)
-    registry = ToolRegistry()
-
-    async def memory_save(path: str, content: str, mode: str) -> str:
-        return f"Saved to {path} (0 chunks indexed)."
-
-    registry.register(
-        ToolSpec(
-            name="memory_save",
-            description="Save memory",
-            parameters={
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-                "mode": {"type": "string"},
-            },
-            required=["path", "content", "mode"],
-        ),
-        memory_save,
-    )
-    try:
-        session_key = "agent:main:webchat:s1"
-        await session_manager.create(session_key)
-        service = build_flush_service(
-            tool_registry=registry,
-            provider_selector=SimpleNamespace(resolve=lambda: None),
-            config=GatewayConfig(memory={"flush_enabled": True}),
-            session_manager=session_manager,
-            memory_managers={"main": SimpleNamespace(workspace_dir=tmp_path)},
-        )
-
-        first = await service.execute(
-            [Message(role="user", content="first content")],
-            session_key,
-            agent_id="main",
-        )
-        second = await service.execute(
-            [Message(role="user", content="second content")],
-            session_key,
-            agent_id="main",
-        )
-        rows = await storage.list_memory_durable_receipts(session_key=session_key)
-
-        assert first.content_hash != second.content_hash
-        repair_rows = [row for row in rows if row.scope == "repair"]
-        assert len(repair_rows) == 2
-        assert len({row.content_hash for row in repair_rows}) == 2
-        assert len({row.idempotency_key for row in repair_rows}) == 2
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_build_flush_service_archive_failed_without_checkpoint_is_checkpoint_failed(
-    tmp_path: Path,
-) -> None:
-    storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
-    session_manager = SessionManager(storage)
-    registry = ToolRegistry()
-
-    async def memory_save(path: str, content: str, mode: str) -> str:
-        raise RuntimeError("disk full")
-
-    registry.register(
-        ToolSpec(
-            name="memory_save",
-            description="Save memory",
-            parameters={
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-                "mode": {"type": "string"},
-            },
-            required=["path", "content", "mode"],
-        ),
-        memory_save,
-    )
-    try:
-        session_key = "agent:main:webchat:s1"
-        session = await session_manager.create(session_key)
-        service = build_flush_service(
-            tool_registry=registry,
-            provider_selector=SimpleNamespace(resolve=lambda: None),
-            config=GatewayConfig(memory={"flush_enabled": True}),
-            session_manager=session_manager,
-        )
-
-        receipt = await service.execute(
-            [Message(role="user", content="temporary transcript")],
-            session_key,
-            agent_id="main",
-        )
-        rows = await storage.list_memory_durable_receipts(session_key=session_key)
-
-        assert receipt.result_status == "archive_failed"
-        assert len(rows) == 1
-        assert rows[0].session_id == session.session_id
-        assert rows[0].scope == "checkpoint"
-        assert rows[0].status == "checkpoint_failed"
-        assert rows[0].reason == "archive_failed"
-        assert rows[0].content_hash == receipt.content_hash
-    finally:
-        await storage.close()
-
-
 @pytest.mark.asyncio
 async def test_build_services_registers_session_search_tool(
     monkeypatch: pytest.MonkeyPatch,
@@ -2555,7 +2194,6 @@ async def test_build_services_registers_session_search_tool(
         control_ui={"enabled": False},
         channels={"channels": []},
         mcp={"enabled": False},
-        memory={"flush_enabled": False},
     )
 
     services = await build_services(

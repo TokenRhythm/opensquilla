@@ -2,8 +2,10 @@
   "schema_version": 1,
   "merge_critical_inputs": [
     ".github/actions/download-required-artifact/action.yml",
+    ".github/ci/dependency-audit.v1.json",
     ".github/ci/suites.v1.json",
     ".github/ci/trust-policy.v1.json",
+    ".github/scripts/audit_dependencies.py",
     ".github/scripts/check_ci_results.py",
     ".github/scripts/ci_attestation.py",
     ".github/scripts/plan_ci.py",

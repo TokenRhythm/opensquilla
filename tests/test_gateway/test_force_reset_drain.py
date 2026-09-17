@@ -1,7 +1,6 @@
 """Tests that runtime quiescence is called on every reset branch.
 
-Asserts that the concrete reset quiescence Port is invoked regardless of
-whether ``flush_service`` is None or wired, and regardless of the force flag.
+Asserts that the concrete reset quiescence Port is invoked regardless of the force flag.
 """
 
 from __future__ import annotations
@@ -85,14 +84,13 @@ class _FakeSessionManager:
         return session, True
 
 
-def _make_ctx(flush_service=None, task_runtime=None) -> RpcContext:
+def _make_ctx(task_runtime=None) -> RpcContext:
     ctx = RpcContext(
         conn_id="test-drain",
         principal=_ADMIN_PRINCIPAL,
         config=GatewayConfig(),
     )
     ctx.session_manager = _FakeSessionManager()
-    ctx.flush_service = flush_service
     ctx.task_runtime = task_runtime
     return ctx
 
@@ -106,47 +104,10 @@ def _make_task_runtime() -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_drain_called_when_flush_service_none():
-    """drain is called even when flush_service is None (kill-switch path)."""
+async def test_drain_called_before_reset():
+    """The runtime drains before resetting its durable session."""
     task_runtime = _make_task_runtime()
-    ctx = _make_ctx(flush_service=None, task_runtime=task_runtime)
-
-    target = (
-        "opensquilla.gateway.adapters.session_reset.GatewaySessionResetPorts._quiesce_task_runtime"
-    )
-    with patch(target, new_callable=AsyncMock) as mock_drain:
-        result = await get_dispatcher().dispatch(
-            "r1",
-            "sessions.reset",
-            {"key": _SESSION_KEY},
-            ctx,
-        )
-
-    assert result.error is None, result.error
-    mock_drain.assert_awaited_once_with(task_runtime, _SESSION_KEY)
-
-
-@pytest.mark.asyncio
-async def test_drain_called_with_flush_service():
-    """drain is called when flush_service is wired (normal path)."""
-    from opensquilla.memory.session_flush import FlushReceipt
-
-    task_runtime = _make_task_runtime()
-
-    flush_receipt = FlushReceipt(
-        mode="skipped",
-        flushed_paths=[],
-        slug=None,
-        message_count=0,
-        duration_ms=0,
-        raw_reason=None,
-        error=None,
-    )
-    fake_flush_service = SimpleNamespace(
-        execute=AsyncMock(return_value=flush_receipt),
-    )
-
-    ctx = _make_ctx(flush_service=fake_flush_service, task_runtime=task_runtime)
+    ctx = _make_ctx(task_runtime=task_runtime)
 
     target = (
         "opensquilla.gateway.adapters.session_reset.GatewaySessionResetPorts._quiesce_task_runtime"
@@ -167,7 +128,7 @@ async def test_drain_called_with_flush_service():
 async def test_drain_failure_aborts_reset_without_rotating_session():
     """A writer that cannot drain leaves the durable session owner unchanged."""
     task_runtime = _make_task_runtime()
-    ctx = _make_ctx(flush_service=None, task_runtime=task_runtime)
+    ctx = _make_ctx(task_runtime=task_runtime)
 
     target = (
         "opensquilla.gateway.adapters.session_reset.GatewaySessionResetPorts._quiesce_task_runtime"
@@ -232,11 +193,6 @@ async def test_reset_holds_all_writer_fences_through_snapshot_and_rotation():
         assert active_fences == {"background", "runtime", "direct", "write"}
         order.append("router:drain")
 
-    async def drain_turn(keys) -> None:
-        assert tuple(keys) == (_SESSION_KEY,)
-        assert active_fences == {"background", "runtime", "direct", "write"}
-        order.append("turn:drain")
-
     @asynccontextmanager
     async def runtime_fence(
         keys,
@@ -251,26 +207,26 @@ async def test_reset_holds_all_writer_fences_through_snapshot_and_rotation():
 
     task_runtime = _make_task_runtime()
     task_runtime.quiesce_sessions = runtime_fence
-    ctx = _make_ctx(flush_service=None, task_runtime=task_runtime)
+    ctx = _make_ctx(task_runtime=task_runtime)
     manager = ctx.session_manager
-    original_get_transcript = manager.get_transcript
+    original_get_session = manager._storage.get_session
     original_apply_intent = manager.apply_intent
 
-    async def observed_get_transcript(key: str) -> list:
+    async def observed_get_session(key: str):
         assert active_fences == {"background", "runtime", "direct", "write"}
-        order.append("snapshot")
-        return await original_get_transcript(key)
+        if "rotate" not in order:
+            order.append("snapshot")
+        return await original_get_session(key)
 
     async def observed_apply_intent(key: str, intent: object, **kwargs):
         assert active_fences == {"background", "runtime", "direct", "write"}
         order.append("rotate")
         return await original_apply_intent(key, intent, **kwargs)
 
-    manager.get_transcript = observed_get_transcript
+    manager._storage.get_session = observed_get_session
     manager.apply_intent = observed_apply_intent
     ctx.turn_runner = SimpleNamespace(
         get_session_lock=lambda _key: _WriteLock(),
-        drain_session_background_writes=drain_turn,
     )
 
     with (
@@ -306,7 +262,6 @@ async def test_reset_holds_all_writer_fences_through_snapshot_and_rotation():
         "direct:enter",
         "write:enter",
         "router:drain",
-        "turn:drain",
         "snapshot",
         "rotate",
         "write:exit",

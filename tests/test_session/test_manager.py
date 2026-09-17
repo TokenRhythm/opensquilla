@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session import manager as session_manager_module
 from opensquilla.session.attachment_manifest import (
     ATTACHMENT_MANIFEST_STATE_KIND,
@@ -1841,7 +1842,6 @@ async def test_branch_fork_transcript_copies_compaction_summaries(manager):
             removed_count=3,
             kept_count=1,
             chunk_count=2,
-            flush_receipt_status="safe",
             covered_through_id=123,
         )
     )
@@ -1877,7 +1877,6 @@ async def test_branch_fork_transcript_copies_compaction_summaries(manager):
     assert child_summaries[0].removed_count == 3
     assert child_summaries[0].kept_count == 1
     assert child_summaries[0].chunk_count == 2
-    assert child_summaries[0].flush_receipt_status == "safe"
     assert child_summaries[0].covered_through_id == 123
     assert child_summaries[0].session_id == child.session_id
     assert child_summaries[0].session_key == "agent:main:direct:u1"
@@ -2599,7 +2598,6 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
             "removed_count",
             "kept_count",
             "chunk_count",
-            "flush_receipt_status",
         }.issubset(columns)
 
         summary = await storage.get_latest_summary("legacy-session")
@@ -2618,7 +2616,6 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
         assert summary.removed_count == 0
         assert summary.kept_count == 0
         assert summary.chunk_count == 0
-        assert summary.flush_receipt_status == "unknown"
     finally:
         await storage.close()
 
@@ -3395,7 +3392,7 @@ async def test_compact_with_result_rejects_owner_rotated_at_exact_boundaries(
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(manager):
+async def test_compact_with_result_preserves_canonical_history(manager):
     await manager.create("agent:main:main")
     for i in range(20):
         await manager.append_message(
@@ -3409,13 +3406,10 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1000,
-        flush_receipt_status="unsafe",
         config=synthetic_compaction_config(),
     )
 
     assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "degraded_forensic"
     canonical_contents = [
         entry.content for entry in await manager.get_canonical_transcript("agent:main:main")
     ]
@@ -3423,110 +3417,31 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
 
 
 @pytest.mark.asyncio
-async def test_degraded_compaction_preimage_can_be_listed_for_repair(manager):
+async def test_compaction_archive_remains_readable(manager):
     await manager.create("agent:main:main")
     for i in range(20):
         await manager.append_message(
             "agent:main:main",
             "user",
-            f"repair msg {i} " + ("x" * 500),
+            f"archived msg {i} " + ("x" * 500),
             token_count=200,
         )
 
     await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1000,
-        flush_receipt_status="degraded_forensic",
         config=synthetic_compaction_config(),
     )
 
-    pending = await manager.list_degraded_compactions(agent_id="main")
-    assert len(pending) == 1
-    assert pending[0].flush_receipt_status == "degraded_forensic"
-    preimage = await manager.get_compaction_preimage(pending[0])
-    assert preimage
-    assert preimage[0].content.startswith("repair msg 0")
-    await manager.mark_compaction_repair_status(pending[0], "repaired")
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_compaction_flush_status_can_be_backfilled_by_compaction_id(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"background flush msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        compaction_id="cmp-bg-flush",
-        flush_receipt_status="degraded_forensic",
-        config=synthetic_compaction_config(),
-    )
-
-    updated = await manager.mark_compaction_flush_receipt_status(
-        "agent:main:main",
-        "cmp-bg-flush",
-        "safe",
-    )
-
-    assert updated == 1
     summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "safe"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_noop_memory_flush_compaction_status_does_not_enter_repair_queue(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"noop msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    result = await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        flush_receipt_status="noop_no_memory",
-        config=synthetic_compaction_config(),
+    assert len(summaries) == 1
+    assert summaries[0].compaction_id is not None
+    archived = await manager._storage.get_compacted_transcript_entries(
+        session_id=summaries[0].session_id,
+        compaction_id=summaries[0].compaction_id,
     )
-
-    assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "noop_no_memory"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_archive_only_memory_flush_compaction_status_does_not_enter_repair_queue(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"archive msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    result = await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        flush_receipt_status="archive_only",
-        config=synthetic_compaction_config(),
-    )
-
-    assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "archive_only"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
+    assert archived
+    assert archived[0].content.startswith("archived msg 0")
 
 
 @pytest.mark.asyncio
@@ -4983,6 +4898,129 @@ async def test_canonical_transcript_page_reads_one_snapshot_during_compaction(
         "snapshot-2",
         "snapshot-3",
     ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_page_rejects_unknown_and_cross_session_cursors(manager):
+    first = await manager.create("agent:main:webchat:cursor-a")
+    second = await manager.create("agent:main:webchat:cursor-b")
+    await manager.append_message(first.session_key, "user", "first")
+    await manager.append_message(second.session_key, "user", "second")
+    anchor = (await manager.get_transcript(first.session_key))[0]
+    assert anchor.id is not None
+
+    for cursor in ((anchor.created_at, anchor.id), (9_999_999, 9_999_999)):
+        with pytest.raises(HistoryCursorInvalidatedError):
+            await manager.get_canonical_transcript_page(
+                second.session_key,
+                limit=10,
+                before=cursor,
+            )
+
+
+@pytest.mark.asyncio
+async def test_canonical_page_keeps_unaddressable_legacy_archive_rows(manager):
+    node = await manager.create("agent:main:webchat:legacy-cursor")
+    await manager._storage.conn.execute(
+        """
+        INSERT INTO compacted_transcript_entries (
+            session_id, session_key, original_entry_id, message_id, role,
+            content, created_at, archived_at, schema_version
+        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node.session_id,
+            node.session_key,
+            "legacy-message",
+            "user",
+            "legacy content",
+            10,
+            20,
+            1,
+        ),
+    )
+    await manager._storage.conn.commit()
+
+    page = await manager.get_canonical_transcript_page(node.session_key, limit=10)
+
+    assert [entry.content for entry in page.entries] == ["legacy content"]
+    assert page.entries[0].id is None
+    assert page.canonical_complete is False
+
+
+@pytest.mark.asyncio
+async def test_cursor_validation_and_page_share_one_sqlite_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "history-cursor-snapshot.db"
+    writer_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    node = await writer.create("agent:main:webchat:cursor-snapshot")
+    for index in range(3):
+        await writer_storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id=f"snapshot-{index}",
+                role="user",
+                content=f"message {index}",
+                created_at=1_000 + index,
+            )
+        )
+    anchor = (await writer.get_transcript(node.session_key))[0]
+    assert anchor.id is not None
+
+    reader_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    original_execute = reader_storage.conn.execute
+    deletion_injected = False
+
+    async def delete_after_snapshot() -> None:
+        nonlocal deletion_injected
+        if deletion_injected:
+            return
+        await writer_storage.delete_transcript(node.session_id)
+        deletion_injected = True
+
+    class DeleteAfterFetch:
+        def __init__(self, delegate: Any) -> None:
+            self._delegate = delegate
+            self._cursor: Any = None
+
+        async def __aenter__(self):
+            self._cursor = await self._delegate.__aenter__()
+            return self
+
+        async def fetchall(self):
+            rows = await self._cursor.fetchall()
+            await delete_after_snapshot()
+            return rows
+
+        async def __aexit__(self, *args: Any):
+            return await self._delegate.__aexit__(*args)
+
+    def execute(sql: str, params: Any = ()):
+        result = original_execute(sql, params)
+        if "WITH cursor_anchor AS" in " ".join(sql.split()):
+            return DeleteAfterFetch(result)
+        return result
+
+    monkeypatch.setattr(reader_storage.conn, "execute", execute)
+    try:
+        entries, has_more = await reader_storage.get_canonical_transcript_page(
+            node.session_id,
+            limit=10,
+            after=(anchor.created_at, anchor.id),
+        )
+    finally:
+        await reader_storage.close()
+        await writer_storage.close()
+
+    assert deletion_injected is True
+    assert has_more is False
+    assert [entry.message_id for entry in entries] == ["snapshot-1", "snapshot-2"]
 
 
 @pytest.mark.asyncio

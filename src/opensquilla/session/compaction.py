@@ -123,7 +123,7 @@ class CompactionConfig:
     api_key: str = field(default="", repr=False)
     base_url: str = "https://openrouter.ai/api/v1"
     timeout_seconds: float = 90.0
-    # One wall-clock budget shared by checkpoint/flush, every summary chunk,
+    # One wall-clock budget shared by checkpoint creation, every summary chunk,
     # validation, and commit admission. Invalid/non-positive values fail back
     # to the bounded default rather than silently disabling the safety guard.
     total_timeout_seconds: float = 120.0

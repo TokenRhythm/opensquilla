@@ -326,7 +326,7 @@ async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
 
     agent = Agent(
         provider=_ThreeToolProvider(tool_turns=1),
-        config=AgentConfig(max_iterations=2, flush_enabled=False),
+        config=AgentConfig(max_iterations=2),
         tool_definitions=[_tool_def("exec_command")],
         tool_handler=handler,
         tool_context=tool_context,
@@ -349,7 +349,7 @@ async def test_plain_chat_finishes_when_git_is_unavailable(
     provider = _ThreeToolProvider(tool_turns=0)
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=1, flush_enabled=False),
+        config=AgentConfig(max_iterations=1),
         tool_context=ToolContext(workspace_dir=str(workspace)),
     )
 
@@ -385,7 +385,6 @@ async def test_retired_patch_ledger_does_not_write_on_turn_completion(
         config=AgentConfig(
             max_iterations=3,
             max_turn_tool_errors=1 if tool_error else 0,
-            flush_enabled=False,
             workspace_dir=str(tmp_path),
             patch_evidence_ledger_path=str(ledger_path),
         ),

@@ -72,7 +72,6 @@ class CompactionReport(BaseModel):
     kept_count: int = 0
     chunk_count: int = 0
     summary_source: str = "unknown"
-    flush_receipt_status: str = "unknown"
     coverage_status: str = "unknown"
     missing_obligations: list[str] = Field(default_factory=list)
     state_kind: str = "structured_summary_v1"

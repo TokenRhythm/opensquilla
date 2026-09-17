@@ -31,6 +31,7 @@ function fixture(t) {
     'desktop/electron/package.json', 'desktop/electron/package-lock.json',
     'desktop/electron/scripts/build-gateway.mjs', 'desktop/electron/scripts/gateway-entry.py',
     'desktop/electron/scripts/gateway-integrity.mjs',
+    'scripts/release_dependency_inventory.py',
   ]) write(path, path)
   const runtime = join(repo, 'runtime')
   const packageDir = join(runtime, 'opensquilla-gateway', '_internal', 'opensquilla')
@@ -38,6 +39,10 @@ function fixture(t) {
   cpSync(join(repo, 'migrations'), join(packageDir, '_migrations'), { recursive: true })
   cpSync(join(repo, router), join(packageDir, 'squilla_router/models/v4.2_phase3_inference'), { recursive: true })
   write('runtime/opensquilla-gateway/opensquilla-gateway.exe', 'unsigned gateway')
+  write('runtime/dependency-inventory.json', JSON.stringify({
+    schemaVersion: 1, kind: 'pyinstaller', lockSha256: fileHash(join(repo, 'uv.lock')),
+    packages: [{ name: 'example', version: '1.0', bundled: true }],
+  }))
   writeGatewayBuildRecord(repo, runtime, gatewayInputs(repo))
   return { repo, runtime, packageDir, write, router: join(packageDir, 'squilla_router/models/v4.2_phase3_inference') }
 }
@@ -52,6 +57,15 @@ test('prepared output and a separately copied final bundle match source', (t) =>
   writeFileSync(join(bundle, 'opensquilla-gateway/opensquilla-gateway.exe'), 'signed gateway')
   verifyGatewayIntegrity(repo, bundle)
   assert.throws(() => verifyGatewayIntegrity(repo, bundle, { prepared: true }), /prepared Gateway outputs/)
+})
+
+test('dependency inventory stays bound to the build after executable signing', (t) => {
+  const { repo, runtime, write } = fixture(t)
+  write('runtime/dependency-inventory.json', JSON.stringify({
+    schemaVersion: 1, kind: 'pyinstaller', lockSha256: fileHash(join(repo, 'uv.lock')),
+    packages: [{ name: 'example', version: '0.1', bundled: true }],
+  }))
+  assert.throws(() => verifyGatewayIntegrity(repo, runtime), /mismatched frozen dependency inventory/)
 })
 
 for (const fault of ['missing', 'changed', 'unexpected']) {

@@ -30,7 +30,11 @@ from .error_redaction import (
 )
 from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .openai import _http_error_body_text, _resolve_llm_proxy, _versioned_api_url
-from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .protocol import (
+    ProviderConnectionConfig,
+    ProviderMetadata,
+    ProviderModelListingResponseError,
+)
 from .request_proof import (
     RESPONSES_REQUEST_ENVELOPE,
     ProviderRequestBudgetExceededError,
@@ -966,7 +970,18 @@ class OpenAIResponsesProvider:
             data = response.json()
         except json.JSONDecodeError:
             if raise_on_error:
-                raise
+                raise ProviderModelListingResponseError(
+                    "Provider model catalog response could not be parsed",
+                    status_code=response.status_code,
+                ) from None
+            return []
+
+        if not isinstance(data, dict) or not isinstance(data.get("data", []), list):
+            if raise_on_error:
+                raise ProviderModelListingResponseError(
+                    "Provider model catalog response had an unexpected shape",
+                    status_code=response.status_code,
+                )
             return []
 
         models: list[ModelInfo] = []

@@ -38,9 +38,7 @@ _COMMAND_HELP_PATHS = (
     ("gateway", "restart"),
     ("gateway", "start"),
     ("gateway", "status"),
-    ("memory", "repair", "list"),
     ("migrate", "opensquilla"),
-    ("memory", "repair", "run"),
     ("memory", "status"),
     ("onboard",),
     ("onboard", "status"),
@@ -403,8 +401,6 @@ def test_health_recovery_command_paths_still_exist() -> None:
         ["providers", "list"],
         ["providers", "status"],
         ["memory", "status"],
-        ["memory", "repair", "list"],
-        ["memory", "repair", "run"],
         ["onboard"],
         ["search", "list"],
         ["search", "status"],
@@ -450,13 +446,6 @@ def test_health_recovery_command_options_still_match_cli_help() -> None:
     memory_status_help = _help(["memory", "status"])
     assert "--deep" in memory_status_help
     assert "--config" in memory_status_help
-    memory_repair_list_help = _help(["memory", "repair", "list"])
-    assert "--json" in memory_repair_list_help
-    assert "--config" in memory_repair_list_help
-    memory_repair_run_help = _help(["memory", "repair", "run"])
-    assert "--json" in memory_repair_run_help
-    assert "--config" in memory_repair_run_help
-    assert "--yes" not in memory_repair_run_help
     channels_status_help = _help(["channels", "status"])
     assert "--json" in channels_status_help
     assert "--config" in channels_status_help

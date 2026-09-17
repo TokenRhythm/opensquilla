@@ -184,6 +184,13 @@ def _string_list(value: object) -> list[str]:
     return []
 
 
+def normalize_skill_triggers(value: object) -> list[str]:
+    """Keep trigger matching text intact while accepting tolerant YAML values."""
+    if isinstance(value, list):
+        return [str(trigger) for trigger in value]
+    return [str(value)]
+
+
 def _explicit_bool(value: object, *, default: bool) -> bool:
     """Parse the boolean spellings accepted by common Skill frontmatter.
 
@@ -604,9 +611,7 @@ def compile_skill_manifest(
     always_raw = frontmatter.get("always", False)
     always = bool(always_raw) if always_raw is not None else False
 
-    triggers = frontmatter.get("triggers", [])
-    if not isinstance(triggers, list):
-        triggers = [str(triggers)]
+    triggers = normalize_skill_triggers(frontmatter.get("triggers", []))
 
     metadata = resolve_skill_metadata(frontmatter)
     provenance = resolve_skill_provenance(frontmatter)

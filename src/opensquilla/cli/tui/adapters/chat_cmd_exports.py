@@ -42,7 +42,7 @@ CHAT_COMPAT_EXPORTS = {
     "_resolve_compaction_provider": "resolve_compaction_provider",
     "_is_approval_or_blocked_result": "is_approval_or_blocked_result",
     "_approval_surface_for_tui_output": "approval_surface_for_tui_output",
-    "_flush_before_standalone_rewrite": "flush_before_standalone_rewrite",
+    "_checkpoint_before_standalone_rewrite": "checkpoint_before_standalone_rewrite",
     "_handle_gateway_slash_command": "handle_gateway_slash_command",
     "_sync_gateway_slash_adapter_io": "sync_gateway_slash_adapter_io",
     "_sync_standalone_slash_adapter_io": "sync_standalone_slash_adapter_io",

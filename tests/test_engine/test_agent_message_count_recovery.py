@@ -668,7 +668,6 @@ async def test_message_count_suffix_uses_current_source_and_request_without_pare
             thinking_budget_tokens=2048,
             max_provider_retries=0,
             system_prompt="Current shared request instructions.",
-            flush_enabled=False,
             model_capabilities=ModelCapabilities(supports_tools=True, supports_reasoning=True),
         ),
         tool_definitions=tools,
@@ -723,8 +722,7 @@ async def test_message_count_prefix_uses_current_generation_budget_across_turns(
         provider=provider,
         config=AgentConfig(
             model_id="glm-5.2", context_window_tokens=64_000, max_tokens=4096,
-            max_provider_retries=0, flush_enabled=False,
-            system_prompt="Parent-only synthetic system instruction.",
+            max_provider_retries=0, system_prompt="Parent-only synthetic system instruction.",
             model_capabilities=ModelCapabilities(supports_tools=True, supports_reasoning=False),
         ),
         tool_definitions=[ToolDefinition(
@@ -766,7 +764,6 @@ async def test_message_count_suffix_refreshes_config_and_tools_between_turns(
             max_tokens=8192,
             system_prompt="First-turn instructions.",
             max_provider_retries=0,
-            flush_enabled=False,
             model_capabilities=ModelCapabilities(supports_tools=True),
         ),
         tool_definitions=[ToolDefinition(
@@ -820,7 +817,6 @@ async def test_message_count_suffix_uses_latest_call_config_within_tool_turn(
             context_window_tokens=64_000,
             max_tokens=8192,
             max_provider_retries=0,
-            flush_enabled=False,
             metadata={"meta_match_tool_choice": "required"},
             model_capabilities=ModelCapabilities(supports_tools=True),
         ),
@@ -860,8 +856,7 @@ async def test_message_limit_recovery_retries_once_below_headroom_without_rewrit
             execution_identity=(
                 ExecutionIdentity(model="synthetic-model") if identity_enabled else None
             ),
-            flush_enabled=False,
-        ),
+            ),
     )
     agent.set_history(history)
 
@@ -919,7 +914,6 @@ async def test_message_limit_recovery_preserves_referenced_and_uploaded_images(
         provider=provider,
         config=AgentConfig(
             max_provider_retries=0,
-            flush_enabled=False,
             model_vision_support="supported",
             execution_identity=(
                 ExecutionIdentity(model="synthetic-model") if identity_enabled else None
@@ -971,7 +965,7 @@ async def test_message_limit_cut_never_splits_parallel_tool_group(
     provider = _ExactMessageLimitProvider([100, None])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=0, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=0),
     )
     agent.set_history(_history_with_parallel_tool_group())
 
@@ -996,7 +990,7 @@ async def test_second_exact_message_limit_error_is_terminal_without_loop(
     provider = _ExactMessageLimitProvider([100, 80])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=3, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=3),
     )
     agent.set_history(_plain_history())
 
@@ -1022,7 +1016,7 @@ async def test_message_limit_summary_failure_continues_with_temporary_window(
     provider = _ExactMessageLimitProvider([100])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=3, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=3),
     )
     history = _plain_history()
     agent.set_history(history)
@@ -1055,7 +1049,7 @@ async def test_failed_compaction_window_preserves_checkpoint_and_canonical_histo
 
     monkeypatch.setattr("opensquilla.engine.agent.compact_context", compact)
     provider = _ExactMessageLimitProvider([100])
-    agent = Agent(provider=provider, config=AgentConfig(flush_enabled=False))
+    agent = Agent(provider=provider, config=AgentConfig())
     history = [
         Message(role="user", content="[Context summary]\nPrevious valid checkpoint."),
         Message(role="assistant", content="Understood. Continuing from summary."),
@@ -1080,7 +1074,7 @@ async def test_summary_cancellation_does_not_make_a_temporary_window(
 
     monkeypatch.setattr("opensquilla.engine.agent.compact_context", compact)
     provider = _ExactMessageLimitProvider([100])
-    agent = Agent(provider=provider, config=AgentConfig(flush_enabled=False))
+    agent = Agent(provider=provider, config=AgentConfig())
     history = _plain_history()
     agent.set_history(history)
 
@@ -1137,7 +1131,7 @@ def test_window_admission_includes_protected_request_components(large_component:
         input_schema=ToolInputSchema(),
     )] if large_component == "tools" else []
     agent = Agent(
-        provider=provider, config=AgentConfig(flush_enabled=False), tool_definitions=tools,
+        provider=provider, config=AgentConfig(), tool_definitions=tools,
     )
     current_request = "current request" * (1000 if large_component == "current_user" else 1)
     messages = [*_plain_history(20), Message(role="user", content=current_request)]
@@ -1194,7 +1188,7 @@ async def test_failed_summary_with_unfittable_system_does_not_report_noop(
     agent = Agent(
         provider=_ExactMessageLimitProvider([]),
         config=AgentConfig(
-            flush_enabled=False, context_window_tokens=1_000,
+            context_window_tokens=1_000,
             system_prompt="synthetic system " * 2_000,
         ),
     )
@@ -1222,8 +1216,7 @@ async def test_failed_summary_blocks_other_compaction_entries_until_turn_closes(
         provider=provider,
         config=AgentConfig(
             model_id="glm-5.2", context_window_tokens=64_000, max_tokens=4096,
-            max_provider_retries=0, flush_enabled=False,
-        ),
+            max_provider_retries=0, ),
     )
     messages = _plain_history(40)
     for message in messages:
@@ -1314,7 +1307,7 @@ async def test_unfittable_tool_schema_terminalizes_rejected_compaction(
     )
     agent = Agent(
         provider=_ExactMessageLimitProvider([]),
-        config=AgentConfig(flush_enabled=False, context_window_tokens=1_000),
+        config=AgentConfig(context_window_tokens=1_000),
         session_key="agent:main:synthetic-window",
         tool_definitions=[ToolDefinition(
             name="check", description="synthetic tool " * 2_000, input_schema=ToolInputSchema(),
@@ -1336,8 +1329,7 @@ async def test_unfittable_tool_schema_terminalizes_rejected_compaction(
 def test_consumer_admission_refuses_changed_request_configuration() -> None:
     provider = _ExactMessageLimitProvider([])
     agent = Agent(provider=provider, config=AgentConfig(
-        system_prompt="Original synthetic instructions", flush_enabled=False,
-    ))
+        system_prompt="Original synthetic instructions", ))
     admission, _ = agent.build_compaction_consumer_admission(
         consumer_provider=provider,
         active_user_message="current request", active_user_in_history=False,
@@ -1358,7 +1350,7 @@ async def test_ten_failed_summaries_do_not_nest_windows_or_rewrite_canonical_his
     requests: list[Any] = []
     _install_exact_compactor(monkeypatch, requests, fail=True)
     provider = _ExactMessageLimitProvider([100, None] * 10)
-    agent = Agent(provider=provider, config=AgentConfig(flush_enabled=False))
+    agent = Agent(provider=provider, config=AgentConfig())
     history = _plain_history()
     agent.set_history(history)
 
@@ -1382,7 +1374,7 @@ async def test_protected_current_turn_over_limit_refuses_without_summary(
     provider = _ExactMessageLimitProvider([10])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=3, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=3),
     )
     current_inputs = [Message(role="user", content=f"current-{index}") for index in range(11)]
 
@@ -1435,7 +1427,7 @@ async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_
     provider = _ExactMessageLimitProvider([None])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=0, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=0),
     )
     active_text = "finish this active request byte-for-byte: 你好 🦑"
     active_user = Message(role="user", content=active_text)
@@ -1553,7 +1545,6 @@ async def test_long_tool_loop_continues_after_live_turn_message_count_projection
         config=AgentConfig(
             max_iterations=20,
             max_provider_retries=0,
-            flush_enabled=False,
             model_capabilities=ModelCapabilities(supports_tools=True),
         ),
         tool_definitions=[
@@ -1621,8 +1612,7 @@ async def test_reasoning_scaffold_cleanup_preserves_recovered_tool_pairing(
             ),
             reasoning_prefill_recovery_mode="recover",
             max_provider_retries=0,
-            flush_enabled=False,
-        ),
+            ),
         tool_definitions=[
             ToolDefinition(
                 name="echo",
@@ -1686,8 +1676,7 @@ async def test_retired_loop_perturbation_does_not_create_message_count_overflow(
             reasoning_prefill_recovery_mode="recover",
             identical_request_loop_break_threshold=1,
             max_provider_retries=0,
-            flush_enabled=False,
-        ),
+            ),
     )
     # 98 historical messages + current user + reasoning prefill = 100 in the
     # pure request view. The retired loop setting must not append another
@@ -1739,7 +1728,7 @@ async def test_token_compaction_maps_duplicate_content_boundaries_by_prefix_cut(
     monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
     agent = Agent(
         provider=_ExactMessageLimitProvider([None]),
-        config=AgentConfig(flush_enabled=False),
+        config=AgentConfig(),
     )
 
     outcome = await agent._check_context_overflow(
@@ -1830,8 +1819,7 @@ async def test_member_budget_rebinding_and_exact_count_recovery_compose_once(
             max_tokens=128_000,
             context_window_tokens=256_000,
             max_provider_retries=0,
-            flush_enabled=False,
-        ),
+            ),
     )
     agent.set_history(_plain_history())
 

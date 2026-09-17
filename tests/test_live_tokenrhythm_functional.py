@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from http.client import HTTPConnection
 
 import httpx
 import pytest
@@ -202,10 +204,23 @@ def test_functional_loopback_auth_host_and_redirect_boundaries_are_preserved(tmp
     relay = _relay(log, upstream)
     try:
         url = relay.start()
-        with httpx.Client(trust_env=False, timeout=5) as client:
-            assert client.post(url + "/chat/completions", content=_body()).status_code == 403
-            assert client.post(url + "/other", content=_body()).status_code == 404
+        endpoint = httpx.URL(url)
+        for path, status, reason in (
+            ("/v1/chat/completions", 403, "invalid_client_credential"),
+            ("/v1/other", 404, "unsupported_provider_endpoint"),
+        ):
+            with closing(HTTPConnection(endpoint.host, endpoint.port, timeout=5)) as client:
+                # Rejection must arrive before any body is sent. Sending body bytes
+                # while the HTTP/1.0 handler closes can reset the socket on Windows.
+                client.putrequest("POST", path)
+                client.putheader("Content-Length", str(len(_body())))
+                client.endheaders()
+                with client.getresponse() as response:
+                    assert response.status == status
+                    assert response.reason == reason
+                    response.read()
         assert received == []
+        assert log.snapshot()["requests"] == []
         with httpx.Client(transport=BudgetedTransport(RelayTarget(url, relay.client_key)),
                           trust_env=False, timeout=5, follow_redirects=True) as client:
             with pytest.raises(TransportRejectedError):

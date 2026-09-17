@@ -123,7 +123,7 @@ async def test_service_boot_starts_growth_replay_and_closes_failed_initializatio
     monkeypatch.setattr("opensquilla.telemetry.growth_sink.GrowthEventSink", Sink)
     monkeypatch.setattr("opensquilla.telemetry.reliability_sink.ReliabilityEventSink", Sink)
     services = await build_services(
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
         session_db_path=":memory:", seed_agent_workspaces=False,
     )
     try:

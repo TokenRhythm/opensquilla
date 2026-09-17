@@ -1559,8 +1559,6 @@ class GoalService:
             "cron_turn",
             "memory",
             "memory_dream",
-            "memory_flush",
-            "memory_repair",
             "compaction",
             "session_compaction",
         }:

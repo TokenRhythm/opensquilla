@@ -410,7 +410,6 @@ class SessionSummary(SQLModel, table=True):
     removed_count: int = 0
     kept_count: int = 0
     chunk_count: int = 0
-    flush_receipt_status: str = "unknown"
     # The transcript entry id up to which this summary covers (inclusive)
     covered_through_id: int = 0
     created_at: int = Field(default_factory=_now_ms)
@@ -444,7 +443,7 @@ class SessionContextState(SQLModel, table=True):
 
 
 class MemoryDurableReceipt(SQLModel, table=True):
-    """Durable ledger row for memory checkpoint and flush outcomes."""
+    """Durable ledger row for deterministic memory checkpoint outcomes."""
 
     __tablename__ = "memory_durable_receipts"
 
@@ -454,7 +453,6 @@ class MemoryDurableReceipt(SQLModel, table=True):
     turn_id: str | None = Field(default=None, index=True)
     scope: str = Field(index=True)
     source_path: str | None = None
-    target_path: str | None = None
     content_hash: str | None = None
     coverage_turn_id: str | None = Field(default=None, index=True)
     coverage_hash: str | None = Field(default=None, index=True)
@@ -462,8 +460,6 @@ class MemoryDurableReceipt(SQLModel, table=True):
     idempotency_key: str = Field(index=True, unique=True)
     status: str = Field(index=True)
     reason: str | None = None
-    attempt_count: int = 0
-    next_retry_at_ms: int | None = None
     created_at: int = Field(default_factory=_now_ms)
     updated_at: int = Field(default_factory=_now_ms)
     schema_version: int = 1

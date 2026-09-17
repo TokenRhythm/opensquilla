@@ -136,7 +136,7 @@ async def test_agent_multi_turn_boundary_e2e_keeps_critical_context() -> None:
         config=AgentConfig(
             context_window_tokens=200_000,
             max_tokens=8192,
-            flush_enabled=False,
+
             max_iterations=4,
         ),
         tool_definitions=[_tool_def("local_context_builder"), _tool_def("web_fetch")],

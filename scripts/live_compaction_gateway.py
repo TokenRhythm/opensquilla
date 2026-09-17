@@ -263,7 +263,6 @@ async def serve_compaction_gateway(
         config.llm.max_tokens = options.max_output_tokens
     config.compaction.enabled = True
     config.preflight_compact_ratio = options.preflight_ratio or 0.85
-    config.memory.flush_enabled = False
     config.tools.profile = "minimal"
     config.tools.allow = ["read_file"] if allow_read_files else []
     config.tools.deny = ["session_status"] if allow_read_files else ["*"]

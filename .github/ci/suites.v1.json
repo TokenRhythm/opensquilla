@@ -11,10 +11,12 @@
     "tests/test_provider_ensemble.py"
   ],
   "baseline_suites": [
+    "dependency-audit",
     "readme-locale",
     "workflow-lint"
   ],
   "full_suites": [
+    "dependency-audit",
     "desktop-recovery-e2e",
     "desktop-static",
     "frontend-artifact",
@@ -436,6 +438,20 @@
         "tests/test_skills/test_paper_*.py",
         "tests/test_skills/test_subtitle_burner.py",
         "tests/test_skills/test_toolchain_*.py"
+      ]
+    },
+    "dependency-audit": {
+      "execution_inputs": [
+        ".github/ci/dependency-audit.v1.json",
+        ".github/scripts/audit_dependencies.py",
+        ".github/workflows/ci.yml",
+        "desktop/electron/package-lock.json",
+        "desktop/electron/package.json",
+        "opensquilla-webui/package-lock.json",
+        "opensquilla-webui/package.json",
+        "pyproject.toml",
+        "tests/test_security/test_weasyprint_presentational_hints.py",
+        "uv.lock"
       ]
     }
   }

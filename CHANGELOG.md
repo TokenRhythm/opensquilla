@@ -63,6 +63,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Automatic session titles now fall back to the first user message when the
+  naming model refuses. Known historical refusal titles also use this display
+  fallback, including the original message archived by context compaction;
+  manual names and stored title data remain unchanged.
 - Restored V1 installation/version reporting and daily conversation/token
   aggregation and uploads alongside V2 telemetry. Uploads start after Gateway
   readiness, retain installation state, and honor reporting opt-outs. Daily
@@ -99,6 +103,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `Task exception was never retrieved` with a nested
   `ValueError: ... was created in a different Context` chain, and the
   subscriber-visible turn-terminal event could be lost.
+
+- Skill catalog filtering and trigger matching tolerate numeric or nested YAML
+  trigger values, including restored caches and older Gateway responses (#1018).
 
 ## [0.5.4] - 2026-08-25
 

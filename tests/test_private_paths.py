@@ -1,12 +1,59 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import os
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from opensquilla import private_paths
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows error translation is native")
+@pytest.mark.parametrize(
+    ("error_number", "retryable"),
+    [(5, True), (32, True), (33, True), (87, False)],
+)
+def test_windows_private_path_bind_preserves_native_error_for_owner_registry(
+    error_number: int,
+    retryable: bool,
+) -> None:
+    from opensquilla import process_tree
+
+    def fail_open(*_args: object) -> int | None:
+        ctypes.set_last_error(error_number)
+        return ctypes.c_void_p(-1).value
+
+    def unexpected_handle_operation(*_args: object) -> None:
+        pytest.fail("an invalid private path handle must not be inspected or closed")
+
+    api = private_paths._CtypesWindowsPrivateAcl.__new__(
+        private_paths._CtypesWindowsPrivateAcl
+    )
+    api.kernel32 = SimpleNamespace(
+        CreateFileW=fail_open,
+        GetFileInformationByHandleEx=unexpected_handle_operation,
+        CloseHandle=unexpected_handle_operation,
+    )
+
+    with pytest.raises(OSError, match="cannot bind private Windows path") as exc_info:
+        with api.open_bound(
+            Path("synthetic-private-file"),
+            directory=False,
+            expected_device=7,
+            expected_inode=42,
+        ):
+            pytest.fail("a failed private path bind must not yield a handle")
+
+    assert exc_info.value.winerror == error_number
+    assert isinstance(exc_info.value, PermissionError) is retryable
+    assert (
+        process_tree._is_transient_owner_registry_write_error(exc_info.value)
+        is retryable
+    )
 
 
 def test_windows_private_acl_is_verified_through_the_same_bound_handle() -> None:

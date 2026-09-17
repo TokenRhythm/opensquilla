@@ -405,7 +405,6 @@ def test_preflight_history_capacity_reserves_non_history_envelope() -> None:
             max_tokens=512,
             system_prompt="system policy " * 100,
             request_context_prompt="request capsule " * 50,
-            flush_enabled=False,
         ),
     )
     active_prompt = "active user " * 300
@@ -542,7 +541,6 @@ def test_durable_consumer_projection_uses_base_model_config() -> None:
                 supports_reasoning=True,
                 reasoning_format="dashscope",
             ),
-            flush_enabled=False,
         ),
     )
 
@@ -1112,7 +1110,7 @@ async def test_failed_path_patch_snapshot_cannot_execute_later_created_file(
 
     agent = _CreateAfterFailedSnapshotAgent(
         provider=_PathPatchThenFinalProvider(patch_file),
-        config=AgentConfig(max_iterations=3, flush_enabled=False),
+        config=AgentConfig(max_iterations=3, ),
         tool_definitions=[
             ToolDefinition(
                 name="apply_patch",
@@ -1183,7 +1181,7 @@ async def test_path_patch_snapshot_respects_mutex_order_and_survives_self_delete
 
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=4, flush_enabled=False),
+        config=AgentConfig(max_iterations=4, ),
         tool_definitions=[
             ToolDefinition(
                 name=name,
@@ -1236,7 +1234,6 @@ async def test_agent_provider_request_proof_budget_is_separate_from_tool_result_
             context_window_tokens=200_000,
             max_tokens=8192,
             tool_result_provider_request_max_chars=96_000,
-            flush_enabled=False,
         ),
     )
 
@@ -1256,7 +1253,6 @@ async def test_agent_provider_request_proof_budget_accepts_explicit_override() -
         config=AgentConfig(
             provider_request_proof_max_chars=123_456,
             tool_result_provider_request_max_chars=96_000,
-            flush_enabled=False,
         ),
     )
 
@@ -1297,22 +1293,15 @@ def test_agent_child_tool_context_inherits_parent_full_host_run_mode() -> None:
     assert child._tool_context.sandbox_run_context.run_mode is RunMode.FULL
 
 
-def test_agent_config_normalizes_flush_triggers_and_clamps_compaction_tail() -> None:
+def test_agent_config_clamps_compaction_tail() -> None:
     config = AgentConfig(
-        flush_triggers=["reset", "inline_overflow"],
         compaction_protected_recent_messages=-4,
     )
 
-    assert config.flush_triggers == ["session_reset", "pre_compaction"]
     assert config.compaction_protected_recent_messages == 0
 
 
-def test_agent_config_rejects_unknown_flush_triggers() -> None:
-    with pytest.raises(ValueError, match="unknown flush trigger"):
-        AgentConfig(flush_triggers=["manual", "bogus"])
-
-
-def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
+def test_agent_child_config_inherits_context_and_budget_policy() -> None:
     agent = Agent(
         provider=_ContextOverflowProvider(success_after=1),
         config=AgentConfig(
@@ -1326,15 +1315,6 @@ def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
             max_turn_output_tokens=70_000,
             max_turn_billed_cost_usd=0.75,
             max_turn_tool_errors=4,
-            flush_enabled=True,
-            flush_triggers=["session_reset", "manual", "idle", "pre_compaction"],
-            flush_pre_compaction=True,
-            flush_timeout_seconds=1.5,
-            flush_background_timeout_seconds=15.0,
-            flush_backoff_initial_seconds=3.0,
-            flush_backoff_max_seconds=30.0,
-            flush_archive_max_bytes=999_999,
-            flush_compaction_requires_safe_receipt=False,
         ),
     )
 
@@ -1349,20 +1329,6 @@ def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
     assert child.config.max_turn_output_tokens == 70_000
     assert child.config.max_turn_billed_cost_usd == 0.75
     assert child.config.max_turn_tool_errors == 4
-    assert child.config.flush_enabled is True
-    assert child.config.flush_triggers == [
-        "session_reset",
-        "manual",
-        "idle",
-        "pre_compaction",
-    ]
-    assert child.config.flush_pre_compaction is True
-    assert child.config.flush_timeout_seconds == 1.5
-    assert child.config.flush_background_timeout_seconds == 15.0
-    assert child.config.flush_backoff_initial_seconds == 3.0
-    assert child.config.flush_backoff_max_seconds == 30.0
-    assert child.config.flush_archive_max_bytes == 999_999
-    assert child.config.flush_compaction_requires_safe_receipt is False
 
 
 def test_agent_config_max_turn_cost_usd_defaults_to_disabled() -> None:
@@ -1401,7 +1367,6 @@ async def test_agent_skips_price_resolution_per_event_when_turn_cost_budget_disa
         provider=provider,
         config=AgentConfig(
             model_id="deepseek/deepseek-v4-pro-20260423",
-            flush_enabled=False,
         ),
         tool_handler=_tool,
     )
@@ -1972,7 +1937,6 @@ async def test_context_overflow_noop_compaction_does_not_resend_unchanged_contex
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -2004,7 +1968,6 @@ async def test_context_overflow_summary_only_larger_payload_does_not_retry(
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -2039,7 +2002,6 @@ async def test_context_overflow_effective_compaction_allows_single_retry(
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -2086,7 +2048,6 @@ async def test_narrow_routed_window_never_durably_compacts_base_session(
             context_window_tokens=8_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     history = [
@@ -2142,7 +2103,6 @@ async def test_inline_compaction_candidate_gets_terminal_when_retry_never_admits
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -2218,7 +2178,6 @@ async def test_inline_compaction_install_wait_obeys_absolute_deadline(
             iteration_timeout=5.0,
             timeout=5.0,
             compaction_total_timeout_seconds=0.5,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -2276,7 +2235,6 @@ async def test_inline_compaction_install_deadline_stops_limiting_accepted_stream
             iteration_timeout=5.0,
             timeout=5.0,
             compaction_total_timeout_seconds=2.0,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -2311,7 +2269,6 @@ async def test_native_overflow_after_final_admission_does_not_compact_history(
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -2354,7 +2311,7 @@ async def test_inline_overflow_compaction_reduces_tool_heavy_structured_context(
         )
     agent = Agent(
         provider=_ContextOverflowProvider(),
-        config=AgentConfig(context_window_tokens=window_tokens, flush_enabled=False),
+        config=AgentConfig(context_window_tokens=window_tokens, ),
     )
     original_chars = session_payload_chars(messages)
 
@@ -2402,7 +2359,7 @@ async def test_inline_overflow_compaction_preserves_original_structured_tail(
     ]
     agent = Agent(
         provider=_ContextOverflowProvider(),
-        config=AgentConfig(context_window_tokens=1000, flush_enabled=False),
+        config=AgentConfig(context_window_tokens=1000, ),
     )
 
     outcome = await agent._check_context_overflow(
@@ -2433,7 +2390,6 @@ async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
             context_window_tokens=12_000 if pressure == "tokens" else 32_000,
             max_tokens=8192,
             provider_request_proof_max_chars=100_000 if pressure == "tokens" else 10_000,
-            flush_enabled=False,
         ),
     )
     summary_config = synthetic_compaction_config()
@@ -2515,7 +2471,6 @@ async def test_soft_pressure_keeps_protected_current_turn_when_final_request_fit
         config=AgentConfig(
             context_window_tokens=1000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
 
@@ -2589,7 +2544,6 @@ async def test_inline_overflow_projects_completed_live_rounds_without_mutating_p
         config=AgentConfig(
             context_window_tokens=1000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
 
@@ -2679,7 +2633,6 @@ async def test_durable_and_live_turn_recovery_share_one_compaction_call_budget(
         config=AgentConfig(
             context_window_tokens=8_000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
 
@@ -2847,7 +2800,6 @@ async def test_stable_consumer_retries_with_completed_live_round_summary(
             context_overflow_threshold=0.85,
             max_overflow_retries=1,
             max_provider_retries=0,
-            flush_enabled=False,
         ),
         tool_handler=_tool,
     )
@@ -3017,7 +2969,6 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
             context_overflow_threshold=0.85,
             max_overflow_retries=1,
             max_provider_retries=0,
-            flush_enabled=False,
         ),
         tool_handler=_tool,
     )
@@ -3061,7 +3012,6 @@ async def test_inline_overflow_rejects_compactor_cut_through_protected_turn(
         config=AgentConfig(
             context_window_tokens=1000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
 
@@ -3082,7 +3032,6 @@ async def test_within_budget_skip_on_string_only_history_is_not_reported_as_comp
         config=AgentConfig(
             context_window_tokens=1000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
     messages = [
@@ -3106,7 +3055,6 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
     import opensquilla.engine.agent as agent_module
 
     provider = _HighUsageToolLoopProvider(tool_rounds=3, input_tokens_per_call=4000)
-    flush_calls: list[int] = []
     compact_requests: list[Any] = []
 
     async def _tool(call: Any) -> ToolResult:
@@ -3116,18 +3064,6 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
             content="ok",
         )
 
-    async def _flush(_plan: Any, flush_messages: list[Message]) -> Any:
-        flush_calls.append(len(flush_messages))
-        return SimpleNamespace(
-            mode="llm",
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
-        )
 
     async def _compact(request: Any) -> CompactionResult:
         compact_requests.append(request)
@@ -3143,14 +3079,10 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
         config=AgentConfig(
             context_window_tokens=20_000,
             context_overflow_threshold=0.5,
-            flush_enabled=True,
-            flush_pre_compaction=True,
-            flush_timeout_seconds=0.01,
             max_iterations=10,
         ),
         tool_handler=_tool,
     )
-    monkeypatch.setattr(agent, "_run_flush", _flush)
     monkeypatch.setattr(agent_module, "compact_context", _compact)
 
     events = [event async for event in agent.run_turn("read the files one by one")]
@@ -3159,7 +3091,6 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
     assert done.text == "done"
     assert done.input_tokens == 16_000
     assert len(provider.calls) == 4
-    assert flush_calls == []
     assert compact_requests == []
 
 
@@ -3175,21 +3106,8 @@ async def test_successful_large_request_surface_does_not_compact_durable_history
         description="large live request surface " + ("z" * 6000),
         input_schema=ToolInputSchema(),
     )
-    flush_calls: list[int] = []
     compact_requests: list[Any] = []
 
-    async def _flush(_plan: Any, flush_messages: list[Message]) -> Any:
-        flush_calls.append(len(flush_messages))
-        return SimpleNamespace(
-            mode="llm",
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
-        )
 
     async def _compact(request: Any) -> CompactionResult:
         compact_requests.append(request)
@@ -3205,70 +3123,16 @@ async def test_successful_large_request_surface_does_not_compact_durable_history
         config=AgentConfig(
             context_window_tokens=3000,
             context_overflow_threshold=0.5,
-            flush_enabled=True,
-            flush_pre_compaction=True,
-            flush_timeout_seconds=0.01,
             system_prompt="live request system context " + ("s" * 2000),
         ),
         tool_definitions=[large_tool],
     )
-    monkeypatch.setattr(agent, "_run_flush", _flush)
     monkeypatch.setattr(agent_module, "compact_context", _compact)
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
     assert len(provider.calls) == 1
-    assert flush_calls == []
-    assert compact_requests == []
-
-
-@pytest.mark.asyncio
-async def test_inline_overflow_flush_enabled_without_trigger_skips_flush(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import opensquilla.engine.agent as agent_module
-
-    provider = _HighUsageToolLoopProvider(tool_rounds=0, input_tokens_per_call=1)
-    flush_calls: list[int] = []
-    compact_requests: list[Any] = []
-
-    async def _flush(_plan: Any, flush_messages: list[Message]) -> Any:
-        flush_calls.append(len(flush_messages))
-
-    async def _compact(request: Any) -> CompactionResult:
-        compact_requests.append(request)
-        return CompactionResult(
-            summary="",
-            kept_entries=request.entries,
-            removed_count=0,
-            chunks_processed=0,
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            context_window_tokens=3000,
-            context_overflow_threshold=0.5,
-            flush_enabled=True,
-            flush_pre_compaction=False,
-            system_prompt="live request system context " + ("s" * 2000),
-        ),
-        tool_definitions=[
-            ToolDefinition(
-                name="large_context_tool",
-                description="large live request surface " + ("z" * 6000),
-                input_schema=ToolInputSchema(),
-            )
-        ],
-    )
-    monkeypatch.setattr(agent, "_run_flush", _flush)
-    monkeypatch.setattr(agent_module, "compact_context", _compact)
-
-    events = [event async for event in agent.run_turn("hello")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert flush_calls == []
     assert compact_requests == []
 
 
@@ -3292,7 +3156,6 @@ async def test_provider_request_budget_exhausted_does_not_mutate_durable_history
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
         session_key="agent:main:budget",
     )
@@ -3340,7 +3203,6 @@ async def test_provider_request_budget_does_not_become_a_history_window(
             context_window_tokens=1_048_576,
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -3375,7 +3237,6 @@ async def test_provider_request_budget_failure_is_not_retried_via_history_compac
             context_window_tokens=1_048_576,
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -3423,7 +3284,6 @@ async def test_provider_budget_effective_cap_remains_request_only(
             context_window_tokens=1_048_576,
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -3453,7 +3313,6 @@ async def test_equal_window_routed_cap_does_not_compact_when_stable_consumer_fit
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     history = [
@@ -3513,7 +3372,6 @@ async def test_equal_window_stable_overflow_still_allows_durable_compaction(
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -3568,7 +3426,6 @@ async def test_narrow_route_uses_stable_window_when_stable_consumer_also_overflo
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -3639,7 +3496,6 @@ async def test_narrow_route_cannot_force_stable_compaction_to_its_request_cap(
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     history = [
@@ -3714,7 +3570,6 @@ async def test_mixed_pressure_does_not_install_candidate_that_stable_consumer_re
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     history = [
@@ -3775,7 +3630,6 @@ async def test_provider_request_budget_recent_tail_reason_survives_noop_compacti
             context_window_tokens=1_048_576,
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -3811,7 +3665,6 @@ async def test_provider_request_budget_recent_tail_exhaustion_is_reported_as_con
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
 
@@ -3822,114 +3675,6 @@ async def test_provider_request_budget_recent_tail_exhaustion_is_reported_as_con
     assert errors[-1].code == "provider_request_too_large"
     assert "current turn" not in errors[-1].message.lower()
     assert RAW_CURRENT_TURN_OVERFLOW_MESSAGE not in errors[-1].message
-
-
-@pytest.mark.asyncio
-async def test_context_overflow_degraded_flush_still_runs_live_compaction_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    compact_called = False
-
-    async def _compact_runs_after_degraded_flush(request: Any) -> CompactionResult:
-        nonlocal compact_called
-        compact_called = True
-        protected = int(request.config.protected_recent_messages or 0)
-        cut = max(0, len(request.entries) - protected)
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=request.entries[cut:],
-            removed_count=cut,
-            kept_start_index=cut,
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr(
-        "opensquilla.engine.agent.compact_context",
-        _compact_runs_after_degraded_flush,
-    )
-    provider = _ContextOverflowProvider(success_after=1)
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(max_provider_retries=0, max_overflow_retries=2),
-    )
-    agent.set_history(
-        [
-            Message(role="user", content="old question " + ("q" * 5000)),
-            Message(role="assistant", content="old answer " + ("a" * 5000)),
-        ]
-    )
-
-    events = [event async for event in agent.run_turn("x" * 4000)]
-
-    assert compact_called is True
-    assert len(provider.calls) == 2
-    assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
-    assert not any(
-        isinstance(event, ErrorEvent)
-        and event.code in {"compaction_refused_memory_flush", "compaction_refused_flush_timeout"}
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
-async def test_context_overflow_flush_timeout_records_backoff_and_retries(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _compact_runs_after_flush_timeout(request: Any) -> CompactionResult:
-        protected = int(request.config.protected_recent_messages or 0)
-        cut = max(0, len(request.entries) - protected)
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=request.entries[cut:],
-            removed_count=cut,
-            kept_start_index=cut,
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr(
-        "opensquilla.engine.agent.compact_context",
-        _compact_runs_after_flush_timeout,
-    )
-    provider = _ContextOverflowProvider(success_after=1)
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_provider_retries=0,
-            max_overflow_retries=2,
-            flush_enabled=True,
-            flush_pre_compaction=True,
-            flush_timeout_seconds=0.01,
-            flush_backoff_initial_seconds=10.0,
-        ),
-    )
-    agent.set_history(
-        [
-            Message(role="user", content="old question " + ("q" * 5000)),
-            Message(role="assistant", content="old answer " + ("a" * 5000)),
-        ]
-    )
-
-    async def slow_flush(_plan: Any, _messages: Any) -> None:
-        await asyncio.sleep(1.0)
-
-    monkeypatch.setattr(agent, "_run_flush", slow_flush)
-    try:
-        events = [event async for event in agent.run_turn("x" * 4000)]
-    finally:
-        task = agent._active_flush_task
-        if task is not None and not task.done():
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-    assert len(provider.calls) == 2
-    assert agent._flush_backoff_seconds == 10.0
-    assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
-    assert not any(
-        isinstance(event, ErrorEvent)
-        and event.code in {"compaction_refused_memory_flush", "compaction_refused_flush_timeout"}
-        for event in events
-    )
 
 
 async def _collect_events(stream: AsyncIterator[Any]) -> list[Any]:

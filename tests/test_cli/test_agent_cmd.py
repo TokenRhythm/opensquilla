@@ -60,7 +60,6 @@ class _FakeServices:
         self.memory_sync_managers = {"main": object()}
         self.memory_retrievers = {"main": object()}
         self.turn_capture_services = {"main": object()}
-        self.flush_service = object()
         self.model_catalog = object()
         self.provider_selector = object()
         self.tool_registry = None
@@ -1383,7 +1382,6 @@ async def test_run_agent_once_wires_memory_services_into_turnrunner(
     assert captured["memory_sync_managers"] is services.memory_sync_managers
     assert captured["memory_retrievers"] is services.memory_retrievers
     assert captured["turn_capture_services"] is services.turn_capture_services
-    assert captured["session_flush_service"] is services.flush_service
     assert captured["model_catalog"] is services.model_catalog
 
 

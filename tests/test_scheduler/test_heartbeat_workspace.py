@@ -223,8 +223,8 @@ async def test_heartbeat_refresh_preserves_caller_authority_and_agent_instructio
         else:
             assert received.sandbox_run_context is None
         assert incoming.workspace_dir == str(agent_root)
-        assert loop._heartbeat_md_path() == agent_root / "HEARTBEAT.md"
-        assert "Agent workspace context" in runner.calls[0]["message"]
+        assert "HEARTBEAT.md" not in runner.calls[0]["message"]
+        assert "queued system events" in runner.calls[0]["message"]
 
 
 @pytest.mark.parametrize("light", [False, True])
@@ -240,5 +240,5 @@ def test_heartbeat_bootstrap_stays_agent_scoped(tmp_path: Path, workspace_config
         bootstrap_context_mode="heartbeat_light" if light else None,
     )
     text = "\n".join(prompt) if isinstance(prompt, tuple) else prompt
-    assert "agent-instruction-marker" in text
+    assert "agent-instruction-marker" not in text
     assert "wrong-task-instruction-marker" not in text

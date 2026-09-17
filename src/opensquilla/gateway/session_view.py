@@ -9,6 +9,7 @@ from typing import Any
 
 from opensquilla.chat.flattened_tool_markers import is_flattened_tool_result_dump
 from opensquilla.session.keys import derive_chat_type, parse_agent_id
+from opensquilla.session.title_quality import is_refusal_title
 
 _CHANNEL_SURFACES = frozenset(
     {
@@ -196,9 +197,14 @@ def _title(
     surface: str,
     transcript_title: str | None = None,
 ) -> str:
+    recover_refusal = _has_refused_chat_title(
+        session, effective_agent_id, session_kind, surface
+    )
     for attr in ("display_name", "derived_title", "subject"):
         value = _display(getattr(session, attr, None))
         if value:
+            if recover_refusal and attr in {"display_name", "derived_title"}:
+                continue
             if (
                 session_kind == "chat"
                 and surface == "webchat"
@@ -234,6 +240,42 @@ def _title(
             return f"{target}{suffix}"
         return f"{_humanize(surface)} conversation"
     return key or "Unknown session"
+
+
+def has_refused_chat_title(
+    session: Any, *, channel_types: dict[str, str] | None = None
+) -> bool:
+    """Whether an automatic chat title needs read-time refusal recovery.
+
+    Explicit display names and task/cron names remain authoritative.  Reuse
+    this predicate when a read path needs to fetch fallback transcript text.
+    """
+
+    key = str(getattr(session, "session_key", "") or "")
+    origin = getattr(session, "origin", None)
+    origin_map = origin if isinstance(origin, dict) else {}
+    surface = _surface(session, key, origin_map, channel_types)
+    return _has_refused_chat_title(
+        session,
+        _effective_agent_id(session, key),
+        _session_kind(session, key, surface, origin_map),
+        surface,
+    )
+
+
+def _has_refused_chat_title(
+    session: Any, effective_agent_id: str, session_kind: str, surface: str
+) -> bool:
+    if session_kind not in {"chat", "channel"}:
+        return False
+    if not is_refusal_title(getattr(session, "derived_title", None)):
+        return False
+    display_name = _display(getattr(session, "display_name", None))
+    return not display_name or (
+        session_kind == "chat"
+        and surface == "webchat"
+        and _is_generic_webchat_title(display_name, effective_agent_id)
+    )
 
 
 def _subtitle(

@@ -20,7 +20,6 @@ export interface ResetSessionResult {
   previousSessionId: string
   sessionId: string
   epoch: number
-  flushReceipt?: Readonly<Record<string, unknown>> | null
 }
 
 export interface CompactSessionCommand {
@@ -56,8 +55,6 @@ export interface SessionCompactionResult {
   qualityReport?: Readonly<Record<string, unknown>>
   skipReason?: string
   reason?: string
-  flushReceipt?: Readonly<Record<string, unknown>> | null
-  flushReceiptStatus?: string | null
 }
 
 /** Business-facing maintenance seam; v4 aliases and wire fields stay private. */

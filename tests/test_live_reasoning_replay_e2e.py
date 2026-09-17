@@ -1039,7 +1039,6 @@ async def test_gateway_adapter_uses_existing_storage_without_seeding_or_exposing
     assert captured[0].llm.context_window_tokens == expected_window
     assert captured[0].llm.max_tokens == 8192
     assert captured[0].compaction.enabled is True
-    assert captured[0].memory.flush_enabled is False
     report = json.loads(report_path.read_text())
     assert report["session_seeded"] is False
     assert report["storage"]["counts"]["transcript_entries"] == 1

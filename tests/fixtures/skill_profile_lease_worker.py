@@ -141,7 +141,7 @@ def _probe_unleased_build_services(
         control_ui={"enabled": False},
         channels={"channels": []},
         mcp={"enabled": False},
-        memory={"flush_enabled": False},
+        memory={},
     )
 
     async def run() -> tuple[str, ...]:

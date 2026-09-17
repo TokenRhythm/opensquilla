@@ -116,7 +116,6 @@ def test_all_content_fields_are_removed_even_without_secret_shapes(marker):
         "trigger_scan_head": marker, "request_payload_head": marker, "response_preview": marker,
         "error": marker, "unexpected_description": marker,
         "reason": marker, "fallback_reason": marker, "image_route_reason": marker,
-        "session_flush_fallback_reason": marker,
         "payload": {"response": marker, "messages": [{"content": marker}], "tokens_input": 12},
     }
     safe = log_metadata(fields)

@@ -92,6 +92,8 @@
           :show-turn-outcome="isTurnTip(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
+          :goal-removable="goalRemovable && !shareMode"
+          :goal-busy="goalBusy"
           :resolve-session-availability="resolveSessionAvailability"
           :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
           @fork="$emit('forkConversation', forkThroughTurnId(entry.index))"
@@ -110,6 +112,7 @@
           @plan-implement-current="$emit('planImplementCurrent', $event)"
           @plan-implement-new="$emit('planImplementNew', $event)"
           @plan-replan="$emit('planReplan', $event)"
+          @goal-clear="$emit('goalClear', $event)"
         />
         <SystemMessage
           v-else
@@ -117,6 +120,7 @@
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
           :retry-available="usageBarrierRetryAvailable(entry.index)"
+          :has-partial-answer="Boolean(messages[entry.index].turnId && visibleAnswerTurns.has(messages[entry.index].turnId!))"
           @resume="$emit('resumeSandbox')"
           @retry="forwardSystemRetry"
         />
@@ -204,6 +208,8 @@ const props = defineProps<{
   isStreaming?: boolean
   goal?: GoalSnapshot | null
   goalElapsed?: string
+  goalRemovable?: boolean
+  goalBusy?: boolean
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
   resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
   /** Required for long-history virtualization; omitted by legacy embedders. */
@@ -244,6 +250,7 @@ const emit = defineEmits<{
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
+  goalClear: [goal: GoalSnapshot]
 }>()
 
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'
@@ -255,6 +262,10 @@ function forwardSystemRetry(
 ) {
   emit('regenerateMessage', message, settle)
 }
+
+const visibleAnswerTurns = computed(() => new Set(props.messages
+  .filter(message => message.displayRole === 'assistant' && message.text.trim() && message.turnId)
+  .map(message => message.turnId!)))
 
 function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]

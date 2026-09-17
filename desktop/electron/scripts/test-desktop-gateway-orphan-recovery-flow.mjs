@@ -391,6 +391,11 @@ try {
     firstApp,
     userDataDir,
   )
+  // Playwright disposes the ElectronApplication channel when the main process
+  // exits. Keep the captured child handle for Windows cleanup, but do not ask
+  // the disposed app for windows/process diagnostics or close it again in
+  // finally: that can mask the orphan verification failure and skip cleanup.
+  firstApp = null
   // Windows process termination does not reliably reap Chromium child
   // processes.  Target only Electron children; the detached Python Gateway is
   // intentionally left alive and verified below.
@@ -411,8 +416,6 @@ try {
     electronChildCleanup.remainingMs('verify-orphan-survived'),
     () => phaseDiagnostics(firstApp, userDataDir, electronChildCleanup),
   )
-  firstApp = null
-
   const orphanRecoveryStartup = createPhaseBudget(
     'verified-orphan-recovery-and-restart',
     ORPHAN_RECOVERY_STARTUP_BUDGET_MS,

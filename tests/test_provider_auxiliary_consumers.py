@@ -9,7 +9,6 @@ import pytest
 from opensquilla.engine.types import AgentConfig
 from opensquilla.gateway.rpc_memory_import import _GatewayFusionCompletion
 from opensquilla.memory.dream.runner import _run_complete
-from opensquilla.memory.session_flush import ProviderCompletionError, _provider_complete
 from opensquilla.provider import auxiliary_budget
 from opensquilla.provider.auxiliary_budget import AuxiliaryRequestTooLargeError
 from opensquilla.provider.protocol import ProviderMetadata
@@ -128,24 +127,6 @@ async def test_media_chat_rejects_token_dense_input_before_call(
             ChatConfig(max_tokens=64),
         )
 
-    assert provider.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_memory_completion_shim_rejects_oversize_before_call(
-    small_catalog: _Catalog,
-) -> None:
-    small_catalog.context_window = 1024
-    provider = _CompletionProvider()
-
-    with pytest.raises(ProviderCompletionError) as exc_info:
-        await _provider_complete(
-            provider,
-            messages=[Message(role="user", content="x" * 5000)],
-            max_tokens=64,
-        )
-
-    assert exc_info.value.code == "provider_request_too_large"
     assert provider.calls == 0
 
 

@@ -411,6 +411,8 @@ export interface ChatTurnOutcome {
   turnId: string
   taskId?: string
   status: string
+  /** Client-only provenance: lifecycle/history status outranks a stream receipt. */
+  statusSource?: 'task'
   kind?: string
   reason?: string
   cancellationSource?: string
@@ -419,6 +421,9 @@ export interface ChatTurnOutcome {
   retryable?: boolean
   documentMutationOutcome?: DocumentMutationOutcome
   errorClass?: string
+  failureKind?: string
+  /** null retains invalid/conflicting evidence across notice merges. */
+  errorId?: string | null
   terminalMessage?: string
   retryAfterMs?: number
   statusHistory?: import('./parts').StatusPart[]

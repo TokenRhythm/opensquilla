@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node
 import { resolve } from 'node:path'
 
 const distDir = resolve(import.meta.dirname, '../dist')
+const musicSourceReadme = resolve(distDir, 'music/README.md')
 const textFilePattern = /\.(css|html|js|map)$/
 
 function normalizeNewlines(value) {
@@ -50,6 +51,12 @@ function walk(dir) {
     const path = resolve(dir, entry)
     if (entry === '.DS_Store') {
       rmSync(path, { force: true, recursive: true })
+      continue
+    }
+    // Vite copies this maintainer guide from public/. Exclude its build copy
+    // before creating the artifact manifest and staging the release wheel.
+    if (path === musicSourceReadme) {
+      rmSync(path)
       continue
     }
     const stat = statSync(path)

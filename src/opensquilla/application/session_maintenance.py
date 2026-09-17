@@ -50,19 +50,6 @@ class SessionCompactionPlan:
 
 
 @dataclass(frozen=True, slots=True)
-class SessionCompactionMemoryAssessment:
-    allows_destructive_compaction: bool
-    safety_status: str
-    semantic_status: str
-
-
-@dataclass(frozen=True, slots=True)
-class SessionCompactionMemoryResult:
-    receipt: object | None = field(default=None, repr=False, compare=False)
-    receipt_status: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class SessionCompactionExecutionResult:
     applied: bool
     summary_len: int
@@ -109,8 +96,6 @@ class SessionCompactionResult:
     state_kind: str = "text"
     quality_report: Mapping[str, object] = field(default_factory=dict)
     reason: str | None = None
-    flush_receipt: object | None = field(default=None, repr=False, compare=False)
-    flush_receipt_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +113,6 @@ class SessionCompactionEvent:
     elapsed_ms: int | None = None
     heartbeat_interval_seconds: float | None = None
     result: SessionCompactionExecutionResult | None = None
-    flush_receipt_status: str | None = None
     cancellation_reconciled: bool = False
     deadline_reconciled: bool = False
     observation_error: str | None = None
@@ -145,18 +129,6 @@ class SessionCompactionEvent:
             "timed_out",
             "emergency_ephemeral",
         }
-
-
-@dataclass(slots=True)
-class SessionCompactionFlushSafetyError(RuntimeError):
-    session_key: str
-    session_id: str | None
-    receipt: object | None
-    receipt_status: str | None
-    assessment: SessionCompactionMemoryAssessment
-
-    def __str__(self) -> str:
-        return "manual compaction requires a safe memory flush"
 
 
 @dataclass(slots=True)
@@ -220,53 +192,11 @@ class SessionCompactionLockPort(Protocol):
     def for_session(self, session_key: str) -> SessionCompactionLock | None: ...
 
 
-class SessionCompactionMemoryPort(Protocol):
-    @property
-    def flush_enabled(self) -> bool: ...
-
-    @property
-    def flush_available(self) -> bool: ...
-
-    async def transcript(self, session_key: str) -> tuple[object, ...] | None: ...
-
-    async def flush(
-        self,
-        session: SessionCompactionSession,
-        transcript: tuple[object, ...],
-        plan: SessionCompactionPlan,
-        compaction_id: str,
-    ) -> object: ...
-
-    def receipt_status(self, receipt: object | None) -> str: ...
-
-    def receipt_is_successful(self, receipt: object) -> bool: ...
-
-    @property
-    def requires_safe_receipt(self) -> bool: ...
-
-    async def checkpoint_covers(
-        self,
-        session: SessionCompactionSession,
-        transcript: tuple[object, ...],
-    ) -> bool: ...
-
-    def assess(
-        self,
-        receipt: object | None,
-        *,
-        checkpoint_safe: bool,
-        required: bool,
-    ) -> SessionCompactionMemoryAssessment: ...
-
-    def record(self, outcome: str, **details: object) -> None: ...
-
-
 class SessionCompactionExecutorPort(Protocol):
     async def compact(
         self,
         command: CompactSession,
         plan: SessionCompactionPlan,
-        memory: SessionCompactionMemoryResult,
     ) -> SessionCompactionExecutionResult: ...
 
 
@@ -315,7 +245,6 @@ class SessionMaintenance:
         *,
         planning: SessionCompactionPlanningPort,
         locking: SessionCompactionLockPort,
-        memory: SessionCompactionMemoryPort,
         executor: SessionCompactionExecutorPort,
         lifecycle: SessionCompactionLifecyclePort,
         ownership: SessionCompactionOwnershipPort,
@@ -324,7 +253,6 @@ class SessionMaintenance:
     ) -> None:
         self._planning = planning
         self._locking = locking
-        self._memory = memory
         self._executor = executor
         self._lifecycle = lifecycle
         self._ownership = ownership
@@ -358,7 +286,6 @@ class SessionMaintenance:
             timing=timing,
             planning=self._planning,
             locking=self._locking,
-            memory=self._memory,
             executor=self._executor,
             lifecycle=self._lifecycle,
             ownership=self._ownership,
@@ -380,7 +307,6 @@ class _ManualCompactionOperation:
         timing: SessionCompactionTiming,
         planning: SessionCompactionPlanningPort,
         locking: SessionCompactionLockPort,
-        memory: SessionCompactionMemoryPort,
         executor: SessionCompactionExecutorPort,
         lifecycle: SessionCompactionLifecyclePort,
         ownership: SessionCompactionOwnershipPort,
@@ -393,7 +319,6 @@ class _ManualCompactionOperation:
         self._timing = timing
         self._planning = planning
         self._locking = locking
-        self._memory = memory
         self._executor = executor
         self._lifecycle = lifecycle
         self._ownership = ownership
@@ -463,71 +388,6 @@ class _ManualCompactionOperation:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    async def _prepare_memory(
-        self,
-        session: SessionCompactionSession,
-        plan: SessionCompactionPlan,
-    ) -> SessionCompactionMemoryResult:
-        if not self._memory.flush_enabled:
-            return SessionCompactionMemoryResult()
-        transcript = await self._memory.transcript(self._command.session_key)
-        if transcript is None:
-            self._memory.record("flush_skipped", reason="transcript_reader_unavailable")
-            return SessionCompactionMemoryResult()
-        if not transcript:
-            return SessionCompactionMemoryResult()
-
-        receipt: object | None = None
-        receipt_status: str | None = None
-        if not self._memory.flush_available:
-            self._memory.record("flush_skipped", reason="flush_service_unavailable")
-            receipt_status = self._memory.receipt_status(None)
-        else:
-            self._stage = "flushing"
-            try:
-                receipt = await self._memory.flush(
-                    session,
-                    transcript,
-                    plan,
-                    self._compaction_id,
-                )
-            except SessionCompactionPhaseTimeoutError:
-                raise
-            except Exception as exc:
-                self._memory.record("flush_failed", error=str(exc))
-                receipt_status = self._memory.receipt_status(None)
-            else:
-                receipt_status = self._memory.receipt_status(receipt)
-                self._memory.record(
-                    (
-                        "flush_done"
-                        if self._memory.receipt_is_successful(receipt)
-                        else "flush_degraded"
-                    ),
-                    receipt_status=receipt_status,
-                    receipt=receipt,
-                )
-
-        if self._memory.requires_safe_receipt:
-            checkpoint_safe = await self._memory.checkpoint_covers(session, transcript)
-            assessment = self._memory.assess(
-                receipt,
-                checkpoint_safe=checkpoint_safe,
-                required=True,
-            )
-            if not assessment.allows_destructive_compaction:
-                raise SessionCompactionFlushSafetyError(
-                    session_key=self._command.session_key,
-                    session_id=session.session_id,
-                    receipt=receipt,
-                    receipt_status=receipt_status,
-                    assessment=assessment,
-                )
-        return SessionCompactionMemoryResult(
-            receipt=receipt,
-            receipt_status=receipt_status,
-        )
-
     async def _run_locked(self) -> SessionCompactionResult:
         session = await self._planning.load_session(self._command.session_key)
         if session is None:
@@ -573,11 +433,9 @@ class _ManualCompactionOperation:
         self._start_heartbeat()
 
         committed: SessionCompactionExecutionResult | None = None
-        memory = SessionCompactionMemoryResult()
         try:
-            memory = await self._prepare_memory(session, plan)
             self._stage = "summarizing"
-            outcome = await self._executor.compact(self._command, plan, memory)
+            outcome = await self._executor.compact(self._command, plan)
             if outcome.applied:
                 committed = outcome
                 for milestone in (
@@ -589,7 +447,6 @@ class _ManualCompactionOperation:
                             "observed",
                             milestone=milestone,
                             result=outcome,
-                            flush_receipt_status=memory.receipt_status,
                         )
                     )
         except asyncio.CancelledError:
@@ -600,7 +457,6 @@ class _ManualCompactionOperation:
                         milestone=SessionCompactionMilestone.PERSISTED,
                         reason="cancelled_after_commit",
                         result=committed,
-                        flush_receipt_status=memory.receipt_status,
                         cancellation_reconciled=True,
                     )
                 )
@@ -613,7 +469,6 @@ class _ManualCompactionOperation:
                         milestone=SessionCompactionMilestone.PERSISTED,
                         reason="deadline_after_commit",
                         result=committed,
-                        flush_receipt_status=memory.receipt_status,
                         deadline_reconciled=True,
                     )
                 )
@@ -626,7 +481,6 @@ class _ManualCompactionOperation:
                         milestone=SessionCompactionMilestone.PERSISTED,
                         reason="post_commit_observation_failed",
                         result=committed,
-                        flush_receipt_status=memory.receipt_status,
                         observation_error=str(exc),
                     )
                 )
@@ -646,7 +500,6 @@ class _ManualCompactionOperation:
                 ),
                 reason=reason,
                 result=outcome,
-                flush_receipt_status=memory.receipt_status,
             )
         )
         return SessionCompactionResult(
@@ -669,8 +522,6 @@ class _ManualCompactionOperation:
             state_kind=outcome.state_kind,
             quality_report=outcome.quality_report,
             reason=reason,
-            flush_receipt=memory.receipt,
-            flush_receipt_status=memory.receipt_status,
         )
 
     async def _run_accounted(self) -> SessionCompactionResult:
@@ -812,12 +663,8 @@ __all__ = [
     "SessionCompactionEvent",
     "SessionCompactionExecutionResult",
     "SessionCompactionExecutorPort",
-    "SessionCompactionFlushSafetyError",
     "SessionCompactionLifecyclePort",
     "SessionCompactionLockPort",
-    "SessionCompactionMemoryAssessment",
-    "SessionCompactionMemoryPort",
-    "SessionCompactionMemoryResult",
     "SessionCompactionMilestone",
     "SessionCompactionNotFoundError",
     "SessionCompactionOwnershipPort",

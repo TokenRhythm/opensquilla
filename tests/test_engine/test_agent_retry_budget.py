@@ -137,6 +137,8 @@ async def test_malformed_empty_retries_once_then_errors() -> None:
     assert len(provider.calls) == 2
     assert any(event.kind == "warning" and event.code == "provider_empty_retry" for event in events)
     assert any(event.kind == "error" and event.code == "empty_response" for event in events)
+    error = next(event for event in events if event.kind == "error")
+    assert error.failure_kind == "empty_response"
 
 
 @pytest.mark.asyncio

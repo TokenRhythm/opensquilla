@@ -172,7 +172,6 @@ class RpcContext:
     cron_scheduler: Any = None  # SchedulerEngine instance (injected at boot)
     turn_runner: TurnRunner | None = None  # TurnRunner instance (injected at boot)
     task_runtime: Any = None  # TaskRuntime instance (injected at boot)
-    flush_service: Any = None  # SessionFlushService | None (injected at boot)
     heartbeat_service: Any = None  # Task-style heartbeat service (injected at boot)
     heartbeat_loop: Any = None  # Background heartbeat loop (injected at boot)
     prompt_cache_keepalive_service: Any = None  # Opt-in, in-memory session lease service.
@@ -228,9 +227,7 @@ class RpcHandlerError(Exception):
     The dispatcher converts this into a ``ResFrame`` with
     :class:`ErrorShape` populated from the exception's ``code``, ``message``,
     and ``details`` attributes. Handlers use it when a raw exception would
-    lose context the client needs — e.g. ``sessions.reset`` returning a
-    :class:`FlushReceipt` alongside the error so the UI can render the
-    failure mode.
+    lose context the client needs to explain or recover from the failure.
     """
 
     def __init__(

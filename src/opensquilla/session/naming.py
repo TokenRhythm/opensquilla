@@ -48,6 +48,7 @@ from opensquilla.provider.tokenrhythm_correlation import (
     tokenrhythm_install_id_headers,
 )
 from opensquilla.router_tiers import DEFAULT_TEXT_TIER, normalize_text_tier
+from opensquilla.session.title_quality import is_refusal_title
 
 if TYPE_CHECKING:
     from opensquilla.provider.types import ProviderRequestCorrelation
@@ -250,14 +251,14 @@ def resolve_naming_target(
     )
 
 
-def _sanitize_title(raw: str | None, max_chars: int) -> str | None:
+def _sanitize_title(raw: object, max_chars: int) -> str | None:
     """Normalize a model response into a clean one-line title, or ``None``."""
 
-    if not raw:
+    if not isinstance(raw, str) or not raw or is_refusal_title(raw):
         return None
     # First non-empty line only.
     title = ""
-    for line in str(raw).splitlines():
+    for line in raw.splitlines():
         if line.strip():
             title = line.strip()
             break
@@ -451,7 +452,14 @@ async def call_naming_llm(
                 data,
                 raw_json=str(getattr(resp, "text", "") or ""),
             )
-            raw = data["choices"][0]["message"]["content"]
+            # A successful HTTP response can still be a refusal. Finalize its
+            # usage above, but never promote content accompanying these markers
+            # to a title (or classify the refusal as a transport failure).
+            if (
+                data["choices"][0].get("finish_reason") != "content_filter"
+                and not data["choices"][0]["message"].get("refusal")
+            ):
+                raw = data["choices"][0]["message"].get("content")
     except asyncio.CancelledError:
         # A propagated cancellation retains this frame. Scrub request state before
         # accounting and raise a fresh exception outside the handler so neither the

@@ -10,7 +10,7 @@ Good content:
 - collaboration style that should persist across sessions
 
 Do not store user profile facts, task history, or tool inventories here. Use
-`USER.md` for the user, `MEMORY.md` or `memory/**/*.md` for memory, and `TOOLS.md`
+`USER.md` for the user, `MEMORY.md` or `memory/**/*.md` for memory, and `AGENTS.md`
 for tool notes.
 
 Keep this concise. Higher-priority system, developer, runtime, safety, and user

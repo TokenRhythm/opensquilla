@@ -452,7 +452,20 @@ async def test_direct_channel_batch_terminal_reset_replaces_partial_with_failure
 
 
 @pytest.mark.asyncio
-async def test_direct_channel_error_log_does_not_expose_provider_prose() -> None:
+@pytest.mark.parametrize(
+    ("code", "failure_kind", "expected_message"),
+    [
+        ("400", "bad_request", "The model provider rejected the request."),
+        ("401", "auth_invalid", "The model provider rejected the configured credentials."),
+        (
+            "429", "rate_limited",
+            "The model provider is rate-limiting requests. Try again later.",
+        ),
+    ],
+)
+async def test_direct_channel_error_log_does_not_expose_provider_prose(
+    code: str, failure_kind: str, expected_message: str,
+) -> None:
     raw_detail = "RAW_PROVIDER_BODY_DO_NOT_PERSIST"
 
     class FakeTurnRunner:
@@ -460,8 +473,8 @@ async def test_direct_channel_error_log_does_not_expose_provider_prose() -> None
             del message, session_key, kwargs
             yield ErrorEvent(
                 message=f"provider rejected request: {raw_detail}",
-                code="400",
-                failure_kind="bad_request",
+                code=code,
+                failure_kind=failure_kind,
             )
 
     channel = _FakeChannel()
@@ -484,9 +497,10 @@ async def test_direct_channel_error_log_does_not_expose_provider_prose() -> None
     agent_error = next(
         row for row in logs if row["event"] == "channel_dispatch.agent_error"
     )
-    assert agent_error["failure_kind"] == "bad_request"
+    assert agent_error["failure_kind"] == failure_kind
     assert "message" not in agent_error
-    assert channel.sent[-1].content == "The task failed before it could finish."
+    assert all(raw_detail not in message.content for message in channel.sent)
+    assert channel.sent[-1].content == expected_message
 
 
 @pytest.mark.asyncio

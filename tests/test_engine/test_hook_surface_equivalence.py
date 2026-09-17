@@ -9,9 +9,8 @@ The harness compares two execution paths for trace emission:
   the ``TurnHook.on_event`` Protocol.
 
 The two paths must produce identical ``TraceEvent`` records observed at the
-sink. The harness also covers the no-op default hooks (``DefaultTranscriptHook``
-and ``DefaultMemoryFlushHook``), which reserve future hooks without
-yet moving the inline body.
+sink. The harness also covers the no-op ``DefaultTranscriptHook``, which
+reserves a future hook without moving the inline body.
 
 Coverage gate: every hook method on every default hook is exercised at least
 once, so the protocols are wired end-to-end before production code moves to
@@ -27,7 +26,6 @@ import pytest
 
 from opensquilla.engine.hooks import (
     CompactionState,
-    DefaultMemoryFlushHook,
     DefaultTraceEmitterHook,
     DefaultTranscriptHook,
     NoopCompactionHook,
@@ -205,11 +203,6 @@ def test_default_chain_order_is_stable() -> None:
 
     chain = build_default_turn_hooks()
     assert chain[0].name == "default_trace_emitter"
-    assert {h.name for h in chain} == {
-        "default_trace_emitter",
-        "default_transcript",
-        "default_memory_flush",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -227,14 +220,6 @@ def _result() -> TurnHookResult:
 
 def test_default_transcript_lifecycle_runs_clean() -> None:
     hook = DefaultTranscriptHook()
-    asyncio.run(hook.before_turn(_ctx()))
-    asyncio.run(hook.after_turn(_ctx(), _result()))
-    asyncio.run(hook.on_error(_ctx(), RuntimeError("boom")))
-    hook.on_event(_ctx(), TurnEvent(kind="turn_end"))
-
-
-def test_default_memory_flush_lifecycle_runs_clean() -> None:
-    hook = DefaultMemoryFlushHook()
     asyncio.run(hook.before_turn(_ctx()))
     asyncio.run(hook.after_turn(_ctx(), _result()))
     asyncio.run(hook.on_error(_ctx(), RuntimeError("boom")))

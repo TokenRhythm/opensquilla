@@ -937,8 +937,6 @@ async def _accept_turn_in_scope(
         "cron_turn",
         "memory",
         "memory_dream",
-        "memory_flush",
-        "memory_repair",
         "compaction",
         "session_compaction",
         "runtime_send",

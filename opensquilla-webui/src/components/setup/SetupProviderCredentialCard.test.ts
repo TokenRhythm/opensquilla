@@ -25,7 +25,7 @@ function panel(overrides: Record<string, unknown> = {}) {
     apiKeyEnvValue: 'DEEPSEEK_API_KEY',
     probeReady: true,
     probeDisabledReason: '',
-    probeButtonLabel: 'Verify current configuration',
+    probeButtonLabel: 'Test model',
     connection: { phase: 'unverified' },
     ...overrides,
   }
@@ -91,7 +91,7 @@ function discoveredModel(id: string) {
 
 function verifiedConnection(overrides: Record<string, unknown> = {}) {
   return {
-    phase: 'verified',
+    phase: 'model_verified',
     failureKind: '',
     detail: '',
     firstResponseMs: 123,
@@ -396,8 +396,8 @@ describe('SetupProviderCredentialCard', () => {
     expect(button).toBeTruthy()
     expect(button?.disabled).toBe(true)
     expect(button?.title).toBe('Add an API key before verifying this provider.')
-    expect(button?.getAttribute('aria-describedby')).toBe('setup-provider-probe-hint-deepseek')
-    expect(el.querySelector('#setup-provider-probe-hint-deepseek')?.textContent)
+    expect(button?.getAttribute('aria-describedby')).toBe('setup-provider-probe-hint-full-deepseek')
+    expect(el.querySelector('#setup-provider-probe-hint-full-deepseek')?.textContent)
       .toBe('Add an API key before verifying this provider.')
     expect(el.textContent).toContain('Add an API key before verifying this provider.')
 
@@ -454,7 +454,7 @@ describe('SetupProviderCredentialCard', () => {
     const { app, el } = await mountCard({ probeReady: false, probeDisabledReason: reason })
 
     const button = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
-      .find(candidate => candidate.textContent?.includes('Verify current configuration'))
+      .find(candidate => candidate.textContent?.includes('Test model'))
     expect(button?.disabled).toBe(true)
     expect(button?.title).toBe(reason)
     expect(el.textContent).toContain(reason)
@@ -547,18 +547,119 @@ describe('SetupProviderCredentialCard', () => {
 })
 
 describe('SetupProviderCredentialCard — configuration verification verdict', () => {
+  it('offers separate connection and model checks with independent readiness', async () => {
+    const onCheckReachability = vi.fn()
+    const onTestModel = vi.fn()
+    const { app, el } = await mountCard({
+      reachabilityReady: true,
+      probeReady: false,
+      probeDisabledReason: 'Choose a model before testing it.',
+    }, { onCheckReachability, onTestModel })
+    const buttons = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+    const connection = buttons.find(button => button.textContent?.trim() === 'Check connection')
+    const model = buttons.find(button => button.textContent?.trim() === 'Test model')
+
+    expect(connection?.disabled).toBe(false)
+    expect(model?.disabled).toBe(true)
+    connection?.click()
+    model?.click()
+    expect(onCheckReachability).toHaveBeenCalledOnce()
+    expect(onTestModel).not.toHaveBeenCalled()
+
+    app.unmount()
+  })
+
+  it('distinguishes endpoint reachability from a successful model call', async () => {
+    const { app, el } = await mountCard({
+      connection: verifiedConnection({
+        phase: 'reachable',
+        verificationLevel: 'reachable',
+        firstResponseMs: null,
+      }),
+    })
+
+    expect(el.textContent).toContain('Endpoint reachable · model not tested')
+    expect(el.textContent).not.toContain('Model call succeeded')
+    expect(el.textContent).not.toContain('First model response')
+
+    app.unmount()
+  })
+
+  it('reports model timeout as incomplete verification rather than unreachable', async () => {
+    const { app, el } = await mountCard({
+      connection: verifiedConnection({
+        phase: 'timed_out',
+        verificationLevel: 'none',
+        failureStage: 'model',
+        failureKind: 'probe_timeout',
+        detail: 'Model probe timed out after 60 seconds.',
+        models: [],
+        modelSource: 'none',
+      }),
+    })
+
+    expect(el.textContent).toContain('Model response timed out · verification incomplete')
+    expect(el.textContent).not.toContain("Couldn't connect")
+
+    app.unmount()
+  })
+
+  it('reports a provider response separately from transport reachability failures', async () => {
+    const { app, el } = await mountCard({
+      connection: verifiedConnection({
+        phase: 'reachable_error',
+        verificationLevel: 'reachable',
+        failureStage: 'reachability',
+        failureKind: 'rate_limited',
+        detail: 'HTTP 429',
+        models: [],
+        modelSource: 'none',
+      }),
+    })
+
+    expect(el.textContent).toContain('Endpoint responded')
+    expect(el.textContent).toContain('rate-limiting requests')
+    expect(el.textContent).not.toContain("Couldn't connect")
+
+    app.unmount()
+  })
+
+  it('does not describe a malformed reachability response as a streaming failure', async () => {
+    const { app, el } = await mountCard({
+      connection: verifiedConnection({
+        phase: 'reachable_error',
+        verificationLevel: 'reachable',
+        failureStage: 'reachability',
+        failureKind: 'malformed_response',
+        detail: 'Provider model catalog response could not be parsed',
+        models: [],
+        modelSource: 'none',
+      }),
+    })
+
+    expect(el.textContent).toContain('Endpoint responded')
+    expect(el.textContent).not.toContain('Streaming response incompatible')
+    app.unmount()
+  })
+
   it('announces the current-settings verdict and exposes probing as busy', async () => {
     const verified = await mountCard({ connection: verifiedConnection() })
     const status = verified.el.querySelector('[role="status"]')
     expect(status?.getAttribute('aria-live')).toBe('polite')
     expect(status?.getAttribute('aria-atomic')).toBe('true')
-    expect(status?.textContent).toContain('Configuration verified')
+    expect(status?.textContent).toContain('Model call succeeded')
     verified.app.unmount()
 
-    const probing = await mountCard({ connection: { phase: 'probing' } })
+    const onCancelProbe = vi.fn()
+    const probing = await mountCard(
+      { connection: { phase: 'probing', probeMode: 'model' } },
+      { onCancelProbe },
+    )
     const button = Array.from(probing.el.querySelectorAll<HTMLButtonElement>('button'))
-      .find(candidate => candidate.textContent?.includes('Verifying configuration'))
+      .find(candidate => candidate.textContent?.includes('Cancel test'))
     expect(button?.getAttribute('aria-busy')).toBe('true')
+    button?.click()
+    expect(onCancelProbe).toHaveBeenCalledOnce()
     probing.app.unmount()
   })
 

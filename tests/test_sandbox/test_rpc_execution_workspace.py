@@ -39,7 +39,7 @@ async def execution_workspace_ctx(
     original.mkdir()
     config = GatewayConfig(
         **({"workspace_dir": str(original)} if request.param == "configured" else {}),
-        memory={"flush_enabled": False},
+        memory={},
     )
     factory = build_execution_workspace_factory(config, profile_home=tmp_path / "profile")
     reset_resolved_run_context_overlays()

@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.paths import native_io_path
 from opensquilla.recovery.atomic import native_move_no_replace, reparse_tag_redirects
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.engine import profile_replacement_transaction_unfinished
@@ -1038,8 +1039,11 @@ def cleanup_inspect(
 
 
 def _remove_no_follow(path: Path) -> None:
+    # Quarantine adds a transaction suffix to the root. Descendants that fit
+    # MAX_PATH before the move can therefore require an extended Windows path.
+    io_path = native_io_path(path)
     try:
-        value = path.lstat()
+        value = io_path.lstat()
     except (FileNotFoundError, NotADirectoryError):
         return
     entry_type = _entry_type(value)
@@ -1047,17 +1051,17 @@ def _remove_no_follow(path: Path) -> None:
         raise OSError(f"refusing to delete special file: {path}")
     if entry_type == "link":
         if stat.S_ISDIR(value.st_mode):
-            os.rmdir(path)
+            os.rmdir(io_path)
         else:
-            path.unlink()
+            io_path.unlink()
         return
     if entry_type == "file":
-        path.unlink()
+        io_path.unlink()
         return
     # CPython uses its descriptor-based, symlink-attack-resistant rmtree on
     # capable platforms and has explicit Windows junction protection. The root
     # itself was lstat-verified as a real directory immediately above.
-    shutil.rmtree(path)
+    shutil.rmtree(io_path)
 
 
 def _current_item(planned: _PlannedItem) -> CleanupItem:
