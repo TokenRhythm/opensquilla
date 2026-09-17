@@ -121,7 +121,6 @@ async def test_preview_recovers_custom_named_channel_title_using_configured_type
     storage.session.derived_title = "I cannot assist with that request"
     ctx = context(storage)
     ctx.config = GatewayConfig(
-        memory={"flush_enabled": False},
         channels={
             "channels": [
                 {

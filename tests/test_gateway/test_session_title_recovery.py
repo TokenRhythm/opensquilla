@@ -38,7 +38,7 @@ def _context(manager: SessionManager) -> RpcContext:
             is_owner=True,
             authenticated=True,
         ),
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(),
     )
     ctx.session_manager = manager
     return ctx
