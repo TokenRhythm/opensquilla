@@ -1985,7 +1985,7 @@
           "label": "Ventana de agrupación (s)"
         },
         "transport_name": {
-          "label": "Transporte",
+          "label": "Modo de conexión",
           "choices": {
             "polling": "Sondeo (polling)",
             "webhook": "Webhook"
@@ -2517,7 +2517,7 @@
         "webhook": "Webhook",
         "websocket": "WebSocket",
         "http_sync": "Sincronización HTTP",
-        "mixed": "Mixto"
+        "mixed": "Múltiples modos de conexión"
       },
       "tabs": {
         "overview": "Resumen",

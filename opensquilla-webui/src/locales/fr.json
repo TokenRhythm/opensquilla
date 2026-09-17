@@ -1985,7 +1985,7 @@
           "label": "Fenêtre de regroupement (s)"
         },
         "transport_name": {
-          "label": "Transport",
+          "label": "Mode de connexion",
           "choices": {
             "polling": "Interrogation (polling)",
             "webhook": "Webhook"
@@ -2517,7 +2517,7 @@
         "webhook": "Webhook",
         "websocket": "WebSocket",
         "http_sync": "Synchro HTTP",
-        "mixed": "Mixte"
+        "mixed": "Plusieurs modes de connexion"
       },
       "tabs": {
         "overview": "Vue d'ensemble",

@@ -1985,7 +1985,7 @@
           "label": "Entprellfenster (s)"
         },
         "transport_name": {
-          "label": "Transport",
+          "label": "Verbindungsart",
           "choices": {
             "polling": "Polling",
             "webhook": "Webhook"
@@ -2517,7 +2517,7 @@
         "webhook": "Webhook",
         "websocket": "WebSocket",
         "http_sync": "HTTP-Sync",
-        "mixed": "Gemischt"
+        "mixed": "Mehrere Verbindungsarten"
       },
       "tabs": {
         "overview": "Übersicht",

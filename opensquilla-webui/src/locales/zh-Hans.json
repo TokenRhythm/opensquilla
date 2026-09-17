@@ -2067,7 +2067,7 @@
           "label": "去抖窗口（秒）"
         },
         "transport_name": {
-          "label": "传输方式",
+          "label": "连接方式",
           "choices": {
             "polling": "轮询",
             "webhook": "Webhook（回调）"
@@ -2599,7 +2599,7 @@
         "webhook": "Webhook（回调）",
         "websocket": "WebSocket 连接",
         "http_sync": "HTTP 同步",
-        "mixed": "混合"
+        "mixed": "支持多种连接方式"
       },
       "tabs": {
         "overview": "概览",

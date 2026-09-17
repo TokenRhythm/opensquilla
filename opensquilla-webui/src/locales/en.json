@@ -2068,7 +2068,7 @@
           "label": "Debounce window (s)"
         },
         "transport_name": {
-          "label": "Transport",
+          "label": "Connection method",
           "choices": {
             "polling": "Polling",
             "webhook": "Webhook"
@@ -2600,7 +2600,7 @@
         "webhook": "Webhook",
         "websocket": "WebSocket",
         "http_sync": "HTTP sync",
-        "mixed": "Mixed"
+        "mixed": "Multiple connection methods"
       },
       "tabs": {
         "overview": "Overview",
