@@ -98,10 +98,15 @@ async function prepare(page: Page, wsUrl: string, token = '') {
 }
 
 function observe(page: Page) {
-  const hellos: Array<{ principal: { authenticated: boolean; authState: string }; guestSessionKey?: string }> = []
+  const hellos: Array<{
+    principal: { authenticated: boolean; authState: string; guestOwnerId?: string }
+    guestSessionKey?: string
+  }> = []
   const denied: Array<{ method: string; sessionKey: unknown; message: string }> = []
+  const sent: Array<{ method: string; sessionKey: unknown }> = []
   let connections = 0
   page.on('websocket', socket => {
+    if (new URL(socket.url()).pathname !== '/ws') return
     connections += 1
     const requests = new Map<string, { method: string; sessionKey: unknown }>()
     socket.on('framesent', ({ payload }) => {
@@ -111,6 +116,7 @@ function observe(page: Page) {
           method: frame.method,
           sessionKey: frame.params?.key ?? frame.params?.sessionKey ?? null,
         })
+        sent.push(requests.get(frame.id)!)
       }
     })
     socket.on('framereceived', ({ payload }) => {
@@ -122,8 +128,70 @@ function observe(page: Page) {
       }
     })
   })
-  return { hellos, denied, get connections() { return connections } }
+  return { hellos, denied, sent, get connections() { return connections } }
 }
+
+for (const lateHello of [false, true]) {
+  test(`subscribes a fresh guest draft after ${lateHello ? 'a delayed' : 'the first'} handshake`, async ({
+    page, baseURL, request,
+  }, testInfo) => {
+    const gateway = await realAuthGateway(testInfo, new URL(baseURL!).origin, 'token')
+    try {
+      await prepare(page, gateway.wsUrl + (lateHello ? '?holdHandshake=1' : ''))
+      const wire = observe(page)
+      // The preview serves the relative-base bundle; enter through its existing
+      // new-chat URL and let the router canonicalize the draft route.
+      await page.goto('/control/chat?newChat=1')
+      const input = page.locator('.chat-textarea')
+      const send = page.locator('.chat-send-btn[aria-label="Send"]')
+      await input.fill('Synthetic guest draft retained through its first handshake.')
+      if (lateHello) {
+        expect(wire.hellos).toHaveLength(0)
+        expect((await request.post(`${gateway.httpUrl}/release-handshake`)).ok()).toBe(true)
+      }
+      await expect.poll(() => wire.hellos.length).toBe(1)
+      await expect(send).toBeEnabled()
+      await expect(input).toHaveValue('Synthetic guest draft retained through its first handshake.')
+      const owner = wire.hellos[0].principal.guestOwnerId
+      expect(owner).toMatch(/^[0-9a-f]{64}$/)
+      const subscriptions = () => wire.sent.filter(item => item.method === 'sessions.messages.subscribe')
+      await expect.poll(() => subscriptions().length).toBeGreaterThan(0)
+      const key = subscriptions().at(-1)!.sessionKey
+      expect(key).toMatch(new RegExp(`^agent:main:webchat:guest:${owner}:[a-z0-9]+$`))
+      expect(wire.denied.filter(item => item.method === 'sessions.messages.subscribe')).toEqual([])
+      expect(wire.sent.filter(item => item.method === 'chat.send')).toEqual([])
+
+      expect((await request.post(`${gateway.httpUrl}/reconnect`)).ok()).toBe(true)
+      await expect.poll(() => wire.hellos.length).toBe(2)
+      await expect(send).toBeEnabled()
+      await expect(input).toHaveValue('Synthetic guest draft retained through its first handshake.')
+      expect(subscriptions().at(-1)!.sessionKey).toBe(key)
+      expect(wire.hellos[1].principal.guestOwnerId).toBe(owner)
+      expect(wire.connections).toBe(2)
+      expect(wire.denied.filter(item => item.method === 'sessions.messages.subscribe')).toEqual([])
+    } finally { await gateway.stop() }
+  })
+}
+
+test('keeps an explicit foreign session denied without rewriting it or reconnecting', async ({ page, baseURL }, testInfo) => {
+  const gateway = await realAuthGateway(testInfo, new URL(baseURL!).origin, 'token')
+  try {
+    await prepare(page, gateway.wsUrl)
+    const wire = observe(page)
+    const foreignSession = 'agent:main:webchat:synthetic-owner-history'
+    await page.goto(`/control/chat?session=${encodeURIComponent(foreignSession)}`)
+    await expect.poll(() => wire.denied.some(item => (
+      item.method === 'sessions.messages.subscribe' && item.sessionKey === foreignSession
+    ))).toBe(true)
+    await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeDisabled()
+    await page.locator('.chat-textarea').fill('Synthetic draft stays in this denied session.')
+    await page.clock.install()
+    await page.clock.fastForward(120_000)
+    expect(new URL(page.url()).searchParams.get('session')).toBe(foreignSession)
+    expect(wire.connections).toBe(1)
+    expect(wire.sent.filter(item => item.method === 'chat.send')).toEqual([])
+  } finally { await gateway.stop() }
+})
 
 test('recovers a rejected browser token through the existing connection panel', async ({ page, baseURL }, testInfo) => {
   const gateway = await realAuthGateway(testInfo, new URL(baseURL!).origin, 'token')

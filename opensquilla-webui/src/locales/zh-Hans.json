@@ -3527,6 +3527,7 @@
       "autoPauseLabel": "自动暂停",
       "states": { "off": "已关闭", "waiting": "等待稳定前缀", "scheduled": "已计划", "probing": "正在探测", "paused": "空闲超时，等待下一条消息", "stopped": "未命中或出错后已停止" }
     },
+    "sendPending": "正在发送…",
     "send": "发送",
     "sendQueues": "发送（排队等待当前回复结束）",
     "sendSteers": "发送（立即引导当前回复）",
@@ -4176,6 +4177,9 @@
       },
       "clearQueue": "清空队列",
       "removeMessage": "移除待发送消息 {index}",
+      "offlineRejected": "消息未被接收。请编辑后重试，或移除消息。",
+      "offlineQueued": "已保存到本地，连接恢复后自动发送。",
+      "identityChanged": "连接身份已改变。请重新连接原来的网关和账号后发送此消息。",
       "annotationUpgradeRequired": "这条待发批注使用旧编辑器。请编辑消息，并重新选择页面后发送。"
     },
     "metaRuns": {
@@ -4366,6 +4370,7 @@
       "waitCompactionBeforeCommand": "请等待上下文压缩完成后再运行 {command}。",
       "waitResponseBeforeCommand": "请等待当前回复结束后再运行 {command}。",
       "promptAnnotationBusy": "请等待当前回复结束后，再发送产物修改指令。",
+      "offlineQueueFailed": "无法加入发送队列，草稿已保留。",
       "queueFull": "队列已满 — 请等待当前回复结束。",
       "queuePersistenceUnavailable": "请将此消息保留在输入框，等待分支完成；当前无法进行持久恢复。",
       "messageStillSaving": "这条消息尚未保存完成 — 请稍后再试。",

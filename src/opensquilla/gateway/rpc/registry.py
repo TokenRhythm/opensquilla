@@ -19,6 +19,8 @@ silently grow the RPC surface.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -62,6 +64,24 @@ from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
+
+_SEND_COMMAND_METHODS = frozenset({
+    "chat.send",
+    "sessions.send",
+    "sessions.steer.v2",
+    "sessions.pending_inputs.enqueue",
+    "sessions.pending_inputs.dispatch",
+    "sessions.pending_inputs.steer",
+})
+_LOG_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+
+
+def _log_correlation_id(value: object) -> str | None:
+    # Request IDs are client-controlled; log a stable digest, never their text.
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
 
 _ARTIFACT_PRODUCT_METHOD_PREFIXES = (
     "artifacts.",
@@ -337,6 +357,23 @@ class RpcRegistry:
         return self._methods.get(name)
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: RpcContext) -> ResFrame:
+        response = await self._dispatch(req_id, method, params, ctx)
+        if isinstance(method, str) and method in _SEND_COMMAND_METHODS and response.error:
+            error = response.error
+            # Log the projected outcome even for early authorization/validation
+            # denials. Messages, params and details may contain private inputs.
+            log.warning(
+                "rpc.send_failed",
+                method=method,
+                request_id_hash=_log_correlation_id(req_id),
+                connection_id_hash=_log_correlation_id(getattr(ctx, "conn_id", None)),
+                code=error.code if _LOG_ERROR_CODE.fullmatch(error.code) else "UNKNOWN_ERROR",
+                accepted=error.accepted,
+                retryable=error.retryable,
+            )
+        return response
+
+    async def _dispatch(self, req_id: str, method: str, params: Any, ctx: RpcContext) -> ResFrame:
         safe_req_id = req_id if isinstance(req_id, str) and is_utf8_encodable(req_id) else ""
         if not isinstance(req_id, str) or not isinstance(method, str):
             return make_error_res(
@@ -477,12 +514,13 @@ class RpcRegistry:
                     exc=exc,
                     may_have_applied=entry.required_scope in _ARTIFACT_WRITE_SCOPES,
                 )
-            log.error(
-                "rpc.dispatch_failed",
-                method=method,
-                error=str(exc),
-                exc_info=True,
-            )
+            if method not in _SEND_COMMAND_METHODS:
+                log.error(
+                    "rpc.dispatch_failed",
+                    method=method,
+                    error=str(exc),
+                    exc_info=True,
+                )
             return make_error_res(req_id, "INTERNAL_ERROR", str(exc))
 
 

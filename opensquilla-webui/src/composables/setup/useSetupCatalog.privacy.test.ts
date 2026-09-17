@@ -89,6 +89,8 @@ async function mountCatalog() {
     isAvailable: true,
     isLocalOwner: true,
     isAuthenticated: true,
+    guestSessionOwnerId: null,
+    deliveryIdentity: null,
     canManageProjectWorkspaces: true,
     canChooseProject: true,
     runModePolicy: null,

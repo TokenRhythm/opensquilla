@@ -23,6 +23,7 @@ describe('Gateway Adapter composition', () => {
       auth: { principal: { authState: 'authenticated' } },
       policy: null,
       connectionGeneration: 1,
+      deliveryContext: null,
       connect: vi.fn(async () => undefined),
       disconnect: vi.fn(),
       recoverConnectionGeneration: vi.fn(() => true),

@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 
 import {
@@ -22,6 +22,7 @@ function mount(sessionKey: ReturnType<typeof ref<string>>, inputText: ReturnType
 }
 
 afterEach(() => {
+  vi.unstubAllGlobals()
   localStorage.clear()
 })
 
@@ -43,6 +44,34 @@ describe('useChatDraftPersistence', () => {
 
     expect(inputText2.value).toBe('half-written instruction')
     expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBe('agent:main:webchat:a')
+  })
+
+  it('preserves a fresh draft during namespace binding even when storage is unavailable', async () => {
+    const sessionKey = ref('agent:main:webchat:provisional')
+    const inputText = ref('Typing while Hello is delayed')
+    const { api, scope } = mount(sessionKey, inputText)
+    const denied = () => { throw new Error('storage denied') }
+    vi.stubGlobal('localStorage', { getItem: denied, setItem: denied, removeItem: denied })
+    try {
+      api.rebindCurrentDraft(`agent:main:webchat:guest:${'a'.repeat(64)}:provisional`)
+      inputText.value += ', then continuing'
+      await nextTick()
+      expect(inputText.value).toBe('Typing while Hello is delayed, then continuing')
+    } finally { scope.stop() }
+  })
+
+  it('does not carry a namespace rebind into an intervening history navigation', async () => {
+    const sessionKey = ref('agent:main:webchat:provisional')
+    const inputText = ref('Fresh draft')
+    const { api, scope } = mount(sessionKey, inputText)
+    const historyKey = 'agent:main:webchat:history'
+    api.saveDraft(historyKey, 'Existing history reply')
+    try {
+      api.rebindCurrentDraft(`agent:main:webchat:guest:${'a'.repeat(64)}:provisional`)
+      sessionKey.value = historyKey
+      await nextTick()
+      expect(inputText.value).toBe('Existing history reply')
+    } finally { scope.stop() }
   })
 
   it('keeps drafts isolated per session and does not clobber typed text', async () => {

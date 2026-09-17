@@ -17,6 +17,15 @@ const clients: Array<{
   connectionGeneration: number
 }> = []
 
+function deliveryHello(overrides: Record<string, unknown> = {}) {
+  return { auth: { principal: {
+    role: 'operator', authState: 'authenticated', authenticated: true, isOwner: true,
+    scopes: ['operator.read', 'operator.write'], capabilities: ['chat.send', 'host.execute'],
+    tokenPublicId: 'desktop', guestOwnerId: null,
+    ...overrides,
+  } } }
+}
+
 vi.mock('@/lib/rpc', () => ({
   RpcClient: class {
     state = 'disconnected'
@@ -64,8 +73,12 @@ describe('rpc link-token bootstrap', () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
   beforeEach(() => {
+    vi.stubGlobal('navigator', {
+      locks: { request: vi.fn(async (_name: string, action: () => unknown) => action()) },
+    })
     setActivePinia(createPinia())
     connectCalls.length = 0
     clients.length = 0
@@ -73,6 +86,349 @@ describe('rpc link-token bootstrap', () => {
     sessionStorage.clear()
     delete window.opensquillaDesktop
     window.history.replaceState(null, '', '/control/sessions')
+  })
+
+  it('retains proven delivery identity through transport retry but retires blocked or malformed authority', async () => {
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    expect(access.deliveryIdentity).toBeNull()
+    store.init()
+    expect(access.deliveryIdentity).toBeNull()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    const identity = access.deliveryIdentity
+    expect(identity).not.toBeNull()
+    clients[0].emit('_state', 'disconnected')
+    expect(store.auth).toBeNull()
+    expect(access.deliveryIdentity).toBe(identity)
+    clients[0].emit('_state', 'connecting')
+    expect(access.deliveryIdentity).toBe(identity)
+    clients[0].emit('_hello', deliveryHello())
+    clients[0].emit('_state', 'connected')
+    expect(access.deliveryIdentity).toBe(identity)
+    clients[0].emit('_hello', deliveryHello({ scopes: 'not-an-authority-set' }))
+    expect(access.deliveryIdentity).toBeNull()
+    clients[0].emit('_state', 'disconnected')
+    expect(access.deliveryIdentity).toBeNull()
+    clients[0].emit('_hello', deliveryHello())
+    clients[0].emit('_status', { lifecycle: 'blocked', health: 'suspect', reason: 'authentication_mismatch' })
+    expect(access.deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
+  it('fences explicit browser targets and credentials without serializing either secret', async () => {
+    const endpoint = 'ws://synthetic.example/ws?token=private-query-value'
+    localStorage.setItem('opensquilla.wsUrl', endpoint)
+    sessionStorage.setItem('opensquilla.wsToken', 'private-form-token')
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    clients[0].emit('_hello', deliveryHello({ tokenPublicId: 'legacy' }))
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    let identity = access.deliveryIdentity
+    expect(identity).not.toBeNull()
+    expect(identity).not.toContain('private-query-value')
+    expect(identity).not.toContain('private-form-token')
+    await store.connect(endpoint, 'private-form-token')
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    expect(access.deliveryIdentity).not.toBeNull()
+    expect(access.deliveryIdentity).toBe(identity)
+    identity = access.deliveryIdentity
+    for (const [url, token] of [
+      [endpoint, 'different-private-token'],
+      ['ws://another.example/ws', 'different-private-token'],
+    ]) {
+      await store.connect(url!, token!)
+      expect(access.deliveryIdentity).toBeNull()
+      clients[0].emit('_hello', deliveryHello({ tokenPublicId: 'legacy' }))
+      await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+      expect(access.deliveryIdentity).not.toBe(identity)
+      expect(access.deliveryIdentity).not.toContain('different-private-token')
+      identity = access.deliveryIdentity
+    }
+    store.disconnect()
+    expect(access.deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
+  it('recovers a same-tab delivery identity after reload only once the same target has a fresh Hello', async () => {
+    const first = useRpcStore()
+    first.init()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(createV4GatewayAccess(first).deliveryIdentity).not.toBeNull())
+    const identity = createV4GatewayAccess(first).deliveryIdentity
+    first.$dispose()
+    setActivePinia(createPinia())
+    const next = useRpcStore()
+    next.init()
+    expect(createV4GatewayAccess(next).deliveryIdentity).toBeNull()
+    clients[1].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(createV4GatewayAccess(next).deliveryIdentity).toBe(identity))
+    next.$dispose()
+  })
+
+  it('shares queue authority with a fresh tab only for the same target credentials and Hello', async () => {
+    localStorage.setItem('opensquilla.wsUrl', 'ws://synthetic.example/ws')
+    sessionStorage.setItem('opensquilla.wsToken', 'synthetic-owner-token')
+    const first = useRpcStore()
+    first.init()
+    clients[0].emit('_hello', deliveryHello())
+    const access = createV4GatewayAccess(first)
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    const original = access.deliveryIdentity
+    first.$dispose()
+    for (const [index, token] of ['synthetic-owner-token', 'synthetic-other-token'].entries()) {
+      // A new tab has no inherited session storage; credentials are supplied
+      // independently, while the queue and random salt share the origin.
+      sessionStorage.clear()
+      sessionStorage.setItem('opensquilla.wsToken', token)
+      setActivePinia(createPinia())
+      const next = useRpcStore()
+      next.init()
+      const nextAccess = createV4GatewayAccess(next)
+      expect(nextAccess.deliveryIdentity).toBeNull()
+      clients[index + 1].emit('_hello', deliveryHello())
+      await vi.waitFor(() => expect(nextAccess.deliveryIdentity).not.toBeNull())
+      if (index === 0) expect(nextAccess.deliveryIdentity).toBe(original)
+      else expect(nextAccess.deliveryIdentity).not.toBe(original)
+      next.$dispose()
+    }
+    expect(sessionStorage.getItem('opensquilla.deliverySalt.v1')).toBeNull()
+    expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  it('serializes concurrent first-tab salt creation without delaying either transport', async () => {
+    const waiting: Array<() => void> = []
+    const request = vi.fn((_name: string, action: () => unknown) => new Promise(resolve => {
+      waiting.push(() => resolve(action()))
+    }))
+    vi.stubGlobal('navigator', { locks: { request } })
+    const first = useRpcStore()
+    first.init()
+    clients[0].emit('_hello', deliveryHello())
+    setActivePinia(createPinia())
+    const second = useRpcStore()
+    second.init()
+    clients[1].emit('_hello', deliveryHello())
+    expect(connectCalls).toHaveLength(2)
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(createV4GatewayAccess(first).deliveryIdentity).toBeNull()
+    expect(createV4GatewayAccess(second).deliveryIdentity).toBeNull()
+    waiting[0]!()
+    const salt = localStorage.getItem('opensquilla.deliverySalt.v1')
+    waiting[1]!()
+    expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBe(salt)
+    await vi.waitFor(() => expect(createV4GatewayAccess(first).deliveryIdentity).not.toBeNull())
+    await vi.waitFor(() => expect(createV4GatewayAccess(second).deliveryIdentity)
+      .toBe(createV4GatewayAccess(first).deliveryIdentity))
+    first.$dispose()
+    second.$dispose()
+  })
+
+  it('without Web Locks only reuses an existing shared salt and keeps first-use transport working', async () => {
+    vi.stubGlobal('navigator', {})
+    const first = useRpcStore()
+    first.init()
+    clients[0].emit('_hello', deliveryHello())
+    await Promise.resolve()
+    expect(connectCalls).toHaveLength(1)
+    expect(createV4GatewayAccess(first).deliveryIdentity).toBeNull()
+    expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBeNull()
+    first.$dispose()
+    localStorage.setItem('opensquilla.deliverySalt.v1', '1'.repeat(32))
+    setActivePinia(createPinia())
+    const next = useRpcStore()
+    next.init()
+    clients[1].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(createV4GatewayAccess(next).deliveryIdentity).not.toBeNull())
+    next.$dispose()
+  })
+
+  it('recovers the original target after A to B to A and explicit disconnect only with matching Hello proof', async () => {
+    const firstEndpoint = 'ws://synthetic-a.example/ws'
+    localStorage.setItem('opensquilla.wsUrl', firstEndpoint)
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    const firstIdentity = access.deliveryIdentity
+    await store.connect('ws://synthetic-b.example/ws')
+    expect(access.deliveryIdentity).toBeNull()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    expect(access.deliveryIdentity).not.toBe(firstIdentity)
+    await store.connect(firstEndpoint)
+    expect(access.deliveryIdentity).toBeNull()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).toBe(firstIdentity))
+    store.disconnect()
+    expect(access.deliveryIdentity).toBeNull()
+    await store.connect(firstEndpoint)
+    expect(access.deliveryIdentity).toBeNull()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).toBe(firstIdentity))
+    store.$dispose()
+  })
+
+  it.each(['endpoint', 'credential', 'principal'])(
+    'does not recover an old delivery identity after a reload changes the %s', async changed => {
+      localStorage.setItem('opensquilla.wsUrl', 'ws://synthetic.example/ws?token=private-query')
+      sessionStorage.setItem('opensquilla.wsToken', 'private-credential')
+      const first = useRpcStore()
+      first.init()
+      clients[0].emit('_hello', deliveryHello())
+      const access = createV4GatewayAccess(first)
+      await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+      const identity = access.deliveryIdentity
+      const stored = localStorage.getItem('opensquilla.deliverySalt.v1')!
+      expect(stored).not.toContain('private-')
+      expect(stored).not.toContain('synthetic.example')
+      first.$dispose()
+      if (changed === 'endpoint') localStorage.setItem('opensquilla.wsUrl', 'ws://another.example/ws')
+      if (changed === 'credential') sessionStorage.setItem('opensquilla.wsToken', 'private-rotated')
+      setActivePinia(createPinia())
+      const next = useRpcStore()
+      next.init()
+      clients[1].emit('_hello', deliveryHello(changed === 'principal' ? { tokenPublicId: 'another' } : {}))
+      const nextAccess = createV4GatewayAccess(next)
+      await vi.waitFor(() => expect(nextAccess.deliveryIdentity).not.toBeNull())
+      expect(nextAccess.deliveryIdentity).not.toBe(identity)
+      next.$dispose()
+    },
+  )
+
+  it('does not let delayed target hashing restore a superseded identity', async () => {
+    const digest = crypto.subtle.digest.bind(crypto.subtle)
+    let resolveOld!: (value: ArrayBuffer) => void
+    vi.spyOn(crypto.subtle, 'digest').mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve }))
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    expect(access.deliveryIdentity).toBeNull()
+    await vi.waitFor(() => expect(resolveOld).toBeTypeOf('function'))
+    await store.connect('ws://another.example/ws', 'synthetic-token')
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    const identity = access.deliveryIdentity
+    const stored = localStorage.getItem('opensquilla.deliverySalt.v1')
+    resolveOld(await digest('SHA-256', new TextEncoder().encode('old-target')))
+    await Promise.resolve()
+    expect(access.deliveryIdentity).toBe(identity)
+    expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBe(stored)
+    store.$dispose()
+  })
+
+  it('does not let delayed target hashing restore a blocked identity', async () => {
+    let finish!: (value: ArrayBuffer) => void
+    vi.spyOn(crypto.subtle, 'digest').mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const store = useRpcStore()
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    clients[0].emit('_status', { lifecycle: 'blocked', health: 'suspect', reason: 'authentication_mismatch' })
+    finish(new ArrayBuffer(32))
+    await Promise.resolve()
+    expect(createV4GatewayAccess(store).deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
+  it('keeps transport startup working without offline authority when hashing is unavailable', async () => {
+    const digest = vi.spyOn(crypto.subtle, 'digest').mockRejectedValue(new Error('Synthetic crypto restriction'))
+    const store = useRpcStore()
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(digest).toHaveBeenCalledOnce())
+    expect(connectCalls).toHaveLength(1)
+    expect(store.isConnected).toBe(true)
+    expect(createV4GatewayAccess(store).deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
+  it('keeps transport startup working without offline authority when target storage is unavailable', async () => {
+    vi.spyOn(crypto.subtle, 'digest').mockResolvedValue(new ArrayBuffer(32))
+    const write = vi.fn(() => { throw new Error('Synthetic storage restriction') })
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: write, removeItem: () => {} })
+    const store = useRpcStore()
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    await Promise.resolve()
+    expect(connectCalls).toHaveLength(1)
+    expect(store.isConnected).toBe(true)
+    expect(write).toHaveBeenCalled()
+    expect(createV4GatewayAccess(store).deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
+  it('recovers the same Desktop descriptor after reload and fences a changed profile', async () => {
+    let payload = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'private-runtime-token', error: null,
+    }
+    window.opensquillaDesktop = {
+      getGatewayConnection: vi.fn(async () => payload),
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    let identity: string | null = null
+    for (let index = 0; index < 3; index += 1) {
+      setActivePinia(createPinia())
+      const store = useRpcStore()
+      store.init()
+      await vi.waitFor(() => expect(connectCalls).toHaveLength(index + 1))
+      const access = createV4GatewayAccess(store)
+      expect(access.deliveryIdentity).toBeNull()
+      clients[index].emit('_hello', deliveryHello())
+      await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+      if (index === 0) identity = access.deliveryIdentity
+      else if (index === 1) expect(access.deliveryIdentity).toBe(identity)
+      else expect(access.deliveryIdentity).not.toBe(identity)
+      expect(localStorage.getItem('opensquilla.deliverySalt.v1')).not.toContain('private-runtime-token')
+      store.$dispose()
+      if (index === 1) payload = { ...payload, profileFingerprint: 'profile-b' }
+    }
+  })
+
+  it('fences Desktop profile, process and token changes independently of the browser origin', async () => {
+    const base = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'private-runtime-token', error: null,
+    }
+    let publish!: (value: typeof base) => void
+    const getConnection = vi.fn(async () => base)
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(handler => { publish = handler; return () => {} }),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    let identity = access.deliveryIdentity
+    expect(identity).not.toBeNull()
+    publish({ ...base, revision: 2 })
+    expect(access.deliveryIdentity).toBe(identity)
+    let revision = 2
+    for (const changed of [
+      { profileFingerprint: 'profile-b' },
+      { instanceId: 'runtime-b' },
+      { authToken: 'private-rotated-token' },
+    ]) {
+      publish({ ...base, ...changed, revision: ++revision })
+      expect(access.deliveryIdentity).toBeNull()
+      clients[0].emit('_hello', deliveryHello())
+      await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+      expect(access.deliveryIdentity).not.toBe(identity)
+      expect(access.deliveryIdentity).not.toContain('private-')
+      identity = access.deliveryIdentity
+    }
+    store.disconnect()
+    expect(access.deliveryIdentity).toBeNull()
+    store.$dispose()
   })
 
   it('uses a URL token over stale browser storage before initial connect', () => {
@@ -463,19 +819,30 @@ describe('rpc link-token bootstrap', () => {
     const store = useRpcStore()
     store.init()
     await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
-    clients[0].emit('_hello', { auth: { principal: { isOwner: true } }, policy: { retained: true } })
+    clients[0].emit('_hello', { ...deliveryHello(), policy: { retained: true } })
+    const access = createV4GatewayAccess(store)
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    let identity = access.deliveryIdentity
+    expect(identity).not.toBeNull()
     await store.connect('ws://desktop/ws')
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
     expect(connectCalls).toHaveLength(1)
     expect(clients[0].disconnect).not.toHaveBeenCalled()
     expect(store.isLocalOwner).toBe(true)
     expect(store.policy).toEqual({ retained: true })
+    expect(access.deliveryIdentity).not.toBeNull()
+    expect(access.deliveryIdentity).toBe(identity)
+    identity = access.deliveryIdentity
     getConnection.mockRejectedValueOnce(new Error('IPC temporarily unavailable'))
     await store.connect('ws://desktop/ws')
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
     expect(store.error).toBeTruthy()
     expect(store.state).toBe('connected')
     expect(store.isLocalOwner).toBe(true)
     expect(connectCalls).toHaveLength(1)
     expect(clients[0].disconnect).not.toHaveBeenCalled()
+    expect(access.deliveryIdentity).not.toBeNull()
+    expect(access.deliveryIdentity).toBe(identity)
     store.$dispose()
   })
 

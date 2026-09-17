@@ -35,6 +35,20 @@
         {{ t('chat.pending.annotationUpgradeRequired') }}
       </span>
       <span
+        v-if="item.pendingDeliveryIdentity && item.pendingPersistenceState === 'retryable'"
+        class="chat-pending-save-status"
+        role="status"
+      >{{ t('chat.pending.offlineRejected') }}</span>
+      <span
+        v-if="item.pendingDeliveryIdentity && item.pendingPersistenceState !== 'saving'
+          && item.pendingPersistenceState !== 'cancelling'
+          && (offline || item.pendingDeliveryIdentity !== deliveryIdentity)"
+        class="chat-pending-save-status"
+        role="status"
+      >{{ t(item.pendingDeliveryIdentity !== deliveryIdentity
+        ? 'chat.pending.identityChanged'
+        : 'chat.pending.offlineQueued') }}</span>
+      <span
         v-if="item.pendingPersistenceState === 'saving'"
         class="chat-pending-save-status"
         role="status"
@@ -163,6 +177,7 @@ interface PendingQueueItem {
   deliveryState?: 'steering' | 'retryable'
   steerAttempt?: PendingSteerAttempt
   pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
+  pendingDeliveryIdentity?: string
 }
 
 type PendingSteerBlocker =
@@ -181,6 +196,8 @@ const props = withDefaults(defineProps<{
   steerAvailable?: boolean
   durableSteerAvailable?: boolean
   steerUnavailableMessage?: string
+  deliveryIdentity?: string | null
+  offline?: boolean
 }>(), {
   reorderEnabled: true,
 })
@@ -292,6 +309,7 @@ function removeLabel(item: PendingQueueItem, index: number): string {
 
 function canShowSteer(item: PendingQueueItem): boolean {
   return !item.hiddenControl && !item.retiredAnnotationInput && !item.pageContext
+    && !item.pendingDeliveryIdentity
 }
 
 function hasUnsendableAttachment(item: PendingQueueItem): boolean {

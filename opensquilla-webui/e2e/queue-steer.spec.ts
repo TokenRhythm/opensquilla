@@ -129,7 +129,10 @@ async function installMockGateway(
           policy: { concurrent_history_reads: true },
           features: { methods: ['sessions.steer.v2'] },
           auth: {
-            principal: { isOwner: true },
+            principal: {
+              role: 'operator', isOwner: true, authenticated: true, authState: 'authenticated',
+              scopes: ['operator.read', 'operator.write'], capabilities: ['chat.read', 'chat.write'],
+            },
             runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
           },
         }))

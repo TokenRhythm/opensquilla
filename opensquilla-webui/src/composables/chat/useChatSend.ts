@@ -165,6 +165,7 @@ interface SendAttempt {
   clientMessageId: string
   composerText: string
   requestSessionKey: string
+  deliveryIdentity?: string | null
   draftIds: string[]
   promptAnnotations: PromptAnnotationSnapshot[]
   promptAnnotationsAcknowledged?: boolean
@@ -490,6 +491,9 @@ export interface UseChatSendOptions {
   ) => void
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
+  /** Proven identity supplied only for an eligible, never-sent offline click. */
+  offlineQueueIdentity?: Readonly<Ref<string | null>>
+  deliveryIdentity?: Readonly<Ref<string | null>>
   /** Transport/admission-only gate used by exact replays after unknown acceptance. */
   idempotentReplayBlockedReason?: Readonly<Ref<string | null>>
   validateActiveProjectBeforeSend?: () => Promise<string | null>
@@ -543,6 +547,7 @@ export interface UseChatSendOptions {
       draftIds?: readonly string[]
       pageContext?: ChatPageContext
       attachments?: Attachment[]
+      deliveryIdentity?: string
     },
   ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
@@ -608,6 +613,12 @@ export function useChatSend(options: UseChatSendOptions) {
   const hiddenDispatchInFlight = new Map<string, Promise<HiddenControlDispatchResult>>()
   const renderedHiddenControls = new Set<string>()
   const acceptanceRecoveryVersion = ref(0)
+  const composerSubmissions = new Map<symbol, { sessionKey: string; snapshot: ComposerSnapshot }>()
+  const composerSubmissionVersion = ref(0)
+  const sendPending = computed(() => {
+    composerSubmissionVersion.value
+    return [...composerSubmissions.values()].some(entry => entry.sessionKey === options.sessionKey.value)
+  })
 
   function noteAcceptanceRecoveryChanged() {
     acceptanceRecoveryVersion.value += 1
@@ -2162,13 +2173,36 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
-  async function onSend(invocation: {
+  type SendInvocation = {
     bypassSlashCommand?: boolean
     composerText?: string
     textOverride?: string
     cancelIfComposerChanged?: boolean
-  } = {}) {
+  }
+
+  async function onSend(invocation: SendInvocation = {}) {
+    const key = options.sessionKey.value
+    if ([...composerSubmissions.values()].some(entry => (
+      entry.sessionKey === key && composerMatchesSnapshot(entry.snapshot)
+    ))) return
+    const token = Symbol('composer-send')
+    composerSubmissions.set(token, { sessionKey: key, snapshot: captureComposerSnapshot() })
+    composerSubmissionVersion.value += 1
+    try {
+      await sendComposerInput(invocation)
+    } finally {
+      composerSubmissions.delete(token)
+      composerSubmissionVersion.value += 1
+    }
+  }
+
+  async function sendComposerInput(invocation: SendInvocation) {
     const requestSessionKey = options.sessionKey.value
+    const requestDeliveryIdentity = options.deliveryIdentity?.value
+    const deliveryStillMatches = () => (
+      options.sessionKey.value === requestSessionKey
+      && options.deliveryIdentity?.value === requestDeliveryIdentity
+    )
     const composerSnapshot = captureComposerSnapshot()
     const bypassSlashCommand = invocation.bypassSlashCommand === true
     const composerText = invocation.composerText ?? options.inputText.value
@@ -2208,13 +2242,15 @@ export function useChatSend(options: UseChatSendOptions) {
       ? recoveredAttempt
       : null
     if (exactReplayAttempt) {
+      if (exactReplayAttempt.deliveryIdentity !== undefined
+        && exactReplayAttempt.deliveryIdentity !== requestDeliveryIdentity) return
       const replayBlockedReason = options.idempotentReplayBlockedReason
         || options.sendBlockedReason
       if (replayBlockedReason?.value) return
       if (options.validateActiveProjectBeforeSend) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
-      if (options.sessionKey.value !== requestSessionKey) return
+      if (!deliveryStillMatches()) return
       if (replayBlockedReason?.value) return
       await dispatchSend(exactReplayAttempt.text, {
         composerText,
@@ -2222,7 +2258,33 @@ export function useChatSend(options: UseChatSendOptions) {
         queueMode: exactReplayAttempt.queueMode,
         retryAttempt: exactReplayAttempt,
         idempotentReplay: true,
+        preDispatchGuard: deliveryStillMatches,
       })
+      return
+    }
+
+    const offlineIdentity = options.offlineQueueIdentity?.value
+    if (offlineIdentity && hasPayload) {
+      // This branch has never called the command port. Already-submitted
+      // requests retain the exact receipt-recovery path above.
+      if (
+        recoveredAttempt
+        || handoffInFlight
+        || !requestSessionKey
+        || offlineIdentity !== options.deliveryIdentity?.value
+        || isControlInput(durableText)
+        || invocation.textOverride !== undefined
+        || composerSnapshot.intent
+        || composerSnapshot.forkBeforeMessageId
+        || composerSnapshot.workspaceId
+        || composerSnapshot.draftIds.length > 0
+        || composerSnapshot.pageContext
+        || modelImageSendBlocked(composerSnapshot.payloadAttachments)
+      ) return
+      const queued = await options.enqueuePendingInput(durableText, undefined, {
+        deliveryIdentity: offlineIdentity,
+      })
+      if (!queued) pushToast(i18n.global.t('chat.toast.offlineQueueFailed'), { tone: 'warn' })
       return
     }
 
@@ -2235,7 +2297,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.validateActiveProjectBeforeSend) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
-      if (options.sessionKey.value !== requestSessionKey) return
+      if (!deliveryStillMatches()) return
       if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
@@ -2274,6 +2336,7 @@ export function useChatSend(options: UseChatSendOptions) {
         payload: payloadFromSnapshot(composerSnapshot),
         composerSnapshot,
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
+        preDispatchGuard: deliveryStillMatches,
       })
       return
     }
@@ -2285,7 +2348,7 @@ export function useChatSend(options: UseChatSendOptions) {
       : null
     if (slashClassification !== null) {
       if (
-        options.sessionKey.value !== requestSessionKey
+        !deliveryStillMatches()
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
@@ -2296,7 +2359,7 @@ export function useChatSend(options: UseChatSendOptions) {
         && await refreshedActiveProjectBlocksSend()
       ) return
       if (
-        options.sessionKey.value !== requestSessionKey
+        !deliveryStillMatches()
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
@@ -2410,7 +2473,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (handled) return
     }
 
-    if (!hasPayload || !options.sessionKey.value) return
+    if (!hasPayload || !deliveryStillMatches()) return
 
     await dispatchSend(text, {
       composerText,
@@ -2418,6 +2481,7 @@ export function useChatSend(options: UseChatSendOptions) {
       payload: payloadFromSnapshot(composerSnapshot),
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
+      preDispatchGuard: deliveryStillMatches,
     })
   }
 
@@ -2449,6 +2513,10 @@ export function useChatSend(options: UseChatSendOptions) {
     const ownerSessionKey = expectedSessionKey
       || item.ownerSessionKey
       || options.sessionKey.value
+    const identityStillMatches = () => !item.pendingDeliveryIdentity || (
+      item.pendingDeliveryIdentity === options.deliveryIdentity?.value
+      && !options.offlineQueueIdentity?.value
+    )
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
     const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
@@ -2463,7 +2531,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
-    if (options.sendBlockedReason?.value) {
+    if (!identityStillMatches() || options.sendBlockedReason?.value) {
       return blockedOutcome()
     }
     if (options.validateActiveProjectBeforeSend) {
@@ -2471,7 +2539,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (!identityStillMatches() || options.sendBlockedReason?.value) return blockedOutcome()
     }
     if (options.hasPendingAttachmentWork()) {
       if (delivery === 'steer') {
@@ -2566,6 +2634,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (delivery === 'steer') {
+      if (item.pendingDeliveryIdentity) return preserveRetryState('not_sent')
       if (text.startsWith('//')) return preserveRetryState('not_sent')
       return dispatchSteerV2(text, { queuedItem: item })
     }
@@ -2581,6 +2650,7 @@ export function useChatSend(options: UseChatSendOptions) {
         forkBeforeMessageId: null,
       },
       preserveComposer: true,
+      preDispatchGuard: identityStillMatches,
       retryAttempt,
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
@@ -2616,6 +2686,7 @@ export function useChatSend(options: UseChatSendOptions) {
     sendOpts: DispatchSendOptions = {},
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
+    const requestDeliveryIdentity = options.deliveryIdentity?.value
     if (!requestSessionKey) return 'not_sent'
     const blockedReason = sendOpts.idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
@@ -2623,7 +2694,8 @@ export function useChatSend(options: UseChatSendOptions) {
     if (blockedReason?.value) return 'not_sent'
     const preDispatchAllowed = (
       stage: 'preflight' | 'before_rpc' = 'preflight',
-    ) => sendOpts.preDispatchGuard?.(stage) !== false
+    ) => options.deliveryIdentity?.value === requestDeliveryIdentity
+      && sendOpts.preDispatchGuard?.(stage) !== false
     if (!preDispatchAllowed()) return 'not_sent'
     let preserveComposer = sendOpts.preserveComposer === true
     const sourceAttachments = sendOpts.payload?.attachments
@@ -2692,6 +2764,8 @@ export function useChatSend(options: UseChatSendOptions) {
       ),
     )
     const retryAttempt = isRecoveredRetry ? retryCandidate : null
+    if (retryAttempt?.deliveryIdentity !== undefined
+      && retryAttempt.deliveryIdentity !== requestDeliveryIdentity) return 'not_sent'
     // The automatic receipt recovery and a user-triggered retry share the
     // immutable SendAttempt. Never put the same idempotency key on the wire
     // twice concurrently.
@@ -2708,9 +2782,10 @@ export function useChatSend(options: UseChatSendOptions) {
     ) {
       const ready = await options.preparePromptAnnotationsForSend(
         attemptAnnotationDraftIds,
-        { isCurrent: () => options.sessionKey.value === requestSessionKey },
+        { isCurrent: () => options.sessionKey.value === requestSessionKey && preDispatchAllowed() },
       )
       if (!ready || options.sessionKey.value !== requestSessionKey) return 'not_sent'
+      if (!preDispatchAllowed()) return 'not_sent'
       if (options.sendBlockedReason?.value) return 'not_sent'
       if (
         JSON.stringify(currentAnnotationDraftIds())
@@ -2729,7 +2804,7 @@ export function useChatSend(options: UseChatSendOptions) {
       : undefined
     if (!retryAttempt && !serverStagedPendingItem && options.prepareAttachmentsForSend) {
       const ready = await options.prepareAttachmentsForSend({
-        isCurrent: () => options.sessionKey.value === requestSessionKey,
+        isCurrent: () => options.sessionKey.value === requestSessionKey && preDispatchAllowed(),
         attachments: sourceAttachments,
       })
       if (!ready) return 'not_sent'
@@ -2852,6 +2927,7 @@ export function useChatSend(options: UseChatSendOptions) {
         clientMessageId,
         composerText: sendOpts?.composerText ?? text,
         requestSessionKey,
+        deliveryIdentity: requestDeliveryIdentity,
         draftIds: [...attemptAnnotationDraftIds],
         promptAnnotations: sentSnapshots,
         pageContext: attemptPageContext,
@@ -3303,6 +3379,46 @@ export function useChatSend(options: UseChatSendOptions) {
         }
       }
       rememberRetryableAttempt(true)
+      if (!preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
+        const restoredSnapshot = captureComposerSnapshot()
+        const canRetry = commandError?.accepted === false
+          && commandError.retryable !== false
+          && Boolean(attempt.deliveryIdentity)
+          && attempt.deliveryIdentity === options.deliveryIdentity?.value
+          && restoredSnapshot.inputText === attempt.composerText
+          && matchesRecoveredDraft(attempt, {
+            requestSessionKey,
+            draftIds: restoredSnapshot.draftIds,
+            pageContext: restoredSnapshot.pageContext,
+            text: attempt.text,
+            attachments: restoredSnapshot.payloadAttachments.filter(isSendableAttachment),
+            intent: restoredSnapshot.intent,
+            initialCollaborationMode: restoredSnapshot.initialCollaborationMode,
+            initialRoutingMode: restoredSnapshot.initialRoutingMode,
+            forkBeforeMessageId: restoredSnapshot.forkBeforeMessageId,
+            workspaceId: restoredSnapshot.workspaceId,
+          })
+        pushToast(sendFailureMessage(err), {
+          tone: 'danger',
+          duration: 8000,
+          ...(canRetry ? { action: {
+            label: i18n.global.t('chat.retry'),
+            onClick: () => {
+              if (
+                recoveredAttempt !== attempt
+                || options.sessionKey.value !== requestSessionKey
+                || attempt.deliveryIdentity !== options.deliveryIdentity?.value
+                || !composerMatchesSnapshot(restoredSnapshot)
+                || options.sendBlockedReason?.value
+                || options.offlineQueueIdentity?.value
+                || options.stream.isStreaming.value
+                || hasAuthoritativeWork()
+              ) return
+              void onSend()
+            },
+          } } : {}),
+        })
+      }
       if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
         options.messages.value.push({
           role: 'error',
@@ -4208,6 +4324,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   return {
     onSend,
+    sendPending,
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,

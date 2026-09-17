@@ -53,6 +53,8 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
     get isAvailable() { return rpc.isConnected },
     get isLocalOwner() { return rpc.isLocalOwner },
     get isAuthenticated() { return rpc.isConnected },
+    guestSessionOwnerId: null,
+    deliveryIdentity: null,
     get canManageProjectWorkspaces() { return rpc.canManageProjectWorkspaces },
     get canChooseProject() { return rpc.canChooseProject },
     runModePolicy: null,

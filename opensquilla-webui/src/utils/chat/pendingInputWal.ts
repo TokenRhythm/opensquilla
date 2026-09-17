@@ -34,6 +34,8 @@ export interface PendingInputWalRecord {
   state: PendingInputWalState
   /** True once enqueue may have crossed the browser/Gateway boundary. */
   mayHaveServerCopy?: boolean
+  /** Credential-free Gateway/subject fingerprint for a never-sent offline draft. */
+  deliveryIdentity?: string
   /** Complete an in-flight tombstone by preserving the text as a local draft. */
   retainAfterCancel?: boolean
   requestFingerprint?: string
@@ -148,6 +150,10 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
     && typeof record.clientMessageId === 'string'
     && record.clientMessageId.length > 0
     && typeof record.text === 'string'
+    && (record.deliveryIdentity === undefined || (
+      typeof record.deliveryIdentity === 'string'
+      && record.deliveryIdentity.length > 0
+    ))
     && validAnnotationDraftIds(record.draftIds)
     && (record.pageContext === undefined || normalizePageContext(record.pageContext) !== null)
     && Array.isArray(record.attachments)

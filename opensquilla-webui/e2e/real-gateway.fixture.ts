@@ -39,9 +39,11 @@ async function reserveLoopbackPort(): Promise<number> {
 export const test = base.extend<{
   isolatedRealGateway: IsolatedRealGateway
   isolatedRealGatewayScenario: RealGoalGatewayScenario
+  isolatedRealGatewayAuthMode: 'none' | 'token'
 }>({
   isolatedRealGatewayScenario: ['lifecycle', { option: true }],
-  isolatedRealGateway: async ({ isolatedRealGatewayScenario }, use, testInfo) => {
+  isolatedRealGatewayAuthMode: ['none', { option: true }],
+  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode }, use, testInfo) => {
     const webuiPort = await reserveLoopbackPort()
     const webuiOrigin = `http://127.0.0.1:${webuiPort}`
     const gateway = await startRealGoalGateway({
@@ -50,6 +52,7 @@ export const test = base.extend<{
       // This deterministic provider also supports an ordinary chat turn; the
       // release gate lets the test prove the UI is connected before it replies.
       scenario: isolatedRealGatewayScenario,
+      authMode: isolatedRealGatewayAuthMode,
     })
     const gatewayHttpUrl = gateway.wsUrl.replace(/^ws:/, 'http:').replace(/\/ws$/, '')
     const webuiRoot = fileURLToPath(new URL('..', import.meta.url))

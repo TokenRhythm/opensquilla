@@ -583,6 +583,8 @@
       :steer-available="sameTurnSteerAvailable"
       :durable-steer-available="turnCommands.supports('durable-steer')"
       :steer-unavailable-message="sameTurnSteerUnavailableMessage"
+      :delivery-identity="gatewayAccess.deliveryIdentity"
+      :offline="!gatewayAccess.isAvailable"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
@@ -617,6 +619,7 @@
       :attachments="pendingAttachments"
       :busy-send-mode="busySendMode"
       :has-send-content="composerHasSendContent"
+      :send-pending="chatSend.sendPending.value"
       :is-streaming="isStreaming"
       :can-stop="canStop"
       :stop-targets-plan-run="composerStopsPlanRun"
@@ -1153,6 +1156,7 @@ const toolResultModal = ref<{
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
+const deliveryIdentity = computed(() => gatewayAccess.deliveryIdentity)
 const gatewayConnectionState = computed(() => gatewayAccess.availability === 'available'
   ? 'connected'
   : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
@@ -1903,6 +1907,8 @@ const chatPendingQueue = useChatPendingQueue({
   pendingInputWal,
   pendingInputQueue,
   connectionState: gatewayConnectionState,
+  deliveryIdentity,
+  composerRevision,
   prepareAttachmentsForSend,
   onPendingPersistenceError: reason => {
     const message = reason === 'order_conflict'
@@ -1911,7 +1917,7 @@ const chatPendingQueue = useChatPendingQueue({
       ? 'Queued attachments are not supported yet. Your draft was kept.'
       : reason === 'wal_failed'
         ? 'Could not save the queued message locally. Your draft was kept.'
-        : 'The queued message is still saved locally and will retry after reconnecting.'
+        : t('chat.pending.offlineRejected')
     pushToast(message, {
       tone: ['server_rejected', 'order_conflict'].includes(reason) ? 'warn' : 'danger',
     })
@@ -2086,10 +2092,12 @@ const {
   loadCurrentSessionUsage,
 } = chatUsageWidget
 
-const chatSessionRoute = useChatSessionRoute(sessionKey)
+const chatSessionRoute = useChatSessionRoute(sessionKey, () => gatewayAccess.guestSessionOwnerId)
 const {
   route,
   createSessionKey,
+  forgetFreshDraftSession,
+  rebindFreshDraftSession,
   draftAgentId,
   goToDraft,
   hasLegacyNewChatQuery,
@@ -2758,6 +2766,7 @@ function startSessionBootstrap(options?: {
   includeHistory?: boolean
   force?: boolean
 }) {
+  bindFreshGuestDraft()
   const key = sessionKey.value
   return bindSessionBootstrapRun(startSessionBootstrapCoordinator(options), key)
 }
@@ -2803,6 +2812,7 @@ function handleSessionConnectionState(
   state: string,
   includeHistory = true,
 ) {
+  if (state === 'connected') bindFreshGuestDraft()
   const run = handleSessionConnectionStateCoordinator(state, includeHistory)
   if (
     run
@@ -2812,6 +2822,31 @@ function handleSessionConnectionState(
     return trackSessionBootstrapAdmission(run)
   }
   return run
+}
+
+function bindFreshGuestDraft() {
+  if (
+    pendingSessionIntent.value !== 'new_chat'
+    || messages.value.length > 0
+    || isStreaming.value
+    || acceptanceRecoveryPending.value
+    || acceptanceStopPending.value
+    || activeStreamTaskId.value
+    || activeTaskGroups.value.size > 0
+    || pendingQueue.value.length > 0
+    || pendingQueueOwnerContext.value
+  ) return
+  rebindFreshDraftSession(key => {
+    // Hello owns the namespace. Cancel the captured pre-Hello lease before
+    // ready() continuations can subscribe with its provisional owner key.
+    cancelSessionBootstrap()
+    metaDraftRecovery.invalidate()
+    draftPersistence.rebindCurrentDraft(key)
+    // A change of authority preserves the editor but requires explicit Send.
+    pendingAutoSend.value = ''
+    pendingAutoSendSessionKey.value = ''
+    persistDraftHistoryState()
+  })
 }
 
 const isSessionHydrating = computed(() => livePhase.value === 'connecting')
@@ -2831,6 +2866,34 @@ const deliveryBlockedReason = computed<string | null>(() => (
 const effectiveSendBlockedReason = computed<string | null>(() => (
   deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
 ))
+const provenSessionDelivery = ref<{
+  key: string; identity: string; withoutProject: boolean
+} | null>(null)
+watch(
+  [sessionKey, deliveryIdentity, () => gatewayAccess.isAvailable, livePhase, activeWorkspaceStatus],
+  ([key, identity, available, live, workspaceStatus]) => {
+    if (available && live === 'ready' && key && identity) {
+      provenSessionDelivery.value = { key, identity, withoutProject: workspaceStatus === 'none' }
+    }
+  },
+)
+const offlineQueueIdentity = computed<string | null>(() => {
+  const identity = deliveryIdentity.value
+  const proven = provenSessionDelivery.value
+  if (
+    gatewayAccess.isAvailable || gatewayAccess.requiresCredential
+    || !identity || proven?.identity !== identity || proven.key !== sessionKey.value
+    || !proven.withoutProject
+    || pendingSessionIntent.value || pendingForkBeforeMessageId.value
+    || boundWorkspaceId.value || pendingWorkspaceId.value
+    || goalDraftArmed.value || replanActive.value || collaboration.value.mode !== 'default'
+    || forkTransition.value || acceptanceRecoveryPending.value || acceptanceStopPending.value
+    || sendableAnnotationDraftIds.value.length > 0 || hasPendingAttachmentWork()
+    || promptAnnotationSendBlockedReason.value
+    || /^[!/]/.test(inputText.value.trim())
+  ) return null
+  return identity
+})
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
 watch(
   livePhase,
@@ -2848,8 +2911,8 @@ watch(livePhase, (phase, previousPhase) => {
 })
 watch(activeWorkspaceStatus, (status, previousStatus) => {
   if (
-    status !== 'ready'
-    || previousStatus === 'ready'
+    (status !== 'ready' && status !== 'none')
+    || previousStatus === status
     || pendingQueue.value.length === 0
   ) return
   schedulePendingDrainAfterTerminal()
@@ -3333,7 +3396,19 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   metaRunCenter,
-  turnCommands,
+  turnCommands: {
+    send(request, options) {
+      // Retire freshness at the delivery boundary, including hidden sends and
+      // unknown acceptance receipts. A reconnect must retain that attempt's key.
+      forgetFreshDraftSession(
+        request.kind === 'new-turn' ? request.params.sessionKey : request.params.key,
+      )
+      return turnCommands.send(request, options)
+    },
+    cancel: (request, options) => turnCommands.cancel(request, options),
+    steer: (request, options) => turnCommands.steer(request, options),
+    supports: capability => turnCommands.supports(capability),
+  },
   activeSteerCapability,
   inputText,
   messages,
@@ -3353,6 +3428,8 @@ const chatSend = useChatSend({
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,
+  offlineQueueIdentity,
+  deliveryIdentity,
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
@@ -4591,8 +4668,8 @@ const composerSendBlockedMessage = computed(() =>
       )
     : '')
   || modelImageSendBlockedMessage.value
-  || effectiveSendBlockedReason.value
-  || activeProjectComposerBlockMessage.value,
+  || (offlineQueueIdentity.value ? null : effectiveSendBlockedReason.value)
+  || (offlineQueueIdentity.value ? '' : activeProjectComposerBlockMessage.value),
 )
 
 const sendButtonTitle = computed(() => {

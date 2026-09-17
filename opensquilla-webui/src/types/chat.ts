@@ -193,6 +193,8 @@ export interface ChatPendingItem {
    * delete intent.
    */
   pendingMayHaveServerCopy?: boolean
+  /** Offline drafts may only cross the wire under their original Gateway identity. */
+  pendingDeliveryIdentity?: string
   /** A cancelling transport row must become a local editable draft after tombstoning. */
   pendingRetainAfterCancel?: boolean
   /** Browser/server staging lifecycle. Unknown enqueue results remain `saving`. */

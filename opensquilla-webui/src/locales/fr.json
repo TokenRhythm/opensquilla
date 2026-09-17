@@ -3443,6 +3443,7 @@
       "autoPauseLabel": "Pause automatique",
       "states": { "off": "Désactivé", "waiting": "En attente d'un préfixe stable", "scheduled": "Planifié", "probing": "Sonde en cours", "paused": "Limite d'inactivité atteinte ; attente du prochain message", "stopped": "Arrêté après échec" }
     },
+    "sendPending": "Envoi en cours…",
     "send": "Envoyer",
     "sendQueues": "Envoyer (mise en file après la réponse actuelle)",
     "sendSteers": "Envoyer (réoriente la réponse actuelle maintenant)",
@@ -4092,6 +4093,9 @@
       },
       "clearQueue": "Vider la file",
       "removeMessage": "Supprimer le message en attente {index}",
+      "offlineRejected": "Le message n’a pas été accepté. Modifiez-le pour réessayer, ou supprimez-le.",
+      "offlineQueued": "Enregistré localement. Le message sera envoyé au rétablissement de la connexion.",
+      "identityChanged": "L’identité de connexion a changé. Reconnectez-vous à la passerelle et au compte d’origine pour envoyer ce message.",
       "annotationUpgradeRequired": "Cette annotation utilise l’ancien éditeur. Modifiez le message et sélectionnez à nouveau la page avant de l’envoyer."
     },
     "metaRuns": {
@@ -4282,6 +4286,7 @@
       "waitCompactionBeforeCommand": "Attendez le compactage du contexte avant d'exécuter {command}.",
       "waitResponseBeforeCommand": "Attendez la réponse actuelle avant d'exécuter {command}.",
       "promptAnnotationBusy": "Attendez la fin de la réponse en cours avant d’envoyer les instructions sur le livrable.",
+      "offlineQueueFailed": "Impossible de mettre ce message en attente. Votre brouillon a été conservé.",
       "queueFull": "La file d'attente est pleine — attendez la fin de la réponse actuelle.",
       "queuePersistenceUnavailable": "Conservez ce message dans l’éditeur jusqu’à la fin de la bifurcation ; la récupération durable est indisponible.",
       "messageStillSaving": "Ce message n'est pas encore enregistré — réessayez dans un instant.",

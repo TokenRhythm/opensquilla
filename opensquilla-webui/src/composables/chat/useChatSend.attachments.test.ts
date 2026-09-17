@@ -1155,6 +1155,190 @@ describe('useChatSend dedicated usage-barrier replay', () => {
 })
 
 describe('useChatSend attachment payloads', () => {
+  it('shows pending feedback synchronously and coalesces a duplicate click during preparation', async () => {
+    let finish!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<null>(resolve => {
+      finish = () => resolve(null)
+    }))
+    const { api, rpc } = makeOptions({ validateActiveProjectBeforeSend })
+    const first = api.onSend()
+    expect(api.sendPending.value).toBe(true)
+    const second = api.onSend()
+    finish()
+    await Promise.all([first, second])
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(api.sendPending.value).toBe(false)
+  })
+
+  it('queues an ordinary offline click without sending or changing its attachments', async () => {
+    const enqueuePendingInput = vi.fn(async () => true)
+    const { api, rpc, options } = makeOptions({
+      sendBlockedReason: ref('Live updates are reconnecting'),
+      offlineQueueIdentity: ref('synthetic-gateway:owner'),
+      deliveryIdentity: ref('synthetic-gateway:owner'),
+      enqueuePendingInput,
+    })
+    await api.onSend()
+    expect(enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('hello', undefined, {
+      deliveryIdentity: 'synthetic-gateway:owner',
+    })
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('never turns an ambiguous direct send into an offline queue item', async () => {
+    const offlineQueueIdentity = ref<string | null>(null)
+    const sendBlockedReason = ref<string | null>(null)
+    const { api, rpc, options } = makeOptions({
+      rpc: { call: vi.fn().mockRejectedValue(new RpcTransportError('Lost receipt', null)) },
+      offlineQueueIdentity, sendBlockedReason,
+      deliveryIdentity: ref('synthetic-gateway:owner'),
+    })
+    await api.onSend()
+    offlineQueueIdentity.value = 'synthetic-gateway:owner'
+    sendBlockedReason.value = 'Live updates are reconnecting'
+    options.inputText.value = 'A different draft'
+    await api.onSend()
+    expect(options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(options.inputText.value).toBe('A different draft')
+  })
+
+  it('offers Retry for a definite rejection and refuses it after the draft or identity changes', async () => {
+    pushToast.mockClear()
+    const deliveryIdentity = ref<string | null>('synthetic-gateway:owner')
+    const { api, rpc, options } = makeOptions({
+      rpc: { call: vi.fn().mockRejectedValue(Object.assign(new Error('Synthetic busy'), {
+        accepted: false, retryable: true,
+      })) },
+      deliveryIdentity,
+    })
+    await api.onSend()
+    const action = pushToast.mock.calls.find(([, toast]) => toast?.action)?.[1].action
+    expect(action?.label).toBe('Retry')
+    options.inputText.value = 'Newer draft'
+    await action.onClick()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(options.inputText.value).toBe('Newer draft')
+    options.inputText.value = 'hello'
+    deliveryIdentity.value = 'synthetic-gateway:guest'
+    await action.onClick()
+    expect(rpc.call).toHaveBeenCalledOnce()
+  })
+
+  it('retries a definitively rejected draft with the original idempotency identity', async () => {
+    pushToast.mockClear()
+    const { api, rpc } = makeOptions({
+      rpc: { call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('Synthetic busy'), { accepted: false, retryable: true }))
+        .mockResolvedValue({ sessionKey: 'agent:main:webchat:test' }) },
+      deliveryIdentity: ref('synthetic-owner'),
+    })
+    await api.onSend()
+    const action = pushToast.mock.calls.find(([, toast]) => toast?.action)?.[1].action
+    expect(action).toBeDefined()
+    action.onClick()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(rpc.call.mock.calls[0]?.[1])
+  })
+
+  it('does not send a Retry toast payload under an identity changed during project validation', async () => {
+    pushToast.mockClear()
+    const deliveryIdentity = ref<string | null>('synthetic-owner')
+    let finish!: () => void
+    const validate = vi.fn<() => Promise<null>>().mockResolvedValue(null)
+    const { api, rpc, options } = makeOptions({
+      deliveryIdentity,
+      validateActiveProjectBeforeSend: validate,
+      rpc: { call: vi.fn().mockRejectedValue(Object.assign(new Error('Synthetic busy'), {
+        accepted: false, retryable: true,
+      })) },
+    })
+    await api.onSend()
+    const action = pushToast.mock.calls.find(([, toast]) => toast?.action)?.[1].action
+    expect(action).toBeDefined()
+    validate.mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(null) }))
+    action.onClick()
+    deliveryIdentity.value = 'synthetic-other-owner'
+    finish()
+    await vi.waitFor(() => expect(api.sendPending.value).toBe(false))
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(options.inputText.value).toBe('hello')
+  })
+
+  it.each(['rejected', 'unknown'])(
+    'does not reuse a %s receipt after the target identity changes', async acceptance => {
+      const deliveryIdentity = ref<string | null>('synthetic-owner')
+      const error = acceptance === 'unknown'
+        ? new RpcTransportError('Synthetic lost receipt', null)
+        : Object.assign(new Error('Synthetic busy'), { accepted: false, retryable: true })
+      const { api, rpc, options } = makeOptions({
+        deliveryIdentity, rpc: { call: vi.fn().mockRejectedValue(error) },
+      })
+      await api.onSend()
+      const messages = [...options.messages.value]
+      deliveryIdentity.value = 'synthetic-other-owner'
+      await api.onSend()
+      expect(rpc.call).toHaveBeenCalledOnce()
+      expect(options.messages.value).toEqual(messages)
+    },
+  )
+
+  it('keeps a direct send draft when the identity changes during attachment preparation', async () => {
+    const deliveryIdentity = ref<string | null>('synthetic-owner')
+    let finish!: (value: boolean) => void
+    let isCurrent!: () => boolean
+    const { api, rpc, options } = makeOptions({
+      deliveryIdentity,
+      prepareAttachmentsForSend: state => {
+        isCurrent = state!.isCurrent!
+        return new Promise(resolve => { finish = resolve })
+      },
+    })
+    const sent = api.onSend()
+    expect(isCurrent()).toBe(true)
+    deliveryIdentity.value = 'synthetic-other-owner'
+    expect(isCurrent()).toBe(false)
+    finish(true)
+    await sent
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.messages.value).toEqual([])
+  })
+
+  it.each([
+    { label: 'new task', pendingSessionIntent: ref<string | null>('new_chat') },
+    { label: 'fork', pendingForkBeforeMessageId: ref<string | null>('synthetic-fork') },
+    { label: 'control', inputText: ref('/reset') },
+  ])('keeps the $label draft editable rather than queueing it offline', async ({ label: _label, ...overrides }) => {
+    const { api, rpc, options } = makeOptions({
+      offlineQueueIdentity: ref('synthetic-owner'), deliveryIdentity: ref('synthetic-owner'),
+      sendBlockedReason: ref('Reconnecting'), ...overrides,
+    })
+    const before = options.inputText.value
+    await api.onSend()
+    expect(options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe(before)
+  })
+
+  it('fences offline queue dispatch if the identity changes during project validation', async () => {
+    let finish!: () => void
+    const deliveryIdentity = ref<string | null>('synthetic-owner')
+    const { api, rpc } = makeOptions({
+      deliveryIdentity,
+      validateActiveProjectBeforeSend: () => new Promise<null>(resolve => { finish = () => resolve(null) }),
+    })
+    const sent = api.sendQueuedFollowup({
+      pendingUiId: 'synthetic-offline-item', text: 'Private draft', attachments: [], intent: null,
+      ownerSessionKey: 'agent:main:webchat:test', pendingDeliveryIdentity: 'synthetic-owner',
+    })
+    deliveryIdentity.value = 'synthetic-guest'
+    finish()
+    await expect(sent).resolves.toBe('deferred')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
   it('replays a persisted handoff identity after refresh and repairs its owner queue', async () => {
     const parent = 'agent:main:webchat:parent'
     const child = 'agent:main:webchat:child'

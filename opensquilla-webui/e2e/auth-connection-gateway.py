@@ -38,8 +38,11 @@ async def main() -> None:
     storage = await SessionStorage.open(str(state / "sessions.db"))
     manager = SessionManager(storage)
     subscriptions = SubscriptionManager()
+    release_handshake = asyncio.Event()
 
     async def websocket(ws) -> None:
+        if ws.query_params.get("holdHandshake") == "1":
+            await release_handshake.wait()
         await handle_ws_connection(
             ws,
             config,
@@ -55,9 +58,20 @@ async def main() -> None:
             await connection.close(code=1012, reason="synthetic_auth_configuration_restart")
         return JSONResponse({"mode": "token"})
 
+    async def release_connection(_request):
+        release_handshake.set()
+        return JSONResponse({"released": True})
+
+    async def reconnect(_request):
+        for connection in get_registry().all():
+            await connection.close(code=1012, reason="synthetic_connection_restart")
+        return JSONResponse({"restarted": True})
+
     app = Starlette(routes=[
         WebSocketRoute("/ws", websocket),
         Route("/enable-token", enable_token, methods=["POST"]),
+        Route("/release-handshake", release_connection, methods=["POST"]),
+        Route("/reconnect", reconnect, methods=["POST"]),
     ])
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
     task = asyncio.create_task(server.serve())

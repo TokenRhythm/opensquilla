@@ -21,6 +21,10 @@ interface GatewayAccessSource {
   readonly auth: Record<string, unknown> | null
   readonly policy: Record<string, unknown> | null
   readonly connectionGeneration: number
+  readonly deliveryContext: {
+    readonly targetId: string
+    readonly principal: unknown
+  } | null
   hasRpcEvent(event: string): boolean
   connect(url: string, token?: string): Promise<void>
   disconnect(): void
@@ -61,6 +65,60 @@ function authenticated(auth: GatewayAccessSource['auth']): boolean {
   return principal?.authState === 'authenticated'
 }
 
+function guestSessionOwnerId(source: GatewayAccessSource): string | null {
+  const principal = objectValue(source.auth?.principal)
+  if (
+    source.state !== 'connected'
+    || source.isLocalOwner
+    || principal?.isOwner !== false
+    || principal.authenticated !== false
+    || !['guest', 'invalid'].includes(String(principal.authState))
+  ) return null
+  const ownerId = principal.guestOwnerId
+  return typeof ownerId === 'string' && /^[0-9a-f]{64}$/.test(ownerId) ? ownerId : null
+}
+
+function authoritySet(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.some(item => (
+    typeof item !== 'string' || !item || item !== item.trim()
+  ))) return null
+  return [...new Set(value as string[])].sort()
+}
+
+function deliveryIdentity(source: GatewayAccessSource): string | null {
+  const context = source.deliveryContext
+  const principal = objectValue(context?.principal)
+  if (!context?.targetId || !principal) return null
+  const scopes = authoritySet(principal.scopes)
+  const capabilities = authoritySet(principal.capabilities)
+  const authState = principal.authState
+  const tokenPublicId = principal.tokenPublicId ?? null
+  const guestOwnerId = principal.guestOwnerId ?? null
+  if (
+    !['operator', 'node'].includes(String(principal.role))
+    || typeof principal.authenticated !== 'boolean'
+    || typeof principal.isOwner !== 'boolean'
+    || !['authenticated', 'guest', 'invalid'].includes(String(authState))
+    || !scopes || !capabilities
+    || (tokenPublicId !== null && (
+      typeof tokenPublicId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(tokenPublicId)
+    ))
+  ) return null
+  if (authState === 'authenticated') {
+    if ((!principal.authenticated && !principal.isOwner) || guestOwnerId !== null) return null
+  } else if (
+    principal.authenticated || principal.isOwner
+    || typeof guestOwnerId !== 'string' || !/^[0-9a-f]{64}$/.test(guestOwnerId)
+  ) return null
+  // The opaque target id binds the actual endpoint/profile/credentials.
+  // URLs and raw credentials never enter this serializable queue identity.
+  return JSON.stringify([
+    'delivery-v1', context.targetId, principal.role, authState,
+    principal.authenticated, principal.isOwner, scopes, capabilities,
+    tokenPublicId, guestOwnerId,
+  ])
+}
+
 function runModePolicy(auth: GatewayAccessSource['auth']): GatewayRunModePolicy | null {
   const policy = objectValue(auth?.runModePolicy)
   if (!policy) return null
@@ -98,6 +156,12 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     },
     get isAuthenticated() {
       return authenticated(source.auth)
+    },
+    get guestSessionOwnerId() {
+      return guestSessionOwnerId(source)
+    },
+    get deliveryIdentity() {
+      return deliveryIdentity(source)
     },
     get canManageProjectWorkspaces() {
       return source.canManageProjectWorkspaces

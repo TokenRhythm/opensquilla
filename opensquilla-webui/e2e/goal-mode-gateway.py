@@ -325,6 +325,9 @@ async def main() -> None:
     scenario = os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_SCENARIO", "continuation")
     if scenario not in {"continuation", "lifecycle", "silent-reply"}:
         raise ValueError(f"Unsupported Goal E2E scenario: {scenario}")
+    auth_mode = os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_AUTH_MODE", "none")
+    if auth_mode not in {"none", "token"}:
+        raise ValueError(f"Unsupported Gateway fixture auth mode: {auth_mode}")
     webui_origin = os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_ORIGIN"]
     state_dir.mkdir(parents=True, exist_ok=True)
     workspace_dir = state_dir / "workspace"
@@ -333,7 +336,7 @@ async def main() -> None:
     config = GatewayConfig(
         host="127.0.0.1",
         port=port,
-        auth=AuthConfig(mode="none"),
+        auth=AuthConfig(mode=auth_mode, token="synthetic-real-gateway-owner-token"),
     )
     config.state_dir = str(state_dir)
     config.workspace_dir = str(workspace_dir)

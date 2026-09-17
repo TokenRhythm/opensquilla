@@ -3443,6 +3443,7 @@
       "autoPauseLabel": "Automatische Pause",
       "states": { "off": "Aus", "waiting": "Wartet auf stabilen Präfix", "scheduled": "Geplant", "probing": "Prüfung läuft", "paused": "Leerlauflimit erreicht; wartet auf nächste Nachricht", "stopped": "Nach Fehlschlag gestoppt" }
     },
+    "sendPending": "Wird gesendet…",
     "send": "Senden",
     "sendQueues": "Senden (wird nach der aktuellen Antwort in die Warteschlange gestellt)",
     "sendSteers": "Senden (lenkt die aktuelle Antwort jetzt)",
@@ -4092,6 +4093,9 @@
       },
       "clearQueue": "Warteschlange leeren",
       "removeMessage": "Ausstehende Nachricht {index} entfernen",
+      "offlineRejected": "Die Nachricht wurde nicht angenommen. Bearbeite sie, um es erneut zu versuchen, oder entferne sie.",
+      "offlineQueued": "Lokal gespeichert. Die Nachricht wird gesendet, sobald die Verbindung wiederhergestellt ist.",
+      "identityChanged": "Die Verbindungsidentität hat sich geändert. Verbinde dich zum Senden wieder mit dem ursprünglichen Gateway und Konto.",
       "annotationUpgradeRequired": "Diese Anmerkung verwendet den alten Editor. Bearbeiten Sie die Nachricht und wählen Sie die Seite vor dem Senden erneut aus."
     },
     "metaRuns": {
@@ -4282,6 +4286,7 @@
       "waitCompactionBeforeCommand": "Warten Sie auf die Kontextverdichtung, bevor Sie {command} ausführen.",
       "waitResponseBeforeCommand": "Warten Sie auf die aktuelle Antwort, bevor Sie {command} ausführen.",
       "promptAnnotationBusy": "Warten Sie, bis die aktuelle Antwort abgeschlossen ist, bevor Sie Artefaktanweisungen senden.",
+      "offlineQueueFailed": "Die Nachricht konnte nicht zur Warteschlange hinzugefügt werden. Dein Entwurf wurde beibehalten.",
       "queueFull": "Warteschlange ist voll — warten Sie, bis die aktuelle Antwort abgeschlossen ist.",
       "queuePersistenceUnavailable": "Behalten Sie diese Nachricht im Eingabefeld, bis die Verzweigung abgeschlossen ist; dauerhafte Wiederherstellung ist nicht verfügbar.",
       "messageStillSaving": "Diese Nachricht ist noch nicht gespeichert — versuchen Sie es gleich erneut.",

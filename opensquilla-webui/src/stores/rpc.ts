@@ -15,6 +15,7 @@ import { recordRpcTransportDiag } from '@/utils/chat/sessionNavigationDiag'
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
 const CACHED_AUTH_KEY = 'opensquilla.cachedAuth'
+const DELIVERY_SALT_KEY = 'opensquilla.deliverySalt.v1'
 const CHAT_DRAFT_PREFIX = 'opensquilla.chat.draft:'
 
 function getDefaultRpcUrl(): string {
@@ -80,6 +81,22 @@ function saveConnectionSettings(url: string, token: string): void {
   } catch {}
 }
 
+async function deliverySalt(): Promise<string | null> {
+  const existing = localStorage.getItem(DELIVERY_SALT_KEY)
+  if (existing && /^[0-9a-f]{32}$/.test(existing)) return existing
+  // Queue WAL is origin-shared, so its salt must be too. Only create it under
+  // the same origin lock: a read/set race would strand the losing tab's rows.
+  // Older browsers can reuse a salt, but cannot safely create one without locks.
+  if (!navigator.locks?.request) return null
+  return navigator.locks.request(DELIVERY_SALT_KEY, () => {
+    const current = localStorage.getItem(DELIVERY_SALT_KEY)
+    if (current && /^[0-9a-f]{32}$/.test(current)) return current
+    const salt = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
+    localStorage.setItem(DELIVERY_SALT_KEY, salt)
+    return salt
+  })
+}
+
 export const useRpcStore = defineStore('rpc', () => {
   const client = ref<RpcClient | null>(null)
   const state = ref<'disconnected' | 'connecting' | 'connected'>('disconnected')
@@ -95,6 +112,15 @@ export const useRpcStore = defineStore('rpc', () => {
   // raw object, so its private generation mutations are not Vue-reactive.
   // Mirror the value explicitly at every transport/state boundary.
   const connectionGeneration = ref(0)
+  const deliveryContext = ref<{ targetId: string; principal: unknown } | null>(null)
+  // Tabs in this browser profile may recover their shared queue only after
+  // both the salted target hash and Hello principal agree. Only a random salt
+  // persists here; raw target credentials never enter the queue identity.
+  let deliveryIntent = 0
+  let deliveryTargetId = ''
+  let deliveryProof: Record<string, unknown> | null = null
+  let browserConnectionUrl = ''
+  let browserAuthToken = ''
   let desktopConnectionRevision = -1
   let desktopConnectionKey = ''
   let desktopAuthToken = ''
@@ -113,6 +139,8 @@ export const useRpcStore = defineStore('rpc', () => {
 
   onScopeDispose(() => {
     connectionDesired = false
+    deliveryProof = null
+    deliveryContext.value = null
     cancelDescriptorRecovery()
     for (const unsubscribe of connectionSubscriptions.splice(0)) unsubscribe()
     client.value?.disconnect()
@@ -188,6 +216,47 @@ export const useRpcStore = defineStore('rpc', () => {
     unavailableMethods.value = new Set()
   }
 
+  function beginDeliveryIntent(target: string | null): void {
+    const intent = ++deliveryIntent
+    deliveryTargetId = ''
+    deliveryProof = null
+    deliveryContext.value = null
+    if (!target) return
+    // Hashing runs alongside transport startup; it never delays the connection.
+    void (async () => {
+      try {
+        const salt = await deliverySalt()
+        if (!salt || intent !== deliveryIntent || !connectionDesired) return
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([salt, target])))
+        if (intent !== deliveryIntent || !connectionDesired) return
+        deliveryTargetId = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+        proveDeliveryContext(deliveryProof)
+      } catch {
+        // Storage/crypto restrictions disable offline delivery, not startup.
+      }
+    })()
+  }
+
+  function proveDeliveryContext(helloAuth: Record<string, unknown> | null): void {
+    deliveryProof = connectionDesired ? helloAuth : null
+    deliveryContext.value = deliveryTargetId && deliveryProof
+      ? { targetId: deliveryTargetId, principal: deliveryProof.principal }
+      : null
+  }
+
+  function connectBrowser(url: string, token?: string): void {
+    const sameTarget = browserConnectionUrl === url && browserAuthToken === (token || '')
+    const provenAuth = sameTarget && state.value === 'connected' ? auth.value : null
+    beginDeliveryIntent(JSON.stringify(['browser', url, token || '']))
+    browserConnectionUrl = url
+    browserAuthToken = token || ''
+    if (!sameTarget) clearConnectionIdentity()
+    client.value?.connect(url, token)
+    // An explicit Connect can reuse a healthy socket and its Hello. A changed
+    // target must wait for its own proof before queued delivery is eligible.
+    if (provenAuth && state.value === 'connected') proveDeliveryContext(provenAuth)
+  }
+
   function applyDesktopConnection(payload: DesktopGatewayConnection, manual = false): void {
     if (
       !connectionDesired
@@ -206,6 +275,8 @@ export const useRpcStore = defineStore('rpc', () => {
     const nextUrl = typeof payload.wsUrl === 'string' ? payload.wsUrl.trim() : ''
     const nextInstance = typeof payload.instanceId === 'string' ? payload.instanceId : ''
     if (payload.status !== 'ready' || !nextUrl || !nextInstance) {
+      deliveryProof = null
+      deliveryContext.value = null
       if (manual) {
         error.value = payload.error || 'Gateway is not ready to connect'
         return
@@ -235,8 +306,12 @@ export const useRpcStore = defineStore('rpc', () => {
     if (nextKey === desktopConnectionKey && nextAuthToken === desktopAuthToken && !explicitRestart) {
       if (client.value?.lifecycle !== 'blocked') error.value = null
       client.value?.ensureConnected()
+      if (manual && state.value === 'connected' && client.value?.lifecycle !== 'blocked') {
+        proveDeliveryContext(auth.value)
+      }
       return
     }
+    beginDeliveryIntent(JSON.stringify(['desktop', nextKey, nextAuthToken]))
     authRefreshAttempted = false
     desktopConnectionKey = nextKey
     if (desktopAuthToken && !nextAuthToken) {
@@ -267,6 +342,10 @@ export const useRpcStore = defineStore('rpc', () => {
       lifecycle.value = status.lifecycle
       health.value = status.health
       if (status.lifecycle === 'blocked') error.value = status.reason
+      if (status.lifecycle === 'blocked' || status.lifecycle === 'stopped') {
+        deliveryProof = null
+        deliveryContext.value = null
+      }
     })
     rpc.on('_blocked', () => {
       if (authRefreshAttempted || !connectionDesired) return
@@ -290,6 +369,7 @@ export const useRpcStore = defineStore('rpc', () => {
       error.value = null
       policy.value = data.policy || null
       auth.value = data.auth || null
+      proveDeliveryContext(auth.value)
       methods.value = Array.isArray(data.features?.methods)
         ? data.features.methods.filter((method): method is string => typeof method === 'string')
         : []
@@ -325,7 +405,7 @@ export const useRpcStore = defineStore('rpc', () => {
     consumeLinkTokenFromUrl()
     const { url, token } = loadConnectionSettings()
     if (rpc.state === 'disconnected') {
-      rpc.connect(url, token || undefined)
+      connectBrowser(url, token || undefined)
     }
   }
 
@@ -334,6 +414,16 @@ export const useRpcStore = defineStore('rpc', () => {
     error.value = null
     connectionDesired = true
     if (getPlatform().id === 'desktop') {
+      const provenAuth = state.value === 'connected' && client.value.lifecycle !== 'blocked'
+        ? auth.value
+        : null
+      beginDeliveryIntent(desktopConnectionKey
+        ? JSON.stringify(['desktop', desktopConnectionKey, desktopAuthToken])
+        : null)
+      // Refresh does not replace a healthy Desktop socket until its supervisor
+      // supplies another descriptor. Its existing Hello remains proof of the
+      // current target even if that read fails.
+      if (provenAuth) proveDeliveryContext(provenAuth)
       // The renderer origin and its form token are not the Desktop runtime's
       // endpoint or credentials. Keep a working socket until its owner replies.
       if (!getPlatform().gateway.getConnection) {
@@ -348,7 +438,7 @@ export const useRpcStore = defineStore('rpc', () => {
     }
     cancelDescriptorRecovery()
     saveConnectionSettings(url, token || '')
-    client.value.connect(url, token)
+    connectBrowser(url, token)
   }
 
   function applyLinkTokenFromUrl(): boolean {
@@ -356,6 +446,7 @@ export const useRpcStore = defineStore('rpc', () => {
     if (!settings) return false
     if (client.value) {
       connectionDesired = true
+      deliveryContext.value = null
       client.value.disconnect()
       error.value = null
       policy.value = null
@@ -363,13 +454,14 @@ export const useRpcStore = defineStore('rpc', () => {
       methods.value = []
       events.value = []
       unavailableMethods.value = new Set()
-      client.value.connect(settings.url, settings.token)
+      connectBrowser(settings.url, settings.token)
     }
     return true
   }
 
   function disconnect() {
     connectionDesired = false
+    beginDeliveryIntent(null)
     cancelDescriptorRecovery()
     client.value?.disconnect()
     desktopConnectionKey = ''
@@ -466,6 +558,7 @@ export const useRpcStore = defineStore('rpc', () => {
     lifecycle,
     health,
     connectionGeneration,
+    deliveryContext,
     isConnected,
     isConnecting,
     isLocalOwner,

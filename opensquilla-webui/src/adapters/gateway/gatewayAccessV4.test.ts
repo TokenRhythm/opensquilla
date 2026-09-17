@@ -23,6 +23,7 @@ function source() {
     auth: null as Record<string, unknown> | null,
     policy: null as Record<string, unknown> | null,
     connectionGeneration: 0,
+    deliveryContext: null as { targetId: string; principal: unknown } | null,
     connect: vi.fn(async () => undefined),
     disconnect: vi.fn(),
     recoverConnectionGeneration: vi.fn(() => true),
@@ -96,6 +97,90 @@ describe('createV4GatewayAccess', () => {
     expect(access.isAuthenticated).toBe(false)
     expect(access.runModePolicy).toBeNull()
     expect(access.streamIdleTimeoutMs).toBeNull()
+    expect(access.guestSessionOwnerId).toBeNull()
+    expect(access.deliveryIdentity).toBeNull()
+  })
+
+  it('binds delivery to proven authority and canonicalizes only scope ordering', () => {
+    const raw = source()
+    const principal = {
+      role: 'operator', authState: 'authenticated', authenticated: true, isOwner: false,
+      scopes: ['operator.write', 'operator.read'], capabilities: ['chat.send', 'guest.safe'],
+      tokenPublicId: 'synthetic-public-id', guestOwnerId: null,
+      rawToken: 'must-not-be-serialized',
+    }
+    raw.deliveryContext = { targetId: 'opaque-target-a', principal }
+    const access = createV4GatewayAccess(raw)
+    const identity = access.deliveryIdentity
+    expect(identity).not.toBeNull()
+    expect(identity).not.toContain('must-not-be-serialized')
+    raw.deliveryContext = { targetId: 'opaque-target-a', principal: {
+      ...principal, scopes: [...principal.scopes].reverse(), capabilities: [...principal.capabilities].reverse(),
+    } }
+    expect(access.deliveryIdentity).toBe(identity)
+    for (const changed of [
+      { scopes: ['operator.read'] },
+      { capabilities: ['chat.send'] },
+      { tokenPublicId: 'another-public-id' },
+      { isOwner: true },
+    ]) {
+      raw.deliveryContext = { targetId: 'opaque-target-a', principal: { ...principal, ...changed } }
+      expect(access.deliveryIdentity).not.toBe(identity)
+    }
+    raw.deliveryContext = { targetId: 'opaque-target-b', principal }
+    expect(access.deliveryIdentity).not.toBe(identity)
+  })
+
+  it('requires a well-formed identity proof and distinguishes anonymous owners', () => {
+    const raw = source()
+    const principal = {
+      role: 'operator', authState: 'guest', authenticated: false, isOwner: false,
+      scopes: ['operator.read'], capabilities: ['guest.safe'], guestOwnerId: 'a'.repeat(64),
+    }
+    raw.deliveryContext = { targetId: 'target', principal }
+    const access = createV4GatewayAccess(raw)
+    const identity = access.deliveryIdentity
+    expect(identity).not.toBeNull()
+    raw.deliveryContext = { targetId: 'target', principal: { ...principal, guestOwnerId: 'b'.repeat(64) } }
+    expect(access.deliveryIdentity).not.toBe(identity)
+    for (const changed of [
+      { scopes: null }, { scopes: [42] }, { capabilities: 'guest.safe' },
+      { role: null }, { guestOwnerId: null }, { authenticated: true }, { isOwner: true },
+    ]) {
+      raw.deliveryContext = { targetId: 'target', principal: { ...principal, ...changed } }
+      expect(access.deliveryIdentity).toBeNull()
+    }
+    raw.deliveryContext = null
+    expect(access.deliveryIdentity).toBeNull()
+  })
+
+  it('exposes a guest namespace only for the connected anonymous principal', () => {
+    const raw = source()
+    const ownerId = 'a'.repeat(64)
+    raw.auth = { principal: {
+      authState: 'guest', authenticated: false, isOwner: false, guestOwnerId: ownerId,
+    } }
+    const access = createV4GatewayAccess(raw)
+    expect(access.guestSessionOwnerId).toBeNull()
+    raw.state = 'connected'
+    expect(access.guestSessionOwnerId).toBe(ownerId)
+    raw.state = 'connecting'
+    expect(access.guestSessionOwnerId).toBeNull()
+  })
+
+  it.each([
+    { authState: 'authenticated', authenticated: false, isOwner: true },
+    { authState: 'authenticated', authenticated: true, isOwner: false },
+    { authState: 'guest', authenticated: true, isOwner: false },
+    { authState: 'guest', authenticated: false, isOwner: true },
+    { authState: 'guest', authenticated: false },
+    { authState: 'guest', authenticated: false, isOwner: false, guestOwnerId: 'not-an-owner' },
+    { authState: 'guest', authenticated: false, isOwner: false, guestOwnerId: 'A'.repeat(64) },
+  ])('does not derive a guest namespace from ambiguous or owner authority: %j', principal => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.auth = { principal: { guestOwnerId: 'a'.repeat(64), ...principal } }
+    expect(createV4GatewayAccess(raw).guestSessionOwnerId).toBeNull()
   })
 
   it.each(['authentication_failed', 'authentication_mismatch'])(

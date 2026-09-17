@@ -3528,6 +3528,7 @@
       "autoPauseLabel": "Auto-pause",
       "states": { "off": "Off", "waiting": "Waiting for a stable prefix", "scheduled": "Scheduled", "probing": "Probing", "paused": "Idle limit reached; waiting for the next message", "stopped": "Stopped after a miss or error" }
     },
+    "sendPending": "Sending…",
     "send": "Send",
     "sendQueues": "Send (queues for after current response)",
     "sendSteers": "Send (steers the current response now)",
@@ -4177,6 +4178,9 @@
       },
       "clearQueue": "Clear queue",
       "removeMessage": "Remove pending message {index}",
+      "offlineRejected": "The message was not accepted. Edit it to retry, or remove it.",
+      "offlineQueued": "Saved locally. Will send when the connection is restored.",
+      "identityChanged": "Connection identity changed. Reconnect to the original gateway and account to send this message.",
       "annotationUpgradeRequired": "This queued annotation uses the retired editor. Edit the message and select the page again before sending."
     },
     "metaRuns": {
@@ -4367,6 +4371,7 @@
       "waitCompactionBeforeCommand": "Wait for context compaction before running {command}.",
       "waitResponseBeforeCommand": "Wait for the current response before running {command}.",
       "promptAnnotationBusy": "Wait for the current response to finish before sending artifact instructions.",
+      "offlineQueueFailed": "Could not queue this message. Your draft was kept.",
       "queueFull": "Queue is full — wait for the current response to finish.",
       "queuePersistenceUnavailable": "Keep this message in the composer until the fork finishes; durable recovery is unavailable.",
       "messageStillSaving": "This message hasn't finished saving — try again in a moment.",

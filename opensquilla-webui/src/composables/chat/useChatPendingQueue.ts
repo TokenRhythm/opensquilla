@@ -115,6 +115,7 @@ export interface PendingQueuePayload {
   attachments?: Attachment[]
   intent?: string | null
   confirmedPlainText?: boolean
+  deliveryIdentity?: string
 }
 
 export interface PendingSteerPayload {
@@ -137,6 +138,8 @@ export interface UseChatPendingQueueOptions {
   pendingInputWal?: PendingInputWal | null
   pendingInputQueue?: PendingInputQueuePort | null
   connectionState?: Readonly<Ref<string>>
+  deliveryIdentity?: Readonly<Ref<string | null>>
+  composerRevision?: Readonly<Ref<number>>
   prepareAttachmentsForSend?: (options: {
     attachments: Attachment[]
     isCurrent?: () => boolean
@@ -234,6 +237,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       void hydratePendingQueue(options.sessionKey.value)
     })
   }
+  if (options.deliveryIdentity) {
+    watch(options.deliveryIdentity, () => {
+      if (options.connectionState?.value !== 'connected') return
+      void hydratePendingQueue(options.sessionKey.value)
+    })
+  }
   watch(options.sessionKey, (sessionKey, previousSessionKey) => {
     if (sessionKey && sessionKey !== previousSessionKey) {
       void hydratePendingQueue(sessionKey)
@@ -254,6 +263,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   function durableItem(item: ChatPendingItem): boolean {
     return Boolean(item.pendingInputId && options.pendingInputWal)
+  }
+
+  function identityAllowsDelivery(item: ChatPendingItem): boolean {
+    return !item.pendingDeliveryIdentity || (
+      options.connectionState?.value === 'connected'
+      && item.pendingDeliveryIdentity === options.deliveryIdentity?.value
+    )
   }
 
   function walRecordForItem(
@@ -279,6 +295,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(item.ownerRequestId ? { ownerRequestId: item.ownerRequestId } : {}),
       state,
       mayHaveServerCopy: item.pendingMayHaveServerCopy === true,
+      ...(item.pendingDeliveryIdentity ? { deliveryIdentity: item.pendingDeliveryIdentity } : {}),
       ...(item.pendingRetainAfterCancel ? { retainAfterCancel: true } : {}),
       ...(item.pendingRequestFingerprint
         ? { requestFingerprint: item.pendingRequestFingerprint }
@@ -323,6 +340,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       pendingClientMessageId: record.clientMessageId,
       pendingPersistenceState: record.state,
       pendingMayHaveServerCopy: mayHaveServerCopy,
+      ...(record.deliveryIdentity ? { pendingDeliveryIdentity: record.deliveryIdentity } : {}),
       ...(record.retainAfterCancel ? { pendingRetainAfterCancel: true } : {}),
       ...(record.requestFingerprint
         ? { pendingRequestFingerprint: record.requestFingerprint }
@@ -396,6 +414,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   async function writeWalItem(
     item: ChatPendingItem,
     state: PendingInputWalState = item.pendingPersistenceState || 'saving',
+    publishStateAfterCommit = false,
   ): Promise<void> {
     if (!options.pendingInputWal || !item.pendingInputId) return
     // Mutate through the reactive array proxy when this item is mounted. New
@@ -405,10 +424,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       candidate.pendingInputId === item.pendingInputId
     )) || item
     const previousWalRevision = trackedItem.pendingWalRevision
-    trackedItem.pendingPersistenceState = state
-    trackedItem.pendingWalRevision = (previousWalRevision ?? 0) + 1
+    const writeRevision = (previousWalRevision ?? 0) + 1
+    if (!publishStateAfterCommit) trackedItem.pendingPersistenceState = state
+    trackedItem.pendingWalRevision = writeRevision
     try {
       await options.pendingInputWal.put(walRecordForItem(trackedItem, state))
+      if (publishStateAfterCommit && trackedItem.pendingWalRevision === writeRevision) {
+        trackedItem.pendingPersistenceState = state
+      }
     } catch (error) {
       trackedItem.pendingWalRevision = previousWalRevision
       throw error
@@ -468,6 +491,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   async function ensureServerStaged(item: ChatPendingItem): Promise<void> {
     const pendingInputId = item.pendingInputId
     if (!pendingInputId || !options.pendingInputWal) return
+    if (locallyCreatingIds.has(pendingInputId)) return
+    if (!identityAllowsDelivery(item)) return
+    // A definite rejection requires an explicit edit/retry. Reconnecting is
+    // not authorization to repeat a denied offline submission indefinitely.
+    if (item.pendingDeliveryIdentity && item.pendingPersistenceState === 'retryable') return
     if (item.ownerRequestId || item.retiredAnnotationInput) return
     if (
       item.pendingPersistenceState === 'cancelling'
@@ -477,6 +505,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (wasRemoved(sessionKey, pendingInputId)) return
     const existing = stagingOperations.get(pendingInputId)
     if (existing) return existing
+    const previouslyMayHaveServerCopy = item.pendingMayHaveServerCopy === true
     const operation = (async () => {
       if (wasRemoved(sessionKey, pendingInputId)) return
       if (!supportsServerQueue()) {
@@ -486,6 +515,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       let refreshedLostUpload = false
       try {
         while (true) {
+          if (!identityAllowsDelivery(item)) return
           if (wasRemoved(sessionKey, pendingInputId)) return
           if (item.attachments.length > 0 && options.prepareAttachmentsForSend) {
             const ready = await options.prepareAttachmentsForSend({
@@ -499,6 +529,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               options.onPendingPersistenceError?.('server_rejected')
               return
             }
+            if (!identityAllowsDelivery(item)) return
             // Persist refreshed upload UUIDs before the request can become
             // ambiguous. A reload then retries the same material snapshot.
             await writeWalItem(item, 'saving')
@@ -521,6 +552,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             // IndexedDB-only draft when the next Gateway is older/offline.
             item.pendingMayHaveServerCopy = true
             await writeWalItem(item, 'saving')
+            if (!identityAllowsDelivery(item)) {
+              if (item.pendingDeliveryIdentity && !previouslyMayHaveServerCopy) {
+                item.pendingMayHaveServerCopy = false
+                await writeWalItem(item, 'local_only')
+              }
+              return
+            }
             const response = await pendingInputQueue!.enqueue({
                 key: item.ownerSessionKey || options.sessionKey.value,
                 pendingInputId,
@@ -604,6 +642,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           return
         }
         if (failure?.accepted === false) {
+          // This attempt did not commit. Preserve any earlier ambiguous
+          // attempt, but a first definite rejection remains locally owned.
+          if (item.pendingDeliveryIdentity) {
+            item.pendingMayHaveServerCopy = previouslyMayHaveServerCopy
+          }
           await writeWalItem(item, 'retryable').catch(() => {})
           options.onPendingPersistenceError?.('server_rejected')
           return
@@ -655,6 +698,24 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return
     }
     const generation = ++hydrateGeneration
+    const hydrationIdentity = options.deliveryIdentity?.value ?? null
+    const hydrationIsCurrent = () => !disposed
+      && generation === hydrateGeneration
+      && options.sessionKey.value === sessionKey
+      && (options.deliveryIdentity?.value ?? null) === hydrationIdentity
+    const serverHydrationIsCurrent = () => hydrationIsCurrent()
+      && (!options.connectionState || options.connectionState.value === 'connected')
+      && (!options.deliveryIdentity || hydrationIdentity !== null)
+    const resumeHydratedOfflineDrafts = () => {
+      // Initial mount and session navigation can finish their readiness events
+      // before IndexedDB resolves. Hydration owns this signal too; it must not
+      // depend on a later connection/identity change that may never happen.
+      if (serverHydrationIsCurrent() && pendingQueue.value.some(item => (
+        item.ownerSessionKey === sessionKey
+        && item.pendingDeliveryIdentity
+        && identityAllowsDelivery(item)
+      ))) schedulePendingDrainAfterTerminal()
+    }
     let records: PendingInputWalRecord[]
     try {
       records = await wal.list(sessionKey)
@@ -662,15 +723,19 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       options.onPendingPersistenceError?.('wal_failed')
       return
     }
-    if (disposed || generation !== hydrateGeneration || options.sessionKey.value !== sessionKey) {
-      return
-    }
+    if (!hydrationIsCurrent()) return
     mergeWalRecords(records, sessionKey)
     const walIds = new Set(records.map(record => record.pendingInputId))
+    // Disconnected hydration is local-only. In particular, do not advertise an
+    // enqueue as ambiguous before it could have crossed the transport boundary.
+    if (!serverHydrationIsCurrent()) return
 
     if (!supportsServerQueue()) {
       for (const item of [...pendingQueue.value]) {
+        if (!serverHydrationIsCurrent()) return
         if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
+        if (!identityAllowsDelivery(item)) continue
+        if (item.pendingDeliveryIdentity && item.pendingPersistenceState === 'retryable') continue
         const pendingInputId = item.pendingInputId!
         // A snapshot can race the WAL write and the enqueue itself. Keep an
         // in-flight/saving row visible until its owner settles; otherwise an
@@ -698,6 +763,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           void writeWalItem(item, 'local_only')
         }
       }
+      resumeHydratedOfflineDrafts()
       return
     }
 
@@ -705,6 +771,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     // as the capability is available so a failing/stale list response can
     // never turn a durable delete intent back into an enqueue attempt.
     for (const item of [...pendingQueue.value]) {
+      if (!serverHydrationIsCurrent()) return
       if (
         durableItem(item)
         && item.ownerSessionKey === sessionKey
@@ -714,12 +781,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
     try {
       const response = { items: await pendingInputQueue!.list(sessionKey) }
-      if (disposed || generation !== hydrateGeneration || options.sessionKey.value !== sessionKey) {
-        return
-      }
+      if (!serverHydrationIsCurrent()) return
       const serverItems = Array.isArray(response.items) ? response.items : []
       const serverIds = new Set<string>()
       for (const serverItem of serverItems) {
+        if (!serverHydrationIsCurrent()) return
         const pendingInputId = serverItem.pendingInputId
         const clientRequestId = serverItem.clientRequestId
         const clientMessageId = serverItem.clientMessageId
@@ -732,6 +798,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         let item = pendingQueue.value.find(candidate => (
           candidate.pendingInputId === pendingInputId
         ))
+        if (item && !identityAllowsDelivery(item)) continue
         if (!item) {
           item = {
             pendingUiId: pendingInputId,
@@ -747,6 +814,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             pendingInputId,
             pendingClientRequestId: clientRequestId,
             pendingClientMessageId: clientMessageId,
+            ...(hydrationIdentity ? { pendingDeliveryIdentity: hydrationIdentity } : {}),
           }
           pendingQueue.value.push(item)
         }
@@ -774,12 +842,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           : item.pendingPosition
         item.pendingMayHaveServerCopy = true
         await writeWalItem(item, 'staged')
+        if (!serverHydrationIsCurrent()) return
       }
 
       sortOrdinaryPendingItems()
 
       for (const item of [...pendingQueue.value]) {
+        if (!serverHydrationIsCurrent()) return
         if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
+        if (!identityAllowsDelivery(item)) continue
         if (serverIds.has(item.pendingInputId!)) continue
         const pendingInputId = item.pendingInputId!
         // The list snapshot may have started before the WAL write or enqueue
@@ -805,6 +876,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           // Another tab either cancelled or dispatched the server row. Both
           // outcomes are terminal for this WAL entry.
           await wal.delete(item.pendingInputId!)
+          if (!serverHydrationIsCurrent()) return
           const index = pendingQueue.value.indexOf(item)
           if (index >= 0) pendingQueue.value.splice(index, 1)
           continue
@@ -813,6 +885,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         // Gateway once a compatible Gateway is available.
         void ensureServerStaged(item)
       }
+      resumeHydratedOfflineDrafts()
     } catch {
       // Server reconciliation is best effort; IndexedDB remains authoritative
       // until the next connected hydrate.
@@ -855,6 +928,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     payload: PendingQueuePayload,
     owner?: PendingQueueOwner,
   ): boolean | Promise<boolean> {
+    if (payload.deliveryIdentity && payload.deliveryIdentity !== options.deliveryIdentity?.value) {
+      return false
+    }
     if (ordinaryPendingCount.value >= MAX_PENDING) {
       console.warn(`Pending queue full (${MAX_PENDING})`)
       return false
@@ -877,6 +953,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       attachments: (payload.attachments || []).map(a => ({ ...a })),
       intent: payload.intent ?? null,
       ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),
+      ...(payload.deliveryIdentity ? { pendingDeliveryIdentity: payload.deliveryIdentity } : {}),
       ownerSessionKey: options.sessionKey.value,
       ...(ownerRequestId ? { ownerRequestId } : {}),
     }
@@ -894,7 +971,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     locallyCreatingIds.add(item.pendingInputId)
     return (async () => {
       try {
-        await writeWalItem(item, 'saving')
+        // "Saved locally" is a durability promise: the initial offline row
+        // stays visibly saving until IndexedDB commits, including on close.
+        await writeWalItem(
+          item,
+          item.pendingDeliveryIdentity ? 'local_only' : 'saving',
+          Boolean(item.pendingDeliveryIdentity),
+        )
       } catch {
         const index = pendingQueue.value.findIndex(candidate => (
           candidate.pendingInputId === item.pendingInputId
@@ -919,12 +1002,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       draftIds?: readonly string[]
       pageContext?: ChatPageContext
       attachments?: Attachment[]
+      deliveryIdentity?: string
     },
   ): boolean | Promise<boolean> {
     if (isControlInput(text) && !enqueueOptions?.confirmedPlainText) return false
     const composerText = options.inputText.value
     const composerAttachments = snapshotComposerAttachments(options.pendingAttachments.value)
     const composerIntent = options.pendingSessionIntent.value
+    const composerSessionKey = options.sessionKey.value
     const queued = enqueuePendingPayload({
       text,
       ...(enqueueOptions?.pageContext ? { pageContext: enqueueOptions.pageContext } : {}),
@@ -934,10 +1019,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       attachments: enqueueOptions?.attachments ?? options.pendingAttachments.value,
       intent: composerIntent,
       ...(enqueueOptions?.confirmedPlainText ? { confirmedPlainText: true } : {}),
+      ...(enqueueOptions?.deliveryIdentity ? { deliveryIdentity: enqueueOptions.deliveryIdentity } : {}),
     }, owner)
     const clearMatchingComposer = () => {
       if (
-        options.inputText.value !== composerText
+        options.sessionKey.value !== composerSessionKey
+        || options.inputText.value !== composerText
         || !composerAttachmentsMatch(options.pendingAttachments.value, composerAttachments)
         || options.pendingSessionIntent.value !== composerIntent
       ) return
@@ -1126,7 +1213,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     // A proven IndexedDB-only row can be forgotten immediately on an older
     // Gateway. Anything that may have crossed the network must retain its
     // cancelling WAL until a queue-capable Gateway can write the tombstone.
-    if (!supportsServerQueue()) {
+    if (
+      !supportsServerQueue()
+      || !identityAllowsDelivery(item)
+      || (item.pendingDeliveryIdentity && !item.pendingMayHaveServerCopy)
+    ) {
       if (item.pendingMayHaveServerCopy) {
         broadcastChange(sessionKey, item.pendingInputId, 'changed')
         return false
@@ -1230,6 +1321,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const item = pendingQueue.value[index]
     if (
       !item
+      || !identityAllowsDelivery(item)
+      || item.pendingRetainAfterCancel === true
       || item.retiredAnnotationInput
       || (item.hiddenControl && !allowHiddenControl)
       || item.deliveryState === 'steering'
@@ -1521,11 +1614,49 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ))
   }
 
+  function composerOwnershipGuard(): () => boolean {
+    const sessionKey = options.sessionKey.value
+    const identity = options.deliveryIdentity?.value
+    const revision = options.composerRevision?.value
+    const text = options.inputText.value
+    const attachments = snapshotComposerAttachments(options.pendingAttachments.value)
+    const intent = options.pendingSessionIntent.value
+    return () => options.sessionKey.value === sessionKey
+      && options.deliveryIdentity?.value === identity
+      && options.composerRevision?.value === revision
+      && options.inputText.value === text
+      && composerAttachmentsMatch(options.pendingAttachments.value, attachments)
+      && options.pendingSessionIntent.value === intent
+  }
+
+  function canRestoreToComposer(item: ChatPendingItem): boolean {
+    return (!item.ownerSessionKey || item.ownerSessionKey === options.sessionKey.value)
+      && (!item.pendingDeliveryIdentity || item.pendingDeliveryIdentity === options.deliveryIdentity?.value)
+  }
+
+  async function cancelForComposer(
+    item: ChatPendingItem,
+    stillOwnsComposer: () => boolean,
+    restore: () => void,
+  ): Promise<void> {
+    // Preserve an editable local copy until cancellation and editor ownership
+    // are both proven. A route/account/draft change cannot discard or inject it.
+    const cancelled = await cancelDurableItem(item, { retainAfterCancel: true })
+    if (!cancelled || !stillOwnsComposer() || !canRestoreToComposer(item)) return
+    const index = pendingQueue.value.indexOf(item)
+    if (index >= 0) pendingQueue.value.splice(index, 1)
+    restore()
+    // The retained copy cannot auto-dispatch if cleanup fails; the composer
+    // already owns the payload and an explicit future edit remains safe.
+    await forgetDurableItem(item, 'removed').catch(() => {})
+  }
+
   function editPendingItem(pendingUiId: string): boolean {
     const index = pendingIndex(pendingUiId)
     const item = pendingQueue.value[index]
     if (
       !item
+      || !canRestoreToComposer(item)
       || item.hiddenControl
       || item.deliveryState
       || item.steerAttempt
@@ -1557,12 +1688,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       options.autoResizeTextarea()
     }
     if (durableItem(item)) {
-      void cancelDurableItem(item).then(cancelled => {
-        if (!cancelled) return
-        const currentIndex = pendingQueue.value.indexOf(item)
-        if (currentIndex >= 0) pendingQueue.value.splice(currentIndex, 1)
-        restore()
-      })
+      void cancelForComposer(item, composerOwnershipGuard(), restore)
       return true
     }
     pendingQueue.value.splice(index, 1)
@@ -1585,13 +1711,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ) tailIndex--
     if (tailIndex < 0) return false
     const tail = pendingQueue.value[tailIndex]
-    if (!tail) return false
+    if (!tail || !canRestoreToComposer(tail)) return false
     if (hasUneditablePendingAttachments(tail)) return false
     if (durableItem(tail)) {
-      void cancelDurableItem(tail).then(cancelled => {
-        if (!cancelled) return
-        const index = pendingQueue.value.indexOf(tail)
-        if (index >= 0) pendingQueue.value.splice(index, 1)
+      void cancelForComposer(tail, composerOwnershipGuard(), () => {
         options.inputText.value = tail.text || ''
         options.pendingAttachments.value = tail.attachments || []
         options.pendingSessionIntent.value = tail.intent || null
@@ -1617,12 +1740,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       p => !p.hiddenControl
         && !p.deliveryState
         && !p.steerAttempt
+        && canRestoreToComposer(p)
         && !hasUneditablePendingAttachments(p),
     )
     const retained = pendingQueue.value.filter(
       p => p.hiddenControl
         || p.deliveryState
         || p.steerAttempt
+        || !canRestoreToComposer(p)
         || hasUneditablePendingAttachments(p),
     )
     if (visible.length === 0) return false
@@ -1639,11 +1764,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     options.pendingSessionIntent.value = options.pendingSessionIntent.value || headIntent || null
     options.autoResizeTextarea()
     options.resetInputHistory()
+    let stillOwnsComposer = composerOwnershipGuard()
     for (const item of durable) {
-      void cancelDurableItem(item).then(cancelled => {
-        if (!cancelled) return
-        const index = pendingQueue.value.indexOf(item)
-        if (index >= 0) pendingQueue.value.splice(index, 1)
+      void cancelForComposer(item, () => stillOwnsComposer(), () => {
         options.inputText.value = [options.inputText.value, item.text]
           .filter(Boolean)
           .join('\n')
@@ -1656,6 +1779,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         )
         options.autoResizeTextarea()
         options.resetInputHistory()
+        stillOwnsComposer = composerOwnershipGuard()
       })
     }
     return true
@@ -1665,7 +1789,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     clearPendingDrainAfterTerminalTimer()
     if (pendingQueue.value.length === 0) return
     const head = pendingQueue.value[0]
-    if (head?.retiredAnnotationInput) return
+    if (head?.retiredAnnotationInput || head?.pendingRetainAfterCancel === true) return
     const ownerSessionKey = head?.ownerSessionKey || options.sessionKey.value
     if (ownerSessionKey !== options.sessionKey.value) {
       if (head) head.deliveryState = 'retryable'
@@ -1732,7 +1856,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       })
       return
     }
-    if (!head) return
+    // The legacy composer callback cannot retain an offline item's delivery
+    // identity. Such drafts require the guarded pending-item dispatch port.
+    if (!head || head.pendingDeliveryIdentity) return
     head.deliveryState = 'steering'
     nextTick(() => {
       if (
@@ -1795,6 +1921,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       pendingQueue.value.length < 2
       || pendingQueue.value.some(item => (
         !ordinaryDurableItem(item)
+        || !identityAllowsDelivery(item)
         || Boolean(item.ownerRequestId)
         || !Number.isSafeInteger(item.pendingWalRevision)
         || item.pendingPersistenceState === 'saving'

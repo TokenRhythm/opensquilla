@@ -30,6 +30,8 @@ async function mountPanel(options: {
     isAvailable: options.availability === 'available',
     isLocalOwner: false,
     isAuthenticated: false,
+    guestSessionOwnerId: null,
+    deliveryIdentity: null,
     canManageProjectWorkspaces: false,
     canChooseProject: false,
     runModePolicy: null,

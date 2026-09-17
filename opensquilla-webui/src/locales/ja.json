@@ -3443,6 +3443,7 @@
       "autoPauseLabel": "自動一時停止",
       "states": { "off": "オフ", "waiting": "安定したプレフィックスを待機", "scheduled": "予定済み", "probing": "プローブ中", "paused": "アイドル上限に到達；次のメッセージを待機中", "stopped": "失敗後に停止" }
     },
+    "sendPending": "送信中…",
     "send": "送信",
     "sendQueues": "送信（現在の応答後にキューへ追加）",
     "sendSteers": "送信（現在の応答を今すぐ誘導）",
@@ -4092,6 +4093,9 @@
       },
       "clearQueue": "キューをクリア",
       "removeMessage": "保留中のメッセージ {index} を削除",
+      "offlineRejected": "メッセージは受け付けられませんでした。編集して再試行するか、削除してください。",
+      "offlineQueued": "ローカルに保存しました。接続が復旧すると送信します。",
+      "identityChanged": "接続の認証情報が変わりました。元のゲートウェイとアカウントに再接続して送信してください。",
       "annotationUpgradeRequired": "この保留中の注釈は旧エディターの形式です。メッセージを編集し、ページを選び直して送信してください。"
     },
     "metaRuns": {
@@ -4282,6 +4286,7 @@
       "waitCompactionBeforeCommand": "{command} を実行する前にコンテキストの圧縮が完了するまでお待ちください。",
       "waitResponseBeforeCommand": "{command} を実行する前に現在の応答が完了するまでお待ちください。",
       "promptAnnotationBusy": "現在の応答が完了してから、成果物の編集指示を送信してください。",
+      "offlineQueueFailed": "送信待ちに追加できませんでした。下書きは保持されています。",
       "queueFull": "キューがいっぱいです — 現在の応答が完了するまでお待ちください。",
       "queuePersistenceUnavailable": "分岐が完了するまでこのメッセージを入力欄に残してください。永続的な復旧は現在利用できません。",
       "messageStillSaving": "このメッセージはまだ保存が完了していません — しばらくしてからもう一度お試しください。",

@@ -14,8 +14,11 @@ const REJECTION = 'Synthetic admission failed. Please retry.'
 type TerminalStatus = 'succeeded' | 'failed' | 'cancelled'
 type Request = { id: string; method: string; params?: Record<string, unknown>; type: string }
 
-async function installGateway(page: Page, holdFirstSend = false) {
+async function installGateway(page: Page, holdFirstSend = false, serverQueue = false) {
   const sends: Array<Record<string, unknown>> = []
+  const enqueues: Array<Record<string, unknown>> = []
+  const dispatches: Array<Record<string, unknown>> = []
+  const pendingItems = new Map<string, Record<string, unknown>>()
   const aborts: Array<Record<string, unknown>> = []
   const history: Array<Record<string, unknown>> = []
   let socket: WebSocketRoute
@@ -24,6 +27,9 @@ async function installGateway(page: Page, holdFirstSend = false) {
   let lastTask: { task_id: string; status: string } | null = null
   let heldSend: Request | null = null
   let connectionCount = 0
+  let holdConnections = false
+  let waitingConnection: WebSocketRoute | null = null
+  let changedAuthority = false
 
   const response = (id: string, payload: unknown) => socket.send(JSON.stringify({
     type: 'res', id, ok: true, payload,
@@ -69,7 +75,8 @@ async function installGateway(page: Page, holdFirstSend = false) {
   await page.routeWebSocket(/\/ws$/, ws => {
     socket = ws
     connectionCount += 1
-    emit('connect.challenge', {})
+    if (holdConnections) waitingConnection = ws
+    else emit('connect.challenge', {})
     ws.onMessage(raw => {
       const frame = JSON.parse(String(raw)) as Request
       if (frame.type === 'ping') {
@@ -82,24 +89,47 @@ async function installGateway(page: Page, holdFirstSend = false) {
           features: { methods: [
             'sessions.messages.subscribe', 'sessions.messages.hydrate',
             'sessions.messages.snapshot', 'sessions.messages.unsubscribe',
+            ...(serverQueue ? [
+              'sessions.pending_inputs.enqueue', 'sessions.pending_inputs.list',
+              'sessions.pending_inputs.cancel', 'sessions.pending_inputs.dispatch',
+            ] : []),
           ] },
           auth: {
-            principal: { isOwner: true },
+            principal: {
+              role: 'operator', isOwner: true, authenticated: true,
+              authState: 'authenticated', scopes: ['operator.read', 'operator.write'],
+              capabilities: changedAuthority ? ['chat.read'] : ['chat.read', 'chat.write'],
+            },
             runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
           },
         }))
         return
       }
-      if (frame.method === 'chat.send') {
-        sends.push({ ...frame.params })
+      if (frame.method === 'sessions.pending_inputs.enqueue') {
+        enqueues.push({ ...frame.params })
+        const pendingInputId = String(frame.params?.pendingInputId)
+        const item = { ...frame.params, requestFingerprint: 'synthetic-fingerprint', revision: 1 }
+        pendingItems.set(pendingInputId, item)
+        response(frame.id, { requestFingerprint: 'synthetic-fingerprint', revision: 1 })
+        return
+      }
+      if (frame.method === 'chat.send' || frame.method === 'sessions.pending_inputs.dispatch') {
+        let params = frame.params
+        if (frame.method === 'sessions.pending_inputs.dispatch') {
+          dispatches.push({ ...frame.params })
+          const id = String(frame.params?.pendingInputId)
+          params = pendingItems.get(id)
+          pendingItems.delete(id)
+        }
+        sends.push({ ...params })
         if (holdFirstSend && sends.length === 1) {
           heldSend = frame
           return
         }
         activeTask = { task_id: `task-send-${sends.length}`, status: 'running' }
         history.push({
-          role: 'user', text: frame.params?.message, id: `user-${sends.length}`,
-          client_message_id: frame.params?.clientMessageId,
+          role: 'user', text: params?.message, id: `user-${sends.length}`,
+          client_message_id: params?.clientMessageId,
           turn_id: activeTask.task_id,
         })
         response(frame.id, { accepted: true, session: SESSION, task_id: activeTask.task_id })
@@ -136,6 +166,7 @@ async function installGateway(page: Page, holdFirstSend = false) {
         }),
         'sessions.messages.unsubscribe': { subscribed: false },
         'sessions.subscribe': { subscribed: true },
+        'sessions.pending_inputs.list': { items: [...pendingItems.values()] },
         'usage.status': { sessions: [] },
       }
       response(frame.id, payloads[frame.method] ?? {})
@@ -143,8 +174,20 @@ async function installGateway(page: Page, holdFirstSend = false) {
   })
 
   return {
-    sends, aborts, finish,
+    sends, aborts, finish, enqueues, dispatches,
     connectionCount: () => connectionCount,
+    disconnect: () => {
+      holdConnections = true
+      socket.close({ code: 1012, reason: 'Synthetic transport restart' })
+    },
+    reconnect: (changeAuthority = false) => {
+      changedAuthority = changeAuthority
+      holdConnections = false
+      if (waitingConnection) {
+        waitingConnection.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
+        waitingConnection = null
+      }
+    },
     rejectHeldSend: () => {
       if (!heldSend) throw new Error('No pending send to reject')
       socket.send(JSON.stringify({
@@ -209,15 +252,87 @@ test('pending admission is visible and a rejected send restores an editable retr
   await send.click()
   await expect.poll(() => gateway.sends.length).toBe(1)
   await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
+  await expect(page.locator('.chat-composer-send-pending')).toContainText('Sending')
   await expect(page.locator('.msg-user')).toContainText('Synthetic request to retry.')
 
   gateway.rejectHeldSend()
   await expect(page.locator('.chat-thread')).toContainText(REJECTION)
   await expect(input).toHaveValue('Synthetic request to retry.')
   await expect(send).toBeEnabled()
-  await send.click()
+  await expect(page.locator('.chat-composer-send-pending')).toHaveCount(0)
+  await page.locator('.toast__action').filter({ hasText: 'Retry' }).click()
   await expect.poll(() => gateway.sends.length).toBe(2)
   expect(gateway.sends[1]?.message).toBe('Synthetic request to retry.')
   gateway.finish('succeeded')
   await expect(send).toBeEnabled()
+})
+
+for (const { changeAuthority, reload, label } of [
+  { changeAuthority: false, reload: false, label: 'is sent once after the same identity reconnects' },
+  { changeAuthority: true, reload: false, label: 'stays local when authority changes' },
+  { changeAuthority: false, reload: true, label: 'survives a reload with the same proven identity' },
+]) {
+  test(`offline draft ${label}`, async ({ page }) => {
+    const gateway = await installGateway(page, false, true)
+    await openChat(page)
+    const input = page.locator('.chat-textarea')
+    const send = page.locator('.chat-send-btn[aria-label="Send"]')
+    gateway.disconnect()
+    await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+    await input.fill('Synthetic never-sent offline draft.')
+    await expect(send).toBeEnabled()
+    await send.click()
+    await expect(page.locator('.chat-pending-save-status')).toContainText('Saved locally')
+    await expect(input).toHaveValue('')
+    expect(gateway.sends).toHaveLength(0)
+    expect(gateway.enqueues).toHaveLength(0)
+
+    gateway.reconnect(changeAuthority)
+    if (reload) await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    if (changeAuthority) {
+      await expect(page.locator('.chat-pending-save-status')).toContainText('changed')
+      expect(gateway.sends).toHaveLength(0)
+      expect(gateway.enqueues).toHaveLength(0)
+      expect(gateway.dispatches).toHaveLength(0)
+    } else {
+      await expect.poll(() => gateway.sends.length).toBe(1)
+      expect(gateway.enqueues).toHaveLength(1)
+      expect(gateway.dispatches).toHaveLength(1)
+      expect(gateway.dispatches[0]?.pendingInputId).toBe(gateway.enqueues[0]?.pendingInputId)
+      expect(gateway.sends[0]?.message).toBe('Synthetic never-sent offline draft.')
+      gateway.finish('succeeded')
+      await expect(send).toBeEnabled()
+      expect(gateway.sends).toHaveLength(1)
+    }
+  })
+}
+
+test('a new browser tab recovers the original identity and durable offline draft', async ({ page }) => {
+  test.skip(process.env.OPENSQUILLA_E2E_NATIVE_DESKTOP === '1', 'Browser tab replacement uses a browser context')
+  const gateway = await installGateway(page, false, true)
+  await openChat(page)
+  gateway.disconnect()
+  await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+  await page.locator('.chat-textarea').fill('Synthetic durable draft for a replacement tab.')
+  await page.locator('.chat-send-btn[aria-label="Send"]').click()
+  await expect(page.locator('.chat-pending-save-status')).toContainText('Saved locally')
+  const context = page.context()
+  await page.close()
+  const replacement = await context.newPage()
+  try {
+    const recovered = await installGateway(replacement, false, true)
+    await openChat(replacement)
+    await expect.poll(async () => ({
+      sends: recovered.sends.length,
+      enqueues: recovered.enqueues.length,
+      cards: await replacement.locator('.chat-pending-card').count(),
+      queued: await replacement.locator('.chat-pending-save-status').allTextContents(),
+    })).toEqual({ sends: 1, enqueues: 1, cards: 0, queued: [] })
+    expect(recovered.sends[0]?.message).toBe('Synthetic durable draft for a replacement tab.')
+    expect(recovered.enqueues).toHaveLength(1)
+    expect(recovered.dispatches).toHaveLength(1)
+    recovered.finish('succeeded')
+    await expect(replacement.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+  } finally { await replacement.close() }
 })

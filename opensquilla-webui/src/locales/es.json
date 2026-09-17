@@ -3443,6 +3443,7 @@
       "autoPauseLabel": "Pausa automática",
       "states": { "off": "Desactivado", "waiting": "Esperando un prefijo estable", "scheduled": "Programado", "probing": "Sondeando", "paused": "Límite de inactividad alcanzado; esperando el siguiente mensaje", "stopped": "Detenido tras fallo" }
     },
+    "sendPending": "Enviando…",
     "send": "Enviar",
     "sendQueues": "Enviar (se pone en cola hasta después de la respuesta actual)",
     "sendSteers": "Enviar (redirige la respuesta actual ahora)",
@@ -4092,6 +4093,9 @@
       },
       "clearQueue": "Vaciar cola",
       "removeMessage": "Quitar el mensaje pendiente {index}",
+      "offlineRejected": "El mensaje no fue aceptado. Edítalo para volver a intentarlo o elimínalo.",
+      "offlineQueued": "Guardado localmente. Se enviará cuando se restablezca la conexión.",
+      "identityChanged": "La identidad de la conexión ha cambiado. Vuelve a conectarte a la puerta de enlace y la cuenta originales para enviar este mensaje.",
       "annotationUpgradeRequired": "Esta anotación pendiente usa el editor anterior. Edita el mensaje y vuelve a seleccionar la página antes de enviarlo."
     },
     "metaRuns": {
@@ -4282,6 +4286,7 @@
       "waitCompactionBeforeCommand": "Espera a que termine la compactación del contexto antes de ejecutar {command}.",
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
       "promptAnnotationBusy": "Espera a que termine la respuesta actual antes de enviar instrucciones del artefacto.",
+      "offlineQueueFailed": "No se pudo poner este mensaje en cola. Se conservó el borrador.",
       "queueFull": "La cola está llena — espera a que termine la respuesta actual.",
       "queuePersistenceUnavailable": "Conserva este mensaje en el editor hasta que termine la bifurcación; la recuperación duradera no está disponible.",
       "messageStillSaving": "Este mensaje aún no se ha guardado — inténtalo de nuevo en un momento.",
