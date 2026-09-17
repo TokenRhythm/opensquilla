@@ -258,7 +258,9 @@ def test_manual_compaction_uses_exact_credential_limits(
 
 
 @pytest.mark.parametrize("writer_provider,configured_output,known_window,expected_output", [
-    ("openai", 8192, True, 8192),
+    # A request budget cannot enlarge the writer's configured model limit;
+    # a smaller request budget still applies independently of the body target.
+    ("openai", 8192, True, 3072),
     ("openai", 512, True, 512),
     ("openrouter", 8192, True, 3072),
     ("openrouter", 8192, False, 3072),
