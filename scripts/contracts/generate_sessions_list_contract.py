@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,17 +17,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA = ROOT / "contracts/gateway/v4/sessions/sessions-list.schema.json"
 PYTHON_OUTPUT = ROOT / "src/opensquilla/contracts/generated/v4/sessions_list.py"
-PYTHON_METADATA_OUTPUT = (
-    ROOT / "src/opensquilla/contracts/generated/v4/sessions_list_metadata.py"
-)
-TYPESCRIPT_OUTPUT = (
-    ROOT / "opensquilla-webui/src/contracts/generated/v4/sessionsList.ts"
-)
-VALIDATOR_OUTPUT = (
-    ROOT / "opensquilla-webui/src/contracts/generated/v4/sessionsListValidators.cjs"
-)
+PYTHON_METADATA_OUTPUT = ROOT / "src/opensquilla/contracts/generated/v4/sessions_list_metadata.py"
+TYPESCRIPT_OUTPUT = ROOT / "opensquilla-webui/src/contracts/generated/v4/sessionsList.ts"
+VALIDATOR_OUTPUT = ROOT / "opensquilla-webui/src/contracts/generated/v4/sessionsListValidators.cjs"
 VALIDATOR_DECLARATIONS_OUTPUT = VALIDATOR_OUTPUT.with_suffix(".d.cts")
 AJV_GENERATOR = ROOT / "scripts/contracts/generate_sessions_list_ajv.mjs"
+LEGACY_PYTHON = (
+    ROOT / ".venv-contract-legacy" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+)
+LEGACY_TYPESCRIPT_PACKAGE = ROOT / "opensquilla-webui/node_modules/json-schema-to-typescript-legacy"
 
 
 @dataclass(frozen=True)
@@ -133,17 +132,28 @@ def _with_typescript_metadata(text: str, *, method: str, scope: str) -> str:
 
 
 def render() -> Rendered:
-    python_runner = [sys.executable, "-m", "datamodel_code_generator"]
+    env = _environment()
+    if not LEGACY_PYTHON.is_file():
+        raise RuntimeError("Run python scripts/contracts/prepare_codegen_toolchains.py first")
+    version = _capture(
+        [
+            str(LEGACY_PYTHON),
+            "-c",
+            "from importlib.metadata import version; print(version('datamodel-code-generator'))",
+        ],
+        env=env,
+    ).strip()
+    if version != "0.75.1":
+        raise RuntimeError(f"Frozen Python generator must be 0.75.1; got {version}")
+    package = json.loads((LEGACY_TYPESCRIPT_PACKAGE / "package.json").read_text(encoding="utf-8"))
+    if package.get("name") != "json-schema-to-typescript" or package.get("version") != "15.0.4":
+        raise RuntimeError("Frozen TypeScript generator must be json-schema-to-typescript 15.0.4")
+    python_runner = [str(LEGACY_PYTHON), "-m", "datamodel_code_generator"]
     typescript_runner = [
-        "npm",
-        "--prefix",
-        "opensquilla-webui",
-        "exec",
-        "--",
-        "json2ts",
+        shutil.which("node") or "node",
+        str(LEGACY_TYPESCRIPT_PACKAGE / "dist/src/cli.js"),
     ]
 
-    env = _environment()
     method, scope = _contract_metadata()
     with tempfile.TemporaryDirectory(prefix="opensquilla-jsonschema-codegen-") as raw_tmp:
         tmp = Path(raw_tmp)

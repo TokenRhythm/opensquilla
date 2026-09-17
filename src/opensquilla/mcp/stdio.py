@@ -26,12 +26,16 @@ class MCPStdioClient(MCPClient):
     """
 
     _CLOSE_TIMEOUT_SECONDS = 2.0
+    # Bound each UTF-8 JSON message, excluding its LF delimiter. Large tool
+    # results and server instructions routinely exceed asyncio's 64 KiB default.
+    _MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
     def __init__(self, config: MCPServerConfig) -> None:
         super().__init__(config)
         self._process: asyncio.subprocess.Process | None = None
         self._request_id = 0
         self._request_lock = asyncio.Lock()
+        self._readahead: bytes = b""
 
     @staticmethod
     def _encode_request(request: dict[str, Any]) -> bytes:
@@ -50,6 +54,7 @@ class MCPStdioClient(MCPClient):
     async def connect(self) -> None:
         """Spawn the subprocess and perform MCP initialization handshake."""
         assert self.config.command is not None, "stdio transport requires command"
+        self._readahead = b""
 
         env: dict[str, str] | None = None
         if self.config.env:
@@ -79,6 +84,7 @@ class MCPStdioClient(MCPClient):
         """Terminate the subprocess."""
         process = self._process
         self._process = None
+        self._readahead = b""
         if process is None:
             return
         if process.returncode is None:
@@ -128,6 +134,40 @@ class MCPStdioClient(MCPClient):
         self._process.stdin.write(encoded)
         await self._process.stdin.drain()
 
+    async def _readline_safe(self) -> bytes:
+        """Read a JSON line up to 16 MiB, retaining LF to distinguish it from EOF.
+
+        Read in bounded chunks rather than using StreamReader's 64 KiB line
+        limit. A frame over the byte budget invalidates the connection: after
+        consuming only part of a frame it is unsafe to resume normal parsing.
+        """
+        assert self._process is not None
+        assert self._process.stdout is not None
+
+        stdout = self._process.stdout
+        chunks: list[bytes] = []
+        size = 0
+        data = self._readahead
+        self._readahead = b""
+        while True:
+            if not data:
+                data = await stdout.read(8192)
+            if not data:
+                return b"".join(chunks)
+            nl_idx = data.find(b"\n")
+            size += nl_idx if nl_idx >= 0 else len(data)
+            if size > self._MAX_MESSAGE_BYTES:
+                await self.close()
+                raise ValueError(
+                    f"MCP stdio message exceeds {self._MAX_MESSAGE_BYTES} byte limit"
+                )
+            if nl_idx >= 0:
+                chunks.append(data[: nl_idx + 1])
+                self._readahead = data[nl_idx + 1 :]
+                return b"".join(chunks)
+            chunks.append(data)
+            data = b""
+
     async def _read_response(self, expected_id: int) -> dict[str, Any]:
         """Read newline-delimited JSON-RPC messages until the response arrives.
 
@@ -139,7 +179,7 @@ class MCPStdioClient(MCPClient):
         assert self._process.stdout is not None
 
         while True:
-            line = await self._process.stdout.readline()
+            line = await self._readline_safe()
             if not line:
                 raise ConnectionError("MCP stdio server closed the connection")
             try:

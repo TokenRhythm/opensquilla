@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { walkFiles } from './lib/fs-walk.mjs'
 
 const require = createRequire(import.meta.url)
-const ts = require('typescript')
+const ts = require('@typescript/typescript6')
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const srcRoot = join(root, 'src')

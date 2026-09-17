@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import vm from 'node:vm'
-import ts from 'typescript'
+import ts from '@typescript/typescript6'
 
 import { normalizeRouterPresetBinding, resolveDesktopRouterUpdate } from '../dist/desktop-router-config.js'
 import * as primaryProviderChange from '../dist/desktop-primary-provider-change.js'

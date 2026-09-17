@@ -82,6 +82,87 @@ def pylock_inventory(path: Path) -> set[tuple[str, str]]:
     return {package_key(package) for package in packages}
 
 
+def registry_lock_inventory(workspace: Path, project: dict[str, Any]) -> set[tuple[str, str]]:
+    """Cover every locked registry variant, including inactive platform forks."""
+    project_name = project.get("project", {}).get("name")
+    if not isinstance(project_name, str) or not project_name:
+        raise AuditError("Python project has no name")
+    lock = tomllib.loads((workspace / "uv.lock").read_text(encoding="utf-8"))
+    packages = lock.get("package")
+    if not isinstance(packages, list) or not packages:
+        raise AuditError("uv.lock has no packages")
+    expected = set()
+    for package in packages:
+        key = package_key(package)
+        source = package.get("source")
+        if key[0] == normalized_name(project_name) and source in (
+            {"editable": "."}, {"virtual": "."},
+        ):
+            continue
+        if (not isinstance(source, dict) or set(source) != {"registry"}
+                or not isinstance(source["registry"], str) or not source["registry"]):
+            raise AuditError(f"Unsupported locked package source: {key[0]}=={key[1]}")
+        expected.add(key)
+    if not expected:
+        raise AuditError("uv.lock has no auditable registry packages")
+    return expected
+
+
+def write_inventory_pylock(destination: Path, packages: set[tuple[str, str]]) -> None:
+    text = 'lock-version = "1.0"\n'
+    for name, version in sorted(packages):
+        text += f"\n[[packages]]\nname = {json.dumps(name)}\nversion = {json.dumps(version)}\n"
+    destination.write_text(text, encoding="utf-8")
+
+
+def export_python_inventory(workspace: Path, output: Path, policy: dict[str, Any]) -> Path:
+    project = tomllib.loads((workspace / "pyproject.toml").read_text(encoding="utf-8"))
+    expected = registry_lock_inventory(workspace, project)
+    conflicts = project.get("tool", {}).get("uv", {}).get("conflicts", [])
+    selectors = [("all", ["--all-extras", "--all-groups"])]
+    if conflicts:
+        known = [{"group": "dev"}, {"group": "legacy-contract-codegen"}]
+        if conflicts not in ([known], [list(reversed(known))]):
+            raise AuditError(
+                "Unsupported Python dependency-group conflict; audit exports need review",
+            )
+        # uv refuses to export conflicting groups together. Keep the original
+        # locked exports, then audit their package/version union without any
+        # marker selecting away the inactive generator or platform variants.
+        selectors = [
+            ("ordinary", ["--all-extras", "--all-groups", "--no-group", "legacy-contract-codegen"]),
+            ("legacy", ["--only-group", "legacy-contract-codegen"]),
+        ]
+    exported: set[tuple[str, str]] = set()
+    provenance = []
+    for label, selection in selectors:
+        target = output / f"pylock.{label}.toml"
+        target.unlink(missing_ok=True)
+        result = run_command([
+            "uvx", "--from", f"uv=={policy['uv_version']}", "uv", "export", "--locked",
+            *selection, "--no-emit-project", "--format", "pylock.toml",
+            "--output-file", str(target),
+        ], cwd=workspace, timeout=policy["timeout_seconds"])
+        (output / f"python-export-{label}.stderr.txt").write_text(result.stderr, encoding="utf-8")
+        require_success(result, f"uv locked {label} export")
+        packages = pylock_inventory(target)
+        exported.update(packages)
+        provenance.append({
+            "file": target.name, "sha256": sha256(target),
+            "selection": selection, "package_versions": len(packages),
+        })
+    if exported != expected:
+        missing, extra = sorted(expected - exported), sorted(exported - expected)
+        raise AuditError(f"Python export coverage mismatch: missing={missing}, extra={extra}")
+    pylock = workspace / "pylock.toml"
+    write_inventory_pylock(pylock, exported)
+    write_json(output / "python-export-provenance.json", {
+        "uv_lock_sha256": sha256(workspace / "uv.lock"), "exports": provenance,
+        "package_versions": len(exported), "inventory_sha256": sha256(pylock),
+    })
+    return pylock
+
+
 def validate_python_report(report: Any, expected: set[tuple[str, str]]) -> dict[str, Any]:
     if not isinstance(report, dict) or not isinstance(report.get("dependencies"), list):
         raise AuditError("Python audit response has no dependency inventory")
@@ -200,10 +281,7 @@ def inventory_pylock(source: Path, destination: Path, lock_digest: str) -> list[
             included.add((name, version))
     if not included:
         raise AuditError("Artifact inventory contains no auditable bundled packages")
-    text = 'lock-version = "1.0"\n'
-    for name, version in sorted(included):
-        text += f"\n[[packages]]\nname = {json.dumps(name)}\nversion = {json.dumps(version)}\n"
-    destination.write_text(text, encoding="utf-8")
+    write_inventory_pylock(destination, included)
     return excluded
 
 
@@ -220,13 +298,7 @@ def audit_python(
         else:
             for name in ("pyproject.toml", "uv.lock"):
                 shutil.copyfile(repo / name, workspace / name)
-            result = run_command([
-                "uvx", "--from", f"uv=={policy['uv_version']}", "uv", "export", "--locked",
-                "--all-extras", "--all-groups", "--no-emit-project", "--format", "pylock.toml",
-                "--output-file", str(pylock),
-            ], cwd=workspace, timeout=timeout)
-            (output / "python-export.stderr.txt").write_text(result.stderr, encoding="utf-8")
-            require_success(result, "uv locked export")
+            pylock = export_python_inventory(workspace, output, policy)
             # A pip-audit project directory must contain only the exported lock;
             # leave no pyproject for a tool to resolve instead of using the lock.
             (workspace / "pyproject.toml").unlink()

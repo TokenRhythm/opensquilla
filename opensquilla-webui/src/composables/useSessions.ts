@@ -394,6 +394,14 @@ export function useSessions(directory: SessionDirectory) {
     return activeRequest
   }
 
+  function cancelPendingRequests() {
+    requestGeneration++
+    activeRequest?.abort()
+    activeRequest = null
+    isLoading.value = false
+    isLoadingMore.value = false
+  }
+
   const allSessions = computed((): SessionItem[] =>
     [...sessionsList.value].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
   )
@@ -533,5 +541,6 @@ export function useSessions(directory: SessionDirectory) {
     allSessions,
     loadSessions,
     loadMoreSessions,
+    cancelPendingRequests,
   }
 }

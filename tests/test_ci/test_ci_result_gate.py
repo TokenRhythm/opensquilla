@@ -129,6 +129,140 @@ def test_artifact_audit_excludes_only_local_project_and_explicit_build_only(tmp_
         AUDIT["inventory_pylock"](inventory, target, "different-lock")
 
 
+def _python_export_repo(tmp_path: Path, *, conflicting: bool = True) -> tuple[Path, Path]:
+    repo, output = tmp_path / "repo", tmp_path / "out"
+    repo.mkdir()
+    output.mkdir()
+    manifest = '[project]\nname = "OpenSquilla"\n'
+    if conflicting:
+        manifest += (
+            '[tool.uv]\nconflicts = [[{ group = "dev" }, '
+            '{ group = "legacy-contract-codegen" }]]\n'
+        )
+    (repo / "pyproject.toml").write_text(manifest, encoding="utf-8")
+    lock = '[[package]]\nname = "opensquilla"\nversion = "1"\nsource = {editable = "."}\n'
+    for name, version in [("generator", "1"), ("generator", "2"), ("pywin32", "311")]:
+        lock += (
+            f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n'
+            'source = {registry = "https://pypi.org/simple"}\n'
+        )
+    (repo / "uv.lock").write_text(lock, encoding="utf-8")
+    return repo, output
+
+
+EXPORT_POLICY = {"timeout_seconds": 1, "uv_version": "0.12.15", "pip_audit_version": "2.10.1"}
+EXPORT_PACKAGES = {("generator", "1"), ("generator", "2"), ("pywin32", "311")}
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+@pytest.mark.parametrize("vulnerable_legacy", [False, True])
+def test_locked_audit_includes_every_exported_generator_and_platform_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conflicting: bool, vulnerable_legacy: bool,
+) -> None:
+    repo, output = _python_export_repo(tmp_path, conflicting=conflicting)
+    export_calls = []
+
+    def fake_run(args: list[str], *, cwd: Path, **kwargs: Any) -> subprocess.CompletedProcess:
+        assert "--locked" in args
+        if "export" in args:
+            assert args[:5] == ["uvx", "--from", "uv==0.12.15", "uv", "export"]
+            export_calls.append(args)
+            packages = EXPORT_PACKAGES
+            if "--no-group" in args:
+                assert args[args.index("--no-group") + 1] == "legacy-contract-codegen"
+                assert "--all-groups" in args and "--all-extras" in args
+                packages = EXPORT_PACKAGES - {("generator", "1")}
+            elif "--only-group" in args:
+                assert args[args.index("--only-group") + 1] == "legacy-contract-codegen"
+                packages = {("generator", "1")}
+            AUDIT["write_inventory_pylock"](Path(args[args.index("--output-file") + 1]), packages)
+            return subprocess.CompletedProcess(args, 0, "", "locked export diagnostic")
+        assert args[:4] == ["uvx", "--from", "pip-audit==2.10.1", "pip-audit"]
+        assert "--strict" in args and "--ignore-vuln" not in args
+        assert not (cwd / "pyproject.toml").exists() and not (cwd / "uv.lock").exists()
+        assert list(cwd.glob("*.toml")) == [cwd / "pylock.toml"]
+        assert AUDIT["pylock_inventory"](cwd / "pylock.toml") == EXPORT_PACKAGES
+        report = {"dependencies": [
+            {"name": name, "version": version, "vulns": (
+                [{"id": "PYSEC-legacy-only"}] if vulnerable_legacy and version == "1" else []
+            )} for name, version in sorted(EXPORT_PACKAGES)
+        ]}
+        (output / "python.json").write_text(json.dumps(report), encoding="utf-8")
+        return subprocess.CompletedProcess(args, int(vulnerable_legacy), "", "")
+
+    monkeypatch.setitem(AUDIT["audit_python"].__globals__, "run_command", fake_run)
+    result = AUDIT["audit_python"](repo, output, EXPORT_POLICY, None)
+    assert result["package_versions"] == 3 and result["coverage_complete"] is True
+    assert result["vulnerability_count"] == int(vulnerable_legacy)
+    assert len(export_calls) == (2 if conflicting else 1)
+    provenance = json.loads((output / "python-export-provenance.json").read_text())
+    assert provenance["uv_lock_sha256"] == AUDIT["sha256"](repo / "uv.lock")
+    assert provenance["inventory_sha256"] == AUDIT["sha256"](output / "pylock.toml")
+    assert provenance["package_versions"] == 3
+    for exported in provenance["exports"]:
+        path = output / exported["file"]
+        assert exported["sha256"] == AUDIT["sha256"](path)
+        assert exported["package_versions"] == len(AUDIT["pylock_inventory"](path))
+
+
+@pytest.mark.parametrize("failure", [
+    "ordinary-export", "legacy-export", "missing-legacy", "missing-platform", "extra-package",
+])
+def test_locked_export_union_fails_closed_before_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    repo, output = _python_export_repo(tmp_path)
+    calls = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        assert "export" in args, "incomplete exports must never reach pip-audit"
+        calls.append(args)
+        legacy = "--only-group" in args
+        label = "legacy" if legacy else "ordinary"
+        if failure == f"{label}-export":
+            return subprocess.CompletedProcess(args, 2, "", "locked export failed")
+        packages = {("generator", "1")} if legacy else EXPORT_PACKAGES - {("generator", "1")}
+        if failure == "missing-legacy" and legacy:
+            packages = {("generator", "2")}
+        if failure == "missing-platform":
+            packages.discard(("pywin32", "311"))
+        if failure == "extra-package":
+            packages.add(("unlocked-package", "1"))
+        AUDIT["write_inventory_pylock"](Path(args[args.index("--output-file") + 1]), packages)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setitem(AUDIT["audit_python"].__globals__, "run_command", fake_run)
+    with pytest.raises(AuditError, match="exited 2|coverage mismatch"):
+        AUDIT["audit_python"](repo, output, EXPORT_POLICY, None)
+    assert calls
+    assert not (output / "python.json").exists()
+    if failure.endswith("-export"):
+        label = failure.removesuffix("-export")
+        assert "locked export failed" in (output / f"python-export-{label}.stderr.txt").read_text()
+
+
+@pytest.mark.parametrize("source", [
+    '{git = "https://example.invalid/pkg"}', '{editable = "../other"}',
+    '{path = "some.whl"}', '{registry = ""}', '{}',
+])
+def test_registry_coverage_rejects_unhandled_sources_instead_of_dropping_them(
+    tmp_path: Path, source: str,
+) -> None:
+    repo, _ = _python_export_repo(tmp_path)
+    with (repo / "uv.lock").open("a", encoding="utf-8") as stream:
+        stream.write(f'\n[[package]]\nname = "unknown"\nversion = "1"\nsource = {source}\n')
+    with pytest.raises(AuditError, match="Unsupported locked package source"):
+        AUDIT["registry_lock_inventory"](repo, {"project": {"name": "opensquilla"}})
+
+
+def test_unknown_group_conflict_requires_an_explicit_coverage_review(tmp_path: Path) -> None:
+    repo, output = _python_export_repo(tmp_path)
+    manifest = repo / "pyproject.toml"
+    manifest.write_text(manifest.read_text().replace('group = "dev"', 'group = "other"'))
+    with pytest.raises(AuditError, match="dependency-group conflict"):
+        AUDIT["export_python_inventory"](repo, output, EXPORT_POLICY)
+
+
 @pytest.mark.parametrize("failure", ["network", "malformed", "missing-platform", "vulnerability"])
 def test_python_audit_command_failure_never_returns_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,

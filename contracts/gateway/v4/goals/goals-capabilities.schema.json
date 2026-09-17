@@ -15,9 +15,9 @@
     "compatibility": "exact-json-tree"
   },
   "x-opensquilla-codegen": {
-    "python": {"tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel"},
-    "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"},
-    "runtimeValidation": {"tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only"}
+    "python": {"tool": "datamodel-code-generator", "version": "0.81.0", "target": "pydantic_v2.BaseModel"},
+    "typescript": {"tool": "json-schema-to-typescript", "version": "16.0.0"},
+    "runtimeValidation": {"tool": "ajv", "version": "8.20.0", "mode": "standalone-adapter-only"}
   },
   "x-opensquilla-method": {
     "name": "goals.capabilities",

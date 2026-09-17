@@ -466,7 +466,7 @@ jobs:
 
       - name: Install pinned Contract generators
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        run: uv sync --only-group dev --frozen
+        run: python scripts/contracts/prepare_codegen_toolchains.py
 
       - name: Verify deterministic Contract generation
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
@@ -589,7 +589,7 @@ jobs:
           enable-cache: true
 
       - name: Install pinned Contract generators
-        run: uv sync --only-group dev --frozen
+        run: python scripts/contracts/prepare_codegen_toolchains.py
 
       - name: Verify every Contract role in a separate output tree
         shell: bash
@@ -651,7 +651,7 @@ jobs:
           enable-cache: true
 
       - name: Install pinned Contract generators
-        run: uv sync --only-group dev --frozen
+        run: python scripts/contracts/prepare_codegen_toolchains.py
 
       - name: Verify Windows Contract generation and real toolchain
         env:

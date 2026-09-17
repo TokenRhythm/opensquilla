@@ -31,11 +31,11 @@ export function boundaryReexportViolation(
 ): string | null
 
 export function collectBoundaryArchitectureViolations(input: {
-  ts: typeof import('typescript')
+  ts: typeof import('@typescript/typescript6')
   root: string
   sources: Array<{
     rel: string
-    source: import('typescript').SourceFile
+    source: import('@typescript/typescript6').SourceFile
   }>
   analysis?: import('./rpc-typescript-program.mjs').RpcAnalysisProgram
 }): string[]

@@ -25,7 +25,7 @@ import { createRpcAnalysisProgram } from './rpc-typescript-program.mjs'
 
 const defaultRoot = fileURLToPath(new URL('../..', import.meta.url))
 const require = createRequire(import.meta.url)
-const ts = require('typescript')
+const ts = require('@typescript/typescript6')
 const trackedRpcKinds = new Set(
   TRACKED_RPC_MEMBERS.flatMap(member => [member, `${member}Reference`]),
 )

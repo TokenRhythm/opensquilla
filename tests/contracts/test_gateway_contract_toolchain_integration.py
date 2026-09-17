@@ -100,12 +100,8 @@ def test_generic_contract_toolchain_is_real_and_deterministic(tmp_path: Path) ->
     subprocess.run(
         runner._resolved_command(
             [
-                "npm",
-                "--prefix",
-                "opensquilla-webui",
-                "exec",
-                "--",
-                "tsc",
+                "node",
+                str(ROOT / "opensquilla-webui/node_modules/typescript/bin/tsc"),
                 "--noEmit",
                 "--strict",
                 "--skipLibCheck",
@@ -232,7 +228,7 @@ def test_required_alternatives_preserve_actual_params_types(tmp_path: Path) -> N
     usage_path.write_text("\n".join(usage) + "\n", encoding="utf-8")
     subprocess.run(
         runner._resolved_command([
-            "npm", "--prefix", "opensquilla-webui", "exec", "--", "tsc",
+            "node", str(ROOT / "opensquilla-webui/node_modules/typescript/bin/tsc"),
             "--noEmit", "--strict", "--skipLibCheck", "--target", "ES2022",
             "--module", "ESNext", "--moduleResolution", "Bundler", str(usage_path),
         ]),

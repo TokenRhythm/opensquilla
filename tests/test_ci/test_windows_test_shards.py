@@ -37,6 +37,8 @@ pytest_file_selection_arg = SHARD_MODULE["_pytest_file_selection_arg"]
 
 OFFLINE_MARKER_EXCLUSIONS = SHARD_MODULE["OFFLINE_MARKER_EXCLUSIONS"]
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Generator provenance checks use the provisional floor pending Windows samples.
+    "tests/contracts/test_codegen_versions.py",
     # Security inventory, rendering, and functional probes use measured Windows
     # testcase totals until the next comparable three-run duration refresh.
     "tests/test_desktop/test_gateway_functional_probes.py",

@@ -5,6 +5,7 @@ __pycache__/
 /dist/
 /build/
 .venv/
+.venv-contract-legacy/
 .env
 .env.test
 opensquilla.toml

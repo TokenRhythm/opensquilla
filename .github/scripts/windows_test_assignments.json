@@ -377,6 +377,7 @@
       "tests/unit/test_env_loading.py"
     ],
     "gateway-sqlite": [
+      "tests/contracts/test_codegen_versions.py",
       "tests/contracts/test_gateway_contract_runner.py",
       "tests/contracts/test_gateway_contract_toolchain_integration.py",
       "tests/contracts/test_gateway_validator_profiles.py",

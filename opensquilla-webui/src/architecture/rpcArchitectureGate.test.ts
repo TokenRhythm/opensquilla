@@ -25,7 +25,7 @@ import { collectRpcTransportOperations } from '../../scripts/lib/rpc-symbol-prov
 
 const fixtureRoot = resolve('rpc-architecture-fixture')
 const require = createRequire(import.meta.url)
-const ts = require('typescript') as typeof import('typescript')
+const ts = require('@typescript/typescript6') as typeof import('@typescript/typescript6')
 
 function source(code: string) {
   return ts.createSourceFile(
@@ -39,8 +39,8 @@ function source(code: string) {
 
 function nodes(code: string) {
   const parsed = source(code)
-  const result: import('typescript').Node[] = []
-  function visit(node: import('typescript').Node) {
+  const result: import('@typescript/typescript6').Node[] = []
+  function visit(node: import('@typescript/typescript6').Node) {
     result.push(node)
     ts.forEachChild(node, visit)
   }

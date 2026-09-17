@@ -458,6 +458,7 @@ try {
   ])
   await import('./test-packaged-first-send-cleanup.mjs')
   await import('./test-session-recovery-transport-contract.mjs')
+  await import('./test-e2e-subprocess-diagnostics.mjs')
   console.log('Desktop E2E case telemetry checks passed')
 } finally {
   await rm(root, { recursive: true, force: true })

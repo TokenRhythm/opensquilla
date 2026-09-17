@@ -4,7 +4,7 @@ import { mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import vm from 'node:vm'
-import ts from 'typescript'
+import ts from '@typescript/typescript6'
 import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
 import { UpdateCheckScheduler, isUpdateCheckAllowed } from '../dist/update-check-scheduler.js'
 import {

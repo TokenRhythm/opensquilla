@@ -8,7 +8,7 @@ import {
 } from './gateway_contract_inventory.mjs'
 
 const require = createRequire(resolve(repositoryRoot, 'opensquilla-webui/package.json'))
-const ts = require('typescript')
+const ts = require('@typescript/typescript6')
 const { parse: parseVue } = require('@vue/compiler-sfc')
 const normalized = path => path.replace(/\\/g, '/')
 const isTest = path => /\.(test|spec)\.[cm]?[jt]sx?$/.test(path)

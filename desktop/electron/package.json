@@ -82,12 +82,13 @@
   },
   "devDependencies": {
     "@types/node": "^24.13.5",
+    "@typescript/typescript6": "6.0.2",
     "electron": "^42.5.1",
     "electron-builder": "^26.15.3",
     "gsap": "^3.15.0",
     "lottie-web": "^5.13.0",
     "playwright": "~1.60.0",
-    "typescript": "^6.0.3",
+    "typescript": "7.0.2",
     "ws": "^8.21.3"
   },
   "build": {

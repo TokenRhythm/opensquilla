@@ -447,6 +447,10 @@ def test_only_the_exact_production_sessions_list_schema_is_grandfathered(
         "sessions/sessions-list.schema.json",
         copied_document,
     )
+    with pytest.raises(runner.ContractConfigurationError, match="repository-pinned toolchain"):
+        runner.load_contract(copied_schema, contract_root=tmp_path)
+    copied_document["x-opensquilla-codegen"] = runner.PINNED_CODEGEN
+    _write_schema(tmp_path, "sessions/sessions-list.schema.json", copied_document)
     with pytest.raises(runner.ContractConfigurationError, match="declare kind"):
         runner.load_contract(copied_schema, contract_root=tmp_path)
 
@@ -498,6 +502,29 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         "eventFamilyCount": 10,
         "schemaTreeSha256": runner._schema_tree_digest(specs),
         "generatorSha256": runner._generator_digest(),
+        "toolchains": {
+            "ordinaryTypes": {
+                "python": {
+                    "tool": "datamodel-code-generator",
+                    "version": "0.81.0",
+                    "target": "pydantic_v2.BaseModel",
+                },
+                "typescript": {"tool": "json-schema-to-typescript", "version": "16.0.0"},
+            },
+            "legacyTypes": {
+                "python": {
+                    "tool": "datamodel-code-generator",
+                    "version": "0.75.1",
+                    "target": "pydantic_v2.BaseModel",
+                },
+                "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"},
+            },
+            "runtimeValidation": {
+                "tool": "ajv",
+                "version": "8.20.0",
+                "mode": "standalone-adapter-only",
+            },
+        },
     }
     assert any(entry["name"] == "skills.install.status" for entry in manifest["methods"])
     assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
@@ -510,7 +537,8 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         if entry["name"] == "telemetry.product_active.record"
     ] == ["stable"]
     profile_save_activate = next(
-        entry for entry in manifest["methods"]
+        entry
+        for entry in manifest["methods"]
         if entry["name"] == "onboarding.llmProfile.upsertAndActivate"
     )
     assert profile_save_activate["lifecycle"] == "stable"
@@ -660,6 +688,10 @@ def test_generic_renderer_derives_all_adapter_only_artifacts(
             output.write_text("export interface SessionsResolveRequestFrame {}\n", encoding="utf-8")
 
     monkeypatch.setattr(runner, "_run", fake_run)
+    # This test synthesizes generator output; version discovery belongs to the
+    # same external-tool boundary, not the Python-only rendering contract.
+    monkeypatch.setattr(runner, "distribution_version", lambda _: "0.81.0")
+    monkeypatch.setattr(runner, "_verify_npm_generator", lambda *args: None)
     monkeypatch.setattr(
         runner,
         "_capture",

@@ -95,9 +95,25 @@ class _RecordingStdin:
 class _QueuedStdout:
     def __init__(self) -> None:
         self.lines: asyncio.Queue[bytes] = asyncio.Queue()
+        self._readahead = b""
 
     async def readline(self) -> bytes:
         return await self.lines.get()
+
+    async def read(self, n: int) -> bytes:
+        """Read up to n bytes, compatible with _readline_safe chunked reads."""
+        if self._readahead:
+            chunk = self._readahead[:n]
+            self._readahead = self._readahead[n:]
+            return chunk
+        try:
+            data = await asyncio.wait_for(self.lines.get(), timeout=10.0)
+        except TimeoutError:
+            return b""
+        if len(data) > n:
+            self._readahead = data[n:]
+            return data[:n]
+        return data
 
     def respond(self, request_id: int) -> None:
         self.lines.put_nowait(
@@ -228,3 +244,200 @@ async def test_call_tool_honors_result_level_is_error_flag() -> None:
 
     assert "upstream API rejected" in result.content
     assert result.is_error is True
+
+
+class _ChunkedStdout:
+    """Mock stdout that delivers data via ``read(chunk_size)`` instead of ``readline()``.
+
+    Used to test ``_readline_safe()`` which avoids the 64 KB StreamReader limit
+    by reading in chunks and splitting on newlines itself.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._buffer = data
+        self._pos = 0
+
+    async def read(self, n: int) -> bytes:
+        chunk = self._buffer[self._pos : self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+
+@pytest.mark.asyncio
+async def test_readline_safe_handles_line_larger_than_64kb() -> None:
+    """_readline_safe must read a single line > 64 KB without error."""
+    payload = {"jsonrpc": "2.0", "id": 1, "result": {"data": "x" * 70_000}}
+    line = (json.dumps(payload) + "\n").encode()
+    assert len(line) > 65536, "test line must exceed 64 KB"
+
+    process = _FakeProcess()
+    process.stdout = _ChunkedStdout(line)  # type: ignore[attr-defined]
+    client = _client_with_process(process)
+
+    result = await client._readline_safe()
+    assert result == line
+
+
+@pytest.mark.asyncio
+async def test_readline_safe_reassembles_lines_across_chunks() -> None:
+    """_readline_safe must reassemble a line split across multiple read calls."""
+    # Pad the line with a long key so it spans multiple 8KB reads.
+    long_key = "x" * 20_000
+    long_payload = {"jsonrpc": "2.0", "id": 1, "result": {"data": long_key}}
+    long_line = (json.dumps(long_payload) + "\n").encode()
+    assert len(long_line) > 16384, "line must span at least two 8192-byte reads"
+
+    process = _FakeProcess()
+    process.stdout = _ChunkedStdout(long_line)  # type: ignore[attr-defined]
+    client = _client_with_process(process)
+
+    result = await client._readline_safe()
+    assert result == long_line
+
+
+@pytest.mark.asyncio
+async def test_read_response_preserves_blank_line_tolerance() -> None:
+    process = _FakeProcess()
+    response = {"jsonrpc": "2.0", "id": 1, "result": {}}
+    process.stdout = _ChunkedStdout(  # type: ignore[attr-defined]
+        b"\n\r\n" + json.dumps(response).encode() + b"\n"
+    )
+    client = _client_with_process(process)
+
+    assert await client._read_response(1) == response
+    assert await client._readline_safe() == b""
+
+
+@pytest.mark.asyncio
+async def test_readline_budget_counts_each_frame_without_its_newline() -> None:
+    process = _FakeProcess()
+    # Both lines arrive in one read. The next frame must not consume this
+    # frame's budget, and multibyte text must be counted as bytes.
+    line = "🦑".encode() * 16
+    process.stdout = _ChunkedStdout(line + b"\n" + line + b"\n")  # type: ignore[attr-defined]
+    client = _client_with_process(process)
+    client._MAX_MESSAGE_BYTES = len(line)
+
+    assert await client._readline_safe() == line + b"\n"
+    assert await client._readline_safe() == line + b"\n"
+    assert await client._readline_safe() == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delimiter", [b"", b"\n"])
+async def test_readline_allows_budget_boundary_across_read_chunks(delimiter: bytes) -> None:
+    process = _FakeProcess()
+    line = b"x" * 8192
+    process.stdout = _ChunkedStdout(line + delimiter)  # type: ignore[attr-defined]
+    client = _client_with_process(process)
+    client._MAX_MESSAGE_BYTES = len(line)
+
+    assert await client._readline_safe() == line + delimiter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delimiter", [b"", b"\n"])
+@pytest.mark.parametrize("buffered", [False, True])
+async def test_readline_rejects_over_budget_and_disconnects(
+    delimiter: bytes, buffered: bool
+) -> None:
+    process = _FakeProcess()
+    prefix = b"{}\n" if buffered else b""
+    process.stdout = _ChunkedStdout(prefix + b"x" * 65 + delimiter)  # type: ignore[attr-defined]
+    client = _client_with_process(process)
+    client._MAX_MESSAGE_BYTES = 64
+    if buffered:
+        assert await client._readline_safe() == b"{}\n"
+
+    with pytest.raises(ValueError, match="MCP stdio message exceeds 64 byte limit"):
+        await client._readline_safe()
+
+    assert process.terminated
+    assert client._process is None
+    assert client._readahead == b""
+    with pytest.raises(ConnectionError, match="not connected"):
+        await client._send_request("tools/list")
+
+
+@pytest.mark.asyncio
+async def test_close_discards_old_process_readahead() -> None:
+    client = _client_with_process(_FakeProcess())
+    client._readahead = b'{"jsonrpc":"2.0",'
+
+    await client.close()
+
+    assert client._readahead == b""
+
+
+@pytest.mark.asyncio
+async def test_connect_does_not_prefix_new_process_response_with_old_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess()
+    process.stdin = _RecordingStdin()  # type: ignore[attr-defined]
+    process.stdout = _ChunkedStdout(  # type: ignore[attr-defined]
+        b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
+    )
+
+    async def spawn(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    client = MCPStdioClient(MCPServerConfig(name="demo", transport="stdio", command="demo"))
+    client._readahead = b'{"jsonrpc":"2.0",'
+    try:
+        await client.connect()
+        assert len(process.stdin.writes) == 2  # type: ignore[attr-defined]
+    finally:
+        await client.close()
+
+
+_LARGE_SERVER_SCRIPT = r"""
+import json, sys
+
+def send(payload):
+    sys.stdout.buffer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+    sys.stdout.buffer.flush()
+
+for line in sys.stdin.buffer:
+    msg = json.loads(line)
+    request_id = msg.get("id")
+    if request_id is None:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {},
+                  "serverInfo": {"name": "synthetic", "version": "1"},
+                  "instructions": "x" * (129 * 1024)}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "large", "description": "x" * (129 * 1024),
+                             "inputSchema": {"type": "object"}}]}
+    else:
+        send({"jsonrpc": "2.0", "method": "notifications/message", "params": {}})
+        result = {"content": [{"type": "text", "text": "\U0001f991" * (256 * 1024)}]}
+    send({"jsonrpc": "2.0", "id": request_id, "result": result})
+"""
+
+
+@pytest.mark.asyncio
+async def test_large_initialize_list_and_tool_responses_from_real_subprocess() -> None:
+    client = MCPStdioClient(
+        MCPServerConfig(
+            name="large",
+            transport="stdio",
+            command=sys.executable,
+            args=["-u", "-c", _LARGE_SERVER_SCRIPT],
+        )
+    )
+    try:
+        async with asyncio.timeout(30):
+            await client.connect()
+            tools = await client.list_tools()
+            assert [tool.name for tool in tools] == ["large"]
+            assert len(tools[0].description) == 129 * 1024
+            result = await client.call_tool("large", {})
+            assert result.content == "🦑" * (256 * 1024)
+            # Consume a subsequent response to cover framing after read-ahead.
+            assert len(await client.list_tools()) == 1
+    finally:
+        await client.close()

@@ -95,28 +95,54 @@ async def test_startup_waits_for_writer_before_restoring_interactive_timeout(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["native", "sqlite3"])
 @pytest.mark.parametrize("cancelled", [False, True], ids=["failure", "cancellation"])
-async def test_failed_startup_closes_its_connection(tmp_path, monkeypatch, cancelled) -> None:
+async def test_failed_startup_closes_its_connection(
+    tmp_path, monkeypatch, cancelled, backend,
+) -> None:
+    # Select each real backend directly: the compatibility wrapper may legitimately
+    # fall back after a native connection timeout, making this coverage load-dependent.
+    if backend == "native":
+        native = storage_module.aiosqlite._native_aiosqlite
+        assert native is not None
+        connect = native.connect
+        connection_type = native.Connection
+        closed_error = ValueError
+        closed_message = "^no active connection$"
+    else:
+        connect = storage_module.aiosqlite._connect_sqlite3
+        connection_type = storage_module.aiosqlite._AsyncConnection
+        closed_error = sqlite3.ProgrammingError
+        closed_message = r"^Cannot operate on a closed database\.$"
+    monkeypatch.setattr(storage_module.aiosqlite, "connect", connect)
+
     storage = SessionStorage(str(tmp_path / "sessions.db"))
     connections = []
+    failure = (
+        asyncio.CancelledError("synthetic initialization cancellation")
+        if cancelled else RuntimeError("synthetic initialization failure")
+    )
 
     async def reject_initialization(*, goal_pause_reason: str) -> None:
+        assert isinstance(storage.conn, connection_type)
         connections.append(storage.conn)
-        if cancelled:
-            raise asyncio.CancelledError
-        raise RuntimeError("synthetic initialization failure")
+        raise failure
 
     monkeypatch.setattr(storage, "_initialize_schema", reject_initialization)
     try:
-        with pytest.raises(asyncio.CancelledError if cancelled else RuntimeError):
+        with pytest.raises(type(failure)) as caught:
             await storage.connect()
+        assert caught.value is failure
+        assert len(connections) == 1
         assert storage._conn is None
         assert storage._transcript_reader is None
         assert storage._meta_launch_draft_gc_task is None
-        with pytest.raises(ValueError, match="no active connection"):
+        with pytest.raises(closed_error, match=closed_message):
             await connections[0].execute("SELECT 1")
     finally:
         await storage.close()
+        for connection in connections:
+            await connection.close()
 
 
 def _agent_task(task_id: str) -> AgentTaskRecord:

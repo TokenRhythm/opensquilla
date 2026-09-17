@@ -23,6 +23,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from importlib.metadata import version as distribution_version
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -43,18 +44,30 @@ PRODUCTION_TARGET_MANIFEST = CONTRACT_ROOT / "production-targets.json"
 PINNED_CODEGEN = {
     "python": {
         "tool": "datamodel-code-generator",
-        "version": "0.75.1",
+        "version": "0.81.0",
         "target": "pydantic_v2.BaseModel",
     },
     "typescript": {
         "tool": "json-schema-to-typescript",
-        "version": "15.0.4",
+        "version": "16.0.0",
     },
     "runtimeValidation": {
         "tool": "ajv",
-        "version": "8.17.1",
+        "version": "8.20.0",
         "mode": "standalone-adapter-only",
     },
+}
+
+# The historical schema bytes participate in the frozen type-artifact hashes.
+# Its runtime validators still use the current AJV toolchain, recorded separately.
+LEGACY_SCHEMA_CODEGEN = {
+    "python": {
+        "tool": "datamodel-code-generator",
+        "version": "0.75.1",
+        "target": "pydantic_v2.BaseModel",
+    },
+    "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"},
+    "runtimeValidation": {"tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only"},
 }
 
 # Exact-output compatibility seam.  Remove an entry only in the PR that
@@ -289,7 +302,12 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
         raise ContractConfigurationError(f"{schema}: Contract must use JSON Schema 2020-12")
     if not isinstance(document.get("$id"), str):
         raise ContractConfigurationError(f"{schema}: Contract must declare a string $id")
-    if document.get("x-opensquilla-codegen") != PINNED_CODEGEN:
+    expected_codegen = (
+        LEGACY_SCHEMA_CODEGEN
+        if schema.resolve() in {path.resolve() for path in LEGACY_GENERATORS}
+        else PINNED_CODEGEN
+    )
+    if document.get("x-opensquilla-codegen") != expected_codegen:
         raise ContractConfigurationError(
             f"{schema}: x-opensquilla-codegen must match the repository-pinned toolchain"
         )
@@ -1314,6 +1332,7 @@ def _render_validators(
 ) -> dict[Path, str]:
     if roles == ():
         return {}
+    _verify_npm_generator("ajv", PINNED_CODEGEN["runtimeValidation"]["version"])
     available = {role for role, _ in spec.targets}
     if roles is not None and (not set(roles) <= available or len(set(roles)) != len(roles)):
         raise ContractConfigurationError(f"invalid validator roles for {spec.wire_name}")
@@ -1377,6 +1396,15 @@ def _typescript_params_schema(spec: ContractSpec) -> dict[str, Any]:
     return document
 
 
+def _verify_npm_generator(name: str, expected: str) -> None:
+    package = ROOT / "opensquilla-webui/node_modules" / name / "package.json"
+    document = json.loads(package.read_text(encoding="utf-8"))
+    if document.get("name") != name or document.get("version") != expected:
+        raise ContractConfigurationError(
+            f"{name} must be {expected}; run npm ci in opensquilla-webui"
+        )
+
+
 def render_generic(
     spec: ContractSpec,
     *,
@@ -1388,6 +1416,11 @@ def render_generic(
         raise ContractConfigurationError(
             f"{spec.schema}: legacy Contract must use its compatibility generator"
         )
+    actual = distribution_version("datamodel-code-generator")
+    expected = PINNED_CODEGEN["python"]["version"]
+    if actual != expected:
+        raise ContractConfigurationError(f"Python generator must be {expected}; got {actual}")
+    _verify_npm_generator("json-schema-to-typescript", PINNED_CODEGEN["typescript"]["version"])
     env = _environment()
     with tempfile.TemporaryDirectory(prefix="opensquilla-jsonschema-codegen-") as raw_tmp:
         tmp = Path(raw_tmp)
@@ -1475,7 +1508,7 @@ def render_generic(
 
 
 def _load_legacy_generator(generator: Path) -> Any:
-    """Load a frozen compatibility generator without changing its source bytes."""
+    """Load the compatibility generator for the frozen type artifacts."""
 
     module_name = f"_opensquilla_legacy_contract_{generator.stem}"
     module_spec = importlib.util.spec_from_file_location(module_name, generator)
@@ -1627,6 +1660,13 @@ def render_compatibility_manifest(specs: tuple[ContractSpec, ...]) -> str:
             "eventFamilyCount": len(events),
             "schemaTreeSha256": _schema_tree_digest(specs),
             "generatorSha256": _generator_digest(),
+            "toolchains": {
+                "ordinaryTypes": {key: PINNED_CODEGEN[key] for key in ("python", "typescript")},
+                "legacyTypes": {
+                    key: LEGACY_SCHEMA_CODEGEN[key] for key in ("python", "typescript")
+                },
+                "runtimeValidation": PINNED_CODEGEN["runtimeValidation"],
+            },
         },
         "methods": methods,
         "events": events,

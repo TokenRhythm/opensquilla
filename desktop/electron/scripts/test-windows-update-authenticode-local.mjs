@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
-import ts from 'typescript'
+import ts from '@typescript/typescript6'
 import {
   WINDOWS_INSTALLER_SIGNATURE_SCRIPT,
   WINDOWS_UPDATE_SIGNING_POLICY,

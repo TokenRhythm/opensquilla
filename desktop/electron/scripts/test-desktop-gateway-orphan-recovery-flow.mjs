@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -22,6 +21,7 @@ import {
   desktopShutdownEvidenceSince,
   gatewayProcessSnapshot,
 } from './e2e-shutdown-helpers.mjs'
+import { execFileWithDiagnostics } from './e2e-subprocess-diagnostics.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -149,6 +149,7 @@ async function phaseError(message, app, userDataDir, phase, cause = null) {
   return new Error(
     `DESKTOP_E2E_PHASE_FAILED: phase=${phase.name} ${message}.${causeSuffix} `
     + `Diagnostics: ${JSON.stringify(diagnostics)}`,
+    cause ? { cause } : undefined,
   )
 }
 
@@ -256,23 +257,20 @@ async function waitForDesktopRenderer(app, userDataDir, phase) {
 
 async function stopExitedElectronChildrenOnWindows(parentPid) {
   if (process.platform !== 'win32') return
-  await new Promise((resolveStop, rejectStop) => {
-    const command = [
-      `Get-CimInstance Win32_Process -Filter \"ParentProcessId = ${parentPid}\"`,
-      "| Where-Object { $_.Name -ieq 'electron.exe' }",
-      '| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }',
-    ].join(' ')
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', command],
-      {
-        windowsHide: true,
-        timeout: WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS,
-        killSignal: 'SIGKILL',
-      },
-      (error) => error ? rejectStop(error) : resolveStop(),
-    )
-  })
+  const command = [
+    `Get-CimInstance Win32_Process -Filter \"ParentProcessId = ${parentPid}\"`,
+    "| Where-Object { $_.Name -ieq 'electron.exe' }",
+    '| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }',
+  ].join(' ')
+  await execFileWithDiagnostics(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', command],
+    {
+      windowsHide: true,
+      timeout: WINDOWS_ELECTRON_CHILD_CLEANUP_COMMAND_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    },
+  )
   await delay(250)
 }
 
