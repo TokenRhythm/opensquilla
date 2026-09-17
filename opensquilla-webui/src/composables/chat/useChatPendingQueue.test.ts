@@ -5,6 +5,8 @@ import {
   useChatPendingQueue,
   type UseChatPendingQueueOptions,
 } from './useChatPendingQueue'
+import { useChatAttachments } from './useChatAttachments'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
@@ -430,6 +432,64 @@ describe('useChatPendingQueue delivery state', () => {
       expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.cancel')).toBe(false)
     } finally { release?.(); queue.cleanup() }
   })
+
+  it.each(['identity', 'session'] as const)(
+    'stops later offline attachment uploads when the %s changes during the first refresh',
+    async change => {
+      const { wal, records } = memoryWal()
+      const connectionState = ref('disconnected')
+      const deliveryIdentity = ref<string | null>('synthetic-owner')
+      let release!: () => void
+      const firstUpload = new Promise<void>(resolve => { release = resolve })
+      const uploadAttachment = vi.fn(async (file: File) => {
+        if (file.name === 'first.pdf') await firstUpload
+        return { fileUuid: `refreshed-${file.name}`, expiresAt: Date.now() + 60_000 }
+      })
+      const unused = async (): Promise<never> => { throw new Error('Unexpected artifact access') }
+      const content: ArtifactContentAccess = {
+        fetchArtifact: unused, openArtifact: unused, openArtifactBlob: unused,
+        clearPreviewStorage: unused, fetchAttachment: unused, uploadAttachment,
+      }
+      const attachments = useChatAttachments(content)
+      const prepare = vi.fn(attachments.prepareAttachmentsForSend)
+      const onPendingPersistenceError = vi.fn()
+      const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
+        ? { items: [] } : { requestFingerprint: 'unexpected-enqueue', revision: 1 })
+      const { queue, inputText, pendingAttachments, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+        pendingInputWal: wal, connectionState, deliveryIdentity,
+        prepareAttachmentsForSend: prepare, onPendingPersistenceError,
+        rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+      })
+      try {
+        inputText.value = 'Keep both private attachment drafts'
+        pendingAttachments.value = ['first.pdf', 'second.pdf'].map((name, index) => ({
+          kind: 'staged', local_id: index + 1, name, mime: 'application/pdf',
+          file_uuid: `original-${name}`, expires_at: 0,
+          file: new File(['Synthetic PDF content'], name, { type: 'application/pdf' }),
+        }))
+        await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+        const originalWal = structuredClone([...records.values()][0]!)
+        connectionState.value = 'connected'
+        await vi.waitFor(() => expect(uploadAttachment).toHaveBeenCalledOnce())
+        if (change === 'identity') deliveryIdentity.value = 'synthetic-guest'
+        else sessionKey.value = 'agent:main:webchat:other'
+        release()
+        await prepare.mock.results[0]!.value
+        await nextTick()
+        expect(uploadAttachment).toHaveBeenCalledOnce()
+        await expect(prepare.mock.results[0]!.value).resolves.toBe(false)
+        expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+        expect(onPendingPersistenceError).not.toHaveBeenCalled()
+        expect([...records.values()]).toEqual([originalWal])
+        expect(queue.pendingQueue.value[0]).toMatchObject({
+          pendingPersistenceState: 'local_only', pendingMayHaveServerCopy: false,
+          attachments: [
+            { file_uuid: 'original-first.pdf' }, { file_uuid: 'original-second.pdf' },
+          ],
+        })
+      } finally { release(); queue.cleanup() }
+    },
+  )
 
   it('stops server hydration after identity changes during a row write and retains the captured identity', async () => {
     const { wal, records } = memoryWal()

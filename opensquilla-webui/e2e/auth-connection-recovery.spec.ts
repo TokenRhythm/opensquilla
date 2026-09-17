@@ -1,9 +1,10 @@
-import { expect, test, type Page, type TestInfo } from '@playwright/test'
+import { expect, test, type Page, type TestInfo, type WebSocketRoute } from '@playwright/test'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const TOKEN = 'synthetic-browser-gateway-token'
 
@@ -269,6 +270,52 @@ test('does not describe an origin-policy close as a missing token', async ({ pag
   })
   await page.goto('/control/sessions')
   await page.getByRole('button', { name: /^(Manage gateway connection|Connection:)/ }).click()
+  const token = page.locator('#conn-ws-token')
+  await expect(token).toBeVisible()
+  await expect(page.locator('.conn-status__pill')).not.toHaveText('Token required')
+  await expect(page.locator('.conn-status__reason')).not.toContainText('Authentication failed')
+  await expect(token).not.toBeFocused()
+})
+
+test('keeps connection settings navigation when a policy close settles the initial draft', async ({ page }) => {
+  await page.clock.install()
+  await prepare(page, 'ws://synthetic-policy.invalid/ws')
+  let socket: WebSocketRoute
+  let subscribed = false
+  await page.routeWebSocket('ws://synthetic-policy.invalid/ws', ws => {
+    socket = ws
+    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
+    ws.onMessage(raw => {
+      const frame = JSON.parse(String(raw))
+      if (frame.method === 'connect') {
+        ws.send(helloOkResponse({ features: { methods: [
+          'sessions.messages.subscribe', 'sessions.messages.hydrate', 'sessions.messages.snapshot',
+        ] } }))
+      } else if (['sessions.messages.subscribe', 'sessions.messages.hydrate', 'sessions.messages.snapshot'].includes(frame.method)) {
+        // The first live bootstrap stays pending until the operator leaves Chat.
+        subscribed = true
+      } else if (frame.type === 'req') {
+        ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }))
+      }
+    })
+  })
+  const connection = page.getByRole('button', { name: /^(Manage gateway connection|Connection:)/ })
+  await page.route(/\/(?:assets\/ChatView-[^/]+\.js|src\/views\/ChatView\.vue)(?:\?.*)?$/, async route => {
+    // Give the draft a connected bootstrap rather than an immediate offline result.
+    await expect(connection).toHaveText('Connected')
+    await route.continue()
+  })
+  await page.route(/\/(?:assets\/SettingsView-[^/]+\.js|src\/views\/web\/SettingsView\.vue)(?:\?.*)?$/, async route => {
+    // Reproduce a slow first load of Settings while the initial draft completes.
+    socket.close({ code: 1008, reason: 'origin_policy_rejected' })
+    await expect(connection).toHaveText('Disconnected')
+    await route.continue()
+  })
+  await page.goto('/control/sessions')
+  await expect.poll(() => subscribed).toBe(true)
+  await expect(page).toHaveURL(/\/control\/chat$/)
+  await connection.click()
+  await expect(page).toHaveURL(/\/settings\/gateway#connection$/)
   const token = page.locator('#conn-ws-token')
   await expect(token).toBeVisible()
   await expect(page.locator('.conn-status__pill')).not.toHaveText('Token required')

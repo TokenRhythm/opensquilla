@@ -80,7 +80,7 @@ def _log_correlation_id(value: object) -> str | None:
     # Request IDs are client-controlled; log a stable digest, never their text.
     if not isinstance(value, str) or not value:
         return None
-    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+    return "sha256:" + hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
 
 
 _ARTIFACT_PRODUCT_METHOD_PREFIXES = (
@@ -365,8 +365,10 @@ class RpcRegistry:
             log.warning(
                 "rpc.send_failed",
                 method=method,
-                request_id_hash=_log_correlation_id(req_id),
-                connection_id_hash=_log_correlation_id(getattr(ctx, "conn_id", None)),
+                # Use the existing metadata schema so production privacy
+                # projection retains these explicitly hashed correlations.
+                request_id=_log_correlation_id(req_id),
+                connection_id=_log_correlation_id(getattr(ctx, "conn_id", None)),
                 code=error.code if _LOG_ERROR_CODE.fullmatch(error.code) else "UNKNOWN_ERROR",
                 accepted=error.accepted,
                 retryable=error.retryable,

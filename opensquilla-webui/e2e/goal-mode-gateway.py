@@ -1,7 +1,8 @@
 """Real Gateway fixture for the Goal-mode browser regression.
 
 The browser test starts this process with the repository virtualenv.  The
-provider is deterministic, but every other boundary is production code:
+Provider replies are deterministic and token counting uses the production
+conservative offline fallback. Every lifecycle boundary is production code:
 WebSocket RPC, SQLite state, TaskRuntime, GoalService, TurnRunner, tools, and
 the automatic continuation lifecycle.
 """
@@ -16,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from opensquilla import token_estimation
 from opensquilla.gateway.boot import start_gateway_server
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
 from opensquilla.gateway.websocket import SubscriptionManager
@@ -317,6 +319,10 @@ class DeterministicGoalSelector:
 
 
 async def main() -> None:
+    # Every fixture gets a fresh temporary directory, including tiktoken's
+    # default download cache. Use the production conservative fallback so a
+    # chat lifecycle proof never waits for an external tokenizer download.
+    token_estimation._encoding = token_estimation._ENCODING_UNAVAILABLE
     port = int(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_PORT"])
     state_dir = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_STATE"])
     event_log = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_EVENT_LOG"])

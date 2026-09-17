@@ -2184,6 +2184,9 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     install_gateway = next(
         step for step in steps if step.get("name") == "Install Gateway dependencies"
     )
+    sandbox = next(
+        step for step in steps if step.get("name") == "Install and verify Linux guest sandbox"
+    )
     run = next(
         step
         for step in steps
@@ -2201,6 +2204,16 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     )
     assert stage["working-directory"] == "opensquilla-webui"
     assert steps.index(download) < steps.index(install_gateway) < steps.index(run)
+    assert steps.index(install_gateway) < steps.index(sandbox) < steps.index(run)
+    assert "if" not in sandbox
+    assert not sandbox.get("continue-on-error")
+    assert "apt-get install --yes bubblewrap" in sandbox["run"]
+    assert (
+        "bwrap --unshare-user --unshare-net --ro-bind / / --proc /proc /bin/true"
+        in sandbox["run"]
+    )
+    assert "probe_bwrap()" in sandbox["run"]
+    assert "not probe.available or not probe.supports_perms" in sandbox["run"]
     assert install_gateway["run"] == "uv sync --frozen"
     assert job["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
     assert job["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")

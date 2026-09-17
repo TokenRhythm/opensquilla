@@ -749,6 +749,26 @@ jobs:
       - name: Install Gateway dependencies
         run: uv sync --frozen
 
+      - name: Install and verify Linux guest sandbox
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          bwrap --version
+          # Exercise the real unprivileged namespace boundary. Keep host
+          # AppArmor and sysctl restrictions intact; a denial must fail here.
+          bwrap --unshare-user --unshare-net --ro-bind / / --proc /proc /bin/true
+          uv run python - <<'PY'
+          import json
+          from dataclasses import asdict
+          from opensquilla.sandbox.backend.linux_readiness import probe_bwrap
+
+          probe = probe_bwrap()
+          print(json.dumps(asdict(probe), sort_keys=True))
+          if not probe.available or not probe.supports_perms:
+              raise SystemExit("Linux guest sandbox preflight failed: " + probe.message)
+          PY
+
       - name: Install frontend dependencies
         working-directory: opensquilla-webui
         run: npm ci

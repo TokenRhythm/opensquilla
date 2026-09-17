@@ -518,12 +518,19 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           if (!identityAllowsDelivery(item)) return
           if (wasRemoved(sessionKey, pendingInputId)) return
           if (item.attachments.length > 0 && options.prepareAttachmentsForSend) {
+            const preparationIsCurrent = () => (
+              (!item.pendingDeliveryIdentity || (
+                options.sessionKey.value === sessionKey && identityAllowsDelivery(item)
+              ))
+              && pendingQueue.value.some(candidate => candidate.pendingInputId === pendingInputId)
+            )
             const ready = await options.prepareAttachmentsForSend({
               attachments: item.attachments,
-              isCurrent: () => pendingQueue.value.some(candidate => (
-                candidate.pendingInputId === pendingInputId
-              )),
+              isCurrent: preparationIsCurrent,
             })
+            // A cancelled authority/session lease is not a server rejection.
+            // Leave the original local WAL intact for its proven owner.
+            if (!preparationIsCurrent()) return
             if (!ready) {
               await writeWalItem(item, 'retryable')
               options.onPendingPersistenceError?.('server_rejected')

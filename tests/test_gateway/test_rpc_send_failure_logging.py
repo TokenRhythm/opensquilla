@@ -17,6 +17,7 @@ from opensquilla.gateway.rpc.registry import (
     RpcRegistry,
     RpcUnavailableError,
 )
+from opensquilla.observability.log_privacy import private_log_event
 from opensquilla.session.storage import StorageBusyError
 
 _SEND_METHODS = (
@@ -65,7 +66,7 @@ async def test_send_failure_logs_one_safe_summary_without_changing_response(
         raise failure
 
     registry.register(method, handler, "operator.write")
-    with capture_logs() as events:
+    with capture_logs(processors=[private_log_event]) as events:
         response = await registry.dispatch(
             _REQUEST_ID, method,
             {"message": _PRIVATE, "token": _PRIVATE, "attachments": [{"name": _PRIVATE}]},
@@ -83,8 +84,8 @@ async def test_send_failure_logs_one_safe_summary_without_changing_response(
         assert response.error.details == failure.details
     assert events == [{
         "event": "rpc.send_failed", "log_level": "warning", "method": method,
-        "request_id_hash": hashlib.sha256(_REQUEST_ID.encode()).hexdigest(),
-        "connection_id_hash": hashlib.sha256(_CONNECTION_ID.encode()).hexdigest(),
+        "request_id": "sha256:" + hashlib.sha256(_REQUEST_ID.encode()).hexdigest(),
+        "connection_id": "sha256:" + hashlib.sha256(_CONNECTION_ID.encode()).hexdigest(),
         "code": code, "accepted": accepted, "retryable": retryable,
     }]
     assert _PRIVATE not in json.dumps(events)
@@ -109,7 +110,7 @@ async def test_send_authorization_denials_are_logged_without_calling_handler(gue
         capabilities=frozenset({"guest.safe"}) if guest else frozenset(),
         guest_owner_id="a" * 64 if guest else None,
     )
-    with capture_logs() as events:
+    with capture_logs(processors=[private_log_event]) as events:
         response = await registry.dispatch(
             _REQUEST_ID, method,
             {"key": "agent:main:webchat:owner", "message": _PRIVATE},
@@ -127,26 +128,26 @@ async def test_send_authorization_denials_are_logged_without_calling_handler(gue
 async def test_invalid_send_envelope_logs_only_hashed_identifier() -> None:
     registry = RpcRegistry()
     request_id = f"{_PRIVATE}\ud800"
-    with capture_logs() as events:
+    with capture_logs(processors=[private_log_event]) as events:
         response = await registry.dispatch(request_id, "chat.send", {}, RpcContext(conn_id="test"))
 
     assert response.error is not None and response.error.code == "INVALID_REQUEST"
     assert len(events) == 1
-    assert events[0]["request_id_hash"] == hashlib.sha256(
+    assert events[0]["request_id"] == "sha256:" + hashlib.sha256(
         request_id.encode("utf-8", errors="replace"),
     ).hexdigest()
     assert _PRIVATE not in json.dumps(events)
 
 
 async def test_early_invalid_send_keeps_supporting_context_without_connection_id() -> None:
-    with capture_logs() as events:
+    with capture_logs(processors=[private_log_event]) as events:
         response = await RpcRegistry().dispatch(
             "\ud800", "chat.send", {}, cast(RpcContext, SimpleNamespace()),
         )
 
     assert response.error is not None and response.error.code == "INVALID_REQUEST"
     assert len(events) == 1
-    assert events[0]["connection_id_hash"] is None
+    assert events[0]["connection_id"] is None
 
 
 async def test_arbitrary_error_code_cannot_inject_private_text_into_send_log() -> None:
@@ -156,7 +157,7 @@ async def test_arbitrary_error_code_cannot_inject_private_text_into_send_log() -
         raise RpcHandlerError(f"ERROR\n{_PRIVATE}", _PRIVATE)
 
     registry.register("chat.send", handler, "operator.write")
-    with capture_logs() as events:
+    with capture_logs(processors=[private_log_event]) as events:
         response = await registry.dispatch("req", "chat.send", {}, RpcContext(conn_id="test"))
 
     assert response.error is not None and response.error.code == f"ERROR\n{_PRIVATE}"
@@ -175,7 +176,7 @@ async def test_successful_send_and_non_send_rejection_do_not_emit_send_failures(
 
     registry.register("chat.send", success, "operator.write")
     registry.register("test.read", rejection, "operator.read")
-    with capture_logs() as events:
+    with capture_logs(processors=[private_log_event]) as events:
         successful = await registry.dispatch("ok", "chat.send", {}, RpcContext(conn_id="test"))
         rejected = await registry.dispatch("no", "test.read", {}, RpcContext(conn_id="test"))
 

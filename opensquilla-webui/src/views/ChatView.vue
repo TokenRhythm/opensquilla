@@ -765,7 +765,7 @@
 <script setup lang="ts">
 import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import {
@@ -6712,6 +6712,12 @@ function enterDraft() {
 }
 
 let chatViewActive = false
+let initialDraftRouteMayCanonicalize = true
+onBeforeRouteLeave(() => {
+  // A lazy destination has not updated route.fullPath yet. Once the operator
+  // leaves, late draft bootstrap must not replace that pending navigation.
+  initialDraftRouteMayCanonicalize = false
+})
 
 function bindBottomIntersectionObserver() {
   bottomIntersectionObserver?.disconnect()
@@ -6907,7 +6913,7 @@ onMounted(async () => {
 
   if (initialDraftProjectGeneration !== null) {
     const synced = await initialDraftProjectSync
-    if (synced && shouldCanonicalizeInitialDraftRoute({
+    if (synced && initialDraftRouteMayCanonicalize && shouldCanonicalizeInitialDraftRoute({
       disposed: chatViewDisposed,
       initialFullPath: initialRouteFullPath,
       currentFullPath: route.fullPath,
