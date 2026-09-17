@@ -4087,11 +4087,14 @@ class Agent:
     def _provider_activity_model(self, observed_model: str = "") -> str:
         """Resolve the current physical model without mutating the route plan."""
 
-        return (
-            str(observed_model or "").strip()
-            or str(getattr(self.provider, "active_model_id", "") or "").strip()
-            or str(self.config.model_id or "").strip()
-        )
+        if str(observed_model or "").strip():
+            return str(observed_model).strip()
+        active_model = getattr(self.provider, "active_model_id", None)
+        if active_model is not None:
+            # A composite can explicitly have no single physical model while
+            # its members run. Its configured fallback is not an observation.
+            return str(active_model or "").strip()
+        return str(self.config.model_id or "").strip()
 
     def _log_reasoning_output_budget_exhausted(
         self,

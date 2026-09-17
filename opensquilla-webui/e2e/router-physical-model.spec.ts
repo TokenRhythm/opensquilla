@@ -12,6 +12,9 @@ const TURN_ID = 'turn-router-physical'
 const PRIMARY = 'deepseek-v4-pro'
 const CANDIDATE = 'kimi-k2.7-code'
 const EXTERNAL = 'deepseek-v4-pro-0813'
+const AGGREGATOR = 'deepseek-flash'
+const FUSION_ROUTE_MODEL = 'glm-5.2'
+const FUSION_MEMBERS = [AGGREGATOR, 'glm-5.3-flash', 'qwen3.8-flash', 'qwen3.8-max']
 const ANSWER = 'The synthetic fallback completed successfully.'
 const BASE_TIME = 1_800_000_000_000
 const ROUTE = {
@@ -29,14 +32,28 @@ const ROUTE = {
     ],
   },
 }
+const FUSION_ROUTE = {
+  ...ROUTE,
+  tier: 'c3', model: FUSION_ROUTE_MODEL,
+  router_tier_snapshot: {
+    ...ROUTE.router_tier_snapshot,
+    tiers: [
+      { tier: 'c1', model: PRIMARY, execution_kind: 'single_model' },
+      { tier: 'c3', model: FUSION_ROUTE_MODEL, execution_kind: 'ensemble' },
+    ],
+  },
+}
 
 type WireEvent = { event: string; payload: Record<string, unknown> }
 
-async function installGateway(page: Page, legacy = false) {
+async function installGateway(page: Page, { legacy = false, fusion = false } = {}) {
+  const route = fusion ? FUSION_ROUTE : ROUTE
   let socket: WebSocketRoute | undefined
   let started = false
   let settled = false
   let seq = 0
+  let iteration = 1
+  let streamedText = ''
   let currentModel = PRIMARY
   let userMessageId = 'user-router-physical'
   let generation = 'router-physical-generation-a'
@@ -63,7 +80,7 @@ async function installGateway(page: Page, legacy = false) {
 
   function activity(model: string, reason = 'transport_transient', phase = 'requesting') {
     currentModel = model
-    if (!executionLegs.some(leg => leg.model === model)) {
+    if (model && !executionLegs.some(leg => leg.model === model)) {
       executionLegs.push({
         kind: model === PRIMARY ? 'primary' : 'provider_fallback',
         provider: 'synthetic', model,
@@ -73,7 +90,7 @@ async function installGateway(page: Page, legacy = false) {
       activity_id: `provider-${executionLegs.length}`, phase, reason,
       retry_attempt: phase === 'retrying' ? 2 : 1,
       retry_limit: 3, retry_after_ms: phase === 'retry_wait' ? 2000 : 0,
-      model_call_id: '1.0', iteration: 1,
+      model_call_id: `${iteration}.0`, iteration,
       ...(!legacy ? { model } : {}),
     })
   }
@@ -82,12 +99,28 @@ async function installGateway(page: Page, legacy = false) {
     return {
       model: currentModel,
       input_tokens: 24, output_tokens: 8,
-      routed_tier: ROUTE.tier,
+      routed_tier: route.tier,
       routed_model: legacy ? PRIMARY : currentModel,
-      routing_source: ROUTE.source,
+      routing_source: route.source,
       routing_applied: true,
-      router_model_call_id: '1.0', router_iteration: 1,
-      ...(!legacy ? { route_plan: ROUTE, execution_legs: executionLegs } : {}),
+      router_model_call_id: `${iteration}.0`, router_iteration: iteration,
+      ...(!legacy ? { route_plan: route, execution_legs: executionLegs } : {}),
+      ...(fusion ? {
+        // Older receipts recorded the outer selector's unused baseline.
+        execution_legs: [{ kind: 'primary', provider: 'synthetic', model: PRIMARY }],
+        ensemble_trace: {
+          profile: 'static_tokenrhythm_b5', total_candidates: 4,
+          selected_candidate_count: 4, llm_request_count: 5,
+          final_request: {
+            role: 'aggregator', request_started: true,
+            execution: { provider: 'synthetic', model: currentModel },
+          },
+        },
+        model_usage_breakdown: [...FUSION_MEMBERS, currentModel].map((model, index) => ({
+          role: index === 4 ? 'aggregator' : 'proposer', provider: 'synthetic', model,
+          input_tokens: 4, output_tokens: 2, cost_usd: 0, request_count: 1,
+        })),
+      } : {}),
     }
   }
 
@@ -100,7 +133,7 @@ async function installGateway(page: Page, legacy = false) {
     }
     if (!settled) return chatHistoryPayload([user])
     return chatHistoryPayload([user, {
-      role: 'assistant', text: ANSWER,
+      role: 'assistant', text: streamedText || ANSWER,
       id: 'assistant-router-physical', message_id: 'assistant-router-physical',
       timestamp: BASE_TIME + 10_000,
       turn_context: { turn_id: TURN_ID }, usage: usage(),
@@ -145,8 +178,8 @@ async function installGateway(page: Page, legacy = false) {
         })
         emit('task.running')
         emit('session.event.state_change', { to_state: 'thinking' })
-        emit('session.event.router_decision', ROUTE)
-        activity(PRIMARY, 'initial')
+        emit('session.event.router_decision', route)
+        activity(fusion ? '' : PRIMARY, 'initial')
         return
       }
       if (frame.method === 'chat.history' && holdHistory) {
@@ -168,7 +201,9 @@ async function installGateway(page: Page, legacy = false) {
         'config.get': {
           squilla_router: {
             enabled: true, rollout_phase: 'full', visual_mode: 'real_candidates',
-            tiers: { c1: { model: PRIMARY }, c2: { model: CANDIDATE } },
+            tiers: fusion
+              ? { c1: { model: PRIMARY }, c3: { model: FUSION_ROUTE_MODEL, ensemble_enabled: true } }
+              : { c1: { model: PRIMARY }, c2: { model: CANDIDATE } },
           },
           llm_ensemble: { enabled: false }, permissions: {}, skills: {},
         },
@@ -191,6 +226,32 @@ async function installGateway(page: Page, legacy = false) {
 
   return {
     activity,
+    aggregate() {
+      FUSION_MEMBERS.forEach((model, index) => {
+        for (const event_type of ['proposer_start', 'proposer_finish']) {
+          emit('session.event.ensemble_progress', {
+            event_type, proposer_index: index, proposer_provider: 'synthetic', proposer_model: model,
+          })
+        }
+      })
+      emit('session.event.ensemble_progress', {
+        event_type: 'aggregator_start', proposer_provider: 'synthetic', proposer_model: AGGREGATOR,
+      })
+      activity(AGGREGATOR, 'initial')
+    },
+    text(text: string, callIteration = iteration) {
+      iteration = callIteration
+      streamedText += text
+      emit('session.event.text_delta', {
+        text, presentation: 'answer', model_call_id: `${iteration}.0`, iteration,
+      })
+    },
+    replay() {
+      emit('session.event.router_control_replay')
+      iteration = 1
+      streamedText = ''
+      emit('session.event.router_decision', route)
+    },
     holdHistory() { holdHistory = true },
     releaseHistory() {
       holdHistory = false
@@ -202,12 +263,13 @@ async function installGateway(page: Page, legacy = false) {
         executionLegs.push({ kind: 'provider_fallback', provider: 'synthetic', model: finalModel })
       }
       settled = true
+      streamedText += ANSWER
       emit('session.event.text_delta', {
-        text: ANSWER, presentation: 'answer', model_call_id: '1.0', iteration: 1,
+        text: ANSWER, presentation: 'answer', model_call_id: `${iteration}.0`, iteration,
       })
       emit('session.event.usage', usage())
-      emit('session.event.state_change', { to_state: 'completed', final_text: ANSWER })
-      emit('session.event.done', { final_text: ANSWER, usage: usage() })
+      emit('session.event.state_change', { to_state: 'completed', final_text: streamedText })
+      emit('session.event.done', { final_text: streamedText, usage: usage() })
     },
     restart() { generation = 'router-physical-generation-b' },
   }
@@ -321,6 +383,41 @@ test('keeps the in-pool fallback highlighted after terminal history restoration'
   await expectExecuting(strip, CANDIDATE, { settled: true, announce: false })
 })
 
+for (const firstIteration of [1, 2]) {
+  test(`settles control replay from call ${firstIteration}.0 to a new call 1.0`, async ({ page }) => {
+    const gateway = await installGateway(page)
+    await startTurn(page)
+    gateway.activity(CANDIDATE)
+    // A tool-only first call can leave the card unbound until iteration two.
+    // Control replay starts a new Agent whose first call is numbered 1.0 again.
+    gateway.text('Synthetic first attempt.', firstIteration)
+    await expectExecuting(page.locator('.router-fx'), CANDIDATE)
+    gateway.replay()
+    gateway.activity(EXTERNAL)
+    gateway.text('Synthetic replay attempt.')
+    const strips = page.locator('.router-fx')
+    await expect(strips).toHaveCount(2)
+    await expectExecuting(strips.nth(0), CANDIDATE, { settled: true })
+    await expectExecuting(strips.nth(1), EXTERNAL)
+
+    gateway.holdHistory()
+    await page.reload()
+    await expect(strips).toHaveCount(2)
+    await expectExecuting(strips.nth(0), CANDIDATE, { settled: true, announce: false })
+    await expectExecuting(strips.nth(1), EXTERNAL, { announce: false })
+    gateway.releaseHistory()
+    await expect(page.locator('.msg-user')).toContainText('Exercise the synthetic fallback chain.')
+    await expectExecuting(strips.nth(0), CANDIDATE, { settled: true, announce: false })
+    await expectExecuting(strips.nth(1), EXTERNAL, { announce: false })
+    gateway.holdHistory()
+    gateway.finish()
+    await expect(page.locator('.assistant-answer')).toHaveText('Synthetic replay attempt.' + ANSWER)
+    await expect(strips).toHaveCount(2)
+    await expectExecuting(strips.nth(0), CANDIDATE, { settled: true, announce: false })
+    await expectExecuting(strips.nth(1), EXTERNAL, { settled: true })
+  })
+}
+
 test('uses terminal execution legs when the final provider activity was not delivered', async ({ page }) => {
   const gateway = await installGateway(page)
   const strip = await startTurn(page)
@@ -336,7 +433,7 @@ test('uses terminal execution legs when the final provider activity was not deli
 })
 
 test('accepts old Gateway activity and history without physical model fields', async ({ page }) => {
-  const gateway = await installGateway(page, true)
+  const gateway = await installGateway(page, { legacy: true })
   const strip = await startTurn(page)
   gateway.activity(CANDIDATE)
   gateway.activity(EXTERNAL, 'transport_transient', 'retrying')
@@ -349,4 +446,29 @@ test('accepts old Gateway activity and history without physical model fields', a
   await page.reload()
   await expect(strip).toHaveAttribute('aria-label', `Router selected ${PRIMARY}`)
   await expect(strip.getByTestId('router-execution-model')).toHaveCount(0)
+})
+
+test('shows the physical C5 aggregator and ignores an unused baseline in older terminal receipts', async ({ page }) => {
+  const gateway = await installGateway(page, { fusion: true })
+  const strip = await startTurn(page)
+  await expect(strip).toHaveAttribute('data-panel', 'router-ensemble-sequence')
+  await expect(strip.getByTestId('router-execution-model')).toHaveCount(0)
+  gateway.aggregate()
+  await expect(strip.getByTestId('router-execution-model')).toHaveText(`Currently executing ${AGGREGATOR}`)
+  await expect(strip.locator('.router-fx-cell.win')).toHaveCount(0)
+  await expect(strip).toHaveAttribute('aria-label', `Currently executing ${AGGREGATOR}`)
+  await expect(strip.locator('.router-fx-sr-only')).toHaveText(`Currently executing ${AGGREGATOR}`)
+  gateway.holdHistory()
+  gateway.finish()
+  await expect(page.locator('.assistant-answer')).toHaveText(ANSWER)
+  await expect(strip.getByTestId('router-execution-model')).toHaveText(`Executed by ${AGGREGATOR}`)
+  await expect(strip).toHaveAttribute('aria-label', `Executed by ${AGGREGATOR}`)
+  await expect(strip.locator('.router-fx-sr-only')).toHaveText(`Executed by ${AGGREGATOR}`)
+  gateway.releaseHistory()
+  await page.reload()
+  await expect(page.locator('.assistant-answer')).toHaveText(ANSWER)
+  await expect(strip).toHaveAttribute('data-panel', 'router-ensemble-sequence')
+  await expect(strip).toHaveAttribute('aria-label', `Executed by ${AGGREGATOR}`)
+  await expect(strip.getByTestId('router-execution-model')).toHaveText(`Executed by ${AGGREGATOR}`)
+  await expect(strip.locator('.router-fx-cell.win')).toHaveCount(0)
 })

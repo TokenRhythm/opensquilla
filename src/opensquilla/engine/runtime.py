@@ -2421,7 +2421,7 @@ class _SelectorFallbackProvider:
             buffer.drain(successful_leg=False)
             yield ProviderActivityEvent(
                 activity_id=activity_id,
-                model=model,
+                model=str(getattr(provider, "active_model_id", model) or ""),
                 phase="retry_wait",
                 reason=reason,
                 retry_attempt=attempt,
@@ -2432,7 +2432,7 @@ class _SelectorFallbackProvider:
             await sleep_before_retry(delay)
             yield ProviderActivityEvent(
                 activity_id=activity_id,
-                model=model,
+                model=str(getattr(provider, "active_model_id", model) or ""),
                 phase="retrying",
                 reason=reason,
                 retry_attempt=attempt,
@@ -2518,6 +2518,9 @@ class _SelectorFallbackProvider:
     def active_model_id(self) -> str:
         """Model of the selector deployment currently serving this turn."""
 
+        active_model = getattr(self._provider, "active_model_id", None)
+        if active_model is not None:
+            return str(active_model or "").strip()
         return self._active_deployment()[1]
 
     def disable_provider_state_replay(self) -> None:
@@ -3765,13 +3768,16 @@ class _SelectorFallbackProvider:
         if self._used_fallback or self._image_continuation_rebound:
             self._realign_routed_model_after_fallback()
         self._last_executed_model = active_model
-        record_execution_leg(
-            self._turn_metadata,
-            provider=active_provider_id,
-            model=active_model,
-            kind="provider_fallback" if self._used_fallback else "primary",
-            config=active_config,
-        )
+        if not provider_accounts_physical_usage(active_provider):
+            # Composite providers persist their actual member requests in the
+            # ensemble trace. The selector identity is only their fallback.
+            record_execution_leg(
+                self._turn_metadata,
+                provider=active_provider_id,
+                model=active_model,
+                kind="provider_fallback" if self._used_fallback else "primary",
+                config=active_config,
+            )
         physical_attempt_limit = max(
             0,
             int(getattr(active_config, "physical_attempt_limit", 0) or 0),
@@ -3867,7 +3873,9 @@ class _SelectorFallbackProvider:
                         ):
                             yield ProviderActivityEvent(
                                 activity_id=primary_activity_id,
-                                model=active_model,
+                                model=str(
+                                    getattr(active_provider, "active_model_id", active_model) or ""
+                                ),
                                 phase="reasoning",
                                 reason="initial",
                                 started_at=primary_reasoning_started_at_ms,
@@ -4113,7 +4121,9 @@ class _SelectorFallbackProvider:
                         )
                         yield ProviderActivityEvent(
                             activity_id=primary_activity_id,
-                            model=active_model,
+                            model=str(
+                                getattr(active_provider, "active_model_id", active_model) or ""
+                            ),
                             phase="retry_wait",
                             reason=retry_reason,
                             retry_attempt=1,
@@ -4150,7 +4160,9 @@ class _SelectorFallbackProvider:
                     # and preventing a fast fallback token from racing the UI.
                     yield ProviderActivityEvent(
                         activity_id=uuid.uuid4().hex,
-                        model=fallback_model,
+                        model=str(
+                            getattr(fallback_provider, "active_model_id", fallback_model) or ""
+                        ),
                         phase="fallback",
                         reason=(
                             "context_overflow"
@@ -4164,17 +4176,18 @@ class _SelectorFallbackProvider:
                         retry_limit=max(1, physical_attempt_limit - 1),
                         started_at=time.time_ns() // 1_000_000,
                     )
-                    record_execution_leg(
-                        self._turn_metadata,
-                        provider=fallback_provider_id,
-                        model=fallback_model,
-                        kind="provider_fallback",
-                        config=fallback_config,
-                        reason=_selector_execution_leg_failure_code(
-                            active_provider_id or self.provider_name,
-                            event,
-                        ),
-                    )
+                    if not provider_accounts_physical_usage(fallback_provider):
+                        record_execution_leg(
+                            self._turn_metadata,
+                            provider=fallback_provider_id,
+                            model=fallback_model,
+                            kind="provider_fallback",
+                            config=fallback_config,
+                            reason=_selector_execution_leg_failure_code(
+                                active_provider_id or self.provider_name,
+                                event,
+                            ),
+                        )
                     def fallback_stream_factory() -> AsyncGenerator[Any, None]:
                         return _selector_safe_stream(
                             lambda: fallback_provider.chat(
@@ -4262,7 +4275,11 @@ class _SelectorFallbackProvider:
                                 ):
                                     yield ProviderActivityEvent(
                                         activity_id=fallback_activity_id,
-                                        model=fallback_model,
+                                        model=str(
+                                            getattr(
+                                                fallback_provider, "active_model_id", fallback_model
+                                            ) or ""
+                                        ),
                                         phase="reasoning",
                                         reason="initial",
                                         started_at=fallback_reasoning_started_at_ms,

@@ -72,6 +72,7 @@ from opensquilla.provider.types import (
     ContentBlockImage,
     EnsembleProgressEvent,
     FailureInjector,
+    ProviderActivityEvent,
     ProviderBillingReceipt,
     ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
@@ -378,6 +379,152 @@ async def test_physical_execution_identity_tracks_ensemble_role(monkeypatch, sce
     assert messages[0].model_dump_json() == before
     assert config.execution_identity == identity
     assert any(isinstance(event, DoneEvent) for event in events) == (scenario != "terminal")
+
+
+@pytest.mark.parametrize("scenario", ["success", "fixed_aggregator", "fixed_direct"])
+@pytest.mark.parametrize("reported_alias", [False, True])
+async def test_fusion_activity_and_reopened_history_use_started_final_model(
+    monkeypatch, tmp_path, scenario, reported_alias,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.engine.runtime import TurnRunner
+    from opensquilla.gateway.rpc import RpcContext
+    from opensquilla.gateway.rpc_chat import _handle_chat_history
+    from opensquilla.gateway.usage_ledger_runtime import SessionUsageEventSink
+    from opensquilla.session.manager import SessionManager
+    from opensquilla.session.storage import SessionStorage
+    from opensquilla.tools.types import CallerKind, ToolContext
+
+    baseline = "deepseek-v4-pro"
+    aggregator = "deepseek-flash"
+    logical_model = "glm-5.2"
+    proposers = [aggregator, "glm-5.3-flash", "qwen3.8-flash", "qwen3.8-max"]
+
+    def success(model):
+        return _FakePlan(events=[
+            ReasoningDeltaEvent(text="synthetic reasoning"),
+            TextDeltaEvent(text="synthetic answer"),
+            DoneEvent(
+                model=f"{model}-reported" if reported_alias else model,
+                input_tokens=2, output_tokens=1,
+            ),
+        ])
+
+    failure = _FakePlan(events=[ErrorEvent(message="synthetic rejection", code="400")])
+    registry = _AttemptRegistry(plans={model: [success(model)] for model in proposers})
+    registry.plans[baseline] = [success(baseline)]
+    if scenario == "fixed_aggregator":
+        registry.plans[aggregator] = [success(aggregator), failure]
+    elif scenario == "fixed_direct":
+        registry.plans.update({model: [failure] for model in proposers})
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="synthetic-c5",
+        proposers=[_member(model) for model in proposers],
+        aggregator=_member(aggregator),
+        fallback_provider=registry.provider_for(ProviderConfig(provider="fake", model=baseline)),
+        fallback_provider_name="fake",
+        fallback_model=baseline,
+        shuffle_candidates=False,
+    )
+
+    class Selector:
+        current_config = ProviderConfig(provider="openrouter", model=baseline)
+        active_provider_id = "openrouter"
+
+        def clone(self):
+            return self
+
+        def resolve(self):
+            return provider
+
+        def remaining_chain(self):
+            return [self.current_config]
+
+    async def routed_pipeline(
+        self, message, session_key, provider, selector, tool_defs, base_prompt, attachments,
+        **kwargs,
+    ):
+        return TurnContext(
+            message=message,
+            session_key=session_key,
+            config=self._config,
+            provider=provider,
+            model=baseline,
+            tool_defs=tool_defs,
+            system_prompt=base_prompt,
+            attachments=attachments,
+            metadata={
+                "routed_tier": "c3",
+                "routed_model": logical_model,
+                "routing_source": "router",
+                "ensemble_enabled": True,
+            },
+        ), provider
+
+    monkeypatch.setattr(TurnRunner, "_run_pipeline", routed_pipeline)
+    database = str(tmp_path / "fusion-history.db")
+    storage = SessionStorage(database)
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:fusion-activity"
+    expected_model = aggregator if scenario == "success" else baseline
+    expected_role = "aggregator" if scenario == "success" else scenario
+    try:
+        await manager.create(session_key)
+        runner = TurnRunner(
+            provider_selector=Selector(),
+            session_manager=manager,
+            usage_event_sink=SessionUsageEventSink(storage),
+            config=GatewayConfig(squilla_router={"enabled": False}),
+        )
+        events = [event async for event in runner.run(
+            "synthetic request", session_key,
+            tool_context=ToolContext(is_owner=True, caller_kind=CallerKind.WEB),
+            history_has_persisted_user=False, no_memory_capture=True,
+        )]
+        activity = [event for event in events if event.kind == "provider_activity"]
+        assert activity[0].model == ""
+        assert activity[-1].model == expected_model
+        observed_models = list(dict.fromkeys(event.model for event in activity if event.model))
+        assert observed_models == (
+            [aggregator] if scenario == "success" else
+            [aggregator, baseline] if scenario == "fixed_aggregator" else [baseline]
+        )
+        called_models = [call["model"] for call in registry.calls]
+        assert called_models[-1] == expected_model
+        assert (baseline in called_models) is (scenario != "success")
+        done = next(event for event in events if event.kind == "done")
+        assert done.execution_legs == []
+        assert done.route_plan["model"] == logical_model
+        final_request = done.ensemble_trace["final_request"]
+        assert final_request["request_started"] is True
+        assert final_request["execution"]["model"] == expected_model
+        assert final_request["execution"]["role"] == expected_role
+        assert final_request["usage"]["model"] == (
+            f"{expected_model}-reported" if reported_alias else expected_model
+        )
+        route_plan = done.route_plan
+    finally:
+        await storage.close()
+
+    reopened = SessionStorage(database)
+    await reopened.connect()
+    try:
+        history = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="synthetic",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=SessionManager(reopened, inject_time_prefix=False),
+            ),
+        )
+        usage = next(row["usage"] for row in history["messages"] if row["role"] == "assistant")
+        assert usage["route_plan"] == route_plan
+        assert usage["execution_legs"] == []
+        assert usage["ensemble_trace"]["final_request"] == final_request
+    finally:
+        await reopened.close()
 
 
 def test_unknown_historical_member_is_unready_placeholder() -> None:
@@ -2036,6 +2183,7 @@ async def test_synthetic_failure_stream_does_not_claim_physical_request_start() 
         message="test",
         timeout_seconds=1,
         reset_deadline_on_event=False,
+        request_activity=ProviderActivityEvent(model="unstarted-model"),
     )
 
     events = [event async for event in stream]
@@ -2046,6 +2194,48 @@ async def test_synthetic_failure_stream_does_not_claim_physical_request_start() 
     assert ledger.attempt_indices == [0]
     assert ledger.request_starts == 0
     assert ledger.outcomes[0]["request_started"] is False
+
+
+@pytest.mark.asyncio
+async def test_silent_final_request_announces_model_and_closes_on_activity_cancel() -> None:
+    entered = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def silent_provider():
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+            yield DoneEvent(model="aggregate-model")
+        finally:
+            closed.set()
+
+    context = TurnExecutionContext.create(
+        TurnIdentity("silent-turn", "silent-answer", "agent:main:silent-final")
+    )
+    stream = _provider_stream_with_lifecycle(
+        silent_provider,
+        execution_context=context,
+        role=StickyExecutionRole.PRIMARY_AGGREGATOR,
+        logical_call_index=0,
+        attempt_index=0,
+        owner="silent-primary",
+        phase="ensemble_aggregator_wait",
+        message="synthetic wait",
+        timeout_seconds=1,
+        reset_deadline_on_event=True,
+        request_activity=ProviderActivityEvent(model="aggregate-model"),
+    )
+    try:
+        event = await asyncio.wait_for(anext(stream), timeout=1)
+        assert isinstance(event, ProviderActivityEvent)
+        assert event.model == "aggregate-model"
+        assert entered.is_set()
+        ledger = context.attempt_ledgers[(StickyExecutionRole.PRIMARY_AGGREGATOR, 0)]
+        assert ledger.request_starts == 1
+    finally:
+        await stream.aclose()
+    assert closed.is_set()
+    assert len(ledger.outcomes) == 1
 
 
 @pytest.mark.asyncio

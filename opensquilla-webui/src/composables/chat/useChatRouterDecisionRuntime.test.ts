@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { ref } from 'vue'
 import type { ChatMessage } from '@/types/chat'
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
+import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 
 function makeRuntime(
@@ -161,6 +162,116 @@ describe('router attempt ownership', () => {
     runtime.queueRouterDecision({ ...decision(14), key: 'new' })
     expect(messagesRef.value.filter(message => message.role === 'router').map(card => card.messageId))
       .toEqual(['router-new-14'])
+  })
+})
+
+describe('physical router replay settlement', () => {
+  function setup() {
+    const context = makeRuntime([
+      { role: 'user', text: 'Synthetic request', ts: 0, turnId: 'turn-current' },
+    ], true, 'squilla_router')
+    const { renderedMessages } = useChatRenderedMessages({
+      messages: context.messagesRef, sessionKey: context.sessionKey, isStreaming: ref(true),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({ c1: 'deepseek-v4-pro', c2: 'kimi-k2.7-code' }),
+      routerTierConfigs: ref({}), routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'), renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text, stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+    const decision = (seq: number, model: string) => {
+      context.runtime.queueRouterDecision({
+        turn_id: 'turn-current', stream_seq: seq,
+        tier: 'c1', model: 'deepseek-v4-pro', source: 'classifier',
+      })
+      context.runtime.bindRouterDecisionToModelCall(`${seq}.0`, seq, 'turn-current')
+      context.runtime.updateRouterExecutionModel(model, 'turn-current')
+    }
+    const cards = () => renderedMessages.value.filter(message => message.isRouterStrip)
+    return { ...context, decision, cards }
+  }
+
+  it('ends the previous physical attempt while the new attempt remains live', () => {
+    const h = setup()
+    h.decision(10, 'kimi-k2.7-code')
+    h.runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20 })
+    expect(h.cards()[0]?.routerSettled).toBe(true)
+    h.decision(21, 'deepseek-v4-pro-0813')
+
+    expect(h.cards().map(card => [card.routerExecutionModel, card.routerSettled])).toEqual([
+      ['kimi-k2.7-code', true], ['deepseek-v4-pro-0813', false],
+    ])
+    expect(h.cards().map(card => card.routerSelectedModel)).toEqual([
+      'deepseek-v4-pro', 'deepseek-v4-pro',
+    ])
+  })
+
+  it('keeps an ordinary applied steer in the same physical attempt', () => {
+    const h = setup()
+    h.decision(10, 'kimi-k2.7-code')
+    h.messagesRef.value.push({
+      role: 'user', text: 'Synthetic adjustment', ts: 2,
+      turnId: 'turn-current', inputDisposition: 'applied',
+    })
+    h.runtime.updateRouterExecutionModel('deepseek-v4-pro-0813', 'turn-current')
+    expect(h.cards()).toHaveLength(1)
+    expect(h.cards()[0]).toMatchObject({
+      routerExecutionModel: 'deepseek-v4-pro-0813', routerSettled: false,
+    })
+  })
+
+  it('does not settle the active card when the same boundary is delivered again', () => {
+    const h = setup()
+    h.decision(10, 'kimi-k2.7-code')
+    const boundary = { turn_id: 'turn-current', stream_seq: 20, stream_generation: 'generation-a' }
+    h.runtime.handleRouterControlReplay(boundary)
+    h.decision(21, 'deepseek-v4-pro-0813')
+    h.runtime.handleRouterControlReplay(boundary)
+    expect(h.cards().map(card => card.routerSettled)).toEqual([true, false])
+  })
+
+  it('restores repeated multi-attempt snapshots without ending their current attempt', () => {
+    const h = setup()
+    const replaySnapshot = () => {
+      h.runtime.resetRouterReplayCursor()
+      h.decision(10, 'kimi-k2.7-code')
+      h.runtime.handleRouterControlReplay({ turn_id: 'turn-current' }, 20)
+      h.decision(21, 'deepseek-v4-pro-0813')
+      h.runtime.handleRouterControlReplay({ turn_id: 'turn-current' }, 30)
+      h.decision(31, 'kimi-k2.7-code')
+    }
+    replaySnapshot()
+    replaySnapshot()
+    replaySnapshot()
+    expect(h.cards().map(card => [card.routerModelCallId, card.routerSettled])).toEqual([
+      ['10.0', true], ['21.0', true], ['31.0', false],
+    ])
+    expect(h.cards().map(card => card.routerExecutionModel)).toEqual([
+      'kimi-k2.7-code', 'deepseek-v4-pro-0813', 'kimi-k2.7-code',
+    ])
+  })
+
+  it('ends an attempt when another generation reuses the boundary sequence', () => {
+    const h = setup()
+    h.runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20, stream_generation: 'generation-a' })
+    h.decision(21, 'kimi-k2.7-code')
+    h.runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20, stream_generation: 'generation-b' })
+    h.decision(22, 'deepseek-v4-pro-0813')
+    expect(h.cards().map(card => card.routerSettled)).toEqual([true, false])
+  })
+
+  it('leaves another turn untouched by the current turn replay boundary', () => {
+    const h = setup()
+    h.decision(10, 'kimi-k2.7-code')
+    h.messagesRef.value.push({ role: 'user', text: 'Next request', ts: 2, turnId: 'turn-next' })
+    h.runtime.queueRouterDecision({
+      turn_id: 'turn-next', stream_seq: 20,
+      tier: 'c1', model: 'deepseek-v4-pro', source: 'classifier',
+    })
+    h.runtime.updateRouterExecutionModel('deepseek-v4-pro-0813', 'turn-next')
+    h.runtime.handleRouterControlReplay({ turn_id: 'turn-next', stream_seq: 30 })
+    const rows = h.messagesRef.value.filter(message => message.role === 'router')
+    expect(rows.map(row => row.routerSettled)).toEqual([undefined, true])
   })
 })
 
