@@ -10,7 +10,7 @@ from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.tools.builtin import patch as patch_tool
 from opensquilla.tools.mutation_receipts import fingerprint_file
-from opensquilla.tools.types import ToolContext, current_tool_context
+from opensquilla.tools.types import RetryableToolInputError, ToolContext, current_tool_context
 
 
 def _original_async(fn: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[str]]:
@@ -71,6 +71,100 @@ async def test_apply_patch_failure_does_not_leave_partial_mutation(
 
     assert first.read_text(encoding="utf-8") == "one\n"
     assert second.read_text(encoding="utf-8") == "two\n"
+    assert ctx.workspace_mutation_receipts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "hunks", "expected"),
+    [
+        pytest.param(
+            "alpha\nseparator\nalpha\n",
+            "@@ -3,1 +3,1 @@\n-alpha\n+gamma",
+            "alpha\nseparator\ngamma\n",
+            id="valid-declared-anchor-disambiguates",
+        ),
+        pytest.param(
+            "start\nalpha\nend\ntail\nseparator\nstart\nbeta\nend\ntail\n",
+            "@@ -7,4 +7,4 @@\n start\n-alpha\n+gamma\n end\n tail\n"
+            "@@ -12,4 +12,4 @@\n start\n-beta\n+alpha\n end\n tail",
+            "start\ngamma\nend\ntail\nseparator\nstart\nalpha\nend\ntail\n",
+            id="relocation-cannot-match-another-hunks-output",
+        ),
+        pytest.param(
+            "beta\nseparator\nalpha\n",
+            "@@ -2,1 +2,2 @@\n-alpha\n+ALPHA\n+extra\n"
+            "@@ -10,1 +10,2 @@\n-beta\n+BETA\n+new",
+            "BETA\nnew\nseparator\nALPHA\nextra\n",
+            id="apply-in-actual-position-order",
+        ),
+        pytest.param(
+            "prefix\nalpha\n",
+            "@@ -2,0 +2,1 @@\n+inserted",
+            "prefix\ninserted\nalpha\n",
+            id="pure-add-keeps-declared-position",
+        ),
+        pytest.param("", "@@ -0,0 +1,1 @@\n+inserted", "inserted\n", id="empty-file"),
+    ],
+)
+async def test_apply_patch_plans_hunks_against_original_content(
+    patch_context: tuple[Path, ToolContext, list[dict[str, Any]]],
+    content: str,
+    hunks: str,
+    expected: str,
+) -> None:
+    workspace, ctx, _events = patch_context
+    target = workspace / "example.txt"
+    target.write_text(content, encoding="utf-8")
+    apply_patch = _original_async(patch_tool.apply_patch)
+
+    await apply_patch(
+        f"*** Begin Patch\n*** Update File: example.txt\n{hunks}\n*** End Patch"
+    )
+
+    assert target.read_text(encoding="utf-8") == expected
+    assert len(ctx.workspace_mutation_receipts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hunks", "error"),
+    [
+        pytest.param(
+            "@@ -10,2 +10,2 @@\n-alpha\n+ALPHA\n beta\n"
+            "@@ -20,2 +20,2 @@\n beta\n-tail\n+TAIL",
+            "overlap",
+            id="overlapping-relocated-spans",
+        ),
+        pytest.param(
+            "@@ -1,2 +1,1 @@\n-alpha\n+ALPHA",
+            "line counts",
+            id="old-count-cannot-delete-unverified-lines",
+        ),
+        pytest.param(
+            "@@ -20,0 +20,1 @@\n+inserted",
+            "outside the file",
+            id="pure-add-cannot-relocate",
+        ),
+    ],
+)
+async def test_apply_patch_rejects_invalid_hunk_plan_without_writes(
+    patch_context: tuple[Path, ToolContext, list[dict[str, Any]]],
+    hunks: str,
+    error: str,
+) -> None:
+    workspace, ctx, _events = patch_context
+    target = workspace / "example.txt"
+    original = "alpha\nbeta\ntail\n"
+    target.write_text(original, encoding="utf-8")
+    apply_patch = _original_async(patch_tool.apply_patch)
+
+    with pytest.raises(RetryableToolInputError, match=error):
+        await apply_patch(
+            f"*** Begin Patch\n*** Update File: example.txt\n{hunks}\n*** End Patch"
+        )
+
+    assert target.read_text(encoding="utf-8") == original
     assert ctx.workspace_mutation_receipts == []
 
 

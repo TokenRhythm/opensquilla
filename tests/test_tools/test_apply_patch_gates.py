@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -548,6 +550,115 @@ async def test_apply_patch_context_drift_still_rejects_real_mismatch(
 
     assert "context mismatch" in exc_info.value.user_message
     assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_relocates_hunk_after_insertion_above_context(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    # A blank line was inserted above the hunk window after the patch was
+    # authored: the context block stays contiguous but shifts down one line.
+    target.write_text("intro = 0\n\nvalue = 1\nname = 'a'\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -2,2 +2,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "intro = 0\n\nvalue = 2\nname = 'a'\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_relocates_hunk_after_removal_above_context(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    # A line above the hunk window was removed after the patch was authored:
+    # the context block stays contiguous but shifts up one line.
+    target.write_text("value = 1\nname = 'a'\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -2,2 +2,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "value = 2\nname = 'a'\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_relocation_rejects_ambiguous_matches(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    # Distance from a stale line number cannot disambiguate repeated blocks.
+    original = "head = 0\n\nvalue = 1\nname = 'a'\ntail = 0\nvalue = 1\nname = 'a'\n"
+    target.write_text(original, encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError, match="ambiguous"):
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -2,2 +2,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_apply_patch_huge_stale_line_number_finishes(tmp_path: Path) -> None:
+    # A bad line number must not cause trillions of iterations on a one-line file.
+    # Bound the worker process so a regression cannot stall the test runner.
+    script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from opensquilla.tools.builtin.patch import _apply_update_content, _parse_patch
+patch = '''*** Begin Patch
+*** Update File: example.txt
+@@ -1000000000000,1 +1000000000000,1 @@
+-alpha
++gamma
+*** End Patch'''
+assert _apply_update_content('alpha\\n', _parse_patch(patch)[0].hunks) == 'gamma\\n'
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(Path(patch_tool.__file__).resolve().parents[3])],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
 
 
 @pytest.mark.asyncio

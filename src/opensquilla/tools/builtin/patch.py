@@ -635,16 +635,15 @@ def _match_line(actual: str, expected: str) -> bool:
     return actual.rstrip("\r\n").rstrip(" \t") == expected.rstrip("\r\n").rstrip(" \t")
 
 
-def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
-    """Apply a single hunk to file_lines (0-indexed list of lines with newlines).
-
-    Returns the new list of lines.
-    """
-    # old_start is 1-indexed; convert to 0-indexed
-    pos = hunk.old_start - 1
-    result = list(file_lines)
-
-    # Verify context and deleted lines match
+def _hunk_verify_error(
+    file_lines: list[str], pos: int, hunk: Hunk
+) -> RetryableToolInputError | None:
+    """Return the anchoring error for hunk at 0-indexed pos, None when it fits."""
+    if not 0 <= pos <= len(file_lines):
+        return RetryableToolInputError(
+            f"apply_patch hunk starts outside the file at line {pos + 1}. "
+            "Read the current file content and retry with matching line numbers and context."
+        )
     check_pos = pos
     for raw in hunk.lines:
         if not raw:
@@ -652,20 +651,58 @@ def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
         prefix = raw[0]
         content = raw[1:]
         if prefix in (" ", "-"):
-            if check_pos >= len(result):
-                raise RetryableToolInputError(
+            if check_pos >= len(file_lines):
+                return RetryableToolInputError(
                     "apply_patch hunk context/delete exceeds file length at "
                     f"line {check_pos + 1}. Read the current file content and retry "
                     "with hunk line numbers and context that match the file."
                 )
-            if not _match_line(result[check_pos], content):
-                raise RetryableToolInputError(
+            if not _match_line(file_lines[check_pos], content):
+                return RetryableToolInputError(
                     f"apply_patch context mismatch at line {check_pos + 1}: "
                     f"expected {content.rstrip('\n')!r}, "
-                    f"got {result[check_pos].rstrip('\n')!r}. Read the current file "
+                    f"got {file_lines[check_pos].rstrip('\n')!r}. Read the current file "
                     "content and retry with exact surrounding context."
                 )
             check_pos += 1
+    return None
+
+
+def _relocate_hunk(file_lines: list[str], hunk: Hunk) -> int:
+    """Keep a valid declared anchor, otherwise require a unique content match."""
+    old_count = sum(bool(raw) and raw[0] in (" ", "-") for raw in hunk.lines)
+    if old_count != hunk.old_count:
+        raise RetryableToolInputError(
+            f"apply_patch hunk declares {hunk.old_count} old lines but contains {old_count} "
+            "context/delete lines. Regenerate the hunk with matching line counts."
+        )
+    declared = max(0, hunk.old_start - 1)
+    error = _hunk_verify_error(file_lines, declared, hunk)
+    if error is None:
+        return declared
+    if not old_count:
+        # An insertion has no content anchor from which to infer a new position.
+        raise error
+    found: int | None = None
+    # Scan only real file positions, even if the model supplied a huge line number.
+    for candidate in range(len(file_lines) - old_count + 1):
+        if _hunk_verify_error(file_lines, candidate, hunk) is not None:
+            continue
+        if found is not None:
+            raise RetryableToolInputError(
+                f"apply_patch hunk context is ambiguous: matches at lines {found + 1} "
+                f"and {candidate + 1}. Read the current file and include more surrounding "
+                "context to uniquely identify the target."
+            )
+        found = candidate
+    if found is None:
+        raise error
+    return found
+
+
+def _apply_hunk(file_lines: list[str], hunk: Hunk, pos: int) -> list[str]:
+    """Apply a hunk at its already validated position in the original file."""
+    result = list(file_lines)
 
     # Now build new lines
     new_lines: list[str] = []
@@ -704,10 +741,24 @@ def _fingerprint_content(content: str | None) -> dict[str, Any]:
 
 def _apply_update_content(content: str, hunks: list[Hunk]) -> str:
     lines = content.splitlines(keepends=True)
+    # Resolve every anchor before editing, so a hunk cannot match text introduced
+    # by another hunk. Actual positions can differ from the declared ordering.
+    planned = sorted(
+        ((_relocate_hunk(lines, hunk), hunk) for hunk in hunks), key=lambda item: item[0]
+    )
+    previous_pos = -1
+    previous_end = 0
+    for pos, hunk in planned:
+        if pos < previous_end or pos == previous_pos:
+            raise RetryableToolInputError(
+                f"apply_patch hunks overlap at line {pos + 1}. "
+                "Combine overlapping edits into one hunk using the current file content."
+            )
+        previous_pos = pos
+        previous_end = pos + hunk.old_count
 
-    # Apply hunks in reverse order so earlier line numbers stay valid
-    for hunk in sorted(hunks, key=lambda h: h.old_start, reverse=True):
-        lines = _apply_hunk(lines, hunk)
+    for pos, hunk in reversed(planned):
+        lines = _apply_hunk(lines, hunk, pos)
 
     return "".join(lines)
 
