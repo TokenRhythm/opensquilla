@@ -2,7 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
 import { createI18n } from 'vue-i18n'
-import type { SandboxPathListResponse } from '@/types/rpc'
+import type { WorkspacePathListing as SandboxPathListResponse } from '@/modules/workspaceCatalog'
+import { WORKSPACE_CATALOG_KEY, type WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import ProjectWorkspacePickerDialog from './ProjectWorkspacePickerDialog.vue'
 
 const PICKER_KEY = 'agent:main:webchat:picker'
@@ -116,6 +117,35 @@ async function mountPicker(options: { initialPath?: string; enabled?: boolean } 
   }))
   const app = createApp(Root)
   app.use(i18n())
+  const catalog: WorkspaceCatalog = {
+    list: async () => [],
+    open: async () => null,
+    rename: async () => null,
+    setPinned: async () => null,
+    remove: async () => undefined,
+    deleteHistory: async workspaceId => ({
+      workspaceId,
+      deletedTaskCount: 0,
+      deletedSessionKeys: [],
+    }),
+    listPath: async request => await mocks.rpcCall('sandbox.path.list', {
+      sessionKey: request.sessionKey,
+      kind: request.kind ?? 'workspace',
+      ...(request.path ? { path: request.path } : {}),
+    }) as SandboxPathListResponse,
+    createDirectory: async request => await mocks.rpcCall('sandbox.path.create-directory', {
+      sessionKey: request.sessionKey,
+      parentPath: request.parentPath,
+      name: request.name,
+      kind: request.kind ?? 'workspace',
+    }),
+    pickPath: async request => await mocks.rpcCall('sandbox.path.pick', {
+      sessionKey: request.sessionKey,
+      kind: request.kind ?? 'workspace',
+      ...(request.initialPath ? { initialPath: request.initialPath } : {}),
+    }),
+  }
+  app.provide(WORKSPACE_CATALOG_KEY, catalog)
   app.mount(host)
   mountedApps.push(app)
   await nextTick()
@@ -290,8 +320,7 @@ describe('ProjectWorkspacePickerDialog', () => {
 
     expect(mocks.rpcCall).toHaveBeenLastCalledWith('sandbox.path.list', {
       sessionKey: PICKER_KEY,
-      path: 'child',
-      basePath: '/repos',
+      path: '/repos/child',
       kind: 'workspace',
     })
   })

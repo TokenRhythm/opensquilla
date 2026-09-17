@@ -377,6 +377,34 @@ async def test_direct_channel_batch_uses_authoritative_done_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_channel_rejects_dropping_runner_for_modern_owner() -> None:
+    class DroppingTurnRunner:
+        called = False
+
+        async def run(self, *_args: Any, **_kwargs: Any):
+            self.called = True
+            yield DoneEvent(text="must not run")
+
+    runner = DroppingTurnRunner()
+
+    with pytest.raises(RuntimeError, match="exact turn-runner owner contract"):
+        await _run_turn_batch_path(
+            _FakeChannel(),
+            runner,
+            _message(),
+            "agent:main:modern-owner",
+            _tool_ctx(),
+            None,
+            None,
+            SimpleNamespace(agent_stream_idle_timeout_seconds=1.0),
+            expected_session_id="modern-session",
+            expected_session_epoch=2,
+        )
+
+    assert runner.called is False
+
+
+@pytest.mark.asyncio
 async def test_direct_channel_batch_terminal_reset_replaces_partial_with_failure() -> None:
     drained = False
 
@@ -424,7 +452,20 @@ async def test_direct_channel_batch_terminal_reset_replaces_partial_with_failure
 
 
 @pytest.mark.asyncio
-async def test_direct_channel_error_log_does_not_expose_provider_prose() -> None:
+@pytest.mark.parametrize(
+    ("code", "failure_kind", "expected_message"),
+    [
+        ("400", "bad_request", "The model provider rejected the request."),
+        ("401", "auth_invalid", "The model provider rejected the configured credentials."),
+        (
+            "429", "rate_limited",
+            "The model provider is rate-limiting requests. Try again later.",
+        ),
+    ],
+)
+async def test_direct_channel_error_log_does_not_expose_provider_prose(
+    code: str, failure_kind: str, expected_message: str,
+) -> None:
     raw_detail = "RAW_PROVIDER_BODY_DO_NOT_PERSIST"
 
     class FakeTurnRunner:
@@ -432,8 +473,8 @@ async def test_direct_channel_error_log_does_not_expose_provider_prose() -> None
             del message, session_key, kwargs
             yield ErrorEvent(
                 message=f"provider rejected request: {raw_detail}",
-                code="400",
-                failure_kind="bad_request",
+                code=code,
+                failure_kind=failure_kind,
             )
 
     channel = _FakeChannel()
@@ -456,9 +497,10 @@ async def test_direct_channel_error_log_does_not_expose_provider_prose() -> None
     agent_error = next(
         row for row in logs if row["event"] == "channel_dispatch.agent_error"
     )
-    assert agent_error["failure_kind"] == "bad_request"
+    assert agent_error["failure_kind"] == failure_kind
     assert "message" not in agent_error
-    assert channel.sent[-1].content == "The task failed before it could finish."
+    assert all(raw_detail not in message.content for message in channel.sent)
+    assert channel.sent[-1].content == expected_message
 
 
 @pytest.mark.asyncio
@@ -1515,7 +1557,13 @@ async def test_channel_admin_sender_gets_owner_tool_context_for_agent_turn(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_saved_channel_run_context_is_applied_to_route_envelope(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("global_mode", "saved_mode"),
+    [(RunMode.SAFE, RunMode.FULL), (RunMode.FULL, RunMode.SAFE)],
+)
+async def test_global_channel_mode_overrides_saved_mode_and_preserves_scope(
+    tmp_path, global_mode: RunMode, saved_mode: RunMode
+) -> None:
     from opensquilla.gateway.channel_dispatch import _apply_saved_channel_run_context
 
     msg = _authenticated_message()
@@ -1528,7 +1576,7 @@ async def test_saved_channel_run_context_is_applied_to_route_envelope(tmp_path) 
     manager = _RunContextSessionManager(
         {
             "sandbox_run_context": {
-                "run_mode": "full",
+                "run_mode": saved_mode.value,
                 "workspace": str(tmp_path),
                 "mounts": [],
                 "domains": [],
@@ -1539,21 +1587,26 @@ async def test_saved_channel_run_context_is_applied_to_route_envelope(tmp_path) 
         }
     )
     config = SimpleNamespace(
-        sandbox=SimpleNamespace(run_mode="standard", sandbox=True, security_grading=True),
-        permissions=SimpleNamespace(default_mode="off"),
+        sandbox=SimpleNamespace(
+            run_mode=global_mode.value,
+            sandbox=global_mode is RunMode.SAFE,
+            security_grading=global_mode is RunMode.SAFE,
+        ),
+        permissions=SimpleNamespace(default_mode="full" if global_mode is RunMode.FULL else "off"),
     )
 
     await _apply_saved_channel_run_context(
         envelope,
         session_manager=manager,
         config=config,
-        workspace_dir=str(tmp_path),
+        workspace_dir=str(tmp_path / "fallback"),
         principal_is_owner=True,
     )
 
-    assert envelope.metadata["run_mode"] == RunMode.FULL.value
-    assert envelope.metadata["elevated"] == "full"
-    assert envelope.metadata["sandbox_run_context"]["run_mode"] == "full"
+    assert envelope.metadata["run_mode"] == global_mode.value
+    assert envelope.metadata.get("elevated") == ("full" if global_mode is RunMode.FULL else None)
+    assert envelope.metadata["sandbox_run_context"]["run_mode"] == global_mode.value
+    assert envelope.metadata["sandbox_run_context"]["workspace"] == str(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -2780,8 +2833,22 @@ async def test_direct_channel_turn_uses_authoritative_project_workspace(
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
-            self.calls.append(kwargs)
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            self.calls.append(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             yield DoneEvent()
 
     runner = RecordingTurnRunner()
@@ -2812,9 +2879,9 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
     tmp_path: Path,
 ) -> None:
     from opensquilla.gateway.project_workspace_runtime import (
+        apply_run_context_route_metadata,
         authoritative_project_run_context,
     )
-    from opensquilla.gateway.rpc_sessions import _apply_run_context_route_metadata
 
     storage = await SessionStorage.open(str(tmp_path / "channel-unbound.db"))
     manager = SessionManager(storage, inject_time_prefix=False)
@@ -2862,7 +2929,7 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
         default_workspace=str(default_workspace),
     )
     assert workspace_guard is None
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         envelope,
         stale_context,
         principal_is_owner=True,
@@ -2889,8 +2956,22 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
-            self.calls.append(kwargs)
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            self.calls.append(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             yield DoneEvent(text="ok")
 
     channel = _FakeChannel()

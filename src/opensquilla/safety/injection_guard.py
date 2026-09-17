@@ -8,7 +8,7 @@ Ingress points:
   attempts to close the tag or inject sibling ``<system>`` /
   ``<available_skills>`` elements fall through as inert entities.
 * :func:`xml_escape` — public escaping helper reused by
-  :mod:`opensquilla.skills.filter` when assembling ``<available_skills>`` from
+  the deterministic Skill catalog projection when assembling ``<available_skills>`` from
   skill metadata.
 * :func:`is_untrusted_fragment` — structural check: does the given text
   contain a well-formed ``<untrusted ...>...</untrusted>`` envelope?
@@ -247,7 +247,7 @@ def _strip_invisible_chars(content: str) -> str:
 def xml_escape(text: str) -> str:
     """Escape the five XML characters: ``&``, ``<``, ``>``, ``"``, ``'``.
 
-    This is the public helper :mod:`opensquilla.skills.filter` uses when
+    This is the public helper the Skill catalog renderer uses when
     building ``<available_skills>``. It is deliberately conservative:
     ``&`` is escaped first to avoid double-escaping the entity
     references introduced by the later substitutions.

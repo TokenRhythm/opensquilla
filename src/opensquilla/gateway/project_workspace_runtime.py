@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opensquilla.gateway.rpc import RpcHandlerError
+from opensquilla.gateway.session_services import SessionServiceUnavailableError
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
@@ -21,6 +22,9 @@ from opensquilla.sandbox.run_context import (
 )
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
+
+if TYPE_CHECKING:
+    from opensquilla.tools.types import ToolContext
 
 _NOT_FOUND_REASONS = frozenset({"not_found", "removed", "untrusted"})
 
@@ -117,6 +121,36 @@ async def authoritative_project_run_context(
             workspace=validated.canonical_path,
         ),
         validated.guard,
+    )
+
+
+async def prepare_heartbeat_tool_context(
+    session_key: str,
+    tool_context: ToolContext,
+    *,
+    storage: SessionStorage | None,
+    session_manager: Any,
+    config: Any,
+) -> ToolContext:
+    """Refresh the execution root without importing the session owner's authority."""
+    if not isinstance(storage, SessionStorage):
+        raise SessionServiceUnavailableError("Heartbeat requires session storage")
+    session = await session_manager.get_session(session_key)
+    if session is None:
+        raise KeyError(f"Session not found: {session_key}")
+    context, _guard = await authoritative_project_run_context(
+        storage=storage, session_manager=session_manager, session=session,
+        config=config, default_workspace=tool_context.workspace_dir,
+    )
+    workspace = context.workspace or tool_context.workspace_dir
+    # A cron caller may carry its own restricted context. Keep its mode and
+    # grants; the resolved session context supplies only the validated root.
+    sandbox_context = tool_context.sandbox_run_context
+    if isinstance(sandbox_context, RunContext):
+        sandbox_context = replace(sandbox_context, workspace=workspace)
+    return replace(
+        tool_context, session_key=session_key, workspace_dir=workspace,
+        sandbox_run_context=sandbox_context,
     )
 
 

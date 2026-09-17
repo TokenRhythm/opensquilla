@@ -57,6 +57,7 @@
           @edit="$emit('editMessage', $event)"
           @edit-attachment="$emit('editAttachment', $event)"
           @preview-attachment="$emit('previewAttachment', $event)"
+          @preview-image="$emit('previewImage', $event, messages[entry.index].attachments || [])"
           @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
         />
@@ -80,7 +81,6 @@
           :tool-status-text="toolStatusText"
           :tool-secondary-text="toolSecondaryText"
           :session-key="sessionKey"
-          :auth-token="authToken"
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
@@ -92,7 +92,10 @@
           :show-turn-outcome="isTurnTip(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
+          :goal-removable="goalRemovable && !shareMode"
+          :goal-busy="goalBusy"
           :resolve-session-availability="resolveSessionAvailability"
+          :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
           @fork="$emit('forkConversation', forkThroughTurnId(entry.index))"
           @regenerate="$emit('regenerateMessage', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
@@ -109,6 +112,7 @@
           @plan-implement-current="$emit('planImplementCurrent', $event)"
           @plan-implement-new="$emit('planImplementNew', $event)"
           @plan-replan="$emit('planReplan', $event)"
+          @goal-clear="$emit('goalClear', $event)"
         />
         <SystemMessage
           v-else
@@ -116,6 +120,7 @@
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
           :retry-available="usageBarrierRetryAvailable(entry.index)"
+          :has-partial-answer="Boolean(messages[entry.index].turnId && visibleAnswerTurns.has(messages[entry.index].turnId!))"
           @resume="$emit('resumeSandbox')"
           @retry="forwardSystemRetry"
         />
@@ -152,7 +157,7 @@ import type {
   ChatToolCallRenderItem,
   ToolResultContext,
 } from '@/types/chat'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   goalHasSettledTerminalOutcome,
   type GoalSnapshot,
@@ -192,7 +197,6 @@ const props = defineProps<{
   downloadAttachment: (attachment: import('@/types/chat').DisplayAttachment) => Promise<boolean>
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
-  authToken?: string
   workbenchEnabled?: boolean
   workbenchResourcePreviewEnabled?: boolean
   workbenchResourceEditEnabled?: boolean
@@ -204,7 +208,10 @@ const props = defineProps<{
   isStreaming?: boolean
   goal?: GoalSnapshot | null
   goalElapsed?: string
+  goalRemovable?: boolean
+  goalBusy?: boolean
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
+  resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */
@@ -221,6 +228,7 @@ const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
   editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
   previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  previewImage: [attachment: import('@/types/chat').DisplayAttachment, attachments: import('@/types/chat').DisplayAttachment[]]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [
     message: ChatRenderedMessage,
@@ -242,6 +250,7 @@ const emit = defineEmits<{
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
+  goalClear: [goal: GoalSnapshot]
 }>()
 
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'
@@ -253,6 +262,10 @@ function forwardSystemRetry(
 ) {
   emit('regenerateMessage', message, settle)
 }
+
+const visibleAnswerTurns = computed(() => new Set(props.messages
+  .filter(message => message.displayRole === 'assistant' && message.text.trim() && message.turnId)
+  .map(message => message.turnId!)))
 
 function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]

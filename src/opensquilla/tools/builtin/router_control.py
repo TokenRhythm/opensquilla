@@ -70,6 +70,11 @@ async def router_control(
             reason="router_control hold store is unavailable",
             evidence=evidence,
         )
+    if not store.is_current_revision(session_key, ctx.router_control_routing_revision):
+        return router_control_rejection_payload(
+            reason="session routing changed after this turn was accepted",
+            evidence=evidence,
+        )
 
     normalized_action = str(action or "").strip()
     replay_depth = int(getattr(ctx, "router_control_replay_depth", 0) or 0)

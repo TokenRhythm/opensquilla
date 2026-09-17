@@ -1,4 +1,12 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
+
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const PARENT_KEY = 'agent:main:webchat:e2e-session-created-parent'
@@ -29,7 +37,7 @@ async function mockSessionCreatedHistory(
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
@@ -46,7 +54,7 @@ async function mockSessionCreatedHistory(
         ? frame.params as Record<string, unknown>
         : {}
       if (method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30_000 } }))
+        ws.send(helloOkResponse())
         return
       }
       if (method === 'chat.history') {
@@ -61,8 +69,9 @@ async function mockSessionCreatedHistory(
         }
         if (sessionKey === PARENT_KEY) {
           if (options.liveHandoff) {
-            ws.send(response(frame.id as string | number | undefined, {
-              messages: [{
+            ws.send(response(
+              frame.id as string | number | undefined,
+              chatHistoryPayload([{
                 role: 'user',
                 text: 'Create a child chat',
                 id: 'live-session-created-user',
@@ -96,15 +105,13 @@ async function mockSessionCreatedHistory(
                   }),
                   execution_status: { status: 'success' },
                 }],
-              }],
-              has_more: false,
-              canonical_available: true,
-              canonical_complete: true,
-            }))
+              }]),
+            ))
             return
           }
-          ws.send(response(frame.id as string | number | undefined, {
-            messages: [{
+          ws.send(response(
+            frame.id as string | number | undefined,
+            chatHistoryPayload([{
               role: 'user',
               text: 'Create two child chats',
               id: 'session-created-user',
@@ -191,15 +198,13 @@ async function mockSessionCreatedHistory(
               id: 'later-assistant',
               timestamp: Math.floor(Date.now() / 1000) + 3,
               turn_context: { turn_id: 'later-turn' },
-            }],
-            has_more: false,
-            canonical_available: true,
-            canonical_complete: true,
-          }))
+            }]),
+          ))
           return
         }
-        ws.send(response(frame.id as string | number | undefined, {
-          messages: [{
+        ws.send(response(
+          frame.id as string | number | undefined,
+          chatHistoryPayload([{
             role: 'assistant',
             text: `Opened child session ${sessionKey}`,
             id: 'child-session-assistant',
@@ -210,19 +215,17 @@ async function mockSessionCreatedHistory(
               routing_source: 'none',
               routing_applied: true,
             },
-          }],
-          has_more: false,
-          canonical_available: true,
-          canonical_complete: true,
-        }))
+          }]),
+        ))
         return
       }
       if (method === 'sessions.messages.snapshot') {
-        ws.send(response(frame.id as string | number | undefined, {
-          key: String(params.key || ''),
-          events: [],
+        ws.send(response(
+          frame.id as string | number | undefined,
+          sessionMessagesSnapshotPayload(String(params.key || ''), {
           current_stream_seq: 0,
-        }))
+          }),
+        ))
         return
       }
       if (method === 'sessions.resolve') {
@@ -234,7 +237,10 @@ async function mockSessionCreatedHistory(
             'Session not found',
           ))
         } else {
-          ws.send(response(frame.id as string | number | undefined, { session_key: key }))
+          ws.send(response(frame.id as string | number | undefined, {
+            session_key: key,
+            session_id: key.split(':').at(-1) || key,
+          }))
         }
         return
       }
@@ -267,25 +273,25 @@ async function mockSessionCreatedHistory(
         },
         'models.routing.get': { mode: 'router' },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(
+          String(params.key || ''),
+          {
           run_status: options.liveHandoff ? 'running' : 'idle',
           active_task: options.liveHandoff
             ? { task_id: 'resume-turn', status: 'running' }
             : null,
-        },
-        'sessions.messages.hydrate': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
+          },
+        ),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(
+          String(params.key || ''),
+          {
           run_status: options.liveHandoff ? 'running' : 'idle',
           active_task: options.liveHandoff
             ? { task_id: 'resume-turn', status: 'running' }
             : null,
-        },
+          },
+        ),
         'usage.status': { sessions: [] },
       }
       ws.send(response(frame.id as string | number | undefined, payloads[method] ?? {}))

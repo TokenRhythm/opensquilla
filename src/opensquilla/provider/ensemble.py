@@ -57,7 +57,13 @@ from .deployment import (
     resolve_provider_deployment,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
+from .execution_identity import project_execution_identity, rebind_execution_identity
 from .failures import ProviderFailureKind, classify_provider_error
+from .image_projection import (
+    ImageMarkerState,
+    assert_text_only_messages,
+    project_messages,
+)
 from .model_catalog import resolve_effective_context_window, shared_catalog
 from .protocol import (
     LLMProvider,
@@ -66,7 +72,9 @@ from .protocol import (
     project_provider_final_request,
     project_provider_message_count,
 )
+from .request_proof import effective_proof_token_budget
 from .selector import ModelSelector, ProviderConfig, SelectorConfig
+from .tokenrhythm_catalog import TOKENRHYTHM_API_BASE_URL, tokenrhythm_authority_identity
 from .types import (
     ChatConfig,
     ContentBlockToolResult,
@@ -120,6 +128,26 @@ ENSEMBLE_FIXED_TERMINAL_MESSAGE = (
     "model also failed. Check the fixed provider, model, and credentials, "
     "then try again."
 )
+
+
+def _ensemble_request_messages(
+    messages: list[Message], config: ChatConfig | None = None,
+) -> list[Message]:
+    """Return a fresh text-only object graph for one physical member call.
+
+    Ensemble is a text-only virtual model.  Re-project at every provider
+    boundary instead of sharing the coordinator's list across concurrent
+    proposers or retries: a provider adapter that mutates its input must not
+    contaminate a sibling leg, and no nested image may reach a member.
+    """
+
+    projection = project_messages(
+        messages,
+        mode="marker",
+        marker_state=ImageMarkerState.NOT_ANALYZED,
+    )
+    assert_text_only_messages(projection.messages)
+    return project_execution_identity(projection.messages, config)
 log = structlog.get_logger(__name__)
 
 
@@ -616,6 +644,7 @@ class _MemberRequestBudgetBinding:
     rederive: bool
     top_level_explicit_cap: int = 0
     inherit_top_level_cap: bool = True
+    confirmed: bool = True
 
 
 @dataclass
@@ -940,17 +969,28 @@ def _member_tools_capability_is_verified(
 
 
 def _member_max_tokens(member: EnsembleMemberConfig) -> int:
-    if member.max_tokens and member.max_tokens > 0:
-        return member.max_tokens
     cfg = member.provider_config
     try:
-        return shared_catalog().resolve_max_tokens(
+        catalog = shared_catalog()
+        if member.max_tokens and member.max_tokens > 0:
+            # An explicit request budget remains separate from automatic
+            # deployment capacity and retains the catalog's provider caps.
+            return catalog.resolve_max_tokens(
+                cfg.model, user_override=member.max_tokens, provider=cfg.provider,
+            )
+        deployment_limits = getattr(catalog, "resolve_deployment_limits", None)
+        if callable(deployment_limits):
+            return int(deployment_limits(
+                cfg.model, provider=cfg.provider, api_key=cfg.api_key,
+                base_url=cfg.base_url, proxy=cfg.proxy,
+            ).max_output_tokens)
+        return catalog.resolve_max_tokens(
             cfg.model,
             user_override=0,
             provider=cfg.provider,
         )
     except Exception:
-        return ChatConfig().max_tokens
+        return member.max_tokens or ChatConfig().max_tokens
 
 
 def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
@@ -958,7 +998,12 @@ def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
     return (
         str(cfg.provider or "").strip().lower(),
         str(cfg.model or "").strip().lower(),
-        str(cfg.base_url or "").strip().rstrip("/").lower(),
+        tokenrhythm_authority_identity(
+            provider=cfg.provider,
+            base_url=cfg.base_url or TOKENRHYTHM_API_BASE_URL,
+            api_key=cfg.api_key,
+        )
+        or str(cfg.base_url or "").strip().rstrip("/").lower(),
     )
 
 
@@ -1018,6 +1063,14 @@ def _derive_ensemble_chat_config(
 ) -> ChatConfig | None:
     if config is None or phase not in _ENSEMBLE_CORRELATION_PHASES:
         return config
+    rebound = rebind_execution_identity(
+        config,
+        kind=(
+            "single_model" if phase in {"fixed_direct", "fallback_single"} else "multi_model_fusion"
+        ),
+    )
+    assert rebound is not None
+    config = rebound
     correlation = _derive_ensemble_correlation(
         config.provider_request_correlation,
         phase,
@@ -1050,6 +1103,12 @@ def _member_chat_config(
     record_budget_rebound: bool = True,
 ) -> ChatConfig:
     cfg = base.model_copy(deep=True) if base is not None else ChatConfig()
+    rebound = rebind_execution_identity(
+        cfg, provider=member.provider_config.provider, model=member.provider_config.model,
+        kind="single_model" if role == "fixed_direct" else "multi_model_fusion",
+    )
+    assert rebound is not None
+    cfg = rebound
     updates: dict[str, Any] = {
         "max_tokens": _member_max_tokens(member),
         "model_capabilities": _member_model_capabilities(member),
@@ -1097,7 +1156,14 @@ def _member_chat_config(
         if rebound_cap <= 0 and request_budget_binding.inherit_top_level_cap:
             rebound_cap = inherited_cap
         effective = effective.model_copy(
-            update={"provider_request_max_chars": rebound_cap}
+            update={
+                "provider_request_max_chars": rebound_cap,
+                "provider_request_max_chars_explicit_cap": explicit_cap,
+                "provider_context_window_tokens": (
+                    (request_budget_binding.context_window_tokens or 0)
+                    if request_budget_binding.rederive else 0
+                ),
+            }
         )
     if (
         request_budget_binding is not None
@@ -1362,6 +1428,7 @@ def _done_usage_row(
 class EnsembleProvider:
     """G8 fusion provider: proposer candidates first, one aggregator stream after."""
 
+    accounts_physical_usage = True
     final_request_admission_guaranteed = True
     # Agent must pass the turn context through to this provider instead of
     # opening a second outer lease for the whole ensemble envelope.  The
@@ -1401,9 +1468,8 @@ class EnsembleProvider:
         ]
         | None = None,
         _fallback_request_budget_member: EnsembleMemberConfig | None = None,
+        _attachment_request_input_tokens: int = 0,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
-        _artifact_tool_executor_capabilities: ModelCapabilities | None = None,
-        _artifact_tool_executor_capability_verified: bool = False,
         _provider_state_replay_activation_targets: Sequence[Any] | None = None,
     ) -> None:
         self.profile_name = profile_name
@@ -1458,14 +1524,14 @@ class EnsembleProvider:
             _member_request_budget_bindings or {}
         )
         self._fallback_request_budget_member = _fallback_request_budget_member
+        self._attachment_request_input_tokens = max(
+            0,
+            int(_attachment_request_input_tokens or 0),
+        )
+        self._require_attachment_capacity_proof = (
+            self._attachment_request_input_tokens > 0
+        )
         self._credential_pool_failure_reporter = _credential_pool_failure_reporter
-        self.artifact_tool_executor_capabilities = (
-            _artifact_tool_executor_capabilities
-        )
-        self.artifact_tools_capability_verified = bool(
-            _artifact_tool_executor_capabilities is not None
-            and _artifact_tool_executor_capability_verified
-        )
         self._provider_state_replay_activation_targets = list(
             _provider_state_replay_activation_targets or []
         )
@@ -1596,6 +1662,67 @@ class EnsembleProvider:
             )
         return None
 
+    def _attachment_request_unavailability(
+        self,
+        *,
+        member: EnsembleMemberConfig | None,
+        chat_config: ChatConfig | None,
+        role: str,
+    ) -> tuple[str, str] | None:
+        """Check the complete routed request against one physical member cap.
+
+        The router freezes a conservative input-token upper bound after prompt,
+        tool, and attachment materialization. Reusing that bound keeps this
+        physical-member preflight cheap and prevents a large attachment from
+        being rescanned once per Ensemble leg.
+        """
+
+        if not self._require_attachment_capacity_proof:
+            return None
+        binding = (
+            self._member_request_budget_binding(member)
+            if member is not None
+            else None
+        )
+        context_window_tokens = (
+            int(binding.context_window_tokens or 0) if binding is not None else 0
+        )
+        if (
+            binding is None
+            or not binding.rederive
+            or not binding.confirmed
+            or context_window_tokens <= 0
+        ):
+            return (
+                f"{role} has no proven attachment request capacity; configure "
+                "context_window_tokens for every Ensemble member and fallback",
+                "provider_request_budget_exhausted",
+            )
+        thinking_budget_tokens = (
+            max(0, int(getattr(chat_config, "thinking_budget_tokens", 0) or 0))
+            if bool(getattr(chat_config, "thinking", False))
+            else 0
+        )
+        budget = ContextBudgetGovernor.from_values(
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max(
+                0,
+                int(getattr(chat_config, "max_tokens", 0) or 0),
+            ),
+            thinking_budget_tokens=thinking_budget_tokens,
+            context_overflow_threshold=binding.context_overflow_threshold,
+        ).snapshot()
+        # Character caps are checked against the final wire payload. They do
+        # not describe a model's token capacity.
+        safe_input_tokens, _ = effective_proof_token_budget(budget.usable_tokens)
+        if self._attachment_request_input_tokens > safe_input_tokens:
+            return (
+                f"{role} attachment request exceeds its proven capacity; "
+                "configure a larger-context Ensemble deployment",
+                "provider_request_budget_exhausted",
+            )
+        return None
+
     def _preflight_proposer_quorum(
         self,
         *,
@@ -1619,6 +1746,12 @@ class EnsembleProvider:
                 member,
                 chat_config=chat_config,
             )
+            if unavailable is None:
+                unavailable = self._attachment_request_unavailability(
+                    member=member,
+                    chat_config=chat_config,
+                    role="Ensemble proposer",
+                )
             eligible = unavailable is None
             k = max(1, int(member.k or 1))
             if eligible:
@@ -1687,6 +1820,11 @@ class EnsembleProvider:
             )
         return aggregator_cfg
 
+    def compaction_chat_config(self, config: ChatConfig) -> ChatConfig:
+        """Bind summary generation to the aggregator without invoking proposers."""
+
+        return self._aggregator_chat_config(config, ())
+
     def _fixed_chat_config(
         self,
         config: ChatConfig | None,
@@ -1722,6 +1860,11 @@ class EnsembleProvider:
                     "physical_attempt_limit": 1,
                 }
             )
+        fallback_config = rebind_execution_identity(
+            fallback_config,
+            provider=self.fallback_provider_name,
+            model=self.fallback_model,
+        )
         return _derive_ensemble_chat_config(fallback_config, role)
 
     def _aggregator_candidate_budget(
@@ -2224,14 +2367,19 @@ class EnsembleProvider:
         )
 
     def validate_chat_request(self, messages: list[Message]) -> ErrorEvent | None:
-        """Reject typed image input before any ensemble leg can start."""
+        """Validate the already-projected outer Ensemble request.
+
+        Ensemble is intentionally a text-only virtual model.  Its public
+        ``chat`` boundary projects image blocks to truthful markers before any
+        member is called, so a residual image here indicates a programming
+        error rather than a user-facing capability failure.
+        """
 
         if count_provider_image_blocks(messages) <= 0:
             return None
-        return ErrorEvent(
-            message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
-            code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
-        )
+        # Keep this method side-effect free for callers that use it as an
+        # admission probe; ``_chat_unbounded`` performs the actual projection.
+        return None
 
     async def list_models(self) -> list[ModelInfo]:
         models: list[ModelInfo] = []
@@ -2351,6 +2499,23 @@ class EnsembleProvider:
             execution_context=execution_context,
         )
 
+    @staticmethod
+    def _account_physical_stream(
+        stream_factory: Callable[[], AsyncIterator[StreamEvent]],
+        *,
+        provider: str,
+        model: str,
+    ) -> AsyncIterator[StreamEvent]:
+        # Keep the provider layer free of an import-time engine cycle while
+        # accounting each physical ensemble leg at its actual dispatch.
+        from opensquilla.engine.usage_accounting import account_provider_stream
+
+        return account_provider_stream(
+            stream_factory,
+            provider=provider,
+            model=model,
+        )
+
     async def _chat(
         self,
         messages: list[Message],
@@ -2380,6 +2545,22 @@ class EnsembleProvider:
         *,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
+        projection = project_messages(
+            messages,
+            mode="marker",
+            marker_state=ImageMarkerState.NOT_ANALYZED,
+        )
+        if projection.marker_count:
+            if config is not None and isinstance(getattr(config, "__dict__", None), dict):
+                metadata = getattr(config, "metadata", None)
+                if isinstance(metadata, dict):
+                    metadata["image_input_mode"] = "marker"
+                    metadata["image_input_reason"] = "ensemble_text_only"
+                    metadata["image_input_count"] = projection.input_image_count
+                    metadata["image_input_marker_count"] = projection.marker_count
+            messages = projection.messages
+            assert_text_only_messages(messages)
+
         validation_error = self.validate_chat_request(messages)
         if validation_error is not None:
             yield validation_error
@@ -2467,6 +2648,29 @@ class EnsembleProvider:
                 yield event
             return
 
+        aggregator_binding = self._member_request_budget_binding(self.aggregator)
+        if self._require_attachment_capacity_proof and (
+            aggregator_binding is None
+            or not aggregator_binding.rederive
+            or not aggregator_binding.confirmed
+            or int(aggregator_binding.context_window_tokens or 0) <= 0
+        ):
+            async for event in self._fallback_or_error(
+                messages,
+                tools=tools,
+                config=config,
+                execution_context=execution_context,
+                reason=(
+                    "ensemble aggregator has no proven attachment request "
+                    "capacity; configure context_window_tokens for every "
+                    "Ensemble member"
+                ),
+                code="provider_request_budget_exhausted",
+                candidates=[],
+            ):
+                yield event
+            return
+
         try:
             aggregator_provider = _build_provider(self.aggregator.provider_config)
         except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
@@ -2490,7 +2694,6 @@ class EnsembleProvider:
             return
 
         aggregator_cfg = self._aggregator_chat_config(config, messages)
-        aggregator_binding = self._member_request_budget_binding(self.aggregator)
         if (
             aggregator_binding is not None
             and not aggregator_binding.inherit_top_level_cap
@@ -3047,6 +3250,14 @@ class EnsembleProvider:
         # generators. Provider-private continuity state (reasoning_content,
         # thinking blocks, thought signatures) belongs to the model that
         # minted it and must not be replayed into any proposer physical call.
+        capacity_unavailable = self._attachment_request_unavailability(
+            member=member,
+            chat_config=chat_cfg,
+            role="Ensemble proposer",
+        )
+        if capacity_unavailable is not None:
+            result.error, result.error_code = capacity_unavailable
+            return result
         provider = _build_provider(_proposer_provider_config(member))
         text_parts: list[str] = []
         got_done = False
@@ -3055,7 +3266,15 @@ class EnsembleProvider:
             result.request_started = True
 
         provider_stream = _provider_stream_with_lifecycle(
-            lambda: provider.chat(messages, tools=tools, config=chat_cfg),
+            lambda: self._account_physical_stream(
+                lambda: provider.chat(
+                    _ensemble_request_messages(messages, chat_cfg),
+                    tools=tools,
+                    config=chat_cfg,
+                ),
+                provider=member.provider_config.provider,
+                model=member.provider_config.model,
+            ),
             execution_context=execution_context,
             role=StickyExecutionRole.PROPOSER,
             logical_call_index=result.index,
@@ -3489,7 +3708,15 @@ class EnsembleProvider:
                     else None
                 )
                 heartbeat_stream = _provider_stream_with_lifecycle(
-                    lambda: provider.chat(messages, tools=tools, config=config),
+                    lambda: self._account_physical_stream(
+                        lambda: provider.chat(
+                            _ensemble_request_messages(messages, config),
+                            tools=tools,
+                            config=config,
+                        ),
+                        provider=self.aggregator.provider_config.provider,
+                        model=self.aggregator.provider_config.model,
+                    ),
                     execution_context=execution_context,
                     role=StickyExecutionRole.PRIMARY_AGGREGATOR,
                     logical_call_index=logical_call_index,
@@ -4074,6 +4301,7 @@ class EnsembleProvider:
         while True:
             fixed_attempt += 1
             fixed_request_started = False
+            physical_provider, physical_model = executed_identity()
 
             async def mark_fixed_request_started() -> None:
                 nonlocal fixed_request_started
@@ -4089,7 +4317,15 @@ class EnsembleProvider:
             terminal_error: ErrorEvent | None = None
             try:
                 async for event in _provider_stream_with_lifecycle(
-                    lambda: provider.chat(fixed_messages, tools=tools, config=config),
+                    lambda: self._account_physical_stream(
+                        lambda: provider.chat(
+                            _ensemble_request_messages(fixed_messages, config),
+                            tools=tools,
+                            config=config,
+                        ),
+                        provider=physical_provider,
+                        model=physical_model,
+                    ),
                     execution_context=execution_context,
                     role=role,
                     logical_call_index=logical_call_index,
@@ -4511,6 +4747,8 @@ class EnsembleProvider:
         fixed_messages = list(messages)
         fixed_budget_proof: dict[str, Any] | None = None
         fixed_budget_exhausted = False
+        fixed_budget_error_message = ""
+        fixed_budget_error_code = "fallback_aggregator_budget_exhausted"
         if immutable_bundle:
             fitted_fixed = self._fit_fixed_candidate_bundle(
                 self.fallback_provider,
@@ -4523,6 +4761,17 @@ class EnsembleProvider:
                 fixed_bundle, fixed_messages, fixed_budget_proof = fitted_fixed
             else:
                 fixed_budget_exhausted = True
+        else:
+            fixed_capacity_unavailable = self._attachment_request_unavailability(
+                member=fallback_member,
+                chat_config=fallback_config,
+                role="Ensemble fixed fallback",
+            )
+            if fixed_capacity_unavailable is not None:
+                fixed_budget_exhausted = True
+                fixed_budget_error_message, fixed_budget_error_code = (
+                    fixed_capacity_unavailable
+                )
         fallback_timeout_seconds = float(
             getattr(fallback_config, "timeout", ChatConfig().timeout)
             if fallback_config is not None
@@ -4580,7 +4829,7 @@ class EnsembleProvider:
                 fixed_budget_proof
             )
         trace["fallback_code"] = (
-            "fallback_aggregator_budget_exhausted"
+            fixed_budget_error_code
             if fixed_budget_exhausted
             else (
                 "provider_request_budget_exhausted"
@@ -4589,6 +4838,9 @@ class EnsembleProvider:
             )
         )
         if fixed_budget_exhausted:
+            capacity_message = fixed_budget_error_message or (
+                "fixed aggregator request budget cannot retain one candidate draft"
+            )
             if execution_context is not None:
                 await execution_context.begin_failed_fixed_recovery(
                     fixed_execution_role,
@@ -4598,7 +4850,7 @@ class EnsembleProvider:
                         tool_schemas=tuple(tools or ()),
                         conversation=tuple(messages),
                         metadata={
-                            "code": "fallback_aggregator_budget_exhausted",
+                            "code": fixed_budget_error_code,
                             "fixed_role": fixed_role,
                         },
                     ),
@@ -4609,20 +4861,14 @@ class EnsembleProvider:
                     safe_reason="fixed request budget exhausted",
                     terminal=True,
                     terminal_text_snapshot=ENSEMBLE_FIXED_TERMINAL_MESSAGE,
-                    terminal_error_message=(
-                        "fixed aggregator request budget cannot retain one "
-                        "candidate draft"
-                    ),
-                    terminal_error_code="fallback_aggregator_budget_exhausted",
+                    terminal_error_message=capacity_message,
+                    terminal_error_code=fixed_budget_error_code,
                 )
                 return
             yield proposer_error(
                 ErrorEvent(
-                    message=(
-                        "fixed aggregator request budget cannot retain one "
-                        "candidate draft"
-                    ),
-                    code="fallback_aggregator_budget_exhausted",
+                    message=capacity_message,
+                    code=fixed_budget_error_code,
                 )
             )
             return
@@ -6835,6 +7081,19 @@ def _runtime_member_request_budget_bindings(
                     provider=member_cfg.provider,
                     global_override=member_global_context_override,
                 )
+                deployment_limits = getattr(model_catalog, "resolve_deployment_limits", None)
+                if resolved_source not in {"override", "config"} and callable(deployment_limits):
+                    limits = deployment_limits(
+                        member_cfg.model,
+                        provider=member_cfg.provider,
+                        api_key=member_cfg.api_key,
+                        base_url=member_cfg.base_url,
+                        proxy=member_cfg.proxy,
+                    )
+                    resolved_window = limits.context_window
+                    resolved_source = (
+                        "catalog" if getattr(limits, "context_window_known", True) else "default"
+                    )
                 context_window = int(resolved_window)
                 context_source = str(resolved_source or "default")
             except Exception:  # noqa: BLE001 - an unknown member keeps the outer cap
@@ -6859,7 +7118,10 @@ def _runtime_member_request_budget_bindings(
                 if same_top_level_provider
                 else "unavailable"
             ),
-            rederive=reliable_context,
+            # Defaults remain usable for ordinary calls, but each member must
+            # use its own default instead of inheriting a larger outer window.
+            rederive=context_window is not None and context_window > 0,
+            confirmed=reliable_context,
             top_level_explicit_cap=member_explicit_cap,
             inherit_top_level_cap=same_top_level_provider,
         )
@@ -6879,7 +7141,6 @@ def build_ensemble_provider_from_config(
     _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
     _session_key: str = "",
     _fallback_selector: Any | None = None,
-    _artifact_mutation: bool = False,
     _selection_mode_override: str | None = None,
     _plan_provider_config: ProviderConfig | None = None,
     _dynamic_baseline_provider_config: ProviderConfig | None = None,
@@ -6923,25 +7184,6 @@ def build_ensemble_provider_from_config(
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
-    artifact_tool_executor_capabilities: ModelCapabilities | None = None
-    artifact_tool_executor_capability_verified = False
-    if _artifact_mutation:
-        if not aggregator.ready:
-            raise ValueError(
-                "artifact_ensemble_unavailable:aggregator_not_ready"
-            )
-        artifact_tool_executor_capabilities = _member_model_capabilities(
-            aggregator,
-            model_catalog=_model_catalog,
-        )
-        if artifact_tool_executor_capabilities.supports_tools is False:
-            raise ValueError(
-                "artifact_ensemble_unavailable:aggregator_tools_unsupported"
-            )
-        artifact_tool_executor_capability_verified = _member_tools_capability_is_verified(
-            aggregator,
-            model_catalog=_model_catalog,
-        )
     is_custom_b5 = selection_mode == CUSTOM_B5_SELECTION_MODE
     # Static and custom lineups share the fixed-lineup quorum/shuffle family.
     # Packaged static profiles additionally use tighter per-call timeouts.
@@ -7101,24 +7343,14 @@ def build_ensemble_provider_from_config(
     )
     effective_all_failed_policy = cast(
         Literal["fallback_single", "error"],
-        (
-            "error"
-            if _artifact_mutation
-            else getattr(ensemble_cfg, "all_failed_policy", "fallback_single")
-        ),
+        (getattr(ensemble_cfg, "all_failed_policy", "fallback_single")),
     )
-    effective_proposer_tools = (
-        False
-        if _artifact_mutation
-        else bool(getattr(ensemble_cfg, "proposer_tools", False))
-    )
-    if _artifact_mutation:
-        selection_plan["artifact_execution_policy"] = "aggregator_only"
+    effective_proposer_tools = bool(getattr(ensemble_cfg, "proposer_tools", False))
     return EnsembleProvider(
         profile_name=profile_name,
         proposers=proposers,
         aggregator=aggregator,
-        fallback_provider=None if _artifact_mutation else fallback_provider,
+        fallback_provider=(fallback_provider),
         fallback_provider_name=inherited_provider_config.provider,
         fallback_model=inherited_provider_config.model,
         fallback_api_key=inherited_provider_config.api_key,
@@ -7137,12 +7369,19 @@ def build_ensemble_provider_from_config(
         selection_plan=selection_plan,
         _member_request_budget_bindings=request_budget_bindings,
         _fallback_request_budget_member=fallback_request_budget_member,
+        _attachment_request_input_tokens=(
+            int((turn_metadata or {}).get("large_context_request_input_tokens") or 0)
+            if (turn_metadata or {}).get("large_context_capacity_required") is True
+            and isinstance(
+                (turn_metadata or {}).get("large_context_request_input_tokens"),
+                int,
+            )
+            and not isinstance(
+                (turn_metadata or {}).get("large_context_request_input_tokens"),
+                bool,
+            )
+            else 0
+        ),
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
-        _artifact_tool_executor_capabilities=artifact_tool_executor_capabilities,
-        _artifact_tool_executor_capability_verified=(
-            artifact_tool_executor_capability_verified
-        ),
-        _provider_state_replay_activation_targets=(
-            deferred_replay_activation_targets
-        ),
+        _provider_state_replay_activation_targets=(deferred_replay_activation_targets),
     )

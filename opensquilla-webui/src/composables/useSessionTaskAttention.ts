@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import type { SessionDirectoryChange } from '@/modules/sessionDirectoryChanges'
 
 export type SessionTaskAttention = 'none' | 'running' | 'completed' | 'failed'
 export type UnreadSessionTaskAttention = Exclude<SessionTaskAttention, 'none' | 'running'>
@@ -255,10 +256,55 @@ export function createSessionTaskAttentionStore(
     persist()
   }
 
+  /**
+   * Consume the semantic SessionDirectoryChanges projection. The legacy
+   * `handleSessionsChanged` parser above remains for chat's older event path;
+   * new directory consumers must not pass wire aliases into this store.
+   */
+  function handleSessionDirectoryChange(
+    change: SessionDirectoryChange,
+    context: SessionTaskAttentionContext,
+  ) {
+    if (!change?.key) return
+
+    if (change.reason === 'taskQueued' || change.reason === 'taskRunning') {
+      markRead(change.key)
+      return
+    }
+    if (change.reason !== 'taskTerminal' && change.reason !== 'cronStaticMessage') return
+
+    const task = change.lastTask || change.changedTask
+    const taskId = textValue(task?.id)
+    if (!taskId) return
+    const handledKey = handledTaskKey(change.key, taskId)
+    if (read.value[change.key] === taskId || handledTasks.has(handledKey)) return
+    rememberHandledTask(change.key, taskId)
+
+    if (
+      change.key === context.currentSessionKey
+      && context.currentSessionVisible
+    ) {
+      markTaskRead(change.key, taskId)
+      return
+    }
+
+    const state = terminalAttention(textValue(task?.status) || textValue(change.runStatus || ''))
+    if (!state) {
+      markRead(change.key)
+      return
+    }
+    unread.value = {
+      ...unread.value,
+      [change.key]: { taskId, state },
+    }
+    persist()
+  }
+
   return {
     unread,
     attentionFor,
     handleSessionsChanged,
+    handleSessionDirectoryChange,
     markRead,
     removeMany,
   }

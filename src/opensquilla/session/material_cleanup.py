@@ -29,9 +29,14 @@ from pathlib import Path
 
 import structlog
 
+from opensquilla.session.models import ProjectWorkspace, SessionNode
+
 log = structlog.get_logger(__name__)
 
-SessionMaterialCleanup = Callable[[str, str], Awaitable[None]]
+PreparedSessionMaterialCleanup = Callable[[], Awaitable[None]]
+SessionMaterialCleanup = Callable[
+    [SessionNode, ProjectWorkspace | None], Awaitable[PreparedSessionMaterialCleanup],
+]
 SessionArtifactCleanup = Callable[[str, str], Awaitable[None]]
 
 _hook: SessionMaterialCleanup | None = None
@@ -83,17 +88,36 @@ async def run_session_artifact_cleanup(session_id: str, session_key: str) -> Non
         )
 
 
-async def run_session_material_cleanup(session_id: str, session_key: str) -> None:
+async def prepare_session_material_cleanup(
+    session: SessionNode,
+    workspace: ProjectWorkspace | None,
+) -> PreparedSessionMaterialCleanup | None:
+    """Capture cleanup authority before the session's database rows disappear."""
+    if _hook is None:
+        return None
+    try:
+        return await _hook(session, workspace)
+    except Exception as exc:  # noqa: BLE001 - material cleanup must not prevent deletion
+        log.warning(
+            "session_material_cleanup.prepare_failed",
+            session_id=session.session_id,
+            error_type=type(exc).__name__,
+        )
+        return None
+
+
+async def run_session_material_cleanup(
+    session_id: str, session_key: str, cleanup: PreparedSessionMaterialCleanup | None,
+) -> None:
     """Invoke the registered cleanup for a deleted session, if any.
 
     Best-effort: a cleanup failure is logged but never propagated, so a
     filesystem hiccup cannot block a session delete.
     """
-    hook = _hook
-    if hook is None:
+    if cleanup is None:
         return
     try:
-        await hook(session_id, session_key)
+        await cleanup()
     except Exception as exc:  # noqa: BLE001 — cleanup must never fail the delete
         log.warning(
             "session_material_cleanup.failed",

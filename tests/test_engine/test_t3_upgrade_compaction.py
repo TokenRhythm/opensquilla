@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -78,47 +77,6 @@ class _StaleResultCompactionSessionManager(_FakeSessionManager):
             tokens_after=300,
             remaining_budget_tokens=context_window_tokens - 300,
         )
-
-
-@dataclass(frozen=True)
-class _FakeFlushReceipt:
-    mode: str = "llm"
-    flushed_paths: list[str] = field(default_factory=list)
-    slug: str | None = None
-    message_count: int = 1
-    duration_ms: int = 10
-    raw_reason: str | None = None
-    error: str | None = None
-    integrity_status: str = "ok"
-    indexed_chunk_count: int = 1
-    output_coverage_status: str = "ok"
-    invalid_candidate_count: int = 0
-    candidate_missing_ids: list[str] = field(default_factory=list)
-    obligation_status: str = "ok"
-    obligation_missing_ids: list[str] = field(default_factory=list)
-
-
-class _FakeFlushService:
-    def __init__(
-        self,
-        receipt: _FakeFlushReceipt | None = None,
-        raise_exc: Exception | None = None,
-        delay_seconds: float = 0.0,
-    ) -> None:
-        self._receipt = receipt or _FakeFlushReceipt()
-        self._raise_exc = raise_exc
-        self._delay_seconds = delay_seconds
-        self.execute_calls: list[dict[str, Any]] = []
-
-    async def execute(self, transcript: Any, session_key: str, **kwargs: Any) -> _FakeFlushReceipt:
-        self.execute_calls.append({"session_key": session_key, **kwargs})
-        if self._delay_seconds:
-            import asyncio
-
-            await asyncio.sleep(self._delay_seconds)
-        if self._raise_exc is not None:
-            raise self._raise_exc
-        return self._receipt
 
 
 # ---------------------------------------------------------------------------
@@ -235,32 +193,19 @@ def _make_turn(
 
 def _make_runner(
     session_manager: Any = None,
-    flush_service: Any = None,
     enabled: bool = True,
     *,
-    flush_enabled: bool = True,
-    flush_timeout_seconds: float = 15.0,
-    flush_background_timeout_seconds: float = 120.0,
-    flush_pre_compaction: bool = True,
-    flush_compaction_requires_safe_receipt: bool = False,
     compaction_config: Any = None,
 ) -> TurnRunner:
     config = SimpleNamespace(
         squilla_router=SimpleNamespace(upgrade_to_c3_compaction_enabled=enabled),
         compaction=compaction_config,
-        memory=SimpleNamespace(
-            flush_enabled=flush_enabled,
-            flush_pre_compaction=flush_pre_compaction,
-            flush_timeout_seconds=flush_timeout_seconds,
-            flush_background_timeout_seconds=flush_background_timeout_seconds,
-            flush_compaction_requires_safe_receipt=flush_compaction_requires_safe_receipt,
-        ),
+        memory=SimpleNamespace(),
     )
     return TurnRunner(
         provider_selector=SimpleNamespace(clone=lambda: SimpleNamespace()),
         session_manager=session_manager,
         config=config,
-        session_flush_service=flush_service,
     )
 
 
@@ -270,17 +215,15 @@ def _make_runner(
 
 
 @pytest.mark.asyncio
-async def test_t2_to_t3_triggers_flush_then_compact() -> None:
+async def test_t2_to_t3_triggers_compaction() -> None:
     sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     turn = _make_turn(routed_tier="c3", previous_tier="c2")
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
 
     assert result == "handled"
     await asyncio.sleep(0)
-    assert len(fs.execute_calls) == 1
     assert len(sm.compact_calls) == 1
     assert sm.compact_calls[0] == ("agent:main:webchat:default", 100_000)
 
@@ -288,10 +231,8 @@ async def test_t2_to_t3_triggers_flush_then_compact() -> None:
 @pytest.mark.asyncio
 async def test_t3_passes_profile_config_without_provider_or_model() -> None:
     sm = _ResultCompactionSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
     runner = _make_runner(
         session_manager=sm,
-        flush_service=fs,
         compaction_config=SimpleNamespace(
             enabled=False,
             compaction_profile="coding",
@@ -352,7 +293,7 @@ async def test_t3_protects_active_and_queued_prompts_in_compaction_config() -> N
         ),
     ]
     sm = _ResultCompactionSessionManager(transcript)
-    runner = _make_runner(session_manager=sm, flush_service=_FakeFlushService())
+    runner = _make_runner(session_manager=sm)
 
     result = await runner._maybe_compact_on_t3_upgrade(
         session_key,
@@ -391,8 +332,7 @@ async def test_t3_skips_durable_work_when_active_prompt_alone_is_too_large() -> 
     ]
     sm = _ResultCompactionSessionManager(transcript)
     sm.record_memory_checkpoint = AsyncMock()
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     result = await runner._maybe_compact_on_t3_upgrade(
         session_key,
@@ -405,21 +345,18 @@ async def test_t3_skips_durable_work_when_active_prompt_alone_is_too_large() -> 
     assert result == "handled"
     assert sm.compact_calls == []
     sm.record_memory_checkpoint.assert_not_called()
-    assert fs.execute_calls == []
 
 
 @pytest.mark.asyncio
-async def test_t3_within_budget_skips_flush_and_compact() -> None:
+async def test_t3_within_budget_skips_compaction() -> None:
     sm = _FakeSessionManager(_within_budget_transcript())
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     turn = _make_turn(routed_tier="c3", previous_tier="c2")
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
 
     assert result == "handled"
     await asyncio.sleep(0)
-    assert fs.execute_calls == []
     assert sm.compact_calls == []
 
 
@@ -427,7 +364,6 @@ async def test_t3_within_budget_skips_flush_and_compact() -> None:
 async def test_t3_budget_check_counts_full_tool_call_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import opensquilla.session.compaction as compaction_module
 
     monkeypatch.setattr(
         compaction_module,
@@ -450,8 +386,7 @@ async def test_t3_budget_check_counts_full_tool_call_replay(
     assert summarized * safety_margin <= window < model_replay * safety_margin
 
     sm = _FakeSessionManager(transcript)
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     turn = _make_turn(routed_tier="c3", previous_tier="c2")
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, window)
@@ -466,14 +401,13 @@ async def test_t3_completed_event_reports_compaction_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sm = _ResultCompactionSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
     events: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
         runtime_module,
         "notify_compaction",
         lambda session_key, **payload: events.append((session_key, payload)),
     )
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     turn = _make_turn(routed_tier="c3", previous_tier="c2")
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
@@ -516,14 +450,13 @@ async def test_t3_stale_preimage_skip_does_not_mark_compacted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sm = _StaleResultCompactionSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
     events: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
         runtime_module,
         "notify_compaction",
         lambda session_key, **payload: events.append((session_key, payload)),
     )
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
     session_key = "agent:main:webchat:default"
 
     turn = _make_turn(routed_tier="c3", previous_tier="c2")
@@ -532,7 +465,7 @@ async def test_t3_stale_preimage_skip_does_not_mark_compacted(
     assert result == "handled"
     assert sm.compact_calls == [(session_key, 100_000)]
     assert runner.has_compacted_this_turn(session_key) is False
-    skipped = [payload for _, payload in events if payload.get("status") == "skipped"]
+    skipped = [payload for _, payload in events if payload.get("status") == "stale"]
     assert skipped[-1]["reason"] == "stale_preimage"
     assert skipped[-1]["applied"] is False
     assert skipped[-1]["durability"] == "none"
@@ -543,8 +476,7 @@ async def test_t3_stale_preimage_skip_does_not_mark_compacted(
 async def test_t0_t1_to_t3_triggers() -> None:
     for prev in ("c0", "c1"):
         sm = _FakeSessionManager(_sample_transcript())
-        fs = _FakeFlushService()
-        runner = _make_runner(session_manager=sm, flush_service=fs)
+        runner = _make_runner(session_manager=sm)
 
         turn = _make_turn(routed_tier="c3", previous_tier=prev)
         result = await runner._maybe_compact_on_t3_upgrade(
@@ -553,242 +485,55 @@ async def test_t0_t1_to_t3_triggers() -> None:
 
         assert result == "handled", f"failed for previous_tier={prev}"
         await asyncio.sleep(0)
-        assert len(fs.execute_calls) == 1
         assert len(sm.compact_calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_t3_to_t3_skips() -> None:
     sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     turn = _make_turn(routed_tier="c3", previous_tier="c3")
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
 
     assert result == "not_applicable"
-    assert len(fs.execute_calls) == 0
     assert len(sm.compact_calls) == 0
 
 
 @pytest.mark.asyncio
 async def test_non_t3_route_skips() -> None:
     sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     turn = _make_turn(routed_tier="c1", previous_tier="c0")
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
 
     assert result == "not_applicable"
-    assert len(fs.execute_calls) == 0
     assert len(sm.compact_calls) == 0
 
 
 @pytest.mark.asyncio
 async def test_config_disabled_skips() -> None:
     sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs, enabled=False)
+    runner = _make_runner(session_manager=sm,  enabled=False)
 
     turn = _make_turn(routed_tier="c3", previous_tier="c2")
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
 
     assert result == "not_applicable"
-    assert len(fs.execute_calls) == 0
     assert len(sm.compact_calls) == 0
 
 
 @pytest.mark.asyncio
 async def test_observe_mode_skips() -> None:
     sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     turn = _make_turn(routed_tier="c3", previous_tier="c2", routing_applied=False)
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
 
     assert result == "not_applicable"
-    assert len(fs.execute_calls) == 0
     assert len(sm.compact_calls) == 0
-
-
-@pytest.mark.asyncio
-async def test_flush_raises_does_not_block_compaction() -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService(raise_exc=RuntimeError("flush boom"))
-    runner = _make_runner(session_manager=sm, flush_service=fs)
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    await asyncio.sleep(0)
-    assert len(fs.execute_calls) == 1
-    assert len(sm.compact_calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_flush_error_receipt_does_not_block_compaction() -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService(receipt=_FakeFlushReceipt(mode="error", error="provider down"))
-    runner = _make_runner(session_manager=sm, flush_service=fs)
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    await asyncio.sleep(0)
-    assert len(fs.execute_calls) == 1
-    assert len(sm.compact_calls) == 1
-
-
-@pytest.mark.parametrize(
-    "receipt",
-    [
-        _FakeFlushReceipt(mode="raw", raw_reason="no_provider"),
-        _FakeFlushReceipt(integrity_status="missing_chunks"),
-        _FakeFlushReceipt(output_coverage_status="coverage_warning"),
-        _FakeFlushReceipt(invalid_candidate_count=1),
-        _FakeFlushReceipt(candidate_missing_ids=["candidate-1"]),
-        _FakeFlushReceipt(obligation_missing_ids=["obligation-1"]),
-    ],
-)
-@pytest.mark.asyncio
-async def test_degraded_flush_receipts_do_not_block_compaction(
-    receipt: _FakeFlushReceipt,
-) -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService(receipt=receipt)
-    runner = _make_runner(session_manager=sm, flush_service=fs)
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    await asyncio.sleep(0)
-    assert len(fs.execute_calls) == 1
-    assert len(sm.compact_calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_t3_strict_flush_receipt_skips_destructive_compaction() -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService(receipt=_FakeFlushReceipt(integrity_status="missing_chunks"))
-    runner = _make_runner(
-        session_manager=sm,
-        flush_service=fs,
-        flush_compaction_requires_safe_receipt=True,
-    )
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    assert len(fs.execute_calls) == 1
-    assert sm.compact_calls == []
-
-
-@pytest.mark.asyncio
-async def test_backfilled_flush_receipt_allows_compact() -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService(receipt=_FakeFlushReceipt(obligation_status="backfilled"))
-    runner = _make_runner(session_manager=sm, flush_service=fs)
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    await asyncio.sleep(0)
-    assert len(fs.execute_calls) == 1
-    assert len(sm.compact_calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_t3_flush_uses_background_timeout_for_service_call() -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
-    runner = _make_runner(
-        session_manager=sm,
-        flush_service=fs,
-        flush_timeout_seconds=0.25,
-        flush_background_timeout_seconds=42.0,
-    )
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    await asyncio.sleep(0)
-    assert fs.execute_calls[0]["timeout"] == 42.0
-
-
-@pytest.mark.asyncio
-async def test_t3_flush_uses_longer_default_background_timeout() -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    await asyncio.sleep(0)
-    assert fs.execute_calls[0]["timeout"] == 120.0
-
-
-@pytest.mark.asyncio
-async def test_t3_flush_grace_timeout_does_not_block_compaction() -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    fs = _FakeFlushService(delay_seconds=0.05)
-    runner = _make_runner(
-        session_manager=sm,
-        flush_service=fs,
-        flush_timeout_seconds=0.001,
-        flush_background_timeout_seconds=42.0,
-    )
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    await asyncio.sleep(0)
-    assert fs.execute_calls[0]["timeout"] == 42.0
-    assert len(sm.compact_calls) == 1
-    await asyncio.sleep(0.06)
-
-
-@pytest.mark.asyncio
-async def test_memory_flush_disabled_compacts_without_flush_service() -> None:
-    sm = _FakeSessionManager(_sample_transcript())
-    runner = _make_runner(
-        session_manager=sm,
-        flush_service=None,
-        flush_enabled=False,
-    )
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    assert len(sm.compact_calls) == 1
-
-
-@pytest.mark.parametrize("value", ["0", "false", "no", "off"])
-@pytest.mark.asyncio
-async def test_env_flush_disabled_compacts_without_flush_service(
-    monkeypatch: pytest.MonkeyPatch,
-    value: str,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_SESSION_FLUSH", value)
-    sm = _FakeSessionManager(_sample_transcript())
-    runner = _make_runner(session_manager=sm, flush_service=None)
-
-    turn = _make_turn(routed_tier="c3", previous_tier="c2")
-    result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
-
-    assert result == "handled"
-    assert len(sm.compact_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -799,15 +544,13 @@ async def test_compact_raises_continues() -> None:
         raise RuntimeError("compact boom")
 
     sm.compact = _boom  # type: ignore[assignment]
-    fs = _FakeFlushService()
-    runner = _make_runner(session_manager=sm, flush_service=fs)
+    runner = _make_runner(session_manager=sm)
 
     turn = _make_turn(routed_tier="c3", previous_tier="c2")
     result = await runner._maybe_compact_on_t3_upgrade("agent:main:webchat:default", turn, 100_000)
 
     assert result == "compact_failed"
     await asyncio.sleep(0)
-    assert len(fs.execute_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -837,7 +580,7 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim(
         "notify_compaction",
         lambda session_key, **payload: events.append((session_key, payload)),
     )
-    runner = _make_runner(session_manager=sm, flush_service=_FakeFlushService())
+    runner = _make_runner(session_manager=sm)
 
     result = await runner._maybe_compact_on_t3_upgrade(
         session_key,
@@ -854,6 +597,9 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim(
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 
@@ -861,7 +607,7 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim(
     assert len(await sm.get_transcript(session_key)) == len(transcript)
     assert len(agent.history) < len(transcript)
     assert summary_context is not None
-    assert "emergency request-scoped compaction" in summary_context.lower()
+    assert "temporary history window" in summary_context.lower()
     statuses = [payload["status"] for _, payload in events]
     assert statuses[:2] == ["started", "emergency_ephemeral"]
     assert "failed" not in statuses
@@ -892,19 +638,21 @@ async def test_t3_open_circuit_still_uses_request_scoped_emergency_trim(
         "notify_compaction",
         lambda session_key, **payload: events.append((session_key, payload)),
     )
-    runner = _make_runner(session_manager=sm, flush_service=_FakeFlushService())
+    runner = _make_runner(session_manager=sm)
     runner._compaction_failures[session_key] = runtime_module._CompactionFailureState(
         count=3,
         opened_at=runtime_module.time.monotonic(),
     )
-    emergency_requests: list[Any] = []
-    original_compact_context = compaction_module.compact_context
+    from opensquilla.engine import request_window
 
-    async def capture_emergency_request(request: Any) -> Any:
-        emergency_requests.append(request)
-        return await original_compact_context(request)
+    selected_windows: list[int] = []
+    original_cuts = request_window.iter_window_prefix_cuts
 
-    monkeypatch.setattr(compaction_module, "compact_context", capture_emergency_request)
+    def observe_cuts(roles, **kwargs):
+        selected_windows.append(kwargs["protected_start"])
+        return original_cuts(roles, **kwargs)
+
+    monkeypatch.setattr(request_window, "iter_window_prefix_cuts", observe_cuts)
 
     result = await runner._maybe_compact_on_t3_upgrade(
         session_key,
@@ -921,6 +669,7 @@ async def test_t3_open_circuit_still_uses_request_scoped_emergency_trim(
     assert emergency["reason"] == "durable_compaction_circuit_open"
     assert emergency["durability"] == "request_scoped"
     assert runner._compaction_failures[session_key].count == 3
-    assert len(emergency_requests) == 1
-    assert emergency_requests[0].context_window_tokens == 1_500
-    assert emergency_requests[0].context_window_chars == 5_000
+    assert selected_windows == [len(transcript) - 2]
+    override = runner._emergency_compaction_overrides[session_key]
+    assert override.history_window_tokens == 1_500
+    assert override.history_capacity_chars == 5_000

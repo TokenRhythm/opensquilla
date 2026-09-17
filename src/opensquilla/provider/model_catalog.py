@@ -53,6 +53,7 @@ class DeploymentModelLimits:
     context_window: int
     max_output_tokens: int
     max_output_tokens_known: bool
+    context_window_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,9 +282,9 @@ def _corrections_budget_fallback(model_id: str) -> tuple[int, int] | None:
 def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
     """Fields the live provider catalog knows, adapted per-1k → per-Mtok.
 
-    Capability booleans are computed deterministically from the provider
-    response at populate time, so they are emitted as known whenever the
-    model is in the cache. A 0.0 per-1k price is the live cache's "free or
+    Vision is known only when the provider actually supplied input modalities;
+    the compatibility boolean default is not evidence of a text-only model.
+    A 0.0 per-1k price is the live cache's "free or
     unknown" sentinel, so costs are emitted only when positive — this layer
     never claims a known $0 price.
     """
@@ -292,8 +293,9 @@ def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "supports_reasoning": info.supports_reasoning,
         "supports_tools": info.supports_tools,
-        "supports_vision": info.supports_vision,
     }
+    if "supports_vision" in info.model_fields_set:
+        fields["supports_vision"] = info.supports_vision
     if info.display_name:
         fields["display_name"] = info.display_name
     if info.context_window > 0:
@@ -438,6 +440,7 @@ class ModelCatalog:
         # User-override layer for resolve_entry; keys are lowercased
         # "provider/model" or bare model ids (see set_user_overrides).
         self._user_overrides: dict[str, dict[str, Any]] = {}
+        self._capacity_endpoint_identities: dict[str, str] = {}
         # Provider-scoped live layer: boot-time ingest of a provider's own
         # public model listing (see provider/live_catalog.py). Keyed
         # provider -> lowercased model id -> validated entry fields.
@@ -472,21 +475,32 @@ class ModelCatalog:
                 continue
             top_provider = m.get("top_provider") or {}
             max_completion = top_provider.get("max_completion_tokens") or 0
+            context_windows = [
+                value for value in (m.get("context_length"), top_provider.get("context_length"))
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            ]
             supported = set(m.get("supported_parameters", []))
             architecture = m.get("architecture") or {}
-            input_modalities = {
-                str(item).lower() for item in architecture.get("input_modalities", [])
-            }
+            modalities = architecture.get("input_modalities")
+            vision_fields: dict[str, Any] = {}
+            if (
+                isinstance(modalities, list)
+                and modalities
+                and all(isinstance(item, str) and item.strip() for item in modalities)
+            ):
+                vision_fields["supports_vision"] = "image" in {
+                    item.strip().lower() for item in modalities
+                }
             pricing = m.get("pricing") or {}
             self._models[model_id] = ModelInfo(
                 provider="openrouter",
                 model_id=model_id,
                 display_name=m.get("name", model_id),
-                context_window=m.get("context_length", 0),
+                context_window=min(context_windows) if context_windows else 0,
                 max_output_tokens=max_completion,
                 supports_reasoning="reasoning" in supported or "reasoning_effort" in supported,
                 supports_tools="tools" in supported or "tool_choice" in supported,
-                supports_vision="image" in input_modalities,
+                **vision_fields,
                 input_cost_per_1k=_price_per_1k(pricing.get("prompt")),
                 output_cost_per_1k=_price_per_1k(pricing.get("completion")),
             )
@@ -981,10 +995,17 @@ class ModelCatalog:
                 user_override=0,
                 provider=provider_id,
             )
+            context_window, context_source = self.resolve_context_window_with_source(
+                model_id, provider_id,
+            )
             return DeploymentModelLimits(
-                context_window=self.resolve_context_window(model_id, provider_id),
+                context_window=context_window,
                 max_output_tokens=max_tokens,
                 max_output_tokens_known=source in {"catalog", "override"},
+                context_window_known=(
+                    context_source in {"catalog", "override"}
+                    or provider_id in LOCAL_RUNTIME_PROVIDERS
+                ),
             )
 
         model_l = str(model_id or "").strip().lower()
@@ -1041,6 +1062,7 @@ class ModelCatalog:
         )
 
         context_override = self.user_context_window_override(model_id, provider_id)
+        context_known = True
         if context_override is not None:
             context_window = context_override
         elif official_contexts := [
@@ -1057,6 +1079,7 @@ class ModelCatalog:
             context_window = generic_budget[1]
         else:
             context_window = DEFAULT_CONTEXT_WINDOW
+            context_known = False
 
         override_fields = self._user_override_fields(model_id, provider_id)
         override_max = override_fields.get("max_output_tokens")
@@ -1146,6 +1169,7 @@ class ModelCatalog:
             context_window=context_window,
             max_output_tokens=effective_max,
             max_output_tokens_known=max_known,
+            context_window_known=context_known,
         )
 
     def resolve_vision_support(
@@ -1440,7 +1464,8 @@ class ModelCatalog:
         return self.resolve_max_tokens_with_source(model_id, user_override, provider)[0]
 
     def resolve_max_tokens_with_source(
-        self, model_id: str, user_override: int = 0, provider: str = ""
+        self, model_id: str, user_override: int = 0, provider: str = "",
+        *, capacity_only: bool = False,
     ) -> tuple[int, MaxTokensSource]:
         """Resolve max_tokens and name the layer that decided the value.
 
@@ -1472,6 +1497,10 @@ class ModelCatalog:
         source: MaxTokensSource
         if using_user_override:
             effective = user_override
+            if isinstance(override_max, int) and override_max > 0:
+                # A request/member output budget cannot enlarge an explicitly
+                # configured model capability. Smaller request limits survive.
+                effective = min(effective, override_max)
             source = "override"
         elif isinstance(override_max, int) and override_max > 0:
             # A [models.*] operator override is authoritative for budgeting;
@@ -1529,6 +1558,11 @@ class ModelCatalog:
                             declared_max_tokens=declared_max,
                             published_max_tokens=published_max,
                         )
+
+        if capacity_only:
+            # Model configuration displays a capability, not the request's
+            # output reservation. Keep the same selection and source chain.
+            return effective, source
 
         # Clamp to context window. Some provider catalogs report a model's
         # max_completion_tokens as almost the entire context window; using that

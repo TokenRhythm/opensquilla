@@ -2,6 +2,8 @@
 
 import sys
 
+import pytest
+
 from opensquilla.contrib.codetask import config
 
 
@@ -21,6 +23,34 @@ class TestSlugify:
 
 
 class TestPaths:
+    @pytest.mark.parametrize("kind", ["desktop-primary", "desktop-recovery", ""])
+    def test_desktop_outputs_are_outside_live_profile(self, monkeypatch, tmp_path, kind):
+        home = tmp_path / "Application Data" / "测试 profile"
+        monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+        monkeypatch.setenv("OPENSQUILLA_DESKTOP", "1")
+        monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", kind)
+        monkeypatch.delenv("OPENSQUILLA_CODETASK_RUNS_DIR", raising=False)
+        monkeypatch.delenv("OPENSQUILLA_CODETASK_WORKSPACE_DIR", raising=False)
+
+        expected = home.with_name("测试 profile-code-task")
+        assert config.storage_root() == expected
+        assert config.runs_root() == expected / "code-task"
+        assert config.build_workspace_dir() == expected / "workspace"
+        assert not home.exists()
+        assert not expected.exists()
+
+    def test_explicit_cli_keeps_existing_output_paths(self, monkeypatch, tmp_path):
+        home = tmp_path / "existing-profile"
+        monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+        monkeypatch.setenv("OPENSQUILLA_DESKTOP", "1")
+        monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", "cli")
+        monkeypatch.delenv("OPENSQUILLA_CODETASK_RUNS_DIR", raising=False)
+        monkeypatch.delenv("OPENSQUILLA_CODETASK_WORKSPACE_DIR", raising=False)
+
+        assert config.storage_root() == home
+        assert config.runs_root() == home / "code-task"
+        assert config.build_workspace_dir() == home / "workspace"
+
     def test_runs_root_override(self, monkeypatch, tmp_path):
         monkeypatch.setenv("OPENSQUILLA_CODETASK_RUNS_DIR", str(tmp_path))
         assert config.runs_root() == tmp_path

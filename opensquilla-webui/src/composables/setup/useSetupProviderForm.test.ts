@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import {
   PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS,
+  PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS,
+  PROVIDER_REACHABILITY_REQUEST_TIMEOUT_MS,
   useSetupProviderForm,
   buildProviderPayload,
   hasEffectiveProvider,
   normalizeCatalogSyncStatus,
   normalizeDiscoveredModels,
+  normalizeProbeTimings,
 } from './useSetupProviderForm'
+import { createV4SetupWorkflow } from '@/adapters/gateway/setupWorkflowV4'
 
 // The connection state machine talks to the gateway through the rpc store —
 // stub it at the module seam (the pattern useSetupCatalog tests use).
@@ -14,6 +18,13 @@ const { callMock } = vi.hoisted(() => ({ callMock: vi.fn() }))
 vi.mock('@/stores/rpc', () => ({
   useRpcStore: () => ({ call: callMock }),
 }))
+
+const setupWorkflow = createV4SetupWorkflow({
+  policy: { provider_probe_modes: ['reachability', 'model'] },
+  request<T>(method: string, params?: Record<string, unknown>): Promise<T> {
+    return callMock(method, params) as Promise<T>
+  },
+})
 
 beforeEach(() => {
   callMock.mockReset()
@@ -59,7 +70,7 @@ describe('hasEffectiveProvider', () => {
 // detected variable, so the form must keep the two mutually exclusive.
 describe('useSetupProviderForm — runtime provider hydration', () => {
   it('hydrates the selected provider from env-backed runtime config', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.initFromConfig(
       { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', api_key_env: 'OPENROUTER_API_KEY' },
       { hasConfig: false, llmConfigured: true, llmSource: 'env' },
@@ -70,7 +81,7 @@ describe('useSetupProviderForm — runtime provider hydration', () => {
   })
 
   it('submits the registry env default shown for a fresh provider draft', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     const envField = {
       name: 'api_key_env',
       label: 'API key env',
@@ -88,7 +99,7 @@ describe('useSetupProviderForm — runtime provider hydration', () => {
   })
 
   it('hydrates saved profile endpoint fields without exposing secret fields', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
 
     f.initStoredProfile('custom', {
       base_url: 'https://llm.example.test/v1',
@@ -112,7 +123,7 @@ describe('useSetupProviderForm — runtime provider hydration', () => {
 
 describe('useSetupProviderForm — api_key / api_key_env are mutually exclusive', () => {
   it('pasting an api_key clears a pre-filled api_key_env', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openrouter')
     f.updateField('api_key_env', 'OPENROUTER_API_KEY') // pre-filled from env
     f.updateField('api_key', 'sk-pasted') // user pastes a key
@@ -122,7 +133,7 @@ describe('useSetupProviderForm — api_key / api_key_env are mutually exclusive'
   })
 
   it('setting api_key_env clears a previously pasted api_key', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openrouter')
     f.updateField('api_key', 'sk-pasted')
     f.updateField('api_key_env', 'OPENROUTER_API_KEY')
@@ -132,7 +143,7 @@ describe('useSetupProviderForm — api_key / api_key_env are mutually exclusive'
   })
 
   it('env-only config submits just the env reference', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openrouter')
     f.updateField('api_key_env', 'OPENROUTER_API_KEY')
     const p = f.payload()
@@ -141,7 +152,7 @@ describe('useSetupProviderForm — api_key / api_key_env are mutually exclusive'
   })
 
   it('a whitespace-only api_key does not count as a credential', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openrouter')
     f.updateField('api_key_env', 'OPENROUTER_API_KEY')
     f.updateField('api_key', '   ')
@@ -153,7 +164,7 @@ describe('useSetupProviderForm — api_key / api_key_env are mutually exclusive'
 
 describe('useSetupProviderForm — provider credential state', () => {
   it('keeps saved credentials when not replacing the key', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.initFromConfig(
       { provider: 'openrouter', model: 'm', api_key_env: 'OPENROUTER_API_KEY' },
       { hasConfig: true, llmConfigured: true, llmSource: 'explicit' },
@@ -164,7 +175,7 @@ describe('useSetupProviderForm — provider credential state', () => {
   })
 
   it('rebuilds from scratch on initFromConfig and drops stale credential edits', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     const spec = [{ providerId: 'openrouter', fields: [{ name: 'model', label: 'Model' }] }]
     const config = { provider: 'openrouter', model: 'm' }
     const status = { hasConfig: true, llmConfigured: true, llmSource: 'explicit' }
@@ -186,7 +197,7 @@ describe('useSetupProviderForm — provider credential state', () => {
   })
 
   it('clears stale provider selection when initFromConfig has no effective provider', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     const spec = [{ providerId: 'openrouter', fields: [{ name: 'model', label: 'Model' }] }]
 
     f.selectProvider('openrouter')
@@ -202,7 +213,7 @@ describe('useSetupProviderForm — provider credential state', () => {
   })
 
   it('pasted replacement key clears the env reference in the save payload', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openrouter')
     f.updateField('api_key_env', 'OPENROUTER_API_KEY')
     f.startCredentialReplace()
@@ -212,7 +223,7 @@ describe('useSetupProviderForm — provider credential state', () => {
   })
 
   it('explicit env source clears the pasted key in the save payload', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openrouter')
     f.startCredentialReplace()
     f.updateField('api_key', 'sk-pasted')
@@ -222,7 +233,7 @@ describe('useSetupProviderForm — provider credential state', () => {
   })
 
   it('startCredentialReplace clears previous reveal state and marks replacement mode', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.setRevealedCredential('shown-key')
     f.setRevealError('failed')
 
@@ -234,7 +245,7 @@ describe('useSetupProviderForm — provider credential state', () => {
   })
 
   it('cancelCredentialReplace clears api_key but leaves api_key_env intact', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openrouter')
     f.updateField('api_key_env', 'OPENROUTER_API_KEY')
     f.startCredentialReplace()
@@ -246,7 +257,7 @@ describe('useSetupProviderForm — provider credential state', () => {
   })
 
   it('setRevealedCredential and setRevealError clear each other', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
 
     f.setRevealError('failed')
     expect(f.revealedCredential.value).toBe('')
@@ -259,7 +270,7 @@ describe('useSetupProviderForm — provider credential state', () => {
 
   it('expires revealed credentials after a limited display window', () => {
     vi.useFakeTimers()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
 
     f.setRevealedCredential('shown-key')
 
@@ -274,7 +285,7 @@ describe('useSetupProviderForm — provider credential state', () => {
 
   it('hides revealed credentials immediately and cancels the pending expiry', () => {
     vi.useFakeTimers()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
 
     f.setRevealedCredential('shown-key')
     vi.advanceTimersByTime(PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS / 2)
@@ -287,7 +298,7 @@ describe('useSetupProviderForm — provider credential state', () => {
   })
 
   it('clears revealed credentials when credential inputs change', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.setRevealedCredential('shown-key')
 
     f.updateField('api_key_env', 'OPENROUTER_API_KEY')
@@ -550,7 +561,7 @@ describe('model discovery wire normalization', () => {
       catalog: { lastSyncedAt: '2026-08-03T06:00:00Z', stale: false },
     }
     mockRpc({ discover: response })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
 
     await f.discoverModels({ forceRefresh: true })
@@ -569,7 +580,7 @@ describe('model discovery wire normalization', () => {
 
 describe('useSetupProviderForm — connection state machine', () => {
   it('starts unconfigured and moves to unverified when a provider is selected', () => {
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     expect(f.connection.value.phase).toBe('unconfigured')
     f.selectProvider('openai')
     expect(f.connection.value.phase).toBe('unverified')
@@ -577,7 +588,7 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('probe ok goes probing → verified and auto-discovers models', async () => {
     mockRpc()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     f.updateField('api_key', 'sk-unsaved')
     f.updateField('model', 'test-model')
@@ -586,7 +597,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(f.connection.value.phase).toBe('probing')
     await pending
 
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
     expect(f.connection.value.firstResponseMs).toBe(123)
     expect(f.connection.value.totalMs).toBe(412)
     expect(f.connection.value.latencyMs).toBeNull()
@@ -599,9 +610,246 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(callMock).toHaveBeenCalledTimes(2)
   })
 
+  it('records a successful reachability check without claiming the model was tested', async () => {
+    mockRpc({
+      probe: {
+        ok: true,
+        verificationLevel: 'reachable',
+        firstResponseMs: null,
+        totalMs: 18,
+      },
+    })
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('openai')
+
+    await f.probeConnection({ mode: 'reachability' })
+
+    expect(f.connection.value).toMatchObject({
+      phase: 'reachable',
+      verificationLevel: 'reachable',
+      probeMode: 'reachability',
+      totalMs: 18,
+    })
+    expect(callMock).toHaveBeenNthCalledWith(1, 'onboarding.provider.probe', {
+      providerId: 'openai',
+      mode: 'reachability',
+    })
+    expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.models.discover', {
+      providerId: 'openai',
+      forceRefresh: true,
+    })
+  })
+
+  it('omits mode and preserves legacy model semantics when the gateway advertises no probe modes', async () => {
+    const requestMock = vi.fn(async (
+      method: string,
+      _params?: Record<string, unknown>,
+      _options?: unknown,
+    ) => {
+      if (method === 'onboarding.provider.probe') return PROBE_OK
+      if (method === 'onboarding.models.discover') return DISCOVER_OK
+      throw new Error(`unexpected rpc method: ${method}`)
+    })
+    const workflow = createV4SetupWorkflow({
+      policy: {},
+      request<T>(method: string, params?: Record<string, unknown>, options?: unknown): Promise<T> {
+        return requestMock(method, params, options) as Promise<T>
+      },
+    })
+    const f = useSetupProviderForm(workflow)
+    f.selectProvider('openai')
+
+    await f.probeConnection({ defaultModel: 'test-model', mode: 'reachability' })
+
+    expect(requestMock).toHaveBeenNthCalledWith(
+      1,
+      'onboarding.provider.probe',
+      { providerId: 'openai', model: 'test-model' },
+      expect.objectContaining({ timeoutMs: PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS }),
+    )
+    expect(f.connection.value).toMatchObject({
+      phase: 'model_verified',
+      verificationLevel: 'model_verified',
+      probeMode: 'model',
+    })
+  })
+
+  it('allows enough transport time for reachability fallback and the model deadline', async () => {
+    const requestMock = vi.fn(async (
+      method: string,
+      _params?: Record<string, unknown>,
+      _options?: unknown,
+    ) => {
+      if (method === 'onboarding.provider.probe') return PROBE_OK
+      if (method === 'onboarding.models.discover') return DISCOVER_OK
+      throw new Error(`unexpected rpc method: ${method}`)
+    })
+    const workflow = createV4SetupWorkflow({
+      policy: { provider_probe_modes: ['reachability', 'model'] },
+      request<T>(method: string, params?: Record<string, unknown>, options?: unknown): Promise<T> {
+        return requestMock(method, params, options) as Promise<T>
+      },
+    })
+    const f = useSetupProviderForm(workflow)
+    f.selectProvider('openai')
+
+    await f.probeConnection({ mode: 'reachability' })
+    expect(requestMock).toHaveBeenCalledWith(
+      'onboarding.provider.probe',
+      { providerId: 'openai', mode: 'reachability' },
+      expect.objectContaining({ timeoutMs: PROVIDER_REACHABILITY_REQUEST_TIMEOUT_MS }),
+    )
+
+    await f.probeConnection({ defaultModel: 'test-model', mode: 'model' })
+    expect(requestMock).toHaveBeenCalledWith(
+      'onboarding.provider.probe',
+      { providerId: 'openai', model: 'test-model', mode: 'model' },
+      expect.objectContaining({ timeoutMs: PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS }),
+    )
+  })
+
+  it('reports a model probe deadline as timed out instead of unreachable', async () => {
+    mockRpc({
+      probe: {
+        ok: false,
+        verificationLevel: 'none',
+        failureStage: 'model',
+        failureKind: 'probe_timeout',
+        message: 'Model probe timed out after 60 seconds.',
+        totalMs: 60_000,
+      },
+    })
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('openai')
+
+    await f.probeConnection({ defaultModel: 'slow-model', mode: 'model' })
+
+    expect(f.connection.value).toMatchObject({
+      phase: 'timed_out',
+      verificationLevel: 'none',
+      failureStage: 'model',
+      failureKind: 'probe_timeout',
+      totalMs: 60_000,
+    })
+    expect(callMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('maps a transport deadline to timed out at the requested probe stage', async () => {
+    callMock.mockRejectedValue(new Error('RPC timed out after 70000ms'))
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('openai')
+
+    await f.probeConnection({ mode: 'reachability' })
+
+    expect(f.connection.value).toMatchObject({
+      phase: 'timed_out',
+      failureStage: 'reachability',
+      probeMode: 'reachability',
+      failureKind: 'probe_timeout',
+    })
+  })
+
+  it('distinguishes an HTTP response failure from an unreachable endpoint', async () => {
+    mockRpc({
+      probe: {
+        ok: false,
+        verificationLevel: 'reachable',
+        failureStage: 'reachability',
+        failureKind: 'rate_limited',
+        message: 'Provider rate limited the request.',
+      },
+    })
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('openai')
+
+    await f.probeConnection({ mode: 'reachability' })
+
+    expect(f.connection.value).toMatchObject({
+      phase: 'reachable_error',
+      verificationLevel: 'reachable',
+      failureStage: 'reachability',
+      failureKind: 'rate_limited',
+    })
+  })
+
+  it('restores the previous state when an in-flight model test is cancelled', async () => {
+    let resolveProbe!: (value: unknown) => void
+    callMock.mockImplementation((method: string) => {
+      if (method === 'onboarding.provider.probe') {
+        return new Promise(resolve => { resolveProbe = resolve })
+      }
+      if (method === 'onboarding.models.discover') return Promise.resolve(DISCOVER_OK)
+      throw new Error(`unexpected rpc method: ${method}`)
+    })
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('openai')
+
+    const pending = f.probeConnection({ defaultModel: 'slow-model', mode: 'model' })
+    expect(f.connection.value).toMatchObject({ phase: 'probing', probeMode: 'model' })
+    f.cancelProbe()
+    expect(f.connection.value.phase).toBe('unverified')
+
+    resolveProbe(PROBE_OK)
+    await pending
+    expect(f.connection.value.phase).toBe('unverified')
+    expect(f.connection.value.failureKind).toBe('')
+  })
+
+  it('keeps endpoint reachability when a model edit cancels a re-test and ignores its late result', async () => {
+    const preservedCatalog = { lastSyncedAt: '2026-08-03T06:00:00Z', stale: false }
+    mockRpc({ discover: { ...DISCOVER_OK, catalog: preservedCatalog } })
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('openai')
+    f.updateField('model', 'test-model')
+    await f.probeConnection({ mode: 'model' })
+    expect(f.connection.value).toMatchObject({
+      phase: 'model_verified',
+      verificationLevel: 'model_verified',
+    })
+
+    let resolveProbe!: (value: unknown) => void
+    callMock.mockImplementation((method: string) => {
+      if (method === 'onboarding.provider.probe') {
+        return new Promise(resolve => { resolveProbe = resolve })
+      }
+      if (method === 'onboarding.models.discover') return Promise.resolve(DISCOVER_OK)
+      throw new Error(`unexpected rpc method: ${method}`)
+    })
+
+    const pending = f.probeConnection({ mode: 'model' })
+    expect(f.connection.value).toMatchObject({ phase: 'probing', probeMode: 'model' })
+
+    f.updateField('model', 'replacement-model')
+    expect(f.connection.value).toMatchObject({
+      phase: 'reachable',
+      verificationLevel: 'reachable',
+      probeMode: null,
+      firstResponseMs: null,
+      totalMs: null,
+      modelSource: 'live',
+      catalog: preservedCatalog,
+    })
+    expect(f.connection.value.models).toEqual([
+      expect.objectContaining({ id: 'test-vendor/test-model' }),
+    ])
+
+    resolveProbe(PROBE_OK)
+    await pending
+    expect(f.connection.value).toMatchObject({
+      phase: 'reachable',
+      verificationLevel: 'reachable',
+      probeMode: null,
+      modelSource: 'live',
+      catalog: preservedCatalog,
+    })
+    expect(f.connection.value.models).toEqual([
+      expect.objectContaining({ id: 'test-vendor/test-model' }),
+    ])
+  })
+
   it('sends the CURRENT unsaved form values and falls back to the default model', async () => {
     mockRpc()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     f.updateField('api_key', 'sk-unsaved')
 
@@ -611,6 +859,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       providerId: 'openai',
       apiKey: 'sk-unsaved',
       model: 'test-default-model',
+      mode: 'model',
     })
     // discover ignores the model but reuses the same candidate credentials
     expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.models.discover', {
@@ -622,7 +871,7 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('lets a canonical model override replace the form model for a probe', async () => {
     mockRpc()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     f.updateField('model', 'stale-provider-form-model')
 
@@ -634,6 +883,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(callMock).toHaveBeenNthCalledWith(1, 'onboarding.provider.probe', {
       providerId: 'openai',
       model: 'canonical-fixed-model',
+      mode: 'model',
     })
     expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.models.discover', {
       providerId: 'openai',
@@ -652,7 +902,7 @@ describe('useSetupProviderForm — connection state machine', () => {
         totalMs: 87,
       },
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection()
 
@@ -666,7 +916,7 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('classifies non-auth failures as unreachable', async () => {
     mockRpc({ probe: { ok: false, failureKind: 'transport_transient', message: 'connect timeout' } })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection()
 
@@ -674,24 +924,18 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(f.connection.value.failureKind).toBe('transport_transient')
   })
 
-  it('normalizes missing or bogus explicit probe timings to null', async () => {
-    mockRpc({ probe: { ok: true, firstResponseMs: -1, totalMs: Number.NaN } })
-    const f = useSetupProviderForm()
-    f.selectProvider('openai')
-    await f.probeConnection({ defaultModel: 'm' })
-
-    expect(f.connection.value.phase).toBe('verified')
-    expect(f.connection.value.firstResponseMs).toBeNull()
-    expect(f.connection.value.totalMs).toBeNull()
+  it('normalizes missing or bogus explicit probe timings to null', () => {
+    expect(normalizeProbeTimings({ ok: true, firstResponseMs: -1, totalMs: Number.NaN }))
+      .toMatchObject({ firstResponseMs: null, totalMs: null })
   })
 
   it('falls back to a legacy gateway latency as complete probe duration only', async () => {
     mockRpc({ probe: { ok: true, latencyMs: 412 } })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
 
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
     expect(f.connection.value.firstResponseMs).toBeNull()
     expect(f.connection.value.totalMs).toBe(412)
     expect(f.connection.value.latencyMs).toBe(412)
@@ -699,7 +943,7 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('accepts legitimate 0ms values in the new explicit timing fields', async () => {
     mockRpc({ probe: { ok: true, firstResponseMs: 0, totalMs: 0 } })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
 
@@ -717,7 +961,7 @@ describe('useSetupProviderForm — connection state machine', () => {
         totalMs: 0,
       },
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection()
 
@@ -730,7 +974,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     // The gateway sends latencyMs=0 when the call never hit the network (missing
     // key / build failure); it must not render as a bogus "· 0ms" pill.
     mockRpc({ probe: { ok: false, failureKind: 'auth_invalid', message: 'No API key available.', latencyMs: 0 } })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection()
 
@@ -742,7 +986,7 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('maps a thrown RPC error to unreachable with the message as detail', async () => {
     callMock.mockRejectedValue(new Error('gateway offline'))
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection()
 
@@ -754,11 +998,11 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('a credential edit resets a verified connection to unverified and clears models', async () => {
     mockRpc()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     f.updateField('api_key', 'sk-first')
     await f.probeConnection({ defaultModel: 'm' })
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
     expect(f.connection.value.firstResponseMs).toBe(123)
     expect(f.connection.value.totalMs).toBe(412)
 
@@ -771,22 +1015,23 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('keeps the discovered catalog when a model choice invalidates the probe verdict', async () => {
     mockRpc()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
     expect(f.connection.value.models).toEqual([expect.objectContaining({ id: 'test-vendor/test-model' })])
     expect(f.connection.value.modelSource).toBe('live')
 
     f.updateField('model', 'another-model')
-    expect(f.connection.value.phase).toBe('unverified')
+    expect(f.connection.value.phase).toBe('reachable')
+    expect(f.connection.value.verificationLevel).toBe('reachable')
     expect(f.connection.value.firstResponseMs).toBeNull()
     expect(f.connection.value.totalMs).toBeNull()
     expect(f.connection.value.models).toEqual([expect.objectContaining({ id: 'test-vendor/test-model' })])
     expect(f.connection.value.modelSource).toBe('live')
 
     await f.probeConnection()
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
 
     f.updateField('base_url', 'http://127.0.0.1:11434')
     expect(f.connection.value.phase).toBe('unverified')
@@ -800,7 +1045,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       if (method === 'onboarding.llmProfile.models.discover') return DISCOVER_OK
       throw new Error(`unexpected rpc method: ${method}`)
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.initStoredProfile('deepseek')
 
     await f.probeConnection({ defaultModel: 'deepseek-chat', storedProfile: true })
@@ -808,6 +1053,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(callMock).toHaveBeenNthCalledWith(1, 'onboarding.llmProfile.probe', {
       providerId: 'deepseek',
       model: 'deepseek-chat',
+      mode: 'model',
     })
     expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.llmProfile.models.discover', {
       providerId: 'deepseek',
@@ -821,7 +1067,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       if (method === 'onboarding.llmProfile.draft.models.discover') return DISCOVER_OK
       throw new Error(`unexpected rpc method: ${method}`)
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.initStoredProfile('custom', {
       base_url: 'https://old.example.test/v1',
       proxy: 'http://old-proxy.example.test:8080',
@@ -840,6 +1086,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       proxy: '',
       model: 'draft-model',
       keepCurrentSecret: false,
+      mode: 'model',
     }
     expect(callMock).toHaveBeenNthCalledWith(
       1,
@@ -849,7 +1096,15 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(callMock).toHaveBeenNthCalledWith(
       2,
       'onboarding.llmProfile.draft.models.discover',
-      { ...expectedDraft, forceRefresh: true },
+      {
+        providerId: 'custom',
+        apiKey: 'draft-secret',
+        baseUrl: 'https://new.example.test/v1',
+        proxy: '',
+        model: 'draft-model',
+        keepCurrentSecret: false,
+        forceRefresh: true,
+      },
     )
   })
 
@@ -859,7 +1114,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       if (method === 'onboarding.llmProfile.draft.models.discover') return DISCOVER_OK
       throw new Error(`unexpected rpc method: ${method}`)
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.initStoredProfile('deepseek', { base_url: 'https://api.deepseek.com', proxy: '' })
 
     await f.probeConnection({ defaultModel: 'deepseek-chat', draftProfile: true })
@@ -870,15 +1125,16 @@ describe('useSetupProviderForm — connection state machine', () => {
       proxy: '',
       model: 'deepseek-chat',
       keepCurrentSecret: true,
+      mode: 'model',
     })
   })
 
   it('switching provider resets the connection', async () => {
     mockRpc()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
 
     f.selectProvider('openrouter')
     expect(f.connection.value.phase).toBe('unverified')
@@ -887,7 +1143,7 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('re-probing unchanged credentials sends a fresh RPC instead of reusing a stale verdict', async () => {
     mockRpc()
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     f.updateField('api_key', 'sk-first')
     await f.probeConnection({ defaultModel: 'm' })
@@ -898,19 +1154,20 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(f.connection.value.phase).toBe('unverified')
 
     await f.probeConnection({ defaultModel: 'm' })
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
     expect(f.connection.value.models).toHaveLength(1)
     expect(callMock).toHaveBeenCalledTimes(4)
     expect(callMock).toHaveBeenNthCalledWith(3, 'onboarding.provider.probe', {
       providerId: 'openai',
       apiKey: 'sk-first',
       model: 'm',
+      mode: 'model',
     })
   })
 
   it('a transient unreachable outcome is NOT cached, so retry re-probes', async () => {
     mockRpc({ probe: { ok: false, failureKind: 'transport_transient', message: 'timeout' } })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection()
     expect(f.connection.value.phase).toBe('unreachable')
@@ -918,13 +1175,13 @@ describe('useSetupProviderForm — connection state machine', () => {
 
     mockRpc() // endpoint recovered
     await f.probeConnection({ defaultModel: 'm' })
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
   })
 
   it('discards a stale probe result that raced a credential edit', async () => {
     let resolveProbe!: (value: unknown) => void
     callMock.mockImplementation(() => new Promise(resolve => { resolveProbe = resolve }))
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
 
     const pending = f.probeConnection()
@@ -944,7 +1201,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       }
       return new Promise(resolve => { resolvers.push(resolve) })
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
 
     const first = f.discoverModels()
@@ -964,7 +1221,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       }
       return new Promise(resolve => { resolveDiscover = resolve })
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
 
     const pending = f.discoverModels()
@@ -991,7 +1248,7 @@ describe('useSetupProviderForm — connection state machine', () => {
         models: [{ ...DISCOVER_ROW, id: 'deepseek-chat', name: 'DeepSeek Chat' }],
       })
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     const stale = f.discoverModels()
 
@@ -1018,7 +1275,7 @@ describe('useSetupProviderForm — connection state machine', () => {
       }
       throw new Error(`unexpected rpc method: ${method}`)
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
 
     const staleListing = f.discoverModels()
@@ -1028,17 +1285,17 @@ describe('useSetupProviderForm — connection state machine', () => {
     await Promise.all([staleListing, probe])
 
     expect(discoverCalls).toBe(2)
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
     expect(f.connection.value.models).toHaveLength(1)
   })
 
   it('a failed discover keeps the verified phase and sets discoverError', async () => {
     mockRpc({ discover: { ok: false, failureKind: 'bad_request', detail: 'listing unsupported', source: 'none', models: [] } })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
 
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
     expect(f.connection.value.models).toEqual([])
     expect(f.connection.value.modelSource).toBe('none')
     expect(f.connection.value.discoverError).toBe('listing unsupported')
@@ -1046,11 +1303,11 @@ describe('useSetupProviderForm — connection state machine', () => {
 
   it('an empty listing (ok, source none) is not an error', async () => {
     mockRpc({ discover: { ok: true, failureKind: '', detail: '', source: 'none', models: [] } })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
 
-    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.phase).toBe('model_verified')
     expect(f.connection.value.models).toEqual([])
     expect(f.connection.value.modelSource).toBe('none')
     expect(f.connection.value.discoverError).toBe('')
@@ -1066,7 +1323,7 @@ describe('useSetupProviderForm — connection state machine', () => {
         models: [DISCOVER_ROW],
       },
     })
-    const f = useSetupProviderForm()
+    const f = useSetupProviderForm(setupWorkflow)
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
 

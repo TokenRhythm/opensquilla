@@ -8,7 +8,9 @@ or standalone runtime dependencies.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -30,6 +32,9 @@ from opensquilla.cli.tui.adapters import runtime_helpers as _runtime_helpers
 from opensquilla.cli.tui.adapters import slash_bridge as _slash_bridge
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
 from opensquilla.cli.ui import ACCENT, console, error_panel
+from opensquilla.contracts.adapters.sessions_resolve_contract import (
+    SESSIONS_RESOLVE_METHOD,
+)
 from opensquilla.engine.commands import Surface
 
 if TYPE_CHECKING:
@@ -67,6 +72,8 @@ class GatewayTerminalReplRunner(Protocol):
         abort_active_turn: Callable[[], Awaitable[None]] | None = None,
         steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
         queue_max_size: int | None = None,
+        on_surface_ready: Callable[[], Awaitable[None]] | None = None,
+        on_user_activity: Callable[[], Awaitable[None]] | None = None,
     ) -> None: ...
 
 
@@ -78,20 +85,24 @@ async def run_concurrent_repl(
     abort_active_turn: Callable[[], Awaitable[None]] | None = None,
     steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
     queue_max_size: int | None = None,
+    on_surface_ready: Callable[[], Awaitable[None]] | None = None,
+    on_user_activity: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     kwargs: dict[str, Any] = {
         "surface": surface,
         "scope": scope,
         "dispatch": dispatch,
-        "queue_max_size": (
-            PENDING_QUEUE_MAX_SIZE if queue_max_size is None else queue_max_size
-        ),
+        "queue_max_size": (PENDING_QUEUE_MAX_SIZE if queue_max_size is None else queue_max_size),
         "abort_active_turn": abort_active_turn,
     }
     # Additive compatibility: third-party/older bridges do not accept the
     # steering callback. Omit it when Gateway steering is not wired.
     if steer_active_turn is not None:
         kwargs["steer_active_turn"] = steer_active_turn
+    if on_surface_ready is not None:
+        kwargs["on_surface_ready"] = on_surface_ready
+    if on_user_activity is not None:
+        kwargs["on_user_activity"] = on_user_activity
     await _runtime_bridge_for_selected_backend().run_concurrent_repl(
         **kwargs,
     )
@@ -197,14 +208,27 @@ def _gateway_input_loop_for(
         dispatch: Callable[[str], Coroutine[Any, Any, bool]],
         abort_active_turn: Callable[[], Awaitable[None]] | None = None,
         steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
+        on_surface_ready: Callable[[], Awaitable[None]] | None = None,
+        on_user_activity: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        await repl_runner(
-            surface=Surface.CLI_GATEWAY,
-            scope=scope,
-            dispatch=dispatch,
-            abort_active_turn=abort_active_turn,
-            steer_active_turn=steer_active_turn,
-        )
+        kwargs: dict[str, Any] = {
+            "surface": Surface.CLI_GATEWAY,
+            "scope": scope,
+            "dispatch": dispatch,
+            "abort_active_turn": abort_active_turn,
+            "steer_active_turn": steer_active_turn,
+            "on_surface_ready": on_surface_ready,
+        }
+        if on_user_activity is not None:
+            with suppress(TypeError, ValueError):
+                parameters = inspect.signature(repl_runner).parameters.values()
+                if any(
+                    parameter.name == "on_user_activity"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                ):
+                    kwargs["on_user_activity"] = on_user_activity
+        await repl_runner(**kwargs)
 
     return _run_gateway_input_loop
 
@@ -390,7 +414,7 @@ async def run_gateway_chat(
         if (
             session_id
             and (exc.code or "").upper() == "NOT_FOUND"
-            and exc.method in {"sessions.bootstrap", "sessions.resolve"}
+            and exc.method in {"sessions.bootstrap", SESSIONS_RESOLVE_METHOD}
         ):
             message = (
                 f"Session '{session_id}' was not found. Run `opensquilla sessions list` "

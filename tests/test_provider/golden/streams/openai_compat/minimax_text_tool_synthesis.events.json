@@ -28,6 +28,14 @@
     "model_usage_breakdown": [],
     "output_tokens": 22,
     "provider": "minimax",
+    "provider_replay": {
+      "model": "minimax-test-1",
+      "native_content": null,
+      "native_reasoning_content": null,
+      "protocol": "openai_chat_completions",
+      "reasoning_details": null,
+      "source": "openai_compat:3f6c6ed194f446e076094a4b726c3a490c6ad9f5c5fb161fba37cfb7ed117ae4"
+    },
     "reasoning_content": null,
     "reasoning_tokens": 0,
     "stop_reason": "stop",

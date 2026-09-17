@@ -120,10 +120,10 @@ async def test_restart_promotes_stranded_steer_once_and_moves_receipt(tmp_path) 
 
     restarted = SessionStorage(str(db_path))
     await restarted.connect()
-    runs: list[str] = []
+    runs: list[Any] = []
 
     async def _handler(run: Any) -> None:
-        runs.append(run.message)
+        runs.append(run)
 
     runtime = TaskRuntime(storage=restarted, turn_handler=_handler)
     recovery = await runtime.recover_stranded_steers()
@@ -133,7 +133,11 @@ async def test_restart_promotes_stranded_steer_once_and_moves_receipt(tmp_path) 
     promoted_task_id = recovery["task_ids"][0]
     record = await runtime.wait(promoted_task_id, timeout=2)
     assert record.status == AgentTaskStatus.SUCCEEDED
-    assert runs == ["continue with the corrected constraint"]
+    assert [run.message for run in runs] == ["continue with the corrected constraint"]
+    # Legacy tasks have no durable epoch. Recovery is allowed only because the
+    # task's session id and persisted transcript still identify the current row.
+    assert runs[0].envelope.session_id == session_id
+    assert runs[0].envelope.session_epoch is None
 
     entry = await restarted.get_canonical_transcript_entry(session_id, message_id)
     assert entry is not None
@@ -161,7 +165,7 @@ async def test_restart_promotes_stranded_steer_once_and_moves_receipt(tmp_path) 
     repeated = await runtime.recover_stranded_steers()
     assert repeated["promoted"] == 0
     assert repeated["resumed"] == 0
-    assert runs == ["continue with the corrected constraint"]
+    assert [run.message for run in runs] == ["continue with the corrected constraint"]
     await runtime.shutdown(cancel=False)
     await restarted.close()
 
@@ -381,6 +385,66 @@ async def test_restart_rejects_route_that_cannot_be_safely_reconstructed(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_restart_rejects_stale_modern_owner_before_runtime_activation(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "steer-stale-owner.db"))
+    await storage.connect()
+    session_key = "agent:main:webchat:steer-stale-owner"
+    old_session_id = "session-steer-stale-owner-old"
+    task_id = "turn-steer-stale-owner"
+    message_id = "message-steer-stale-owner"
+    await _seed_steering_input(
+        storage,
+        session_key=session_key,
+        session_id=old_session_id,
+        task_id=task_id,
+        message_id=message_id,
+        message="must remain attached to the old incarnation",
+        task_status=AgentTaskStatus.FAILED,
+        task_details={"session_epoch": 0},
+    )
+    await storage.upsert_session(
+        SessionNode(
+            session_key=session_key,
+            session_id="session-steer-stale-owner-new",
+            agent_id="main",
+            status=SessionStatus.RUNNING,
+            epoch=1,
+            created_at=200,
+            updated_at=200,
+            started_at=200,
+        )
+    )
+
+    runs: list[Any] = []
+    provider_calls = 0
+
+    async def _handler(run: Any) -> None:
+        runs.append(run)
+
+    def _accepted_config_provider(*, session_key: str, run_kind: str) -> None:
+        nonlocal provider_calls
+        provider_calls += 1
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=_handler,
+        accepted_config_provider=_accepted_config_provider,
+    )
+    recovery = await runtime.recover_stranded_steers()
+
+    assert recovery["rejected"] == 1
+    assert recovery["promoted"] == 0
+    assert recovery["task_ids"] == []
+    assert runs == []
+    assert provider_calls == 0
+    assert runtime._reservations_by_session == {}
+    await runtime.shutdown(cancel=False)
+    await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_resumes_same_promoted_task_if_crash_preceded_activation(
     tmp_path,
 ) -> None:
@@ -400,6 +464,7 @@ async def test_restart_resumes_same_promoted_task_if_crash_preceded_activation(
         message_id=message_id,
         message="recover this only once",
         task_status=AgentTaskStatus.RUNNING,
+        task_details={"session_epoch": 0},
     )
     await first.mark_abandoned_agent_tasks(now_ms=200)
     stranded = await first.list_stranded_steer_inputs()
@@ -411,6 +476,8 @@ async def test_restart_resumes_same_promoted_task_if_crash_preceded_activation(
         [stranded[0].entry],
     )
     assert envelope is not None
+    assert envelope.session_id == session_id
+    assert envelope.session_epoch == 0
     reservation = await inert_runtime.reserve(
         envelope,
         "recover this only once",
@@ -443,10 +510,10 @@ async def test_restart_resumes_same_promoted_task_if_crash_preceded_activation(
 
     second = SessionStorage(str(db_path))
     await second.connect()
-    runs: list[tuple[str, Any]] = []
+    runs: list[Any] = []
 
     async def _handler(run: Any) -> None:
-        runs.append((run.message, run.accepted_config))
+        runs.append(run)
 
     def _current_routing_provider(*, session_key: str, run_kind: str) -> Any:
         assert session_key == "agent:main:webchat:steer-double-restart"
@@ -470,14 +537,184 @@ async def test_restart_resumes_same_promoted_task_if_crash_preceded_activation(
     record = await runtime.wait(promoted_task_id, timeout=2)
     assert record.status == AgentTaskStatus.SUCCEEDED
     assert len(runs) == 1
-    recovered_message, recovered_routing = runs[0]
-    assert recovered_message == "recover this only once"
+    recovered_run = runs[0]
+    recovered_routing = recovered_run.accepted_config
+    assert recovered_run.message == "recover this only once"
+    assert recovered_run.envelope.session_id == session_id
+    assert recovered_run.envelope.session_epoch == 0
     assert recovered_routing.session_mode == "router"
     assert recovered_routing.session_routing_revision == 12
     assert recovered_routing.session_routing_source == "session"
     tasks = await second.list_agent_tasks(session_key=session_key)
     assert {task.task_id for task in tasks} == {old_task_id, promoted_task_id}
     await second.close()
+
+
+@pytest.mark.asyncio
+async def test_requeue_recovery_task_rechecks_owner_after_preflight_rotation(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "steer-requeue-owner-cas.db"))
+    await storage.connect()
+    session_key = "agent:main:webchat:steer-requeue-owner-cas"
+    old_session_id = "session-steer-requeue-owner-old"
+    task_id = "turn-steer-requeue-owner-cas"
+    await storage.upsert_session(
+        SessionNode(
+            session_key=session_key,
+            session_id=old_session_id,
+            agent_id="main",
+            status=SessionStatus.RUNNING,
+            epoch=0,
+            created_at=100,
+            updated_at=100,
+            started_at=100,
+        )
+    )
+    await storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=task_id,
+            session_key=session_key,
+            agent_id="main",
+            source_kind="web",
+            queue_mode="followup",
+            run_kind="web_turn",
+            status=AgentTaskStatus.ABANDONED,
+            created_at=110,
+            updated_at=120,
+            terminal_reason="process_restart",
+            details={
+                "session_id": old_session_id,
+                "session_epoch": 0,
+                "metadata": {"steer_restart_recovery": True},
+            },
+        )
+    )
+
+    # Simulate the runtime's read-only preflight succeeding before reset wins
+    # the race. The storage transaction must independently recheck this pair.
+    preflight_session = await storage.get_session(session_key)
+    preflight_task = await storage.get_agent_task(task_id)
+    assert preflight_session is not None
+    assert (preflight_session.session_id, preflight_session.epoch) == (
+        old_session_id,
+        0,
+    )
+    assert preflight_task is not None
+    assert preflight_task.details is not None
+    assert preflight_task.details["session_id"] == old_session_id
+    assert preflight_task.details["session_epoch"] == 0
+
+    await storage.upsert_session(
+        SessionNode(
+            session_key=session_key,
+            session_id="session-steer-requeue-owner-new",
+            agent_id="main",
+            status=SessionStatus.RUNNING,
+            epoch=1,
+            created_at=200,
+            updated_at=200,
+            started_at=200,
+        )
+    )
+
+    requeued = await storage.requeue_steer_recovery_task(
+        task_id,
+        expected_session_id=old_session_id,
+        expected_session_epoch=0,
+    )
+
+    assert requeued is False
+    unchanged = await storage.get_agent_task(task_id)
+    assert unchanged is not None
+    assert unchanged.status == AgentTaskStatus.ABANDONED
+    assert unchanged.terminal_reason == "process_restart"
+    assert unchanged.started_at is None
+    assert unchanged.details == preflight_task.details
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_promote_stranded_steer_rechecks_owner_after_preflight_rotation(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "steer-promote-owner-cas.db"))
+    await storage.connect()
+    session_key = "agent:main:webchat:steer-promote-owner-cas"
+    old_session_id = "session-steer-promote-owner-old"
+    old_task_id = "turn-steer-promote-owner-old"
+    promoted_task_id = "turn-steer-promote-owner-new"
+    message_id = "message-steer-promote-owner-cas"
+    await _seed_steering_input(
+        storage,
+        session_key=session_key,
+        session_id=old_session_id,
+        task_id=old_task_id,
+        message_id=message_id,
+        message="keep this steer with its accepted owner",
+        task_status=AgentTaskStatus.FAILED,
+        task_details={"session_epoch": 0},
+    )
+
+    # The caller validated a recoverable row while the old owner was current.
+    stranded = await storage.list_stranded_steer_inputs()
+    assert len(stranded) == 1
+    assert stranded[0].entry.session_id == old_session_id
+    assert stranded[0].target_task.details is not None
+    assert stranded[0].target_task.details["session_epoch"] == 0
+
+    await storage.upsert_session(
+        SessionNode(
+            session_key=session_key,
+            session_id="session-steer-promote-owner-new",
+            agent_id="main",
+            status=SessionStatus.RUNNING,
+            epoch=1,
+            created_at=200,
+            updated_at=200,
+            started_at=200,
+        )
+    )
+    promoted_task = AgentTaskRecord(
+        task_id=promoted_task_id,
+        session_key=session_key,
+        agent_id="main",
+        source_kind="web",
+        queue_mode="followup",
+        run_kind="web_turn",
+        status=AgentTaskStatus.QUEUED,
+        created_at=210,
+        updated_at=210,
+        details={
+            "session_id": old_session_id,
+            "session_epoch": 0,
+            "metadata": {"steer_restart_recovery": True},
+        },
+    )
+
+    claimed = await storage.promote_stranded_steer_inputs(
+        target_task_id=old_task_id,
+        message_ids=[message_id],
+        task_record=promoted_task,
+        expected_session_id=old_session_id,
+        expected_session_epoch=0,
+    )
+
+    assert claimed == []
+    assert await storage.get_agent_task(promoted_task_id) is None
+    entry = await storage.get_canonical_transcript_entry(old_session_id, message_id)
+    assert entry is not None
+    assert entry.turn_context is not None
+    assert entry.turn_context["disposition"] == "steering"
+    assert entry.turn_context["turn_id"] == old_task_id
+    receipt = await storage.get_turn_ingress_receipt(
+        source_scope="rpc:web:steer.v2",
+        request_session_key=session_key,
+        client_request_id=f"request-{message_id}",
+    )
+    assert receipt is not None
+    assert receipt.receipt.task_id == old_task_id
+    await storage.close()
 
 
 def test_gateway_runs_steer_restart_recovery_before_readiness() -> None:

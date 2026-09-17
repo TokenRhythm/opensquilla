@@ -20,6 +20,12 @@ from opensquilla.artifacts import (
     ArtifactStore,
     artifact_payload,
 )
+from opensquilla.attachment_workspace import (
+    AttachmentWorkspaceMaterializer,
+    workspace_attachment_budget_from_config,
+)
+from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES
+from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.engine.usage_accounting import (
     account_provider_stream,
     current_usage_accounting_scope,
@@ -134,11 +140,12 @@ def configure_audio(config: Any | None) -> None:
 @tool(
     name="image",
     description=(
-        "Analyze an image using a vision-capable model. "
+        "Load an image for the main model to inspect in its next step. "
         "Accepts only a real local file path or HTTP(S) URL. "
         "Do not call this tool for images already attached to the current chat turn; "
         "use the attachment content directly. "
-        "Returns the model's text analysis of the image."
+        "Returns image content and a loading receipt, not a separate model's analysis. "
+        "The current mode's image capability and request limits still apply."
     ),
     params={
         "path": {
@@ -155,10 +162,13 @@ def configure_audio(config: Any | None) -> None:
         },
     },
     required=["path", "prompt"],
+    runtime_only_arguments={"_tool_use_id"},
     sandbox=SandboxToolDescriptor.media(kind="media.analyze"),
     execution_timeout_seconds=_VISION_ANALYSIS_TIMEOUT_SECONDS,
 )
-async def image(path: str, prompt: str = "Describe this image") -> str:
+async def image(
+    path: str, prompt: str = "Describe this image", _tool_use_id: str = "",
+) -> str:
     if not prompt or not prompt.strip():
         raise ToolError("Prompt must not be empty")
 
@@ -176,34 +186,99 @@ async def image(path: str, prompt: str = "Describe this image") -> str:
             return json.dumps(path_block)
         image_bytes, media_type = await _read_image_file(path)
 
-    # Validate not corrupt using Pillow
+    if _tool_use_id and len(image_bytes) > IMAGE_ATTACHMENT_BYTES:
+        raise SafeToolError("Image exceeds the supported attachment byte limit.")
     try:
-        import io
-
-        from PIL import Image
-
-        img = Image.open(io.BytesIO(image_bytes))
-        img.verify()
-    except Exception as exc:
+        validate_image_bytes(image_bytes, media_type)
+    except ValueError as exc:
         raise SafeToolError(f"Image appears corrupt or unreadable: {exc}") from exc
 
-    # Try provider vision call; graceful fallback if unavailable
     b64_data = base64.b64encode(image_bytes).decode()
+    if _tool_use_id:
+        context = current_tool_context.get()
+        if context is None:
+            raise SafeToolError("Image loading requires an active model tool call.")
+        image_content = {"mime": media_type, "data": b64_data}
+        receipt = {
+            "status": "loaded",
+            "path": path,
+            "note": "Image loaded for model input; it has not yet been analyzed.",
+        }
+        if is_url:
+            retained = await _retain_downloaded_image(image_bytes, media_type)
+            receipt["source_url"] = path
+            image_content["source_url"] = path
+            if retained["local_path"]:
+                receipt["local_path"] = retained["local_path"]
+                receipt["name"] = retained["name"]
+                image_content["local_path"] = retained["local_path"]
+                image_content["name"] = retained["name"]
+            else:
+                receipt["retention_note"] = retained["note"]
+        context.tool_result_media[_tool_use_id] = [image_content]
+        return json.dumps(receipt)
+
+    # Keep the text-returning API for callers outside model tool dispatch.
+    # Model calls use the typed result above and share the main request budget.
     try:
         description = await _call_vision_provider(b64_data, media_type, prompt)
         model_used = "provider"
+    except _ImageAnalysisUnavailableError:
+        return json.dumps(
+            {
+                "status": "not_analyzed",
+                "note": "Image not analyzed: the current model has no confirmed image capability",
+                "path": path,
+            }
+        )
     except ToolError:
         raise
     except Exception:
         return json.dumps(
             {
-                "status": "not_available",
-                "note": "Vision provider not configured or unavailable",
+                "status": "analysis_failed",
+                "note": "Image analysis failed on the current model; no other model was called",
                 "path": path,
             }
         )
 
     return json.dumps({"description": description, "model": model_used, "path": path})
+
+
+async def _retain_downloaded_image(payload: bytes, mime: str) -> dict[str, str]:
+    context = current_tool_context.get()
+    config = context.sandbox_gateway_config if context is not None else None
+    if getattr(getattr(config, "attachments", None), "persist_transcripts", True) is False:
+        return {
+            "local_path": "", "note": "No local copy retained: attachment persistence disabled.",
+        }
+    if (
+        context is None or not context.workspace_dir
+        or not context.artifact_media_root or not context.artifact_session_id
+    ):
+        return {"local_path": "", "note": "No local copy retained: session workspace unavailable."}
+
+    from opensquilla.tools.write_policy import attachment_workspace_write_authorizer
+
+    workspace = Path(context.workspace_dir).expanduser().resolve()
+
+    materializer = AttachmentWorkspaceMaterializer(
+        media_root=Path(context.artifact_media_root),
+        workspace_dir=workspace,
+        disk_budget_bytes=workspace_attachment_budget_from_config(config),
+        authorize_write=attachment_workspace_write_authorizer(context),
+    )
+    result = await asyncio.to_thread(
+        materializer.materialize_bytes, payload,
+        name=f"image.{mime.split('/', 1)[1]}", mime=mime,
+        session_id=context.artifact_session_id,
+    )
+    if result.available and result.rel_path:
+        return {"local_path": result.rel_path, "name": result.name, "note": ""}
+    return {
+        "local_path": "",
+        "note": f"No local copy retained: {result.error or 'storage unavailable'}",
+    }
 
 
 async def _read_image_file(path: str) -> tuple[bytes, str]:
@@ -359,7 +434,11 @@ async def _fetch_image_url(url: str) -> tuple[bytes, str]:
             current_url = urljoin(current_url, location)
         else:
             raise ToolError(f"Too many redirects (>{_MAX_REDIRECTS})")
-        resp.raise_for_status()
+        if resp.is_error:
+            raise ToolError(
+                f"Failed to fetch image from URL: HTTP {resp.status_code} "
+                f"({resp.reason_phrase or 'request failed'})"
+            )
         image_bytes = resp.content
     except ToolError:
         raise
@@ -403,6 +482,10 @@ def _mime_to_ext(content_type: str) -> str:
     return mapping.get(ct, "")
 
 
+class _EmptyMediaResponseError(RuntimeError):
+    """A media request completed without a visible answer."""
+
+
 async def _complete_from_stream(provider: Any, messages: list, config: Any = None) -> str:
     """Consume a chat() stream and return the assembled text response."""
     correlation = current_provider_request_correlation()
@@ -420,25 +503,41 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         budget = resolve_auxiliary_request_budget(
             provider,
             max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
+            context_window_tokens=int(
+                getattr(config, "context_window_tokens_global_override", 0) or 0
+            ),
         )
         config = config.model_copy(
             update={
                 "max_tokens": budget.max_output_tokens,
                 "provider_request_max_chars": budget.provider_request_max_chars,
+                "provider_context_window_tokens": budget.context_window_tokens,
+                "provider_request_max_chars_explicit_cap": (
+                    budget.provider_request_max_chars_explicit_cap
+                ),
             }
         )
     if budget is None:
+        explicit_cap = getattr(config, "provider_request_max_chars_explicit_cap", None)
         budget = resolve_auxiliary_request_budget(
             provider,
             max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
+            context_window_tokens=int(
+                getattr(config, "context_window_tokens_global_override", 0) or 0
+            ),
             provider_request_max_chars=int(
-                getattr(config, "provider_request_max_chars", 0) or 0
+                (getattr(config, "provider_request_max_chars", 0) or 0)
+                if explicit_cap is None else explicit_cap
             ),
         )
     config = config.model_copy(
         update={
             "max_tokens": budget.max_output_tokens,
             "provider_request_max_chars": budget.provider_request_max_chars,
+            "provider_context_window_tokens": budget.context_window_tokens,
+            "provider_request_max_chars_explicit_cap": (
+                budget.provider_request_max_chars_explicit_cap
+            ),
         }
     )
     ensure_auxiliary_text_fits(
@@ -447,6 +546,9 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         max_tokens=budget.max_input_tokens,
         system=str(getattr(config, "system", "") or ""),
     )
+    admit = getattr(provider, "_admit_auxiliary_request", None)
+    if callable(admit):
+        admit()
     scope = current_usage_accounting_scope()
     close_stream = None
     if scope is None:
@@ -465,11 +567,12 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
     text_parts: list[str] = []
     try:
         async for event in stream:
-            if hasattr(event, "text"):
+            kind = getattr(event, "kind", None)
+            if kind == "text_delta":
                 text_parts.append(event.text)
-            elif hasattr(event, "delta") and isinstance(event.delta, str):
-                text_parts.append(event.delta)
-            elif getattr(event, "kind", None) == "error":
+            elif kind == "provider_generation_reset":
+                text_parts.clear()
+            elif kind == "error":
                 code = getattr(event, "code", "") or "provider_error"
                 message = getattr(event, "message", "") or "Provider stream failed"
                 raise RuntimeError(f"Provider stream error ({code}): {message}")
@@ -477,20 +580,28 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         aclose = getattr(close_stream, "aclose", None)
         if callable(aclose):
             await aclose()
-    return "".join(text_parts)
+    text = "".join(text_parts)
+    if not text.strip():
+        raise _EmptyMediaResponseError("The provider returned no visible media analysis")
+    return text
+
+
+class _ImageAnalysisUnavailableError(RuntimeError):
+    """The current turn does not authorize a vision request."""
 
 
 async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> str:
-    """Send image to provider vision API. Raises if provider not available."""
-    try:
-        from opensquilla.provider.selector import ModelSelector, SelectorConfig
-        from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
+    """Analyze on the current deployment, retrying an empty answer at most once."""
+    from opensquilla.provider.image_projection import ImageProjectionMode, project_messages
+    from opensquilla.provider.protocol import validate_provider_chat_admission
+    from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
 
-        cfg = _resolve_vision_provider_config(default_model="openai/gpt-4o-mini")
-        selector = ModelSelector(SelectorConfig(primary=cfg))
-        provider = selector.resolve()
-    except Exception as exc:
-        raise RuntimeError(f"Provider not available: {exc}") from exc
+    context = current_tool_context.get()
+    resolve_target = context.image_analysis_target if context is not None else None
+    target = resolve_target() if resolve_target is not None else None
+    if target is None:
+        raise _ImageAnalysisUnavailableError
+    provider, config = target
 
     vision_message = Message(
         role="user",
@@ -499,13 +610,23 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
             ContentBlockText(text=prompt),
         ],
     )
-    correlation = derive_provider_request_correlation(
-        current_provider_request_correlation(),
-        execution_id=uuid.uuid4().hex,
-        call_kind="auxiliary.media",
-    )
-    with bind_provider_request_correlation(correlation):
-        return await _complete_from_stream(provider, [vision_message])
+    messages = project_messages([vision_message], mode=ImageProjectionMode.NATIVE).messages
+    admission_error = validate_provider_chat_admission(provider, messages, config)
+    if admission_error is not None:
+        raise RuntimeError(admission_error.code)
+    for attempt in range(2):
+        correlation = derive_provider_request_correlation(
+            current_provider_request_correlation(),
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.media",
+        )
+        with bind_provider_request_correlation(correlation):
+            try:
+                return await _complete_from_stream(provider, messages, config)
+            except _EmptyMediaResponseError:
+                if attempt:
+                    raise
+    raise AssertionError("image analysis attempts exhausted")
 
 
 # ---------------------------------------------------------------------------

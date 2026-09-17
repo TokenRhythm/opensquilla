@@ -198,8 +198,11 @@ class CompactionPersistPort(Protocol):
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None: ...
 
 @runtime_checkable
@@ -379,8 +382,11 @@ class StreamConsumerStageInput:
     # adapter compares it atomically and preserves later append-only queue rows.
     compaction_source_entries: tuple[Any, ...] | None = None
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+    compaction_source_context_fingerprint: str | None = None
     compaction_source_boundary_message_id: str | None = None
     compaction_source_boundary_entry_id: int | None = None
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
     # Original ingress mode.  Internal Goal continuations and heartbeats use
     # ``system_event``; their text is held until the terminal snapshot can be
     # canonicalized so silent-reply protocol markers never flash on a client.
@@ -412,26 +418,6 @@ def _supports_generation_reset(inp: StreamConsumerStageInput) -> bool:
         return True
     return bool(context.surface.supports_generation_reset)
 
-
-def _control_reason_for_error_code(code: Any) -> Any | None:
-    """Map only typed control/error codes; provider failures stay recoverable."""
-
-    from opensquilla.engine.types import ControlTerminalReason
-
-    normalized = str(code or "").strip().lower().replace("-", "_")
-    return {
-        "agent_runtime_timeout": ControlTerminalReason.HARD_DEADLINE,
-        "hard_deadline": ControlTerminalReason.HARD_DEADLINE,
-        "hard_deadline_exceeded": ControlTerminalReason.HARD_DEADLINE,
-        "shutdown": ControlTerminalReason.SHUTDOWN,
-        "gateway_shutdown": ControlTerminalReason.SHUTDOWN,
-        "cancel": ControlTerminalReason.CANCEL,
-        "cancelled": ControlTerminalReason.CANCEL,
-        "canceled": ControlTerminalReason.CANCEL,
-        "platform_validation": ControlTerminalReason.PLATFORM_VALIDATION,
-        "platform_safety": ControlTerminalReason.PLATFORM_SAFETY,
-        "safety_control": ControlTerminalReason.PLATFORM_SAFETY,
-    }.get(normalized)
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -726,10 +712,9 @@ class _ErrorHandler:
             _LLM_TIMEOUT_ENVELOPE,
             _drop_unpaired_tool_use_segments,
         )
-        from opensquilla.engine.types import ErrorEvent as _ErrorEvent
-
         if event.code == "timeout":
-            event = _ErrorEvent(
+            event = replace(
+                event,
                 message=_LLM_TIMEOUT_ENVELOPE["user_message"],
                 code=_LLM_TIMEOUT_ENVELOPE["error_class"],
             )
@@ -1526,6 +1511,7 @@ class _CompactionHandler:
                     "removed_count": event.removed_count,
                     "source_entries": inp.compaction_source_entries,
                     "source_preimage": inp.compaction_source_preimage,
+                    "source_context_fingerprint": inp.compaction_source_context_fingerprint,
                     "source_boundary_message_id": (
                         inp.compaction_source_boundary_message_id
                     ),
@@ -1540,6 +1526,14 @@ class _CompactionHandler:
                 if event.compaction_timeout_seconds is not None:
                     persist_kwargs["compaction_timeout_seconds"] = (
                         event.compaction_timeout_seconds
+                    )
+                if (
+                    inp.expected_session_id is not None
+                    or inp.expected_session_epoch is not None
+                ):
+                    persist_kwargs["expected_session_id"] = inp.expected_session_id
+                    persist_kwargs["expected_session_epoch"] = (
+                        inp.expected_session_epoch
                     )
                 installed = await self._persist.persist_and_notify(**persist_kwargs)
                 if installed is False:

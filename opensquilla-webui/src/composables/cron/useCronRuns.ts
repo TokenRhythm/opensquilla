@@ -1,9 +1,8 @@
 import { ref, watch, type Ref } from 'vue'
-import { useRpcStore } from '@/stores/rpc'
 import type { CronRun } from '@/types/cron'
+import type { CronScheduler } from '@/modules/cronScheduler'
 
-export function useCronRuns(selectedId: Ref<string | null>) {
-  const rpc = useRpcStore()
+export function useCronRuns(scheduler: CronScheduler, selectedId: Ref<string | null>) {
   const runs = ref<CronRun[]>([])
   const runsLoading = ref(false)
   let loadGeneration = 0
@@ -13,9 +12,9 @@ export function useCronRuns(selectedId: Ref<string | null>) {
     const generation = ++loadGeneration
     runsLoading.value = true
     try {
-      const data = await rpc.call<{ runs?: CronRun[] } | CronRun[]>('cron.runs', { id: jobId, limit: 10 })
+      const data = await scheduler.listRuns(jobId, 10)
       if (generation !== loadGeneration || selectedId.value !== jobId) return
-      runs.value = Array.isArray(data) ? data : (data.runs || [])
+      runs.value = [...data]
     } catch {
       if (generation !== loadGeneration || selectedId.value !== jobId) return
       runs.value = []

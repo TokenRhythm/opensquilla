@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -9,6 +9,17 @@ function read(rel) {
 }
 
 const failures = []
+
+for (const rel of [
+  'src/workbench/artifactPromptAnnotationProvider.ts',
+  'src/adapters/gateway/artifactPromptAnnotationsV4.ts',
+  'src/stores/workbenchDocumentContext.ts',
+  'src/components/workbench/ArtifactHtmlStudio.vue',
+]) {
+  if (existsSync(join(root, rel))) {
+    failures.push(`${rel}: retired document editing entry points must remain absent.`)
+  }
+}
 
 function assertAbsent(rel, pattern, message) {
   const body = read(rel)
@@ -21,16 +32,48 @@ function assertPresent(rel, pattern, message) {
 }
 
 assertAbsent(
-  'src/utils/chat/artifacts.ts',
+  'src/adapters/gateway/artifactAccessV4.ts',
   /\btoken\??:\s*string|searchParams\.set\(['"]token['"]|includeSessionKey\s*!==\s*false/,
   'artifact URLs must not carry bearer tokens or default session keys in query params.',
 )
 
 assertPresent(
-  'src/utils/chat/artifacts.ts',
+  'src/adapters/gateway/privateArtifactHttpTransport.ts',
   /searchParams\.delete\(['"]token['"]\)[\s\S]+searchParams\.delete\(['"]sessionKey['"]\)[\s\S]+searchParams\.delete\(['"]session_key['"]\)/,
   'artifact URL sanitizer must strip sensitive same-origin query params.',
 )
+
+for (const rel of [
+  'src/views/ChatView.vue',
+  'src/components/workbench/AppWorkbench.vue',
+  'src/components/workbench/ArtifactDocumentPanel.vue',
+  'src/components/workbench/ArtifactPreviewPanel.vue',
+  'src/components/workbench/artifactWorkbenchProvider.ts',
+  'src/components/chat/ArtifactImageLightbox.vue',
+  'src/components/chat/AssistantMessage.vue',
+  'src/components/chat/AudioArtifactCard.vue',
+  'src/components/chat/ChatArtifactList.vue',
+  'src/components/chat/ChatMessageList.vue',
+  'src/components/chat/DeliverablesDrawer.vue',
+  'src/components/chat/VideoArtifactCard.vue',
+]) {
+  assertAbsent(
+    rel,
+    /\bauthToken\b|opensquilla\.wsToken|artifact(?:Download|Preview|Thumbnail)Url|artifactAccessHeaders/,
+    'artifact consumers must use semantic artifact/session requests without HTTP credentials.',
+  )
+}
+
+for (const rel of [
+  'src/workbench/workbenchResourceProvider.ts',
+  'src/workbench/artifactDocumentProvider.ts',
+]) {
+  assertAbsent(
+    rel,
+    /\b[A-Z_]+_RPC_METHODS\b|\bcreateRpc[A-Z]/,
+    'business provider barrels must not re-export Gateway wire helpers.',
+  )
+}
 
 assertAbsent(
   'src/composables/chat/useChatMarkdownExport.ts',
@@ -51,13 +94,13 @@ assertPresent(
 )
 
 assertPresent(
-  'src/utils/chat/attachmentAccess.ts',
+  'src/adapters/gateway/privateArtifactHttpTransport.ts',
   /url\.protocol !== 'http:'[\s\S]+url\.protocol !== 'https:'[\s\S]+url\.origin !== base\.origin/,
   'attachment downloads must reject non-HTTP(S) and cross-origin staged URLs.',
 )
 
 assertPresent(
-  'src/utils/chat/attachmentAccess.ts',
+  'src/adapters/gateway/privateArtifactHttpTransport.ts',
   /CREDENTIAL_QUERY_KEYS[\s\S]+url\.searchParams\.delete\(key\)/,
   'attachment downloads must strip token and session query credentials.',
 )

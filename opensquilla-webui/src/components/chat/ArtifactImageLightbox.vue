@@ -5,7 +5,7 @@
       class="deliv-preview"
       role="dialog"
       aria-modal="true"
-      :aria-label="t('chat.previewOf', { title: artifactFileTitle(active) })"
+      :aria-label="t('chat.previewOf', { title: imageTitle(active) })"
       @click.self="closePreview"
     >
       <div ref="lightboxPanel" class="deliv-preview__panel deliv-preview__panel--media">
@@ -15,7 +15,7 @@
             aria-live="polite"
             aria-atomic="true"
           >
-            {{ artifactFileTitle(active) }}
+            {{ imageTitle(active) }}
           </span>
           <button
             ref="lightboxCloseBtn"
@@ -44,7 +44,7 @@
             v-if="fullState === 'loaded' && fullUrl"
             class="deliv-preview__image"
             :src="fullUrl"
-            :alt="artifactFileTitle(active)"
+            :alt="imageTitle(active)"
             decoding="async"
           />
           <div
@@ -103,23 +103,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import {
-  createArtifactPreview,
-  type ArtifactPreviewController,
-  type ArtifactPreviewState,
-} from '@/composables/chat/useArtifactPreview'
-import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
+import { useArtifactImageLightbox, type ImageLightboxItem } from '@/composables/chat/useArtifactImageLightbox'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useToasts } from '@/composables/useToasts'
-import type { ArtifactPayload } from '@/types/rpc'
-import { fetchArtifactBlob } from '@/utils/chat/artifactAccess'
+import type { ArtifactPayload } from '@/types/artifacts'
+import {
+  ARTIFACT_WORKBENCH_KEY,
+  type ArtifactPreviewController,
+  type ArtifactPreviewState,
+} from '@/modules/artifactWorkbench'
+import { isImageAttachmentMime, isImageDisplayAttachment } from '@/utils/chat/attachments'
 import {
   artifactCategory,
-  artifactDownloadUrl,
   artifactFileTitle,
 } from '@/utils/chat/artifacts'
 import { downloadBlob } from '@/utils/browser'
@@ -127,7 +126,10 @@ import { downloadBlob } from '@/utils/browser'
 const { t } = useI18n()
 const { pushToast } = useToasts()
 const controller = useArtifactImageLightbox()
-const active = computed(() => controller.request.value?.artifact ?? null)
+const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+const artifactWorkbench = injectedArtifactWorkbench
+const active = computed(() => controller.request.value?.image ?? null)
 const isOpen = computed(() => active.value !== null)
 const lightboxIsTopmost = useDialogLayer(isOpen)
 const lightboxCloseBtn = ref<HTMLButtonElement | null>(null)
@@ -148,58 +150,44 @@ function artifactKey(artifact: ArtifactPayload): string {
   )
 }
 
+function imageKey(image: ImageLightboxItem): string {
+  return image.kind === 'artifact'
+    ? `artifact:${artifactKey(image.artifact)}`
+    : `attachment:${image.attachment.renderKey}`
+}
+
+function imageTitle(image: ImageLightboxItem): string {
+  return image.kind === 'artifact' ? artifactFileTitle(image.artifact) : image.attachment.name
+}
+
 const navigationVisualArtifacts = computed(() => {
   const request = controller.request.value
   if (!request) return []
   const seen = new Set<string>()
-  const images: ArtifactPayload[] = []
-  for (const artifact of request.navigationArtifacts) {
-    if (artifactCategory(artifact) !== 'visual') continue
-    const key = artifactKey(artifact)
+  const images: ImageLightboxItem[] = []
+  for (const image of request.navigationImages) {
+    if (image.kind === 'artifact'
+      ? artifactCategory(image.artifact) !== 'visual'
+      : !isImageDisplayAttachment(image.attachment)) continue
+    const key = imageKey(image)
     if (!key || seen.has(key)) continue
     seen.add(key)
-    images.push(artifact)
+    images.push(image)
   }
-  if (!seen.has(artifactKey(request.artifact))) images.push(request.artifact)
+  if (!seen.has(imageKey(request.image))) images.push(request.image)
   return images
 })
 
 const activeImageIndex = computed(() => {
   if (!active.value) return -1
-  const key = artifactKey(active.value)
-  return navigationVisualArtifacts.value.findIndex(artifact => artifactKey(artifact) === key)
+  const key = imageKey(active.value)
+  return navigationVisualArtifacts.value.findIndex(image => imageKey(image) === key)
 })
 const canNavigateImages = computed(() => navigationVisualArtifacts.value.length > 1)
 const canGoPreviousImage = computed(() => activeImageIndex.value > 0)
 const canGoNextImage = computed(() =>
   activeImageIndex.value >= 0
   && activeImageIndex.value < navigationVisualArtifacts.value.length - 1)
-
-function readAuthToken(): string {
-  if (typeof sessionStorage === 'undefined') return ''
-  try {
-    return sessionStorage.getItem('opensquilla.wsToken') || ''
-  } catch {
-    return ''
-  }
-}
-
-function sameOrigin(url: string): boolean {
-  try {
-    return new URL(url, window.location.origin).origin === window.location.origin
-  } catch {
-    return false
-  }
-}
-
-function previewHeaders(url: string, sessionKey: string): Record<string, string> {
-  if (!sameOrigin(url)) return {}
-  const headers: Record<string, string> = {}
-  if (sessionKey) headers['x-opensquilla-session-key'] = sessionKey
-  const authToken = readAuthToken()
-  if (authToken) headers.Authorization = `Bearer ${authToken}`
-  return headers
-}
 
 function disposeFull() {
   stopFullState?.()
@@ -211,17 +199,27 @@ function disposeFull() {
   fullUrl.value = ''
 }
 
-function loadFull(artifact: ArtifactPayload, sessionKey: string) {
+function loadFull(image: ImageLightboxItem, sessionKey: string) {
   disposeFull()
-  const url = artifactDownloadUrl(artifact, window.location.origin, {
-    sessionKey,
-    includeSessionKey: false,
-  })
-  fullController = createArtifactPreview({
-    resolveUrl: () => url,
-    headers: () => previewHeaders(url, sessionKey),
-    sameOrigin,
+  fullController = artifactWorkbench.previews.create({
+    sessionKey: () => sessionKey,
+    variant: 'content',
     fullSize: true,
+    ...(image.kind === 'attachment' ? {
+      loadBlob: async (signal: AbortSignal) => {
+        const result = await artifactWorkbench.content.fetchAttachment(image.attachment, {
+          sessionKey,
+          signal,
+        })
+        if (!result.ok) throw new Error(result.message)
+        if (result.source === 'local-file'
+          && (!result.blob.type || result.blob.type === 'application/octet-stream')) {
+          return result.blob.slice(0, result.blob.size, image.attachment.mime)
+        }
+        return result.blob
+      },
+      acceptBlob: (blob: Blob) => isImageAttachmentMime(blob.type),
+    } : { artifact: () => image.artifact }),
   })
   const preview = fullController
   stopFullState = watch(
@@ -309,38 +307,37 @@ function onLightboxKeydown(event: KeyboardEvent) {
 async function downloadActive() {
   const request = controller.request.value
   if (!request) return
-  const result = await fetchArtifactBlob(request.artifact, {
-    authToken: readAuthToken(),
-    baseOrigin: window.location.origin,
+  const options = {
     sessionKey: request.sessionKey,
-  })
+  }
+  const result = request.image.kind === 'artifact'
+    ? await artifactWorkbench.content.fetchArtifact(request.image.artifact, options)
+    : await artifactWorkbench.content.fetchAttachment(request.image.attachment, options)
   if (!result.ok) {
     pushToast(result.message || t('chat.toast.downloadFailed'), { tone: 'danger' })
     return
   }
-  downloadBlob(result.blob, String(request.artifact.name || artifactFileTitle(request.artifact)))
+  const filename = 'filename' in result && typeof result.filename === 'string'
+    ? result.filename
+    : imageTitle(request.image)
+  downloadBlob(result.blob, filename)
 }
 
-const activeResourceSignature = computed(() => {
+const activeResource = computed(() => {
   const request = controller.request.value
-  if (!request) return ''
-  return [
-    request.sessionKey,
-    artifactKey(request.artifact),
-    String(request.artifact.download_url || ''),
-  ].join('\u0000')
+  return request?.image ?? null
 })
 
 watch(
-  activeResourceSignature,
-  (signature, previousSignature) => {
+  activeResource,
+  (image, previousImage) => {
     const request = controller.request.value
-    if (!signature || !request) {
+    if (!image || !request) {
       disposeFull()
       return
     }
-    loadFull(request.artifact, request.sessionKey)
-    if (!previousSignature) nextTick(() => lightboxCloseBtn.value?.focus())
+    loadFull(image, request.sessionKey)
+    if (!previousImage) nextTick(() => lightboxCloseBtn.value?.focus())
   },
   { immediate: true },
 )

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import tomli_w
 
-import opensquilla.gateway.rpc_config as rpc_config
+import opensquilla.gateway.adapters.app_settings as settings_runtime
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
 from opensquilla.gateway.rpc import RpcContext
@@ -175,7 +175,7 @@ async def test_generic_config_profile_credential_change_reconciles_after_persist
     )
     events: list[str] = []
     observed: list[tuple[str, str]] = []
-    real_persist = rpc_config._persist_config
+    real_persist = settings_runtime.persist_gateway_config
 
     def recording_persist(candidate: Any) -> None:
         real_persist(candidate)
@@ -191,7 +191,7 @@ async def test_generic_config_profile_credential_change_reconciles_after_persist
             )
         )
 
-    monkeypatch.setattr(rpc_config, "_persist_config", recording_persist)
+    monkeypatch.setattr(settings_runtime, "persist_gateway_config", recording_persist)
     monkeypatch.setattr(
         "opensquilla.gateway.llm_runtime.discard_profile_credential_pool",
         lambda provider: events.append(f"discard:{provider}"),
@@ -295,7 +295,7 @@ async def test_config_mutation_refreshes_from_authoritative_live_config(
         seen.append(refreshed_config)
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_config._refresh_live_catalog_after_change",
+        "opensquilla.gateway.adapters.app_settings._refresh_live_catalog_after_change",
         fake_refresh,
     )
     ctx = RpcContext(conn_id="test", config=config)
@@ -492,15 +492,15 @@ async def test_empty_merge_patch_is_sparse_noop_and_preserves_disk_drift(tmp_pat
     ctx = RpcContext(conn_id="test", config=config)
 
     drifted = tomllib.loads(path.read_text())
-    drifted["memory"] = {"flush_enabled": True}
+    drifted["memory"] = {"capture_assistant": True}
     path.write_text(tomli_w.dumps(drifted))
 
     response = await _handle_config_patch({"patch": {"memory": {}}}, ctx)
 
     persisted = tomllib.loads(path.read_text())
     assert response["patched"] == ["(merge)"]
-    assert persisted["memory"] == {"flush_enabled": True}
-    assert config.memory.flush_enabled is False
+    assert persisted["memory"] == {"capture_assistant": True}
+    assert config.memory.capture_assistant is False
 
 
 async def test_merge_patch_force_path_preserves_dotted_dynamic_key(tmp_path) -> None:

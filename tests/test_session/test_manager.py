@@ -14,10 +14,20 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session import manager as session_manager_module
+from opensquilla.session.attachment_manifest import (
+    ATTACHMENT_MANIFEST_STATE_KIND,
+    attachment_manifest_from_context_state,
+    build_attachment_manifest,
+    manifest_context_state,
+)
 from opensquilla.session.compaction import CompactionConfig, CompactionResult
+from opensquilla.session.compaction_lifecycle import ConsumerAdmissionStaleError
+from opensquilla.session.compaction_state import StructuredCompactionSummary
 from opensquilla.session.context_view import (
     build_compaction_context_records,
+    compaction_replay_is_complete,
     format_compaction_summary_context,
 )
 from opensquilla.session.manager import SessionManager
@@ -42,6 +52,7 @@ from opensquilla.turn_outcome_projection import (
     build_fork_terminal_outcome_projection,
     extract_fork_terminal_outcome_projection,
 )
+from tests.helpers.compaction import synthetic_compaction_config
 
 
 @pytest_asyncio.fixture
@@ -695,6 +706,35 @@ async def test_update_fields(manager):
     updated = await manager.update("agent:main:main", model="claude-opus-4-6", channel="telegram")
     assert updated.model == "claude-opus-4-6"
     assert updated.channel == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_update_expected_owner_rejects_epoch_change_before_write(
+    manager,
+    monkeypatch,
+):
+    key = "agent:main:update-owner-race"
+    admitted = await manager.create(key)
+    original_upsert = manager._storage.upsert_session
+
+    async def advance_epoch_before_upsert(node, **kwargs):
+        await manager._storage.increment_epoch(key)
+        return await original_upsert(node, **kwargs)
+
+    monkeypatch.setattr(manager._storage, "upsert_session", advance_epoch_before_upsert)
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        await manager.update(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+            display_name="Late title",
+        )
+
+    persisted = await manager.get_session(key)
+    assert persisted is not None
+    assert persisted.epoch == 1
+    assert persisted.display_name != "Late title"
 
 
 @pytest.mark.asyncio
@@ -1802,7 +1842,6 @@ async def test_branch_fork_transcript_copies_compaction_summaries(manager):
             removed_count=3,
             kept_count=1,
             chunk_count=2,
-            flush_receipt_status="safe",
             covered_through_id=123,
         )
     )
@@ -1838,7 +1877,6 @@ async def test_branch_fork_transcript_copies_compaction_summaries(manager):
     assert child_summaries[0].removed_count == 3
     assert child_summaries[0].kept_count == 1
     assert child_summaries[0].chunk_count == 2
-    assert child_summaries[0].flush_receipt_status == "safe"
     assert child_summaries[0].covered_through_id == 123
     assert child_summaries[0].session_id == child.session_id
     assert child_summaries[0].session_key == "agent:main:direct:u1"
@@ -1884,6 +1922,341 @@ async def test_branch_fork_transcript_copies_compacted_archive(manager):
         limit=10,
     )
     assert child_page.canonical_complete is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fork_mode", ["before_message", "through_turn", "prepared"])
+@pytest.mark.parametrize("archived", [False, True])
+async def test_prefix_forks_preserve_legacy_attachment_ids_with_new_message_identity(
+    manager,
+    fork_mode: str,
+    archived: bool,
+) -> None:
+    parent = await manager.create("agent:main:prefix-attachment-parent")
+    image_content = json.dumps(
+        {
+            "text": "inspect the attachments",
+            "attachments": [
+                {"type": "image/png", "name": "first.png", "data": "cG5n"},
+                {"type": "image/png", "name": "duplicate.png", "data": "cG5n"},
+                {
+                    "attachment_id": "att_existing_prefix_123",
+                    "type": "image/png",
+                    "sha256_ref": "a" * 64,
+                    "name": "stored.png",
+                },
+            ],
+        }
+    )
+    image_entry = TranscriptEntry(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        role="user",
+        content=image_content,
+        turn_context={"turn_id": "prefix-attachment-turn"},
+    )
+    await manager._storage.append_transcript_entry(image_entry)
+    parent_manifest = build_attachment_manifest(
+        [image_entry],
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+    )
+    attachment_ids = [item.attachment_id for item in parent_manifest.occurrences]
+    assert len(set(attachment_ids)) == 3
+    reference_text = "Attachment references: " + ", ".join(attachment_ids)
+    answer_entry = TranscriptEntry(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        role="assistant",
+        content=reference_text,
+        turn_context={"turn_id": "prefix-attachment-turn"},
+    )
+    await manager._storage.append_transcript_entry(answer_entry)
+    future = await manager.append_message(parent.session_key, "user", "later request")
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id="prefix-attachment-turn",
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    if archived:
+        assert await manager.persist_compaction_result(
+            parent.session_key,
+            reference_text,
+            [{"role": "user", "content": future.content}],
+            compaction_id="cmp-prefix-attachment-parent",
+        )
+
+    child_key = "agent:main:prefix-attachment-child"
+    if fork_mode == "prepared":
+        plan = await manager.prepare_prefix_branch(
+            parent.session_key,
+            child_key,
+            fork_before_message_id=future.message_id,
+        )
+        child = plan.node
+        await manager._storage.upsert_session(child)
+        for entry in plan.initial_transcript_entries:
+            await manager._storage.append_transcript_entry(entry)
+    else:
+        options = (
+            {"fork_before_message_id": future.message_id}
+            if fork_mode == "before_message"
+            else {"fork_through_turn_id": "prefix-attachment-turn"}
+        )
+        child = await manager.branch(
+            parent.session_key,
+            child_key,
+            fork_transcript=True,
+            **options,
+        )
+
+    child_entries = await manager.get_canonical_transcript(child.session_key)
+    assert len(child_entries) == 2
+    assert {entry.message_id for entry in child_entries}.isdisjoint(
+        {image_entry.message_id, answer_entry.message_id, future.message_id}
+    )
+    assert child_entries[1].content == reference_text
+    copied_envelope = json.loads(child_entries[0].content)
+    original_envelope = json.loads(image_content)
+    for original, copied, attachment_id in zip(
+        original_envelope["attachments"],
+        copied_envelope["attachments"],
+        attachment_ids,
+        strict=True,
+    ):
+        assert copied == {**original, "attachment_id": attachment_id}
+    parent_entries = await manager.get_canonical_transcript(parent.session_key)
+    assert next(
+        entry.content for entry in parent_entries if entry.message_id == image_entry.message_id
+    ) == image_content
+    child_manifest = build_attachment_manifest(
+        child_entries,
+        session_id=child.session_id,
+        session_key=child.session_key,
+    )
+    assert [item.attachment_id for item in child_manifest.occurrences] == attachment_ids
+    assert all(
+        item.source_message_id == child_entries[0].message_id
+        for item in child_manifest.occurrences
+    )
+
+    child_tail = await manager.append_message(child.session_key, "user", "child continuation")
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        reference_text,
+        [{"role": "user", "content": child_tail.content}],
+        compaction_id="cmp-prefix-attachment-child",
+    )
+    states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    compacted_manifest = attachment_manifest_from_context_state(
+        max(states, key=lambda state: (state.created_at, state.id or 0))
+    )
+    assert [item.attachment_id for item in compacted_manifest.occurrences] == attachment_ids
+    nested = await manager.branch(
+        child.session_key,
+        "agent:main:prefix-attachment-nested",
+        fork_transcript=True,
+        fork_before_message_id=child_tail.message_id,
+    )
+    nested_entries = await manager.get_canonical_transcript(nested.session_key)
+    nested_manifest = build_attachment_manifest(
+        nested_entries,
+        session_id=nested.session_id,
+        session_key=nested.session_key,
+    )
+    assert [item.attachment_id for item in nested_manifest.occurrences] == attachment_ids
+    assert nested_entries[0].message_id != child_entries[0].message_id
+
+
+@pytest.mark.asyncio
+async def test_full_fork_preserves_attachment_message_id_for_manifest_rebuild(
+    manager,
+) -> None:
+    parent = await manager.create("agent:main:attachment-fork-parent")
+    await manager.append_message(parent.session_key, "user", "old request")
+    await manager.append_message(parent.session_key, "assistant", "old answer")
+    image_content = json.dumps(
+        {
+            "text": "inspect this image",
+            "attachments": [
+                {
+                    "attachment_id": "att_full_fork_image_123",
+                    "type": "image/png",
+                    "name": "fork.png",
+                    "data": "Zm9yay1pbWFnZQ==",
+                }
+            ],
+        }
+    )
+    parent_image = await manager.append_message(
+        parent.session_key,
+        "user",
+        image_content,
+        message_id="message-full-fork-image",
+    )
+    assert await manager.persist_compaction_result(
+        parent.session_key,
+        "older parent context",
+        [{"role": "user", "content": image_content}],
+        compaction_id="cmp-parent-attachment-fork",
+    )
+    parent_states = await manager.get_context_states(parent.session_key)
+    parent_manifest_state = next(
+        state
+        for state in parent_states
+        if state.state_kind == ATTACHMENT_MANIFEST_STATE_KIND
+    )
+    [parent_occurrence] = attachment_manifest_from_context_state(
+        parent_manifest_state
+    ).occurrences
+    assert parent_occurrence.source_message_id == parent_image.message_id
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:attachment-fork-child",
+        fork_transcript=True,
+    )
+    [child_image] = await manager.get_transcript(child.session_key)
+    assert child_image.message_id == parent_image.message_id
+    await manager.append_message(child.session_key, "assistant", "child latest")
+
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        "child image context",
+        [{"role": "assistant", "content": "child latest"}],
+        compaction_id="cmp-child-attachment-fork",
+    )
+    child_states = await manager.get_context_states(child.session_key)
+    child_manifest_state = next(
+        state
+        for state in child_states
+        if state.state_kind == ATTACHMENT_MANIFEST_STATE_KIND
+    )
+    [child_occurrence] = attachment_manifest_from_context_state(
+        child_manifest_state
+    ).occurrences
+    assert child_occurrence.attachment_id == "att_full_fork_image_123"
+    assert child_occurrence.source_message_id == parent_image.message_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archived", [False, True])
+async def test_full_fork_preserves_legacy_attachment_id_from_compacted_archive(
+    manager,
+    archived: bool,
+) -> None:
+    parent = await manager.create("agent:main:legacy-attachment-fork-parent")
+    image_content = json.dumps(
+        {
+            "text": "inspect this legacy image",
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "name": "legacy-fork.png",
+                    "data": "bGVnYWN5LWZvcms=",
+                }
+            ],
+        }
+    )
+    parent_image = await manager.append_message(
+        parent.session_key,
+        "user",
+        image_content,
+        message_id="message-legacy-full-fork-image",
+    )
+    await manager.append_message(parent.session_key, "assistant", "old answer")
+    await manager.append_message(parent.session_key, "user", "active tail")
+    parent_manifest = build_attachment_manifest(
+        await manager.get_canonical_transcript(parent.session_key),
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+    )
+    [parent_occurrence] = parent_manifest.occurrences
+
+    await manager.save_context_state(manifest_context_state(parent_manifest))
+    if archived:
+        assert await manager.persist_compaction_result(
+            parent.session_key,
+            f"legacy image attachment_id={parent_occurrence.attachment_id}",
+            [{"role": "user", "content": "active tail"}],
+            compaction_id="cmp-parent-legacy-attachment-fork",
+        )
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:legacy-attachment-fork-child",
+        fork_transcript=True,
+    )
+
+    child_canonical = await manager.get_canonical_transcript(child.session_key)
+    child_image = next(
+        entry for entry in child_canonical if entry.message_id == parent_image.message_id
+    )
+    assert child_image.message_id == parent_image.message_id
+    assert json.loads(child_image.content)["attachments"][0]["attachment_id"] == (
+        parent_occurrence.attachment_id
+    )
+    parent_canonical = await manager.get_canonical_transcript(parent.session_key)
+    unchanged_parent_image = next(
+        entry for entry in parent_canonical if entry.message_id == parent_image.message_id
+    )
+    assert unchanged_parent_image.content == image_content
+    child_manifest = build_attachment_manifest(
+        child_canonical,
+        session_id=child.session_id,
+        session_key=child.session_key,
+    )
+
+    assert [item.attachment_id for item in child_manifest.occurrences] == [
+        parent_occurrence.attachment_id
+    ]
+    child_states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    copied_manifest = attachment_manifest_from_context_state(
+        max(child_states, key=lambda state: (state.created_at, state.id or 0))
+    )
+    assert copied_manifest.by_id(parent_occurrence.attachment_id) is not None
+
+    await manager.append_message(child.session_key, "assistant", "child answer")
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        f"legacy image attachment_id={parent_occurrence.attachment_id}",
+        [{"role": "assistant", "content": "child answer"}],
+        compaction_id="cmp-child-legacy-attachment-fork",
+    )
+    compacted_child_states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    compacted_child_manifest = attachment_manifest_from_context_state(
+        max(
+            compacted_child_states,
+            key=lambda state: (state.created_at, state.id or 0),
+        )
+    )
+    assert [
+        (
+            item.attachment_id,
+            item.source_message_id,
+            item.ordinal,
+        )
+        for item in compacted_child_manifest.occurrences
+    ] == [
+        (
+            parent_occurrence.attachment_id,
+            parent_image.message_id,
+            0,
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -2225,7 +2598,6 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
             "removed_count",
             "kept_count",
             "chunk_count",
-            "flush_receipt_status",
         }.issubset(columns)
 
         summary = await storage.get_latest_summary("legacy-session")
@@ -2244,7 +2616,6 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
         assert summary.removed_count == 0
         assert summary.kept_count == 0
         assert summary.chunk_count == 0
-        assert summary.flush_receipt_status == "unknown"
     finally:
         await storage.close()
 
@@ -2307,6 +2678,7 @@ async def test_legacy_summary_database_compacts_and_replays_after_restart(tmp_pa
         node.session_key,
         context_window_tokens=1000,
         compaction_id="cmp-legacy-upgrade-replacement",
+        config=synthetic_compaction_config(),
     )
     assert result.removed_count > 0
     assert result.summary_payload is not None
@@ -2602,7 +2974,9 @@ async def test_compact_reduces_transcript(manager):
     # Add many large messages
     for i in range(20):
         await manager.append_message("agent:main:main", "user", "x" * 500, token_count=200)
-    summary = await manager.compact("agent:main:main", context_window_tokens=1000)
+    summary = await manager.compact(
+        "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+    )
     assert summary != ""
     node = await manager._storage.get_session("agent:main:main")
     assert node.compaction_count == 1
@@ -2625,10 +2999,12 @@ async def test_compact_with_result_returns_source_and_persists(manager):
         )
     original_contents = [entry.content for entry in await manager.get_transcript("agent:main:main")]
 
-    result = await manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+    result = await manager.compact_with_result(
+        "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+    )
 
     assert result.summary
-    assert result.summary_source == "fallback"
+    assert result.summary_source == "llm"
     node = await manager._storage.get_session("agent:main:main")
     assert node.compaction_count == 1
     transcript = await manager.get_transcript("agent:main:main")
@@ -2813,7 +3189,7 @@ async def test_compact_with_result_singleflight_shares_generation_and_commit(
         "_acquire_compaction_singleflight",
         track_acquire,
     )
-    shared_config = CompactionConfig()
+    shared_config = synthetic_compaction_config()
 
     owner = asyncio.create_task(
         manager.compact_with_result(
@@ -2887,11 +3263,15 @@ async def test_compact_with_result_singleflight_waiter_cancel_does_not_cancel_ow
     )
 
     owner = asyncio.create_task(
-        manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+        manager.compact_with_result(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
     )
     await asyncio.wait_for(generation_started.wait(), timeout=1)
     waiter = asyncio.create_task(
-        manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+        manager.compact_with_result(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
     )
     await asyncio.wait_for(waiter_joined.wait(), timeout=1)
 
@@ -2941,6 +3321,7 @@ async def test_compact_with_result_skips_rewrite_when_transcript_changes(manager
         "agent:main:main",
         context_window_tokens=1000,
         mutation_context=mutation_context,
+        config=synthetic_compaction_config(),
     )
 
     assert result.summary == ""
@@ -2955,7 +3336,63 @@ async def test_compact_with_result_skips_rewrite_when_transcript_changes(manager
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(manager):
+@pytest.mark.parametrize(
+    ("rotate_on_entry", "operation"),
+    [(1, "compaction snapshot"), (2, "compaction commit")],
+)
+async def test_compact_with_result_rejects_owner_rotated_at_exact_boundaries(
+    manager,
+    tmp_path,
+    monkeypatch,
+    rotate_on_entry,
+    operation,
+):
+    key = "agent:main:main"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await manager.create(key)
+    for i in range(20):
+        await manager.append_message(
+            key,
+            "user",
+            f"msg {i} " + ("x" * 500),
+            token_count=200,
+        )
+    context_entries = 0
+    replacement = None
+
+    @contextlib.asynccontextmanager
+    async def mutation_context():
+        nonlocal context_entries, replacement
+        context_entries += 1
+        if context_entries == rotate_on_entry:
+            replacement, rotated = await manager.apply_intent(
+                key,
+                SessionIntent.RESET_SAME_KEY,
+            )
+            assert rotated is True
+        yield
+
+    with pytest.raises(StaleEpochError, match=operation):
+        await manager.compact_with_result(
+            key,
+            context_window_tokens=1000,
+            mutation_context=mutation_context,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+            config=synthetic_compaction_config(),
+        )
+
+    assert replacement is not None
+    current = await manager.get_session(key)
+    assert current is not None
+    assert current.session_id == replacement.session_id
+    assert current.compaction_count == 0
+    assert await manager.get_transcript(key) == []
+    assert await manager.get_summaries(key) == []
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_preserves_canonical_history(manager):
     await manager.create("agent:main:main")
     for i in range(20):
         await manager.append_message(
@@ -2969,12 +3406,10 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1000,
-        flush_receipt_status="unsafe",
+        config=synthetic_compaction_config(),
     )
 
     assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "degraded_forensic"
     canonical_contents = [
         entry.content for entry in await manager.get_canonical_transcript("agent:main:main")
     ]
@@ -2982,106 +3417,31 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
 
 
 @pytest.mark.asyncio
-async def test_degraded_compaction_preimage_can_be_listed_for_repair(manager):
+async def test_compaction_archive_remains_readable(manager):
     await manager.create("agent:main:main")
     for i in range(20):
         await manager.append_message(
             "agent:main:main",
             "user",
-            f"repair msg {i} " + ("x" * 500),
+            f"archived msg {i} " + ("x" * 500),
             token_count=200,
         )
 
     await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1000,
-        flush_receipt_status="degraded_forensic",
+        config=synthetic_compaction_config(),
     )
 
-    pending = await manager.list_degraded_compactions(agent_id="main")
-    assert len(pending) == 1
-    assert pending[0].flush_receipt_status == "degraded_forensic"
-    preimage = await manager.get_compaction_preimage(pending[0])
-    assert preimage
-    assert preimage[0].content.startswith("repair msg 0")
-    await manager.mark_compaction_repair_status(pending[0], "repaired")
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_compaction_flush_status_can_be_backfilled_by_compaction_id(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"background flush msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        compaction_id="cmp-bg-flush",
-        flush_receipt_status="degraded_forensic",
-    )
-
-    updated = await manager.mark_compaction_flush_receipt_status(
-        "agent:main:main",
-        "cmp-bg-flush",
-        "safe",
-    )
-
-    assert updated == 1
     summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "safe"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_noop_memory_flush_compaction_status_does_not_enter_repair_queue(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"noop msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    result = await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        flush_receipt_status="noop_no_memory",
+    assert len(summaries) == 1
+    assert summaries[0].compaction_id is not None
+    archived = await manager._storage.get_compacted_transcript_entries(
+        session_id=summaries[0].session_id,
+        compaction_id=summaries[0].compaction_id,
     )
-
-    assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "noop_no_memory"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
-
-
-@pytest.mark.asyncio
-async def test_archive_only_memory_flush_compaction_status_does_not_enter_repair_queue(manager):
-    await manager.create("agent:main:main")
-    for i in range(20):
-        await manager.append_message(
-            "agent:main:main",
-            "user",
-            f"archive msg {i} " + ("x" * 500),
-            token_count=200,
-        )
-
-    result = await manager.compact_with_result(
-        "agent:main:main",
-        context_window_tokens=1000,
-        flush_receipt_status="archive_only",
-    )
-
-    assert result.removed_count > 0
-    summaries = await manager.get_summaries("agent:main:main")
-    assert summaries[0].flush_receipt_status == "archive_only"
-    assert await manager.list_degraded_compactions(agent_id="main") == []
+    assert archived
+    assert archived[0].content.startswith("archived msg 0")
 
 
 @pytest.mark.asyncio
@@ -3138,7 +3498,7 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1_200,
-        config=CompactionConfig(safety_margin=1.2),
+        config=synthetic_compaction_config(safety_margin=1.2),
     )
 
     assert result.removed_count > 0
@@ -3171,6 +3531,7 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_compact_with_result_strict_coverage_installs_verified_backfill(manager):
     node = await manager.create("agent:main:main")
@@ -3193,7 +3554,7 @@ async def test_compact_with_result_strict_coverage_installs_verified_backfill(ma
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=300,
-        config=CompactionConfig(safety_margin=1.0, coverage_blocking=True),
+        config=synthetic_compaction_config(safety_margin=1.0, coverage_blocking=True),
     )
 
     assert result.removed_count > 0
@@ -3215,13 +3576,24 @@ async def test_compact_with_result_strict_coverage_installs_verified_backfill(ma
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_writes_portable_context_state(manager):
+@pytest.mark.parametrize("fallback_tokenizer", [False, True])
+async def test_compact_with_result_writes_portable_context_state(
+    manager, monkeypatch, fallback_tokenizer,
+):
+    from opensquilla import token_estimation
+
+    if fallback_tokenizer:
+        monkeypatch.setattr(
+            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
+        )
+    # Keep pressure above the window while allowing the portable payload to fit
+    # with either the normal tokenizer or the conservative offline estimator.
     await manager.create("agent:main:main")
     await manager.append_message(
         "agent:main:main",
         "user",
         "Goal: keep portable state. File src/opensquilla/session/models.py.",
-        token_count=250,
+        token_count=1500,
     )
     for i in range(8):
         await manager.append_message(
@@ -3233,8 +3605,8 @@ async def test_compact_with_result_writes_portable_context_state(manager):
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=300,
-        config=CompactionConfig(safety_margin=1.0),
+        context_window_tokens=1000,
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
 
     states = await manager.get_context_states("agent:main:main")
@@ -3298,7 +3670,7 @@ async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(mana
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=500,
-        config=CompactionConfig(safety_margin=1.0),
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
 
     assert result.removed_count == 2
@@ -3337,7 +3709,7 @@ async def test_compact_counts_tool_calls_when_token_count_is_underreported(manag
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=300,
-        config=CompactionConfig(
+        config=synthetic_compaction_config(
             safety_margin=1.0,
             # This test isolates the wire-token estimator. Default production
             # policy correctly retains the unresolved tool call as raw state.
@@ -3404,7 +3776,9 @@ async def test_compact_rewrite_failure_keeps_session_state_atomic(
     _fail_next_summary_insert(monkeypatch, manager._storage)
 
     with pytest.raises(RuntimeError, match="rewrite insert failed"):
-        await manager.compact("agent:main:main", context_window_tokens=1000)
+        await manager.compact(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
 
     assert await manager.get_transcript("agent:main:main") == original_transcript
     assert (
@@ -3426,7 +3800,26 @@ async def test_persist_compaction_result_rewrite_failure_keeps_session_state_ato
     monkeypatch: pytest.MonkeyPatch,
 ):
     node = await manager.create("agent:main:main")
-    for index in range(4):
+    await manager.append_message(
+        node.session_key,
+        "user",
+        json.dumps(
+            {
+                "text": "image before failed rewrite",
+                "attachments": [
+                    {
+                        "attachment_id": "att_atomic_rollback_123",
+                        "type": "image/png",
+                        "name": "rollback.png",
+                        "data": "aW1hZ2U=",
+                    }
+                ],
+            }
+        ),
+        message_id="message-atomic-image",
+        token_count=5,
+    )
+    for index in range(1, 4):
         await manager.append_message("agent:main:main", "user", f"msg {index}", token_count=5)
     original_transcript = await manager.get_transcript("agent:main:main")
     original_canonical_transcript = await manager.get_canonical_transcript("agent:main:main")
@@ -3657,6 +4050,120 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
     assert states[0].state_kind == "structured_summary_v1"
     assert states[0].payload is not None
     assert states[0].payload["compaction_id"] == "cmp_inline_1"
+
+
+@pytest.mark.asyncio
+async def test_compaction_atomically_persists_attachment_manifest_with_summary(
+    manager,
+) -> None:
+    node = await manager.create("agent:main:attachment-compaction")
+    image_data = "aW1hZ2UtYnl0ZXM="
+    await manager.append_message(
+        node.session_key,
+        "user",
+        json.dumps(
+            {
+                "text": "inspect this image",
+                "attachments": [
+                    {
+                        "attachment_id": "att_compaction_image_123",
+                        "path": "/private/tmp/material/image.png",
+                        "type": "image/png",
+                        "name": "diagram.png",
+                        "data": image_data,
+                    }
+                ],
+            }
+        ),
+        message_id="message-image",
+    )
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    await manager.append_message(node.session_key, "user", "follow up")
+    await manager.append_message(node.session_key, "assistant", "latest reply")
+
+    await manager.persist_compaction_result(
+        node.session_key,
+        "image discussion summary",
+        [{"role": "assistant", "content": "latest reply"}],
+        compaction_id="cmp-image",
+    )
+
+    active = await manager.get_transcript(node.session_key)
+    canonical = await manager.get_canonical_transcript(node.session_key)
+    states = await manager.get_context_states(node.session_key)
+    states_by_kind = {state.state_kind: state for state in states}
+
+    assert [entry.content for entry in active] == ["latest reply"]
+    assert any(image_data in entry.content for entry in canonical)
+    assert "structured_summary_v1" in states_by_kind
+    assert ATTACHMENT_MANIFEST_STATE_KIND in states_by_kind
+    manifest = attachment_manifest_from_context_state(
+        states_by_kind[ATTACHMENT_MANIFEST_STATE_KIND]
+    )
+    [occurrence] = manifest.occurrences
+    assert occurrence.attachment_id == "att_compaction_image_123"
+    assert occurrence.source_message_id == "message-image"
+    summaries = await manager.get_summaries(node.session_key)
+    assert len(summaries) == 1
+    assert summaries[0].summary_payload is not None
+    assert summaries[0].summary_payload["files_and_artifacts"] == []
+    assert occurrence.attachment_id in summaries[0].summary_payload[
+        "important_identifiers"
+    ]
+    serialized_summary = json.dumps(summaries[0].summary_payload, sort_keys=True)
+    assert "/private/tmp" not in serialized_summary
+    assert image_data not in serialized_summary
+    serialized_manifest = json.dumps(
+        states_by_kind[ATTACHMENT_MANIFEST_STATE_KIND].payload,
+        sort_keys=True,
+    )
+    assert image_data not in serialized_manifest
+    assert '"data"' not in serialized_manifest
+    assert '"path"' not in serialized_manifest
+
+
+@pytest.mark.asyncio
+async def test_attachment_manifest_build_failure_aborts_compaction_atomically(
+    manager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = await manager.create("agent:main:attachment-compaction-failure")
+    for index in range(4):
+        await manager.append_message(
+            node.session_key,
+            "user" if index % 2 == 0 else "assistant",
+            f"message {index}",
+        )
+    original_transcript = await manager.get_transcript(node.session_key)
+    original_canonical = await manager.get_canonical_transcript(node.session_key)
+    original_node = await manager.get_session(node.session_key)
+
+    def fail_manifest(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        raise ValueError("manifest collision")
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "_merge_attachment_manifest_state",
+        fail_manifest,
+    )
+
+    with pytest.raises(ValueError, match="manifest collision"):
+        await manager.persist_compaction_result(
+            node.session_key,
+            "summary must not commit",
+            [{"role": "assistant", "content": "message 3"}],
+            compaction_id="cmp-manifest-failure",
+        )
+
+    assert await manager.get_transcript(node.session_key) == original_transcript
+    assert await manager.get_canonical_transcript(node.session_key) == original_canonical
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    current_node = await manager.get_session(node.session_key)
+    assert current_node is not None
+    assert original_node is not None
+    assert current_node.compaction_count == original_node.compaction_count
 
 
 @pytest.mark.asyncio
@@ -3928,6 +4435,295 @@ async def test_inline_compaction_rejects_stale_source_without_partial_install(ma
 
 
 @pytest.mark.asyncio
+async def test_exact_transcript_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-transcript-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-transcript-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader.append_message(key, "user", "retired owner input")
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_transcript = reader_storage.get_transcript
+
+    async def paused_get_transcript(*args: Any, **kwargs: Any):
+        rows = await original_get_transcript(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(reader_storage, "get_transcript", paused_get_transcript)
+    read_task = asyncio.create_task(
+        reader.get_transcript(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await resetter.append_message(key, "user", "replacement input")
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="transcript read"):
+            await read_task
+
+        current = await resetter.get_session(key)
+        assert current is not None
+        assert current.session_id == replacement.session_id
+        assert [entry.content for entry in await resetter.get_transcript(key)] == [
+            "replacement input"
+        ]
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_summary_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-summary-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-summary-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader_storage.save_summary(
+        SessionSummary(
+            session_id=admitted.session_id,
+            session_key=key,
+            summary_text="retired owner summary",
+        )
+    )
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_all_summaries = reader_storage.get_all_summaries
+
+    async def paused_get_all_summaries(*args: Any, **kwargs: Any):
+        rows = await original_get_all_summaries(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(
+        reader_storage,
+        "get_all_summaries",
+        paused_get_all_summaries,
+    )
+    read_task = asyncio.create_task(
+        reader.get_summaries(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_summary(
+            SessionSummary(
+                session_id=replacement.session_id,
+                session_key=key,
+                summary_text="replacement owner summary",
+            )
+        )
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="summary read"):
+            await read_task
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_context_state_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-context-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-context-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader_storage.save_context_state(
+        SessionContextState(
+            session_id=admitted.session_id,
+            session_key=key,
+            state_kind="structured_summary_v1",
+            payload={"owner": "retired"},
+            portable=True,
+        )
+    )
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_context_states = reader_storage.get_context_states
+
+    async def paused_get_context_states(*args: Any, **kwargs: Any):
+        rows = await original_get_context_states(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(
+        reader_storage,
+        "get_context_states",
+        paused_get_context_states,
+    )
+    read_task = asyncio.create_task(
+        reader.get_context_states(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_context_state(
+            SessionContextState(
+                session_id=replacement.session_id,
+                session_key=key,
+                state_kind="structured_summary_v1",
+                payload={"owner": "replacement"},
+                portable=True,
+            )
+        )
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="context-state read"):
+            await read_task
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_exact_owner_rejects_reset_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "inline-compaction-owner-reset.db"
+    writer_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    await reset_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:inline-owner-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await writer.create(key)
+    await writer.append_message(key, "user", "old question")
+    active = await writer.append_message(key, "user", "active request")
+    source = await writer.capture_compaction_source(
+        key,
+        boundary_message_id=active.message_id,
+        expected_session_id=admitted.session_id,
+        expected_session_epoch=int(admitted.epoch or 0),
+    )
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_rewrite = writer_storage.rewrite_compacted_session
+
+    async def paused_rewrite(**kwargs: Any):
+        commit_started.set()
+        await release_commit.wait()
+        return await original_rewrite(**kwargs)
+
+    monkeypatch.setattr(writer_storage, "rewrite_compacted_session", paused_rewrite)
+    persist_task = asyncio.create_task(
+        writer.persist_compaction_result(
+            key,
+            "retired owner summary",
+            [{"role": "user", "content": "active request"}],
+            removed_count=1,
+            source_entries=source.entries,
+            source_preimage=source.preimage,
+            source_boundary_message_id=source.boundary_message_id,
+            source_boundary_entry_id=source.boundary_entry_id,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(commit_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await resetter.append_message(key, "user", "replacement input")
+        release_commit.set()
+
+        with pytest.raises(StaleEpochError, match="owner mismatch"):
+            await persist_task
+
+        current = await resetter.get_session(key)
+        assert current is not None
+        assert current.session_id == replacement.session_id
+        assert current.compaction_count == 0
+        assert [entry.content for entry in await resetter.get_transcript(key)] == [
+            "replacement input"
+        ]
+        assert await reset_storage.get_all_summaries(replacement.session_id) == []
+    finally:
+        release_commit.set()
+        if not persist_task.done():
+            persist_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await persist_task
+        await reset_storage.close()
+        await writer_storage.close()
+
+
+@pytest.mark.asyncio
 async def test_canonical_transcript_page_crosses_multiple_compaction_boundaries(manager):
     node = await manager.create("agent:main:main")
     for index in range(10):
@@ -4102,6 +4898,129 @@ async def test_canonical_transcript_page_reads_one_snapshot_during_compaction(
         "snapshot-2",
         "snapshot-3",
     ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_page_rejects_unknown_and_cross_session_cursors(manager):
+    first = await manager.create("agent:main:webchat:cursor-a")
+    second = await manager.create("agent:main:webchat:cursor-b")
+    await manager.append_message(first.session_key, "user", "first")
+    await manager.append_message(second.session_key, "user", "second")
+    anchor = (await manager.get_transcript(first.session_key))[0]
+    assert anchor.id is not None
+
+    for cursor in ((anchor.created_at, anchor.id), (9_999_999, 9_999_999)):
+        with pytest.raises(HistoryCursorInvalidatedError):
+            await manager.get_canonical_transcript_page(
+                second.session_key,
+                limit=10,
+                before=cursor,
+            )
+
+
+@pytest.mark.asyncio
+async def test_canonical_page_keeps_unaddressable_legacy_archive_rows(manager):
+    node = await manager.create("agent:main:webchat:legacy-cursor")
+    await manager._storage.conn.execute(
+        """
+        INSERT INTO compacted_transcript_entries (
+            session_id, session_key, original_entry_id, message_id, role,
+            content, created_at, archived_at, schema_version
+        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node.session_id,
+            node.session_key,
+            "legacy-message",
+            "user",
+            "legacy content",
+            10,
+            20,
+            1,
+        ),
+    )
+    await manager._storage.conn.commit()
+
+    page = await manager.get_canonical_transcript_page(node.session_key, limit=10)
+
+    assert [entry.content for entry in page.entries] == ["legacy content"]
+    assert page.entries[0].id is None
+    assert page.canonical_complete is False
+
+
+@pytest.mark.asyncio
+async def test_cursor_validation_and_page_share_one_sqlite_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "history-cursor-snapshot.db"
+    writer_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    node = await writer.create("agent:main:webchat:cursor-snapshot")
+    for index in range(3):
+        await writer_storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id=f"snapshot-{index}",
+                role="user",
+                content=f"message {index}",
+                created_at=1_000 + index,
+            )
+        )
+    anchor = (await writer.get_transcript(node.session_key))[0]
+    assert anchor.id is not None
+
+    reader_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    original_execute = reader_storage.conn.execute
+    deletion_injected = False
+
+    async def delete_after_snapshot() -> None:
+        nonlocal deletion_injected
+        if deletion_injected:
+            return
+        await writer_storage.delete_transcript(node.session_id)
+        deletion_injected = True
+
+    class DeleteAfterFetch:
+        def __init__(self, delegate: Any) -> None:
+            self._delegate = delegate
+            self._cursor: Any = None
+
+        async def __aenter__(self):
+            self._cursor = await self._delegate.__aenter__()
+            return self
+
+        async def fetchall(self):
+            rows = await self._cursor.fetchall()
+            await delete_after_snapshot()
+            return rows
+
+        async def __aexit__(self, *args: Any):
+            return await self._delegate.__aexit__(*args)
+
+    def execute(sql: str, params: Any = ()):
+        result = original_execute(sql, params)
+        if "WITH cursor_anchor AS" in " ".join(sql.split()):
+            return DeleteAfterFetch(result)
+        return result
+
+    monkeypatch.setattr(reader_storage.conn, "execute", execute)
+    try:
+        entries, has_more = await reader_storage.get_canonical_transcript_page(
+            node.session_id,
+            limit=10,
+            after=(anchor.created_at, anchor.id),
+        )
+    finally:
+        await reader_storage.close()
+        await writer_storage.close()
+
+    assert deletion_injected is True
+    assert has_more is False
+    assert [entry.message_id for entry in entries] == ["snapshot-1", "snapshot-2"]
 
 
 @pytest.mark.asyncio
@@ -4296,3 +5215,351 @@ async def test_archive(manager):
     await manager.archive("agent:main:main")
     node = await manager._storage.get_session("agent:main:main")
     assert node.status == SessionStatus.DONE
+
+
+@pytest.mark.parametrize("failure", [None, "empty", "length", "missing_done", "oversized", "error"])
+async def test_suffix_manual_compaction_preserves_sqlite_source_until_valid_summary(
+    manager, monkeypatch, failure
+):
+    from opensquilla.provider.types import (
+        ChatConfig,
+        DoneEvent,
+        ErrorEvent,
+        TextDeltaEvent,
+        ToolDefinition,
+    )
+    from opensquilla.session.compaction import CompactionRequestContext
+    from opensquilla.session.compaction_deployment import (
+        CompactionExecutionPlan,
+        CompactionExecutionTarget,
+    )
+
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    node = await manager.create("agent:test:suffix-manual")
+    for index in range(12):
+        await manager.append_message(
+            node.session_key,
+            "user" if index % 2 == 0 else "assistant",
+            f"Historical exchange {index}. " + "Routine context. " * 50,
+            token_count=250,
+        )
+    before = await manager.get_transcript(node.session_key)
+    requests = []
+
+    class CapturingProvider:
+        async def chat(self, messages, tools=None, config=None):
+            requests.append((messages, tools, config))
+            if failure == "error":
+                yield ErrorEvent(message="synthetic provider failure")
+                return
+            if failure != "empty":
+                yield TextDeltaEvent(
+                    text=("Long summary. " * 2000 if failure == "oversized" else
+                          "The historical exchanges are complete. No outstanding work.")
+                )
+            if failure != "missing_done":
+                yield DoneEvent(
+                    stop_reason="length" if failure == "length" else "end_turn",
+                    output_tokens=32,
+                )
+
+    config = CompactionConfig(
+        llm_plan=CompactionExecutionPlan(candidates=(CompactionExecutionTarget(
+            provider=CapturingProvider(), provider_id="test", model="current-model",
+            context_window_tokens=20_000,
+        ),)),
+        request_context=CompactionRequestContext(
+            chat_config=ChatConfig(system="Current system", max_tokens=4096, thinking=True),
+            tools=(ToolDefinition(name="lookup", description="Find facts", input_schema={}),),
+        ),
+        protected_recent_messages=2,
+    )
+    result = await manager.compact_with_result(
+        node.session_key, context_window_tokens=1000, config=config, trigger_reason="manual",
+    )
+    assert len(requests) == 1
+    messages, tools, sent_config = requests[0]
+    assert sent_config.system == "Current system"
+    assert sent_config.max_tokens == 4096
+    assert tools[0].name == "lookup"
+    assert "portable checkpoint" in messages[-1].content
+    after = await manager.get_transcript(node.session_key)
+    summaries = await manager.get_summaries(node.session_key)
+    async with manager._storage.conn.execute(
+        "SELECT message_id, content FROM compacted_transcript_entries "
+        "WHERE session_id = ? ORDER BY original_entry_id", (node.session_id,),
+    ) as cursor:
+        archived = await cursor.fetchall()
+    if failure:
+        assert result.removed_count == 0
+        assert [entry.model_dump() for entry in after] == [entry.model_dump() for entry in before]
+        assert summaries == []
+        assert archived == []
+    else:
+        assert result.removed_count > 0
+        assert [message.content for message in messages[:-1]] == [
+            entry.content for entry in before[:result.removed_count]
+        ]
+        assert [entry.message_id for entry in after] == [
+            entry.message_id for entry in before[result.removed_count:]
+        ]
+        assert [(row[0], row[1]) for row in archived] == [
+            (entry.message_id, entry.content) for entry in before[:result.removed_count]
+        ]
+        assert len(summaries) == 1
+        replay = format_compaction_summary_context([summaries[0].summary_text])
+        assert "historical exchanges are complete" in replay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["missing_fact", "oversized", "malformed", "empty", "header"])
+async def test_precomputed_compaction_revalidates_claimed_pass_without_removing_rows(
+    manager, invalid,
+):
+    node = await manager.create("agent:main:untrusted-candidate")
+    content = (
+        "Preserve src/required_checkpoint.py." if invalid == "missing_fact" else "Earlier work."
+    )
+    await manager.append_message(node.session_key, "user", content)
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Continue current work.")
+    before = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    payload = StructuredCompactionSummary(
+        current_status="x" * 16_553 if invalid == "oversized" else "Earlier work complete.",
+        source_coverage={"status": "pass", "checked_obligations": 0},
+    ).model_dump(mode="json")
+    if invalid == "malformed":
+        payload["files_and_artifacts"] = "invalid-list"
+    if invalid == "header":
+        payload["current_status"] = ""
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        " " if invalid == "empty" else "Claimed complete summary.",
+        [{"role": "user", "content": "Continue current work."}],
+        summary_payload=payload, summary_format="structured_v1", coverage_status="pass",
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+
+    assert installed is False
+    assert await manager.get_transcript(node.session_key) == before
+    assert await manager.get_canonical_transcript(node.session_key) == before
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    assert (await manager.get_session(node.session_key)).compaction_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["none", "missing_proof", "before_persist", "at_commit", "lost_fact"],
+)
+async def test_precomputed_summary_replacement_checks_source_context_and_commit_cas(
+    manager, monkeypatch, change,
+):
+    node = await manager.create("agent:main:replace-checkpoint")
+    prior = "Earlier work touched src/required_checkpoint.py."
+    old_summary = await manager._storage.save_summary(SessionSummary(
+        session_id=node.session_id, session_key=node.session_key,
+        summary_text=prior, covered_through_id=0,
+    ))
+    await manager.append_message(node.session_key, "user", "Earlier exchange.")
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Continue current work.")
+    source = await manager.capture_compaction_source(node.session_key)
+    before = await manager.get_transcript(node.session_key)
+    payload = StructuredCompactionSummary(
+        current_status="Earlier work complete." if change == "lost_fact" else prior,
+        source_coverage={"status": "pass", "replaces_prior_context": True},
+    ).model_dump(mode="json")
+
+    async def change_context():
+        await manager._storage.save_summary(SessionSummary(
+            session_id=node.session_id, session_key=node.session_key,
+            summary_text="Concurrent checkpoint.", covered_through_id=0,
+        ))
+
+    if change == "before_persist":
+        await change_context()
+    if change == "at_commit":
+        rewrite = manager._storage.rewrite_compacted_session
+
+        async def concurrent_rewrite(**kwargs):
+            await change_context()
+            return await rewrite(**kwargs)
+
+        monkeypatch.setattr(manager._storage, "rewrite_compacted_session", concurrent_rewrite)
+
+    installed = await manager.persist_compaction_result(
+        node.session_key, payload["current_status"],
+        [{"role": "user", "content": "Continue current work."}],
+        summary_payload=payload, summary_format="structured_v1", coverage_status="pass",
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=(
+            None if change == "missing_proof" else source.context_fingerprint
+        ),
+    )
+
+    assert installed is (change == "none")
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[0].id == old_summary.id
+    assert summaries[0].summary_text == prior
+    assert await manager.get_canonical_transcript(node.session_key) == before
+    if installed:
+        assert await manager.get_transcript(node.session_key) == before[2:]
+        assert len(summaries) == 2
+        assert summaries[-1].coverage_status == "pass"
+        assert summaries[-1].summary_payload["source_coverage"]["checked_obligations"] > 0
+        assert "src/required_checkpoint.py" in summaries[-1].summary_text
+    else:
+        assert await manager.get_transcript(node.session_key) == before
+        assert len(summaries) == (2 if change in {"before_persist", "at_commit"} else 1)
+        assert await manager.get_context_states(node.session_key) == []
+        assert (await manager.get_session(node.session_key)).compaction_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exceeds_total_replay_budget", [False, True])
+async def test_precomputed_append_validates_all_final_checkpoints(
+    manager, exceeds_total_replay_budget,
+):
+    node = await manager.create("agent:main:checkpoint-append-budget")
+    repeats = 650 if exceeds_total_replay_budget else 20
+    old_summary = await manager._storage.save_summary(SessionSummary(
+        session_id=node.session_id, session_key=node.session_key,
+        summary_text="old checkpoint " * repeats,
+    ))
+    await manager.append_message(node.session_key, "user", "Earlier task.")
+    await manager.append_message(node.session_key, "assistant", "Earlier answer.")
+    await manager.append_message(node.session_key, "user", "Current task.")
+    original = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    candidate = StructuredCompactionSummary(
+        current_status="new checkpoint " * 600,
+        source_coverage={"status": "pass", "replaces_prior_context": False},
+    )
+    installed = await manager.persist_compaction_result(
+        node.session_key, candidate.current_status,
+        [{"role": "user", "content": "Current task."}],
+        summary_payload=candidate.model_dump(mode="json"), summary_format="structured_v1",
+        coverage_status="pass", removed_count=2, source_entries=source.entries,
+        source_preimage=source.preimage, source_context_fingerprint=source.context_fingerprint,
+    )
+
+    assert installed is not exceeds_total_replay_budget
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[0] == old_summary
+    records = build_compaction_context_records(
+        context_states=await manager.get_context_states(node.session_key), summaries=summaries,
+    )
+    texts = [record.text for record in records]
+    assert compaction_replay_is_complete(texts, format_compaction_summary_context(texts))
+    assert len(summaries) == (1 if exceeds_total_replay_budget else 2)
+    assert await manager.get_transcript(node.session_key) == (
+        original if exceeds_total_replay_budget else original[2:]
+    )
+    assert await manager.get_canonical_transcript(node.session_key) == original
+    assert (await manager.get_session(node.session_key)).compaction_count == int(installed)
+
+
+@pytest.mark.asyncio
+async def test_precomputed_summary_only_replacement_preserves_coverage_boundary(manager):
+    node = await manager.create("agent:main:summary-only-replacement")
+    await manager.append_message(node.session_key, "user", "Earlier work.")
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Current request.")
+    original = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    assert await manager.persist_compaction_result(
+        node.session_key, "Earlier work complete.",
+        [{"role": "user", "content": "Current request."}],
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+    prior_boundary = (await manager.get_summaries(node.session_key))[-1].covered_through_id
+    assert prior_boundary > 0
+
+    source = await manager.capture_compaction_source(node.session_key)
+    replacement = StructuredCompactionSummary(
+        current_status="Earlier work complete; continue the current request.",
+        source_coverage={"replaces_prior_context": True},
+    )
+    assert await manager.persist_compaction_result(
+        node.session_key, replacement.current_status,
+        [{"role": "user", "content": "Current request."}],
+        summary_format="structured_v1", summary_payload=replacement.model_dump(mode="json"),
+        removed_count=0, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[-1].covered_through_id == prior_boundary
+    records = build_compaction_context_records(
+        summaries=summaries, context_states=await manager.get_context_states(node.session_key),
+    )
+    assert len(records) == 1
+    assert replacement.current_status in records[0].text
+    assert await manager.get_transcript(node.session_key) == original[2:]
+    assert await manager.get_canonical_transcript(node.session_key) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid", "expected_reason"),
+    [
+        ("empty", "empty_summary"),
+        ("missing_fact", "coverage_blocked"),
+        ("oversized", "summary_replay_incomplete"),
+        ("boundary", "invalid_source_boundary"),
+        ("overrun", "invalid_source_boundary"),
+        ("tail", "invalid_source_boundary"),
+        ("consumer_reject", "consumer_admission_failed"),
+        ("consumer_stale", "consumer_admission_stale"),
+    ],
+)
+async def test_manager_final_candidate_gate_preserves_original_context(
+    manager, monkeypatch, invalid, expected_reason,
+):
+    node = await manager.create("agent:main:final-candidate")
+    content = (
+        "Preserve src/required_checkpoint.py." if invalid == "missing_fact" else "Earlier work."
+    )
+    await manager.append_message(node.session_key, "user", content)
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Current request.")
+    before = await manager.get_transcript(node.session_key)
+
+    async def candidate(request):
+        removed = 4 if invalid == "overrun" else 2
+        summary = (
+            "" if invalid == "empty"
+            else "x" * 16_553 if invalid == "oversized"
+            else "Earlier work complete."
+        )
+        return CompactionResult(
+            summary=summary,
+            kept_entries=[] if invalid == "tail" else request.entries[removed:],
+            removed_count=removed, kept_start_index=1 if invalid == "boundary" else removed,
+            chunks_processed=1, summary_source="llm", coverage_status="pass",
+        )
+
+    def admission(*_):
+        if invalid == "consumer_stale":
+            raise ConsumerAdmissionStaleError("consumer changed")
+        return False
+
+    monkeypatch.setattr(session_manager_module, "compact_context", candidate)
+    result = await manager.compact_with_result(
+        node.session_key, context_window_tokens=100_000,
+        consumer_admission=admission if invalid.startswith("consumer_") else None,
+    )
+
+    assert result.skip_reason == expected_reason
+    assert result.summary == ""
+    assert result.removed_count == result.kept_start_index == 0
+    assert result.replaced_previous_summary is False
+    assert await manager.get_transcript(node.session_key) == before
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    assert (await manager.get_session(node.session_key)).compaction_count == 0

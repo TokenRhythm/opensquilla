@@ -211,7 +211,9 @@ const winnerIndex = computed(() => (
 ))
 const winnerName = computed(() => winnerIndex.value >= 0 ? visualGridCells.value[winnerIndex.value]?.visualName || '' : '')
 const executionModelAnnouncement = computed(() => t(
-  'chat.routerFx.executionModel',
+  props.message.routerSettled || props.message.routerStatic
+    ? 'chat.routerFx.executionModelCompleted'
+    : 'chat.routerFx.executionModel',
   { model: executionModel.value },
 ))
 const visibleWinnerIndex = computed(() => {
@@ -415,7 +417,7 @@ function initializeMotion() {
     startScanning()
     return
   }
-  const shouldAnnounce = winnerIndex.value >= 0
+  const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value)
     && props.message.routerStatic !== true
     && props.message.routerObserve !== true
   settleStatic(shouldAnnounce)
@@ -430,8 +432,8 @@ watch([winnerIndex, executionModel], ([next, nextExecutionModel], [previous, pre
     !mounted
     || (next === previous && nextExecutionModel === previousExecutionModel)
   ) return
-  if (executionDiffersFromRoute.value) {
-    settleStatic(true)
+  if (executionDiffersFromRoute.value || nextExecutionModel !== previousExecutionModel) {
+    settleStatic(props.message.routerStatic !== true && props.message.routerObserve !== true)
     return
   }
   if (next < 0) return
@@ -451,7 +453,7 @@ watch(
   ],
   ([routerStatic, routerObserve, routerSettled, reduceMotion]) => {
     if (!mounted || (!routerStatic && !routerObserve && !routerSettled && !reduceMotion)) return
-    const shouldAnnounce = winnerIndex.value >= 0 && !routerStatic && !routerObserve
+    const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value) && !routerStatic && !routerObserve
     settleStatic(shouldAnnounce)
   },
 )

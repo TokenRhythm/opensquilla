@@ -40,7 +40,7 @@ from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider.ensemble import EnsembleMemberConfig, EnsembleProvider
 from opensquilla.provider.preset_registry import get_preset
-from opensquilla.provider.selector import ProviderConfig
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import ContentBlockImage, ProviderBillingReceipt
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
@@ -181,6 +181,41 @@ class _BlockingProvider:
             yield None
 
 
+class _CloseTrackedIterator:
+    def __init__(
+        self,
+        events: list[Any],
+        *,
+        block_after_events: bool = False,
+        block_close: bool = False,
+    ) -> None:
+        self._events = iter(events)
+        self._block_after_events = block_after_events
+        self._block_close = block_close
+        self.entered = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.close_calls = 0
+
+    def __aiter__(self) -> _CloseTrackedIterator:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._events)
+        except StopIteration:
+            if not self._block_after_events:
+                raise StopAsyncIteration from None
+        self.entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        if self._block_close:
+            await asyncio.Event().wait()
+
+
 class _SequenceProvider:
     provider_name = "fake"
 
@@ -268,6 +303,16 @@ class _PhysicalLegProvider(_SequenceProvider):
     def __init__(self, name: str, events: list[Any]) -> None:
         super().__init__([events])
         self.provider_name = name
+        self.message_calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.message_calls.append(messages)
+        return super().chat(messages, tools=tools, config=config)
 
 
 class _CorrelationCapturingPhysicalLegProvider(_PhysicalLegProvider):
@@ -380,7 +425,7 @@ class _CapturingTurnLog:
 
 
 @pytest.mark.asyncio
-async def test_selector_preflight_rejects_ensemble_image_before_usage_or_fallback() -> None:
+async def test_selector_projects_ensemble_image_and_accounts_fallback_call() -> None:
     sink = _RecordingSink()
     fallback = _PhysicalLegProvider(
         "anthropic",
@@ -395,12 +440,19 @@ async def test_selector_preflight_rejects_ensemble_image_before_usage_or_fallbac
     with bind_usage_accounting_scope(scope):
         events = [event async for event in wrapper.chat([_image_message()])]
 
-    assert [getattr(event, "code", "") for event in events] == [
-        "ensemble_multimodal_unsupported"
-    ]
-    assert fallback.calls == 0
-    assert sink.started == []
-    assert sink.finalized == []
+    assert not any(isinstance(event, ProviderError) for event in events)
+    assert any(isinstance(event, ProviderDone) for event in events)
+    assert fallback.calls == 1
+    assert len(fallback.message_calls) == 1
+    assert not any(
+        isinstance(block, ContentBlockImage)
+        for message in fallback.message_calls[0]
+        if isinstance(message.content, list)
+        for block in message.content
+    )
+    assert "图片未分析" in str(fallback.message_calls[0])
+    assert len(sink.started) == 1
+    assert len(sink.finalized) == 1
     assert sink.unknown == []
 
 
@@ -429,7 +481,7 @@ async def test_selector_does_not_project_usage_accounting_error_as_provider_fail
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_location", ["current", "history"])
 @pytest.mark.parametrize("wrapped_by_selector", [False, True])
-async def test_agent_preflight_rejects_ensemble_image_before_call_accounting(
+async def test_agent_projects_ensemble_image_and_accounts_physical_call(
     image_location: str,
     wrapped_by_selector: bool,
 ) -> None:
@@ -484,21 +536,27 @@ async def test_agent_preflight_rejects_ensemble_image_before_call_accounting(
         )
     ]
 
-    errors = [event for event in events if isinstance(event, ErrorEvent)]
-    assert [error.code for error in errors] == ["ensemble_multimodal_unsupported"]
-    assert fallback.calls == 0
-    assert sink.started == []
-    assert sink.finalized == []
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(isinstance(event, EngineDoneEvent) for event in events)
+    assert fallback.calls == 1
+    assert len(fallback.message_calls) == 1
+    assert not any(
+        isinstance(block, ContentBlockImage)
+        for sent_message in fallback.message_calls[0]
+        if isinstance(sent_message.content, list)
+        for block in sent_message.content
+    )
+    assert "图片未分析" in str(fallback.message_calls[0])
+    assert len(sink.started) == 1
+    assert len(sink.finalized) == 1
     assert sink.unknown == []
-    assert tracker.rows == []
-    assert observer_calls == []
+    assert len(tracker.rows) == 1
+    assert len(observer_calls) == 1
     assert "router_fallback_hops" not in turn_metadata
-    assert not any(record["kind"] == "llm_request" for record in turn_log.records)
-    [decision] = [
-        record for record in turn_log.records if record["kind"] == "turn_policy_decision"
-    ]
-    assert decision["payload"]["code"] == "ensemble_multimodal_unsupported"
-    assert "messages" not in decision["payload"]
+    kinds = [record["kind"] for record in turn_log.records]
+    assert "image_input_projection" in kinds
+    assert "llm_request" in kinds
+    assert "llm_response" in kinds
 
 
 @pytest.mark.asyncio
@@ -665,6 +723,80 @@ async def test_cancelled_provider_call_is_marked_unknown() -> None:
     assert sink.finalized == []
     assert len(sink.unknown) == 1
     assert sink.unknown[0][1] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_accounted_outer_aclose_closes_physical_stream_once_after_done() -> None:
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(sink=sink, context=_context())
+    physical = _CloseTrackedIterator(
+        [ProviderDone(input_tokens=2, output_tokens=1, model="model-a")],
+        block_after_events=True,
+    )
+
+    with bind_usage_accounting_scope(scope):
+        accounted = account_provider_stream(
+            lambda: physical,
+            provider="fake",
+            model="model-a",
+        )
+        event = await anext(accounted)
+        await accounted.aclose()
+        await accounted.aclose()
+
+    assert isinstance(event, ProviderDone)
+    assert physical.close_calls == 1
+    assert len(sink.finalized) == 1
+    assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+async def test_accounted_outer_aclose_without_scope_is_bounded_and_closes_once() -> None:
+    physical = _CloseTrackedIterator(
+        [ProviderText(text="partial")],
+        block_close=True,
+    )
+    accounted = account_provider_stream(
+        lambda: physical,
+        provider="fake",
+        model="model-a",
+        close_timeout=0.01,
+    )
+
+    assert isinstance(await anext(accounted), ProviderText)
+    await asyncio.wait_for(accounted.aclose(), timeout=0.1)
+    await accounted.aclose()
+
+    assert physical.close_started.is_set()
+    assert physical.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_accounted_outer_cancellation_closes_physical_stream_once() -> None:
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(sink=sink, context=_context())
+    physical = _CloseTrackedIterator([], block_after_events=True)
+
+    async def consume() -> None:
+        with bind_usage_accounting_scope(scope):
+            async for _ in account_provider_stream(
+                lambda: physical,
+                provider="fake",
+                model="model-a",
+            ):
+                pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(physical.entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert physical.close_calls == 1
+    assert sink.finalized == []
+    assert [(call.event_id, reason) for call, reason in sink.unknown] == [
+        (sink.started[0].event_id, "cancelled")
+    ]
 
 
 @pytest.mark.asyncio
@@ -1341,7 +1473,10 @@ async def test_direct_meta_llm_helper_records_usage_with_parent_attribution() ->
 
 
 @pytest.mark.asyncio
-async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplicate() -> None:
+@pytest.mark.parametrize("max_provider_retries", [0, 3])
+async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplicate(
+    monkeypatch, max_provider_retries
+) -> None:
     sink = _RecordingSink()
     fallback = _CorrelationCapturingPhysicalLegProvider(
         "anthropic",
@@ -1359,13 +1494,27 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
         "openai",
         [ProviderError(message="rate limited", code="429")],
     )
-    wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
+    primary_attempts = max_provider_retries + 1
+    primary.streams *= primary_attempts
+    monkeypatch.setattr(
+        "opensquilla.provider.selector._build_provider",
+        lambda config: primary if config.provider == "openai" else fallback,
+    )
+    selector = ModelSelector(SelectorConfig(
+        primary=ProviderConfig(provider="openai", model="primary-model", api_key="dummy"),
+        fallbacks=[ProviderConfig(
+            provider="anthropic", model="fallback-model", api_key="other-dummy"
+        )],
+    ))
+    wrapper = _SelectorFallbackProvider(selector.resolve(), selector)
     tracker = _RecordingTracker()
     agent = Agent(
         provider=wrapper,
         config=AgentConfig(
             max_iterations=1,
-            max_provider_retries=0,
+            max_provider_retries=max_provider_retries,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
             provider_id="openai",
             model_id="primary-model",
         ),
@@ -1384,17 +1533,17 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
     async for _ in agent.run_turn("hello"):
         pass
 
-    assert primary.calls == 1
+    assert primary.calls == primary_attempts
     assert fallback.calls == 1
     assert [(call.call_index, call.provider, call.model) for call in sink.started] == [
-        (1, "openai", "primary-model"),
-        (2, "anthropic", "fallback-model"),
+        *[(index, "openai", "primary-model") for index in range(1, primary_attempts + 1)],
+        (primary_attempts + 1, "anthropic", "fallback-model"),
     ]
     assert [(call.call_index, reason) for call, reason in sink.unknown] == [
-        (1, "provider_error:429")
+        (index, "provider_error:429") for index in range(1, primary_attempts + 1)
     ]
-    assert [call.call_index for call, _ in sink.finalized] == [2]
-    assert len(sink.started) == 2  # no Agent-level wrapper envelope
+    assert [call.call_index for call, _ in sink.finalized] == [primary_attempts + 1]
+    assert len(sink.started) == primary_attempts + 1  # no Agent-level wrapper envelope
     assert tracker.rows[0][1]["provider"] == "anthropic"
     assert tracker.rows[0][1]["model_id"] == "fallback-model"
     expected_correlation = ProviderRequestCorrelation(
@@ -1403,7 +1552,9 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
         execution_id="execution-1",
         call_kind="agent.chat",
     )
-    assert primary.configs[0].provider_request_correlation == expected_correlation
+    assert all(
+        config.provider_request_correlation == expected_correlation for config in primary.configs
+    )
     assert fallback.configs[0].provider_request_correlation == ProviderRequestCorrelation(
         session_id="session-1",
         turn_id="turn-1",
@@ -1412,8 +1563,21 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
     )
 
 
+@pytest.fixture
+def selector_retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.sleep_before_retry", sleep)
+    return sleeps
+
+
 @pytest.mark.asyncio
-async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible() -> None:
+async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible(
+    selector_retry_sleeps: list[float],
+) -> None:
     fallback = _PhysicalLegProvider(
         "anthropic",
         [ProviderText(text="ok"), ProviderDone(model="fallback-model")],
@@ -1422,23 +1586,32 @@ async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible() -
         "openai",
         [ProviderError(message="rate limited", code="429")],
     )
+    primary.streams *= 4
     wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
 
     events = [event async for event in wrapper.chat([])]
 
     assert [getattr(event, "kind", "") for event in events] == [
-        "provider_activity",
-        "text_delta",
-        "done",
+        *["provider_activity"] * 7, "text_delta", "done",
     ]
-    assert (events[0].phase, events[0].reason) == ("fallback", "rate_limited")
-    assert events[0].retry_attempt == 1
-    assert events[0].started_at > 0
-    assert primary.calls == fallback.calls == 1
+    assert [(event.phase, event.retry_attempt) for event in events[:6]] == [
+        (phase, attempt)
+        for attempt in range(1, 4)
+        for phase in ("retry_wait", "retrying")
+    ]
+    assert all(event.retry_limit == 3 for event in events[:6])
+    assert (events[6].phase, events[6].reason) == ("fallback", "rate_limited")
+    assert events[6].retry_attempt == 1
+    assert all(event.started_at > 0 for event in events[:7])
+    assert primary.calls == 4
+    assert fallback.calls == 1
+    assert len(selector_retry_sleeps) == 3
 
 
 @pytest.mark.asyncio
-async def test_meta_helper_with_selector_records_only_physical_legs() -> None:
+async def test_meta_helper_with_selector_records_only_physical_legs(
+    selector_retry_sleeps: list[float],
+) -> None:
     sink = _RecordingSink()
     fallback = _PhysicalLegProvider(
         "anthropic",
@@ -1448,6 +1621,7 @@ async def test_meta_helper_with_selector_records_only_physical_legs() -> None:
         "openai",
         [ProviderError(message="rate limited", code="429")],
     )
+    primary.streams *= 4
     wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
     chat = make_llm_chat_from_provider(
         provider=wrapper,
@@ -1459,13 +1633,18 @@ async def test_meta_helper_with_selector_records_only_physical_legs() -> None:
     assert await chat("system", "user") == "ok"
 
     assert [(call.call_index, call.provider, call.model) for call in sink.started] == [
-        (1, "openai", "primary-model"),
-        (2, "anthropic", "fallback-model"),
+        *[(index, "openai", "primary-model") for index in range(1, 5)],
+        (5, "anthropic", "fallback-model"),
     ]
     assert {call.execution_id for call in sink.started} != {"turn-1"}
     assert all(call.run_kind == "meta_llm" for call in sink.started)
-    assert len(sink.finalized) == 1
-    assert len(sink.unknown) == 1
+    assert [call.call_index for call, _ in sink.finalized] == [5]
+    assert [(call.call_index, reason) for call, reason in sink.unknown] == [
+        (index, "provider_error:429") for index in range(1, 5)
+    ]
+    assert primary.calls == 4
+    assert fallback.calls == 1
+    assert len(selector_retry_sleeps) == 3
 
 
 @pytest.mark.asyncio

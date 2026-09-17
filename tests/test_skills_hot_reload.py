@@ -12,7 +12,7 @@ import pytest
 from opensquilla.skills import file_hash
 from opensquilla.skills import loader as skill_loader_module
 from opensquilla.skills.file_hash import _TreeChangedDuringHashError
-from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, SkillLoader
+from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, PinnedSkillLoader, SkillLoader
 
 
 def _write_skill(root: Path, name: str, description: str = "description") -> Path:
@@ -631,6 +631,11 @@ def test_manifest_change_during_scan_retries_once(tmp_path: Path, monkeypatch) -
 
 
 def test_twice_unstable_scan_keeps_last_known_good(tmp_path: Path, monkeypatch) -> None:
+    # Assert publication separately from the later compatibility auto-probe.
+    # Slow filesystems must not let get_by_name cross the 250 ms probe window
+    # halfway through this one logical observation.
+    clock = [1.0]
+    monkeypatch.setattr(skill_loader_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     root = tmp_path / "skills"
     _write_skill(root, "alpha", "last known good")
     loader = _loader(root, tmp_path)
@@ -657,6 +662,9 @@ def test_twice_unstable_scan_keeps_last_known_good(tmp_path: Path, monkeypatch) 
     assert result.success is False
     assert result.generation == generation
     assert loader.get_by_name("alpha").description == "last known good"  # type: ignore[union-attr]
+    clock[0] += skill_loader_module._COMPAT_PROBE_INTERVAL_SECONDS + 0.01
+    assert loader.get_by_name("alpha").description == "third candidate"  # type: ignore[union-attr]
+    assert loader.snapshot().generation > generation
 
 
 def test_mutation_guard_hides_in_progress_write_until_next_access(tmp_path: Path) -> None:
@@ -829,7 +837,7 @@ def test_publish_writes_snapshot_without_reentering_loader(
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
-def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) -> None:
+def test_snapshot_v12_is_invalid_and_v16_round_trips_atomically(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
@@ -840,7 +848,7 @@ def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) 
     loader.load_all()
     loader.save_snapshot()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 15
+    assert data["version"] == 16
     assert all("mtime_ns" in entry for entry in data["manifest"].values())
     assert all("tree_state" in entry for entry in data["manifest"].values())
     assert data["skills"][0]["tree_digest"]
@@ -850,6 +858,48 @@ def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) 
     restored_skills = restored.load_snapshot() or []
     assert [skill.name for skill in restored_skills] == ["alpha"]
     assert restored_skills[0].tree_digest == data["skills"][0]["tree_digest"]
+
+
+def test_legacy_snapshot_normalizes_triggers_without_recompiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "alpha")
+    skill_file.write_text(
+        "---\nname: alpha\ndescription: Synthetic trigger fixture\n"
+        "triggers: [123, [nested, list], dubbing]\n---\nbody",
+        encoding="utf-8",
+    )
+    snapshot_path = tmp_path / "snapshot.json"
+    loader = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+    loader.load_all()
+    loader.save_snapshot()
+
+    data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    for key in ("skills", "candidates"):
+        assert data[key]
+        for skill in data[key]:
+            skill["triggers"] = [123, ["nested", "list"], "dubbing"]
+    snapshot_path.write_text(json.dumps(data), encoding="utf-8")
+
+    restored = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+
+    def unexpected_rebuild(*args: object, **kwargs: object) -> None:
+        pytest.fail("unchanged Skill sources should reuse the existing snapshot")
+
+    monkeypatch.setattr(restored, "_build_catalog", unexpected_rebuild)
+    expected = ["123", "['nested', 'list']", "dubbing"]
+    snapshot_skills = restored.load_snapshot()
+    assert snapshot_skills is not None
+    assert [skill.triggers for skill in snapshot_skills] == [expected]
+    assert [skill.triggers for skill in restored.load_all()] == [expected]
+    catalog = restored.snapshot()
+    assert [skill.triggers for skill in catalog.skills] == [expected]
+    assert [skill.triggers for skill in catalog.candidates] == [expected]
+    pinned = PinnedSkillLoader(catalog, restored)
+    for matcher in (restored, pinned):
+        for query in ("DUBBING", "123", "['nested', 'list']"):
+            assert [skill.name for skill in matcher.find_by_trigger(query)] == ["alpha"]
 
 
 def test_description_zh_is_parsed_and_survives_snapshot_round_trip(tmp_path: Path) -> None:

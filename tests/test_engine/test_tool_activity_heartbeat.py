@@ -54,11 +54,14 @@ class _OneToolProvider:
         return []
 
 
-def _tool_def(name: str = "slow_tool") -> ToolDefinition:
+def _tool_def(
+    name: str = "slow_tool", *, execution_timeout_seconds: float | None = None,
+) -> ToolDefinition:
     return ToolDefinition(
         name=name,
         description=f"Mock tool {name}",
         input_schema=ToolInputSchema(properties={}, required=[]),
+        execution_timeout_seconds=execution_timeout_seconds,
     )
 
 
@@ -80,10 +83,9 @@ async def test_long_active_tool_emits_run_heartbeat_before_tool_result() -> None
         provider=_OneToolProvider(),
         config=AgentConfig(
             max_iterations=1,
-            tool_timeout=1.0,
             metadata={"tool_activity_heartbeat_interval": 0.02},
         ),
-        tool_definitions=[_tool_def()],
+        tool_definitions=[_tool_def(execution_timeout_seconds=1.0)],
         tool_handler=_handler,
     )
 
@@ -124,10 +126,9 @@ async def test_tool_activity_heartbeat_does_not_extend_tool_timeout() -> None:
         provider=_OneToolProvider(),
         config=AgentConfig(
             max_iterations=1,
-            tool_timeout=0.06,
             metadata={"tool_activity_heartbeat_interval": 0.02},
         ),
-        tool_definitions=[_tool_def()],
+        tool_definitions=[_tool_def(execution_timeout_seconds=0.06)],
         tool_handler=_handler,
     )
 
@@ -149,44 +150,72 @@ async def test_stubborn_tool_late_success_cannot_replace_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(agent_module, "TIMEOUT_CANCEL_GRACE_SECONDS", 0.02)
+    started = asyncio.Event()
     cancelled = asyncio.Event()
     release = asyncio.Event()
     finished = asyncio.Event()
+    observed_cancellations: list[tuple[float, str]] = []
+    real_cancel_task = agent_module.cancel_task
+
+    async def observe_cancel_task(task: Any, **kwargs: Any) -> bool:
+        if kwargs["operation"] == "tool:slow_tool":
+            observed_cancellations.append((kwargs["grace_seconds"], kwargs["policy"]))
+        return await real_cancel_task(task, **kwargs)
+
+    monkeypatch.setattr(agent_module, "cancel_task", observe_cancel_task)
 
     async def _handler(tc: ToolCall) -> ToolResult:
+        started.set()
         try:
-            await release.wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            await release.wait()
-        finished.set()
-        return ToolResult(
-            tool_use_id=tc.tool_use_id,
-            tool_name=tc.tool_name,
-            content="late-success",
-        )
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+            return ToolResult(
+                tool_use_id=tc.tool_use_id,
+                tool_name=tc.tool_name,
+                content="late-success",
+            )
+        finally:
+            finished.set()
 
     agent = Agent(
         provider=_OneToolProvider(),
-        config=AgentConfig(max_iterations=1, tool_timeout=0.01),
-        tool_definitions=[_tool_def()],
+        config=AgentConfig(max_iterations=1),
+        tool_definitions=[_tool_def(execution_timeout_seconds=0.01)],
         tool_handler=_handler,
     )
 
-    events = await asyncio.wait_for(
-        _collect_events(agent),
-        timeout=0.2,
-    )
-    result = next(event for event in events if isinstance(event, ToolResultEvent))
+    turn = asyncio.create_task(_collect_events(agent))
+    try:
+        # Provider/agent startup is not part of the tool cancellation grace.
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        await asyncio.wait_for(cancelled.wait(), timeout=5.0)
+        events = await asyncio.wait_for(asyncio.shield(turn), timeout=5.0)
+        result = next(event for event in events if isinstance(event, ToolResultEvent))
 
-    assert cancelled.is_set()
-    assert result.is_error
-    assert result.execution_status is not None
-    assert result.execution_status["status"] == "timeout"
-    assert "late-success" not in result.result
+        assert observed_cancellations == [(0.02, "bounded")]
+        assert not finished.is_set(), "Timeout waited for the stubborn tool to finish"
+        assert result.is_error
+        assert result.execution_status is not None
+        assert result.execution_status["status"] == "timeout"
 
-    release.set()
-    await asyncio.wait_for(finished.wait(), timeout=0.2)
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=5.0)
+        assert result.execution_status["status"] == "timeout"
+        assert all(
+            "late-success" not in event.result
+            for event in events
+            if isinstance(event, ToolResultEvent)
+        )
+    finally:
+        release.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), timeout=5.0)
+        if started.is_set():
+            await asyncio.wait_for(finished.wait(), timeout=5.0)
 
 
 @pytest.mark.asyncio
@@ -197,31 +226,121 @@ async def test_stubborn_tool_stop_uses_short_grace(
     started = asyncio.Event()
     cancelled = asyncio.Event()
     release = asyncio.Event()
+    finished = asyncio.Event()
+    observed_batches: list[tuple[float, tuple[str, ...]]] = []
+    real_cancel_tasks = agent_module.cancel_tasks
+
+    async def observe_cancel_tasks(tasks: Any, **kwargs: Any) -> None:
+        if kwargs["operation"] == "agent_tool_batch":
+            observed_batches.append((kwargs["grace_seconds"], tuple(tasks.values())))
+        await real_cancel_tasks(tasks, **kwargs)
+
+    monkeypatch.setattr(agent_module, "cancel_tasks", observe_cancel_tasks)
 
     async def _handler(tc: ToolCall) -> ToolResult:
         started.set()
         try:
-            await release.wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            await release.wait()
-        return ToolResult(tc.tool_use_id, tc.tool_name, "late-success")
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+            return ToolResult(tc.tool_use_id, tc.tool_name, "late-success")
+        finally:
+            finished.set()
 
     agent = Agent(
         provider=_OneToolProvider(),
-        config=AgentConfig(max_iterations=1, tool_timeout=60.0),
-        tool_definitions=[_tool_def()],
+        config=AgentConfig(max_iterations=1),
+        tool_definitions=[_tool_def(execution_timeout_seconds=60.0)],
         tool_handler=_handler,
     )
     turn = asyncio.create_task(_collect_events(agent))
-    await asyncio.wait_for(started.wait(), timeout=0.2)
+    try:
+        # Provider/agent startup is not part of the tool cancellation grace.
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(turn, timeout=5.0)
+        assert cancelled.is_set()
+        assert observed_batches == [(0.02, ("bounded",))]
+        assert not finished.is_set(), "Stop waited for the stubborn tool to finish"
+    finally:
+        release.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), timeout=5.0)
+        if started.is_set():
+            await asyncio.wait_for(finished.wait(), timeout=5.0)
 
-    turn.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(turn, timeout=0.2)
-    assert cancelled.is_set()
 
-    release.set()
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+async def test_bounded_cancellation_parks_only_when_controlled_grace_expires(
+    monkeypatch: pytest.MonkeyPatch,
+    batch: bool,
+) -> None:
+    from opensquilla.engine import cancellation
+
+    count = 2 if batch else 1
+    started = [asyncio.Event() for _ in range(count)]
+    cancelled = [asyncio.Event() for _ in range(count)]
+    release = asyncio.Event()
+    timers: list[asyncio.Timeout] = []
+    budgets: list[float] = []
+
+    class ControlledAsyncio:
+        def timeout(self, delay: float) -> asyncio.Timeout:
+            budgets.append(delay)
+            timer = asyncio.timeout(None)
+            timers.append(timer)
+            return timer
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(asyncio, name)
+
+    # Only the cancellation primitive sees the controlled timer. Test
+    # watchdogs retain the real event loop and tolerate slow CI scheduling.
+    monkeypatch.setattr(cancellation, "asyncio", ControlledAsyncio())
+
+    async def stubborn_worker(index: int) -> None:
+        started[index].set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled[index].set()
+            await release.wait()
+
+    workers = [asyncio.create_task(stubborn_worker(index)) for index in range(count)]
+    operation = None
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 5.0)
+        if batch:
+            operation = asyncio.create_task(cancellation.cancel_tasks(
+                dict.fromkeys(workers, "bounded"),
+                operation="synthetic-batch",
+                grace_seconds=0.02,
+            ))
+        else:
+            operation = asyncio.create_task(cancellation.cancel_task(
+                workers[0], policy="bounded", operation="synthetic-single", grace_seconds=0.02,
+            ))
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in cancelled)), 5.0)
+        assert budgets == [0.02], "bounded workers must share one requested grace timer"
+        assert not operation.done(), "cancellation returned before its grace expired"
+        assert all(not worker.done() for worker in workers)
+
+        timers[0].reschedule(asyncio.get_running_loop().time())
+        result = await asyncio.wait_for(asyncio.shield(operation), 5.0)
+        assert result is (None if batch else False)
+        assert all(not worker.done() for worker in workers)
+        assert all(worker in cancellation._BACKGROUND_TASKS for worker in workers)
+    finally:
+        release.set()
+        if operation is not None and not operation.done():
+            operation.cancel()
+        pending = workers + ([operation] if operation is not None else [])
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 5.0)
 
 
 @pytest.mark.asyncio
@@ -273,6 +392,7 @@ async def test_write_file_timeout_waits_for_disk_and_receipt_before_terminal(
     write_definition = next(item for item in definitions if item.name == "write_file")
     assert write_definition.cancellation_policy == "must_settle"
     assert "cancellation_policy" not in write_definition.model_dump()
+    write_definition.execution_timeout_seconds = 0.02
     agent = Agent(
         provider=_OneToolProvider(
             "write_file",
@@ -281,7 +401,6 @@ async def test_write_file_timeout_waits_for_disk_and_receipt_before_terminal(
         config=AgentConfig(
             max_iterations=1,
             iteration_timeout=1.0,
-            tool_timeout=0.02,
         ),
         tool_definitions=[write_definition],
         tool_handler=build_tool_handler(registry, ctx),

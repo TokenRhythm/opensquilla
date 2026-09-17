@@ -15,6 +15,7 @@
     v-else-if="part.interruptKind === 'clarify' && part.clarify"
     :request="part.clarify"
     :submitted="part.resolution === 'replied'"
+    :expired="part.resolution === 'expired' || part.resolution === 'unavailable'"
     :busy="part.busy"
     :error="part.error"
     @submit="fields => emit('clarify-submit', fields, part.clarify!)"
@@ -46,7 +47,7 @@ const emit = defineEmits<{
 function toApprovalItem(data: InterruptApprovalData): ChatApprovalItem {
   return {
     id: data.approvalId,
-    namespace: data.namespace,
+    namespace: data.namespace === 'plugin' ? 'plugin' : 'exec',
     toolName: data.toolName,
     command: data.command,
     approvalKind: data.approvalKind,

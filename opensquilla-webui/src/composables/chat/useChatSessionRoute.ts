@@ -1,6 +1,9 @@
 import type { Ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { recentDraftSessionKey } from '@/composables/chat/useChatDraftPersistence'
+import {
+  recentDraftSessionKey,
+  recoverableDraftSessionKey,
+} from '@/composables/chat/useChatDraftPersistence'
 import {
   agentIdFromSessionKey,
   canonicalSessionKey,
@@ -18,6 +21,13 @@ export interface PersistSessionOptions {
 
 export interface ResolveInitialSessionOptions {
   recoverDraft?: boolean
+  scopedDraft?: ScopedDraftHistoryState | null
+}
+
+export interface ScopedDraftHistoryState {
+  sessionKey: string
+  agentId: string
+  projectId: string
 }
 
 export interface InitialSessionResolution {
@@ -66,11 +76,39 @@ function readStoredSession(): string {
   }
 }
 
-export function useChatSessionRoute(sessionKey: Ref<string>) {
+export function useChatSessionRoute(
+  sessionKey: Ref<string>,
+  guestSessionOwnerId: () => string | null = () => null,
+) {
   const route = useRoute()
   const router = useRouter()
+  // Only keys minted in this mounted view can change namespace before a send.
+  // A recovered draft or explicit URL may refer to durable owner history.
+  let freshDraftSessionKey = ''
+
+  function forgetFreshDraftSession(key = sessionKey.value) {
+    if (freshDraftSessionKey === key) freshDraftSessionKey = ''
+  }
+
+  function inGuestNamespace(key: string): string {
+    const ownerId = guestSessionOwnerId()
+    if (!ownerId || !/^[0-9a-f]{64}$/.test(ownerId)) return key
+    const suffix = key.slice(key.lastIndexOf(':') + 1)
+    return webchatSessionKey(agentIdFromSessionKey(key), `guest:${ownerId}:${suffix}`)
+  }
+
+  function rebindFreshDraftSession(rebind: (key: string) => void): boolean {
+    const key = sessionKey.value
+    if (!key || key !== freshDraftSessionKey || readSessionFromUrl()) return false
+    const next = inGuestNamespace(key)
+    if (next === key) return false
+    rebind(next)
+    freshDraftSessionKey = sessionKey.value === next ? next : ''
+    return sessionKey.value === next
+  }
 
   function persistSession(key: string, options: PersistSessionOptions = {}) {
+    forgetFreshDraftSession()
     const previous = sessionKey.value
     const next = canonicalSessionKey(key)
     const routeSession = readSessionFromUrl()
@@ -134,7 +172,10 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
 
   function createSessionKey(agentId?: string): string {
     const agent = agentId || agentIdFromSessionKey(sessionKey.value)
-    return webchatSessionKey(agent, Math.random().toString(36).slice(2, 10))
+    freshDraftSessionKey = inGuestNamespace(
+      webchatSessionKey(agent, Math.random().toString(36).slice(2, 10)),
+    )
+    return freshDraftSessionKey
   }
 
   function resolveInitialSession(
@@ -142,6 +183,7 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
   ): InitialSessionResolution {
     const urlSession = readSessionFromUrl()
     if (urlSession) {
+      freshDraftSessionKey = ''
       return {
         sessionKey: canonicalSessionKey(urlSession),
         hasUrlSession: true,
@@ -149,14 +191,22 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
         recoveredDraft: false,
       }
     }
-    const mayRecoverDraft = options.recoverDraft !== false
-      && isDraftRoute()
-      && !readAgentFromUrl()
-      && !readProjectFromUrl()
-      && !hasLegacyNewChatQuery()
+    const mayRecoverDraft = options.recoverDraft !== false && isDraftRoute()
     if (mayRecoverDraft) {
-      const recoveredSessionKey = recentDraftSessionKey()
+      const scopedDraft = options.scopedDraft
+      const scopedSessionKey = scopedDraft
+        && scopedDraft.agentId === draftAgentId()
+        && scopedDraft.projectId === readProjectFromUrl()
+        && agentIdFromSessionKey(scopedDraft.sessionKey) === draftAgentId()
+        ? recoverableDraftSessionKey(scopedDraft.sessionKey)
+        : ''
+      const mayRecoverRecentDraft = !readAgentFromUrl()
+        && !readProjectFromUrl()
+        && !hasLegacyNewChatQuery()
+      const recoveredSessionKey = scopedSessionKey
+        || (mayRecoverRecentDraft ? recentDraftSessionKey() : '')
       if (recoveredSessionKey) {
+        freshDraftSessionKey = ''
         return {
           sessionKey: recoveredSessionKey,
           hasUrlSession: false,
@@ -178,6 +228,8 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
   return {
     route,
     createSessionKey,
+    forgetFreshDraftSession,
+    rebindFreshDraftSession,
     draftAgentId,
     goToDraft,
     hasLegacyNewChatQuery,

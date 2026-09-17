@@ -77,13 +77,6 @@ Search memory for my release-note preferences before drafting this.
 
 ## Session-Derived Memory
 
-For long or important sessions, flush session state into memory before
-archiving, compacting, or switching tasks:
-
-```sh
-opensquilla memory flush-session <session-key>
-```
-
 Use session export when exact old wording matters:
 
 ```sh
@@ -92,27 +85,12 @@ opensquilla sessions export <session-key>
 
 Memory is for useful recall. Session export is for exact records.
 
-## Maintenance and Repair
+## Index Maintenance
 
 Refresh the index after editing memory files or changing memory configuration:
 
 ```sh
 opensquilla memory index --force
-```
-
-Inspect fallback and repair surfaces:
-
-```sh
-opensquilla memory raw-fallbacks list
-opensquilla memory repair list
-```
-
-Show or repair a degraded compaction memory record when instructed by
-diagnostics:
-
-```sh
-opensquilla memory repair show --summary-id <id>
-opensquilla memory repair run --summary-id <id>
 ```
 
 ## Best Practices
@@ -126,4 +104,4 @@ opensquilla memory repair run --summary-id <id>
 
 ---
 
-[Docs index](../README.md) · [Product guide](../../README.product.md) · [Improve this page](../contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](../README.md) · [Product guide](../../README.product.md) · [Improve this page](../contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

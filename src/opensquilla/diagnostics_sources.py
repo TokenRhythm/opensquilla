@@ -17,7 +17,6 @@ gateway or CLI stacks.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 
@@ -53,7 +52,6 @@ def logs_status_snapshot() -> dict[str, Any]:
     Reports the *ambient* process environment (env vars, default state
     paths), matching what a gateway launched from this environment would see.
     """
-    from opensquilla.gateway.rpc_logs import _build_logs_status
+    from opensquilla.gateway.log_status_runtime import read_log_status
 
-    ctx: Any = SimpleNamespace(config=None, diagnostics_state=None)
-    return _build_logs_status(ctx)
+    return read_log_status(config=None, diagnostics_state=None)

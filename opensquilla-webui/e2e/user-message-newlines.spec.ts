@@ -1,4 +1,9 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload, sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload, sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-user-newlines'
@@ -17,17 +22,13 @@ async function seedMultilineUserHistory(page: Page) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({
-            protocol: 3,
-            policy: { tick_interval_ms: 30000 },
-          }))
+          ws.send(helloOkResponse())
           return
         }
 
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': {
-            messages: [
+          'chat.history': chatHistoryPayload([
               {
                 role: 'user',
                 text: '你好~\n我测试一下换行功能~\n你好~\n我测试一下换行功能~',
@@ -46,22 +47,17 @@ async function seedMultilineUserHistory(page: Page) {
                 id: 'msg-error-newlines',
                 timestamp: Math.floor(Date.now() / 1000) - 30,
               },
-            ],
-            has_more: false,
-          },
+          ]),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
-          'sessions.messages.subscribe': {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY),
           'usage.status': { sessions: [] },
         }
 
@@ -95,7 +91,7 @@ test('system and error message text preserve authored line breaks', async ({ pag
   await expect(systemText).toContainText('连接提示第一行\n连接提示第二行')
   await expect(systemText).toHaveCSS('white-space', 'pre-wrap')
 
-  const errorText = page.locator('.msg-error-card__text').first()
+  const errorText = page.locator('.msg-error__text').first()
   await expect(errorText).toContainText('错误详情第一行\n错误详情第二行')
   await expect(errorText).toHaveCSS('white-space', 'pre-wrap')
 })

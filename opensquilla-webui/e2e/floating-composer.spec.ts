@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-floating-a'
@@ -71,9 +72,7 @@ async function installMockGateway(page: Page) {
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30000 },
+        ws.send(helloOkResponse({
           auth: {
             runModePolicy: {
               allowedRunModes: ['safe', 'full'],
@@ -147,6 +146,8 @@ async function installMockGateway(page: Page) {
               runStatus: 'idle',
             },
           ],
+          count: 2,
+          ts: 1_800_000_000,
           has_more: false,
         },
         'sessions.messages.unsubscribe': { subscribed: false },

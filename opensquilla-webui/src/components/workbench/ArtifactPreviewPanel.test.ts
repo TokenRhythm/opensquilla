@@ -4,10 +4,20 @@ import { createApp, h, nextTick, reactive } from 'vue'
 import type { Component } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import { HttpTransportError } from '@/adapters/gateway/privateHttpTransport'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
 import en from '@/locales/en.json'
-import type { ArtifactPayload } from '@/types/rpc'
+import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import {
+  httpBinaryResponse,
+  httpTransportTestDouble,
+  type TestHttpBinaryResponse,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
+import type { Window as TestWindow } from 'happy-dom'
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -28,6 +38,7 @@ async function settlePreview() {
 
 function mountPanel(
   props: Record<string, unknown>,
+  http: TestHttpTransport = httpTransportTestDouble(),
 ): { element: HTMLElement; unmount: () => void; update: (patch: Record<string, unknown>) => void } {
   const element = document.createElement('div')
   document.body.append(element)
@@ -40,6 +51,9 @@ function mountPanel(
     locale: 'en',
     messages: { en },
   }))
+  app.provide(ARTIFACT_WORKBENCH_KEY, {
+    previews: createV4ArtifactPreviews(http, { baseOrigin: () => 'http://localhost' }),
+  } as ArtifactWorkbench)
   app.mount(element)
   return {
     element,
@@ -52,12 +66,27 @@ function mountPanel(
 }
 
 afterEach(() => {
+  (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = false
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
   document.body.innerHTML = ''
 })
 
 describe('ArtifactPreviewPanel', () => {
+  it('invalidates file actions after an opaque iframe navigates without changing preview permissions', async () => {
+    // Load events are injected deterministically; do not make real DNS requests.
+    (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = true
+    const onWorkbenchEvent = vi.fn()
+    const mounted = mountPanel({ artifact: artifact(), previewLaunchUrl: 'http://preview.localhost/minimal.html', onWorkbenchEvent })
+    await settlePreview()
+    const frame = mounted.element.querySelector('iframe')!
+    frame.dispatchEvent(new Event('load'))
+    expect(onWorkbenchEvent).not.toHaveBeenCalledWith({ type: 'preview-page-unknown' })
+    frame.dispatchEvent(new Event('load'))
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'preview-page-unknown' })
+    expect(frame.getAttribute('sandbox')).not.toContain('allow-same-origin')
+    mounted.unmount()
+  })
   it('runs offline web HTML scripts in an opaque sandbox', async () => {
     const observed: { blob?: Blob } = {}
     const createObjectUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation(blob => {
@@ -65,12 +94,14 @@ describe('ArtifactPreviewPanel', () => {
       return 'about:blank#artifact-preview'
     })
     const revokeObjectUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn().mockResolvedValue(httpBinaryResponse(
       '<html><body><script>document.body.textContent = "ready"</script></body></html>',
-      { status: 200, headers: { 'Content-Type': 'text/html' } },
-    )))
+        { contentType: 'text/html' },
+      )),
+    })
 
-    const mounted = mountPanel({ artifact: artifact() })
+    const mounted = mountPanel({ artifact: artifact() }, http)
     await settlePreview()
 
     const frame = mounted.element.querySelector<HTMLIFrameElement>('.artifact-preview__frame--html')
@@ -91,17 +122,19 @@ describe('ArtifactPreviewPanel', () => {
   it('keeps a prepared opaque preview isolated even when the saved mode is full', async () => {
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank#prepared-preview')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn().mockResolvedValue(httpBinaryResponse(
       '<html><body><form><input></form></body></html>',
-      { status: 200, headers: { 'Content-Type': 'text/html' } },
-    )))
+        { contentType: 'text/html' },
+      )),
+    })
 
     const mounted = mountPanel({
       artifact: artifact(),
       previewMode: 'full',
       previewNetworkAllowed: false,
       previewSandboxProfile: 'opaque-offline',
-    })
+    }, http)
     await settlePreview()
 
     const frame = mounted.element.querySelector<HTMLIFrameElement>(
@@ -115,15 +148,16 @@ describe('ArtifactPreviewPanel', () => {
   })
 
   it('can omit its header when embedded in the workbench chrome', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
-      'plain text',
-      { status: 200, headers: { 'Content-Type': 'text/plain' } },
-    )))
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn().mockResolvedValue(httpBinaryResponse('plain text', {
+        contentType: 'text/plain',
+      })),
+    })
 
     const mounted = mountPanel({
       artifact: artifact({ name: 'notes.txt', mime: 'text/plain' }),
       showHeader: false,
-    })
+    }, http)
     await settlePreview()
 
     expect(mounted.element.querySelector('.artifact-preview__toolbar')).toBeNull()
@@ -131,19 +165,52 @@ describe('ArtifactPreviewPanel', () => {
     mounted.unmount()
   })
 
+  it('keeps refreshing on its own toolbar button and omits preview from the file menu', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank#toolbar-preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const requestBinary = vi.fn().mockResolvedValue(httpBinaryResponse(
+      '<html><body>Preview</body></html>',
+      { contentType: 'text/html' },
+    ))
+    const mounted = mountPanel({ artifact: artifact() }, httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+
+    mounted.element.querySelector<HTMLButtonElement>('.resource-actions-trigger')!.click()
+    await settlePreview()
+    const menu = document.querySelector<HTMLElement>('[role="menu"]')!
+    expect(menu).not.toBeNull()
+    const actions = [...menu.querySelectorAll('[role="menuitem"]')]
+      .map(action => action.textContent?.trim())
+    expect(actions).not.toContain(en.resourceActions.preview)
+    expect(actions).not.toContain(en.workbench.artifactPreview.refresh)
+    expect(requestBinary).toHaveBeenCalledOnce()
+
+    menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    mounted.element.querySelector<HTMLButtonElement>(
+      `[aria-label="${en.workbench.artifactPreview.refresh}"]`,
+    )!.click()
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledTimes(2)
+    mounted.unmount()
+  })
+
   it('opens PDFs fitted to the panel width without disabling frame interaction', async () => {
     const onWorkbenchEvent = vi.fn()
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank?pdf-preview')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
-      new Uint8Array([0x25, 0x50, 0x44, 0x46]),
-      { status: 200, headers: { 'Content-Type': 'application/pdf' } },
-    )))
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn().mockResolvedValue(httpBinaryResponse(
+        new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+        { contentType: 'application/pdf' },
+      )),
+    })
 
     const mounted = mountPanel({
       artifact: artifact({ name: 'report.pdf', mime: 'application/pdf' }),
       onWorkbenchEvent,
-    })
+    }, http)
     await settlePreview()
 
     const frame = mounted.element.querySelector<HTMLIFrameElement>(
@@ -173,15 +240,17 @@ describe('ArtifactPreviewPanel', () => {
     const onWorkbenchEvent = vi.fn()
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn().mockResolvedValue(httpBinaryResponse(
       '<!doctype html><p>Preview</p>',
-      { status: 200, headers: { 'Content-Type': 'text/html' } },
-    )))
+        { contentType: 'text/html' },
+      )),
+    })
 
     const mounted = mountPanel({
       artifact: artifact(),
       onWorkbenchEvent,
-    })
+    }, http)
     await settlePreview()
     const frame = mounted.element.querySelector<HTMLIFrameElement>(
       '.artifact-preview__frame--html',
@@ -197,27 +266,28 @@ describe('ArtifactPreviewPanel', () => {
   })
 
   it('replaces native HTML loading state with the native surface slot', async () => {
-    let resolveFetch!: (response: Response) => void
+    let resolveRequest!: (response: TestHttpBinaryResponse) => void
     const onNativeHtmlReady = vi.fn()
     const onWorkbenchEvent = vi.fn()
-    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => {
-      resolveFetch = resolve
-    })))
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn(() => new Promise<TestHttpBinaryResponse>((resolve) => {
+        resolveRequest = resolve
+      })),
+    })
 
     const mounted = mountPanel({
       artifact: artifact(),
       nativeHtml: true,
       onNativeHtmlReady,
       onWorkbenchEvent,
-    })
+    }, http)
     await nextTick()
 
     expect(mounted.element.querySelector('[data-workbench-native-surface-slot]')).toBeNull()
     expect(mounted.element.querySelector('[role="status"]')).not.toBeNull()
 
-    resolveFetch(new Response('<!doctype html><p>Native preview</p>', {
-      status: 200,
-      headers: { 'Content-Type': 'text/html' },
+    resolveRequest(httpBinaryResponse('<!doctype html><p>Native preview</p>', {
+      contentType: 'text/html',
     }))
     await settlePreview()
 
@@ -233,32 +303,32 @@ describe('ArtifactPreviewPanel', () => {
   })
 
   it('reloads changed native HTML instead of resuming stale bytes after Source was active', async () => {
-    const fetchMock = vi.fn((url: string | URL | Request) => Promise.resolve(new Response(
-      `<h1>${String(url)}</h1>`,
-      { status: 200, headers: { 'Content-Type': 'text/html' } },
+    const requestBinary = vi.fn((url: string) => Promise.resolve(httpBinaryResponse(
+      `<h1>${url}</h1>`,
+      { contentType: 'text/html' },
     )))
+    const http = httpTransportTestDouble({ requestBinary })
     const onNativeHtmlReady = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
 
     const mounted = mountPanel({
       artifact: artifact(),
       nativeHtml: true,
       onNativeHtmlReady,
       suspended: true,
-    })
+    }, http)
     await settlePreview()
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
 
     mounted.update({ suspended: false })
     await settlePreview()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(requestBinary).toHaveBeenCalledTimes(1)
     expect(onNativeHtmlReady).toHaveBeenCalledTimes(1)
 
     mounted.update({ suspended: true })
     await settlePreview()
     mounted.update({ suspended: false })
     await settlePreview()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(requestBinary).toHaveBeenCalledTimes(1)
 
     mounted.update({ suspended: true })
     await settlePreview()
@@ -269,11 +339,11 @@ describe('ArtifactPreviewPanel', () => {
       }),
     })
     await settlePreview()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(requestBinary).toHaveBeenCalledTimes(1)
 
     mounted.update({ suspended: false })
     await settlePreview()
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(requestBinary).toHaveBeenCalledTimes(2)
     expect(onNativeHtmlReady).toHaveBeenCalledTimes(2)
     expect(onNativeHtmlReady.mock.calls[1]?.[0].artifact.id).toBe('artifact-2')
     mounted.unmount()
@@ -294,7 +364,7 @@ describe('ArtifactPreviewPanel', () => {
     await settlePreview()
 
     const actions = [...mounted.element.querySelectorAll<HTMLButtonElement>(
-      '.artifact-preview__actions button',
+      '.artifact-preview__actions button:not(.resource-actions-trigger)',
     )]
     expect(actions).toHaveLength(2)
     actions[0]?.click()
@@ -306,15 +376,16 @@ describe('ArtifactPreviewPanel', () => {
   })
 
   it('explains an artifact integrity failure instead of showing a generic error', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      code: 'INTEGRITY_ERROR',
-      error: 'checksum mismatch',
-    }), {
-      status: 409,
-      headers: { 'Content-Type': 'application/json' },
-    })))
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn().mockRejectedValue(new HttpTransportError(
+        'http-status',
+        'checksum mismatch',
+        409,
+        { code: 'INTEGRITY_ERROR', error: 'checksum mismatch' },
+      )),
+    })
 
-    const mounted = mountPanel({ artifact: artifact() })
+    const mounted = mountPanel({ artifact: artifact() }, http)
     await settlePreview()
 
     expect(mounted.element.textContent).toContain('Artifact integrity check failed')
@@ -328,13 +399,15 @@ describe('ArtifactPreviewPanel', () => {
   ] as const)(
     'renders the native %s state in the DOM recovery surface',
     async (nativeSurfaceState, expectedTitle) => {
-      vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)))
+      const http = httpTransportTestDouble({
+        requestBinary: vi.fn(() => new Promise<TestHttpBinaryResponse>(() => undefined)),
+      })
 
       const mounted = mountPanel({
         artifact: artifact(),
         nativeHtml: true,
         nativeSurfaceState,
-      })
+      }, http)
       await settlePreview()
 
       expect(mounted.element.textContent).toContain(expectedTitle)

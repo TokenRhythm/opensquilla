@@ -1,9 +1,7 @@
-"""Immutable Safe capability reports and fingerprinted probe caching."""
+"""Immutable Safe availability reports (legacy capability RPC response shape)."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
@@ -85,64 +83,30 @@ def capability_report_from_setup(
     backend: str,
 ) -> CapabilityReport:
     code = {
-        SandboxSetupState.READY: "probe_required",
+        SandboxSetupState.READY: "ready",
         SandboxSetupState.NOT_SETUP: "not_setup",
         SandboxSetupState.SETTING_UP: "setting_up",
         SandboxSetupState.FAILED: "setup_failed",
         SandboxSetupState.UNAVAILABLE: "backend_unavailable",
     }[setup.state]
     return CapabilityReport(
-        # Setup state is only a prerequisite.  It must never manufacture
-        # runtime capabilities; the live canary probe supplies those.
-        available=False,
+        available=setup.state is SandboxSetupState.READY,
         backend=str(backend),
         platform=setup.platform,
         code=code,
-        reason=(
-            "Sandbox setup is ready; live capability verification is required."
-            if setup.state is SandboxSetupState.READY
-            else setup.detail or setup.message
-        ),
+        reason=setup.detail or setup.message,
         setup_supported=setup.state is not SandboxSetupState.UNAVAILABLE,
         restart_required=False,
-        probe_version=1,
+        # No measured capability claims: availability describes initialization.
+        probe_version=0,
         capabilities=frozenset(),
     )
-
-
-class CapabilityService:
-    """Deduplicate immutable capability probes by runtime fingerprint."""
-
-    def __init__(
-        self,
-        probe: Callable[[str], Awaitable[CapabilityReport]],
-    ) -> None:
-        self._probe = probe
-        self._cache: dict[str, CapabilityReport] = {}
-        self._lock = asyncio.Lock()
-
-    async def get(self, fingerprint: str) -> CapabilityReport:
-        key = str(fingerprint)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        async with self._lock:
-            cached = self._cache.get(key)
-            if cached is not None:
-                return cached
-            report = await self._probe(key)
-            self._cache[key] = report
-            return report
-
-    def invalidate(self) -> None:
-        self._cache.clear()
 
 
 __all__ = [
     "REQUIRED_SAFE_CAPABILITIES",
     "WINDOWS_REQUIRED_SAFE_CAPABILITIES",
     "CapabilityReport",
-    "CapabilityService",
     "capability_report_from_setup",
     "required_safe_capabilities",
 ]

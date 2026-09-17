@@ -5,6 +5,10 @@ import {
   useChatPendingQueue,
   type UseChatPendingQueueOptions,
 } from './useChatPendingQueue'
+import { useChatAttachments } from './useChatAttachments'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
+import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
+import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
 import {
   createPendingInputWal,
@@ -12,6 +16,15 @@ import {
   type PendingInputWalRecord,
   type ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
+
+type LegacyQueueRpc = {
+  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+}
+
+type QueueTestOverrides = Partial<UseChatPendingQueueOptions> & {
+  rpc?: LegacyQueueRpc
+  hasRpcMethod?: (method: string) => boolean
+}
 
 function makeQueue(
   dispatchPendingItem?: (item: ChatPendingItem, ownerSessionKey: string) => Promise<
@@ -23,7 +36,7 @@ function makeQueue(
     ownerSessionKey: string,
   ) => Promise<'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'>,
   onHiddenControlDispatchResult?: (result: HiddenControlDispatchResult) => void | boolean,
-  overrides: Partial<UseChatPendingQueueOptions> = {},
+  overrides: QueueTestOverrides = {},
 ) {
   const sessionKey = ref('agent:main:webchat:test')
   const inputText = ref('')
@@ -32,6 +45,21 @@ function makeQueue(
   const isStreaming = ref(false)
   const sendCurrentInput = vi.fn()
   const defaultWal = memoryWal().wal
+  const {
+    rpc,
+    hasRpcMethod,
+    pendingInputQueue,
+    ...safeOverrides
+  } = overrides
+  const compatibilityQueue: PendingInputQueuePort | null = pendingInputQueue
+    ?? (rpc
+      ? createLegacyPendingInputQueue({
+          request: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+            rpc.call<T>(method, params)
+          ),
+          supports: hasRpcMethod,
+        })
+      : null)
   const queue = useChatPendingQueue({
     sessionKey,
     inputText,
@@ -47,8 +75,8 @@ function makeQueue(
     dispatchHiddenControl,
     onHiddenControlDispatchResult,
     pendingInputWal: defaultWal,
-    supportsMethod: () => false,
-    ...overrides,
+    pendingInputQueue: compatibilityQueue,
+    ...safeOverrides,
   })
 
   return {
@@ -186,6 +214,385 @@ class TestBroadcastChannel {
 }
 
 describe('useChatPendingQueue delivery state', () => {
+  it('publishes an offline draft as locally saved only after the initial WAL commit', async () => {
+    const { wal, records } = memoryWal()
+    const persist = vi.mocked(wal.put).getMockImplementation()!
+    let commit!: () => void
+    vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+      commit = () => { void persist(record).then(resolve) }
+    }))
+    const { queue, inputText } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('disconnected'), deliveryIdentity: ref('synthetic-owner'),
+    })
+    try {
+      inputText.value = 'Close only after the save commits'
+      const queued = queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+      expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('saving')
+      expect(records.size).toBe(0)
+      expect(inputText.value).toBe('Close only after the save commits')
+      commit()
+      await expect(queued).resolves.toBe(true)
+      expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      expect([...records.values()][0]).toMatchObject({
+        text: 'Close only after the save commits', state: 'local_only',
+      })
+      expect(inputText.value).toBe('')
+    } finally { queue.cleanup() }
+  })
+
+  it('keeps an offline click local until the same identity reconnects, then drains once', async () => {
+    const { wal, records } = memoryWal()
+    const connectionState = ref('disconnected')
+    const deliveryIdentity = ref<string | null>('synthetic-gateway:owner')
+    const dispatch = vi.fn(async () => 'accepted' as const)
+    const rpc = { call: vi.fn(async (method: string) => (
+      method === 'sessions.pending_inputs.list'
+        ? { items: [] }
+        : { requestFingerprint: 'synthetic-fingerprint', revision: 1 }
+    )) as LegacyQueueRpc['call'] }
+    const { queue, inputText } = makeQueue(dispatch, () => false, undefined, undefined, {
+      rpc, hasRpcMethod: () => true, pendingInputWal: wal, connectionState, deliveryIdentity,
+    })
+    try {
+      inputText.value = 'Keep this offline message'
+      await expect(queue.enqueuePendingInput(inputText.value, undefined, {
+        deliveryIdentity: deliveryIdentity.value!,
+      })).resolves.toBe(true)
+      expect(inputText.value).toBe('')
+      expect([...records.values()][0]).toMatchObject({
+        text: 'Keep this offline message', state: 'local_only',
+        deliveryIdentity: 'synthetic-gateway:owner', mayHaveServerCopy: false,
+      })
+      expect(rpc.call).not.toHaveBeenCalled()
+      expect(dispatch).not.toHaveBeenCalled()
+
+      inputText.value = 'A newer draft'
+      connectionState.value = 'connected'
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce())
+      expect(inputText.value).toBe('A newer draft')
+      expect(queue.pendingQueue.value).toEqual([])
+      expect(vi.mocked(rpc.call).mock.calls.filter(([method]) => method === 'sessions.pending_inputs.enqueue')).toHaveLength(1)
+    } finally { queue.cleanup() }
+  })
+
+  it('retains offline messages across reload without sending under a different identity', async () => {
+    const { wal, records } = memoryWal()
+    const original = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('disconnected'),
+      deliveryIdentity: ref('synthetic-gateway:owner'),
+    })
+    original.inputText.value = 'Private owner draft'
+    await original.queue.enqueuePendingInput(original.inputText.value, undefined, {
+      deliveryIdentity: 'synthetic-gateway:owner',
+    })
+    original.queue.cleanup()
+    const deliveryIdentity = ref<string | null>('synthetic-gateway:guest')
+    const dispatch = vi.fn(async () => 'accepted' as const)
+    const rpc = { call: vi.fn(async () => ({ items: [] })) as LegacyQueueRpc['call'] }
+    const { queue } = makeQueue(dispatch, () => false, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('connected'), deliveryIdentity,
+      rpc, hasRpcMethod: () => true,
+    })
+    try {
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+      const item = queue.pendingQueue.value[0]!
+      expect(item.pendingDeliveryIdentity).toBe('synthetic-gateway:owner')
+      expect(queue.beginPendingDelivery(item.pendingUiId)).toBeNull()
+      queue.schedulePendingDrainAfterTerminal()
+      await new Promise(resolve => setTimeout(resolve, 80))
+      expect(dispatch).not.toHaveBeenCalled()
+      expect(vi.mocked(rpc.call).mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+      expect([...records.values()][0]?.text).toBe('Private owner draft')
+    } finally { queue.cleanup() }
+  })
+
+  it.each([true, false])(
+    'drains a delayed initial offline WAL hydration when the connection was already ready (server queue: %s)',
+    async supportsQueue => {
+      vi.useFakeTimers()
+      const { wal } = memoryWal([{
+        schemaVersion: 1, pendingInputId: 'restored-offline', sessionKey: 'agent:main:webchat:test',
+        clientRequestId: 'restored-request', clientMessageId: 'restored-message',
+        text: 'Saved before the previous tab closed', attachments: [], intent: null,
+        state: 'local_only', mayHaveServerCopy: false, deliveryIdentity: 'synthetic-owner',
+        createdAt: 1, updatedAt: 1,
+      }])
+      const list = vi.mocked(wal.list).getMockImplementation()!
+      let release!: () => void
+      vi.mocked(wal.list).mockImplementationOnce(key => new Promise(resolve => {
+        release = () => { void list(key).then(resolve) }
+      }))
+      const dispatch = vi.fn(async () => 'accepted' as const)
+      const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
+        ? { items: [] } : { requestFingerprint: 'restored-fingerprint', revision: 1 })
+      const { queue } = makeQueue(dispatch, () => false, undefined, undefined, {
+        pendingInputWal: wal, connectionState: ref('connected'), deliveryIdentity: ref('synthetic-owner'),
+        rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => supportsQueue,
+      })
+      try {
+        // Live and workspace readiness can precede the IndexedDB read. No
+        // connection/identity transition or external flush happens afterward.
+        queue.schedulePendingDrainAfterTerminal()
+        expect(queue.pendingQueue.value).toEqual([])
+        release()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe(supportsQueue ? 'staged' : 'local_only')
+        await vi.advanceTimersByTimeAsync(50)
+        expect(dispatch).toHaveBeenCalledOnce()
+        expect(queue.pendingQueue.value).toEqual([])
+        await vi.advanceTimersByTimeAsync(500)
+        expect(dispatch).toHaveBeenCalledOnce()
+        expect(call.mock.calls.filter(([method]) => method === 'sessions.pending_inputs.enqueue')).toHaveLength(supportsQueue ? 1 : 0)
+      } finally { queue.cleanup(); vi.useRealTimers() }
+    },
+  )
+
+  it('does not retry a definite offline enqueue denial on another reconnect', async () => {
+    const connectionState = ref('disconnected')
+    let supportsQueue = true
+    const call = vi.fn(async (method: string) => {
+      if (method === 'sessions.pending_inputs.enqueue') {
+        throw Object.assign(new Error('Synthetic permission denial'), { accepted: false, code: 'UNAUTHORIZED' })
+      }
+      return { items: [] }
+    })
+    const { queue, inputText } = makeQueue(undefined, () => false, undefined, undefined, {
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => supportsQueue,
+      connectionState, deliveryIdentity: ref('synthetic-owner'),
+    })
+    try {
+      inputText.value = 'Retain this rejected message'
+      await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+      connectionState.value = 'connected'
+      await vi.waitFor(() => expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('retryable'))
+      connectionState.value = 'disconnected'
+      await nextTick()
+      connectionState.value = 'connected'
+      await nextTick()
+      await queue.hydratePendingQueue()
+      await new Promise(resolve => setTimeout(resolve, 80))
+      expect(call.mock.calls.filter(([method]) => method === 'sessions.pending_inputs.enqueue')).toHaveLength(1)
+      expect(queue.pendingQueue.value[0]?.text).toBe('Retain this rejected message')
+      expect(queue.pendingQueue.value[0]?.pendingMayHaveServerCopy).toBe(false)
+      supportsQueue = false
+      await queue.hydratePendingQueue()
+      expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('retryable')
+      supportsQueue = true
+      inputText.value = 'A newer draft'
+      expect(queue.editPendingItem(queue.pendingQueue.value[0]!.pendingUiId)).toBe(true)
+      await vi.waitFor(() => expect(inputText.value).toBe('Retain this rejected message\nA newer draft'))
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.cancel')).toBe(false)
+    } finally { queue.cleanup() }
+  })
+
+  it('does not clear a different session draft when an offline WAL write finishes', async () => {
+    const { wal } = memoryWal()
+    let complete!: () => void
+    vi.mocked(wal.put).mockImplementationOnce(() => new Promise<void>(resolve => { complete = resolve }))
+    const { queue, inputText, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('disconnected'), deliveryIdentity: ref('synthetic-owner'),
+    })
+    try {
+      inputText.value = 'Same words in different drafts'
+      const saved = queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+      sessionKey.value = 'agent:main:webchat:other'
+      complete()
+      await saved
+      expect(inputText.value).toBe('Same words in different drafts')
+    } finally { queue.cleanup() }
+  })
+
+  it('keeps a never-transmitted offline draft locally removable if identity changes during staging WAL', async () => {
+    const { wal } = memoryWal()
+    const persist = vi.mocked(wal.put).getMockImplementation()!
+    const connectionState = ref('disconnected')
+    const deliveryIdentity = ref<string | null>('synthetic-owner')
+    let release: (() => void) | undefined
+    const call = vi.fn(async (_method: string) => ({ items: [] }))
+    const { queue, inputText } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState, deliveryIdentity,
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+    })
+    try {
+      inputText.value = 'Never transmitted'
+      await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+      vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+        release = () => { void persist(record).then(resolve) }
+      }))
+      connectionState.value = 'connected'
+      await vi.waitFor(() => expect(release).toBeDefined())
+      connectionState.value = 'disconnected'
+      deliveryIdentity.value = 'synthetic-guest'
+      release!()
+      await vi.waitFor(() => expect(queue.pendingQueue.value[0]).toMatchObject({
+        pendingMayHaveServerCopy: false, pendingPersistenceState: 'local_only',
+      }))
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+      expect(await queue.cancelDurableItem(queue.pendingQueue.value[0]!)).toBe(true)
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.cancel')).toBe(false)
+    } finally { release?.(); queue.cleanup() }
+  })
+
+  it.each(['identity', 'session'] as const)(
+    'stops later offline attachment uploads when the %s changes during the first refresh',
+    async change => {
+      const { wal, records } = memoryWal()
+      const connectionState = ref('disconnected')
+      const deliveryIdentity = ref<string | null>('synthetic-owner')
+      let release!: () => void
+      const firstUpload = new Promise<void>(resolve => { release = resolve })
+      const uploadAttachment = vi.fn(async (file: File) => {
+        if (file.name === 'first.pdf') await firstUpload
+        return { fileUuid: `refreshed-${file.name}`, expiresAt: Date.now() + 60_000 }
+      })
+      const unused = async (): Promise<never> => { throw new Error('Unexpected artifact access') }
+      const content: ArtifactContentAccess = {
+        fetchArtifact: unused, openArtifact: unused, openArtifactBlob: unused,
+        clearPreviewStorage: unused, fetchAttachment: unused, uploadAttachment,
+      }
+      const attachments = useChatAttachments(content)
+      const prepare = vi.fn(attachments.prepareAttachmentsForSend)
+      const onPendingPersistenceError = vi.fn()
+      const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
+        ? { items: [] } : { requestFingerprint: 'unexpected-enqueue', revision: 1 })
+      const { queue, inputText, pendingAttachments, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+        pendingInputWal: wal, connectionState, deliveryIdentity,
+        prepareAttachmentsForSend: prepare, onPendingPersistenceError,
+        rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+      })
+      try {
+        inputText.value = 'Keep both private attachment drafts'
+        pendingAttachments.value = ['first.pdf', 'second.pdf'].map((name, index) => ({
+          kind: 'staged', local_id: index + 1, name, mime: 'application/pdf',
+          file_uuid: `original-${name}`, expires_at: 0,
+          file: new File(['Synthetic PDF content'], name, { type: 'application/pdf' }),
+        }))
+        await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+        const originalWal = structuredClone([...records.values()][0]!)
+        connectionState.value = 'connected'
+        await vi.waitFor(() => expect(uploadAttachment).toHaveBeenCalledOnce())
+        if (change === 'identity') deliveryIdentity.value = 'synthetic-guest'
+        else sessionKey.value = 'agent:main:webchat:other'
+        release()
+        await prepare.mock.results[0]!.value
+        await nextTick()
+        expect(uploadAttachment).toHaveBeenCalledOnce()
+        await expect(prepare.mock.results[0]!.value).resolves.toBe(false)
+        expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+        expect(onPendingPersistenceError).not.toHaveBeenCalled()
+        expect([...records.values()]).toEqual([originalWal])
+        expect(queue.pendingQueue.value[0]).toMatchObject({
+          pendingPersistenceState: 'local_only', pendingMayHaveServerCopy: false,
+          attachments: [
+            { file_uuid: 'original-first.pdf' }, { file_uuid: 'original-second.pdf' },
+          ],
+        })
+      } finally { release(); queue.cleanup() }
+    },
+  )
+
+  it('stops server hydration after identity changes during a row write and retains the captured identity', async () => {
+    const { wal, records } = memoryWal()
+    const persist = vi.mocked(wal.put).getMockImplementation()!
+    const connectionState = ref('connected')
+    const deliveryIdentity = ref<string | null>('synthetic-owner')
+    let release: (() => void) | undefined
+    vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+      release = () => { void persist(record).then(resolve) }
+    }))
+    const call = vi.fn(async () => ({ items: ['first', 'second'].map(id => ({
+      pendingInputId: id, clientRequestId: `request-${id}`, clientMessageId: `message-${id}`,
+      message: `Private ${id}`, requestFingerprint: `fingerprint-${id}`, revision: 1,
+    })) }))
+    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState, deliveryIdentity,
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+    })
+    try {
+      await vi.waitFor(() => expect(release).toBeDefined())
+      connectionState.value = 'disconnected'
+      deliveryIdentity.value = 'synthetic-guest'
+      release!()
+      await vi.waitFor(() => expect(records.has('first')).toBe(true))
+      await nextTick()
+      expect(queue.pendingQueue.value.map(item => item.pendingInputId)).toEqual(['first'])
+      expect(queue.pendingQueue.value[0]?.pendingDeliveryIdentity).toBe('synthetic-owner')
+      expect(records.get('first')?.deliveryIdentity).toBe('synthetic-owner')
+      expect(queue.beginPendingDelivery('first')).toBeNull()
+      expect(records.has('second')).toBe(false)
+    } finally { release?.(); queue.cleanup() }
+  })
+
+  it('waits for a proven delivery identity before importing server queue rows', async () => {
+    const deliveryIdentity = ref<string | null>(null)
+    const call = vi.fn(async (_method: string) => ({ items: [{
+      pendingInputId: 'server-row', clientRequestId: 'server-request', clientMessageId: 'server-message',
+      message: 'Server-owned draft', requestFingerprint: 'server-fingerprint', revision: 1,
+    }] }))
+    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+      connectionState: ref('connected'), deliveryIdentity,
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+    })
+    try {
+      await queue.hydratePendingQueue()
+      expect(call).not.toHaveBeenCalled()
+      expect(queue.pendingQueue.value).toEqual([])
+      deliveryIdentity.value = 'synthetic-owner'
+      await vi.waitFor(() => expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged'))
+      expect(call).toHaveBeenCalledOnce()
+      expect(queue.pendingQueue.value[0]?.pendingDeliveryIdentity).toBe('synthetic-owner')
+    } finally { queue.cleanup() }
+  })
+
+  it.each([
+    { action: 'edit', change: 'session' },
+    { action: 'tail', change: 'identity' },
+    { action: 'all', change: 'draft' },
+    { action: 'edit', change: 'revision' },
+  ])(
+    'keeps the queued draft when $action cancellation outlives its composer $change',
+    async ({ action, change }) => {
+      const { wal, records } = memoryWal()
+      const persist = vi.mocked(wal.put).getMockImplementation()!
+      const deliveryIdentity = ref<string | null>('synthetic-owner')
+      const composerRevision = ref(0)
+      const connectionState = ref('disconnected')
+      let release: (() => void) | undefined
+      const { queue, inputText, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+        pendingInputWal: wal, connectionState, deliveryIdentity, composerRevision,
+      })
+      try {
+        inputText.value = 'Original private draft'
+        await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+        const item = queue.pendingQueue.value[0]!
+        inputText.value = 'Visible draft'
+        vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+          release = () => { void persist(record).then(resolve) }
+        }))
+        expect(action === 'edit' ? queue.editPendingItem(item.pendingUiId)
+          : action === 'tail' ? queue.popPendingTail() : queue.popAllPendingIntoComposer()).toBe(true)
+        await vi.waitFor(() => expect(release).toBeDefined())
+        if (change === 'session') sessionKey.value = 'agent:main:webchat:other'
+        else if (change === 'identity') deliveryIdentity.value = 'synthetic-guest'
+        else if (change === 'revision') composerRevision.value += 1
+        else inputText.value = 'A newer untouched draft'
+        const expectedDraft = inputText.value
+        release!()
+        await vi.waitFor(() => expect(records.get(item.pendingInputId!)?.state).not.toBe('cancelling'))
+        await nextTick()
+        expect(inputText.value).toBe(expectedDraft)
+        expect(records.get(item.pendingInputId!)).toMatchObject({
+          text: 'Original private draft', state: 'local_only', retainAfterCancel: true,
+        })
+        sessionKey.value = 'agent:main:webchat:test'
+        deliveryIdentity.value = 'synthetic-owner'
+        connectionState.value = 'connected'
+        await nextTick()
+        expect(queue.beginPendingDelivery(item.pendingUiId)).toBeNull()
+      } finally { release?.(); queue.cleanup() }
+    },
+  )
+
   it('fails closed when the IndexedDB global accessor itself throws', () => {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB')
     Object.defineProperty(globalThis, 'indexedDB', {
@@ -213,7 +620,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     inputText.value = 'survives a refresh'
 
@@ -268,7 +675,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     const original: Attachment = {
       kind: 'staged',
@@ -316,7 +723,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     inputText.value = 'queued draft'
 
@@ -353,7 +760,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         sessionKey: delayedSessionKey,
         pendingInputWal: wal,
-        supportsMethod: () => false,
+        hasRpcMethod: () => false,
       },
     )
     expect(queue.pendingQueue.value).toEqual([])
@@ -387,7 +794,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     await vi.waitFor(() => {
       expect(queue.pendingQueue.value[0]).toMatchObject({
@@ -484,7 +891,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -497,7 +904,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'queue with attachment'
@@ -557,7 +964,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -577,7 +984,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
         prepareAttachmentsForSend,
       },
     )
@@ -621,7 +1028,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -634,7 +1041,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'stage exactly once'
@@ -678,7 +1085,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -691,7 +1098,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -734,7 +1141,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -743,7 +1150,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
     })
 
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
@@ -774,7 +1181,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -783,7 +1190,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
     })
 
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
@@ -840,7 +1247,7 @@ describe('useChatPendingQueue delivery state', () => {
         }],
       }
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -853,7 +1260,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -883,7 +1290,7 @@ describe('useChatPendingQueue delivery state', () => {
         throw new Error(`unexpected method: ${method}`)
       },
     )
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -896,7 +1303,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     inputText.value = 'cancel after lost acknowledgement'
@@ -934,7 +1341,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const initialRpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const initialRpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         initialRpcCall(method, params) as Promise<T>
       ),
@@ -947,7 +1354,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc: initialRpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     initial.inputText.value = 'cancel across a Gateway downgrade'
@@ -969,7 +1376,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     await vi.waitFor(() => {
       expect(legacy.queue.pendingQueue.value[0]).toMatchObject({
@@ -1006,7 +1413,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const restoredRpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const restoredRpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         restoredRpcCall(method, params) as Promise<T>
       ),
@@ -1019,7 +1426,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc: restoredRpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1047,14 +1454,14 @@ describe('useChatPendingQueue delivery state', () => {
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     const second = makeQueue(
       undefined,
       () => false,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     try {
       first.inputText.value = 'cancel this in every tab'
@@ -1106,11 +1513,55 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('retains an old annotation WAL for explicit recovery without staging or dispatching it', async () => {
+    const { wal } = memoryWal([{
+      schemaVersion: 1,
+      pendingInputId: 'pending-old-annotation',
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-old-annotation',
+      clientMessageId: 'message-old-annotation',
+      text: 'Update this heading',
+      promptAnnotationIds: ['retired-draft'],
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      createdAt: 1,
+      updatedAt: 1,
+    }])
+    const dispatch = vi.fn(async () => 'accepted' as const)
+    const { queue, inputText } = makeQueue(dispatch, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+    })
+    await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+    const item = queue.pendingQueue.value[0]!
+    expect(item.retiredAnnotationInput).toBe(true)
+    expect(queue.beginPendingDelivery(item.pendingUiId)).toBeNull()
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(queue.editPendingItem(item.pendingUiId)).toBe(true)
+    await vi.waitFor(() => expect(inputText.value).toBe('Update this heading'))
+    queue.cleanup()
+  })
+
+  it('stages annotation-only input through the ordinary queue without changing the visible body', async () => {
+    const enqueue = vi.fn(async () => ({ requestFingerprint: 'fingerprint', revision: 1 }))
+    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputQueue: { supportsQueue: () => true, supportsReorder: () => false, enqueue,
+        list: async () => [], cancel: async () => {}, reorder: async () => ({ items: [] }) },
+    })
+    const pageContext = { targetRef: 'target-1', annotations: [{ text: 'First change' }, { text: 'Second change' }] }
+    await queue.enqueuePendingPayload({ text: '', pageContext })
+    await vi.waitFor(() => expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'First change\nSecond change', displayText: '', pageContext,
+    })))
+    queue.cleanup()
+  })
+
   it('does not edit a queued annotation batch into plain text', async () => {
     const { inputText, queue } = makeQueue()
     await expect(queue.enqueuePendingPayload({
       text: 'apply the second selected edit',
-      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+      pageContext: { targetRef: 'target-1', annotations: [{ text: 'Change this heading' }] },
     })).resolves.toBe(true)
     const itemId = pendingUiId(queue, 0)
     inputText.value = 'keep the current composer draft'
@@ -1119,7 +1570,7 @@ describe('useChatPendingQueue delivery state', () => {
     expect(queue.pendingQueue.value).toHaveLength(1)
     expect(queue.pendingQueue.value[0]).toMatchObject({
       text: 'apply the second selected edit',
-      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+      pageContext: { targetRef: 'target-1', annotations: [{ text: 'Change this heading' }] },
     })
     expect(inputText.value).toBe('keep the current composer draft')
     queue.cleanup()
@@ -1170,7 +1621,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1184,7 +1635,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1260,7 +1711,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1274,7 +1725,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     await vi.waitFor(() => {
@@ -1318,7 +1769,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
     await vi.waitFor(() => {
@@ -1367,7 +1818,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       throw new Error(`unexpected method: ${method}`)
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
         void params
         return rpcCall(method) as Promise<T>
@@ -1381,7 +1832,7 @@ describe('useChatPendingQueue delivery state', () => {
       {
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
       },
     )
 
@@ -1529,7 +1980,7 @@ describe('useChatPendingQueue delivery state', () => {
         items: key === sessionB ? structuredClone(serverRows) : [],
       }
     })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+    const rpc: LegacyQueueRpc = {
       call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
         rpcCall(method, params) as Promise<T>
       ),
@@ -1545,7 +1996,7 @@ describe('useChatPendingQueue delivery state', () => {
         sessionKey,
         pendingInputWal: wal,
         rpc,
-        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
         connectionState: ref('connected'),
       },
     )
@@ -1993,7 +2444,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     first.inputText.value = 'follow-up A'
     await first.queue.enqueuePendingInput(first.inputText.value, { ownerRequestId })
@@ -2003,7 +2454,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     await reloaded.queue.hydratePendingQueue(parent)
     expect(reloaded.queue.pendingQueue.value.map(item => item.ownerRequestId)).toEqual([
@@ -2040,7 +2491,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { wal } = memoryWal()
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     for (const text of ['A', 'B', 'C']) {
       first.inputText.value = text
@@ -2057,7 +2508,7 @@ describe('useChatPendingQueue delivery state', () => {
 
     const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     await reloaded.queue.hydratePendingQueue(reloaded.sessionKey.value)
     expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'A', 'B'])
@@ -2090,7 +2541,7 @@ describe('useChatPendingQueue delivery state', () => {
     })
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     for (const text of ['A', 'B']) {
       source.inputText.value = text
@@ -2164,7 +2615,7 @@ describe('useChatPendingQueue delivery state', () => {
     ))
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     let current = true
 
@@ -2222,7 +2673,7 @@ describe('useChatPendingQueue delivery state', () => {
       () => blocked,
       undefined,
       undefined,
-      { pendingInputWal: wal, supportsMethod: () => false },
+      { pendingInputWal: wal, hasRpcMethod: () => false },
     )
     try {
       source.inputText.value = 'source item must still drain'
@@ -2306,7 +2757,7 @@ describe('useChatPendingQueue delivery state', () => {
     })
     const source = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
-      supportsMethod: () => false,
+      hasRpcMethod: () => false,
     })
     const controller = new AbortController()
 
@@ -2379,13 +2830,13 @@ describe('useChatPendingQueue delivery state', () => {
         }
         return {}
       })
-    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
-      call: rpcCall as unknown as NonNullable<UseChatPendingQueueOptions['rpc']>['call'],
+    const rpc: LegacyQueueRpc = {
+      call: rpcCall as unknown as LegacyQueueRpc['call'],
     }
     const first = makeQueue(undefined, () => false, undefined, undefined, {
       pendingInputWal: wal,
       rpc,
-      supportsMethod: method => [
+      hasRpcMethod: method => [
         'sessions.pending_inputs.enqueue',
         'sessions.pending_inputs.reorder',
       ].includes(method),

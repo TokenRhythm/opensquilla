@@ -34,6 +34,7 @@ from .codex_auth import (
     refresh_codex_credentials,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .openai_responses import _responses_input
 from .protocol import ProviderConnectionConfig, ProviderMetadata
@@ -42,6 +43,8 @@ from .request_proof import (
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import (
     DEFAULT_MAX_TOOL_CALLS,
@@ -248,7 +251,8 @@ class OpenAICodexProvider:
         return project_final_request_payload(
             payload,
             projection_adapter="openai_codex",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=wire_active_user_index,
@@ -304,7 +308,8 @@ class OpenAICodexProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="openai_codex",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
             active_user_message_index=wire_active_user_index,
@@ -330,6 +335,7 @@ class OpenAICodexProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, cfg),
                 projection_adapter="openai_codex",
                 status_projection_mode="content_envelope",
                 envelope_shape=RESPONSES_REQUEST_ENVELOPE,
@@ -389,6 +395,9 @@ class OpenAICodexProvider:
                                     max_len=2000,
                                 ),
                                 code=str(response.status_code),
+                                retry_after_s=retry_after_from_headers(
+                                    response.status_code, getattr(response, "headers", None)
+                                ),
                             )
                             return
 
@@ -406,7 +415,7 @@ class OpenAICodexProvider:
                     api_key=credentials.access_token,
                     max_len=2000,
                 ),
-                code="timeout",
+                code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout",
             )
         except httpx.RequestError as exc:
             yield ErrorEvent(
@@ -415,7 +424,7 @@ class OpenAICodexProvider:
                     api_key=credentials.access_token,
                     max_len=2000,
                 ),
-                code="request_error",
+                code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error",
             )
         except CandidateArtifactLimitError as exc:
             log.warning(

@@ -70,7 +70,7 @@ def test_default_sources_use_version_scoped_runtime_pack_paths(
         "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/runtime-packs"
     )
     assert bases[RuntimeSource.GITHUB] == (
-        "https://github.com/opensquilla/runtime-packs/releases/download"
+        "https://github.com/TokenRhythm/runtime-packs/releases/download"
     )
 
 
@@ -1421,6 +1421,9 @@ def test_cancel_does_not_promise_cancellation_after_activation_boundary(
     assert not event.is_set()
 
 
+# Real archive extraction must reach the bounded probe handshake without
+# competing with the CI worker pool's disk writes.
+@pytest.mark.ci_serial
 def test_cancel_during_probe_keeps_old_activation_and_resumable_download(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1456,11 +1459,14 @@ def test_cancel_during_probe_keeps_old_activation_and_resumable_download(
 
     monkeypatch.setattr(runtime_pack_manager, "_run_probe", blocking_probe)
     operation = service.start_install("python")
-    assert entered.wait(5)
-    cancelling = service.cancel("python", operation.operation_id)
-    assert cancelling.state is RuntimeOperationState.CANCELLING
-    release.set()
-    completed = service.wait_for_operation(operation.operation_id)
+    try:
+        assert entered.wait(5)
+        cancelling = service.cancel("python", operation.operation_id)
+        assert cancelling.state is RuntimeOperationState.CANCELLING
+    finally:
+        release.set()
+        completed = service.wait_for_operation(operation.operation_id)
+        assert operation.operation_id not in service._threads
 
     assert completed is not None and completed.state is RuntimeOperationState.CANCELLED
     active = service.active_runtime("python")
@@ -1746,4 +1752,27 @@ def test_unavailable_status_never_exposes_catalog_path(
         component.last_error is not None
         and str(secret_path) not in component.last_error.message
         for component in status.components
+    )
+
+
+@pytest.mark.parametrize(
+    "base",
+    [
+        "https://github.com/opensquilla/runtime-packs/releases/download",
+        "https://github.com/TokenRhythm/runtime-packs/releases/download",
+        "https://downloads.example.test/runtime-packs",
+    ],
+)
+def test_runtime_pack_repository_override_survives_organization_migration(
+    monkeypatch: pytest.MonkeyPatch,
+    base: str,
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_RUNTIME_PACK_OSS_BASE", raising=False)
+    monkeypatch.setenv("OPENSQUILLA_RUNTIME_PACK_GITHUB_BASE", f"{base}/")
+
+    bases = runtime_pack_manager._default_source_bases()
+
+    assert bases[RuntimeSource.GITHUB] == base
+    assert bases[RuntimeSource.OSS] == (
+        "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/runtime-packs"
     )

@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from opensquilla.provider import anthropic as anthropic_module
 from opensquilla.provider import openai as openai_module
@@ -275,9 +276,15 @@ def test_anthropic_final_request_proof_allows_native_image_payload(
                 "message": {"id": "msg_1", "model": "claude-test", "usage": {}},
             },
             {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
                 "type": "content_block_delta",
+                "index": 0,
                 "delta": {"type": "text_delta", "text": "ok"},
             },
+            {"type": "content_block_stop", "index": 0},
             {"type": "message_delta", "usage": {"output_tokens": 1}},
             {"type": "message_stop"},
         ]
@@ -503,9 +510,15 @@ def test_anthropic_final_request_proof_compacts_adapter_payload_with_tools(
                 "message": {"id": "msg_1", "model": "claude-test", "usage": {}},
             },
             {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
                 "type": "content_block_delta",
+                "index": 0,
                 "delta": {"type": "text_delta", "text": "ok"},
             },
+            {"type": "content_block_stop", "index": 0},
             {"type": "message_delta", "usage": {"output_tokens": 1}},
             {"type": "message_stop"},
         ]
@@ -578,3 +591,93 @@ def test_anthropic_final_request_proof_compacts_adapter_payload_with_tools(
     assert proof["tools_chars"] > 0
     assert proof["system_chars"] > 0
     assert proof["top_level_chars"] > 0
+
+
+@pytest.mark.parametrize("window", [8_192, 32_000, 200_000, 1_000_000])
+@pytest.mark.parametrize("thinking", [False, True])
+def test_physical_budget_projection_matches_sent_payload(
+    monkeypatch: Any, window: int, thinking: bool,
+) -> None:
+    payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=_openai_sse_body(),
+        )
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(
+        openai_module.httpx, "AsyncClient",
+        lambda **kwargs: client(**{**kwargs, "transport": httpx.MockTransport(handler)}),
+    )
+    provider = OpenAIProvider(api_key="test", model="gpt-test")
+    config = ChatConfig(
+        max_tokens=2_048, thinking=thinking, thinking_budget_tokens=5_000,
+        provider_context_window_tokens=window,
+        provider_request_max_chars=10,
+        provider_request_max_chars_explicit_cap=0,
+        physical_attempt_limit=1,
+    )
+    messages = [Message(role="user", content="Continue the synthetic task.")]
+    projection = provider.project_final_request(messages, config=config)
+    assert projection.fits
+    generation = projection.payload.get(
+        "max_completion_tokens", projection.payload.get("max_tokens"),
+    )
+    reserve = 20_000 if window >= 64_000 else max(512, window // 8)
+    usable = max(0, window - generation - reserve)
+    assert projection.proof["effective_proof_token_budget"] == max(
+        0, usable - min(4_096, max(128, usable // 10)),
+    )
+    assert projection.proof["proof_budget"] == 4 * usable
+
+    async def run() -> list[Any]:
+        return [event async for event in provider.chat(messages, config=config)]
+
+    events = asyncio.run(run())
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert len(payloads) == 1
+    assert payloads[0] == projection.payload
+
+
+def test_anthropic_budget_reserves_adjusted_generation_once() -> None:
+    provider = AnthropicProvider(api_key="test", model="claude-test")
+    projection = provider.project_final_request(
+        [Message(role="user", content="Continue.")],
+        config=ChatConfig(
+            max_tokens=1_024, thinking=True, thinking_budget_tokens=5_000,
+            provider_context_window_tokens=32_000,
+            provider_request_max_chars_explicit_cap=0,
+        ),
+    )
+    assert projection.payload["max_tokens"] == 9_096
+    assert projection.proof["effective_proof_token_budget"] == 17_014
+    assert projection.fits
+
+
+def test_generation_reserve_cannot_be_silently_halved(monkeypatch: Any) -> None:
+    requests: list[httpx.Request] = []
+    client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    monkeypatch.setattr(
+        openai_module.httpx, "AsyncClient",
+        lambda **kwargs: client(**{**kwargs, "transport": httpx.MockTransport(handler)}),
+    )
+    provider = OpenAIProvider(api_key="test", model="gpt-test")
+    config = ChatConfig(max_tokens=8_192, provider_context_window_tokens=8_192)
+    messages = [Message(role="user", content="Continue.")]
+    projection = provider.project_final_request(messages, config=config)
+    assert not projection.fits
+    assert projection.proof["effective_proof_token_budget"] == 0
+
+    async def run() -> list[Any]:
+        return [event async for event in provider.chat(messages, config=config)]
+
+    events = asyncio.run(run())
+    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert requests == []

@@ -51,6 +51,10 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
         context / "src/opensquilla/gateway/static/dist/assets/stale-hash.js",
         "stale bundle\n",
     )
+    _write(
+        context / "opensquilla-webui/dist/assets/stale-hash.js",
+        "stale source bundle\n",
+    )
 
     # Nested dotfiles and private BGM remain supported inputs. The former is
     # harmless build metadata; the latter is deliberately allowed for local
@@ -88,3 +92,4 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
     assert not (copied / "config/tls/server.pem").exists()
     assert not (copied / "config/tls/server.key").exists()
     assert not (copied / "src/opensquilla/gateway/static/dist").exists()
+    assert not (copied / "opensquilla-webui/dist").exists()

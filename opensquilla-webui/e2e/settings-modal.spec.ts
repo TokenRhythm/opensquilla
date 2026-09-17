@@ -73,16 +73,63 @@ test.describe('Settings modal', () => {
     await expect(dialog(page).locator('textarea#cfg-yaml-area')).toHaveCount(0)
     await expect(dialog(page).getByText('Guided setup')).toHaveCount(0)
 
-    // Footer keeps the config.toml escape hatch with a copy affordance.
-    const foot = dialog(page).locator('.settings-foot')
-    await expect(foot).toContainText('More options live in')
-    // Honest restart copy: most edits apply live, only some need a restart.
-    await expect(foot).toContainText('Most changes apply live; some need a gateway restart')
-    // The old blanket "always restart" leak is gone.
-    await expect(foot).not.toContainText('Restart the gateway after manual edits')
-    await expect(foot.locator('.settings-foot__path')).toContainText(/config.*\.toml/)
-    await foot.getByRole('button', { name: 'Copy config path' }).click()
+    // Config details live in Advanced; routine settings keep the footer clear.
+    await expect(dialog(page).locator('.settings-foot')).toHaveCount(0)
+    await expect(dialog(page).getByRole('button', { name: 'Copy config path' })).toHaveCount(0)
+    await railTab(page, 'Advanced').click()
+    const file = dialog(page).getByTestId('advanced-config-file')
+    await expect(file).toContainText('Configuration file')
+    await expect(file.locator('code')).toContainText(/config.*\.toml/)
+    await file.getByRole('button', { name: 'Copy config path' }).click()
     await expect(page.locator('.toast', { hasText: /Copied/ }).first()).toBeVisible()
+  })
+
+  test('renders a failure toast above Settings from the body portal', async ({ page }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: () => Promise.reject(new Error('Clipboard denied')) },
+      })
+      Object.defineProperty(document, 'execCommand', {
+        configurable: true,
+        value: () => false,
+      })
+    })
+    await openFromSidebar(page)
+
+    await railTab(page, 'Advanced').click()
+    await dialog(page).getByRole('button', { name: 'Copy config path' }).click()
+    const toast = page.locator('.toast.toast--danger', { hasText: /Copy failed/ }).first()
+    await expect(toast).toBeVisible()
+
+    const placement = await toast.evaluate(element => {
+      const host = element.closest('[data-testid="toast-host"]')
+      const app = document.querySelector('#app')
+      const rect = element.getBoundingClientRect()
+      const topmost = document.elementFromPoint(
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2,
+      )
+      return {
+        bodyChild: host?.parentElement === document.body,
+        outsideApp: Boolean(host && app && !app.contains(host)),
+        fullyInViewport: rect.left >= 0
+          && rect.top >= 0
+          && rect.right <= window.innerWidth
+          && rect.bottom <= window.innerHeight,
+        aboveModal: topmost === element || element.contains(topmost),
+      }
+    })
+    expect(placement).toEqual({
+      bodyChild: true,
+      outsideApp: true,
+      fullyInViewport: true,
+      aboveModal: true,
+    })
+
+    await toast.getByRole('button', { name: 'Dismiss notification' }).click()
+    await expect(toast).toHaveCount(0)
+    await expect(dialog(page)).toBeVisible()
   })
 
   test('rail switches sections, marks the active tab, and syncs the URL with replace', async ({ page }) => {

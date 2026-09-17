@@ -25,6 +25,7 @@ async function mountQueue(
     pendingUiId?: string
     text: string
     pendingInputId?: string
+    pendingDeliveryIdentity?: string
     pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
     deliveryState?: 'steering' | 'retryable'
     steerAttempt?: PendingSteerAttempt
@@ -39,6 +40,8 @@ async function mountQueue(
     steerAvailable?: boolean
     durableSteerAvailable?: boolean
     steerUnavailableMessage?: string
+    offline?: boolean
+    deliveryIdentity?: string | null
   } = {},
 ) {
   const el = document.createElement('div')
@@ -60,6 +63,35 @@ async function mountQueue(
 }
 
 describe('PendingQueue', () => {
+  it('shows Saving instead of Saved locally until the offline WAL has committed', async () => {
+    const items = reactive([{
+      text: 'Waiting for local durability', pendingDeliveryIdentity: 'synthetic-owner',
+      pendingPersistenceState: 'saving' as 'saving' | 'local_only',
+    }])
+    const { app, el } = await mountQueue({}, items, { offline: true, deliveryIdentity: 'synthetic-owner' })
+    expect(el.textContent).toContain('Saving')
+    expect(el.textContent).not.toContain('Saved locally')
+    items[0]!.pendingPersistenceState = 'local_only'
+    await nextTick()
+    expect(el.textContent).toContain('Saved locally')
+    expect(el.textContent).not.toContain('Saving')
+    app.unmount()
+  })
+
+  it.each([
+    { offline: true, deliveryIdentity: 'synthetic-owner', status: 'Saved locally' },
+    { offline: false, deliveryIdentity: 'synthetic-guest', status: 'Connection identity changed' },
+  ])('explains why an offline message is retained: $status', async ({ status, ...props }) => {
+    const { app, el } = await mountQueue({}, [{
+      text: 'Retained offline message', pendingDeliveryIdentity: 'synthetic-owner',
+      pendingPersistenceState: 'local_only',
+    }], props)
+    expect(el.querySelector('.chat-pending-save-status')?.textContent).toContain(status)
+    expect(el.querySelector('.chat-pending-action--steer')).toBeNull()
+    expect(el.querySelector('[aria-label="Remove pending message 1"]')).not.toBeNull()
+    app.unmount()
+  })
+
   const steerRequest = {
     key: 'agent:main:webchat:test',
     message: 'Make it longer',

@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import secrets
 import sqlite3
 import time
 from collections.abc import (
@@ -28,6 +29,12 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
+from opensquilla.persistence.memory_flush_retirement import (
+    RETIRED_MEMORY_COLUMNS,
+    memory_flush_retirement_statements,
+)
+from opensquilla.session.attachment_manifest import preserve_attachment_occurrence_ids
 from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.goals import (
     GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY,
@@ -116,7 +123,6 @@ from opensquilla.turn_outcome_projection import (
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
-    from opensquilla.artifact_session import PreparedPromptAnnotationTarget, PromptAnnotation
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
@@ -517,6 +523,8 @@ def _serialized_read[**P, R](
 # prompt-annotation drafts atomically consumed by chat turns. Version 24 added
 # durable idempotency receipts for artifact mutation attempts. Version 25 added
 # the persistent per-session model-routing mode and its compare-and-set revision.
+# Nullable execution workspace bindings are additive and are migrated without
+# changing the semantic session schema version used by upgrade compatibility.
 SCHEMA_VERSION = 25
 MAX_PENDING_CHAT_INPUTS = 5
 
@@ -594,6 +602,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     subject TEXT,
     origin TEXT,
     workspace_id TEXT,
+    execution_workspace TEXT,
     agent_id TEXT NOT NULL DEFAULT 'main',
     schema_version INTEGER NOT NULL DEFAULT 1,
     epoch INTEGER NOT NULL DEFAULT 0
@@ -825,6 +834,7 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning_content TEXT,
+    assistant_replay TEXT,
     turn_usage TEXT,
     turn_context TEXT,
     created_at INTEGER NOT NULL,
@@ -863,6 +873,7 @@ CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning_content TEXT,
+    assistant_replay TEXT,
     turn_usage TEXT,
     turn_context TEXT,
     created_at INTEGER NOT NULL,
@@ -943,7 +954,6 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     removed_count INTEGER NOT NULL DEFAULT 0,
     kept_count INTEGER NOT NULL DEFAULT 0,
     chunk_count INTEGER NOT NULL DEFAULT 0,
-    flush_receipt_status TEXT NOT NULL DEFAULT 'unknown',
     covered_through_id INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1
@@ -1197,7 +1207,6 @@ CREATE TABLE IF NOT EXISTS memory_durable_receipts (
     turn_id TEXT,
     scope TEXT NOT NULL,
     source_path TEXT,
-    target_path TEXT,
     content_hash TEXT,
     coverage_turn_id TEXT,
     coverage_hash TEXT,
@@ -1205,8 +1214,6 @@ CREATE TABLE IF NOT EXISTS memory_durable_receipts (
     idempotency_key TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL,
     reason TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    next_retry_at_ms INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1
@@ -1495,6 +1502,7 @@ def _transcript_preimage(
             entry.provenance_source_tool,
             entry.schema_version,
             _stable_json(entry.tool_calls),
+            _stable_json(entry.assistant_replay),
             _stable_json(entry.turn_usage),
             _stable_json(entry.turn_context),
         )
@@ -1518,14 +1526,95 @@ def _ordered_detail_message_ids(*values: Any) -> list[str]:
     return ordered
 
 
+def _bind_task_session_owner(
+    details: dict[str, Any],
+    *,
+    session_id: str,
+    session_epoch: int,
+) -> dict[str, Any]:
+    """Validate and freeze one task's durable session incarnation owner."""
+
+    if "session_id" in details:
+        bound_session_id = details["session_id"]
+        if not isinstance(bound_session_id, str) or not bound_session_id:
+            raise ValueError("Task session owner session_id must be a non-empty string")
+        if bound_session_id != session_id:
+            raise StaleEpochError(
+                "Task session owner changed before durable acceptance"
+            )
+    if "session_epoch" in details:
+        bound_session_epoch = details["session_epoch"]
+        if (
+            isinstance(bound_session_epoch, bool)
+            or not isinstance(bound_session_epoch, int)
+            or bound_session_epoch < 0
+        ):
+            raise ValueError(
+                "Task session owner session_epoch must be a non-negative integer"
+            )
+        if bound_session_epoch != session_epoch:
+            raise StaleEpochError(
+                "Task session epoch changed before durable acceptance"
+            )
+    details["session_id"] = session_id
+    details["session_epoch"] = session_epoch
+    return details
+
+
+def _validate_optional_session_owner(
+    *,
+    session_id: str | None,
+    session_epoch: int | None,
+) -> None:
+    """Validate an optional owner CAS while allowing legacy id-only callers."""
+
+    if session_id is not None and (
+        not isinstance(session_id, str) or not session_id
+    ):
+        raise ValueError("expected session owner id must be a non-empty string")
+    if session_epoch is not None and (
+        isinstance(session_epoch, bool)
+        or not isinstance(session_epoch, int)
+        or session_epoch < 0
+    ):
+        raise ValueError("expected session owner epoch must be a non-negative integer")
+    if session_epoch is not None and session_id is None:
+        raise ValueError("expected session owner epoch requires its session id")
+
+
+async def _matches_session_owner_on_conn(
+    conn: Any,
+    *,
+    session_key: str,
+    session_id: str | None,
+    session_epoch: int | None,
+) -> bool:
+    """Return whether the current row still matches a supplied durable owner."""
+
+    if session_id is None:
+        return True
+    async with conn.execute(
+        "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+        (session_key,),
+    ) as cur:
+        row = await cur.fetchone()
+    return bool(
+        row is not None
+        and str(row["session_id"]) == session_id
+        and (session_epoch is None or int(row["epoch"]) == session_epoch)
+    )
+
+
 def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     """Deserialize JSON text fields back to Python objects."""
     json_fields = {
         "delivery_context",
         "tool_calls",
+        "assistant_replay",
         "turn_usage",
         "turn_context",
         "origin",
+        "execution_workspace",
         "details",
         "summary_payload",
         "missing_obligations",
@@ -1551,7 +1640,15 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
             try:
                 result[k] = json.loads(v)
             except (json.JSONDecodeError, TypeError):
+                if k == "assistant_replay":
+                    raise ValueError("invalid assistant replay JSON") from None
+                if k == "execution_workspace":
+                    raise ValueError("invalid execution workspace JSON") from None
                 result[k] = None
+            if k == "assistant_replay" and not isinstance(result[k], dict):
+                raise ValueError("assistant replay JSON must be an object")
+            if k == "execution_workspace" and not isinstance(result[k], dict):
+                raise ValueError("execution workspace JSON must be an object")
         elif k in bool_fields:
             result[k] = bool(v)
         else:
@@ -2260,14 +2357,17 @@ class SessionStorage:
         # Migrate older databases — add the epoch column if missing.
         await self._migrate_epoch_column()
         await self._migrate_workspace_id_column()
+        await self._migrate_execution_workspace_column()
         await self._migrate_collaboration_columns()
         await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
+        await self._migrate_assistant_replay_column()
         await self._migrate_transcript_turn_usage_column()
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
         await self._migrate_memory_durable_receipt_coverage_columns()
+        await self._retire_legacy_memory_flush_metadata()
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_COVERAGE)
         # Recency index for list_sessions / title search. Guarded on the column
         # because a very old (pre-updated_at) sessions table can survive here
@@ -2338,6 +2438,35 @@ class SessionStorage:
                 finally:
                     await connection.close()
             self._usage_backfill_indexes_ready = True
+
+    async def ensure_daily_usage_store_id(self) -> str:
+        """Keep upload deduplication scoped to this database, including after moves.
+
+        Create the identity only when an enabled uploader has pending data.
+        Confirm the persisted winner inside the transaction so concurrent
+        connections cannot start sending under different temporary identities.
+        """
+        key = "telemetry.daily_usage_store_id"
+        async with self._write_transaction("ensure_daily_usage_store_id") as conn:
+            await conn.execute(
+                """
+                INSERT INTO runtime_preferences (
+                    preference_key, preference_value, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(preference_key) DO NOTHING
+                """,
+                (key, secrets.token_hex(16), _now_ms()),
+            )
+            async with conn.execute(
+                "SELECT preference_value FROM runtime_preferences WHERE preference_key = ?",
+                (key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None or re.fullmatch(r"[0-9a-f]{32}", str(row[0])) is None:
+                # Rotating a damaged existing identity would replay accepted days.
+                raise ValueError("Invalid daily usage store identity")
+            store_id = str(row[0])
+        return store_id
 
     async def record_daily_usage(
         self,
@@ -2450,6 +2579,18 @@ class SessionStorage:
             )
             await self._conn.commit()
 
+    async def _migrate_execution_workspace_column(self) -> None:
+        """Add the nullable durable execution-root binding to old databases."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {str(row[1]) for row in await cur.fetchall()}
+        if "execution_workspace" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN execution_workspace TEXT"
+            )
+            await self._conn.commit()
+
     async def _migrate_collaboration_columns(self) -> None:
         """Idempotently widen legacy sessions with durable Plan mode state."""
 
@@ -2541,6 +2682,21 @@ class SessionStorage:
             )
             await self._conn.commit()
 
+    async def _migrate_assistant_replay_column(self) -> None:
+        """Add optional accepted-message storage without rewriting old rows."""
+        assert self._conn is not None
+        changed = False
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
+                columns = {row[1] for row in await cur.fetchall()}
+            if "assistant_replay" not in columns:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN assistant_replay TEXT"
+                )
+                changed = True
+        if changed:
+            await self._conn.commit()
+
     async def _migrate_transcript_turn_usage_column(self) -> None:
         """Idempotently add per-turn usage metadata storage to transcripts."""
         assert self._conn is not None
@@ -2603,10 +2759,6 @@ class SessionStorage:
             "chunk_count": (
                 "ALTER TABLE session_summaries ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"
             ),
-            "flush_receipt_status": (
-                "ALTER TABLE session_summaries ADD COLUMN "
-                "flush_receipt_status TEXT NOT NULL DEFAULT 'unknown'"
-            ),
         }
         changed = False
         for column, sql in additions.items():
@@ -2639,6 +2791,37 @@ class SessionStorage:
                 changed = True
         if changed:
             await self._conn.commit()
+
+    async def _retire_legacy_memory_flush_metadata(self) -> None:
+        """Converge direct legacy opens using the versioned upgrade's SQL plan."""
+        # Normal opens need only metadata reads. Re-check under the writer lock
+        # below because another opener may finish retirement after this probe.
+        for table, retired in RETIRED_MEMORY_COLUMNS.items():
+            async with self.conn.execute(f'PRAGMA table_info("{table}")') as cur:
+                if retired.intersection(row[1] for row in await cur.fetchall()):
+                    break
+        else:
+            return
+        async with self._write_transaction("retire_legacy_memory_flush_metadata") as conn:
+            async with conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('session_summaries', 'memory_durable_receipts')"
+            ) as cur:
+                tables = {row[0]: row[1] for row in await cur.fetchall()}
+            columns = {}
+            for table in tables:
+                async with conn.execute(f'PRAGMA table_info("{table}")') as cur:
+                    columns[table] = [row[1] for row in await cur.fetchall()]
+            async with conn.execute(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type IN ('index', 'trigger') "
+                "AND tbl_name IN ('session_summaries', 'memory_durable_receipts') "
+                "AND sql IS NOT NULL"
+            ) as cur:
+                objects = [(row[0], row[1]) for row in await cur.fetchall()]
+            for statement in memory_flush_retirement_statements(
+                table_sql=tables, columns=columns, schema_objects=objects,
+            ):
+                await conn.execute(statement)
 
     @property
     def conn(self) -> Any:
@@ -3979,6 +4162,7 @@ class SessionStorage:
         *,
         session_key: str,
         expected_epoch: int,
+        expected_session_id: str | None = None,
     ) -> SessionNode | None:
         """Set compatibility session totals from the ledger, idempotently.
 
@@ -3997,13 +4181,17 @@ class SessionStorage:
             if session_row is None:
                 return None
             actual_epoch = max(0, int(session_row["epoch"] or 0))
-            if actual_epoch != expected_epoch:
+            actual_session_id = str(session_row["session_id"])
+            if actual_epoch != expected_epoch or (
+                expected_session_id is not None
+                and actual_session_id != expected_session_id
+            ):
                 await self._raise_stale_epoch(
                     conn,
                     session_key=stable_key,
                     expected_epoch=expected_epoch,
                 )
-            session_id = str(session_row["session_id"])
+            session_id = actual_session_id
 
             async with conn.execute(
                 """
@@ -4121,7 +4309,7 @@ class SessionStorage:
                     + max(0, int(live["estimated_cost_entries"] or 0))
                 ),
             )
-            await conn.execute(
+            cursor = await conn.execute(
                 """
                 UPDATE sessions
                 SET input_tokens = ?, output_tokens = ?, total_tokens = ?,
@@ -4131,7 +4319,7 @@ class SessionStorage:
                     cache_read = ?, cache_write = ?,
                     model_override = COALESCE(?, model_override),
                     model_provider = COALESCE(?, model_provider)
-                WHERE session_key = ? AND epoch = ?
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
                 """,
                 (
                     input_tokens,
@@ -4156,9 +4344,16 @@ class SessionStorage:
                         else None
                     ),
                     stable_key,
+                    session_id,
                     expected_epoch,
                 ),
             )
+            if int(cursor.rowcount or 0) != 1:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=stable_key,
+                    expected_epoch=expected_epoch,
+                )
             async with conn.execute(
                 "SELECT * FROM sessions WHERE session_key = ?",
                 (stable_key,),
@@ -4799,14 +4994,46 @@ class SessionStorage:
         self,
         session_key: str,
         workspace_id: str | None,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         session_key = canonicalize_session_key(session_key)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("workspace binding requires an exact session owner")
         async with self._write_transaction("bind_session_workspace") as conn:
-            cursor = await conn.execute(
-                "UPDATE sessions SET workspace_id = ? WHERE session_key = ?",
-                (workspace_id, session_key),
-            )
+            if expected_session_id is None:
+                cursor = await conn.execute(
+                    "UPDATE sessions SET workspace_id = ? WHERE session_key = ?",
+                    (workspace_id, session_key),
+                )
+            else:
+                assert expected_session_epoch is not None
+                cursor = await conn.execute(
+                    """
+                    UPDATE sessions SET workspace_id = ?
+                    WHERE session_key = ? AND session_id = ? AND epoch = ?
+                    """,
+                    (
+                        workspace_id,
+                        session_key,
+                        expected_session_id,
+                        expected_session_epoch,
+                    ),
+                )
             if int(cursor.rowcount or 0) == 0:
+                if expected_session_id is not None:
+                    assert expected_session_epoch is not None
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
                 raise KeyError(f"Session not found: {session_key}")
 
     @_serialized_read
@@ -4825,6 +5052,7 @@ class SessionStorage:
             SELECT rowid, session_key, agent_id, origin
             FROM sessions
             WHERE workspace_id IS NULL
+              AND execution_workspace IS NULL
               AND origin IS NOT NULL
               AND rowid > ?
             ORDER BY rowid
@@ -4865,6 +5093,7 @@ class SessionStorage:
                 FROM sessions
                 WHERE session_key = ?
                   AND workspace_id IS NULL
+                  AND execution_workspace IS NULL
                   AND agent_id = ?
                   AND origin IS ?
                 """,
@@ -4890,6 +5119,7 @@ class SessionStorage:
                 SET workspace_id = ?
                 WHERE session_key = ?
                   AND workspace_id IS NULL
+                  AND execution_workspace IS NULL
                   AND agent_id = ?
                   AND origin IS ?
                 """,
@@ -4940,6 +5170,7 @@ class SessionStorage:
         expected_session_keys: Sequence[str] | None,
     ) -> list[str]:
         deleted: list[SessionNode] = []
+        material_cleanups = []
         async with self._write_transaction("delete_project_workspace_sessions") as conn:
             async with conn.execute(
                 """
@@ -4976,11 +5207,12 @@ class SessionStorage:
                 )
 
             for session in deleted:
+                material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
 
-        for session in deleted:
+        for session, cleanup in zip(deleted, material_cleanups, strict=True):
             try:
-                await self._cleanup_deleted_session(session)
+                await self._cleanup_deleted_session(session, cleanup)
             except Exception:  # noqa: BLE001 - the database commit is authoritative.
                 log.warning(
                     "project_workspace.session_cleanup_failed "
@@ -5031,18 +5263,23 @@ class SessionStorage:
         node: SessionNode,
         *,
         expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         """Insert or update a session, optionally fencing an existing generation.
 
-        ``expected_session_id`` is for delayed mutations of an already-read
-        session. When supplied, a missing row or a different session id raises
-        ``KeyError`` inside the write transaction, before the UPSERT can recreate
-        a deleted row or overwrite a same-key replacement. Omitting it preserves
-        the create/repair behavior of the legacy UPSERT.
+        The expected owner is for delayed mutations of an already-read session.
+        When supplied, a missing row or a different owner raises ``KeyError``
+        inside the write transaction, before the UPSERT can recreate a deleted
+        row or overwrite a same-key replacement. Omitting it preserves the
+        create/repair behavior of the legacy UPSERT.
         """
 
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         data = node.model_dump()
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
@@ -5079,16 +5316,21 @@ class SessionStorage:
                     int(previous_identity["model_routing_revision"] or 0),
                 )
             if expected_session_id is not None:
-                if node.session_id != expected_session_id:
+                if node.session_id != expected_session_id or (
+                    expected_session_epoch is not None
+                    and int(node.epoch or 0) != expected_session_epoch
+                ):
                     raise KeyError(
                         f"Session generation changed: {node.session_key}"
                     )
-                async with conn.execute(
-                    "SELECT session_id FROM sessions WHERE session_key = ?",
-                    (node.session_key,),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                if row is None or str(row["session_id"]) != expected_session_id:
+                if previous_identity is None or (
+                    str(previous_identity["session_id"]) != expected_session_id
+                    or (
+                        expected_session_epoch is not None
+                        and int(previous_identity["epoch"] or 0)
+                        != expected_session_epoch
+                    )
+                ):
                     raise KeyError(
                         f"Session generation changed: {node.session_key}"
                     )
@@ -5414,14 +5656,31 @@ class SessionStorage:
             (session.session_key,),
         )
 
-    async def _cleanup_deleted_session(self, session: SessionNode) -> None:
+    async def _prepare_deleted_session_cleanup(
+        self, conn: Any, session: SessionNode,
+    ) -> Callable[[], Awaitable[None]] | None:
+        from opensquilla.session.material_cleanup import prepare_session_material_cleanup
+
+        workspace = None
+        if session.workspace_id:
+            async with conn.execute(
+                "SELECT * FROM project_workspaces WHERE workspace_id=?", (session.workspace_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is not None:
+                workspace = ProjectWorkspace(**dict(row))
+        return await prepare_session_material_cleanup(session, workspace)
+
+    async def _cleanup_deleted_session(
+        self, session: SessionNode, cleanup: Callable[[], Awaitable[None]] | None,
+    ) -> None:
         # Cascade the on-disk session material (transcript media + workspace
         # attachment copies). DB-only deletion otherwise leaks both stores until
         # the transcript disk budget hard-fails. Best-effort via the registered
         # process-global hook; never fails the delete.
         from opensquilla.session.material_cleanup import run_session_material_cleanup
 
-        await run_session_material_cleanup(session.session_id, session.session_key)
+        await run_session_material_cleanup(session.session_id, session.session_key, cleanup)
 
         # G4 cleanup: cascade meta-skill audit rows for this session. The
         # sessions table is created lazily at runtime (not via yoyo), so
@@ -5440,6 +5699,7 @@ class SessionStorage:
     async def delete_session(self, session_key: str) -> None:
         session_key = canonicalize_session_key(session_key)
         session: SessionNode | None = None
+        cleanup = None
         async with self._write_transaction("delete_session") as conn:
             # Controls and drafts can exist on a provisional key before the
             # first accepted turn creates a sessions row. Fence those request
@@ -5476,17 +5736,19 @@ class SessionStorage:
                 row = await cursor.fetchone()
             if row is not None:
                 session = SessionNode(**_deserialize_row(dict(row)))
+                cleanup = await self._prepare_deleted_session_cleanup(conn, session)
                 await self._delete_session_rows(conn, session)
 
         _clear_pending_meta_launch_boundary(session_key)
         if session is None:
             return
-        await self._cleanup_deleted_session(session)
+        await self._cleanup_deleted_session(session, cleanup)
 
     async def prune_stale_session_records(self, before_ms: int) -> list[SessionNode]:
         """Delete and return the exact stale session generations committed."""
 
         deleted: list[SessionNode] = []
+        material_cleanups = []
         async with self._write_transaction("prune_stale_sessions") as conn:
             async with conn.execute(
                 "SELECT * FROM sessions WHERE updated_at < ?",
@@ -5495,10 +5757,11 @@ class SessionStorage:
                 rows = await cur.fetchall()
             for row in rows:
                 session = SessionNode(**_deserialize_row(dict(row)))
+                material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
                 deleted.append(session)
-        for session in deleted:
-            await self._cleanup_deleted_session(session)
+        for session, cleanup in zip(deleted, material_cleanups, strict=True):
+            await self._cleanup_deleted_session(session, cleanup)
         return deleted
 
     async def prune_stale_sessions(self, before_ms: int) -> int:
@@ -5798,6 +6061,7 @@ class SessionStorage:
                     "revision": current_revision,
                     "source": "session",
                     "initialized": False,
+                    "changed": False,
                 }
             if expected_revision is not None and current_revision != expected_revision:
                 raise SessionRoutingConflictError(
@@ -5823,6 +6087,7 @@ class SessionStorage:
                 "revision": current_revision + 1,
                 "source": "session",
                 "initialized": current_mode is None,
+                "changed": True,
             }
 
     # ── Collaboration plans ────────────────────────────────────────────────
@@ -7976,6 +8241,11 @@ class SessionStorage:
             details = dict(task_record.details or {})
             details.pop("goal_candidate", None)
             details["goal_context"] = context.as_task_detail()
+            details = _bind_task_session_owner(
+                details,
+                session_id=goal.session_id,
+                session_epoch=goal.session_epoch,
+            )
             metadata_raw = details.get("metadata")
             metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
             metadata["required_collaboration_mode"] = "default"
@@ -8799,10 +9069,31 @@ class SessionStorage:
             values,
         )
 
-    async def create_agent_task(self, task: AgentTaskRecord) -> AgentTaskRecord:
+    async def create_agent_task(
+        self,
+        task: AgentTaskRecord,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> AgentTaskRecord:
+        """Create a task only while its admitted session owner is current."""
+
         task.session_key = canonicalize_session_key(task.session_key)
         task.agent_id = normalize_agent_id(task.agent_id)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         async with self._write_transaction("create_agent_task") as conn:
+            if not await _matches_session_owner_on_conn(
+                conn,
+                session_key=task.session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                raise StaleEpochError(
+                    "Task session owner changed before durable admission"
+                )
             await self._insert_agent_task(conn, task)
         return task
 
@@ -8840,6 +9131,49 @@ class SessionStorage:
                 task = AgentTaskRecord(**_deserialize_row(dict(row)))
                 rows_by_id[task.task_id] = task
         return [rows_by_id[task_id] for task_id in ids if task_id in rows_by_id]
+
+    async def fail_queued_agent_task_activation(
+        self,
+        task_id: str,
+        *,
+        session_key: str,
+        error_class: str,
+        error_message: str,
+    ) -> AgentTaskRecord | None:
+        """Fail an exact accepted task only while its ledger is still queued.
+
+        The caller must first revoke its unactivated runtime reservation. A
+        zero-row update may mean another writer already settled the task; the
+        record returned from this transaction is the authoritative outcome.
+        """
+        session_key = canonicalize_session_key(session_key)
+        timestamp = _now_ms()
+        async with self._write_transaction("fail_queued_agent_task_activation") as conn:
+            await conn.execute(
+                """
+                UPDATE agent_tasks
+                SET status = ?, finished_at = ?, updated_at = ?,
+                    terminal_reason = 'activation_failed', error_class = ?, error_message = ?
+                WHERE task_id = ? AND session_key = ? AND status = ?
+                """,
+                (
+                    AgentTaskStatus.FAILED.value,
+                    timestamp,
+                    timestamp,
+                    error_class,
+                    error_message,
+                    task_id,
+                    session_key,
+                    AgentTaskStatus.QUEUED.value,
+                ),
+            )
+            async with conn.execute(
+                "SELECT * FROM agent_tasks WHERE task_id = ? AND session_key = ?",
+                (task_id, session_key),
+            ) as cur:
+                row = await cur.fetchone()
+            result = AgentTaskRecord(**_deserialize_row(dict(row))) if row is not None else None
+        return result
 
     async def update_agent_task(self, task_id: str, **fields: Any) -> AgentTaskRecord:
         if not fields:
@@ -8966,15 +9300,20 @@ class SessionStorage:
         receipt: MemoryDurableReceipt,
         *,
         expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> MemoryDurableReceipt:
         """Upsert a receipt, optionally requiring its live session generation.
 
         ``expected_session_id`` is checked in the same write transaction as the
         receipt UPSERT. A missing or replaced session raises ``KeyError``.
-        Omitting it intentionally retains synthetic repair and legacy behavior.
+        Omitting it supports receipts written without a live session owner.
         """
 
         receipt.session_key = canonicalize_session_key(receipt.session_key)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         receipt.updated_at = _now_ms()
         data = receipt.model_dump()
         cols = list(data.keys())
@@ -8992,11 +9331,18 @@ class SessionStorage:
                         f"Session generation changed: {receipt.session_key}"
                     )
                 async with conn.execute(
-                    "SELECT session_id FROM sessions WHERE session_key = ?",
+                    "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
                     (receipt.session_key,),
                 ) as cursor:
                     row = await cursor.fetchone()
-                if row is None or str(row["session_id"]) != expected_session_id:
+                if (
+                    row is None
+                    or str(row["session_id"]) != expected_session_id
+                    or (
+                        expected_session_epoch is not None
+                        and int(row["epoch"] or 0) != expected_session_epoch
+                    )
+                ):
                     raise KeyError(
                         f"Session generation changed: {receipt.session_key}"
                     )
@@ -9076,48 +9422,6 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [MemoryDurableReceipt(**_deserialize_row(dict(row))) for row in rows]
 
-    @_serialized_read
-    async def list_memory_repair_receipts(
-        self,
-        *,
-        statuses: tuple[str, ...],
-        limit: int,
-        due_before_ms: int | None = None,
-        path: str | None = None,
-        session_key_prefix: str | None = None,
-    ) -> list[MemoryDurableReceipt]:
-        """List repair candidates without bypassing the shared operation gate."""
-
-        if limit <= 0 or not statuses:
-            return []
-        placeholders = ", ".join("?" for _ in statuses)
-        clauses = [f"status IN ({placeholders})"]
-        params: list[Any] = [*statuses]
-        if due_before_ms is not None:
-            clauses.append("(next_retry_at_ms IS NULL OR next_retry_at_ms <= ?)")
-            params.append(due_before_ms)
-        if path is not None:
-            clauses.append("(source_path = ? OR target_path = ?)")
-            params.extend((path, path))
-        if session_key_prefix is not None:
-            clauses.append("substr(session_key, 1, ?) = ?")
-            params.extend((len(session_key_prefix), session_key_prefix))
-        params.append(limit)
-        async with self.conn.execute(
-            f"""
-            SELECT * FROM memory_durable_receipts
-            WHERE {' AND '.join(clauses)}
-            ORDER BY
-                next_retry_at_ms IS NOT NULL ASC,
-                next_retry_at_ms ASC,
-                created_at ASC,
-                rowid ASC
-            LIMIT ?
-            """,
-            params,
-        ) as cur:
-            rows = await cur.fetchall()
-        return [MemoryDurableReceipt(**_deserialize_row(dict(row))) for row in rows]
 
     @_serialized_read
     async def list_recent_memory_durable_receipts(
@@ -9125,6 +9429,7 @@ class SessionStorage:
         *,
         limit: int,
         session_key_prefix: str | None = None,
+        scope: str | None = None,
     ) -> list[MemoryDurableReceipt]:
         """Return the newest durable receipts under the storage read gate."""
 
@@ -9135,6 +9440,9 @@ class SessionStorage:
         if session_key_prefix is not None:
             clauses.append("substr(session_key, 1, ?) = ?")
             params.extend((len(session_key_prefix), session_key_prefix))
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         async with self.conn.execute(
@@ -9149,137 +9457,6 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [MemoryDurableReceipt(**_deserialize_row(dict(row))) for row in rows]
 
-    @_serialized_read
-    async def memory_durable_receipt_exists_for_path(
-        self,
-        path: str,
-        *,
-        session_key_prefix: str | None = None,
-    ) -> bool:
-        """Check source/target path identity without exposing the raw connection."""
-
-        clauses = ["(source_path = ? OR target_path = ?)"]
-        params: list[Any] = [path, path]
-        if session_key_prefix is not None:
-            clauses.append("substr(session_key, 1, ?) = ?")
-            params.extend((len(session_key_prefix), session_key_prefix))
-        async with self.conn.execute(
-            f"""
-            SELECT 1 FROM memory_durable_receipts
-            WHERE {' AND '.join(clauses)}
-            LIMIT 1
-            """,
-            params,
-        ) as cur:
-            return await cur.fetchone() is not None
-
-    async def claim_memory_repair_receipt(
-        self,
-        receipt_id: str,
-        *,
-        eligible_statuses: tuple[str, ...],
-        claimed_status: str,
-        now_ms: int,
-    ) -> MemoryDurableReceipt | None:
-        """Atomically claim one due repair receipt and return the claimed row."""
-
-        if not eligible_statuses:
-            return None
-        placeholders = ", ".join("?" for _ in eligible_statuses)
-        async with self._write_transaction("claim_memory_repair_receipt") as conn:
-            async with conn.execute(
-                f"""
-                UPDATE memory_durable_receipts
-                SET status = ?, updated_at = ?
-                WHERE receipt_id = ?
-                  AND status IN ({placeholders})
-                  AND (next_retry_at_ms IS NULL OR next_retry_at_ms <= ?)
-                """,
-                (
-                    claimed_status,
-                    now_ms,
-                    receipt_id,
-                    *eligible_statuses,
-                    now_ms,
-                ),
-            ) as cur:
-                claimed = cur.rowcount or 0
-            if claimed != 1:
-                return None
-            async with conn.execute(
-                "SELECT * FROM memory_durable_receipts WHERE receipt_id = ?",
-                (receipt_id,),
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                raise RuntimeError("Claimed memory repair receipt was not readable")
-            return MemoryDurableReceipt(**_deserialize_row(dict(row)))
-
-    async def recover_stale_memory_repair_claims(
-        self,
-        *,
-        running_status: str,
-        pending_status: str,
-        stale_before_ms: int,
-        next_retry_at_ms: int,
-        updated_at_ms: int,
-        reason: str,
-    ) -> int:
-        """Move stale repair claims back to pending in one explicit transaction."""
-
-        async with self._write_transaction("recover_stale_memory_repair_claims") as conn:
-            async with conn.execute(
-                """
-                UPDATE memory_durable_receipts
-                SET status = ?,
-                    reason = ?,
-                    next_retry_at_ms = ?,
-                    updated_at = ?
-                WHERE status = ?
-                  AND updated_at <= ?
-                """,
-                (
-                    pending_status,
-                    reason,
-                    next_retry_at_ms,
-                    updated_at_ms,
-                    running_status,
-                    stale_before_ms,
-                ),
-            ) as cur:
-                return int(cur.rowcount or 0)
-
-    async def update_memory_durable_receipt(
-        self,
-        receipt_id: str,
-        **fields: Any,
-    ) -> MemoryDurableReceipt:
-        allowed = set(MemoryDurableReceipt.model_fields) - {"receipt_id", "created_at"}
-        unknown = sorted(set(fields) - allowed)
-        if unknown:
-            raise ValueError(
-                f"Unknown memory durable receipt fields: {', '.join(unknown)}"
-            )
-        if "session_key" in fields:
-            fields["session_key"] = canonicalize_session_key(fields["session_key"])
-        fields.setdefault("updated_at", _now_ms())
-        assignments = ", ".join(f"{name} = ?" for name in fields)
-        values = [_serialize(value) for value in fields.values()]
-        values.append(receipt_id)
-        async with self._write_transaction("update_memory_durable_receipt") as conn:
-            await conn.execute(
-                f"UPDATE memory_durable_receipts SET {assignments} WHERE receipt_id = ?",
-                values,
-            )
-            async with conn.execute(
-                "SELECT * FROM memory_durable_receipts WHERE receipt_id = ?",
-                (receipt_id,),
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                raise KeyError(f"Memory durable receipt not found: {receipt_id}")
-            updated = MemoryDurableReceipt(**_deserialize_row(dict(row)))
-        return updated
 
     @_serialized_read
     async def list_agent_tasks_for_sessions(
@@ -9850,6 +10027,7 @@ class SessionStorage:
             SessionStatus.KILLED,
             SessionStatus.TIMEOUT,
         )
+        recovered_owners: set[tuple[str, str, int]] = set()
         async with self._write_transaction("claim_meta_control_recovery") as conn:
             async def quarantine_invalid(task_id: str) -> None:
                 await conn.execute(
@@ -9876,7 +10054,9 @@ class SessionStorage:
                 remaining = bounded_limit - len(recovered)
                 async with conn.execute(
                     """
-                    SELECT task.*
+                    SELECT task.*,
+                           owner.session_id AS recovery_owner_session_id,
+                           owner.epoch AS recovery_owner_epoch
                     FROM agent_tasks AS task
                     JOIN meta_control_intents AS intent
                       ON intent.accepted_task_id = task.task_id
@@ -9900,8 +10080,53 @@ class SessionStorage:
                     break
 
                 for raw_task in task_rows:
-                    task = AgentTaskRecord(**_deserialize_row(dict(raw_task)))
+                    task_data = dict(raw_task)
+                    owner_session_id = str(
+                        task_data.pop("recovery_owner_session_id")
+                    )
+                    owner_epoch = int(task_data.pop("recovery_owner_epoch"))
+                    task = AgentTaskRecord(**_deserialize_row(task_data))
                     details = task.details if isinstance(task.details, dict) else {}
+                    detail_session_id = (
+                        details["session_id"] if "session_id" in details else None
+                    )
+                    detail_session_epoch = (
+                        details["session_epoch"]
+                        if "session_epoch" in details
+                        else None
+                    )
+                    try:
+                        if "session_id" in details and (
+                            not isinstance(detail_session_id, str)
+                            or not detail_session_id
+                        ):
+                            raise ValueError(
+                                "Task session owner session_id must be a non-empty string"
+                            )
+                        if "session_epoch" in details and (
+                            isinstance(detail_session_epoch, bool)
+                            or not isinstance(detail_session_epoch, int)
+                            or detail_session_epoch < 0
+                        ):
+                            raise ValueError(
+                                "Task session owner session_epoch must be a non-negative integer"
+                            )
+                        _validate_optional_session_owner(
+                            session_id=detail_session_id,
+                            session_epoch=detail_session_epoch,
+                        )
+                    except ValueError:
+                        await quarantine_invalid(task.task_id)
+                        continue
+                    if (
+                        detail_session_id is not None
+                        and detail_session_id != owner_session_id
+                    ) or (
+                        detail_session_epoch is not None
+                        and detail_session_epoch != owner_epoch
+                    ):
+                        await quarantine_invalid(task.task_id)
+                        continue
                     metadata = details.get("metadata")
                     message_id = details.get("persisted_user_message_id")
                     if not isinstance(metadata, dict) or not isinstance(message_id, str):
@@ -9914,9 +10139,10 @@ class SessionStorage:
                     async with conn.execute(
                         """
                         SELECT * FROM transcript_entries
-                        WHERE session_key = ? AND message_id = ? AND role = 'user'
+                        WHERE session_key = ? AND session_id = ?
+                          AND message_id = ? AND role = 'user'
                         """,
-                        (task.session_key, message_id),
+                        (task.session_key, owner_session_id, message_id),
                     ) as entry_cur:
                         entry_row = await entry_cur.fetchone()
                     if entry_row is None:
@@ -9924,7 +10150,8 @@ class SessionStorage:
                         continue
                     entry = TranscriptEntry(**_deserialize_row(dict(entry_row)))
                     if (
-                        not isinstance(entry.turn_context, dict)
+                        entry.session_id != owner_session_id
+                        or not isinstance(entry.turn_context, dict)
                         or entry.turn_context.get("meta_control") != control
                     ):
                         await quarantine_invalid(task.task_id)
@@ -9936,12 +10163,19 @@ class SessionStorage:
                             terminal_reason = NULL, error_class = NULL, error_message = NULL
                         WHERE task_id = ? AND status = ?
                           AND terminal_reason = 'meta_control_restart_before_start'
+                          AND EXISTS (
+                              SELECT 1 FROM sessions AS owner
+                              WHERE owner.session_key = agent_tasks.session_key
+                                AND owner.session_id = ? AND owner.epoch = ?
+                          )
                         """,
                         (
                             AgentTaskStatus.QUEUED,
                             now_ms,
                             task.task_id,
                             AgentTaskStatus.ABANDONED,
+                            owner_session_id,
+                            owner_epoch,
                         ),
                     ) as update_cur:
                         if int(update_cur.rowcount or 0) != 1:
@@ -9953,20 +10187,26 @@ class SessionStorage:
                     task.error_class = None
                     task.error_message = None
                     recovered.append(RecoverableMetaControlTask(task=task, entry=entry))
+                    recovered_owners.add(
+                        (task.session_key, owner_session_id, owner_epoch)
+                    )
 
-            recovered_keys = sorted({item.task.session_key for item in recovered})
-            for session_key in recovered_keys:
+            for session_key, owner_session_id, owner_epoch in sorted(
+                recovered_owners
+            ):
                 await conn.execute(
                     """
                     UPDATE sessions
                     SET status = ?, updated_at = ?, ended_at = NULL, runtime_ms = NULL
-                    WHERE session_key = ?
+                    WHERE session_key = ? AND session_id = ? AND epoch = ?
                       AND status NOT IN (?, ?, ?, ?)
                     """,
                     (
                         SessionStatus.RUNNING,
                         now_ms,
                         session_key,
+                        owner_session_id,
+                        owner_epoch,
                         *terminal_session_statuses,
                     ),
                 )
@@ -9980,15 +10220,28 @@ class SessionStorage:
         *,
         session_key: str,
         expected_epoch: int,
+        expected_session_id: str | None = None,
     ) -> None:
         async with conn.execute(
-            "SELECT epoch FROM sessions WHERE session_key = ?",
+            "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
             (session_key,),
         ) as cur:
             row = await cur.fetchone()
-        actual = int(row[0]) if row is not None else None
+        actual_session_id = str(row[0]) if row is not None else None
+        actual_epoch = int(row[1]) if row is not None else None
+        expected_owner = (
+            f"{expected_session_id}@{expected_epoch}"
+            if expected_session_id is not None
+            else str(expected_epoch)
+        )
+        actual_owner = (
+            f"{actual_session_id}@{actual_epoch}"
+            if actual_session_id is not None
+            else "missing"
+        )
         raise StaleEpochError(
-            f"Epoch mismatch for {session_key}: expected {expected_epoch}, got {actual}"
+            f"Session owner mismatch for {session_key}: "
+            f"expected {expected_owner}, got {actual_owner}"
         )
 
     @classmethod
@@ -10017,12 +10270,12 @@ class SessionStorage:
             f"SELECT {placeholders} "
             "WHERE EXISTS ("
             "  SELECT 1 FROM sessions "
-            "  WHERE session_key = ? AND epoch = ?"
+            "  WHERE session_key = ? AND session_id = ? AND epoch = ?"
             ")"
         )
         async with conn.execute(
             insert_sql,
-            values + [entry.session_key, expected_epoch],
+            values + [entry.session_key, entry.session_id, expected_epoch],
         ) as cur:
             inserted = cur.rowcount or 0
         if inserted == 0:
@@ -10030,6 +10283,7 @@ class SessionStorage:
                 conn,
                 session_key=entry.session_key,
                 expected_epoch=expected_epoch,
+                expected_session_id=entry.session_id,
             )
 
     async def append_transcript_entry(
@@ -10061,15 +10315,19 @@ class SessionStorage:
 
         if expected_epoch is not None:
             async with conn.execute(
-                "SELECT epoch FROM sessions WHERE session_key = ?",
-                (entry.session_key,),
+                """
+                SELECT 1 FROM sessions
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                """,
+                (entry.session_key, entry.session_id, expected_epoch),
             ) as cur:
                 session_row = await cur.fetchone()
-            if session_row is None or int(session_row[0]) != expected_epoch:
+            if session_row is None:
                 await cls._raise_stale_epoch(
                     conn,
                     session_key=entry.session_key,
                     expected_epoch=expected_epoch,
+                    expected_session_id=entry.session_id,
                 )
 
         async with conn.execute(
@@ -10094,6 +10352,9 @@ class SessionStorage:
 
         entry.id = int(existing[0])
         entry.created_at = int(existing[1])
+        # Replacement is authoritative, including replay state. Keeping an old
+        # envelope when the caller supplies None could revive an abandoned
+        # generation; accepted-message callers supply their complete envelope.
         data = entry.model_dump(exclude={"id", "created_at"})
         assignments = [f"{column} = ?" for column in data]
         values = [_serialize(data[column]) for column in data]
@@ -10134,13 +10395,14 @@ class SessionStorage:
                 SET updated_at = ?,
                     total_tokens = total_tokens + ?,
                     total_tokens_fresh = CASE WHEN ? THEN 0 ELSE total_tokens_fresh END
-                WHERE session_key = ? AND epoch = ?
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
                 """,
                 (
                     updated_at,
                     effective_token_delta,
                     int(mark_total_tokens_stale and inserted),
                     entry.session_key,
+                    entry.session_id,
                     expected_epoch,
                 ),
             ) as cur:
@@ -10150,6 +10412,7 @@ class SessionStorage:
                     conn,
                     session_key=entry.session_key,
                     expected_epoch=expected_epoch,
+                    expected_session_id=entry.session_id,
                 )
         return inserted
 
@@ -10177,13 +10440,14 @@ class SessionStorage:
                 SET updated_at = ?,
                     total_tokens = total_tokens + ?,
                     total_tokens_fresh = CASE WHEN ? THEN 0 ELSE total_tokens_fresh END
-                WHERE session_key = ? AND epoch = ?
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
                 """,
                 (
                     updated_at,
                     token_delta,
                     int(mark_total_tokens_stale),
                     entry.session_key,
+                    entry.session_id,
                     expected_epoch,
                 ),
             ) as cur:
@@ -10193,6 +10457,7 @@ class SessionStorage:
                     conn,
                     session_key=entry.session_key,
                     expected_epoch=expected_epoch,
+                    expected_session_id=entry.session_id,
                 )
 
     @staticmethod
@@ -10217,6 +10482,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -10240,6 +10506,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -12140,9 +12407,6 @@ class SessionStorage:
         goal_mutation: (
             StartGoalMutation | ClaimGoalMutation | ClaimCurrentGoalMutation | None
         ) = None,
-        expected_prompt_annotations: Sequence[PromptAnnotation] = (),
-        prepared_prompt_annotation_targets: Sequence[PreparedPromptAnnotationTarget] = (),
-        prompt_annotation_turn_id: str | None = None,
         pending_input_id: str | None = None,
         pending_input_fingerprint: str | None = None,
         pending_input_revision: int | None = None,
@@ -12186,24 +12450,6 @@ class SessionStorage:
             raise ValueError("Goal turns cannot start or claim a Plan run")
         if goal_mutation is not None and meta_control_intent_id is not None:
             raise ValueError("Goal turns cannot consume a MetaSkill control intent")
-        expected_prompt_annotations = tuple(expected_prompt_annotations)
-        prepared_prompt_annotation_targets = tuple(prepared_prompt_annotation_targets)
-        if expected_prompt_annotations and prepared_prompt_annotation_targets:
-            raise ValueError(
-                "prompt annotation acceptance cannot use legacy and prepared inputs together"
-            )
-        prompt_annotation_acceptance = bool(
-            expected_prompt_annotations or prepared_prompt_annotation_targets
-        )
-        if prompt_annotation_acceptance:
-            if session_node is not None or merge_into_task:
-                raise ValueError(
-                    "prompt annotations require an existing session and a distinct turn"
-                )
-            if not isinstance(prompt_annotation_turn_id, str) or not (
-                prompt_annotation_turn_id := prompt_annotation_turn_id.strip()
-            ):
-                raise ValueError("prompt_annotation_turn_id is required")
         pending_guard_values = (
             pending_input_id,
             pending_input_fingerprint,
@@ -12236,6 +12482,11 @@ class SessionStorage:
             task_record.agent_id = normalize_agent_id(task_record.agent_id)
             if task_record.session_key != entry.session_key:
                 raise ValueError("task and transcript session keys must match")
+            task_record.details = _bind_task_session_owner(
+                dict(task_record.details or {}),
+                session_id=entry.session_id,
+                session_epoch=expected_epoch,
+            )
         if isinstance(goal_mutation, StartGoalMutation):
             if task_record is None or merge_into_task:
                 raise ValueError("Goal set requires one newly accepted runtime task")
@@ -12474,35 +12725,6 @@ class SessionStorage:
                     ),
                 )
 
-            if prompt_annotation_acceptance:
-                from opensquilla.artifact_session import (
-                    consume_prepared_prompt_annotations_on_conn,
-                    consume_prompt_annotations_on_conn,
-                )
-
-                assert prompt_annotation_turn_id is not None
-                if prepared_prompt_annotation_targets:
-                    await consume_prepared_prompt_annotations_on_conn(
-                        conn,
-                        prepared_targets=prepared_prompt_annotation_targets,
-                        session_key=entry.session_key,
-                        session_id=entry.session_id,
-                        session_epoch=expected_epoch,
-                        message_id=entry.message_id,
-                        turn_id=prompt_annotation_turn_id,
-                        updated_at=updated_at,
-                    )
-                else:
-                    await consume_prompt_annotations_on_conn(
-                        conn,
-                        expected_annotations=expected_prompt_annotations,
-                        session_key=entry.session_key,
-                        session_id=entry.session_id,
-                        session_epoch=expected_epoch,
-                        message_id=entry.message_id,
-                        turn_id=prompt_annotation_turn_id,
-                        updated_at=updated_at,
-                    )
             if pending_input_id is not None:
                 pending = await self._select_pending_chat_input(
                     conn,
@@ -13224,7 +13446,17 @@ class SessionStorage:
                         if isinstance(existing_details_raw, dict)
                         else {}
                     )
+                    existing_details = _bind_task_session_owner(
+                        existing_details,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                    )
                     details = {**existing_details, **incoming_details}
+                    # The already queued task owns collection. Incoming detail
+                    # fields may add message metadata, but cannot rebind its
+                    # durable session incarnation.
+                    details["session_id"] = existing_details["session_id"]
+                    details["session_epoch"] = existing_details["session_epoch"]
                     if (
                         isinstance(
                             goal_mutation,
@@ -13303,6 +13535,11 @@ class SessionStorage:
                     )
                     incoming_count = incoming_details.get("message_count")
                     details = dict(incoming_details)
+                    details = _bind_task_session_owner(
+                        details,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                    )
                     details["persisted_user_message_id"] = entry.message_id
                     details["persisted_user_message_ids"] = message_ids
                     details["message_count"] = (
@@ -13644,6 +13881,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -13667,6 +13905,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -13734,6 +13973,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -13757,6 +13997,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -13928,9 +14169,15 @@ class SessionStorage:
         message_ids: Sequence[str],
         task_record: AgentTaskRecord,
         recovery: str = "process_restart_followup",
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> list[str]:
         """Create one follow-up and claim its steer rows atomically."""
 
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         ordered_ids = list(dict.fromkeys(message_id for message_id in message_ids if message_id))
         if not ordered_ids:
             return []
@@ -13938,6 +14185,37 @@ class SessionStorage:
         task_record.agent_id = normalize_agent_id(task_record.agent_id)
         claimed: list[tuple[str, str, str, dict[str, Any]]] = []
         async with self._write_transaction("promote_stranded_steer_inputs") as conn:
+            if not await _matches_session_owner_on_conn(
+                conn,
+                session_key=task_record.session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                return []
+            if expected_session_id is not None:
+                task_details = dict(task_record.details or {})
+                if expected_session_epoch is not None:
+                    task_details = _bind_task_session_owner(
+                        task_details,
+                        session_id=expected_session_id,
+                        session_epoch=expected_session_epoch,
+                    )
+                else:
+                    if "session_id" in task_details:
+                        detail_session_id = task_details["session_id"]
+                        if (
+                            not isinstance(detail_session_id, str)
+                            or not detail_session_id
+                        ):
+                            raise ValueError(
+                                "Task session owner session_id must be a non-empty string"
+                            )
+                        if detail_session_id != expected_session_id:
+                            raise StaleEpochError(
+                                "Task session owner changed before recovery promotion"
+                            )
+                    task_details["session_id"] = expected_session_id
+                task_record.details = task_details
             async with conn.execute(
                 "SELECT status FROM agent_tasks WHERE task_id = ?",
                 (target_task_id,),
@@ -13969,6 +14247,11 @@ class SessionStorage:
                 ) as cur:
                     receipt_row = await cur.fetchone()
                 if receipt_row is None:
+                    continue
+                if (
+                    expected_session_id is not None
+                    and str(receipt_row["session_id"]) != expected_session_id
+                ):
                     continue
                 for table in ("transcript_entries", "compacted_transcript_entries"):
                     async with conn.execute(
@@ -14065,10 +14348,71 @@ class SessionStorage:
                 tasks.append(task)
         return tasks
 
-    async def requeue_steer_recovery_task(self, task_id: str) -> bool:
+    async def requeue_steer_recovery_task(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> bool:
         """CAS a never-started recovery task back to QUEUED after restart."""
 
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
         async with self._write_transaction("requeue_steer_recovery_task") as conn:
+            async with conn.execute(
+                """
+                SELECT session_key, details
+                FROM agent_tasks
+                WHERE task_id = ?
+                  AND status = ?
+                  AND terminal_reason = ?
+                  AND started_at IS NULL
+                """,
+                (
+                    task_id,
+                    AgentTaskStatus.ABANDONED,
+                    "process_restart",
+                ),
+            ) as cur:
+                task_row = await cur.fetchone()
+            if task_row is None:
+                return False
+            session_key = canonicalize_session_key(str(task_row["session_key"]))
+            if not await _matches_session_owner_on_conn(
+                conn,
+                session_key=session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                return False
+            details_raw = _deserialize_row({"details": task_row["details"]}).get(
+                "details"
+            )
+            details = dict(details_raw) if isinstance(details_raw, dict) else {}
+            if expected_session_id is not None:
+                if expected_session_epoch is not None:
+                    details = _bind_task_session_owner(
+                        details,
+                        session_id=expected_session_id,
+                        session_epoch=expected_session_epoch,
+                    )
+                else:
+                    if "session_id" in details:
+                        detail_session_id = details["session_id"]
+                        if (
+                            not isinstance(detail_session_id, str)
+                            or not detail_session_id
+                        ):
+                            raise ValueError(
+                                "Task session owner session_id must be a non-empty string"
+                            )
+                        if detail_session_id != expected_session_id:
+                            return False
+                    details["session_id"] = expected_session_id
+            details.pop("turn_outcome", None)
             async with conn.execute(
                 """
                 UPDATE agent_tasks
@@ -14093,46 +14437,11 @@ class SessionStorage:
             ) as cur:
                 changed = cur.rowcount or 0
             if changed:
-                async with conn.execute(
-                    "SELECT details FROM agent_tasks WHERE task_id = ?",
-                    (task_id,),
-                ) as cur:
-                    row = await cur.fetchone()
-                if row is not None:
-                    details_raw = _deserialize_row({"details": row["details"]}).get(
-                        "details"
-                    )
-                    details = (
-                        dict(details_raw) if isinstance(details_raw, dict) else {}
-                    )
-                    details.pop("turn_outcome", None)
-                    await conn.execute(
-                        "UPDATE agent_tasks SET details = ? WHERE task_id = ?",
-                        (_serialize(details), task_id),
-                    )
+                await conn.execute(
+                    "UPDATE agent_tasks SET details = ? WHERE task_id = ?",
+                    (_serialize(details), task_id),
+                )
         return changed > 0
-
-    async def _canonical_transcript_cursor_exists(
-        self,
-        session_id: str,
-        cursor: tuple[int, int],
-    ) -> bool:
-        created_at, entry_id = cursor
-        sql = """
-            SELECT 1
-            FROM transcript_entries
-            WHERE session_id = ? AND created_at = ? AND id = ?
-            UNION ALL
-            SELECT 1
-            FROM compacted_transcript_entries
-            WHERE session_id = ? AND created_at = ? AND original_entry_id = ?
-            LIMIT 1
-        """
-        async with self.conn.execute(
-            sql,
-            (session_id, created_at, entry_id, session_id, created_at, entry_id),
-        ) as cur:
-            return await cur.fetchone() is not None
 
     @_serialized_read
     async def get_canonical_transcript_page(
@@ -14147,28 +14456,38 @@ class SessionStorage:
 
         Each source CTE is bounded to ``limit + 1`` rows and both are merged in
         one SQLite read snapshot. ``before`` keeps its historical precedence
-        over ``after`` when both cursors exist; an unknown cursor is ignored,
-        matching the legacy list-pagination path.
+        over ``after`` when both cursors exist. A supplied cursor must identify
+        an anchor in this session; missing, foreign, or deleted anchors fail
+        instead of becoming an unpositioned latest read.
         """
         page_size = max(1, int(limit))
         fetch_size = page_size + 1
 
-        resolved_before = before
-        if resolved_before is not None and not await self._canonical_transcript_cursor_exists(
-            session_id,
-            resolved_before,
-        ):
-            resolved_before = None
-
-        resolved_after = None
-        if resolved_before is None and after is not None:
-            if await self._canonical_transcript_cursor_exists(session_id, after):
-                resolved_after = after
-
-        cursor = resolved_before or resolved_after
-        ascending = resolved_after is not None
+        cursor = before
+        ascending = False
+        if cursor is None and after is not None:
+            cursor = after
+            ascending = True
         comparator = ">" if ascending else "<"
         direction = "ASC" if ascending else "DESC"
+
+        anchor_params: list[Any] = []
+        anchor_sql = "SELECT 1 AS present"
+        if cursor is not None:
+            created_at, entry_id = cursor
+            anchor_sql = """
+                SELECT 1 AS present
+                FROM transcript_entries
+                WHERE session_id = ? AND created_at = ? AND id = ?
+                UNION ALL
+                SELECT 1 AS present
+                FROM compacted_transcript_entries
+                WHERE session_id = ? AND created_at = ? AND original_entry_id = ?
+                LIMIT 1
+            """
+            anchor_params.extend(
+                (session_id, created_at, entry_id, session_id, created_at, entry_id)
+            )
 
         active_params: list[Any] = [session_id]
         active_cursor_clause = ""
@@ -14191,7 +14510,10 @@ class SessionStorage:
             archived_params.extend((created_at, created_at, entry_id))
         archived_params.append(fetch_size)
         sql = f"""
-            WITH active_page AS (
+            WITH cursor_anchor AS (
+                {anchor_sql}
+            ),
+            active_page AS (
                 SELECT
                     id,
                     session_id,
@@ -14202,6 +14524,7 @@ class SessionStorage:
                     tool_calls,
                     tool_call_id,
                     reasoning_content,
+                    assistant_replay,
                     turn_usage,
                     turn_context,
                     created_at,
@@ -14214,6 +14537,7 @@ class SessionStorage:
                     schema_version
                 FROM transcript_entries
                 WHERE session_id = ?
+                  AND EXISTS (SELECT 1 FROM cursor_anchor)
                   {active_cursor_clause}
                 ORDER BY created_at {direction}, id {direction}
                 LIMIT ?
@@ -14229,6 +14553,7 @@ class SessionStorage:
                     tool_calls,
                     tool_call_id,
                     reasoning_content,
+                    assistant_replay,
                     turn_usage,
                     turn_context,
                     created_at,
@@ -14241,6 +14566,7 @@ class SessionStorage:
                     schema_version
                 FROM compacted_transcript_entries
                 WHERE session_id = ?
+                  AND EXISTS (SELECT 1 FROM cursor_anchor)
                   {archived_cursor_clause}
                 ORDER BY
                     created_at {direction},
@@ -14252,22 +14578,43 @@ class SessionStorage:
                 SELECT * FROM active_page
                 UNION ALL
                 SELECT * FROM archived_page
+            ),
+            page AS (
+                SELECT merged.*, 1 AS _page_row
+                FROM merged
+                ORDER BY created_at {direction}, id {direction}
+                LIMIT ?
+            ),
+            cursor_status AS (
+                SELECT EXISTS (SELECT 1 FROM cursor_anchor) AS is_valid
             )
-            SELECT *
-            FROM merged
-            ORDER BY created_at {direction}, id {direction}
-            LIMIT ?
+            SELECT page.*, cursor_status.is_valid AS _cursor_valid
+            FROM cursor_status
+            LEFT JOIN page ON cursor_status.is_valid = 1
+            ORDER BY page.created_at {direction}, page.id {direction}
         """
 
-        # Both sources must be read by one SQLite statement. A compaction moves
-        # rows from transcript_entries into compacted_transcript_entries inside
-        # one transaction; separate SELECT statements could otherwise observe
-        # opposite sides of that move and duplicate or omit canonical rows.
-        params = [*active_params, *archived_params, fetch_size]
+        # Cursor membership and both transcript sources share one SQLite
+        # statement, so a concurrent reset, delete, or compaction lands wholly
+        # before or after this snapshot.
+        params = [*anchor_params, *active_params, *archived_params, fetch_size]
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
 
-        entries = [TranscriptEntry(**_deserialize_row(dict(row))) for row in rows]
+        if not rows or not bool(rows[0]["_cursor_valid"]):
+            raise HistoryCursorInvalidatedError(
+                "history cursor no longer anchors this session"
+            )
+
+        entry_rows: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload.pop("_cursor_valid", None)
+            page_row = payload.pop("_page_row", None)
+            if page_row is not None:
+                entry_rows.append(payload)
+
+        entries = [TranscriptEntry(**_deserialize_row(row)) for row in entry_rows]
         has_more = len(entries) > page_size
         entries = entries[:page_size]
         if not ascending:
@@ -14384,6 +14731,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14408,6 +14756,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14425,26 +14774,45 @@ class SessionStorage:
                 """,
                 (target_session_id, target_session_key, source_session_id),
             )
-            if terminal_outcome_projections is None:
-                return
             async with conn.execute(
-                "SELECT id, turn_context FROM compacted_transcript_entries "
+                "SELECT id, role, message_id, content, turn_context "
+                "FROM compacted_transcript_entries "
                 "WHERE session_id = ?",
                 (target_session_id,),
             ) as cursor:
                 rows = await cursor.fetchall()
             for row in rows:
+                content = row["content"]
+                rebound_content = (
+                    preserve_attachment_occurrence_ids(
+                        content,
+                        session_id=source_session_id,
+                        source_message_id=row["message_id"],
+                    )
+                    if row["role"] == "user"
+                    else content
+                )
                 context = _json_object_or_none(row["turn_context"])
                 turn_id = turn_id_from_context(context)
-                rebound_context = attach_fork_terminal_outcome_projection(
-                    context,
-                    terminal_outcome_projections.get(turn_id or ""),
+                rebound_context = (
+                    attach_fork_terminal_outcome_projection(
+                        context,
+                        terminal_outcome_projections.get(turn_id or ""),
+                    )
+                    if terminal_outcome_projections is not None
+                    else context
                 )
-                if rebound_context == context:
+                if rebound_content == content and rebound_context == context:
                     continue
                 await conn.execute(
-                    "UPDATE compacted_transcript_entries SET turn_context = ? WHERE id = ?",
-                    (_serialize(rebound_context), row["id"]),
+                    "UPDATE compacted_transcript_entries "
+                    "SET content = ?, turn_context = ? WHERE id = ?",
+                    (
+                        rebound_content,
+                        _serialize(rebound_context) if rebound_context != context
+                        else row["turn_context"],
+                        row["id"],
+                    ),
                 )
 
     @_serialized_read
@@ -14531,6 +14899,136 @@ class SessionStorage:
             for sid, content in rows:
                 if isinstance(content, str):
                     result.setdefault(sid, []).append(content)
+        return result
+
+    @_serialized_read
+    async def list_canonical_user_transcript_content_batch(
+        self,
+        session_ids: list[str],
+        *,
+        limit_per_session: int = 3,
+    ) -> dict[str, list[str]]:
+        """Return early user text across active and archived transcript rows.
+
+        Each source uses its existing session cursor index to select at most
+        ``limit_per_session`` candidates per session. Merging those candidates
+        in one statement preserves a single snapshot while compaction moves
+        rows between tables. Archived rows keep their original transcript ID,
+        matching canonical history ordering instead of archive insertion order.
+        """
+        unique_ids = list(dict.fromkeys(session_ids))
+        result: dict[str, list[str]] = {sid: [] for sid in unique_ids}
+        bounded_limit = max(0, int(limit_per_session))
+        if not unique_ids or not bounded_limit:
+            return result
+
+        # One parameter per session plus three limits stays below SQLite's
+        # historical 999-variable limit, including large directory requests.
+        chunk = 300
+        for index in range(0, len(unique_ids), chunk):
+            batch = unique_ids[index : index + chunk]
+            values = ",".join("(?)" for _ in batch)
+            sql = f"""
+                WITH requested(session_id) AS (VALUES {values}),
+                candidates AS (
+                    SELECT active.session_id, active.content,
+                           active.created_at, active.id AS original_entry_id
+                    FROM requested
+                    JOIN transcript_entries AS active ON active.id IN (
+                        SELECT id FROM transcript_entries
+                        WHERE session_id = requested.session_id
+                          AND role = 'user'
+                          AND COALESCE(content, '') != ''
+                        ORDER BY created_at ASC, id ASC
+                        LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT archived.session_id, archived.content,
+                           archived.created_at, archived.original_entry_id
+                    FROM requested
+                    JOIN compacted_transcript_entries AS archived ON archived.id IN (
+                        SELECT id FROM compacted_transcript_entries
+                        WHERE session_id = requested.session_id
+                          AND role = 'user'
+                          AND COALESCE(content, '') != ''
+                        ORDER BY created_at ASC, original_entry_id ASC, id ASC
+                        LIMIT ?
+                    )
+                ),
+                ranked AS (
+                    SELECT session_id, content,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY session_id
+                               ORDER BY created_at ASC, original_entry_id ASC
+                           ) AS rn
+                    FROM candidates
+                )
+                SELECT session_id, content
+                FROM ranked
+                WHERE rn <= ?
+                ORDER BY session_id ASC, rn ASC
+            """
+            params = [*batch, bounded_limit, bounded_limit, bounded_limit]
+            async with self.conn.execute(sql, params) as cur:
+                rows = await cur.fetchall()
+            for sid, content in rows:
+                if isinstance(content, str):
+                    result[sid].append(content)
+        return result
+
+    @_serialized_read
+    async def list_last_transcript_content_batch(
+        self,
+        session_ids: list[str],
+        *,
+        max_chars: int = 120,
+    ) -> dict[str, str]:
+        """Return one bounded preview message for each active session.
+
+        The session preview endpoint only needs the newest non-empty user or
+        assistant message.  Selecting that row in SQLite avoids materializing
+        every transcript entry (and keeps the result bounded even when a
+        single message is very large).  This intentionally reads the active
+        transcript table only, matching the historical ``get_transcript``
+        path used by ``sessions.preview``.
+
+        Missing or empty transcripts are returned explicitly as ``""`` so the
+        caller can preserve the legacy wire shape without another lookup.
+        Chunks stay below SQLite's variable limit when a caller previews many
+        sessions at once.
+        """
+        if not session_ids:
+            return {}
+
+        bounded_chars = max(0, int(max_chars))
+        chunk = 300
+        result: dict[str, str] = {session_id: "" for session_id in session_ids}
+        for index in range(0, len(session_ids), chunk):
+            batch = session_ids[index : index + chunk]
+            placeholders = ",".join("?" for _ in batch)
+            sql = f"""
+                SELECT latest.session_id, substr(entry.content, 1, ?) AS content
+                FROM (
+                    SELECT
+                        session_id,
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY session_id
+                            ORDER BY created_at DESC, id DESC
+                        ) AS rn
+                    FROM transcript_entries
+                    WHERE session_id IN ({placeholders})
+                        AND role IN ('user', 'assistant')
+                        AND COALESCE(content, '') != ''
+                ) AS latest
+                JOIN transcript_entries AS entry ON entry.id = latest.id
+                WHERE latest.rn = 1
+            """
+            async with self.conn.execute(sql, [bounded_chars, *batch]) as cur:
+                rows = await cur.fetchall()
+            for session_id, content in rows:
+                if isinstance(content, str):
+                    result[session_id] = content
         return result
 
     async def delete_transcript(self, session_id: str) -> None:
@@ -14670,12 +15168,38 @@ class SessionStorage:
         expected_source_boundary_message_id: str | None = None,
         expected_source_boundary_entry_id: int | None = None,
         expected_context_fingerprint: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool:
         """Atomically persist a compaction rewrite for one session."""
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("compaction rewrite requires an exact session owner")
 
         async with self._write_transaction("rewrite_compacted_session") as conn:
+            if expected_session_id is not None:
+                assert expected_session_epoch is not None
+                if (
+                    node.session_id != expected_session_id
+                    or int(node.epoch or 0) != expected_session_epoch
+                    or not await _matches_session_owner_on_conn(
+                        conn,
+                        session_key=node.session_key,
+                        session_id=expected_session_id,
+                        session_epoch=expected_session_epoch,
+                    )
+                ):
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=node.session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
             preserve_surviving_rows = expected_source_entries is not None
             if expected_source_entries is not None:
                 expected_prefix = list(expected_source_entries)
@@ -14903,27 +15427,6 @@ class SessionStorage:
     async def get_all_summaries(self, session_id: str) -> list[SessionSummary]:
         return await self._select_all_summaries(self.conn, session_id)
 
-    @_serialized_read
-    async def list_degraded_summaries(
-        self,
-        *,
-        session_key_prefix: str | None = None,
-        limit: int = 50,
-    ) -> list[SessionSummary]:
-        clauses = ["flush_receipt_status IN ('degraded_forensic', 'failed_retryable')"]
-        params: list[Any] = []
-        if session_key_prefix:
-            clauses.append("session_key LIKE ?")
-            params.append(f"{session_key_prefix}%")
-        params.append(limit)
-        sql = (
-            "SELECT * FROM session_summaries "
-            f"WHERE {' AND '.join(clauses)} "
-            "ORDER BY created_at ASC LIMIT ?"
-        )
-        async with self.conn.execute(sql, params) as cur:
-            rows = await cur.fetchall()
-        return [SessionSummary(**_deserialize_row(dict(r))) for r in rows]
 
     @_serialized_read
     async def get_compacted_transcript_entries(
@@ -14943,6 +15446,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14961,50 +15465,45 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
 
-    async def update_summary_flush_receipt_status(
-        self,
-        summary_id: int,
-        status: str,
-    ) -> None:
-        async with self._write_transaction("update_summary_flush_receipt_status") as conn:
-            await conn.execute(
-                "UPDATE session_summaries SET flush_receipt_status = ? WHERE id = ?",
-                (status, summary_id),
-            )
-
-    async def update_summary_flush_receipt_status_by_compaction(
-        self,
-        *,
-        session_key: str,
-        compaction_id: str,
-        status: str,
-    ) -> int:
-        async with self._write_transaction(
-            "update_summary_flush_receipt_status_by_compaction"
-        ) as conn:
-            cur = await conn.execute(
-                """
-                UPDATE session_summaries
-                SET flush_receipt_status = ?
-                WHERE session_key = ? AND compaction_id = ?
-                """,
-                (status, canonicalize_session_key(session_key), compaction_id),
-            )
-            count = int(cur.rowcount or 0)
-        return count
 
     # ── SessionContextState CRUD ─────────────────────────────────────────────
 
     async def save_context_state(
-        self, state: SessionContextState
+        self,
+        state: SessionContextState,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> SessionContextState:
         """Persist portable or provider-native context state for later replay."""
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("context state write requires an exact session owner")
+        if expected_session_id is not None and state.session_id != expected_session_id:
+            raise ValueError("context state does not match the expected session owner")
         state.session_key = canonicalize_session_key(state.session_key)
         data = state.model_dump(exclude={"id"})
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
         values = [_serialize(data[c]) for c in cols]
         async with self._write_transaction("save_context_state") as conn:
+            if expected_session_id is not None:
+                assert expected_session_epoch is not None
+                if not await _matches_session_owner_on_conn(
+                    conn,
+                    session_key=state.session_key,
+                    session_id=expected_session_id,
+                    session_epoch=expected_session_epoch,
+                ):
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=state.session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
             async with conn.execute(
                 "INSERT INTO session_context_states "
                 f"({', '.join(cols)}) VALUES ({placeholders})",
@@ -15021,10 +15520,35 @@ class SessionStorage:
         provider: str | None = None,
         state_kind: str | None = None,
         valid_only: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> list[SessionContextState]:
         session_key = canonicalize_session_key(session_key)
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("context state read requires an exact session owner")
+        if expected_session_id is not None:
+            assert expected_session_epoch is not None
+            if not await _matches_session_owner_on_conn(
+                self.conn,
+                session_key=session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                await self._raise_stale_epoch(
+                    self.conn,
+                    session_key=session_key,
+                    expected_epoch=expected_session_epoch,
+                    expected_session_id=expected_session_id,
+                )
         clauses = ["session_key = ?"]
         params: list[Any] = [session_key]
+        if expected_session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(expected_session_id)
         if provider is not None:
             clauses.append("provider = ?")
             params.append(provider)
@@ -15040,6 +15564,20 @@ class SessionStorage:
             params,
         ) as cur:
             rows = await cur.fetchall()
+        if expected_session_id is not None:
+            assert expected_session_epoch is not None
+            if not await _matches_session_owner_on_conn(
+                self.conn,
+                session_key=session_key,
+                session_id=expected_session_id,
+                session_epoch=expected_session_epoch,
+            ):
+                await self._raise_stale_epoch(
+                    self.conn,
+                    session_key=session_key,
+                    expected_epoch=expected_session_epoch,
+                    expected_session_id=expected_session_id,
+                )
         return [SessionContextState(**_deserialize_row(dict(row))) for row in rows]
 
     async def invalidate_context_states(

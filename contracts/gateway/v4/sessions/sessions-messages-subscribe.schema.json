@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sessions/sessions-messages-subscribe.schema.json",
+  "title": "OpenSquilla sessions.messages.subscribe Contract",
+  "description": "Language-neutral Contract for the per-session v4 message replay subscription. This is distinct from sessions.subscribe, which observes the session directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": { "$ref": "#/$defs/SessionsMessagesSubscribeRequestFrame" },
+    "response": { "$ref": "#/$defs/SessionsMessagesSubscribeResponseFrame" }
+  },
+  "x-opensquilla-wire": { "protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree" },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.messages.subscribe",
+    "kind": "command",
+    "scope": "operator.read",
+    "guestAllowed": true,
+    "idempotency": "idempotent",
+    "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "sessions.messages.subscribe" },
+    "request": "#/$defs/SessionsMessagesSubscribeRequestFrame",
+    "params": "#/$defs/SessionsMessagesSubscribeParams",
+    "response": "#/$defs/SessionsMessagesSubscribeResponseFrame",
+    "result": "#/$defs/SessionsMessagesSubscribeResult",
+    "errors": [
+      { "code": "INVALID_REQUEST", "semantics": "missing-or-non-string-key" },
+      { "code": "UNAUTHORIZED" },
+      { "code": "SESSION_NOT_FOUND", "semantics": "missing-subagent-session" },
+      { "code": "STORAGE_BUSY", "retryable": true, "retryAfterMs": true, "details": true },
+      { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "NullableString": { "type": ["string", "null"] },
+    "NullableInteger": { "type": ["integer", "null"] },
+    "OpenObject": { "type": "object", "additionalProperties": true },
+    "NullableOpenObject": { "anyOf": [{ "$ref": "#/$defs/OpenObject" }, { "type": "null" }] },
+    "SessionsMessagesSubscribeParams": {
+      "title": "sessions.messages.subscribe params",
+      "description": "The snake_case cursor fields are canonical; camelCase aliases remain accepted by the current v4 handler. Unknown fields are ignored.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key"],
+      "properties": {
+        "key": { "type": "string" },
+        "since_stream_generation": { "$ref": "#/$defs/NullableString" },
+        "sinceStreamGeneration": { "$ref": "#/$defs/NullableString" },
+        "since_stream_seq": { "type": ["integer", "string", "null"] },
+        "sinceStreamSeq": { "type": ["integer", "string", "null"] },
+        "fast_ack": { "type": ["boolean", "null"] }
+      }
+    },
+    "SessionsMessagesSubscribeLegacyNonObjectParams": {
+      "anyOf": [
+        { "type": "array", "items": {} },
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "boolean" }
+      ]
+    },
+    "SessionsMessagesSubscribeRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "method"],
+      "properties": {
+        "type": { "const": "req" },
+        "id": { "type": "string" },
+        "method": { "const": "sessions.messages.subscribe" },
+        "params": {
+          "anyOf": [
+            { "$ref": "#/$defs/SessionsMessagesSubscribeParams" },
+            { "$ref": "#/$defs/SessionsMessagesSubscribeLegacyNonObjectParams" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "RunModeLock": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["locked"],
+      "properties": {
+        "locked": { "type": "boolean" },
+        "runMode": { "enum": ["safe", "full"] },
+        "source": { "type": "string" }
+      }
+    },
+    "SessionMessagesMetadata": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "workspaceId", "projectWorkspace", "projectWorkspaceDeferred",
+        "active_task_group_ids", "run_mode_lock", "pendingUserInputs",
+        "collaboration", "routing", "currentPlan", "activePlanRun", "goal",
+        "goalSnapshotStreamSeq", "tasks", "active_task", "last_task", "run_status",
+        "hydration_complete", "deferred_fields"
+      ],
+      "properties": {
+        "workspaceId": { "$ref": "#/$defs/NullableString" },
+        "projectWorkspace": { "$ref": "#/$defs/NullableOpenObject" },
+        "projectWorkspaceDeferred": { "type": "boolean" },
+        "active_task_group_ids": { "type": "array", "items": { "type": "string" } },
+        "run_mode_lock": { "$ref": "#/$defs/RunModeLock" },
+        "pendingUserInputs": { "type": "array", "items": { "$ref": "#/$defs/OpenObject" } },
+        "collaboration": { "$ref": "#/$defs/NullableOpenObject" },
+        "routing": { "$ref": "#/$defs/NullableOpenObject" },
+        "currentPlan": { "$ref": "#/$defs/NullableOpenObject" },
+        "activePlanRun": { "$ref": "#/$defs/NullableOpenObject" },
+        "goal": { "$ref": "#/$defs/NullableOpenObject" },
+        "goalSnapshotStreamSeq": { "$ref": "#/$defs/NullableInteger" },
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/OpenObject" } },
+        "active_task": { "$ref": "#/$defs/NullableOpenObject" },
+        "last_task": { "$ref": "#/$defs/NullableOpenObject" },
+        "run_status": { "type": "string" },
+        "queued_task_ids": { "type": "array", "items": { "type": "string" } },
+        "epoch": { "$ref": "#/$defs/NullableInteger" },
+        "hydration_complete": { "type": "boolean" },
+        "deferred_fields": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "SessionsMessagesSubscribeResult": {
+      "title": "sessions.messages.subscribe result",
+      "allOf": [
+        { "$ref": "#/$defs/SessionMessagesMetadata" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "subscribed", "key", "stream_generation", "current_stream_seq",
+            "replay_complete", "replay_gap_reason", "replayed_count"
+          ],
+          "properties": {
+            "subscribed": { "type": "boolean" },
+            "key": { "type": "string" },
+            "stream_generation": { "type": "string" },
+            "current_stream_seq": { "type": "integer", "minimum": 0 },
+            "replay_complete": { "type": "boolean" },
+            "replay_gap_reason": { "$ref": "#/$defs/NullableString" },
+            "replayed_count": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "details": {},
+        "retryable": { "type": ["boolean", "null"] },
+        "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "accepted": { "type": ["boolean", "null"] }
+      }
+    },
+    "SessionsMessagesSubscribeOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok", "payload"],
+      "properties": {
+        "type": { "const": "res" },
+        "id": { "type": "string" },
+        "ok": { "const": true },
+        "payload": { "$ref": "#/$defs/SessionsMessagesSubscribeResult" },
+        "error": { "type": "null" }
+      }
+    },
+    "SessionsMessagesSubscribeErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok", "error"],
+      "properties": {
+        "type": { "const": "res" },
+        "id": { "type": "string" },
+        "ok": { "const": false },
+        "payload": { "type": "null" },
+        "error": { "$ref": "#/$defs/RpcError" }
+      }
+    },
+    "SessionsMessagesSubscribeResponseFrame": {
+      "oneOf": [
+        { "$ref": "#/$defs/SessionsMessagesSubscribeOkResponseFrame" },
+        { "$ref": "#/$defs/SessionsMessagesSubscribeErrorResponseFrame" }
+      ]
+    }
+  }
+}

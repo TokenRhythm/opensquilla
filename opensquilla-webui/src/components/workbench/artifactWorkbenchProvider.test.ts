@@ -1,12 +1,16 @@
+import type { PromptAnnotationCreateRequest } from '@/types/promptAnnotations'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
   NativeWorkbenchApi,
   NativeWorkbenchSurfaceResult,
   Platform,
 } from '@/platform/types'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
-import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
+import {
+  createArtifactPreviewWorkbenchItem,
+  requestInitialSectionForWorkbenchItem,
+} from '@/workbench/artifactItems'
 import {
   artifactPayloadFromWorkbenchResource,
   resourceFromPreparedPreview,
@@ -16,7 +20,58 @@ import type {
   WorkbenchPanelRenderState,
   WorkbenchRuntimeContext,
 } from '@/workbench/types'
-import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
+import type {
+  ArtifactContentAccess,
+  ArtifactPreviewAccess,
+} from '@/modules/artifactWorkbench'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import {
+  HttpTransportError,
+  type HttpTransport,
+} from '@/adapters/gateway/privateHttpTransport'
+import {
+  httpBinaryResponse,
+  httpTransportTestDouble,
+} from '@/testing/httpTransport.test-helper'
+import {
+  createArtifactWorkbenchDefinitions as createDefinitions,
+  type ArtifactWorkbenchProviderOptions,
+} from './artifactWorkbenchProvider'
+
+const testHttp: HttpTransport = {
+  clearPreviewOrigin: vi.fn(async () => undefined),
+  fetchExternalArtifact: vi.fn(async () => { throw new Error('unexpected external request') }),
+  requestBinary: vi.fn(async () => { throw new Error('unexpected binary request') }),
+  requestBlob: vi.fn(async () => new Blob()),
+  requestJson: vi.fn(async () => { throw new Error('unexpected JSON request') }),
+}
+
+const testArtifactContent: ArtifactContentAccess = {
+  ...createV4ArtifactContentAccess(testHttp),
+  fetchAttachment: vi.fn(async () => ({
+    ok: false as const,
+    status: 0,
+    source: 'none' as const,
+    url: '',
+    message: 'not used',
+  })),
+  uploadAttachment: vi.fn(async () => ({ fileUuid: 'test-file' })),
+}
+const testArtifactPreviews: ArtifactPreviewAccess = createV4ArtifactPreviews(testHttp, {
+  baseOrigin: () => 'http://localhost',
+})
+
+function createArtifactWorkbenchDefinitions(
+  options: Omit<ArtifactWorkbenchProviderOptions, 'artifactContent' | 'artifactPreviews'>
+    & Partial<Pick<ArtifactWorkbenchProviderOptions, 'artifactContent' | 'artifactPreviews'>>,
+) {
+  return createDefinitions({
+    artifactContent: testArtifactContent,
+    artifactPreviews: testArtifactPreviews,
+    ...options,
+  })
+}
 
 const artifact: ArtifactPayload = {
   id: 'artifact-1',
@@ -64,7 +119,6 @@ async function createNativeRuntimeHarness(
     sessionKey: 'session-a',
   })
   const definition = createArtifactWorkbenchDefinitions({
-    authToken: () => '',
     baseOrigin: 'http://localhost',
     confirmRemoteResources,
     currentSessionId: () => 'session-a',
@@ -90,7 +144,10 @@ async function createNativeRuntimeHarness(
 async function createAnnotationDraftHarness(
   showOverlayResult: NativeWorkbenchSurfaceResult = { ok: true },
   atomicCloseRearm = false,
+  workingDocumentId?: string,
+  navigatedPage?: string,
 ) {
+  let currentHead = { ...artifact }
   const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
   const workspace = {
     ...legacy,
@@ -108,36 +165,13 @@ async function createAnnotationDraftHarness(
       },
     },
   }
-  const createAnnotation = vi.fn(async (request: {
-    annotationId: string
-    sessionKey: string
-    documentId: string
-    revisionId: string
-  }) => ({
-    annotationId: request.annotationId,
-    sessionKey: request.sessionKey,
-    sessionId: null,
-    sessionEpoch: null,
-    documentId: request.documentId,
-    documentName: 'preview.html',
-    revisionId: request.revisionId,
-    generation: 1,
-    anchorId: 'anchor-1',
-    body: '',
-    status: 'draft' as const,
-    freshness: 'fresh' as const,
-    staleReason: null,
-    stateRevision: 1,
-    tagName: 'button',
-    locator: {},
-    quote: '<button>',
-    sourceExcerpt: null,
-    sentMessageId: null,
-    sentTurnId: null,
-    sentOrder: null,
-    createdAt: 1,
-    updatedAt: 1,
-    schemaVersion: 1,
+  const createAnnotation = vi.fn(async (request: PromptAnnotationCreateRequest) => ({
+    annotationId: request.annotationId, sessionKey: request.sessionKey,
+    documentId: request.documentId, documentName: 'preview.html',
+    body: '', status: 'draft' as const, tagName: request.selection.tagName,
+    targetRef: request.selection.targetRef, locatorHint: request.selection.locatorHint,
+    resourceId: request.resourceId, quote: request.selection.selectionText || null,
+    createdAt: 1, updatedAt: 1,
   }))
   const updateAnnotation = vi.fn(async (_annotationId: string, _body: string) => null)
   const discardAnnotation = vi.fn(async (_annotationId: string) => true)
@@ -167,6 +201,7 @@ async function createAnnotationDraftHarness(
     expires_at: '2099-01-01T00:00:00Z',
     preview_origin: 'http://p-0123456789abcdef0123456789abcdef.localhost:48721',
     idle_timeout_seconds: 28_800,
+    ...(workingDocumentId ? { workingDocumentId } : {}),
     source: {
       kind: 'single_file' as const,
       collection_status: 'not_applicable' as const,
@@ -192,15 +227,9 @@ async function createAnnotationDraftHarness(
     setArtifactAnnotationMode: setAnnotationMode,
     showArtifactAnnotationOverlay: showOverlay,
     closeArtifactAnnotationOverlay: closeOverlay,
-    screenshot: vi.fn(async () => ({
-      ok: true as const,
-      method: 'screenshot' as const,
-      value: {
-        mime: 'image/png' as const,
-        data: new Uint8Array([137, 80, 78, 71]),
-        width: 320,
-        height: 180,
-      },
+    captureWorkbenchScreenshot: vi.fn(async () => ({
+      targetRef: 'target-focused', mimeType: 'image/png' as const,
+      dataBase64: 'iVBORw==', width: 320, height: 180,
     })),
     createArtifactPreviewLease: vi.fn(async () => ({
       ok: true as const,
@@ -218,6 +247,7 @@ async function createAnnotationDraftHarness(
       payload: undefined,
     })),
     createSurface,
+    navigateSurface: vi.fn(async () => ({ ok: true as const })),
     setSurfaceRect,
     activateSurface: vi.fn(async () => ({ ok: true as const })),
     destroySurface,
@@ -240,7 +270,7 @@ async function createAnnotationDraftHarness(
         error: null,
         workspace,
       })),
-      headArtifact: vi.fn(() => artifact),
+      headArtifact: vi.fn(() => currentHead),
     },
     promptAnnotations: {
       create: createAnnotation,
@@ -251,7 +281,6 @@ async function createAnnotationDraftHarness(
       releaseOverlayEdit,
       setActiveDocument: vi.fn(),
     },
-    authToken: () => 'synthetic-token',
     baseOrigin: 'http://127.0.0.1:18791',
     confirmRemoteResources: vi.fn(async () => true),
     currentSessionId: () => 'session-a',
@@ -287,6 +316,12 @@ async function createAnnotationDraftHarness(
     visible: true,
   }, item)
   await runtime.performAction?.('toggle-annotation-mode', item)
+  if (navigatedPage) {
+    await runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: item.id, type: 'navigation-state',
+      detail: { url: `${lease.preview_origin}/${navigatedPage}` },
+    }, item)
+  }
   await runtime.handleNativeSurfaceEvent?.({
     version: 3,
     surfaceId: item.id,
@@ -296,8 +331,11 @@ async function createAnnotationDraftHarness(
         selectionId: 'selection-focused',
         tagName: 'button',
         elementPath: '[["","button",1]]',
-        elementProofSha256: 'b'.repeat(64),
-        domSha256: 'a'.repeat(64),
+        targetRef: 'target-focused',
+
+        selectionText: 'Button',
+
+        locatorHint: 'button',
         rect: { x: 1, y: 2, width: 30, height: 20 },
       },
     },
@@ -307,6 +345,10 @@ async function createAnnotationDraftHarness(
 
   return {
     annotationId,
+    advanceHead() {
+      workspace.document.headRevisionId = 'revision-2'
+      currentHead = { ...artifact, id: 'artifact-next' }
+    },
     beginOverlayEdit,
     closeOverlay,
     completeOverlayEdit,
@@ -315,6 +357,7 @@ async function createAnnotationDraftHarness(
     discardAnnotation,
     destroySurface,
     item,
+    nativeApi,
     pushToast,
     releaseOverlayEdit,
     renderState,
@@ -327,6 +370,229 @@ async function createAnnotationDraftHarness(
 }
 
 describe('artifact Workbench provider', () => {
+  describe('explicit preview reopen', () => {
+    async function setup(nativeHtml: boolean, options: Partial<Parameters<typeof createArtifactPreviewWorkbenchItem>[0]> = {}) {
+      const renderState: Record<string, unknown> = {}
+      const nativeApi: NativeWorkbenchApi = {
+        getCapabilities: vi.fn<NonNullable<NativeWorkbenchApi['getCapabilities']>>(
+          async () => ({ protocolVersions: [3], modes: ['offline'], maxSurfaces: 8 }),
+        ),
+        createArtifactPreviewLease: vi.fn(), renewArtifactPreviewLease: vi.fn(), revokeArtifactPreviewLease: vi.fn(),
+        createSurface: vi.fn(async () => ({ ok: true })),
+        destroySurface: vi.fn(async () => ({ ok: true })),
+        setSurfaceRect: vi.fn(async () => ({ ok: true })),
+        activateSurface: vi.fn(async () => ({ ok: true })),
+        onSurfaceEvent: vi.fn(() => () => undefined),
+      }
+      let leaseNumber = 0
+      const createLease = vi.fn<ArtifactPreviewAccess['createLease']>(async (_artifact, _mode, _client, request) => ({
+        version: 1, lease_id: `lease-${++leaseNumber}`, effective_mode: 'offline',
+        launch_url: `http://preview.localhost/${request?.pagePath || 'index.html'}?lease=${leaseNumber}`,
+        entrypoint: 'index.html', ...(request?.pagePath ? { page_path: request.pagePath } : {}),
+        preview_origin: 'http://preview.localhost', expires_at: '2099-01-01T00:00:00Z', idle_timeout_seconds: 3600,
+        workingDocumentId: 'doc_reopen',
+        source: { kind: 'bundle', collection_status: 'complete', file_count: 3, total_bytes: 128, warning_codes: [] },
+      }))
+      const item = createArtifactPreviewWorkbenchItem({
+        artifact, nativeHtml, sessionKey: 'session-a', initialSectionRequestId: 1, ...options,
+      })
+      const definition = createArtifactWorkbenchDefinitions({
+        artifactPreviews: { ...testArtifactPreviews, createLease, revokeLease: vi.fn(async () => undefined) },
+        baseOrigin: 'http://localhost', currentSessionId: () => 'session-a',
+        platform: { id: nativeHtml ? 'desktop' : 'web', capabilities: {}, files: {} } as unknown as Platform,
+        previewLeasesEnabled: true, confirmRemoteResources: vi.fn(async () => true),
+        getPreviewPreferences: async () => ({ mode: 'offline', noticeShown: true }),
+        pushToast: vi.fn(), t: key => key,
+      }).find(candidate => candidate.kind === 'artifact-preview')!
+      const runtime = await definition.createRuntime!(item, {
+        nativeWorkbenchApi: nativeHtml ? nativeApi : undefined,
+        getRenderState: () => renderState,
+        updateRenderState: patch => Object.assign(renderState, patch),
+        isItemOpen: () => true, setExpanded: vi.fn(), reportError: vi.fn(),
+      })
+      return { item, runtime, renderState, createLease, nativeApi }
+    }
+
+    for (const nativeHtml of [true, false]) {
+      describe(nativeHtml ? 'native' : 'DOM', () => {
+        it.each([undefined, 'pages/editorial.html'])('navigates back to the same explicit page %s after in-page navigation', async pagePath => {
+          const f = await setup(nativeHtml, { artifact: { ...artifact, ...(pagePath ? { previewPagePath: pagePath } : {}) } })
+          try {
+            expect(f.createLease).toHaveBeenCalledTimes(1)
+            if (nativeHtml) {
+              await f.runtime.handleNativeSurfaceEvent?.({
+                version: 3, surfaceId: f.item.id, type: 'navigation-state',
+                detail: { url: 'http://preview.localhost/dashboard.html' },
+              }, f.item)
+            } else {
+              await f.runtime.handleComponentEvent?.({ type: 'preview-page-unknown' }, f.item)
+            }
+            const next = requestInitialSectionForWorkbenchItem(f.item, f.item)
+            await f.runtime.update?.(next)
+            expect(f.createLease).toHaveBeenCalledTimes(2)
+            expect(f.createLease.mock.lastCall?.[3]?.pagePath).toBe(pagePath)
+            expect(f.renderState.previewLaunchUrl).toBe(`http://preview.localhost/${pagePath || 'index.html'}?lease=2`)
+            expect(f.renderState.currentUrl).toBe('')
+            expect(f.renderState.workingFilePageUnknown).toBe(false)
+            if (nativeHtml) {
+              expect(f.nativeApi.createSurface).toHaveBeenCalledTimes(2)
+              expect(vi.mocked(f.nativeApi.createSurface).mock.lastCall?.[0]).toMatchObject({
+                payload: { launchUrl: f.renderState.previewLaunchUrl },
+              })
+            }
+          } finally { await f.runtime.dispose?.('closed') }
+        })
+
+        it('does not reload on initial, duplicate or metadata-only updates', async () => {
+          const f = await setup(nativeHtml)
+          try {
+            await f.runtime.update?.(f.item)
+            expect(f.createLease).toHaveBeenCalledTimes(1)
+            const next = requestInitialSectionForWorkbenchItem(f.item, f.item)
+            await f.runtime.update?.(next)
+            expect(f.createLease).toHaveBeenCalledTimes(2)
+            const url = f.renderState.previewLaunchUrl
+            await f.runtime.update?.({ ...next, title: 'Updated metadata', payload: { ...next.payload, navigationArtifacts: [] } })
+            await f.runtime.update?.(next)
+            expect(f.createLease).toHaveBeenCalledTimes(2)
+            expect(f.renderState.previewLaunchUrl).toBe(url)
+          } finally { await f.runtime.dispose?.('closed') }
+        })
+
+        it('recognizes a wrapped explicit request id', async () => {
+          const f = await setup(nativeHtml, { initialSectionRequestId: Number.MAX_SAFE_INTEGER })
+          try {
+            const next = requestInitialSectionForWorkbenchItem(f.item, f.item)
+            expect(next.payload.initialSectionRequestId).toBe(1)
+            await f.runtime.update?.(next)
+            expect(f.createLease).toHaveBeenCalledTimes(2)
+          } finally { await f.runtime.dispose?.('closed') }
+        })
+
+        it.each(['source', 'non-HTML', 'prepared', 'zero-id'] as const)('does not navigate for %s updates', async kind => {
+          const f = await setup(nativeHtml, kind === 'non-HTML'
+            ? { artifact: { ...artifact, name: 'notes.txt', mime: 'text/plain' } }
+            : kind === 'prepared' ? { preparedPreview: {
+                protocolVersion: 1, mode: 'isolated', resource: { type: 'attachment', id: 'att_1' },
+                sandboxProfile: 'opaque-offline', network: false, launchUrl: '/prepared/att_1',
+              } } : {})
+          try {
+            const before = f.createLease.mock.calls.length
+            const next = requestInitialSectionForWorkbenchItem(f.item, f.item)
+            await f.runtime.update?.({ ...next, payload: {
+              ...next.payload,
+              ...(kind === 'source' ? { initialSection: 'source' } : {}),
+              ...(kind === 'zero-id' ? { initialSectionRequestId: 0 } : {}),
+            } })
+            expect(f.createLease).toHaveBeenCalledTimes(before)
+          } finally { await f.runtime.dispose?.('closed') }
+        })
+      })
+    }
+  })
+
+  it.each(['known-lease', 'unknown-lease', 'untyped-code'] as const)
+  ('presents only the recognized typed subpage failure for %s', async kind => {
+    const harness = await createAnnotationDraftHarness()
+    const privateDiagnostic = 'private gateway path /internal/fixture-value'
+    if (kind === 'untyped-code') {
+      vi.mocked(harness.nativeApi.getCapabilities!).mockRejectedValue(
+        Object.assign(new Error(privateDiagnostic), { code: 'PREVIEW_PAGE_UNSUPPORTED' }),
+      )
+    } else {
+      vi.mocked(harness.nativeApi.createArtifactPreviewLease!).mockResolvedValue({
+        ok: false, status: 409,
+        code: kind === 'known-lease' ? 'PREVIEW_PAGE_UNSUPPORTED' : 'UNKNOWN_LEASE_FAILURE',
+        message: privateDiagnostic,
+      })
+    }
+    try {
+      await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
+        artifact: { ...artifact, previewPagePath: 'editorial.html' },
+        nativeHtml: true, sessionKey: 'session-a',
+      }))
+      const expected = kind === 'known-lease'
+        ? 'This client or Gateway does not support opening this subpage directly. Update and try again.'
+        : 'The operation could not be completed. Try again.'
+      await vi.waitFor(() => expect(harness.renderState.previewLeaseError).toBe(expected))
+      expect(harness.renderState.previewBlocked).toBe(true)
+      expect(harness.renderState.previewLeaseError).not.toContain(privateDiagnostic)
+    } finally {
+      await harness.runtime.dispose?.('closed')
+    }
+  })
+
+  it('binds annotation context to the actual navigated subpage', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, false, undefined,
+      'pages/editorial.html')
+    expect(harness.createAnnotation).toHaveBeenCalledWith(expect.objectContaining({
+      pagePath: 'pages/editorial.html',
+    }))
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('keeps entrypoint annotations compatible with the original page context', async () => {
+    const harness = await createAnnotationDraftHarness()
+    expect(harness.createAnnotation.mock.calls[0]?.[0]).not.toHaveProperty('pagePath')
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it.each(['old-protocol', 'missing-broker'])('does not substitute the homepage for a subpage on %s', async compatibility => {
+    const harness = await createAnnotationDraftHarness()
+    if (compatibility === 'old-protocol') {
+      vi.mocked(harness.nativeApi.getCapabilities!).mockResolvedValue({
+        protocolVersions: [1], modes: ['offline'], maxSurfaces: 8,
+      })
+    } else {
+      harness.nativeApi.createArtifactPreviewLease = undefined
+    }
+    await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
+      artifact: { ...artifact, previewPagePath: 'editorial.html' },
+      nativeHtml: true, sessionKey: 'session-a',
+    }))
+    await vi.waitFor(() => expect(harness.renderState.previewLeaseError)
+      .toBe('This client or Gateway does not support opening this subpage directly. Update and try again.'))
+    expect(harness.renderState.previewBlocked).toBe(true)
+    expect(harness.renderState.previewLaunchUrl).toBe('')
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('replaces the same Document surface for subpages and returning to its entrypoint', async () => {
+    const harness = await createAnnotationDraftHarness()
+    const createLease = vi.mocked(harness.nativeApi.createArtifactPreviewLease!)
+    const initial = await createLease.mock.results[0]!.value
+    if (!initial.ok) throw new Error('Expected initial lease')
+    createLease.mockImplementation(async request => ({
+      ...initial,
+      payload: {
+        ...initial.payload,
+        ...(request.pagePath ? { page_path: request.pagePath } : {}),
+        launch_url: `${initial.payload.preview_origin}/${request.pagePath || 'index.html'}`,
+      },
+    }))
+    const openPage = async (previewPagePath?: string) => {
+      const next = createArtifactPreviewWorkbenchItem({
+        artifact: { ...artifact, ...(previewPagePath ? { previewPagePath } : {}) },
+        nativeHtml: true, sessionKey: 'session-a',
+      })
+      expect(next.id).toBe(harness.item.id)
+      await harness.runtime.update?.(next)
+    }
+    await openPage('pages/editorial.html')
+    await vi.waitFor(() => expect(harness.renderState.previewLaunchUrl)
+      .toContain('/pages/editorial.html'))
+    expect(createLease).toHaveBeenLastCalledWith(expect.objectContaining({
+      pagePath: 'pages/editorial.html',
+    }))
+    await openPage('minimal.html')
+    await vi.waitFor(() => expect(harness.renderState.previewLaunchUrl).toContain('/minimal.html'))
+    await openPage()
+    await vi.waitFor(() => expect(harness.renderState.previewLaunchUrl).toContain('/index.html'))
+    expect(createLease.mock.lastCall?.[0]).not.toHaveProperty('pagePath')
+    expect(harness.renderState.currentUrl).toBe('')
+    await harness.runtime.dispose?.('closed')
+  })
+
   it.each([
     'surface-hidden',
     'surface-navigation',
@@ -544,8 +810,7 @@ describe('artifact Workbench provider', () => {
           selectionId: 'selection-next',
           tagName: 'button',
           elementPath: '[["","button",2]]',
-          elementProofSha256: 'c'.repeat(64),
-          domSha256: 'a'.repeat(64),
+          targetRef: 'target-focused',
           rect: { x: 40, y: 2, width: 30, height: 20 },
         },
       },
@@ -659,7 +924,7 @@ describe('artifact Workbench provider', () => {
           selectionId: 'selection-after-rearm-failure',
           tagName: 'button',
           elementPath: '[["","button",2]]',
-          elementProofSha256: 'd'.repeat(64),
+          targetRef: 'target-focused',
           rect: { x: 40, y: 2, width: 30, height: 20 },
         },
       },
@@ -946,7 +1211,7 @@ describe('artifact Workbench provider', () => {
           selectionId: 'selection-after-cancel-stop',
           tagName: 'button',
           elementPath: '[["","button",2]]',
-          elementProofSha256: 'e'.repeat(64),
+          targetRef: 'target-focused',
           rect: { x: 40, y: 2, width: 30, height: 20 },
         },
       },
@@ -955,10 +1220,11 @@ describe('artifact Workbench provider', () => {
   })
 
   it('does not expose a Desktop native-open diagnostic in the toast', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>fixture</p>', {
-      status: 200,
-      headers: { 'content-type': 'text/html' },
-    })))
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn(async () => httpBinaryResponse('<p>fixture</p>', {
+        contentType: 'text/html',
+      })),
+    })
     const diagnostic = 'spawn EACCES /private/operator/report.html'
     const nativeOpen = vi.fn(async () => ({ ok: false, message: diagnostic }))
     const pushToast = vi.fn()
@@ -969,7 +1235,10 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
+      artifactContent: {
+        ...testArtifactContent,
+        ...createV4ArtifactContentAccess(http),
+      },
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1035,7 +1304,6 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(value => value),
       },
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1088,7 +1356,6 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(value => value),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1168,9 +1435,16 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const renderState: Record<string, unknown> = {}
+    const requestBinary = vi.fn(async () => {
+      throw new HttpTransportError('http-status', 'missing', 404)
+    })
+    const http = httpTransportTestDouble({ requestBinary })
     const definition = createArtifactWorkbenchDefinitions({
+      artifactContent: {
+        ...testArtifactContent,
+        ...createV4ArtifactContentAccess(http),
+      },
       artifactDocuments: { load, snapshot, headArtifact },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1211,12 +1485,10 @@ describe('artifact Workbench provider', () => {
     expect(props.documentSnapshot).toBeUndefined()
     expect(props.documentActions).toBeUndefined()
 
-    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 }))
-    vi.stubGlobal('fetch', fetchImpl)
     await runtime.performAction?.('download', item)
-    expect(fetchImpl).toHaveBeenCalledWith(
+    expect(requestBinary).toHaveBeenCalledWith(
       '/api/v1/workbench/previews/attachment-rev-1',
-      expect.objectContaining({ method: 'GET' }),
+      expect.objectContaining({ sessionKey: 'session-a', timeoutMs: 0 }),
     )
     expect(headArtifact).not.toHaveBeenCalled()
   })
@@ -1236,7 +1508,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1285,7 +1556,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources,
       currentSessionId: () => 'session-a',
@@ -1456,7 +1726,6 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(() => currentHead),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1539,7 +1808,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1698,7 +1966,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -1729,19 +1996,15 @@ describe('artifact Workbench provider', () => {
     expect(renderState.previewMode).toBe('full')
     expect(createSurface).toHaveBeenLastCalledWith(expect.objectContaining({ version: 3 }))
     expect(renderState.previewDefaultMode).toBe('offline')
+    expect(savePreviewPreferences).not.toHaveBeenCalled()
+
+    await runtime.performAction?.('set-default-preview-mode', item)
+    await runtime.performAction?.('set-default-preview-mode', item)
+
     expect(savePreviewPreferences).toHaveBeenCalledOnce()
     expect(savePreviewPreferences).toHaveBeenLastCalledWith({
-      mode: 'offline',
-      noticeShown: true,
-    })
-
-    await runtime.performAction?.('set-default-preview-mode', item)
-    await runtime.performAction?.('set-default-preview-mode', item)
-
-    expect(savePreviewPreferences).toHaveBeenCalledTimes(2)
-    expect(savePreviewPreferences).toHaveBeenLastCalledWith({
       mode: 'full',
-      noticeShown: true,
+      noticeShown: false,
     })
     expect(pushToast).toHaveBeenCalledOnce()
     expect(renderState.previewDefaultMode).toBe('full')
@@ -1778,7 +2041,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definitions = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources,
       currentSessionId: () => 'session-a',
@@ -1923,7 +2185,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2194,7 +2455,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2312,7 +2572,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2376,7 +2635,6 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2408,8 +2666,7 @@ describe('artifact Workbench provider', () => {
   it('clears a Web preview origin before revoking its lease on normal close', async () => {
     const previewOrigin =
       'http://p-0123456789abcdef0123456789abcdef.localhost:48721'
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({
+    const requestJson = vi.fn(async (_endpoint: string, _options?: unknown) => ({
         version: 1,
         lease_id: 'apl-web-fixture',
         effective_mode: 'full',
@@ -2425,13 +2682,10 @@ describe('artifact Workbench provider', () => {
           total_bytes: 42,
           warning_codes: [],
         },
-      }), {
-        status: 201,
-        headers: { 'content-type': 'application/json' },
       }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
-    vi.stubGlobal('fetch', fetchMock)
+    const clearPreviewOrigin = vi.fn(async (_origin: string) => undefined)
+    const requestBlob = vi.fn(async (_endpoint: string, _options?: unknown) => new Blob())
+    const http = httpTransportTestDouble({ clearPreviewOrigin, requestBlob, requestJson })
     try {
       const renderState: Record<string, unknown> = {}
       const previewItem = createArtifactPreviewWorkbenchItem({
@@ -2440,7 +2694,13 @@ describe('artifact Workbench provider', () => {
         sessionKey: 'session-a',
       })
       const definition = createArtifactWorkbenchDefinitions({
-        authToken: () => '',
+        artifactContent: {
+          ...testArtifactContent,
+          ...createV4ArtifactContentAccess(http),
+        },
+        artifactPreviews: createV4ArtifactPreviews(http, {
+          baseOrigin: () => 'http://127.0.0.1:18791',
+        }),
         baseOrigin: 'http://127.0.0.1:18791',
         confirmRemoteResources: vi.fn(async () => true),
         currentSessionId: () => 'session-a',
@@ -2463,16 +2723,18 @@ describe('artifact Workbench provider', () => {
 
       await runtime.dispose?.('closed')
 
-      expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
-        `${previewOrigin}/.opensquilla/clear-site-data`,
-      )
-      expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
-        credentials: 'omit',
-        mode: 'no-cors',
-        referrerPolicy: 'no-referrer',
-      })
-      expect(String(fetchMock.mock.calls[2]?.[0])).toContain(
+      expect(clearPreviewOrigin).toHaveBeenCalledWith(previewOrigin)
+      expect(String(requestBlob.mock.calls[0]?.[0])).toContain(
         '/api/v1/artifact-preview-leases/apl-web-fixture',
+      )
+      expect(requestBlob.mock.calls[0]?.[1]).toMatchObject({
+        keepalive: true,
+        method: 'DELETE',
+        sessionKey: 'session-a',
+        timeoutMs: 0,
+      })
+      expect(clearPreviewOrigin.mock.invocationCallOrder[0]).toBeLessThan(
+        requestBlob.mock.invocationCallOrder[0]!,
       )
     } finally {
       vi.unstubAllGlobals()
@@ -2601,7 +2863,6 @@ describe('artifact Workbench provider', () => {
         discard: vi.fn(async () => true),
         setActiveDocument: vi.fn(),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -2648,204 +2909,6 @@ describe('artifact Workbench provider', () => {
       annotationMode: false,
       nativeSurfaceState: 'loading',
     })
-    await runtime.dispose?.('closed')
-  })
-
-  it('shows a non-error agent-edit placeholder and rebuilds from the latest head after release', async () => {
-    const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
-    const revision1 = {
-      ...legacy.revisions[0],
-      revisionId: 'revision-1',
-      documentId: 'document-1',
-      artifactId: 'artifact-head-1',
-      generation: 1,
-    }
-    const revision2 = {
-      ...revision1,
-      revisionId: 'revision-2',
-      parentRevisionId: 'revision-1',
-      artifactId: 'artifact-head-2',
-      artifactSha256: 'b'.repeat(64),
-      generation: 2,
-    }
-    const workspace = {
-      ...legacy,
-      source: 'document-api' as const,
-      document: {
-        ...legacy.document,
-        documentId: 'document-1',
-        headRevisionId: 'revision-1',
-        capabilities: {
-          ...legacy.document.capabilities,
-          preview: true,
-          edit: true,
-          source: true,
-          agentEdit: true,
-        },
-      },
-      revisions: [revision1],
-      headArtifact: {
-        ...artifact,
-        id: revision1.artifactId,
-        documentId: 'document-1',
-      },
-    }
-    let leaseSequence = 0
-    const createLease = vi.fn(async () => {
-      leaseSequence += 1
-      const token = String(leaseSequence).padStart(32, '0')
-      return {
-        ok: true as const,
-        status: 201,
-        payload: {
-          version: 1 as const,
-          lease_id: `apl-agent-edit-${leaseSequence}`,
-          effective_mode: 'full' as const,
-          launch_url: `http://p-${token}.localhost:48721/index.html`,
-          entrypoint: 'index.html',
-          expires_at: '2099-01-01T00:00:00Z',
-          preview_origin: `http://p-${token}.localhost:48721`,
-          idle_timeout_seconds: 28_800,
-          source: {
-            kind: 'single_file' as const,
-            collection_status: 'not_applicable' as const,
-            file_count: 1,
-            total_bytes: 128,
-            warning_codes: [],
-          },
-        },
-      }
-    })
-    const createSurface = vi.fn()
-      .mockResolvedValueOnce({
-        ok: false as const,
-        code: 'AGENT_EDIT_IN_PROGRESS',
-        message: 'agent edit owns this surface',
-        retryable: true,
-      })
-      .mockResolvedValue({ ok: true as const })
-    const revokeLease = vi.fn(async () => ({
-      ok: true as const,
-      status: 204,
-      payload: undefined,
-    }))
-    const nativeApi: NativeWorkbenchApi = {
-      getCapabilities: vi.fn(async () => ({
-        protocolVersions: [4] as Array<4>,
-        modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
-      })),
-      getArtifactAnnotationCapabilities: vi.fn(async () => ({
-        version: 4 as const,
-        available: false,
-        picker: false,
-        trustedOverlay: false,
-        overlayCopyVersion: 1 as const,
-      })),
-      createArtifactPreviewLease: createLease,
-      renewArtifactPreviewLease: vi.fn(async () => ({
-        ok: true as const,
-        status: 200,
-        payload: {
-          version: 1 as const,
-          lease_id: `apl-agent-edit-${leaseSequence}`,
-          expires_at: '2099-01-01T00:00:00Z',
-        },
-      })),
-      revokeArtifactPreviewLease: revokeLease,
-      createSurface,
-      setSurfaceRect: vi.fn(async () => ({ ok: true as const })),
-      activateSurface: vi.fn(async () => ({ ok: true as const })),
-      destroySurface: vi.fn(async () => ({ ok: true as const })),
-      onSurfaceEvent: vi.fn(() => () => undefined),
-    }
-    let refreshAttempt = 0
-    let staleSnapshot = false
-    const loadDocument = vi.fn(async () => {
-      refreshAttempt += 1
-      if (refreshAttempt === 1) {
-        // The document store preserves the previous head when its first
-        // release-triggered refresh races state propagation.
-        staleSnapshot = true
-        return
-      }
-      staleSnapshot = false
-      workspace.document.headRevisionId = revision2.revisionId
-      workspace.revisions = [revision1, revision2]
-      workspace.headArtifact = {
-        ...workspace.headArtifact,
-        id: revision2.artifactId,
-      }
-    })
-    const renderState: Record<string, unknown> = {}
-    const reportError = vi.fn()
-    const item = createArtifactPreviewWorkbenchItem({
-      artifact,
-      nativeHtml: true,
-      sessionKey: 'session-a',
-    })
-    const definition = createArtifactWorkbenchDefinitions({
-      artifactDocuments: {
-        load: loadDocument,
-        snapshot: vi.fn(() => ({
-          key: 'fixture',
-          loading: false,
-          loaded: true,
-          stale: staleSnapshot,
-          error: null,
-          workspace,
-        })),
-        headArtifact: vi.fn(() => workspace.headArtifact),
-      },
-      authToken: () => 'synthetic-token',
-      baseOrigin: 'http://127.0.0.1:18791',
-      confirmRemoteResources: vi.fn(async () => true),
-      currentSessionId: () => 'session-a',
-      platform: {
-        id: 'desktop',
-        capabilities: { canOpenArtifactsNatively: true },
-        files: {},
-      } as unknown as Platform,
-      previewLeasesEnabled: true,
-      pushToast: vi.fn(),
-      t: key => key,
-    }).find(candidate => candidate.kind === 'artifact-preview')!
-    const runtime = await definition.createRuntime!(item, {
-      nativeWorkbenchApi: nativeApi,
-      getRenderState: () => renderState,
-      updateRenderState: patch => Object.assign(renderState, patch),
-      isItemOpen: () => true,
-      setExpanded: vi.fn(),
-      reportError,
-    })
-
-    expect(renderState).toMatchObject({
-      agentEditInProgress: true,
-      previewBlocked: true,
-      previewLeaseError: '',
-    })
-    expect(reportError).not.toHaveBeenCalled()
-    expect(revokeLease).toHaveBeenCalledWith(expect.objectContaining({
-      leaseId: 'apl-agent-edit-1',
-      scopeId: 'session-a',
-    }))
-
-    await runtime.handleNativeSurfaceEvent?.({
-      version: 4,
-      surfaceId: item.id,
-      type: 'agent-edit-released',
-    }, item)
-
-    expect(loadDocument).toHaveBeenCalledTimes(2)
-    expect(loadDocument).toHaveBeenLastCalledWith(
-      artifact,
-      'session-a',
-      { force: true },
-    )
-    expect(createLease).toHaveBeenCalledTimes(2)
-    expect(createSurface).toHaveBeenCalledTimes(2)
-    expect(renderState.agentEditInProgress).toBe(false)
-    expect(reportError).not.toHaveBeenCalled()
     await runtime.dispose?.('closed')
   })
 
@@ -2970,7 +3033,6 @@ describe('artifact Workbench provider', () => {
         discard: vi.fn(async () => true),
         setActiveDocument: vi.fn(),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -3002,7 +3064,7 @@ describe('artifact Workbench provider', () => {
       height: 500,
       visible: true,
     }, item)
-    expect(renderState.annotationAvailable).toBe(false)
+    expect(renderState.annotationAvailable).toBe(true)
     workspace.document.capabilities.promptAnnotations = true
     workspace.document.capabilities.manualEdit = true
     workspace.document.capabilities.selectionContext = true
@@ -3133,7 +3195,7 @@ describe('artifact Workbench provider', () => {
       annotationId: string
       sessionKey: string
       documentId: string
-      revisionId: string
+      selection: { targetRef: string; resourceId?: string; locatorHint?: string }
     }) => {
       if (rejectNextCreate) {
         const error = rejectNextCreate
@@ -3153,7 +3215,9 @@ describe('artifact Workbench provider', () => {
         sessionEpoch: null,
         documentId: request.documentId,
         documentName: 'preview.html',
-        revisionId: request.revisionId,
+        targetRef: request.selection.targetRef,
+        resourceId: request.selection.resourceId,
+        locatorHint: request.selection.locatorHint,
         generation: 1,
         anchorId: 'anchor-1',
         body: '',
@@ -3244,16 +3308,7 @@ describe('artifact Workbench provider', () => {
           resolveDeferredScreenshot = resolve
         })
       }
-      return {
-        ok: true as const,
-        method: 'screenshot' as const,
-        value: {
-          mime: 'image/png' as const,
-          data: new Uint8Array([137, 80, 78, 71]),
-          width: 320,
-          height: 180,
-        },
-      }
+      return { targetRef: 'target-1', mimeType: 'image/png' as const, dataBase64: 'iVBORw==', width: 320, height: 180 }
     })
     const createScreenshotUrl = vi.spyOn(URL, 'createObjectURL')
       .mockReturnValue('blob:frozen-annotation-preview')
@@ -3335,7 +3390,7 @@ describe('artifact Workbench provider', () => {
       setArtifactAnnotationMode: setMode,
       showArtifactAnnotationOverlay: showOverlay,
       closeArtifactAnnotationOverlay: closeOverlay,
-      screenshot,
+      captureWorkbenchScreenshot: screenshot,
       createArtifactPreviewLease: vi.fn(async () => ({
         ok: true as const,
         status: 201,
@@ -3385,7 +3440,6 @@ describe('artifact Workbench provider', () => {
         releaseOverlayEdit,
         setActiveDocument,
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
@@ -3407,7 +3461,7 @@ describe('artifact Workbench provider', () => {
       reportError: vi.fn(),
     })
 
-    expect(renderState.annotationAvailable).toBe(false)
+    expect(renderState.annotationAvailable).toBe(true)
     workspace.document.capabilities.promptAnnotations = true
     workspace.document.capabilities.manualEdit = true
     workspace.document.capabilities.selectionContext = true
@@ -3433,21 +3487,19 @@ describe('artifact Workbench provider', () => {
           selectionId: 'selection-1',
           tagName: 'button',
           elementPath: '[["","button",1]]',
-          elementProofSha256: 'b'.repeat(64),
-          domSha256: 'a'.repeat(64),
+          targetRef: 'target-1', locatorHint: 'button',
           rect: { x: 1, y: 2, width: 30, height: 20 },
         },
       },
     }, item)
     expect(createAnnotation).toHaveBeenCalledWith(expect.objectContaining({
       documentId: 'document-1',
-      revisionId: 'revision-1',
+      resourceId: 'document:document-1',
       selection: {
         selectionId: 'selection-1',
         tagName: 'button',
         elementPath: '[["","button",1]]',
-        elementProofSha256: 'b'.repeat(64),
-        domSha256: 'a'.repeat(64),
+        targetRef: 'target-1', locatorHint: 'button',
       },
     }))
     expect(showOverlay).toHaveBeenCalledWith(expect.objectContaining({
@@ -3459,7 +3511,7 @@ describe('artifact Workbench provider', () => {
     // before the create RPC can resolve it.
     expect(setMode).toHaveBeenCalledTimes(1)
     expect(setMode).not.toHaveBeenCalledWith(expect.objectContaining({ enabled: false }))
-    expect(screenshot).toHaveBeenCalledWith({ version: 3 })
+    expect(screenshot).toHaveBeenCalledWith({ surfaceId: item.id, targetRef: 'target-1' })
     expect(screenshot.mock.invocationCallOrder[0]).toBeLessThan(
       showOverlay.mock.invocationCallOrder[0]!,
     )
@@ -3585,15 +3637,12 @@ describe('artifact Workbench provider', () => {
     expect(completeOverlayEdit).toHaveBeenCalledWith(annotationId)
     expect(releaseOverlayEdit).toHaveBeenCalledWith(annotationId)
 
-    // A typed, recoverable selection rejection stays visible and actionable;
-    // it must not open an editor or silently release the rearmed one-shot mode.
+    // A local storage failure stays visible and actionable without opening
+    // an editor or silently releasing the rearmed one-shot mode.
     expect(renderState.annotationMode).toBe(true)
     const createCountBeforeChangedSelection = createAnnotation.mock.calls.length
     const rearmCountBeforeChangedSelection = setMode.mock.calls.length
-    rejectNextCreate = Object.assign(new Error('selected element changed'), {
-      code: 'DOCUMENT_CHANGED',
-      accepted: false,
-    })
+    rejectNextCreate = new Error('synthetic local storage failure')
     await runtime.handleNativeSurfaceEvent?.({
       version: 3,
       surfaceId: item.id,
@@ -3603,8 +3652,7 @@ describe('artifact Workbench provider', () => {
           selectionId: 'selection-dynamic-unrelated',
           tagName: 'button',
           elementPath: '[["","button",1]]',
-          elementProofSha256: 'c'.repeat(64),
-          domSha256: 'f'.repeat(64),
+          targetRef: 'target-1', locatorHint: 'button',
           rect: { x: 2, y: 3, width: 31, height: 21 },
         },
       },
@@ -3614,13 +3662,10 @@ describe('artifact Workbench provider', () => {
     expect(renderState.annotationFallback).toBeNull()
     expect(renderState.annotationMode).toBe(true)
     expect(pushToast).toHaveBeenCalledWith(
-      'workbench.artifactAnnotation.elementChanged',
-      { tone: 'warn', duration: 12_000 },
-    )
-    expect(pushToast).not.toHaveBeenCalledWith(
       'workbench.artifactAnnotation.createFailed',
-      expect.anything(),
+      { tone: 'danger', duration: 9000 },
     )
+    expect(JSON.stringify(pushToast.mock.calls)).not.toContain('synthetic local storage failure')
     expect(setMode).toHaveBeenCalledTimes(rearmCountBeforeChangedSelection + 1)
     expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([
       true,
@@ -3629,8 +3674,8 @@ describe('artifact Workbench provider', () => {
       true,
     ])
 
-    // The recovered picker accepts a local proof after unrelated runtime DOM
-    // changes, without a whole-DOM hash or an extra toolbar toggle.
+    // The recovered picker accepts another ordinary page selection without
+    // requiring an extra toolbar toggle.
     const rearmCountBeforeRecoveredSelection = setMode.mock.calls.length
     await runtime.handleNativeSurfaceEvent?.({
       version: 3,
@@ -3641,7 +3686,7 @@ describe('artifact Workbench provider', () => {
           selectionId: 'selection-2',
           tagName: 'p',
           elementPath: '[["","p",1]]',
-          elementProofSha256: 'd'.repeat(64),
+          targetRef: 'target-1', locatorHint: 'button',
           rect: { x: 4, y: 5, width: 32, height: 22 },
         },
       },
@@ -3652,7 +3697,7 @@ describe('artifact Workbench provider', () => {
         selectionId: 'selection-2',
         tagName: 'p',
         elementPath: '[["","p",1]]',
-        elementProofSha256: 'd'.repeat(64),
+        targetRef: 'target-1', locatorHint: 'button',
       },
     }))
     expect(showOverlay).toHaveBeenCalledTimes(2)
@@ -3724,7 +3769,7 @@ describe('artifact Workbench provider', () => {
       pressed: true,
     })
 
-    const lateSelection = (selectionId: string, proof: string) => ({
+    const lateSelection = (selectionId: string, _proof: string) => ({
       version: 3 as const,
       surfaceId: item.id,
       type: 'annotation-selected' as const,
@@ -3733,7 +3778,7 @@ describe('artifact Workbench provider', () => {
           selectionId,
           tagName: 'section',
           elementPath: '[["","section",1]]',
-          elementProofSha256: proof.repeat(64),
+          targetRef: 'target-1', locatorHint: 'section',
           rect: { x: 8, y: 9, width: 40, height: 24 },
         },
       },
@@ -4061,28 +4106,8 @@ describe('artifact Workbench provider', () => {
     expect(discardAnnotation).toHaveBeenCalledTimes(discardCountBeforeCloseRetry + 1)
     expect(renderState.annotationFallback).toBeNull()
 
-    // If neither create nor the authoritative draft refetch can establish the
-    // outcome, keep the one-shot picker suspended. Rearming here would mint a
-    // stream of new IDs while the original durable draft may already exist.
-    rejectNextCreate = Object.assign(new Error('create outcome is unknown'), {
-      code: 'ARTIFACT_ANNOTATION_CREATE_AMBIGUOUS',
-    })
-    const setModeCountBeforeAmbiguousCreate = setMode.mock.calls.length
-    const discardCountBeforeAmbiguousCreate = discardAnnotation.mock.calls.length
-    await runtime.handleNativeSurfaceEvent?.(
-      lateSelection('selection-ambiguous-create', '8'),
-      item,
-    )
-    expect(setMode).toHaveBeenCalledTimes(setModeCountBeforeAmbiguousCreate)
-    expect(discardAnnotation).toHaveBeenCalledTimes(discardCountBeforeAmbiguousCreate)
-    expect(renderState.annotationFallback).toBeNull()
-    expect(renderState.annotationMode).toBe(true)
-
-    // Once the Gateway has accepted the prompt annotations, the renderer must
-    // release the native picker instead of leaving the toolbar visibly pressed.
-    // A slower rearm from the just-closed element editor must not resurrect the
-    // mode after that newer accepted-send intent wins.
-    await runtime.performAction?.('toggle-annotation-mode', item)
+    // A new selection still uses the existing bounded native renderer recovery.
+    if (renderState.annotationMode) await runtime.performAction?.('toggle-annotation-mode', item)
     await runtime.performAction?.('toggle-annotation-mode', item)
     const overlayCallsBeforeRendererRecovery = showOverlay.mock.calls.length
     const fallbackToastsBeforeRendererRecovery = pushToast.mock.calls.filter(
@@ -4119,8 +4144,8 @@ describe('artifact Workbench provider', () => {
     }, item)
     await vi.waitFor(() => expect(resolveDeferredModeEnable).toBeTypeOf('function'))
     await runtime.handleComponentEvent?.({
-      type: 'artifact-prompt-annotations-accepted',
-      payload: { acceptedIds: ['annotation-accepted'] },
+      type: 'page-annotations-sent',
+      payload: { draftIds: ['annotation-accepted'] },
     }, item)
     finishDeferredModeEnable()
     await pendingAcceptedSubmit
@@ -4137,4 +4162,236 @@ describe('artifact Workbench provider', () => {
     revokeScreenshotUrl.mockRestore()
   })
 
+})
+
+async function createWorkingHeadRuntime(workingDocumentId?: string) {
+  const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
+  const revision1 = {
+    ...legacy.revisions[0]!, documentId: 'document-1', revisionId: 'revision-1',
+    artifactId: String(artifact.id), generation: 1,
+  }
+  const workspace = {
+    ...legacy, source: 'document-api' as const,
+    document: { ...legacy.document, documentId: 'document-1', headRevisionId: 'revision-1' },
+    revisions: [revision1], headArtifact: { ...artifact },
+  }
+  let sequence = 0
+  let visible = false
+  const navigateSurface = vi.fn(async (): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
+  const createLease = vi.fn(async () => {
+    sequence += 1
+    const origin = `http://p-${String(sequence).padStart(32, '0')}.localhost:48721`
+    return {
+      ok: true as const, status: 201,
+      payload: {
+        version: 1 as const, lease_id: `apl-working-${sequence}`,
+        effective_mode: 'full' as const, launch_url: `${origin}/index.html`,
+        entrypoint: 'index.html', expires_at: '2099-01-01T00:00:00Z',
+        preview_origin: origin, idle_timeout_seconds: 28_800,
+        source: { kind: 'single_file' as const, collection_status: 'not_applicable' as const,
+          file_count: 1, total_bytes: 128, warning_codes: [] },
+        ...(workingDocumentId ? { workingDocumentId } : {}),
+      },
+    }
+  })
+  const createSurface = vi.fn(async () => {
+    visible = false
+    return { ok: true as const, surfaceInstanceId: `instance-${sequence}` }
+  })
+  const destroySurface = vi.fn(async () => { visible = false; return { ok: true as const } })
+  const revokeLease = vi.fn(async () => ({ ok: true as const, status: 204, payload: undefined }))
+  const nativeApi: NativeWorkbenchApi = {
+    getCapabilities: vi.fn(async () => ({ protocolVersions: [4] as Array<4>,
+      modes: ['full', 'offline'] as Array<'full' | 'offline'>, maxSurfaces: 8 })),
+    createArtifactPreviewLease: createLease,
+    renewArtifactPreviewLease: vi.fn(async () => ({ ok: true as const, status: 200,
+      payload: { version: 1 as const, lease_id: `apl-working-${sequence}`, expires_at: '2099-01-01T00:00:00Z' } })),
+    revokeArtifactPreviewLease: revokeLease,
+    createSurface, destroySurface, navigateSurface,
+    setSurfaceRect: vi.fn(async rect => {
+      visible = rect.visible && rect.width > 0 && rect.height > 0
+      return { ok: true as const }
+    }),
+    activateSurface: vi.fn(async () => ({ ok: true as const })),
+    onSurfaceEvent: vi.fn(() => () => undefined),
+  }
+  const state: Record<string, unknown> = {}
+  const reportError = vi.fn()
+  const item = createArtifactPreviewWorkbenchItem({ artifact, nativeHtml: true,
+    sessionKey: 'session-a', resourceIdentity: 'document:document-1' })
+  const definition = createArtifactWorkbenchDefinitions({
+    artifactDocuments: {
+      load: vi.fn(async () => undefined),
+      snapshot: () => ({ key: 'test', loading: false, loaded: true, stale: false, error: null, workspace }),
+      headArtifact: () => workspace.headArtifact,
+    },
+    baseOrigin: 'http://localhost', confirmRemoteResources: vi.fn(async () => true),
+    currentSessionId: () => 'session-a',
+    platform: { id: 'desktop', capabilities: { canOpenArtifactsNatively: true }, files: {} } as unknown as Platform,
+    previewLeasesEnabled: true, pushToast: vi.fn(), t: key => key,
+  }).find(value => value.kind === 'artifact-preview')!
+  const runtime = await definition.createRuntime!(item, {
+    nativeWorkbenchApi: nativeApi, getRenderState: () => state,
+    updateRenderState: patch => Object.assign(state, patch), isItemOpen: () => true,
+    setExpanded: vi.fn(), reportError,
+  })
+  const rect = { itemId: item.id, x: 300, y: 40, width: 600, height: 500, visible: true }
+  await runtime.handleSurfaceRect?.(rect, item)
+  const headChanged = { type: 'artifact-head-changed', payload: { revisionId: 'revision-2' } }
+  function advance() {
+    workspace.document.headRevisionId = 'revision-2'
+    workspace.revisions.push({ ...revision1, revisionId: 'revision-2', artifactId: 'artifact-2', generation: 2 })
+    workspace.headArtifact = { ...artifact, id: 'artifact-2' }
+  }
+  return { runtime, item, rect, headChanged, advance, createSurface, destroySurface,
+    createLease, revokeLease, navigateSurface, reportError, isVisible: () => visible }
+}
+
+describe('working document preview refresh', () => {
+  it('keeps the current lease and native instance through publish, deduplicates its state event, and refreshes the page', async () => {
+    const h = await createWorkingHeadRuntime('document-1')
+    try {
+      h.advance()
+      await h.runtime.handleComponentEvent?.(h.headChanged, h.item)
+      await h.runtime.handleComponentEvent?.(h.headChanged, h.item)
+      expect(h.destroySurface).not.toHaveBeenCalled()
+      expect(h.createSurface).toHaveBeenCalledTimes(1)
+      expect(h.createLease).toHaveBeenCalledTimes(1)
+      expect(h.revokeLease).not.toHaveBeenCalled()
+      expect(h.navigateSurface).toHaveBeenCalledExactlyOnceWith({ version: 4, surfaceId: h.item.id, action: 'reload' })
+      expect(h.isVisible()).toBe(true)
+      expect(h.reportError).not.toHaveBeenCalled()
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+  it.each([undefined, 'another-document'])('rebuilds a lease without a matching server binding (%s)', async marker => {
+    const h = await createWorkingHeadRuntime(marker)
+    try {
+      h.advance()
+      await h.runtime.handleComponentEvent?.(h.headChanged, h.item)
+      expect(h.destroySurface).toHaveBeenCalledTimes(1)
+      expect(h.createSurface).toHaveBeenCalledTimes(2)
+      expect(h.createLease).toHaveBeenCalledTimes(2)
+      expect(h.navigateSurface).not.toHaveBeenCalled()
+      expect(h.isVisible()).toBe(true)
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+  it('does not activate a hidden working page when its head changes', async () => {
+    const h = await createWorkingHeadRuntime('document-1')
+    try {
+      await h.runtime.handleSurfaceRect?.({ ...h.rect, visible: false }, h.item)
+      h.advance()
+      await h.runtime.handleComponentEvent?.(h.headChanged, h.item)
+      expect(h.isVisible()).toBe(false)
+      expect(h.destroySurface).not.toHaveBeenCalled()
+      await h.runtime.handleSurfaceRect?.(h.rect, h.item)
+      expect(h.isVisible()).toBe(true)
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+  it('honors the latest visible geometry after a required replacement', async () => {
+    const h = await createWorkingHeadRuntime()
+    try {
+      await h.runtime.handleSurfaceRect?.({ ...h.rect, width: 0, height: 0, visible: false }, h.item)
+      h.advance()
+      await h.runtime.handleComponentEvent?.(h.headChanged, h.item)
+      expect(h.isVisible()).toBe(false)
+      await h.runtime.handleSurfaceRect?.({ ...h.rect, width: 720 }, h.item)
+      expect(h.isVisible()).toBe(true)
+      expect(h.createSurface).toHaveBeenCalledTimes(2)
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+  it('surfaces a rejected refresh without destroying or silently replacing the target', async () => {
+    const h = await createWorkingHeadRuntime('document-1')
+    try {
+      h.advance()
+      h.navigateSurface.mockResolvedValueOnce({ ok: false, message: 'The native Workbench surface renderer crashed.' })
+      await expect(h.runtime.handleComponentEvent?.(h.headChanged, h.item)).rejects.toThrow('Failed to refresh the working preview')
+      expect(h.destroySurface).not.toHaveBeenCalled()
+      expect(h.createSurface).toHaveBeenCalledTimes(1)
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+})
+
+describe('working preview annotation after native reload', () => {
+  it('waits for native readiness before rearming and accepts a fresh selection', async () => {
+    const h = await createAnnotationDraftHarness({ ok: true }, false, 'document-1')
+    await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id,
+      type: 'annotation-submit', detail: { annotationId: h.annotationId, body: 'Keep this draft.' },
+    }, h.item)
+    h.setAnnotationMode.mockClear()
+    await h.runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, h.item)
+    expect(h.nativeApi.navigateSurface).toHaveBeenCalledWith({ version: 3, surfaceId: h.item.id, action: 'reload' })
+    expect(h.destroySurface).not.toHaveBeenCalled()
+    expect(h.renderState.annotationAvailable).toBe(false)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    const selection = { version: 3 as const, surfaceId: h.item.id, type: 'annotation-selected' as const,
+      detail: { selection: { selectionId: 'selection-after-reload', targetRef: 'target-focused',
+        tagName: 'h1', elementPath: '[["","h1",1]]', locatorHint: 'h1', selectionText: 'New heading',
+        rect: { x: 1, y: 2, width: 120, height: 30 } } } }
+    await h.runtime.handleNativeSurfaceEvent?.(selection, h.item)
+    expect(h.createAnnotation).toHaveBeenCalledTimes(1)
+    await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id, type: 'loading' }, h.item)
+    await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id, type: 'ready' }, h.item)
+    expect(h.setAnnotationMode).toHaveBeenCalledOnce()
+    expect(h.setAnnotationMode).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }))
+    expect(h.renderState.annotationAvailable).toBe(true)
+    await h.runtime.handleNativeSurfaceEvent?.(selection, h.item)
+    expect(h.createAnnotation).toHaveBeenCalledTimes(2)
+    expect(h.createAnnotation.mock.calls[1]?.[0].selection).toMatchObject({ selectionId: 'selection-after-reload', locatorHint: 'h1' })
+    expect(h.showOverlay.mock.calls[1]?.[0].annotationId).not.toBe(h.annotationId)
+    expect(h.discardAnnotation).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('retains the interrupted draft without selecting the reloaded page behind it', async () => {
+    const h = await createAnnotationDraftHarness({ ok: true }, false, 'document-1')
+    vi.mocked(h.nativeApi.getArtifactAnnotationCapabilities!).mockImplementation(async () => ({
+      version: 3 as const,
+      available: !h.renderState.annotationFallback,
+      picker: !h.renderState.annotationFallback,
+      trustedOverlay: true,
+    }))
+    await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id,
+      type: 'annotation-draft-change', detail: { annotationId: h.annotationId, body: 'Original element draft.' },
+    }, h.item)
+    await h.runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, h.item)
+    await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id,
+      type: 'annotation-cancel', detail: { annotationId: h.annotationId, reason: 'surface-navigation' },
+    }, h.item)
+    h.setAnnotationMode.mockClear()
+    await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id, type: 'loading' }, h.item)
+    await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id, type: 'ready' }, h.item)
+    expect(h.renderState.annotationFallback).toMatchObject({ annotationId: h.annotationId, body: 'Original element draft.' })
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    expect(h.createAnnotation).toHaveBeenCalledOnce()
+    expect(h.discardAnnotation).not.toHaveBeenCalled()
+    expect(h.setSurfaceRect).toHaveBeenLastCalledWith(expect.objectContaining({ visible: false }))
+    await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id,
+      type: 'annotation-submit', detail: { annotationId: h.annotationId, body: 'Original element draft.' },
+    }, h.item)
+    expect(h.renderState.annotationFallback).toBeNull()
+    expect(h.completeOverlayEdit).toHaveBeenCalledWith(h.annotationId)
+    expect(h.setAnnotationMode).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }))
+    expect(h.createAnnotation).toHaveBeenCalledOnce()
+    expect(h.setSurfaceRect).toHaveBeenLastCalledWith(expect.objectContaining({ visible: true }))
+    await h.runtime.dispose?.('closed')
+  })
+})
+
+it('keeps pending annotation rearm when the same working head is delivered during native reload', async () => {
+  const h = await createAnnotationDraftHarness({ ok: true }, false, 'document-1')
+  await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id,
+    type: 'annotation-submit', detail: { annotationId: h.annotationId, body: 'Keep this draft.' },
+  }, h.item)
+  h.advanceHead()
+  const head = { type: 'artifact-head-changed', payload: { revisionId: 'revision-2' } }
+  await h.runtime.handleComponentEvent?.(head, h.item)
+  await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id, type: 'loading' }, h.item)
+  h.setAnnotationMode.mockClear()
+  await h.runtime.handleComponentEvent?.(head, h.item)
+  await h.runtime.handleNativeSurfaceEvent?.({ version: 3, surfaceId: h.item.id, type: 'ready' }, h.item)
+  expect(h.nativeApi.navigateSurface).toHaveBeenCalledOnce()
+  expect(h.setAnnotationMode).toHaveBeenCalledOnce()
+  expect(h.setAnnotationMode).toHaveBeenCalledWith(expect.objectContaining({ enabled: true }))
+  expect(h.destroySurface).not.toHaveBeenCalled()
+  await h.runtime.dispose?.('closed')
 })

@@ -198,6 +198,10 @@ class SessionNode(SQLModel, table=True):
     # and continue to resolve the Agent/default OpenSquilla workspace.
     workspace_id: str | None = Field(default=None, index=True)
 
+    # Backend-owned execution root for new ordinary tasks. NULL is the legacy
+    # path-resolution contract, not a request to allocate a new directory.
+    execution_workspace: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+
     # Agent id for multi-agent support
     agent_id: str = "main"
 
@@ -227,6 +231,11 @@ class TranscriptEntry(SQLModel, table=True):
     tool_calls: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
     tool_call_id: str | None = None
     reasoning_content: str | None = None
+    # Accepted provider messages, separate from the turn's display aggregates.
+    # None identifies legacy rows whose original message boundaries are unknown.
+    assistant_replay: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON), repr=False
+    )
     turn_usage: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     # Gateway-owned causal identity shared by every durable row in one turn.
     # Additive JSON keeps older readers and pre-identity transcript rows valid.
@@ -401,7 +410,6 @@ class SessionSummary(SQLModel, table=True):
     removed_count: int = 0
     kept_count: int = 0
     chunk_count: int = 0
-    flush_receipt_status: str = "unknown"
     # The transcript entry id up to which this summary covers (inclusive)
     covered_through_id: int = 0
     created_at: int = Field(default_factory=_now_ms)
@@ -435,7 +443,7 @@ class SessionContextState(SQLModel, table=True):
 
 
 class MemoryDurableReceipt(SQLModel, table=True):
-    """Durable ledger row for memory checkpoint and flush outcomes."""
+    """Durable ledger row for deterministic memory checkpoint outcomes."""
 
     __tablename__ = "memory_durable_receipts"
 
@@ -445,7 +453,6 @@ class MemoryDurableReceipt(SQLModel, table=True):
     turn_id: str | None = Field(default=None, index=True)
     scope: str = Field(index=True)
     source_path: str | None = None
-    target_path: str | None = None
     content_hash: str | None = None
     coverage_turn_id: str | None = Field(default=None, index=True)
     coverage_hash: str | None = Field(default=None, index=True)
@@ -453,8 +460,6 @@ class MemoryDurableReceipt(SQLModel, table=True):
     idempotency_key: str = Field(index=True, unique=True)
     status: str = Field(index=True)
     reason: str | None = None
-    attempt_count: int = 0
-    next_retry_at_ms: int | None = None
     created_at: int = Field(default_factory=_now_ms)
     updated_at: int = Field(default_factory=_now_ms)
     schema_version: int = 1

@@ -17,25 +17,17 @@ from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from opensquilla.cli.url_utils import normalize_gateway_url
-from opensquilla.paths import default_opensquilla_home, state_dir
+from opensquilla.paths import (
+    default_opensquilla_home,
+    desktop_profile_lifecycle_active,
+    state_dir,
+)
 
 UNMANAGED_GATEWAY_RUNNING = "UNMANAGED_GATEWAY_RUNNING"
 MANAGED_GATEWAY_TARGET_MISMATCH = "MANAGED_GATEWAY_TARGET_MISMATCH"
 REMOTE_GATEWAY_UNAVAILABLE = "REMOTE_GATEWAY_UNAVAILABLE"
 DESKTOP_PROFILE_RECOVERY_REQUIRED = "DESKTOP_PROFILE_RECOVERY_REQUIRED"
 DESKTOP_CONFIG_OUTSIDE_PROFILE = "desktop_config_outside_profile"
-
-_DESKTOP_PROFILE_KINDS = frozenset({"desktop-primary", "desktop-recovery"})
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
-
-def desktop_profile_lifecycle_active() -> bool:
-    """Return whether lifecycle bookkeeping belongs to a Desktop profile."""
-
-    profile_kind = os.environ.get("OPENSQUILLA_PROFILE_KIND", "").strip().lower()
-    if profile_kind:
-        return profile_kind in _DESKTOP_PROFILE_KINDS
-    return os.environ.get("OPENSQUILLA_DESKTOP", "").strip().lower() in _TRUTHY
 
 
 def desktop_config_path_is_profile_local(config_path: str | None = None) -> bool:

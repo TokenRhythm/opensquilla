@@ -170,14 +170,19 @@ async def test_polling_fallback_invalidates_nested_changes(
     )
     watcher = watcher_module.SkillCatalogWatcher(loader, poll_interval=0.01)
     await watcher.start()
-    await asyncio.sleep(0.03)
-    (skill_dir / "nested").mkdir()
-    (skill_dir / "nested" / ".hidden").write_text("changed", encoding="utf-8")
-    for _ in range(20):
-        if changes:
-            break
-        await asyncio.sleep(0.01)
-    await watcher.stop()
+    try:
+        # start() schedules the initial scan; wait for its baseline before
+        # mutating the tree so a slow worker cannot absorb the change into it.
+        async with asyncio.timeout(5):
+            while watcher._poll_signature is None:
+                await asyncio.sleep(0.01)
+        (skill_dir / "nested").mkdir()
+        (skill_dir / "nested" / ".hidden").write_text("changed", encoding="utf-8")
+        async with asyncio.timeout(5):
+            while "poll" not in changes:
+                await asyncio.sleep(0.01)
+    finally:
+        await watcher.stop()
 
     assert watcher.task is None
     assert "poll" in changes

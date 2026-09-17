@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 
 from opensquilla.cli.agent_cmd import (
     AgentRunResult,
+    _standalone_session_owner_kwargs,
     _to_benchmark_transcript,
     run_agent_command,
     run_agent_once,
@@ -33,7 +34,8 @@ from opensquilla.project_workspaces import (
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import SessionIntent
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 from opensquilla.tools.types import CallerKind, InteractionMode
 
 
@@ -58,7 +60,6 @@ class _FakeServices:
         self.memory_sync_managers = {"main": object()}
         self.memory_retrievers = {"main": object()}
         self.turn_capture_services = {"main": object()}
-        self.flush_service = object()
         self.model_catalog = object()
         self.provider_selector = object()
         self.tool_registry = None
@@ -69,6 +70,63 @@ class _FakeServices:
 
     async def close(self) -> None:
         return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_workspace", [False, True])
+async def test_cli_new_sessions_keep_the_effective_startup_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_workspace: bool
+) -> None:
+    from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.config.default_opensquilla_home", lambda: tmp_path / "profile"
+    )
+    config = GatewayConfig.load(tmp_path / "config.toml", read_only=True)
+    selected = tmp_path / "selected" if explicit_workspace else Path(config.workspace_dir)
+    selected.mkdir(parents=True)
+    storage = await SessionStorage.open(str(tmp_path / "cli-workspace.db"))
+    contexts: list[Any] = []
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self, message: str, session_key: str, *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            contexts.append(kwargs["tool_context"])
+            yield DoneEvent(text="ok")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        manager = SessionManager(
+            storage,
+            execution_workspace_factory=build_execution_workspace_factory(
+                config, profile_home=tmp_path,
+            ),
+        )
+        return _FakeServices(config, manager)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    try:
+        for suffix in ("first", "second"):
+            key = f"agent:main:cli-workspace:{suffix}"
+            await run_agent_once(
+                message="pwd", session_id=key, config=config,
+                workspace=str(selected) if explicit_workspace else None,
+            )
+            session = await storage.get_session(key)
+            assert session.execution_workspace["kind"] == "configured"
+            assert session.execution_workspace["root"] == str(selected.resolve())
+    finally:
+        await storage.close()
+
+    assert [ctx.workspace_dir for ctx in contexts] == [str(selected.resolve())] * 2
+    assert config.workspace_dir_source == "default"
 
 
 def test_benchmark_transcript_preserves_tool_result_execution_status() -> None:
@@ -210,6 +268,278 @@ async def test_run_agent_once_uses_agent_registry_model_when_model_not_explicit(
     assert captured["runner_config_model"] == "agent/default"
     assert captured["run_model"] == "agent/default"
     assert captured["tool_context"].workspace_dir == str(agent_workspace)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_once_fences_reset_owner_across_cli_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cli-owner.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    key = "agent:main:cli-owner"
+    admitted = await manager.create(key)
+    append_calls: list[dict[str, Any]] = []
+    run_call: dict[str, Any] = {}
+    route_call: dict[str, Any] = {}
+    replacement = None
+    original_append = manager.append_message
+
+    async def recording_append(
+        session_key: str,
+        role: str,
+        content: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        owner = {
+            "expected_session_id": expected_session_id,
+            "expected_session_epoch": expected_session_epoch,
+        }
+        append_calls.append({**kwargs, **owner})
+        return await original_append(
+            session_key,
+            role,
+            content,
+            **kwargs,
+            **owner,
+        )
+
+    manager.append_message = recording_append  # type: ignore[method-assign]
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            return None
+
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            nonlocal replacement
+            run_call.update(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
+            replacement, rotated = await manager.apply_intent(
+                key,
+                SessionIntent.RESET_SAME_KEY,
+            )
+            assert rotated is True
+            await manager.append_message(
+                key,
+                role="assistant",
+                content="late answer",
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            yield DoneEvent(text="unreachable")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, manager)
+
+    from opensquilla.gateway.routing import build_cli_route_envelope
+
+    def recording_route(**kwargs: Any) -> Any:
+        route_call.update(kwargs)
+        return build_cli_route_envelope(**kwargs)
+
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.routing.build_cli_route_envelope",
+        recording_route,
+    )
+    try:
+        with pytest.raises(StaleEpochError, match="owner mismatch"):
+            await run_agent_once(message="hello", session_id=key, config=GatewayConfig())
+        current = await manager.get_session(key)
+        transcript = await manager.get_transcript(key)
+    finally:
+        await storage.close()
+
+    owner = {
+        "expected_session_id": admitted.session_id,
+        "expected_session_epoch": int(admitted.epoch or 0),
+    }
+    assert {name: append_calls[0][name] for name in owner} == owner
+    assert {name: run_call[name] for name in owner} == owner
+    assert route_call["session_id"] == admitted.session_id
+    assert route_call["session_epoch"] == int(admitted.epoch or 0)
+    assert replacement is not None
+    assert current is not None
+    assert current.session_id == replacement.session_id
+    assert transcript == []
+
+
+@pytest.mark.asyncio
+async def test_agent_owner_guard_rejects_kwargs_only_durable_writer(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cli-dropping-writer.db"))
+    key = "agent:main:cli-dropping-writer"
+    await SessionManager(storage, inject_time_prefix=False).create(key)
+    append_calls: list[dict[str, Any]] = []
+
+    class DroppingWriter:
+        _storage = storage
+
+        async def append_message(self, *args: Any, **kwargs: Any) -> None:
+            append_calls.append(dict(kwargs))
+
+    class ExactRunner:
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            yield DoneEvent(text="unreachable")
+
+    try:
+        with pytest.raises(RuntimeError, match="writer cannot enforce"):
+            await _standalone_session_owner_kwargs(
+                DroppingWriter(),
+                ExactRunner(),
+                key,
+            )
+    finally:
+        await storage.close()
+
+    assert append_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_export_rejects_kwargs_only_durable_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cli-dropping-reader.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    key = "agent:main:cli-dropping-reader"
+    await manager.create(key)
+    read_calls: list[dict[str, Any]] = []
+    run_calls: list[dict[str, Any]] = []
+
+    async def dropping_reader(*args: Any, **kwargs: Any) -> list[Any]:
+        read_calls.append(dict(kwargs))
+        return []
+
+    manager.get_transcript = dropping_reader  # type: ignore[method-assign]
+
+    class ExactRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            return None
+
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            run_calls.append(kwargs)
+            yield DoneEvent(text="unreachable")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, manager)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", ExactRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    try:
+        with pytest.raises(RuntimeError, match="reader cannot enforce"):
+            await run_agent_once(
+                message="hello",
+                session_id=key,
+                transcript_path=str(tmp_path / "transcript.jsonl"),
+                config=GatewayConfig(),
+            )
+    finally:
+        await storage.close()
+
+    assert read_calls == []
+    assert run_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_transcript_export_rejects_owner_reset_after_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cli-export-owner.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    key = "agent:main:cli-export-owner"
+    admitted = await manager.create(key)
+    export_path = tmp_path / "transcript.jsonl"
+    replacement = None
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            return None
+
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            nonlocal replacement
+            assert expected_session_id == admitted.session_id
+            assert expected_session_epoch == int(admitted.epoch or 0)
+            yield DoneEvent(text="owner-a")
+            replacement, rotated = await manager.apply_intent(
+                key,
+                SessionIntent.RESET_SAME_KEY,
+            )
+            assert rotated is True
+            await manager.append_message(
+                key,
+                role="assistant",
+                content="owner-b",
+                expected_session_id=replacement.session_id,
+                expected_session_epoch=int(replacement.epoch or 0),
+            )
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, manager)
+
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    try:
+        with pytest.raises(StaleEpochError, match="owner changed before transcript read"):
+            await run_agent_once(
+                message="hello",
+                session_id=key,
+                transcript_path=str(export_path),
+                config=GatewayConfig(),
+            )
+        current = await manager.get_session(key)
+        transcript = await manager.get_transcript(key)
+    finally:
+        await storage.close()
+
+    assert replacement is not None
+    assert current is not None
+    assert current.session_id == replacement.session_id
+    assert [entry.content for entry in transcript] == ["owner-b"]
+    assert not export_path.exists()
 
 
 @pytest.mark.asyncio
@@ -697,8 +1027,22 @@ async def test_run_agent_once_uses_bound_project_workspace_over_tampered_origin(
         def __init__(self, **kwargs: Any) -> None:
             return None
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
-            calls.append(kwargs)
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            calls.append(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             yield DoneEvent(text="ok")
 
     async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
@@ -764,8 +1108,22 @@ async def test_run_agent_once_refreshes_unbound_saved_context_before_config_fall
         def __init__(self, **kwargs: Any) -> None:
             return None
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
-            calls.append(kwargs)
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            calls.append(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             yield DoneEvent(text="ok")
 
     async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
@@ -850,8 +1208,22 @@ async def test_run_agent_once_preserves_saved_mode_over_config_fallback_for_proj
         def __init__(self, **kwargs: Any) -> None:
             return None
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
-            calls.append(kwargs)
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            calls.append(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             yield DoneEvent(text="ok")
 
     async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
@@ -913,9 +1285,24 @@ async def test_run_agent_once_revalidates_bound_project_after_transcript_prepara
     original_append_message = manager.append_message
     retargeted = False
 
-    async def retarget_after_append(*args: Any, **kwargs: Any) -> Any:
+    async def retarget_after_append(
+        session_key: str,
+        role: str,
+        content: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
         nonlocal retargeted
-        entry = await original_append_message(*args, **kwargs)
+        entry = await original_append_message(
+            session_key,
+            role,
+            content,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            **kwargs,
+        )
         if not retargeted:
             retargeted = True
             project_path.rename(tmp_path / "project-old")
@@ -929,8 +1316,22 @@ async def test_run_agent_once_revalidates_bound_project_after_transcript_prepara
         def __init__(self, **kwargs: Any) -> None:
             return None
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
-            calls.append(kwargs)
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            calls.append(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             yield DoneEvent(text="unsafe")
 
     async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
@@ -981,7 +1382,6 @@ async def test_run_agent_once_wires_memory_services_into_turnrunner(
     assert captured["memory_sync_managers"] is services.memory_sync_managers
     assert captured["memory_retrievers"] is services.memory_retrievers
     assert captured["turn_capture_services"] is services.turn_capture_services
-    assert captured["session_flush_service"] is services.flush_service
     assert captured["model_catalog"] is services.model_catalog
 
 
@@ -1196,7 +1596,17 @@ async def test_run_agent_once_resolves_persisted_safe_before_cli_fallback(
         def __init__(self, **kwargs: Any) -> None:
             pass
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            assert expected_session_id is not None
+            assert expected_session_epoch is not None
             captured["tool_context"] = kwargs.get("tool_context")
             yield DoneEvent(text="ok", model=kwargs.get("model") or "")
 
@@ -1295,6 +1705,67 @@ async def test_run_agent_once_can_opt_into_interactive_single_shot(
 
     assert captured["tool_context"].interaction_mode is InteractionMode.INTERACTIVE
     assert captured["bootstrap_context_mode"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_marker", [None, "0", "1"])
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_agent_launch_counts_user_cli_not_internal_coding_child(
+    monkeypatch: pytest.MonkeyPatch, child_marker: str | None, stateless: bool
+) -> None:
+    from opensquilla.telemetry.contracts.common import (
+        ClientEntrypoint,
+        ClientSurface,
+        ExecutionMode,
+    )
+
+    launches: list[dict[str, Any]] = []
+    active: list[dict[str, Any]] = []
+    turns: list[dict[str, Any]] = []
+
+    async def record_launch(**kwargs: Any) -> None:
+        launches.append(kwargs)
+
+    async def record_active(**kwargs: Any) -> None:
+        active.append(kwargs)
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            turns.append(kwargs)
+            yield DoneEvent(text="ok", model="synthetic-model")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        svc = _FakeServices(config)
+        svc.growth_event_sink = SimpleNamespace(
+            record_client_launch=record_launch, record_product_active=record_active,
+        )
+        return svc
+
+    if child_marker is None:
+        monkeypatch.delenv("OPENSQUILLA_CODETASK_CHILD", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_CODETASK_CHILD", child_marker)
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+
+    result = await run_agent_once(
+        message="synthetic task", config=GatewayConfig(), stateless=stateless
+    )
+
+    assert result.status == "ok"
+    expected_launches = [] if child_marker == "1" else [{
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }]
+    assert launches == expected_launches
+    assert active == ([] if child_marker == "1" else [{"surface": ClientSurface.CLI}])
+    assert len(turns) == 1
+    assert turns[0]["telemetry_surface"] is ClientSurface.CLI
+    assert turns[0]["telemetry_execution_mode"] is ExecutionMode.ONE_SHOT
 
 
 @pytest.mark.asyncio

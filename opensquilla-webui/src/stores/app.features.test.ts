@@ -17,7 +17,9 @@ const REQUIRED_V3_METHODS = [
   'setArtifactAnnotationMode',
   'showArtifactAnnotationOverlay',
   'closeArtifactAnnotationOverlay',
-  'screenshot',
+  'getWorkbenchBrowserTarget',
+  'focusWorkbenchAnnotation',
+  'captureWorkbenchScreenshot',
 ] as const
 
 function stubMatchMedia() {

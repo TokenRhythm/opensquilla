@@ -24,7 +24,9 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 TABLES = (
     "sessions",
     "transcript_entries",
+    "compacted_transcript_entries",
     "session_summaries",
+    "memory_durable_receipts",
     "usage_events",
     "usage_event_items",
     "usage_item_billing_receipts",
@@ -150,6 +152,32 @@ CREATE TABLE session_summaries (
     flush_receipt_status TEXT NOT NULL DEFAULT 'unknown',
     covered_through_id INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE compacted_transcript_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    compaction_id TEXT,
+    compaction_index INTEGER,
+    original_entry_id INTEGER,
+    message_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_calls TEXT,
+    tool_call_id TEXT,
+    reasoning_content TEXT,
+    turn_usage TEXT,
+    turn_context TEXT,
+    created_at INTEGER NOT NULL,
+    token_count INTEGER,
+    provenance_kind TEXT,
+    provenance_origin_session_id TEXT,
+    provenance_source_session_key TEXT,
+    provenance_source_channel TEXT,
+    provenance_source_tool TEXT,
+    archived_at INTEGER NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1
 );
 """

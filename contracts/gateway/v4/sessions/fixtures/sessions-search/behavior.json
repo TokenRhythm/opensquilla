@@ -1,0 +1,82 @@
+{
+  "format_version": 1,
+  "kind": "behavior",
+  "cases": [
+    {
+      "id": "behavior.empty-query",
+      "coverage": "empty-query",
+      "expectation": "observation",
+      "request": {
+        "query": "   "
+      },
+      "expected": {
+        "sessions": [],
+        "messages": [],
+        "query": ""
+      }
+    },
+    {
+      "id": "behavior.ascii-fts",
+      "coverage": "ascii-transcript-search",
+      "expectation": "observation",
+      "request": {
+        "query": "milk",
+        "limit": 5
+      },
+      "expected": {
+        "search_port": "search_transcript",
+        "limit": 5,
+        "duplicate_session_keys_removed": true
+      }
+    },
+    {
+      "id": "behavior.non-ascii-like",
+      "coverage": "non-ascii-transcript-search",
+      "expectation": "observation",
+      "request": {
+        "query": "通知团队",
+        "limit": 5
+      },
+      "expected": {
+        "search_port": "search_transcript_like",
+        "limit": 5
+      }
+    },
+    {
+      "id": "behavior.title-hit-excludes-message-duplicate",
+      "coverage": "title-content-deduplication",
+      "expectation": "observation",
+      "expected": {
+        "same_canonical_key_in_both_arrays": false
+      }
+    },
+    {
+      "id": "behavior.permission",
+      "coverage": "operator-read-scope-and-guest-denial",
+      "expectation": "observation",
+      "principal": {
+        "role": "operator",
+        "scopes": [
+          "operator.read"
+        ]
+      },
+      "expected": {
+        "authorized": true,
+        "guest_allowed": false
+      },
+      "expected_error_case": "error.unauthorized"
+    },
+    {
+      "id": "behavior.transcript-failure-degrades",
+      "coverage": "best-effort-transcript-failure",
+      "expectation": "observation",
+      "setup": {
+        "transcript_search_exception": "RuntimeError"
+      },
+      "expected": {
+        "title_hits_preserved": true,
+        "messages": []
+      }
+    }
+  ]
+}

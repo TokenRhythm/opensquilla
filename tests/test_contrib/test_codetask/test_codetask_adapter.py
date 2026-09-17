@@ -1,5 +1,6 @@
 """Unit tests for opensquilla.contrib.codetask.adapter (subprocess mocked)."""
 
+import os
 import subprocess as sp
 import sys
 
@@ -78,9 +79,78 @@ def test_sandbox_off_uses_full_host_access_without_workspace_containment(
     ):
         assert flag in argv
     assert argv[argv.index("--permissions") + 1] == "full"
+    assert argv[argv.index("--timeout") + 1] == "10"
+    assert "--iteration-timeout-seconds" not in argv
     assert "--workspace-strict" not in argv
     assert "--workspace-lockdown" not in argv
     assert captured["cwd"] == str(repo)
+
+
+def test_coding_usage_callback_runs_after_agent_process_starts(monkeypatch, tmp_path):
+    captured = {}
+    observed: list[str] = []
+    _install_popen(monkeypatch, captured, stdout='{"status": "ok", "text": "done"}')
+    _isolate_operator_config(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = LocalAdapter().run(
+        "fix it",
+        repo=repo,
+        scratch_dir=tmp_path / "s",
+        artifact_dir=tmp_path / "a",
+        on_agent_started=lambda: observed.append("started"),
+    )
+
+    assert out.success is True
+    assert observed == ["started"]
+
+
+def test_coding_usage_callback_failure_never_changes_agent_result(monkeypatch, tmp_path):
+    captured = {}
+    _install_popen(monkeypatch, captured, stdout='{"status": "ok", "text": "done"}')
+    _isolate_operator_config(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def fail_observation() -> None:
+        raise RuntimeError("telemetry unavailable")
+
+    out = LocalAdapter().run(
+        "fix it",
+        repo=repo,
+        scratch_dir=tmp_path / "s",
+        artifact_dir=tmp_path / "a",
+        on_agent_started=fail_observation,
+    )
+
+    assert out.success is True
+
+
+def test_coding_usage_callback_is_not_called_when_agent_does_not_start(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_operator_config(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    observed: list[str] = []
+
+    def fail_popen(*args, **kwargs):
+        raise FileNotFoundError("missing runtime")
+
+    monkeypatch.setattr(adapter.subprocess, "Popen", fail_popen)
+
+    with pytest.raises(RuntimeError, match="could not launch agent interpreter"):
+        LocalAdapter().run(
+            "fix it",
+            repo=repo,
+            scratch_dir=tmp_path / "s",
+            artifact_dir=tmp_path / "a",
+            on_agent_started=lambda: observed.append("started"),
+        )
+
+    assert observed == []
 
 
 def test_legacy_trusted_mode_keeps_restricted_workspace_containment(monkeypatch, tmp_path):
@@ -324,6 +394,7 @@ def test_run_points_agent_at_codetask_config(monkeypatch, tmp_path):
     from opensquilla.contrib.codetask.config import agent_config_path
 
     _isolate_operator_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENSQUILLA_CODETASK_CHILD", "0")
     profile_scoped = {
         "OPENSQUILLA_DESKTOP": "1",
         "OPENSQUILLA_DESKTOP_PROFILE_KIND": "desktop-primary",
@@ -345,6 +416,8 @@ def test_run_points_agent_at_codetask_config(monkeypatch, tmp_path):
         "OPENSQUILLA_SCHEDULER_DB": str(tmp_path / "scheduler.db"),
         "OPENSQUILLA_META_RUNS_DB": str(tmp_path / "meta-runs.db"),
         "OPENSQUILLA_ROUTER_DECISIONS_DB": str(tmp_path / "router.db"),
+        "OPENSQUILLA_CODING_MODE_ACTIVE": "1",
+        "OPENSQUILLA_CODING_MODE_CONFIG_PATH": str(tmp_path / "parent-config.toml"),
     }
     for name, value in profile_scoped.items():
         monkeypatch.setenv(name, value)
@@ -353,6 +426,7 @@ def test_run_points_agent_at_codetask_config(monkeypatch, tmp_path):
         "HTTPS_PROXY": "http://127.0.0.1:19090",
         "OPENSQUILLA_NODE_BIN_DIR": str(tmp_path / "node-bin"),
         "OPENSQUILLA_MIGRATIONS_DIR": str(tmp_path / "migrations"),
+        "OPENSQUILLA_TELEMETRY_BASE_URL": "https://telemetry.example.test/temporary",
     }
     for name, value in inherited.items():
         monkeypatch.setenv(name, value)
@@ -374,6 +448,10 @@ def test_run_points_agent_at_codetask_config(monkeypatch, tmp_path):
     for name in profile_scoped:
         if name != "OPENSQUILLA_STATE_DIR":
             assert name not in env
+    assert "OPENSQUILLA_CODING_MODE_ACTIVE" not in env
+    assert "OPENSQUILLA_CODING_MODE_CONFIG_PATH" not in env
+    assert env["OPENSQUILLA_CODETASK_CHILD"] == "1"
+    assert os.environ["OPENSQUILLA_CODETASK_CHILD"] == "0"
     for name, value in inherited.items():
         assert env[name] == value
     import tomllib
@@ -539,8 +617,13 @@ def test_per_run_config_inherits_operator_provider(monkeypatch, tmp_path):
     # re-pin the subagent to a provider the operator moved away from)...
     assert "llm_ensemble" not in parsed
     # ...and the template's run policy stays authoritative.
-    for section in ("tools", "sandbox", "meta_skill", "memory"):
+    for section in ("tools", "sandbox", "meta_skill"):
         assert section in parsed, section
+    assert parsed["workspace_strict"] is False
+    assert parsed["sandbox"]["sandbox"] is False
+    assert parsed["sandbox"]["security_grading"] is False
+    assert "memory*" in parsed["tools"]["deny"]
+    assert parsed["tools"]["trusted_fake_ip_cidrs"] == ["198.18.0.0/15"]
     assert parsed["meta_skill"]["enabled"] is False
 
 

@@ -7,6 +7,7 @@ import type {
   ChatStreamTimelineItem,
   ChatToolCallRenderItem,
 } from '@/types/chat'
+import type { StatusPart } from '@/types/parts'
 import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 import AssistantActivityTimeline from './AssistantActivityTimeline.vue'
 import timelineSource from './AssistantActivityTimeline.vue?raw'
@@ -59,7 +60,7 @@ function group(call: ChatToolCallRenderItem): ChatStreamTimelineItem {
 
 async function mountTimeline(
   timelineItems: ChatStreamTimelineItem[],
-  statusHistory: Array<{ action: string; label: string; at: number }> = [],
+  statusHistory: StatusPart[] = [],
   lifecycle: 'working' | 'answering' | 'settled' = 'working',
 ) {
   const root = document.createElement('div')
@@ -99,6 +100,30 @@ afterEach(() => {
 })
 
 describe('AssistantActivityTimeline', () => {
+  it.each(['working', 'settled'] as const)('distinguishes temporary reductions from saved summaries while %s', async lifecycle => {
+    const root = await mountTimeline([], [
+      {
+        action: 'context_compaction', label: '', at: 1_000,
+        id: 'cmp-temporary', category: 'maintenance', state: 'completed',
+        source: 'automatic', durability: 'request_scoped',
+      },
+      {
+        action: 'context_compaction', label: '', at: 2_000,
+        id: 'cmp-saved', category: 'maintenance', state: 'completed',
+        source: 'automatic', durability: 'durable',
+      },
+    ], lifecycle)
+
+    const events = root.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
+    expect(events).toHaveLength(2)
+    expect(events[0]?.textContent).toContain('History temporarily reduced; continuing')
+    expect(events[0]?.textContent).not.toContain('Summary saved')
+    expect(events[0]?.dataset.status).toBe('completed')
+    expect(events[0]?.dataset.durability).toBe('request_scoped')
+    expect(events[1]?.textContent).toContain('Summary saved')
+    expect(root.querySelector('.assistant-activity-status__row--current')).toBeNull()
+  })
+
   it('inherits caller attributes on its semantic root without Vue fragment warnings', async () => {
     const root = await mountTimeline([
       group(toolCall('attribute-root', 'read_file')),

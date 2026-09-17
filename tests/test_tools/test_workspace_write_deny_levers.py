@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -61,6 +63,13 @@ def _configure_ctx(workspace: Path, globs: list[str]) -> ToolContext:
     ctx.workspace_dir = str(workspace)
     ctx.workspace_write_deny_globs = globs  # type: ignore[attr-defined]
     return ctx
+
+
+def _python_shell_command(script: str) -> str:
+    argv = [sys.executable, "-c", script]
+    if os.name == "nt":
+        return "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in argv)
+    return shlex.join(argv)
 
 
 @pytest.mark.parametrize(
@@ -331,7 +340,7 @@ async def test_exec_command_interpreter_write_passes_through_by_default(
     _configure_ctx(workspace, ["tests/**"])
 
     result = await shell.exec_command(
-        "python3 -c \"open('tests/test_a.py','w').write('assert b')\"",
+        _python_shell_command("open('tests/test_a.py','w').write('assert b')"),
         workdir=str(workspace),
     )
 
@@ -351,7 +360,7 @@ async def test_exec_command_interpreter_reads_stay_unblocked_with_lever_on(
     _configure_ctx(workspace, ["tests/**"])
 
     result = await shell.exec_command(
-        "python3 -c \"print(open('tests/test_a.py').read())\"",
+        _python_shell_command("print(open('tests/test_a.py').read())"),
         workdir=str(workspace),
     )
 
@@ -555,7 +564,7 @@ async def test_exec_command_mutator_passes_through_by_default(
     _configure_ctx(workspace, ["tests/**"])
 
     result = await shell.exec_command(
-        "sed -i 's/assert a/assert b/' tests/test_a.py", workdir=str(workspace)
+        "sed -i.bak 's/assert a/assert b/' tests/test_a.py", workdir=str(workspace)
     )
 
     assert result.startswith("exit_code=0")

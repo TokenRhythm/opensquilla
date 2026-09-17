@@ -225,6 +225,18 @@ def test_serialized_projection_fails_closed_for_malformed_metadata() -> None:
     ("name", "parameters", "category", "primary_arguments"),
     [
         (
+            "browser",
+            {
+                "operation": {"type": "string"},
+                "targetRef": {"type": "string"},
+                "action": {"type": "string"},
+                "ref": {"type": "string"},
+                "url": {"type": "string"},
+            },
+            "generic",
+            ("operation", "targetRef", "action", "ref"),
+        ),
+        (
             "cron",
             {
                 "action": {"type": "string"},

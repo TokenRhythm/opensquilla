@@ -23,25 +23,11 @@ def test_saved_safe_policy_is_pinned_at_every_gateway_turn_boundary() -> None:
     for path in (
         "src/opensquilla/gateway/boot.py",
         "src/opensquilla/gateway/channel_dispatch.py",
-        "src/opensquilla/gateway/rpc_sessions.py",
+        "src/opensquilla/gateway/direct_turn_runtime.py",
         "src/opensquilla/cli/agent_cmd.py",
     ):
         assert "pin_sandbox_policy" in _text(path), path
     assert "sandbox_policy" in _text("src/opensquilla/tools/types.py")
-
-
-def test_capability_status_requires_live_canaries() -> None:
-    capability = _text("src/opensquilla/sandbox/capability_service.py")
-    runtime = _text("src/opensquilla/sandbox/setup_runtime.py")
-    assert 'SandboxSetupState.READY: "probe_required"' in capability
-    assert "_probe_runtime_capabilities" in runtime
-    for capability_name in (
-        "process",
-        "filesystem-worker",
-        "denyWriteCarveout",
-        "authorityDenyRead",
-    ):
-        assert capability_name in runtime
 
 
 def test_recursive_delete_reaches_backup_broker_and_double_confirmation() -> None:

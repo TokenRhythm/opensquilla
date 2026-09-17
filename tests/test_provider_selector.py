@@ -513,6 +513,48 @@ def test_strict_router_fallback_chain_discards_configured_lower_tail(monkeypatch
     ]
 
 
+def test_strict_router_fallback_chain_keeps_resolved_cross_provider_config(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda cfg: cfg)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model="configured/c0",
+                api_key="primary-key",
+            ),
+            fallbacks=[
+                ProviderConfig(
+                    provider="plugin-provider",
+                    model="outside-router-chain",
+                    api_key="plugin-key",
+                )
+            ],
+        )
+    )
+    configured_foreign = ProviderConfig(
+        provider="anthropic",
+        model="configured/c1",
+        api_key="foreign-key",
+        replay_provider_state=True,
+    )
+
+    selector.override_model_with_fallback_chain(
+        "configured/c0",
+        [configured_foreign],
+        preserve_existing_tail=False,
+    )
+
+    chain = selector.remaining_chain()
+    assert [(cfg.provider, cfg.model) for cfg in chain] == [
+        ("openrouter", "configured/c0"),
+        ("anthropic", "configured/c1"),
+    ]
+    assert chain[1].api_key == "foreign-key"
+    assert chain[1].replay_provider_state is False
+
+
 def test_strict_empty_router_fallback_chain_removes_every_lower_model(monkeypatch) -> None:
     monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda cfg: cfg)
     selector = ModelSelector(
@@ -539,6 +581,52 @@ def test_strict_empty_router_fallback_chain_removes_every_lower_model(monkeypatc
     )
 
     assert [cfg.model for cfg in selector.remaining_chain()] == [HIGH_TIER_MODEL]
+
+
+def test_strict_router_fallback_chain_ignores_plugin_replacement(monkeypatch) -> None:
+    plugin_calls = 0
+
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            nonlocal plugin_calls
+            del primary_failure
+            plugin_calls += 1
+            return [
+                ProviderConfig(
+                    provider="openrouter",
+                    model="outside-router-chain",
+                    api_key="plugin-key",
+                )
+            ]
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda cfg: cfg)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model="configured-c0",
+                api_key="test-key",
+            )
+        ),
+        plugin=_Plugin(),
+    )
+    selector.override_model_with_fallback_chain(
+        "configured-c0",
+        [
+            {
+                "tier": "c1",
+                "provider": "openrouter",
+                "model": "configured-c1",
+            }
+        ],
+        preserve_existing_tail=False,
+    )
+
+    fallback = selector.next_fallback_after_failure(RuntimeError("rate limited"))
+
+    assert fallback.model == "configured-c1"
+    assert plugin_calls == 0
+    assert [cfg.model for cfg in selector.remaining_chain()] == ["configured-c1"]
 
 
 @pytest.mark.parametrize(

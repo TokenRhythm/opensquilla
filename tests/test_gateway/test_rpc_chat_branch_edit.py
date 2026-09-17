@@ -31,8 +31,24 @@ class _RecordingTurnRunner:
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
         return self._locks.setdefault(session_key, asyncio.Lock())
 
-    async def run(self, message: str, session_key: str, **kwargs: Any):
-        self.run_calls.append({"message": message, "session_key": session_key, **kwargs})
+    async def run(
+        self,
+        message: str,
+        session_key: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **kwargs: Any,
+    ):
+        self.run_calls.append(
+            {
+                "message": message,
+                "session_key": session_key,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
+                **kwargs,
+            }
+        )
         yield DoneEvent()
 
 
@@ -56,7 +72,7 @@ def ctx(manager):
     context = RpcContext(
         conn_id="test-conn",
         principal=_PRINCIPAL,
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
         turn_runner=runner,
     )
     context.session_manager = manager
@@ -110,3 +126,5 @@ async def test_chat_send_fork_before_message_returns_child_without_future_histor
 
     assert ctx.turn_runner.run_calls[0]["session_key"] == child_key
     assert ctx.turn_runner.run_calls[0]["message"] == "B edited"
+    assert ctx.turn_runner.run_calls[0]["expected_session_id"] == child.session_id
+    assert ctx.turn_runner.run_calls[0]["expected_session_epoch"] == int(child.epoch or 0)

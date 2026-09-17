@@ -20,13 +20,23 @@
             :data-mime="att.mime || ''"
             :title="attachmentTitle(att)"
           >
-            <span class="attachment-chip__icon" aria-hidden="true">
-              <span v-if="isAttachmentBusy(att)" class="spinner attachment-chip__spinner" />
-              <Icon v-else-if="att.kind === 'failed'" name="info" :size="15" />
-              <img v-else-if="isImageDisplayAttachment(att) && att.dataUrl" class="attachment-chip__thumb" :src="att.dataUrl" alt="" />
-              <Icon v-else :name="attachmentIcon(att)" :size="15" />
-            </span>
-            <span class="attachment-chip__name">{{ att.name }}</span>
+            <component
+              :is="attachmentCanPreview(att) ? 'button' : 'span'"
+              class="attachment-chip__primary"
+              :class="{ 'attachment-chip__preview': attachmentCanPreview(att) }"
+              :type="attachmentCanPreview(att) ? 'button' : undefined"
+              :title="attachmentCanPreview(att) ? t('chat.openTitle', { title: att.name }) : undefined"
+              :aria-label="attachmentCanPreview(att) ? t('chat.openTitle', { title: att.name }) : undefined"
+              @click.stop="previewImage(att)"
+            >
+              <span class="attachment-chip__icon" aria-hidden="true">
+                <span v-if="isAttachmentBusy(att)" class="spinner attachment-chip__spinner" />
+                <Icon v-else-if="att.kind === 'failed'" name="info" :size="15" />
+                <img v-else-if="isImageDisplayAttachment(att) && att.dataUrl" class="attachment-chip__thumb" :src="att.dataUrl" alt="" />
+                <Icon v-else :name="attachmentIcon(att)" :size="15" />
+              </span>
+              <span class="attachment-chip__name">{{ att.name }}</span>
+            </component>
             <span class="attachment-chip__meta">{{ attachmentMeta(att) }}</span>
             <button v-if="att.kind === 'failed' && att.file" class="attachment-action" :title="t('chat.retryUpload')" :aria-label="t('chat.retryUpload')" @click="emit('retryAttachment', i)">
               <Icon name="refresh" :size="12" />
@@ -410,16 +420,21 @@
                   || (sessionRoutingBusy ? t('chat.composer.routingUpdateBlocked') : sendButtonTitle)"
                 :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
                 :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-                :aria-busy="sessionRoutingBusy ? 'true' : 'false'"
-                :disabled="Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
+                :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
+                :disabled="sendPending || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
                 @click="emit('send')"
               >
-                <Icon name="arrowUp" :size="17" />
+                <LoadingSpinner v-if="sendPending" />
+                <Icon v-else name="arrowUp" :size="17" />
               </button>
             </Transition>
           </div>
           </div>
         </div>
+      </div>
+      <div v-if="sendPending" class="chat-composer-send-pending">
+        <LoadingSpinner aria-hidden="true" />
+        <span role="status" aria-live="polite">{{ t('chat.sendPending') }}</span>
       </div>
       <div v-if="sendBlockedMessage" class="chat-collapse-region">
         <p
@@ -448,6 +463,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
 import ChatComposerGoalMode from '@/components/chat/ChatComposerGoalMode.vue'
@@ -479,6 +495,7 @@ const props = withDefaults(defineProps<{
   attachments: Attachment[]
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
+  sendPending?: boolean
   isStreaming: boolean
   canStop: boolean
   stopTargetsPlanRun?: boolean
@@ -547,6 +564,7 @@ const emit = defineEmits<{
   keydown: [event: KeyboardEvent]
   removeAttachment: [index: number]
   retryAttachment: [index: number]
+  previewImage: [attachment: Attachment]
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: SandboxRunMode]
@@ -799,6 +817,14 @@ function openPromptCacheKeepalive() {
   if (!props.promptCacheKeepaliveSessionReady) return
   moreActionsOpen.value = false
   emit('openPromptCacheKeepalive')
+}
+
+function attachmentCanPreview(att: Attachment): boolean {
+  return isImageDisplayAttachment(att) && Boolean(att.file || att.data || att.dataUrl)
+}
+
+function previewImage(att: Attachment) {
+  if (attachmentCanPreview(att)) emit('previewImage', att)
 }
 
 function attachmentIcon(att: Attachment): IconName {
@@ -1239,6 +1265,33 @@ defineExpose<ChatComposerExpose>({
 
 .attachment-chip--busy {
   opacity: 0.7;
+}
+
+.attachment-chip__primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+button.attachment-chip__primary {
+  cursor: pointer;
+}
+
+button.attachment-chip__primary:hover {
+  color: var(--accent);
+}
+
+button.attachment-chip__primary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .attachment-chip--failed {
@@ -1853,6 +1906,21 @@ defineExpose<ChatComposerExpose>({
   background: var(--bg-hover);
   color: var(--text-dim);
   border-color: var(--bg-hover);
+}
+
+.chat-composer-send-pending {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.chat-composer-send-pending .loading-spinner,
+.chat-send-btn .loading-spinner {
+  width: 14px;
+  height: 14px;
 }
 
 .chat-send-btn.btn--primary:hover {

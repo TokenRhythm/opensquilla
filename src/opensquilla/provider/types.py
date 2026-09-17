@@ -35,8 +35,9 @@ class ReasoningDeltaEvent:
     not the final answer. Emitting it as its own event lets every layer keep
     the two apart from the source, so the renderer never has to guess a block's
     identity after the fact. The concatenation of these deltas equals
-    DoneEvent.reasoning_content, which remains the source of truth for non-TUI
-    consumers (signature replay, persistence, compaction, cost).
+    DoneEvent.reasoning_content for display and text consumers. Exact signed
+    continuation uses DoneEvent.provider_replay; concatenated text cannot
+    preserve individual thinking blocks or their signatures.
     """
 
     kind: Literal["reasoning_delta"] = field(default="reasoning_delta", init=False)
@@ -126,6 +127,7 @@ class DoneEvent:
     # not carry a synthetic receipt; their physical breakdown rows do.
     billing_receipt: ProviderBillingReceipt | None = None
     generation_epoch: int | None = None
+    provider_replay: ProviderReplayState | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -549,6 +551,15 @@ def derive_provider_request_correlation(
     return replace(correlation, **updates) if updates else correlation
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionIdentity:
+    """Request-local deployment facts, not proof of upstream model weights."""
+
+    kind: Literal["single_model", "multi_model_fusion"] = "single_model"
+    provider: str = ""
+    model: str = ""
+
+
 class ChatConfig(BaseModel):
     """Runtime options for a single chat call."""
 
@@ -556,6 +567,7 @@ class ChatConfig(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     system: str | None = None
+    execution_identity: ExecutionIdentity | None = Field(default=None, exclude=True, repr=False)
     stop_sequences: list[str] = []
     thinking: bool = False
     thinking_budget_tokens: int = 5000
@@ -577,6 +589,14 @@ class ChatConfig(BaseModel):
     )
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
+    # Resolved window of this physical deployment, rebound for every routed
+    # or ensemble leg. Zero preserves legacy callers without catalog facts.
+    provider_context_window_tokens: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        repr=False,
+    )
     # Runtime-only provenance for an explicit global
     # ``llm.context_window_tokens`` override. Selector fallback must resolve the
     # new physical model with this same operator setting; zero means the active
@@ -656,6 +676,11 @@ class ChatConfig(BaseModel):
 class ContentBlockText(BaseModel):
     type: Literal["text"] = "text"
     text: str
+    _execution_identity_span: tuple[int, int] | None = PrivateAttr(default=None)
+
+    @property
+    def execution_identity_span(self) -> tuple[int, int] | None:
+        return self._execution_identity_span
 
 
 class ContentBlockToolUse(BaseModel):
@@ -678,6 +703,15 @@ class ContentBlockImage(BaseModel):
     source_type: Literal["base64", "url"] = "base64"
     media_type: str  # "image/png", "image/jpeg", etc.
     data: str  # base64 data or URL
+    # Request-local provenance only.  It binds marker/retry decisions to the
+    # canonical occurrence without ever entering a provider wire payload.
+    attachment_id: str | None = Field(default=None, exclude=True, repr=False)
+    # In-memory image bytes alone do not prove that a later turn can replay them.
+    durable_retained: bool | None = Field(default=None, exclude=True, repr=False)
+    # Retained tool images carry replay metadata separately from provider pixels.
+    name: str | None = Field(default=None, exclude=True)
+    local_path: str | None = Field(default=None, exclude=True)
+    source_url: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class ContentBlockDocument(BaseModel):
@@ -692,6 +726,13 @@ class ContentBlockThinking(BaseModel):
     type: Literal["thinking"] = "thinking"
     thinking: str = ""
     signature: str | None = None
+
+
+class ContentBlockRedactedThinking(BaseModel):
+    """Opaque Anthropic continuation data; never display or summarize it."""
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str = Field(repr=False)
 
 
 class ContentBlockCompaction(BaseModel):
@@ -709,9 +750,32 @@ MessageContent = (
         | ContentBlockImage
         | ContentBlockDocument
         | ContentBlockThinking
+        | ContentBlockRedactedThinking
         | ContentBlockCompaction
     ]
 )
+
+
+class ProviderReplayState(BaseModel):
+    """Continuation state returned by one accepted provider response.
+
+    ``source`` is an opaque, credential-free endpoint identity, not a URL or
+    request dump. Native blocks retain their original ordering and values;
+    adapters decide whether a target can consume them without changing this
+    canonical record. ``native_reasoning_content`` retains the actual response
+    field, distinct from the display text in ``Message.reasoning_content``
+    which can also be derived from aliases, native details, or thinking tags.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: str
+    source: str
+    model: str
+    reasoning_details: list[dict[str, Any]] | None = Field(default=None, repr=False)
+    native_reasoning_content: str | None = Field(default=None, repr=False)
+    # Ordered complete Anthropic blocks, including opaque continuation data.
+    native_content: list[dict[str, Any]] | None = Field(default=None, repr=False)
 
 
 class Message(BaseModel):
@@ -719,7 +783,13 @@ class Message(BaseModel):
 
     role: Literal["user", "assistant"]
     content: MessageContent
+    _execution_identity_span: tuple[int, int] | None = PrivateAttr(default=None)
     reasoning_content: str | None = None
+    provider_replay: ProviderReplayState | None = None
+
+    @property
+    def execution_identity_span(self) -> tuple[int, int] | None:
+        return self._execution_identity_span
 
 
 # ---------------------------------------------------------------------------

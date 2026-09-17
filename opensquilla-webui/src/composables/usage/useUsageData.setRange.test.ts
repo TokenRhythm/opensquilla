@@ -7,13 +7,12 @@ import i18n, { loadLocaleMessages, type LocaleCode } from '@/i18n'
 import { useUsageData } from './useUsageData'
 import { requestUsageSnapshot } from './useUsageQuery'
 import type { UsageSnapshot } from '@/types/usage'
+import { usageSession } from '@/testing/usage.test-helper'
+import type { SessionDirectory } from '@/modules/sessionDirectory'
+import type { Observability } from '@/modules/observability'
 
 vi.mock('vue-router', () => ({
   useRouter: () => ({ push: vi.fn() }),
-}))
-
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({}),
 }))
 
 vi.mock('./useUsageQuery', () => ({
@@ -83,8 +82,14 @@ function deferred<T>() {
 
 function mountUsageData() {
   const scope = effectScope()
-  const api = scope.run(() => useUsageData())!
-  return { api, scope }
+  const directory: SessionDirectory = {
+    listPage: vi.fn().mockResolvedValue({ items: [], hasMore: false, nextCursor: null }),
+    count: vi.fn().mockResolvedValue({ value: 0, exact: true }),
+    resolve: vi.fn().mockResolvedValue({ key: 'agent:main:webchat:default', id: 'default' }),
+    search: vi.fn().mockResolvedValue({ sessions: [], messages: [] }),
+  }
+  const api = scope.run(() => useUsageData(directory, {} as Observability))!
+  return { api, directory, scope }
 }
 
 async function flushMicrotasks() {
@@ -110,6 +115,16 @@ afterEach(() => {
 })
 
 describe('useUsageData range selection under concurrent refreshes', () => {
+  it('delegates task-title connection ownership to SessionDirectory', async () => {
+    vi.mocked(requestUsageSnapshot).mockResolvedValueOnce(snapshotFor('last_7_calendar_days'))
+    const { api, directory, scope } = mountUsageData()
+    scopes.push(scope)
+
+    await api.loadData()
+
+    expect(directory.listPage).toHaveBeenCalledWith({ limit: 200 })
+  })
+
   it('does not describe complete all-time task totals as a date-range approximation', async () => {
     localStorage.setItem(RANGE_KEY, 'all')
     const snapshot = snapshotFor('all')
@@ -196,12 +211,12 @@ describe('useUsageData model labels', () => {
       const { api, scope } = mountUsageData()
       scopes.push(scope)
 
-      const label = api.modelDisplayLabel({
+      const label = api.modelDisplayLabel(usageSession({
         modelBreakdown: [
           { model: 'provider/primary-model' },
           { model: 'provider/helper-model' },
         ],
-      })
+      }))
 
       expect(label).toBe(expected)
       expect(label).not.toMatch(/auto|自动|自動/i)
@@ -212,8 +227,8 @@ describe('useUsageData model labels', () => {
     const { api, scope } = mountUsageData()
     scopes.push(scope)
 
-    expect(api.modelDisplayLabel({
+    expect(api.modelDisplayLabel(usageSession({
       modelBreakdown: [{ model: 'provider/only-model' }],
-    })).toBe('provider/only-model')
+    }))).toBe('provider/only-model')
   })
 })

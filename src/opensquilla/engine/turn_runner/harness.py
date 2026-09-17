@@ -81,7 +81,7 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
 )
 from opensquilla.engine.usage_accounting import UsageExecutionContext
 from opensquilla.provider.model_catalog import resolve_effective_context_window
-from opensquilla.session.compaction_lifecycle import normalize_flush_triggers_strict
+from opensquilla.provider.registry import LOCAL_RUNTIME_PROVIDERS
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -94,10 +94,6 @@ if TYPE_CHECKING:
     from opensquilla.observability.turn_call_log import TurnCallLogger
     from opensquilla.provider.protocol import LLMProvider
     from opensquilla.tools.types import ToolContext
-
-
-def _coerce_flush_triggers(value: Any) -> list[str]:
-    return list(normalize_flush_triggers_strict(value))
 
 
 def create_turn_execution_context(
@@ -311,6 +307,10 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "usage_execution_context": request.usage_execution_context,
             "provider_request_correlation": request.provider_request_correlation,
             "router_history_replay_request": request.router_history_replay_request,
+            "bound_user_message_id": request.bound_user_message_id,
+            "transcript_snapshot": request.transcript_snapshot,
+            "expected_session_id": request.expected_session_id,
+            "expected_session_epoch": request.expected_session_epoch,
         }
         accepted_kwargs = {
             name: value
@@ -342,8 +342,14 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> dict[str, Any]:
-        from opensquilla.engine.runtime import _accepts_keyword_arg
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _accepts_keyword_arg,
+            _has_session_storage,
+        )
 
         kwargs: dict[str, Any] = {
             "exclude_last_user": exclude_last_user,
@@ -359,6 +365,21 @@ class _TurnRunnerRouterContextAdapter(RouterContextPort):
             "transcript_snapshot",
         ):
             kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(
+                    self._runner._router_previous_assistant_context,
+                    name,
+                )
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                kwargs["expected_session_id"] = expected_session_id
+                kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(self._runner._session_manager):
+                raise RuntimeError(
+                    "session router context reader does not support exact ownership"
+                )
         return await self._runner._router_previous_assistant_context(
             session_key,
             **kwargs,
@@ -448,11 +469,11 @@ class _TurnRunnerMemoryFingerprintAdapter(MemoryFingerprintPort):
 # ---------------------------------------------------------------------------
 
 class _TurnRunnerTimeoutBudgetAdapter(TimeoutBudgetPort):
-    """Bind the five ``TurnRunner._resolve_agent_*`` helpers as a single port.
+    """Bind the active ``TurnRunner._resolve_agent_*`` helpers as a single port.
 
     The adapter composes the resolver chain in the order the inline body
     walks it. ``effective_runtime_timeout`` honors the per-call
-    ``timeout`` override; the other four resolvers consume the per-call
+    ``timeout`` override; the remaining resolvers consume the per-call
     explicit override and the session/env/config fallback chain
     internally.
     """
@@ -466,8 +487,6 @@ class _TurnRunnerTimeoutBudgetAdapter(TimeoutBudgetPort):
         session_key: str,
         timeout: float | None,
         max_iterations: int | None,
-        iteration_timeout: float | None,
-        tool_timeout: float | None,
         request_timeout: float | None,
         max_provider_retries: int | None,
     ) -> _ResolvedBudgets:
@@ -489,12 +508,6 @@ class _TurnRunnerTimeoutBudgetAdapter(TimeoutBudgetPort):
             runtime_timeout=runtime_timeout,
             max_iterations=resolved_max_iterations,
             max_iterations_source=max_iterations_source,
-            iteration_timeout=self._runner._resolve_agent_iteration_timeout(
-                session_key, iteration_timeout
-            ),
-            tool_timeout=self._runner._resolve_agent_tool_timeout(
-                session_key, tool_timeout
-            ),
             request_timeout=self._runner._resolve_agent_request_timeout(
                 session_key, request_timeout
             ),
@@ -535,6 +548,12 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
         user_context_window = _positive_int_or_zero(
             getattr(llm_cfg, "context_window_tokens", 0)
         )
+        if provider and provider.strip().lower() != str(
+            getattr(llm_cfg, "provider", "") or ""
+        ).strip().lower():
+            # The global context declaration belongs to the primary deployment;
+            # a routed model at another provider must use its own capacity.
+            user_context_window = 0
         # Explicit provider-request proof budget (chars). Positive values bypass
         # the derived context-budget ladder in ContextBudgetGovernor.from_values.
         user_proof_max_chars = _positive_int_or_zero(
@@ -580,11 +599,15 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
                 )
             # Per-model [models.*] context_window overrides beat the global
             # llm.context_window_tokens value; the global still beats the catalog.
-            context_window, _context_window_source = resolve_effective_context_window(
+            context_window, context_window_source = resolve_effective_context_window(
                 runner._model_catalog,
                 model_id,
                 provider=provider_name,
                 global_override=user_context_window,
+            )
+            context_window_known = (
+                context_window_source in {"override", "config", "catalog"}
+                or provider_name.strip().lower() in LOCAL_RUNTIME_PROVIDERS
             )
             capabilities = runner._model_catalog.get_capabilities(
                 model_id, provider_name=provider_name, base_url=base_url
@@ -635,6 +658,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             auto_max_tokens = 0
             auto_max_tokens_source = "default"
             context_window = user_context_window if user_context_window > 0 else 200_000
+            context_window_known = user_context_window > 0
             capabilities = None
             tools_capability_verified = False
             vision_support = "unknown"
@@ -643,6 +667,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
         return _ResolvedCatalog(
             max_tokens=max_tokens,
             context_window=context_window,
+            context_window_known=context_window_known,
             capabilities=capabilities,
             tools_capability_verified=tools_capability_verified,
             vision_support=cast(Any, vision_support),
@@ -745,6 +770,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
         if vision_support not in {"supported", "unsupported", "unknown"}:
             vision_support = "unknown"
         context_window = limits.context_window
+        context_window_known = bool(getattr(limits, "context_window_known", True))
         if include_global_overrides:
             per_model_context = catalog.user_context_window_override(
                 model_id,
@@ -755,12 +781,14 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             )
             if per_model_context is None and global_context > 0:
                 context_window = global_context
+                context_window_known = True
         max_tokens = limits.max_output_tokens
         if include_global_overrides and configured_max_tokens > 0:
             max_tokens = min(configured_max_tokens, context_window)
         return _ResolvedCatalog(
             max_tokens=max_tokens,
             context_window=context_window,
+            context_window_known=context_window_known,
             capabilities=capabilities,
             tools_capability_verified=tools_capability_verified,
             vision_support=cast(Any, vision_support),
@@ -798,7 +826,6 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
         from opensquilla.paths import media_root_from_config
 
         runner = self._runner
-        mem_cfg = getattr(runner._config, "memory", None) if runner._config else None
         agent_token_cfg = (
             getattr(runner._config, "agent_token_saving", None)
             if runner._config
@@ -812,39 +839,10 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
         thinking = runner._resolve_turn_thinking(turn)
         return _AgentConfigAuxiliaries(
             thinking=thinking,
-            flush_workspace_dir=str(runner._resolve_memory_source_dir(agent_id)),
             tool_result_store_dir=str(
                 media_root_from_config(runner._config) / "tool-results"
             ),
             tool_result_store_session_id=session_id_for_log or session_key,
-            flush_enabled=getattr(mem_cfg, "flush_enabled", False),
-            flush_triggers=_coerce_flush_triggers(
-                getattr(mem_cfg, "flush_triggers", None)
-            ),
-            flush_pre_compaction=getattr(mem_cfg, "flush_pre_compaction", False),
-            flush_timeout_seconds=getattr(mem_cfg, "flush_timeout_seconds", 15.0),
-            flush_background_timeout_seconds=getattr(
-                mem_cfg, "flush_background_timeout_seconds", 120.0
-            ),
-            flush_backoff_initial_seconds=getattr(
-                mem_cfg, "flush_backoff_initial_seconds", 30.0
-            ),
-            flush_backoff_max_seconds=getattr(
-                mem_cfg, "flush_backoff_max_seconds", 300.0
-            ),
-            flush_archive_max_bytes=getattr(
-                mem_cfg, "flush_archive_max_bytes", 800_000
-            ),
-            flush_compaction_requires_safe_receipt=getattr(
-                mem_cfg,
-                "flush_compaction_requires_safe_receipt",
-                False,
-            ),
-            flush_compaction_safety_mode=getattr(
-                mem_cfg,
-                "flush_compaction_safety_mode",
-                "protect",
-            ),
             compaction_profile=getattr(
                 compaction_cfg,
                 "compaction_profile",
@@ -869,21 +867,6 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 agent_token_cfg,
                 "tool_result_projection_max_inline_chars",
                 60_000,
-            ),
-            tool_result_fresh_diagnostic_policy_enabled=getattr(
-                agent_token_cfg,
-                "tool_result_fresh_diagnostic_policy_enabled",
-                False,
-            ),
-            tool_result_diagnostic_retrieval_gate_enabled=getattr(
-                agent_token_cfg,
-                "tool_result_diagnostic_retrieval_gate_enabled",
-                False,
-            ),
-            tool_result_fresh_diagnostic_inline_max_chars=getattr(
-                agent_token_cfg,
-                "tool_result_fresh_diagnostic_inline_max_chars",
-                64_000,
             ),
             tool_result_dispatch_max_chars=getattr(
                 agent_token_cfg,
@@ -914,33 +897,6 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 agent_token_cfg,
                 "tool_result_store_retention_seconds",
                 7 * 24 * 60 * 60,
-            ),
-            source_diff_preservation_mode=getattr(
-                runner._config,
-                "source_diff_preservation_mode",
-                "log",
-            ),
-            source_diff_candidate_mode=getattr(
-                runner._config,
-                "source_diff_candidate_mode",
-                "log",
-            ),
-            runtime_state_capsule_mode=getattr(
-                runner._config,
-                "runtime_state_capsule_mode",
-                "off",
-            ),
-            text_only_tool_recovery_mode=getattr(
-                runner._config,
-                "text_only_tool_recovery_mode",
-                "off",
-            ),
-            finalize_evidence_gate=bool(
-                getattr(
-                    getattr(runner._config, "prompt", None),
-                    "finalize_evidence_gate",
-                    False,
-                )
             ),
         )
 
@@ -996,7 +952,7 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
     """Bind the typed ``Agent(...)`` constructor.
 
     The adapter injects the runner-singleton dependencies
-    (``usage_tracker``, ``session_flush_service``) so the stage never
+    (``usage_tracker``) so the stage never
     sees those runtime attributes directly.
     """
 
@@ -1066,7 +1022,6 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
             session_key=session_key,
             turn_call_logger=turn_call_logger,
             memory_sync_manager=memory_sync_manager,
-            session_flush_service=self._runner._session_flush_service,
             tool_registry=self._runner._tool_registry,
             tool_context=tool_context,
             usage_event_sink=usage_event_sink,
@@ -1101,6 +1056,7 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: Any | None = None,
+        compaction_request_context: Any | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -1108,11 +1064,23 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         provider_request_correlation: Any | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if compaction_request_context is not None and _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade, "compaction_request_context"
+        ):
+            correlation_kwargs["compaction_request_context"] = compaction_request_context
+        if attachment_path_resolver is not None and _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "attachment_path_resolver",
+        ):
+            correlation_kwargs["attachment_path_resolver"] = attachment_path_resolver
         if _accepts_keyword_arg(
             self._runner._maybe_compact_on_t3_upgrade,
             "provider_request_correlation",
@@ -1164,6 +1132,9 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
             "transcript_snapshot",
         ):
             correlation_kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            correlation_kwargs["expected_session_id"] = expected_session_id
+            correlation_kwargs["expected_session_epoch"] = expected_session_epoch
         return await self._runner._maybe_compact_on_t3_upgrade(
             session_key,
             turn,
@@ -1191,6 +1162,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: Any | None = None,
+        compaction_request_context: Any | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -1198,11 +1170,23 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         provider_request_correlation: Any | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if compaction_request_context is not None and _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact, "compaction_request_context"
+        ):
+            correlation_kwargs["compaction_request_context"] = compaction_request_context
+        if attachment_path_resolver is not None and _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "attachment_path_resolver",
+        ):
+            correlation_kwargs["attachment_path_resolver"] = attachment_path_resolver
         if _accepts_keyword_arg(
             self._runner._maybe_preflight_compact,
             "provider_request_correlation",
@@ -1254,6 +1238,9 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
             "transcript_snapshot",
         ):
             correlation_kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            correlation_kwargs["expected_session_id"] = expected_session_id
+            correlation_kwargs["expected_session_epoch"] = expected_session_epoch
         await self._runner._maybe_preflight_compact(
             session_key,
             context_window_tokens,
@@ -1281,22 +1268,37 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         session_key: str,
         trim_last_user: bool,
         bound_user_message_id: str | None = None,
-        restricted_turn: bool = False,
         transcript_snapshot: Any | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> str | None:
-        from opensquilla.engine.runtime import _accepts_keyword_arg
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _accepts_keyword_arg,
+            _has_session_storage,
+        )
 
         kwargs: dict[str, Any] = {
             "trim_last_user": trim_last_user,
             "bound_user_message_id": bound_user_message_id,
         }
-        if _accepts_keyword_arg(self._runner._load_history, "restricted_turn"):
-            kwargs["restricted_turn"] = restricted_turn
         if transcript_snapshot is not None and _accepts_keyword_arg(
             self._runner._load_history,
             "transcript_snapshot",
         ):
             kwargs["transcript_snapshot"] = transcript_snapshot
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(self._runner._load_history, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                kwargs["expected_session_id"] = expected_session_id
+                kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(self._runner._session_manager):
+                raise RuntimeError(
+                    "session history reader does not support exact ownership"
+                )
         return await self._runner._load_history(
             agent,
             session_key,
@@ -1387,10 +1389,17 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None:
         from opensquilla.engine.cache_break_monitor import notify_compaction
+        from opensquilla.engine.runtime import (
+            _accepts_explicit_keyword_arg,
+            _has_session_storage,
+        )
         from opensquilla.session.compaction_lifecycle import (
             COMPACTION_PERSISTED_EVENT,
             COMPACTION_TRIGGERED_EVENT,
@@ -1436,10 +1445,24 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             persist_kwargs["source_entries"] = source_entries
         if "source_preimage" in params or accepts_kwargs:
             persist_kwargs["source_preimage"] = source_preimage
+        if "source_context_fingerprint" in params or accepts_kwargs:
+            persist_kwargs["source_context_fingerprint"] = source_context_fingerprint
         if "source_boundary_message_id" in params or accepts_kwargs:
             persist_kwargs["source_boundary_message_id"] = source_boundary_message_id
         if "source_boundary_entry_id" in params or accepts_kwargs:
             persist_kwargs["source_boundary_entry_id"] = source_boundary_entry_id
+        if expected_session_id is not None or expected_session_epoch is not None:
+            supports_exact_owner = all(
+                _accepts_explicit_keyword_arg(persist_method, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            )
+            if supports_exact_owner:
+                persist_kwargs["expected_session_id"] = expected_session_id
+                persist_kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(session_manager):
+                raise RuntimeError(
+                    "compaction persistence does not support exact ownership"
+                )
         async with self._runner._session_write_context(session_key):
             installed = await persist_method(
                 session_key,
@@ -1531,24 +1554,12 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
         session_key: str,
         bootstrap_context_mode: str | None,
     ) -> None:
-        restricted_tool_boundary = bool(
-            getattr(agent, "_tool_context", None) is not None
-            and getattr(agent._tool_context, "exclusive_tools", None) is not None
-        )
         assembled = self._runner._assemble_prompt(
             agent_id,
             tool_defs,
             session_key=session_key,
-            bootstrap_context_mode=(
-                "restricted_tool_boundary"
-                if restricted_tool_boundary
-                else bootstrap_context_mode
-            ),
-            workspace_dir=(
-                None
-                if restricted_tool_boundary
-                else getattr(agent.config, "workspace_dir", None)
-            ),
+            bootstrap_context_mode=(bootstrap_context_mode),
+            workspace_dir=(getattr(agent.config, "workspace_dir", None)),
         )
         refreshed_prompt = (
             assembled[0] if isinstance(assembled, tuple) else assembled
@@ -1592,6 +1603,8 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
     them to the outer ``_run_turn`` terminal handler.
     """
 
+    supports_file_parse_facts = True
+
     def __init__(self, runner: TurnRunner) -> None:
         self._runner = runner
 
@@ -1602,7 +1615,10 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         *,
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
+        persist_image_material: bool | None = None,
+        image_workspace_dir: str | Path | None = None,
     ) -> list[Any] | None:
+        image_kwargs = self._image_material_kwargs(persist_image_material, image_workspace_dir)
         return self._runner._build_attachment_messages(
             message,
             attachments,
@@ -1613,7 +1629,27 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
             workspace_attachment_budget_bytes=(
                 workspace_attachment_budget_from_config(self._runner._config)
             ),
+            **image_kwargs,
         )
+
+    def _image_material_kwargs(
+        self,
+        persist_image_material: bool | None,
+        image_workspace_dir: str | Path | None,
+    ) -> dict[str, Any]:
+        if persist_image_material is None:
+            turn_config = getattr(self._runner, "_turn_config", None)
+            config = turn_config() if callable(turn_config) else self._runner._config
+            persist_image_material = (
+                getattr(getattr(config, "attachments", None), "persist_transcripts", True)
+                is not False
+            )
+        if persist_image_material:
+            return {}
+        return {
+            "persist_image_material": False,
+            "image_workspace_dir": image_workspace_dir,
+        }
 
     def build_cancellable(
         self,
@@ -1623,7 +1659,11 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
         cancel_check: Callable[[], None],
+        file_parse_fact_sink: Callable[[Any], object] | None = None,
+        persist_image_material: bool | None = None,
+        image_workspace_dir: str | Path | None = None,
     ) -> list[Any] | None:
+        image_kwargs = self._image_material_kwargs(persist_image_material, image_workspace_dir)
         return self._runner._build_attachment_messages(
             message,
             attachments,
@@ -1635,6 +1675,8 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
                 workspace_attachment_budget_from_config(self._runner._config)
             ),
             cancel_check=cancel_check,
+            file_parse_fact_sink=file_parse_fact_sink,
+            **image_kwargs,
         )
 
 
@@ -1674,6 +1716,10 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
         assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        provenance: dict[str, Any] | None = None,
+        assistant_replay: dict[str, Any] | None = None,
     ) -> TranscriptAppendResult:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1689,6 +1735,8 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["message_id"] = assistant_message_id
         if reasoning_content is not None:
             append_kwargs["reasoning_content"] = reasoning_content
+        if assistant_replay is not None:
+            append_kwargs["assistant_replay"] = assistant_replay
         if (
             turn_usage is not None
             and _accepts_keyword_arg(session_manager.append_message, "turn_usage")
@@ -1696,6 +1744,12 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["turn_usage"] = turn_usage
         if _accepts_keyword_arg(session_manager.append_message, "token_count"):
             append_kwargs["token_count"] = token_count
+        if expected_session_id is not None:
+            append_kwargs["expected_session_id"] = expected_session_id
+        if expected_session_epoch is not None:
+            append_kwargs["expected_session_epoch"] = expected_session_epoch
+        if provenance is not None:
+            append_kwargs["provenance"] = provenance
         entry = await self._runner._append_session_message(session_key, **append_kwargs)
         raw_message_id = getattr(entry, "message_id", None)
         message_id = (
@@ -1728,7 +1782,13 @@ class _TurnRunnerTurnMemoryCaptureAdapter(TurnMemoryCapturePort):
         input_provenance: dict[str, Any] | None,
         run_kind: str,
         no_memory_capture: bool,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> None:
+        owner_kwargs: dict[str, Any] = {}
+        if expected_session_id is not None or expected_session_epoch is not None:
+            owner_kwargs["expected_session_id"] = expected_session_id
+            owner_kwargs["expected_session_epoch"] = expected_session_epoch
         await self._runner._capture_turn_memory(
             agent_id=agent_id,
             session_key=session_key,
@@ -1739,6 +1799,7 @@ class _TurnRunnerTurnMemoryCaptureAdapter(TurnMemoryCapturePort):
             input_provenance=input_provenance,
             run_kind=run_kind,
             no_memory_capture=no_memory_capture,
+            **owner_kwargs,
         )
 
 class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
@@ -1762,6 +1823,8 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
         session_key: str,
         done_event: DoneEvent,
         resolved_model: str,  # noqa: ARG002 - reserved for future model-pinning
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> CostRollupResult | None:
         from opensquilla.session.cost_rollup import (
             normalize_event_cost_source,
@@ -1786,7 +1849,16 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             if callable(reconcile):
                 reconciled = await reconcile(
                     session_key=session_key,
-                    expected_epoch=max(0, int(getattr(current_session, "epoch", 0) or 0)),
+                    expected_epoch=(
+                        expected_session_epoch
+                        if expected_session_epoch is not None
+                        else max(0, int(getattr(current_session, "epoch", 0) or 0))
+                    ),
+                    **(
+                        {"expected_session_id": expected_session_id}
+                        if expected_session_id is not None
+                        else {}
+                    ),
                 )
                 if reconciled is not None:
                     return CostRollupResult(
@@ -1936,6 +2008,15 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             # silently bypass squilla-router routing.
             await session_manager.update(
                 session_key,
+                **(
+                    {
+                        "expected_session_id": expected_session_id,
+                        "expected_session_epoch": expected_session_epoch,
+                    }
+                    if expected_session_id is not None
+                    or expected_session_epoch is not None
+                    else {}
+                ),
                 input_tokens=next_input_tokens,
                 output_tokens=next_output_tokens,
                 total_tokens=next_total_tokens,
@@ -1971,9 +2052,8 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
     """Bind ``TurnRunner._persist_turn_error`` as a Protocol port.
 
     Forwards verbatim. The helper owns its own log-and-continue
-    try/except and guards both ``session_manager is None`` and
-    ``event is None`` internally, so the adapter and stage body have no
-    additional guards.
+    try/except and guards ``event is None`` internally; diagnostic recording
+    does not require a session manager.
     """
 
     def __init__(self, runner: TurnRunner) -> None:
@@ -1985,11 +2065,25 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         session_key: str,
         event: ErrorEvent | None,
         append_transcript: bool = True,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        turn_id: str | None = None,
+        surface: str = "unknown",
+        provider: str | None = None,
+        model: str | None = None,
+        fallback_hops: int = 0,
     ) -> None:
         await self._runner._persist_turn_error(
             session_key,
             event,
             append_transcript=append_transcript,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            turn_id=turn_id,
+            surface=surface,
+            provider=provider,
+            model=model,
+            fallback_hops=fallback_hops,
         )
 
 

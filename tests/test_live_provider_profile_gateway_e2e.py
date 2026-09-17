@@ -691,6 +691,12 @@ def test_attachment_capacity_fixture_is_over_raw_admission_but_media_bounded() -
     assert metrics["history_turn_count"] == 3
     assert metrics["history_image_count"] == 4
     assert metrics["last_history_image_count"] == 2
+    assert len(fixture["history_base64"]) == 4
+    all_images = [*fixture["history_base64"], fixture["current_attachment"]["data"]]
+    assert metrics["projected_media_tokens"] == sum(
+        e2e.estimate_provider_media_tokens("image", 0, encoded_data=data)
+        for data in all_images
+    )
     assert (
         metrics["raw_history_estimated_tokens"]
         >= metrics["router_admission_token_limit"] + e2e.ATTACHMENT_CAPACITY_MIN_RAW_MARGIN_TOKENS
@@ -756,7 +762,7 @@ def test_attachment_capacity_seed_uses_only_isolated_session_state(tmp_path: Pat
     assert session_state == (0, "router")
 
 
-def test_attachment_capacity_config_is_single_call_and_includes_image_tier(
+def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "gateway.toml"
@@ -785,14 +791,18 @@ def test_attachment_capacity_config_is_single_call_and_includes_image_tier(
     assert data["agent_runtime_timeout_seconds"] == 75.0
     assert data["task_runtime"]["turn_hard_deadline_s"] == 75.0
     assert data["naming"]["enabled"] is False
-    assert data["squilla_router"]["tiers"]["image_model"] == tiers["image_model"]
-    assert data["squilla_router"]["tiers"]["image_model"]["model"] == "kimi-k2.6"
-    assert all(tiers[slot]["supports_image"] is False for slot in e2e.TEXT_PROFILE_SLOTS)
+    assert "image_model" not in data["squilla_router"]["tiers"]
+    assert data["squilla_router"]["tiers"]["c2"] == tiers["c2"]
+    assert tiers["c2"]["model"] == "kimi-k2.6"
+    assert tiers["c2"]["image_only"] is False
+    assert all("supports_image" not in tiers[slot] for slot in ("c0", "c1", "c2", "c3"))
     assert (
         data["models"]["tokenrhythm"]["deepseek-v4-pro-0813"]["context_window"]
         == e2e.ATTACHMENT_CAPACITY_BASE_CONTEXT_WINDOW_TOKENS
     )
     assert data["models"]["tokenrhythm"]["kimi-k2.6"]["supports_vision"] is True
+    for slot in ("c0", "c1", "c3"):
+        assert data["models"]["tokenrhythm"][tiers[slot]["model"]]["supports_vision"] is False
 
 
 def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
@@ -866,6 +876,8 @@ def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
     assert case["usage"]["physical_response_count"] == 1
     assert case["usage"]["compaction_count"] == 0
     assert case["usage"]["provider_proof_fits"] is True
+    assert case["usage"]["provider_proof_media_blocks"] == 5
+    assert case["usage"]["request_history_user_turn_count"] == 3
 
 
 @pytest.mark.parametrize(
@@ -938,12 +950,14 @@ def test_attachment_capacity_runner_bounds_provider_http_failures_to_one_call(
 @pytest.mark.parametrize(
     ("mode", "expected_failure", "expected_response_count"),
     [
-        ("empty", "implementation", 0),
+        # An empty SSE body has no terminal evidence and raises incomplete_stream.
+        ("empty", "transport", 0),
         ("truncated", "implementation", 0),
         ("marker_missing", "implementation", 1),
         ("timeout", "transport", 0),
     ],
 )
+@pytest.mark.ci_serial
 def test_attachment_capacity_runner_fails_closed_for_stream_faults(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1121,10 +1135,26 @@ def _attachment_capacity_evidence_records(
     fixture: dict[str, object],
     session_key: str,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    retained = fixture["retained_base64"]
-    assert isinstance(retained, list)
     current = fixture["current_attachment"]
     assert isinstance(current, dict)
+    history_messages = []
+    for turn in fixture["turns"]:
+        envelope = json.loads(turn["user"])
+        history_messages.extend(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": envelope["text"]},
+                        *[
+                            {"type": "image", "data": image["data"]}
+                            for image in envelope["attachments"]
+                        ],
+                    ],
+                },
+                {"role": "assistant", "content": turn["assistant"]},
+            ]
+        )
     request = {
         "session_key": session_key,
         "kind": "llm_request",
@@ -1133,15 +1163,7 @@ def _attachment_capacity_evidence_records(
         "payload": {
             "messages": [
                 {"role": "system", "content": "bounded system"},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Historical image turn three."},
-                        {"type": "image", "data": retained[0]},
-                        {"type": "image", "data": retained[1]},
-                    ],
-                },
-                {"role": "assistant", "content": "history answer"},
+                *history_messages,
                 {
                     "role": "user",
                     "content": "[Request context for this turn]\nsynthetic context",
@@ -1174,7 +1196,7 @@ def _attachment_capacity_evidence_records(
             {
                 "step_name": "apply_squilla_router",
                 "routing_source": "image_route",
-                "routed_tier": "image_model",
+                "routed_tier": "c2",
             }
         ],
     }
@@ -1202,7 +1224,7 @@ def test_attachment_capacity_evidence_enforces_zero_or_one_call_boundary(
             "fits": True,
             "estimated_tokens": 1000,
             "effective_proof_token_budget": 80_000,
-            "media_blocks": 3,
+            "media_blocks": 5,
         },
         turn_error=None,
     )
@@ -1214,9 +1236,9 @@ def test_attachment_capacity_evidence_enforces_zero_or_one_call_boundary(
         assert evidence["actual_request_model"] == "kimi-k2.6"
         assert evidence["actual_response_model"] == "kimi-k2.6"
         assert evidence["request_projection"] == {
-            "history_user_turn_count": 1,
-            "media_blocks": 3,
-            "excluded_old_media_absent": True,
+            "history_user_turn_count": 3,
+            "media_blocks": 5,
+            "expected_history_text_present": True,
             "expected_media_present": True,
             "expected_media_text_absent": True,
         }
@@ -1240,7 +1262,7 @@ def test_attachment_capacity_evidence_requires_no_compaction(
             "fits": True,
             "estimated_tokens": 1000,
             "effective_proof_token_budget": 80_000,
-            "media_blocks": 3,
+            "media_blocks": 5,
         },
         turn_error=None,
     )
@@ -1280,7 +1302,7 @@ def test_attachment_capacity_failure_taxonomy_is_preserved(
         session_key=session_key,
         fixture=fixture,
         session_metrics={"compaction_count": 0},
-        proof={"fits": True, "media_blocks": 3},
+        proof={"fits": True, "media_blocks": 5},
         turn_error=turn_error,
     )
 
@@ -1345,7 +1367,7 @@ def test_attachment_capacity_failure_taxonomy_uses_safe_llm_error_code(
         session_key=session_key,
         fixture=fixture,
         session_metrics={"compaction_count": 0},
-        proof={"fits": True, "media_blocks": 3},
+        proof={"fits": True, "media_blocks": 5},
         turn_error="The task failed before it could finish.",
     )
 
@@ -1363,8 +1385,11 @@ def test_attachment_capacity_failure_taxonomy_uses_safe_llm_error_code(
         "proof_media_count",
         "input_usage",
         "output_usage",
-        "old_media_leak",
-        "retained_media_as_text",
+        "extra_media",
+        "missing_history_image",
+        "missing_history_user_text",
+        "missing_history_assistant_text",
+        "history_media_as_text",
     ],
 )
 def test_attachment_capacity_evidence_rejects_each_safety_invariant(
@@ -1373,7 +1398,7 @@ def test_attachment_capacity_evidence_rejects_each_safety_invariant(
     fixture = e2e._attachment_capacity_fixture()  # noqa: SLF001
     session_key = "agent:main:webchat:offline-broken-invariant"
     records, decisions = _attachment_capacity_evidence_records(fixture, session_key)
-    proof = {"fits": True, "media_blocks": 3}
+    proof = {"fits": True, "media_blocks": 5}
 
     request = records[0]
     response = records[1]
@@ -1398,11 +1423,19 @@ def test_attachment_capacity_evidence_rejects_each_safety_invariant(
         response["payload"]["usage"]["input_tokens"] = 0
     elif broken_invariant == "output_usage":
         response["payload"]["usage"]["output_tokens"] = 0
-    elif broken_invariant == "old_media_leak":
-        request["payload"]["messages"][0]["content"] += fixture["excluded_base64"][0]
-    elif broken_invariant == "retained_media_as_text":
+    elif broken_invariant == "extra_media":
+        request["payload"]["messages"][1]["content"].append(
+            {"type": "image", "data": fixture["current_attachment"]["data"]}
+        )
+    elif broken_invariant == "missing_history_image":
+        request["payload"]["messages"][1]["content"].pop()
+    elif broken_invariant == "missing_history_user_text":
+        request["payload"]["messages"][1]["content"].pop(0)
+    elif broken_invariant == "missing_history_assistant_text":
+        request["payload"]["messages"][2]["content"] = ""
+    elif broken_invariant == "history_media_as_text":
         request["payload"]["messages"][1]["content"] = "".join(
-            fixture["retained_base64"]
+            fixture["history_base64"]
         )
 
     evidence = e2e._evaluate_attachment_capacity_evidence(  # noqa: SLF001
@@ -1595,7 +1628,7 @@ def test_attachment_capacity_requires_independent_request_and_response_models(
         session_key=session_key,
         fixture=fixture,
         session_metrics={"compaction_count": 0},
-        proof={"fits": True, "media_blocks": 3},
+        proof={"fits": True, "media_blocks": 5},
         turn_error=None,
     )
 
@@ -1604,9 +1637,17 @@ def test_attachment_capacity_requires_independent_request_and_response_models(
     assert evidence["ok"] is False
 
 
-def test_attachment_capacity_proof_parser_keeps_only_scalar_evidence(tmp_path: Path) -> None:
+@pytest.mark.parametrize("structured", [False, True])
+def test_attachment_capacity_proof_parser_keeps_only_scalar_evidence(
+    tmp_path: Path, structured: bool,
+) -> None:
     log_path = tmp_path / "debug.log"
     log_path.write_text(
+        '2026-01-01T00:00:00Z [DEBUG] opensquilla.provider: '
+        '{"estimated_tokens": 37720, "effective_proof_token_budget": 87704, '
+        '"media_blocks_reserved": 3, "fits": true, '
+        '"event": "provider.request_proof", "top_contributors": ["must-not-survive"]}\n'
+        if structured else
         "provider.request_proof estimated_tokens=37720 "
         "effective_proof_token_budget=87704 media_blocks_reserved=3 fits=True "
         "top_contributors=['must-not-survive']\n",
@@ -1624,8 +1665,9 @@ def test_attachment_capacity_proof_parser_keeps_only_scalar_evidence(tmp_path: P
     assert "must-not-survive" not in json.dumps(proof)
 
 
+@pytest.mark.parametrize("structured", [False, True])
 def test_attachment_capacity_http_error_parser_keeps_only_unique_status_scalars(
-    tmp_path: Path,
+    tmp_path: Path, structured: bool,
 ) -> None:
     stdout = tmp_path / "gateway.stdout.log"
     debug = tmp_path / "debug.log"
@@ -1637,6 +1679,9 @@ def test_attachment_capacity_http_error_parser_keeps_only_unique_status_scalars(
         encoding="utf-8",
     )
     debug.write_text(
+        '{"status_code": 429, "event": "provider.chat_http_error"}\n'
+        '{"status_code": 503, "event": "provider.chat_http_error"}\n'
+        if structured else
         "provider.chat_http_error provider='tokenrhythm' model='kimi-k2.6' "
         "status_code=429 response_body_chars=88\n"
         "provider.chat_http_error provider='tokenrhythm' model='kimi-k2.6' "

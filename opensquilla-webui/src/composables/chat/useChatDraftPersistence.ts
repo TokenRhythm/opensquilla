@@ -44,6 +44,17 @@ export function recentDraftSessionKey(): string {
   }
 }
 
+/** Return a specific recoverable draft without changing the recent pointer. */
+export function recoverableDraftSessionKey(key: string): string {
+  try {
+    return validDraftSessionKey(key) && Boolean(localStorage.getItem(draftKey(key)))
+      ? key
+      : ''
+  } catch {
+    return ''
+  }
+}
+
 export interface UseChatDraftPersistenceOptions {
   sessionKey: Ref<string>
   inputText: Ref<string>
@@ -61,6 +72,17 @@ export interface UseChatDraftPersistenceOptions {
  * complaint. Storage failures (private mode, quota) are swallowed.
  */
 export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions) {
+  let pendingRebind: { from: string; to: string } | null = null
+
+  /** Move one proven fresh draft without loading another session's composer. */
+  function rebindCurrentDraft(key: string): void {
+    const previous = options.sessionKey.value
+    if (!previous || !key || previous === key) return
+    const from = pendingRebind?.to === previous ? pendingRebind.from : previous
+    pendingRebind = { from, to: key }
+    options.sessionKey.value = key
+  }
+
   function saveDraft(key: string, text: string): void {
     if (!key) return
     try {
@@ -112,6 +134,15 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   watch(
     options.sessionKey,
     (key, previousKey) => {
+      const rebind = pendingRebind
+      pendingRebind = null
+      if (rebind && rebind.from === previousKey && rebind.to === key) {
+        // Read text at watcher execution, not at Hello: typing may continue
+        // before Vue flushes. In-memory preservation also works without storage.
+        clearDraft(previousKey)
+        saveDraft(key, options.inputText.value)
+        return
+      }
       if (previousKey && previousKey !== key) {
         saveDraft(previousKey, options.inputText.value)
         options.inputText.value = loadDraft(key)
@@ -132,5 +163,5 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     saveDraft(options.sessionKey.value, text)
   })
 
-  return { saveDraft, loadDraft, clearDraft, discardRecentDraft }
+  return { saveDraft, loadDraft, clearDraft, discardRecentDraft, rebindCurrentDraft }
 }

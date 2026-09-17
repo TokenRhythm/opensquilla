@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +22,6 @@ from opensquilla.engine import (
     ToolResult,
     WarningEvent,
 )
-from opensquilla.engine.agent import _progress_watchdog_guidance_message
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.session_sanitize import session_payload_chars
 from opensquilla.engine.types import CompactionEvent
@@ -49,8 +47,6 @@ from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceeded,
     prove_provider_payload,
 )
-from opensquilla.sandbox.config import SandboxSettings
-from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.compaction import CompactionResult
@@ -58,13 +54,8 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionPlan,
     CompactionExecutionTarget,
 )
-from opensquilla.tools.dispatch import build_tool_handler
-from opensquilla.tools.mutation_receipts import (
-    fingerprint_path,
-    record_semantic_mutation_receipt,
-)
-from opensquilla.tools.registry import get_default_registry
-from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
+from opensquilla.tools.types import CallerKind, ToolContext
+from tests.helpers.compaction import synthetic_compaction_config
 
 RAW_CURRENT_TURN_OVERFLOW_MESSAGE = (
     "Context overflow is in the current turn's recent tool calls or "
@@ -143,6 +134,7 @@ class _StallingProvider:
 
     def __init__(self) -> None:
         self.calls: list[list[Message]] = []
+        self.stream_started = asyncio.Event()
         self.stream_closed = False
 
     def chat(
@@ -156,6 +148,7 @@ class _StallingProvider:
 
     async def _stream(self) -> AsyncIterator[Any]:
         try:
+            self.stream_started.set()
             await asyncio.sleep(60.0)
             yield ProviderText(text="late")
         finally:
@@ -412,7 +405,6 @@ def test_preflight_history_capacity_reserves_non_history_envelope() -> None:
             max_tokens=512,
             system_prompt="system policy " * 100,
             request_context_prompt="request capsule " * 50,
-            flush_enabled=False,
         ),
     )
     active_prompt = "active user " * 300
@@ -447,6 +439,92 @@ def test_preflight_history_capacity_reserves_non_history_envelope() -> None:
     ) == persisted_capacity
 
 
+@pytest.mark.parametrize("consumer_window_known", [False, True])
+def test_raw_attachment_capacity_keeps_durable_consumer_window_provenance(
+    consumer_window_known: bool,
+) -> None:
+    base_provider = OpenAIProvider(api_key="test", model="base-model")
+    agent = Agent(
+        provider=OpenAIProvider(api_key="test", model="routed-model"),
+        config=AgentConfig(
+            model_id="routed-model",
+            context_window_tokens=32_000,
+            context_window_known=True,
+            max_tokens=8_192,
+        ),
+    )
+    agent.bind_durable_consumer(
+        provider=base_provider,
+        model_id="base-model",
+        context_window_tokens=200_000,
+        context_window_known=consumer_window_known,
+        max_output_tokens=8_192,
+        provider_request_proof_max_chars=30_000,
+    )
+    arguments = {
+        "active_user_message": "synthetic",
+        "active_user_in_history": False,
+        "attachments": [{"type": "text", "content": "small"}],
+        "context_window_tokens": 200_000,
+        "consumer_provider": base_provider,
+        "consumer_model_id": "base-model",
+        "consumer_max_output_tokens": 8_192,
+        "consumer_provider_request_max_chars": 30_000,
+    }
+
+    known_route_capacity = agent.preflight_history_capacity(**arguments)
+    agent.config.context_window_known = False
+    unknown_route_capacity = agent.preflight_history_capacity(**arguments)
+
+    assert known_route_capacity == unknown_route_capacity
+    tokens, chars = known_route_capacity
+    assert tokens > 0 and chars > 0
+    if consumer_window_known:
+        assert tokens > 100_000
+    else:
+        assert tokens < 30_000 // 4
+
+
+def test_raw_attachment_capacity_reserves_actual_anthropic_generation_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import agent as agent_module
+    from opensquilla.provider.anthropic import AnthropicProvider
+
+    provider = AnthropicProvider(api_key="test", model="claude-sonnet-4-20250514")
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="claude-sonnet-4-20250514",
+            context_window_tokens=128_000,
+            max_tokens=1_024,
+            thinking=True,
+            thinking_budget_tokens=10_000,
+        ),
+    )
+    observed: list[dict[str, Any]] = []
+
+    def capture_proof(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        observed.append({"generation_budget": payload["max_tokens"], **kwargs})
+        return prove_provider_payload(payload, **kwargs)
+
+    monkeypatch.setattr(agent_module, "prove_provider_payload", capture_proof)
+    capacity, _ = agent.preflight_history_capacity(
+        active_user_message="synthetic",
+        active_user_in_history=False,
+        attachments=[{"type": "text", "content": "small"}],
+    )
+
+    assert len(observed) == 1
+    # Anthropic raises the wire output cap to thinking + 4,096. Both input
+    # dimensions must reserve that cap once, before proof headroom and fixed
+    # request content are subtracted.
+    assert observed[0]["generation_budget"] == 14_096
+    assert observed[0]["token_budget"] == 128_000 - 14_096 - 20_000
+    assert observed[0]["proof_budget"] == 4 * observed[0]["token_budget"]
+    assert 0 < capacity < observed[0]["token_budget"] - 4_096
+
+
 def test_durable_consumer_projection_uses_base_model_config() -> None:
     base_provider = OpenAIProvider(
         api_key="test",
@@ -463,7 +541,6 @@ def test_durable_consumer_projection_uses_base_model_config() -> None:
                 supports_reasoning=True,
                 reasoning_format="dashscope",
             ),
-            flush_enabled=False,
         ),
     )
 
@@ -491,371 +568,6 @@ def test_durable_consumer_projection_uses_base_model_config() -> None:
     assert "enable_thinking" not in projection.payload
     assert "reasoning_effort" not in projection.payload
     assert projection.proof["raw_proof_budget"] == 12_000
-
-
-class _RepeatedToolFailureThenDoneProvider:
-    provider_name = "fake"
-
-    def __init__(self, *, tool_retries: int = 3) -> None:
-        self.tool_retries = tool_retries
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number > self.tool_retries:
-            yield ProviderText(text="handled")
-            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-            return
-        tool_use_id = f"cmd-{call_number}"
-        yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
-        yield ProviderToolUseEnd(
-            tool_use_id=tool_use_id,
-            tool_name="exec_command",
-            arguments={"command": "python build_pptx.py", "timeout": 30},
-        )
-        yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _RepeatedSuccessfulToolThenDoneProvider:
-    provider_name = "fake"
-
-    def __init__(
-        self,
-        *,
-        tool_retries: int = 4,
-        tool_name: str = "grep_search",
-        arguments: dict[str, Any] | None = None,
-    ) -> None:
-        self.tool_retries = tool_retries
-        self.tool_name = tool_name
-        self.calls: list[list[Message]] = []
-        self.arguments = arguments or {
-            "path": "/testbed/crates/regex/src/matcher.rs",
-            "pattern": 'impl.*Matcher"',
-        }
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number > self.tool_retries:
-            yield ProviderText(text="handled")
-            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-            return
-        tool_use_id = f"{self.tool_name}-{call_number}"
-        yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name=self.tool_name)
-        yield ProviderToolUseEnd(
-            tool_use_id=tool_use_id,
-            tool_name=self.tool_name,
-            arguments=dict(self.arguments),
-        )
-        yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _FinalThenDoneProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            yield ProviderText(text="Implemented the fix.")
-        else:
-            yield ProviderText(text="No code change is required.")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _FailedToolThenFinalProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            tool_use_id = "cmd-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="exec_command",
-                arguments={"command": "cargo build 2>&1 | tail -30"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text=f"final attempt {call_number}")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _PostWriteFailedVerificationThenSourceProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            tool_use_id = "edit-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="edit_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="edit_file",
-                arguments={"path": "src.py", "old_text": "old", "new_text": "new"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 2:
-            tool_use_id = "cmd-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="exec_command",
-                arguments={"command": "cargo build --release --bin ruff 2>&1 | tail -30"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if 3 <= call_number <= 5:
-            tool_use_id = f"read-{call_number}"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="read_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="read_file",
-                arguments={"path": "src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text="done")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _StableVerifiedDiffThenSourceProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-        self.tool_lists: list[list[Any] | None] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        self.tool_lists.append(tools)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            tool_use_id = "edit-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="edit_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="edit_file",
-                arguments={"path": "src.py", "old_text": "old", "new_text": "new"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 2:
-            tool_use_id = "cmd-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="exec_command",
-                arguments={"command": "pytest tests/test_src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if 3 <= call_number <= 8:
-            tool_use_id = f"read-{call_number}"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="read_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="read_file",
-                arguments={"path": "src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text=f"final after convergence {call_number}")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _RepeatedFailedVerificationFinalProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            tool_use_id = "edit-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="edit_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="edit_file",
-                arguments={"path": "src.py", "old_text": "old", "new_text": "new"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number in {2, 4}:
-            tool_use_id = f"cmd-{call_number}"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="exec_command",
-                arguments={"command": "make check"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text=f"final attempt {call_number}")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _PostWriteCleanMavenVerificationThenFinalProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            tool_use_id = "edit-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="edit_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="edit_file",
-                arguments={"path": "src.py", "old_text": "old", "new_text": "new"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 2:
-            tool_use_id = "cmd-2"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="exec_command",
-                arguments={"command": "mvn test -Dtest=ParserTest 2>&1 | tail -20"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text=f"final attempt {call_number}")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _EditThenFinalProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            tool_use_id = "edit-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="edit_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="edit_file",
-                arguments={"path": "src.py", "old_text": "old", "new_text": "new"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text=f"final attempt {call_number}")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
 
 
 class _NoWorkspaceWriteThenPatchProvider:
@@ -912,49 +624,6 @@ class _NoWorkspaceWriteThenPatchProvider:
 
     async def list_models(self) -> list[Any]:
         return []
-
-
-class _ScratchReproThenPatchProvider(_NoWorkspaceWriteThenPatchProvider):
-    def __init__(self, scratch_dir: Path) -> None:
-        super().__init__()
-        self.scratch_dir = scratch_dir
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number <= 17:
-            async for event in super()._stream(call_number):
-                yield event
-            return
-        if call_number in {18, 19, 21}:
-            name_by_call = {
-                18: "repro_issue.tcl",
-                19: "notes.md",
-                21: "notes_after_source.md",
-            }
-            name = name_by_call[call_number]
-            tool_use_id = {
-                18: "write-repro",
-                19: "write-notes",
-                21: "write-notes-after-source",
-            }[call_number]
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="write_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="write_file",
-                arguments={
-                    "path": str(self.scratch_dir / name),
-                    "content": (
-                        "puts repro\n" if call_number == 18 else "investigation notes\n"
-                    ),
-                },
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 20:
-            async for event in super()._stream(18):
-                yield event
-            return
-        yield ProviderText(text="done")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
 class _WritePatchFileThenApplyProvider:
@@ -1030,106 +699,6 @@ class _PathPatchThenFinalProvider:
 
     async def list_models(self) -> list[Any]:
         return []
-
-
-class _PatchFailureRecoveryProvider(_NoWorkspaceWriteThenPatchProvider):
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number <= 17:
-            tool_use_id = f"read-{call_number}"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="read_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="read_file",
-                arguments={"path": "src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number in {18, 20}:
-            tool_use_id = f"patch-{call_number}"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="apply_patch")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="apply_patch",
-                arguments={
-                    "patch": (
-                        "*** Begin Patch\n"
-                        "*** Update File: src.py\n"
-                        "@@\n"
-                        "-old\n"
-                        "+new\n"
-                        "*** End Patch\n"
-                    )
-                },
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 19:
-            tool_use_id = "read-recovery"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="read_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="read_file",
-                arguments={"path": "src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text="done")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-
-class _EditFailureRecoveryProvider(_NoWorkspaceWriteThenPatchProvider):
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number <= 17:
-            tool_use_id = f"read-{call_number}"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="read_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="read_file",
-                arguments={"path": "src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 18:
-            tool_use_id = "edit-missing-context"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="edit_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="edit_file",
-                arguments={"path": "src.py", "old_text": "missing", "new_text": "new"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 19:
-            tool_use_id = "read-recovery"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="read_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="read_file",
-                arguments={"path": "src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 20:
-            tool_use_id = "patch-after-read"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="apply_patch")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="apply_patch",
-                arguments={
-                    "patch": (
-                        "*** Begin Patch\n"
-                        "*** Update File: src.py\n"
-                        "@@\n"
-                        "-old\n"
-                        "+new\n"
-                        "*** End Patch\n"
-                    )
-                },
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text="done")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
 class _HighUsageToolLoopProvider:
@@ -1394,48 +963,6 @@ async def test_turn_error_persist_skips_error_time_compaction_for_exhaustion() -
 
 
 @pytest.mark.asyncio
-async def test_agent_blocks_repeated_identical_tool_failures_before_tail_growth() -> None:
-    calls = 0
-
-    async def _failing_tool(call: Any) -> ToolResult:
-        nonlocal calls
-        calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="write failed: " + ("permission denied " * 200),
-            is_error=True,
-        )
-
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        config=AgentConfig(
-            tool_failure_loop_block_threshold=3,
-        ),
-        tool_handler=_failing_tool,
-    )
-    tool_call = ToolCall(
-        tool_use_id="write-1",
-        tool_name="write_file",
-        arguments={"path": "index.html", "content": "<html>bad</html>"},
-    )
-
-    first = await agent._execute_tool(tool_call)
-    second = await agent._execute_tool(tool_call)
-    third = await agent._execute_tool(tool_call)
-
-    assert first.is_error is True
-    assert second.is_error is True
-    assert third.is_error is True
-    assert calls == 2
-    assert "tool_failure_loop_exhausted" not in third.content
-    assert "Do not retry this exact call unchanged" in third.content
-    assert len(third.content) < len(second.content)
-    assert third.execution_status is not None
-    assert third.execution_status.get("reason") == "tool_failure_loop_exhausted"
-
-
-@pytest.mark.asyncio
 async def test_agent_tool_failure_loop_allows_changed_arguments() -> None:
     calls = 0
 
@@ -1481,1346 +1008,6 @@ async def test_agent_tool_failure_loop_allows_changed_arguments() -> None:
     assert changed.content == "write failed"
 
 
-@pytest.mark.asyncio
-async def test_agent_tool_failure_loop_result_returns_to_model_instead_of_terminal_error() -> None:
-    provider = _RepeatedToolFailureThenDoneProvider(tool_retries=3)
-    handler_calls = 0
-
-    async def _failing_tool(call: Any) -> ToolResult:
-        nonlocal handler_calls
-        handler_calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="syntax error",
-            is_error=True,
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            tool_failure_loop_block_threshold=3,
-            max_iterations=5,
-            flush_enabled=False,
-        ),
-        tool_handler=_failing_tool,
-    )
-
-    events = [event async for event in agent.run_turn("build the deck")]
-
-    assert handler_calls == 2
-    assert len(provider.calls) == 4
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert not any(
-        isinstance(event, ErrorEvent)
-        and getattr(event, "code", None) == "tool_failure_loop_exhausted"
-        for event in events
-    )
-    assert any(
-        getattr(event, "kind", None) == "tool_result"
-        and (getattr(event, "execution_status", None) or {}).get("reason")
-        == "tool_failure_loop_exhausted"
-        for event in events
-    )
-    assert not any(
-        isinstance(event, WarningEvent) and event.code == "repeated_tool_call_recovery"
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_recovers_repeated_successful_identical_tool_calls(
-    tmp_path,
-) -> None:
-    provider = _RepeatedSuccessfulToolThenDoneProvider(tool_retries=4)
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    handler_calls = 0
-
-    async def _tool(call: Any) -> ToolResult:
-        nonlocal handler_calls
-        handler_calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="No matches",
-            is_error=False,
-        )
-
-    def _matching_tool_use_count(messages: list[Message]) -> int:
-        count = 0
-        for message in messages:
-            if not isinstance(message.content, list):
-                continue
-            for block in message.content:
-                if (
-                    getattr(block, "type", None) == "tool_use"
-                    and getattr(block, "name", None) == "grep_search"
-                    and getattr(block, "input", None) == provider.arguments
-                ):
-                    count += 1
-        return count
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            repeated_tool_call_recovery_threshold=3,
-            max_iterations=8,
-            flush_enabled=False,
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_handler=_tool,
-    )
-
-    events = [event async for event in agent.run_turn("find the matcher impl")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert handler_calls == 2
-    assert len(provider.calls) == 5
-    assert _matching_tool_use_count(provider.calls[-1]) == 2
-    assert any(
-        isinstance(event, WarningEvent)
-        and event.code == "repeated_tool_call_recovery"
-        for event in events
-    )
-    logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    recovery_events = [
-        event
-        for event in logged
-        if event.get("mechanism") == "repeated_tool_call_recovery"
-    ]
-    assert len(recovery_events) == 2
-    assert recovery_events[0]["evidence"]["repeat_count"] == 3
-    assert recovery_events[1]["evidence"]["repeat_count"] == 4
-
-
-@pytest.mark.asyncio
-async def test_agent_recovers_repeated_successful_identical_exec_commands() -> None:
-    provider = _RepeatedSuccessfulToolThenDoneProvider(
-        tool_retries=4,
-        tool_name="exec_command",
-        arguments={
-            "command": (
-                "cd /testbed && printf 'some.domain.com/x\\n' | "
-                "./target/release/rg --no-config -w domain 2>&1 || true"
-            )
-        },
-    )
-    handler_calls = 0
-
-    async def _tool(call: Any) -> ToolResult:
-        nonlocal handler_calls
-        handler_calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="",
-            is_error=False,
-        )
-
-    def _matching_tool_use_count(messages: list[Message]) -> int:
-        count = 0
-        for message in messages:
-            if not isinstance(message.content, list):
-                continue
-            for block in message.content:
-                if (
-                    getattr(block, "type", None) == "tool_use"
-                    and getattr(block, "name", None) == "exec_command"
-                    and getattr(block, "input", None) == provider.arguments
-                ):
-                    count += 1
-        return count
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            repeated_tool_call_recovery_threshold=3,
-            max_iterations=8,
-            flush_enabled=False,
-        ),
-        tool_handler=_tool,
-    )
-
-    events = [event async for event in agent.run_turn("verify the regex behavior")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert handler_calls == 2
-    assert len(provider.calls) == 5
-    assert _matching_tool_use_count(provider.calls[-1]) == 2
-    assert any(
-        isinstance(event, WarningEvent) and event.code == "repeated_tool_call_recovery"
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_repeated_git_diff_not_covered_by_default() -> None:
-    provider = _RepeatedSuccessfulToolThenDoneProvider(
-        tool_retries=4,
-        tool_name="git_diff",
-        arguments={"path": "/testbed"},
-    )
-    handler_calls = 0
-
-    async def _tool(call: Any) -> ToolResult:
-        nonlocal handler_calls
-        handler_calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="diff --git a/f b/f",
-            is_error=False,
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            repeated_tool_call_recovery_threshold=3,
-            max_iterations=8,
-            flush_enabled=False,
-        ),
-        tool_handler=_tool,
-    )
-
-    events = [event async for event in agent.run_turn("show the current diff")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert handler_calls == 4
-    assert not any(
-        isinstance(event, WarningEvent) and event.code == "repeated_tool_call_recovery"
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_repeated_extra_tool_recovery_covers_git_diff() -> None:
-    provider = _RepeatedSuccessfulToolThenDoneProvider(
-        tool_retries=4,
-        tool_name="git_diff",
-        arguments={"path": "/testbed"},
-    )
-    handler_calls = 0
-
-    async def _tool(call: Any) -> ToolResult:
-        nonlocal handler_calls
-        handler_calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="diff --git a/f b/f",
-            is_error=False,
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            repeated_tool_call_recovery_threshold=3,
-            repeated_tool_call_recovery_extra_tools=("git_diff",),
-            max_iterations=8,
-            flush_enabled=False,
-        ),
-        tool_handler=_tool,
-    )
-
-    events = [event async for event in agent.run_turn("show the current diff")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert handler_calls == 2
-    assert any(
-        isinstance(event, WarningEvent) and event.code == "repeated_tool_call_recovery"
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_tool_failure_loop_resets_after_successful_state_change() -> None:
-    calls: list[str] = []
-
-    async def _tool(call: Any) -> ToolResult:
-        calls.append(call.tool_name)
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="ok" if call.tool_name == "edit_file" else "syntax error",
-            is_error=call.tool_name != "edit_file",
-        )
-
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        config=AgentConfig(tool_failure_loop_block_threshold=3),
-        tool_handler=_tool,
-    )
-    command_call = ToolCall(
-        tool_use_id="cmd-1",
-        tool_name="exec_command",
-        arguments={"command": "python build_pptx.py", "timeout": 30},
-    )
-
-    await agent._execute_tool(command_call)
-    await agent._execute_tool(
-        ToolCall(
-            tool_use_id="cmd-2",
-            tool_name="exec_command",
-            arguments=command_call.arguments,
-        )
-    )
-    await agent._execute_tool(
-        ToolCall(
-            tool_use_id="edit-1",
-            tool_name="edit_file",
-            arguments={"path": "build_pptx.py", "old_text": "bad", "new_text": "good"},
-        )
-    )
-    retry_after_edit = await agent._execute_tool(
-        ToolCall(
-            tool_use_id="cmd-3",
-            tool_name="exec_command",
-            arguments=command_call.arguments,
-        )
-    )
-
-    assert calls == ["exec_command", "exec_command", "edit_file", "exec_command"]
-    assert retry_after_edit.content == "syntax error"
-    assert retry_after_edit.execution_status is None
-
-
-@pytest.mark.asyncio
-async def test_agent_progress_watchdog_log_mode_suppresses_model_warning() -> None:
-    provider = _RepeatedToolFailureThenDoneProvider(tool_retries=2)
-
-    async def _failing_tool(call: Any) -> ToolResult:
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="syntax error",
-            is_error=True,
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=5,
-            flush_enabled=False,
-            progress_watchdog_mode="log",
-            progress_watchdog_repeated_tool_error_threshold=2,
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_handler=_failing_tool,
-    )
-
-    events = [event async for event in agent.run_turn("build the deck")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 3
-    assert not any(
-        isinstance(message.content, str) and "[Runtime progress warning]" in message.content
-        for message in provider.calls[2]
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_progress_watchdog_can_warn_model_after_repeated_tool_errors() -> None:
-    provider = _RepeatedToolFailureThenDoneProvider(tool_retries=2)
-
-    async def _failing_tool(call: Any) -> ToolResult:
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="syntax error",
-            is_error=True,
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=5,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            progress_watchdog_repeated_tool_error_threshold=2,
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_handler=_failing_tool,
-    )
-
-    events = [event async for event in agent.run_turn("build the deck")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 3
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime progress warning]" in message.content
-        and "Do not repeat the same action unchanged" in message.content
-        for message in provider.calls[2]
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_warn_model_recovers_once_before_empty_workspace_diff_final(
-    tmp_path,
-) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    provider = _FinalThenDoneProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=3,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-        ),
-        tool_context=ToolContext(workspace_dir=str(tmp_path)),
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 2
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime progress warning]" in message.content
-        and "no visible workspace diff" in message.content
-        for message in provider.calls[1]
-    )
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "No code change is required."
-
-
-def _init_git_repo_with_source(tmp_path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    source = tmp_path / "src" / "parser.py"
-    source.parent.mkdir(parents=True)
-    source.write_text("old\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src/parser.py"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True)
-    source.write_text("new\n", encoding="utf-8")
-
-
-@pytest.mark.asyncio
-async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> None:
-    _init_git_repo_with_source(tmp_path)
-    (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    provider = _FinalThenDoneProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=3,
-            flush_enabled=False,
-            progress_watchdog_mode="log",
-            final_diff_contract_mode="warn_model",
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_context=ToolContext(
-            workspace_dir=str(tmp_path),
-            workspace_file_writes=[
-                {"relative_path": "src/parser.py", "path": str(tmp_path / "src/parser.py")}
-            ],
-            workspace_mutation_receipts=[
-                {"relative_path": "src/parser.py", "changed": True, "partial": False},
-                {"relative_path": "src/parser.py", "changed": False, "partial": False},
-                {"relative_path": "debug_case.py", "changed": True, "partial": True},
-            ],
-            workspace_mutation_records=[
-                {
-                    "tool": "exec_command",
-                    "paths": [{"relative_path": "debug_case.py", "classification": "scratch"}],
-                }
-            ],
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 2
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime final-diff check]" in message.content
-        and "debug_case.py" in message.content
-        for message in provider.calls[1]
-    )
-    assert any(
-        isinstance(event, WarningEvent)
-        and event.code == "final_diff_contract_recovery"
-        for event in events
-    )
-    logged = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(
-        event.get("feature") == "final_diff_contract"
-        and event.get("injected_to_model") is True
-        and event.get("reason") == "scratch_artifact_in_final_diff"
-        for event in logged
-    )
-    final_diff_events = [
-        event for event in logged if event.get("feature") == "final_diff_contract"
-    ]
-    assert final_diff_events
-    assert all(
-        "runtime_events.jsonl" not in (event.get("diff_paths") or [])
-        for event in final_diff_events
-    )
-    final_diff_event = final_diff_events[0]
-    expected_receipt_summary = {
-        "workspace_mutation_receipt_count": 3,
-        "changed_receipt_count": 2,
-        "noop_receipt_count": 1,
-        "partial_receipt_count": 1,
-    }
-    for key, value in expected_receipt_summary.items():
-        assert final_diff_event["details"][key] == value
-        assert final_diff_event["evidence"][key] == value
-
-
-@pytest.mark.asyncio
-async def test_agent_final_diff_contract_log_mode_does_not_prompt_model(tmp_path) -> None:
-    _init_git_repo_with_source(tmp_path)
-    (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
-    runtime_events_path = tmp_path.parent / f"{tmp_path.name}-runtime_events.jsonl"
-    provider = _FinalThenDoneProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=3,
-            flush_enabled=False,
-            progress_watchdog_mode="log",
-            final_diff_contract_mode="log",
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_context=ToolContext(workspace_dir=str(tmp_path)),
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 1
-    assert not [
-        event
-        for event in events
-        if isinstance(event, WarningEvent) and event.code == "final_diff_contract_recovery"
-    ]
-    logged = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(
-        event.get("feature") == "final_diff_contract"
-        and event.get("injected_to_model") is False
-        for event in logged
-    )
-    final_diff_event = next(
-        event for event in logged if event.get("feature") == "final_diff_contract"
-    )
-    expected_receipt_summary = {
-        "workspace_mutation_receipt_count": 0,
-        "changed_receipt_count": 0,
-        "noop_receipt_count": 0,
-        "partial_receipt_count": 0,
-    }
-    for key, value in expected_receipt_summary.items():
-        assert final_diff_event["details"][key] == value
-        assert final_diff_event["evidence"][key] == value
-
-
-@pytest.mark.asyncio
-async def test_agent_final_diff_contract_warns_for_empty_diff_after_workspace_write(
-    tmp_path,
-) -> None:
-    _init_git_repo_with_source(tmp_path)
-    (tmp_path / "src" / "parser.py").write_text("old\n", encoding="utf-8")
-    runtime_events_path = tmp_path.parent / f"{tmp_path.name}-empty-diff-events.jsonl"
-    provider = _FinalThenDoneProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=3,
-            flush_enabled=False,
-            progress_watchdog_mode="log",
-            final_diff_contract_mode="warn_model",
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_context=ToolContext(
-            workspace_dir=str(tmp_path),
-            workspace_file_writes=[
-                {"relative_path": "src/parser.py", "path": str(tmp_path / "src/parser.py")}
-            ],
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 2
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime final-diff check]" in message.content
-        and "Current diff paths: <none>" in message.content
-        and "src/parser.py" in message.content
-        for message in provider.calls[1]
-    )
-    assert any(
-        isinstance(event, WarningEvent)
-        and event.code == "final_diff_contract_recovery"
-        for event in events
-    )
-    logged = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(
-        event.get("feature") == "final_diff_contract"
-        and event.get("injected_to_model") is True
-        and event.get("reason") == "workspace_writes_without_final_diff"
-        and event.get("diff_paths") == []
-        for event in logged
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_records_final_diff_contract_on_finish_error_with_diff(tmp_path) -> None:
-    _init_git_repo_with_source(tmp_path)
-    (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
-    runtime_events_path = tmp_path.parent / f"{tmp_path.name}-error-runtime_events.jsonl"
-    provider = _ProviderRaisesTimeout()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_provider_retries=0,
-            timeout=60.0,
-            iteration_timeout=30.0,
-            flush_enabled=False,
-            progress_watchdog_mode="log",
-            final_diff_contract_mode="warn_model",
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_context=ToolContext(workspace_dir=str(tmp_path)),
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert len(provider.calls) == 1
-    assert any(
-        isinstance(event, ErrorEvent)
-        and event.code == "request_error"
-        and event.failure_kind == "transport_transient"
-        for event in events
-    )
-    assert not any(
-        isinstance(event, ErrorEvent) and event.code == "iteration_timeout"
-        for event in events
-    )
-    assert "provider transport timeout" not in repr(events)
-    assert not [
-        event
-        for event in events
-        if isinstance(event, WarningEvent) and event.code == "final_diff_contract_recovery"
-    ]
-    logged = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(event.get("reason") == "finish_error_with_non_empty_diff" for event in logged)
-    final_diff_events = [
-        event for event in logged if event.get("feature") == "final_diff_contract"
-    ]
-    assert final_diff_events
-    final_diff_event = final_diff_events[0]
-    assert final_diff_event["mode"] == "warn_model"
-    assert final_diff_event["action"] == "observe"
-    assert final_diff_event["injected_to_model"] is False
-    assert final_diff_event["reason"] == "scratch_artifact_in_final_diff"
-    assert final_diff_event["diff_paths"] == ["debug_case.py", "src/parser.py"]
-    assert final_diff_event["evidence"]["scratch_paths"] == ["debug_case.py"]
-    assert final_diff_event["evidence"]["source_paths"] == ["src/parser.py"]
-
-
-@pytest.mark.asyncio
-async def test_agent_warn_model_recovers_before_final_after_failed_tool_with_diff(
-    tmp_path,
-) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src.py"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    provider = _FailedToolThenFinalProvider()
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-
-    async def _failing_after_write(call: Any) -> ToolResult:
-        tool_context.workspace_file_writes.append(
-            {"relative_path": "src.py", "path": str(source)}
-        )
-        source.write_text("new\n", encoding="utf-8")
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content=(
-                "[shell_warning:masked_pipeline_failure]\n"
-                "error[E0308]: mismatched types"
-            ),
-            is_error=True,
-            execution_status={
-                "version": 1,
-                "status": "error",
-                "exit_code": 0,
-                "timed_out": False,
-                "truncated": False,
-                "reason": "masked_pipeline_failure",
-                "source": "adapter",
-                "preservation_class": "diagnostic",
-            },
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=4,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_handler=_failing_after_write,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 3
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime progress warning]" in message.content
-        and "masked_pipeline_failure" in message.content
-        and "Do not finalize this patch yet" in message.content
-        for message in provider.calls[2]
-    )
-    assert any(
-        isinstance(event, WarningEvent)
-        and event.code == "failed_tool_finalization_recovery"
-        for event in events
-    )
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 3"
-    assert agent.config.metadata["failed_tool_finalization_recoveries"] == 1
-
-
-@pytest.mark.asyncio
-async def test_agent_rewarns_after_new_failed_focused_verification_with_diff(
-    tmp_path,
-) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src.py"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    verification_calls = 0
-
-    async def _tool(call: Any) -> ToolResult:
-        nonlocal verification_calls
-        if call.tool_name == "edit_file":
-            source.write_text("new\n", encoding="utf-8")
-            tool_context.workspace_file_writes.append(
-                {"relative_path": "src.py", "path": str(source)}
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="edited",
-            )
-        if call.tool_name == "exec_command":
-            verification_calls += 1
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=f"error: focused validation failure {verification_calls}",
-                is_error=True,
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _RepeatedFailedVerificationFinalProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=8,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    warning_events = [
-        event
-        for event in events
-        if isinstance(event, WarningEvent)
-        and event.code == "failed_tool_finalization_recovery"
-    ]
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 6
-    assert len(warning_events) == 2
-    assert agent.config.metadata["failed_tool_finalization_recoveries"] == 2
-    assert any(
-        isinstance(message.content, str)
-        and "focused validation still failed" in message.content
-        and "focused validation failure 1" in message.content
-        for message in provider.calls[3]
-    )
-    assert any(
-        isinstance(message.content, str)
-        and "focused validation still failed" in message.content
-        and "focused validation failure 2" in message.content
-        for message in provider.calls[5]
-    )
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 6"
-
-
-@pytest.mark.asyncio
-async def test_agent_does_not_warn_after_clean_maven_verification_summary(
-    tmp_path,
-) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src.py"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    success_log = (
-        "exit_code=0\n"
-        "[INFO] Results:\n"
-        "[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0\n"
-        "[INFO] Scanned 862 class file(s) for forbidden API invocations, 0 error(s).\n"
-        "[INFO] BUILD SUCCESS\n"
-    )
-    assert Agent._tool_result_has_validation_success_signal(success_log)
-    assert not Agent._tool_result_has_failure_signal(success_log)
-    short_success_log = "test result: ok. 4 passed; 0 failed\n"
-    assert Agent._tool_result_has_validation_success_signal(short_success_log)
-    assert not Agent._tool_result_has_failure_signal(short_success_log)
-
-    async def _tool(call: Any) -> ToolResult:
-        if call.tool_name == "edit_file":
-            source.write_text("new\n", encoding="utf-8")
-            tool_context.workspace_file_writes.append(
-                {"relative_path": "src.py", "path": str(source)}
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="edited",
-            )
-        if call.tool_name == "exec_command":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=success_log,
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _PostWriteCleanMavenVerificationThenFinalProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=5,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert not [
-        event
-        for event in events
-        if isinstance(event, WarningEvent)
-        and event.code == "failed_tool_finalization_recovery"
-    ]
-    assert len(provider.calls) == 3
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 3"
-    assert "failed_tool_finalization_recoveries" not in agent.config.metadata
-
-
-@pytest.mark.asyncio
-async def test_agent_warns_before_final_without_successful_focused_verification(
-    tmp_path,
-) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src.py"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-
-    async def _tool(call: Any) -> ToolResult:
-        if call.tool_name == "edit_file":
-            source.write_text("new\n", encoding="utf-8")
-            tool_context.workspace_file_writes.append(
-                {"relative_path": "src.py", "path": str(source)}
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="edited",
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _EditThenFinalProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=4,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-        ),
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 3
-    assert any(
-        isinstance(message.content, str)
-        and "before any focused validation command succeeded" in message.content
-        for message in provider.calls[2]
-    )
-    assert agent.config.metadata["failed_tool_finalization_recoveries"] == 1
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 3"
-
-
-def test_agent_focused_verification_recognizes_build_and_linter_checks() -> None:
-    agent = object.__new__(Agent)
-
-    assert agent._command_looks_like_focused_verification(
-        "cd /testbed && cargo build --release --bin ruff 2>&1 | tail -30"
-    )
-    assert agent._command_looks_like_focused_verification(
-        "cd /testbed && cargo check -p ruff_linter"
-    )
-    assert agent._command_looks_like_focused_verification(
-        "./target/release/ruff check /tmp/repro.py --select=F523 --fix"
-    )
-    assert agent._command_looks_like_focused_verification("make check")
-    assert agent._command_looks_like_focused_verification(
-        "./run-tests.py -i basics/try_finally_return.py"
-    )
-    assert agent._command_looks_like_focused_verification("tests/jqtest")
-
-
-def test_focused_verification_classifier_success() -> None:
-    result = ToolResult(
-        tool_use_id="tool-1",
-        tool_name="exec_command",
-        content="exit_code=0\n3 passed\n",
-        is_error=False,
-    )
-
-    assert Agent._classify_focused_verification_result(result) == "success"
-
-
-def test_focused_verification_classifier_failure() -> None:
-    result = ToolResult(
-        tool_use_id="tool-1",
-        tool_name="exec_command",
-        content="exit_code=1\nFAILED tests/test_demo.py::test_demo\n",
-        is_error=True,
-    )
-
-    assert Agent._classify_focused_verification_result(result) == "failure"
-
-
-def test_focused_verification_classifier_unknown_without_success_signal() -> None:
-    result = ToolResult(
-        tool_use_id="tool-1",
-        tool_name="exec_command",
-        content="exit_code=0\nran command and wrote logs\n",
-        is_error=False,
-    )
-
-    assert Agent._classify_focused_verification_result(result) == "unknown"
-
-
-def test_agent_source_context_signature_includes_exec_source_reads() -> None:
-    agent = object.__new__(Agent)
-    source_result = ToolResult(
-        tool_use_id="tool-1",
-        tool_name="exec_command",
-        content="1\tfn important() {}\n",
-    )
-
-    signature = agent._source_context_signature(
-        [
-            ToolCall(
-                tool_use_id="tool-1",
-                tool_name="exec_command",
-                arguments={"command": "sed -n '1,20p' src/lib.rs"},
-            )
-        ],
-        [source_result],
-    )
-
-    assert signature is not None
-
-
-def test_agent_source_context_signature_ignores_non_source_exec_commands() -> None:
-    agent = object.__new__(Agent)
-    test_result = ToolResult(
-        tool_use_id="tool-1",
-        tool_name="exec_command",
-        content="test result: ok. 4 passed; 0 failed\n",
-    )
-
-    signature = agent._source_context_signature(
-        [
-            ToolCall(
-                tool_use_id="tool-1",
-                tool_name="exec_command",
-                arguments={"command": "cargo test -p parser"},
-            )
-        ],
-        [test_result],
-    )
-
-    assert signature is None
-
-
-def test_agent_filters_gitlink_only_porcelain_status() -> None:
-    status = (
-        " m modules/oniguruma\n"
-        " M src/parser.y\n"
-        " M sample.json\n"
-        "A  sample2.json\n"
-        "?? sample.json\n"
-        "?? scratch.py\n"
-        "?? src/new_module.py\n"
-    )
-
-    filtered = Agent._filter_gitlink_porcelain_status(
-        status,
-        {"modules/oniguruma"},
-    )
-
-    assert "modules/oniguruma" not in filtered
-    assert " M src/parser.y" in filtered
-    assert " M sample.json" in filtered
-    assert "A  sample2.json" not in filtered
-    assert "?? sample.json" not in filtered
-    assert "?? scratch.py" not in filtered
-    assert "?? src/new_module.py" in filtered
-    assert Agent._filter_gitlink_porcelain_status(
-        " m modules/oniguruma\n",
-        {"modules/oniguruma"},
-    ) == ""
-
-
-@pytest.mark.asyncio
-async def test_agent_ignores_gitlink_only_workspace_diff(tmp_path) -> None:
-    submodule = tmp_path / "submodule"
-    repo = tmp_path / "repo"
-    submodule.mkdir()
-    repo.mkdir()
-    for path in (submodule, repo):
-        subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@example.com"],
-            cwd=path,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Test"],
-            cwd=path,
-            check=True,
-            capture_output=True,
-        )
-    (submodule / "file.txt").write_text("clean\n", encoding="utf-8")
-    subprocess.run(["git", "add", "file.txt"], cwd=submodule, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "submodule init"],
-        cwd=submodule,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "add",
-            str(submodule),
-            "modules/oniguruma",
-        ],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(["git", "commit", "-m", "repo init"], cwd=repo, check=True, capture_output=True)
-    (repo / "modules/oniguruma/file.txt").write_text("dirty\n", encoding="utf-8")
-    (repo / "sample.json").write_text('{"repro": true}\n', encoding="utf-8")
-
-    agent = Agent(
-        provider=_FinalThenDoneProvider(),
-        config=AgentConfig(flush_enabled=False),
-        tool_context=ToolContext(workspace_dir=str(repo)),
-    )
-
-    assert await agent._workspace_git_status_porcelain() == ""
-    assert agent._workspace_diff_paths_for_runtime_event() == []
-    assert agent._workspace_diff_fingerprint_for_runtime_event() is None
-
-    (repo / "src").mkdir()
-    (repo / "src/new_module.py").write_text("value = 1\n", encoding="utf-8")
-
-    status = await agent._workspace_git_status_porcelain()
-    assert status == "?? src/new_module.py\n"
-    assert agent._workspace_diff_paths_for_runtime_event() == ["src/new_module.py"]
-    assert agent._workspace_diff_fingerprint_for_runtime_event() is not None
-
-
-def test_progress_watchdog_post_write_guidance_is_diff_focused() -> None:
-    message = _progress_watchdog_guidance_message(
-        "verified_workspace_diff_continued_tool_activity",
-        {
-            "count": 3,
-            "workspace_write_count": 1,
-        },
-    )
-
-    assert "You already have repository edits" in message
-    assert "latest verification result" in message
-    assert "Stop broad source exploration" in message
-
-
-def test_progress_watchdog_repeated_post_write_guidance_limits_source_tools() -> None:
-    message = _progress_watchdog_guidance_message(
-        "verified_workspace_diff_continued_tool_activity",
-        {
-            "count": 6,
-            "workspace_write_count": 1,
-        },
-    )
-
-    assert "have received this warning again" in message
-    assert "Do not call read_file" in message
-    assert "make a source edit" in message
-
-
-def test_progress_watchdog_code_fix_no_write_guidance_requires_workspace_edit() -> None:
-    message = _progress_watchdog_guidance_message(
-        "tool_activity_without_workspace_write",
-        {
-            "count": 16,
-            "scratch_write_count": 4,
-            "workspace_change_likely_required": True,
-        },
-    )
-
-    assert "appears to require a repository patch" in message
-    assert "no tracked workspace source file has been changed yet" in message
-    assert "targeted source reads/searches" in message
-    assert "writing more scratch notes" in message
-    assert "use an available source-edit tool" in message
-    assert "apply_patch, edit_file, or write_file" not in message
-
-
-def test_workspace_edit_gate_rejects_unconfigured_external_write_file(tmp_path) -> None:
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(workspace_dir=str(tmp_path)),
-    )
-    gate_details = {
-        "reason": "tool_activity_without_workspace_write",
-        "count": 16,
-        "threshold": 8,
-    }
-
-    scratch_result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-1",
-            tool_name="write_file",
-            arguments={"path": "/tmp/notes.md", "content": "notes"},
-        ),
-        gate_details,
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-    workspace_result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-2",
-            tool_name="write_file",
-            arguments={"path": str(tmp_path / "src.py"), "content": "patch"},
-        ),
-        gate_details,
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert scratch_result is not None
-    assert scratch_result.is_error is True
-    assert scratch_result.execution_status["reason"] == "workspace_edit_required"
-    assert workspace_result is None
-
-
-@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
-def test_workspace_edit_gate_allows_configured_scratch_repro_file(
-    tmp_path,
-    tool_name: str,
-) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    tool_context = ToolContext(
-        workspace_dir=str(workspace),
-        scratch_dir=str(scratch),
-    )
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=tool_context,
-    )
-    gate_details = {
-        "reason": "tool_activity_without_workspace_write",
-        "count": 16,
-        "threshold": 8,
-    }
-    target = scratch / "repro_issue.tcl"
-    if tool_name == "edit_file":
-        target.write_text("before\n", encoding="utf-8")
-    arguments = (
-        {"path": str(target), "content": "puts repro\n"}
-        if tool_name == "write_file"
-        else {"path": str(target), "old_text": "before", "new_text": "after"}
-    )
-    tool_call = ToolCall(
-        tool_use_id=f"{tool_name}-scratch",
-        tool_name=tool_name,
-        arguments=arguments,
-    )
-
-    result = agent._workspace_edit_gate_tool_result(
-        tool_call,
-        gate_details,
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert result is None
-    tool_context.scratch_file_writes.append(
-        {
-            "path": str(target),
-            "relative_path": "repro_issue.tcl",
-            "name": "repro_issue.tcl",
-            "suffix": ".tcl",
-        }
-    )
-    assert agent._effective_workspace_write_records() == []
-
-
-def test_workspace_edit_gate_allows_custom_external_scratch_root(tmp_path) -> None:
-    # Anchored to the temp drive so the path is absolute on Windows too;
-    # a bare "/opt/..." has no drive there and falls back to cwd-relative.
-    scratch = Path(tmp_path.anchor) / "opensquilla-custom-scratch"
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(tmp_path),
-            scratch_dir=str(scratch),
-        ),
-    )
-
-    result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-custom-scratch",
-            tool_name="write_file",
-            arguments={
-                "path": str(scratch / "reproduce_issue.py"),
-                "content": "print('repro')\n",
-            },
-        ),
-        {
-            "reason": "tool_activity_without_workspace_write",
-            "count": 16,
-            "threshold": 8,
-        },
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert result is None
-
-
 @pytest.mark.parametrize("scratch_relation", ["workspace_ancestor", "same_root"])
 def test_tool_context_rejects_scratch_root_containing_workspace(
     tmp_path,
@@ -2850,645 +1037,6 @@ def test_agent_revalidates_mutated_tool_context_roots(tmp_path) -> None:
         )
 
 
-def test_configured_hidden_scratch_diff_is_not_source_progress(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    scratch = workspace / ".artifacts"
-    scratch.mkdir()
-    target = scratch / "repro.py"
-    target.write_text("before\n", encoding="utf-8")
-    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=workspace,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=workspace,
-        check=True,
-    )
-    subprocess.run(["git", "add", ".artifacts/repro.py"], cwd=workspace, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True)
-    target.write_text("after\n", encoding="utf-8")
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-
-    assert agent._workspace_tracked_diff_paths_for_nudge() == []
-    assert agent._workspace_has_source_change_evidence() is False
-    observation = agent._final_diff_contract_observation()
-    assert observation is not None
-    assert observation.source_paths == []
-    assert observation.scratch_paths == [".artifacts/repro.py"]
-
-
-def test_final_diff_contract_skips_non_repository_workspace(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(workspace_dir=str(workspace)),
-    )
-
-    assert agent._workspace_diff_paths_for_final_diff_contract() is None
-    assert agent._final_diff_contract_observation() is None
-
-
-@pytest.mark.asyncio
-async def test_workspace_edit_gate_allows_real_configured_scratch_edit_file(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    # Scratch write tracking is a workspace policy layer; opt out of the
-    # sandbox-disabled Full Host Access fallback so it stays active.
-    monkeypatch.setenv("OPENSQUILLA_SANDBOX_DISABLED_FULL_HOST", "off")
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    target = scratch / "repro_issue.py"
-    target.write_text("before\n", encoding="utf-8")
-    tool_context = ToolContext(
-        is_owner=True,
-        interaction_mode=InteractionMode.UNATTENDED,
-        workspace_dir=str(workspace),
-        scratch_dir=str(scratch),
-        file_edit_requires_fresh_read=True,
-    )
-    configure_runtime(
-        SandboxSettings(
-            sandbox=False,
-            security_grading=False,
-            allow_legacy_mode=True,
-        ),
-        workspace=workspace,
-    )
-    try:
-        real_handler = build_tool_handler(get_default_registry(), tool_context)
-        agent = Agent(
-            provider=_ContextOverflowProvider(success_after=1),
-            tool_handler=real_handler,
-            tool_context=tool_context,
-        )
-        read_result = await agent._execute_tool(
-            ToolCall(
-                tool_use_id="read-scratch-repro",
-                tool_name="read_file",
-                arguments={"path": str(target)},
-            )
-        )
-        edit_call = ToolCall(
-            tool_use_id="edit-scratch-repro",
-            tool_name="edit_file",
-            arguments={
-                "path": str(target),
-                "old_text": "before",
-                "new_text": "after",
-            },
-        )
-        gate_result = agent._workspace_edit_gate_tool_result(
-            edit_call,
-            {
-                "reason": "tool_activity_without_workspace_write",
-                "count": 16,
-                "threshold": 8,
-            },
-            recovery_read_paths=set(),
-            recovery_reads_remaining=0,
-        )
-        edit_result = await agent._execute_tool(edit_call)
-    finally:
-        reset_runtime()
-
-    assert read_result.is_error is False
-    assert gate_result is None
-    assert edit_result.is_error is False
-    assert target.read_text(encoding="utf-8") == "after\n"
-    assert [record["relative_path"] for record in tool_context.scratch_file_writes] == [
-        "repro_issue.py"
-    ]
-    assert agent._effective_workspace_write_records() == []
-
-
-@pytest.mark.parametrize(
-    "relative_path",
-    [
-        "notes.md",
-        "notes.txt",
-        "notes",
-        "../outside/repro.py",
-        "../workspace/source.py",
-    ],
-)
-def test_workspace_edit_gate_rejects_non_repro_or_escaped_configured_scratch_write(
-    tmp_path,
-    relative_path: str,
-) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-    gate_details = {
-        "reason": "tool_activity_without_workspace_write",
-        "count": 16,
-        "threshold": 8,
-    }
-
-    result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-scratch",
-            tool_name="write_file",
-            arguments={
-                "path": str(scratch / relative_path),
-                "content": "not source progress\n",
-            },
-        ),
-        gate_details,
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert result is not None
-    assert result.is_error is True
-    assert result.execution_status["reason"] == "workspace_edit_required"
-
-
-@pytest.mark.parametrize(
-    ("path", "allowed"),
-    [
-        ("repro.py", True),
-        ("case.tcl", True),
-        ("notes.md", False),
-        ("../outside/repro.py", False),
-    ],
-)
-def test_workspace_edit_gate_only_allows_write_scratch_repro_scripts(
-    tmp_path,
-    path: str,
-    allowed: bool,
-) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-
-    result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-scratch-tool",
-            tool_name="write_scratch",
-            arguments={"path": path, "content": "diagnostic\n"},
-        ),
-        {
-            "reason": "tool_activity_without_workspace_write",
-            "count": 16,
-            "threshold": 8,
-        },
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert (result is None) is allowed
-    if result is not None:
-        assert result.is_error is True
-        assert result.execution_status["reason"] == "workspace_edit_required"
-
-
-def test_workspace_edit_gate_rejects_configured_scratch_prefix_collision(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    scratch_collision = tmp_path / "scratch-elsewhere"
-    workspace.mkdir()
-    scratch.mkdir()
-    scratch_collision.mkdir()
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-
-    result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-prefix-collision",
-            tool_name="write_file",
-            arguments={
-                "path": str(scratch_collision / "repro.py"),
-                "content": "print('outside')\n",
-            },
-        ),
-        {
-            "reason": "tool_activity_without_workspace_write",
-            "count": 16,
-            "threshold": 8,
-        },
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert result is not None
-    assert result.is_error is True
-    assert result.execution_status["reason"] == "workspace_edit_required"
-
-
-@pytest.mark.parametrize("path_form", ["absolute", "relative"])
-def test_workspace_edit_gate_rejects_configured_scratch_inside_workspace(
-    tmp_path,
-    path_form: str,
-) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = workspace / ".scratch"
-    scratch.mkdir(parents=True)
-    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
-    tool_context = ToolContext(
-        workspace_dir=str(workspace),
-        scratch_dir=str(scratch),
-    )
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=tool_context,
-    )
-
-    result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-nested-scratch",
-            tool_name="write_file",
-            arguments={
-                "path": (
-                    str(scratch / "repro.py")
-                    if path_form == "absolute"
-                    else ".scratch/repro.py"
-                ),
-                "content": "print('repro')\n",
-            },
-        ),
-        {
-            "reason": "tool_activity_without_workspace_write",
-            "count": 16,
-            "threshold": 8,
-        },
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert result is not None
-    assert result.is_error is True
-    assert result.execution_status["reason"] == "workspace_edit_required"
-    tool_context.workspace_file_writes.append(
-        {
-            "path": str(scratch / "repro.py"),
-            "relative_path": ".scratch/repro.py",
-            "created": True,
-        }
-    )
-    tool_context.workspace_mutation_receipts.append(
-        {
-            "relative_path": ".scratch/repro.py",
-            "classification": "scratch",
-            "changed": True,
-            "partial": False,
-        }
-    )
-    assert agent._effective_workspace_write_records() == []
-    assert agent._workspace_mutation_receipt_counts() == {
-        "changed_receipt_count": 0,
-        "noop_receipt_count": 0,
-        "partial_receipt_count": 0,
-    }
-    assert agent._workspace_has_source_change_evidence() is False
-
-
-@pytest.mark.parametrize("escape_destination", ["outside", "workspace"])
-def test_workspace_edit_gate_rejects_configured_scratch_symlink_escape(
-    tmp_path,
-    escape_destination: str,
-) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    outside = tmp_path / "outside"
-    workspace.mkdir()
-    scratch.mkdir()
-    outside.mkdir()
-    escape = scratch / "escape"
-    try:
-        escape.symlink_to(
-            workspace if escape_destination == "workspace" else outside,
-            target_is_directory=True,
-        )
-    except OSError as exc:
-        pytest.skip(f"symlinks unavailable: {exc}")
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-
-    result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-symlink-escape",
-            tool_name="write_file",
-            arguments={
-                "path": str(escape / "repro.py"),
-                "content": "print('outside')\n",
-            },
-        ),
-        {
-            "reason": "tool_activity_without_workspace_write",
-            "count": 16,
-            "threshold": 8,
-        },
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert result is not None
-    assert result.is_error is True
-    assert result.execution_status["reason"] == "workspace_edit_required"
-
-
-@pytest.mark.parametrize(("filename", "allowed"), [("repro.py", True), ("notes.md", False)])
-def test_workspace_edit_gate_classifies_workspace_symlink_into_scratch(
-    tmp_path,
-    filename: str,
-    allowed: bool,
-) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    scratch_alias = workspace / "scratch-alias"
-    try:
-        scratch_alias.symlink_to(scratch, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"symlinks unavailable: {exc}")
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-
-    result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-scratch-alias",
-            tool_name="write_file",
-            arguments={
-                "path": f"scratch-alias/{filename}",
-                "content": "diagnostic\n",
-            },
-        ),
-        {
-            "reason": "tool_activity_without_workspace_write",
-            "count": 16,
-            "threshold": 8,
-        },
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert (result is None) is allowed
-    if result is not None:
-        assert result.execution_status["reason"] == "workspace_edit_required"
-
-
-@pytest.mark.parametrize("target_kind", ["external", "nested", "nested_escape"])
-def test_workspace_edit_gate_rejects_apply_patch_to_configured_scratch(
-    tmp_path,
-    target_kind: str,
-) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    scratch = (
-        tmp_path / "scratch" if target_kind == "external" else workspace / ".scratch"
-    )
-    scratch.mkdir()
-    patch_target = {
-        "external": str(scratch / "repro.py"),
-        "nested": ".scratch/repro.py",
-        "nested_escape": ".scratch/../src.py",
-    }[target_kind]
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-
-    result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="patch-scratch",
-            tool_name="apply_patch",
-            arguments={
-                "patch": "\n".join(
-                    [
-                        "*** Begin Patch",
-                        f"*** Add File: {patch_target}",
-                        "+print('repro')",
-                        "*** End Patch",
-                    ]
-                )
-            },
-        ),
-        {
-            "reason": "tool_activity_without_workspace_write",
-            "count": 16,
-            "threshold": 8,
-        },
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert result is not None
-    assert result.is_error is True
-    assert result.execution_status["reason"] == "workspace_edit_required"
-
-
-def test_finalize_evidence_classifies_each_apply_patch_target(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = workspace / ".scratch"
-    scratch.mkdir(parents=True)
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-    tool_call = ToolCall(
-        tool_use_id="patch-mixed",
-        tool_name="apply_patch",
-        arguments={
-            "patch": (
-                "*** Begin Patch\n"
-                "*** Add File: .scratch/repro.py\n"
-                "+print('repro')\n"
-                "*** Update File: src.py\n"
-                "@@ -1,1 +1,1 @@\n"
-                "-old\n"
-                "+new\n"
-                "*** End Patch\n"
-            )
-        },
-    )
-
-    assert agent._finalize_evidence_write_targets(tool_call) == [
-        (".scratch/repro.py", True),
-        ("src.py", False),
-    ]
-
-    context_literal_call = ToolCall(
-        tool_use_id="patch-context-literal",
-        tool_name="apply_patch",
-        arguments={
-            "patch": (
-                "  *** Begin Patch  \n"
-                "*** Update File: docs/example.txt\n"
-                "@@ -1,1 +1,1 @@\n"
-                " *** Add File: .scratch/repro.py\n"
-                "-old\n"
-                "+new\n"
-                "  *** End Patch  \n"
-            )
-        },
-    )
-    assert agent._workspace_edit_gate_apply_patch_raw_target_paths(
-        context_literal_call
-    ) == ["docs/example.txt"]
-    assert agent._finalize_evidence_write_targets(
-        ToolCall(
-            tool_use_id="edit-source-scratch",
-            tool_name="edit_source",
-            arguments={"path": ".scratch/repro.py"},
-        )
-    ) == [(".scratch/repro.py", True)]
-
-    source_patch_file = scratch / "source.patch"
-    source_patch_file.write_text(
-        "*** Begin Patch\n"
-        "*** Update File: src.py\n"
-        "@@ -1,1 +1,1 @@\n"
-        "-old\n"
-        "+new\n"
-        "*** End Patch\n",
-        encoding="utf-8",
-    )
-    scratch_patch_file = scratch / "scratch.patch"
-    scratch_patch_file.write_text(
-        "*** Begin Patch\n"
-        "*** Add File: .scratch/repro.py\n"
-        "+print('repro')\n"
-        "*** End Patch\n",
-        encoding="utf-8",
-    )
-    source_patch_call = ToolCall(
-        tool_use_id="source-patch-file",
-        tool_name="apply_patch",
-        arguments={"path": str(source_patch_file)},
-    )
-    scratch_patch_call = ToolCall(
-        tool_use_id="scratch-patch-file",
-        tool_name="apply_patch",
-        arguments={"path": str(scratch_patch_file)},
-    )
-    gate_details = {
-        "reason": "tool_activity_without_workspace_write",
-        "count": 16,
-        "threshold": 8,
-    }
-
-    assert agent._finalize_evidence_write_targets(source_patch_call) == [("src.py", False)]
-    assert agent._finalize_evidence_write_targets(scratch_patch_call) == [
-        (".scratch/repro.py", True)
-    ]
-    assert (
-        agent._workspace_edit_gate_tool_result(
-            source_patch_call,
-            gate_details,
-            recovery_read_paths=set(),
-            recovery_reads_remaining=0,
-        )
-        is None
-    )
-    blocked = agent._workspace_edit_gate_tool_result(
-        scratch_patch_call,
-        gate_details,
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-    assert blocked is not None
-    assert blocked.execution_status["reason"] == "workspace_edit_required"
-
-    frozen_source_patch_call = agent._snapshot_apply_patch_path_call(source_patch_call)
-    assert frozen_source_patch_call is not source_patch_call
-    assert frozen_source_patch_call.arguments["path"] == str(source_patch_file)
-    source_patch_file.unlink()
-    assert agent._finalize_evidence_write_targets(frozen_source_patch_call) == [
-        ("src.py", False)
-    ]
-    assert agent._finalize_evidence_write_targets(source_patch_call) == [(None, False)]
-
-
-def test_workspace_edit_gate_handles_unexpandable_paths(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(
-            workspace_dir=str(workspace),
-            scratch_dir=str(scratch),
-        ),
-    )
-    tool_call = ToolCall(
-        tool_use_id="unexpandable-patch-path",
-        tool_name="apply_patch",
-        arguments={"path": "~opensquilla_user_that_does_not_exist/fix.patch"},
-    )
-
-    assert agent._snapshot_apply_patch_path_call(tool_call) is tool_call
-    assert agent._workspace_edit_gate_apply_patch_raw_target_paths(tool_call) == []
-    assert agent._configured_scratch_path_candidate(
-        "~opensquilla_user_that_does_not_exist/repro.py",
-        relative_to="workspace",
-    ) == (None, False)
-    blocked = agent._workspace_edit_gate_tool_result(
-        tool_call,
-        {
-            "reason": "tool_activity_without_workspace_write",
-            "count": 16,
-            "threshold": 8,
-        },
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-    assert blocked is not None
-    assert blocked.execution_status["reason"] == "workspace_edit_required"
-
-
 def test_apply_patch_snapshot_rejects_fifo_without_blocking(tmp_path) -> None:
     if not hasattr(os, "mkfifo"):
         pytest.skip("FIFO creation is unavailable")
@@ -3511,7 +1059,7 @@ def test_apply_patch_snapshot_rejects_fifo_without_blocking(tmp_path) -> None:
         arguments={"path": str(fifo)},
     )
 
-    assert agent._workspace_edit_gate_apply_patch_text(tool_call) is None
+    assert agent._read_patch_file_snapshot_text(tool_call) is None
     assert agent._snapshot_apply_patch_path_call(tool_call) is tool_call
 
 
@@ -3562,7 +1110,7 @@ async def test_failed_path_patch_snapshot_cannot_execute_later_created_file(
 
     agent = _CreateAfterFailedSnapshotAgent(
         provider=_PathPatchThenFinalProvider(patch_file),
-        config=AgentConfig(max_iterations=3, flush_enabled=False),
+        config=AgentConfig(max_iterations=3, ),
         tool_definitions=[
             ToolDefinition(
                 name="apply_patch",
@@ -3633,7 +1181,7 @@ async def test_path_patch_snapshot_respects_mutex_order_and_survives_self_delete
 
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=4, flush_enabled=False),
+        config=AgentConfig(max_iterations=4, ),
         tool_definitions=[
             ToolDefinition(
                 name=name,
@@ -3652,76 +1200,6 @@ async def test_path_patch_snapshot_respects_mutex_order_and_survives_self_delete
     assert source.read_text(encoding="utf-8") == "new\n"
     assert not patch_file.exists()
     assert any(isinstance(event, DoneEvent) for event in events)
-
-
-def test_workspace_edit_gate_rejects_synthetic_marker_write_file(tmp_path) -> None:
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=ToolContext(workspace_dir=str(tmp_path)),
-    )
-    gate_details = {
-        "reason": "tool_activity_without_workspace_write",
-        "count": 16,
-        "threshold": 8,
-    }
-
-    marker_result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-marker",
-            tool_name="write_file",
-            arguments={
-                "path": str(tmp_path / "src" / "debug_marker.h"),
-                "content": "/* Placeholder for runtime guard unlock */\n",
-            },
-        ),
-        gate_details,
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-    real_new_file_result = agent._workspace_edit_gate_tool_result(
-        ToolCall(
-            tool_use_id="write-real",
-            tool_name="write_file",
-            arguments={
-                "path": str(tmp_path / "src" / "feature_support.h"),
-                "content": "int feature_support_enabled(void);\n",
-            },
-        ),
-        gate_details,
-        recovery_read_paths=set(),
-        recovery_reads_remaining=0,
-    )
-
-    assert marker_result is not None
-    assert marker_result.is_error is True
-    assert "temporary marker" in marker_result.content
-    assert real_new_file_result is None
-
-
-def test_effective_workspace_write_records_ignore_synthetic_new_files(tmp_path) -> None:
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    tool_context.workspace_file_writes.extend(
-        [
-            {
-                "relative_path": "src/debug_marker.h",
-                "path": str(tmp_path / "src" / "debug_marker.h"),
-                "created": True,
-            },
-            {
-                "relative_path": "src/parser.y",
-                "path": str(tmp_path / "src" / "parser.y"),
-                "created": False,
-            },
-        ]
-    )
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        tool_context=tool_context,
-    )
-
-    assert [record["relative_path"] for record in agent._effective_workspace_write_records()] == [
-        "src/parser.y"
-    ]
 
 
 def test_filter_ignored_porcelain_status_ignores_root_scratch_artifacts() -> None:
@@ -3748,560 +1226,6 @@ def test_filter_ignored_porcelain_status_can_make_scratch_only_diff_empty() -> N
 
 
 @pytest.mark.asyncio
-async def test_workspace_edit_gate_preserves_source_tools_after_repeated_no_write(
-    tmp_path,
-) -> None:
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    handler_calls: list[str] = []
-
-    async def _tool(call: Any) -> ToolResult:
-        handler_calls.append(call.tool_name)
-        if call.tool_name == "read_file":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=source.read_text(encoding="utf-8"),
-            )
-        if call.tool_name == "apply_patch":
-            source.write_text("new\n", encoding="utf-8")
-            tool_context.workspace_file_writes.append(
-                {"relative_path": "src.py", "path": str(source)}
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="Applied patch: 1 file(s) modified [workspace]",
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _NoWorkspaceWriteThenPatchProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=25,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-        ),
-        tool_definitions=[
-            ToolDefinition(
-                name=name,
-                description=f"{name} tool.",
-                input_schema=ToolInputSchema(),
-            )
-            for name in [
-                "read_file",
-                "grep_search",
-                "exec_command",
-                "apply_patch",
-                "edit_file",
-                "write_file",
-            ]
-        ],
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert source.read_text(encoding="utf-8") == "new\n"
-    assert handler_calls.count("read_file") == 17
-    assert handler_calls.count("apply_patch") == 1
-    assert agent.config.metadata["workspace_edit_gate_activations"] == 1
-    filtered_tool_names = {tool.name for tool in provider.tools_by_call[16] or []}
-    assert filtered_tool_names == {
-        "read_file",
-        "grep_search",
-        "exec_command",
-        "apply_patch",
-        "edit_file",
-        "write_file",
-    }
-    gated_config = provider.configs[16]
-    assert gated_config is not None
-    assert "Runtime Patch Progress Guidance" in (gated_config.system or "")
-    assert gated_config.tool_choice is None
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert not any(
-        getattr(event, "kind", None) == "tool_result"
-        and getattr(event, "tool_name", None) == "read_file"
-        and (getattr(event, "execution_status", None) or {}).get("reason")
-        == "workspace_edit_required"
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
-async def test_workspace_edit_gate_scratch_repro_does_not_clear_gate(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    # Scratch write tracking is a workspace policy layer; opt out of the
-    # sandbox-disabled Full Host Access fallback so it stays active.
-    monkeypatch.setenv("OPENSQUILLA_SANDBOX_DISABLED_FULL_HOST", "off")
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    source = workspace / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    tool_context = ToolContext(
-        is_owner=True,
-        interaction_mode=InteractionMode.UNATTENDED,
-        workspace_dir=str(workspace),
-        scratch_dir=str(scratch),
-    )
-    handler_call_ids: list[str] = []
-    provider = _ScratchReproThenPatchProvider(scratch)
-    configure_runtime(
-        SandboxSettings(
-            sandbox=False,
-            security_grading=False,
-            allow_legacy_mode=True,
-        ),
-        workspace=workspace,
-    )
-    try:
-        registry = get_default_registry()
-        real_handler = build_tool_handler(registry, tool_context)
-
-        async def _recording_handler(call: Any) -> ToolResult:
-            handler_call_ids.append(call.tool_use_id)
-            return await real_handler(call)
-
-        visible_names = {"apply_patch", "read_file", "write_file"}
-        agent = Agent(
-            provider=provider,
-            config=AgentConfig(
-                max_iterations=25,
-                flush_enabled=False,
-                progress_watchdog_mode="warn_model",
-            ),
-            tool_definitions=[
-                tool
-                for tool in registry.to_tool_definitions(tool_context)
-                if tool.name in visible_names
-            ],
-            tool_handler=_recording_handler,
-            tool_context=tool_context,
-        )
-        events = [event async for event in agent.run_turn("Fix the failing parser test")]
-    finally:
-        reset_runtime()
-
-    assert (scratch / "repro_issue.tcl").read_text(encoding="utf-8") == "puts repro\n"
-    assert not (scratch / "notes.md").exists()
-    assert (scratch / "notes_after_source.md").read_text(encoding="utf-8") == (
-        "investigation notes\n"
-    )
-    assert source.read_text(encoding="utf-8") == "new\n"
-    assert handler_call_ids.count("write-repro") == 1
-    assert "write-notes" not in handler_call_ids
-    assert handler_call_ids.count("patch-1") == 1
-    assert handler_call_ids.count("write-notes-after-source") == 1
-    assert agent.config.metadata["workspace_edit_gate_activations"] == 1
-    assert [record["relative_path"] for record in tool_context.scratch_file_writes] == [
-        "repro_issue.tcl",
-        "notes_after_source.md",
-    ]
-    assert [record["relative_path"] for record in agent._effective_workspace_write_records()] == [
-        "src.py"
-    ]
-    blocked_events = [
-        event
-        for event in events
-        if getattr(event, "kind", None) == "tool_result"
-        and getattr(event, "tool_name", None) == "write_file"
-        and (getattr(event, "execution_status", None) or {}).get("reason")
-        == "workspace_edit_required"
-    ]
-    assert len(blocked_events) == 1
-    assert any(isinstance(event, DoneEvent) for event in events)
-
-
-@pytest.mark.asyncio
-async def test_workspace_edit_gate_allows_target_read_after_patch_context_failure(
-    tmp_path,
-) -> None:
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    handler_calls: list[str] = []
-    patch_calls = 0
-
-    async def _tool(call: Any) -> ToolResult:
-        nonlocal patch_calls
-        handler_calls.append(call.tool_name)
-        if call.tool_name == "read_file":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=source.read_text(encoding="utf-8"),
-            )
-        if call.tool_name == "apply_patch":
-            patch_calls += 1
-            if patch_calls == 1:
-                return ToolResult(
-                    tool_use_id=call.tool_use_id,
-                    tool_name=call.tool_name,
-                    content=(
-                        "apply_patch context mismatch at line 1: expected 'old', "
-                        "got 'older'. Read the current file content and retry with "
-                        "exact surrounding context."
-                    ),
-                    is_error=True,
-                )
-            source.write_text("new\n", encoding="utf-8")
-            tool_context.workspace_file_writes.append(
-                {"relative_path": "src.py", "path": str(source)}
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="Applied patch: 1 file(s) modified [workspace]",
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _PatchFailureRecoveryProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=30,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-        ),
-        tool_definitions=[
-            ToolDefinition(
-                name=name,
-                description=f"{name} tool.",
-                input_schema=ToolInputSchema(),
-            )
-            for name in [
-                "read_file",
-                "grep_search",
-                "exec_command",
-                "apply_patch",
-                "edit_file",
-                "write_file",
-            ]
-        ],
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert source.read_text(encoding="utf-8") == "new\n"
-    assert handler_calls.count("read_file") == 18
-    assert handler_calls.count("apply_patch") == 2
-    assert agent.config.metadata["workspace_edit_gate_activations"] == 1
-    assert agent.config.metadata["workspace_edit_gate_patch_recoveries"] == 1
-
-    first_gated_tools = {tool.name for tool in provider.tools_by_call[16] or []}
-    assert first_gated_tools == {
-        "read_file",
-        "grep_search",
-        "exec_command",
-        "apply_patch",
-        "edit_file",
-        "write_file",
-    }
-    recovery_tools = {tool.name for tool in provider.tools_by_call[18] or []}
-    assert recovery_tools == {
-        "read_file",
-        "grep_search",
-        "exec_command",
-        "apply_patch",
-        "edit_file",
-        "write_file",
-    }
-    post_recovery_tools = {tool.name for tool in provider.tools_by_call[19] or []}
-    assert post_recovery_tools == {
-        "read_file",
-        "grep_search",
-        "exec_command",
-        "apply_patch",
-        "edit_file",
-        "write_file",
-    }
-
-    recovery_config = provider.configs[18]
-    assert recovery_config is not None
-    assert "failed edit target path" in (recovery_config.system or "")
-    assert recovery_config.tool_choice is None
-    post_recovery_config = provider.configs[19]
-    assert post_recovery_config is not None
-    assert post_recovery_config.tool_choice is None
-    assert any(isinstance(event, DoneEvent) for event in events)
-
-
-@pytest.mark.asyncio
-async def test_workspace_edit_gate_allows_target_read_after_edit_context_failure(
-    tmp_path,
-) -> None:
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    handler_calls: list[str] = []
-
-    async def _tool(call: Any) -> ToolResult:
-        handler_calls.append(call.tool_name)
-        if call.tool_name == "read_file":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=source.read_text(encoding="utf-8"),
-            )
-        if call.tool_name == "edit_file":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=(
-                    "edit_file could not find old_text in src.py. Read the current "
-                    "file content, then retry with exact text from that file."
-                ),
-                is_error=True,
-            )
-        if call.tool_name == "apply_patch":
-            source.write_text("new\n", encoding="utf-8")
-            tool_context.workspace_file_writes.append(
-                {"relative_path": "src.py", "path": str(source)}
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="Applied patch: 1 file(s) modified [workspace]",
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _EditFailureRecoveryProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=30,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-        ),
-        tool_definitions=[
-            ToolDefinition(
-                name=name,
-                description=f"{name} tool.",
-                input_schema=ToolInputSchema(),
-            )
-            for name in [
-                "read_file",
-                "grep_search",
-                "exec_command",
-                "apply_patch",
-                "edit_file",
-                "write_file",
-            ]
-        ],
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert source.read_text(encoding="utf-8") == "new\n"
-    assert handler_calls.count("read_file") == 18
-    assert handler_calls.count("edit_file") == 1
-    assert handler_calls.count("apply_patch") == 1
-    assert agent.config.metadata["workspace_edit_gate_activations"] == 1
-    assert agent.config.metadata["workspace_edit_gate_patch_recoveries"] == 1
-
-    recovery_tools = {tool.name for tool in provider.tools_by_call[18] or []}
-    assert recovery_tools == {
-        "read_file",
-        "grep_search",
-        "exec_command",
-        "apply_patch",
-        "edit_file",
-        "write_file",
-    }
-    assert any(isinstance(event, DoneEvent) for event in events)
-
-
-@pytest.mark.asyncio
-async def test_agent_failed_focused_verification_counts_after_workspace_write(tmp_path) -> None:
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-
-    async def _tool(call: Any) -> ToolResult:
-        if call.tool_name == "edit_file":
-            source.write_text("new\n", encoding="utf-8")
-            tool_context.workspace_file_writes.append(
-                {"relative_path": "src.py", "path": str(source)}
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="edited",
-            )
-        if call.tool_name == "exec_command":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="error: build failed",
-                is_error=True,
-            )
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="source",
-        )
-
-    provider = _PostWriteFailedVerificationThenSourceProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=8,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert len(provider.calls) == 6
-    assert any(
-        isinstance(message.content, str)
-        and "continued tool activity after a workspace diff and focused verification"
-        in message.content
-        and "Stop broad source exploration" in message.content
-        for message in provider.calls[5]
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_converges_after_stable_verified_workspace_diff(tmp_path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src.py"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    handler_calls: list[str] = []
-
-    async def _tool(call: Any) -> ToolResult:
-        handler_calls.append(call.tool_name)
-        if call.tool_name == "edit_file":
-            before = fingerprint_path(source)
-            source.write_text("new\n", encoding="utf-8")
-            after = fingerprint_path(source)
-            record_semantic_mutation_receipt(
-                tool_name="edit_file",
-                path=source,
-                operation="edit_file",
-                before=before,
-                after=after,
-                partial=False,
-                ctx=tool_context,
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="edited",
-            )
-        if call.tool_name == "exec_command":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="test result: ok. 4 passed; 0 failed\n",
-            )
-        if call.tool_name == "read_file":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=source.read_text(encoding="utf-8"),
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _StableVerifiedDiffThenSourceProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=12,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            post_write_convergence_enabled=True,
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert handler_calls == ["edit_file", "exec_command", *["read_file"] * 6]
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime post-write convergence]" in message.content
-        and "current diff has stayed unchanged" in message.content
-        for call in provider.calls
-        for message in call
-    )
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime post-write convergence]" in message.content
-        and "Do not call tools" in message.content
-        for call in provider.calls
-        for message in call
-    )
-    assert provider.tool_lists[-1] is None
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final after convergence 9"
-    runtime_events = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(row.get("name") == "post_write_convergence.warned" for row in runtime_events)
-    assert any(row.get("name") == "post_write_convergence.finalized" for row in runtime_events)
-
-
-@pytest.mark.asyncio
-async def test_agent_blocks_repeated_missing_tool_handler_failures() -> None:
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        config=AgentConfig(tool_failure_loop_block_threshold=3),
-    )
-    tool_call = ToolCall(
-        tool_use_id="missing-1",
-        tool_name="missing_tool",
-        arguments={"value": "same"},
-    )
-
-    await agent._execute_tool(tool_call)
-    await agent._execute_tool(tool_call)
-    third = await agent._execute_tool(tool_call)
-
-    assert "tool_failure_loop_exhausted" not in third.content
-    assert "Do not retry this exact call unchanged" in third.content
-    assert third.execution_status is not None
-    assert third.execution_status.get("reason") == "tool_failure_loop_exhausted"
-
-
-@pytest.mark.asyncio
 async def test_agent_provider_request_proof_budget_is_separate_from_tool_result_cap() -> None:
     provider = _ConfigCapturingProvider()
     agent = Agent(
@@ -4310,7 +1234,6 @@ async def test_agent_provider_request_proof_budget_is_separate_from_tool_result_
             context_window_tokens=200_000,
             max_tokens=8192,
             tool_result_provider_request_max_chars=96_000,
-            flush_enabled=False,
         ),
     )
 
@@ -4330,7 +1253,6 @@ async def test_agent_provider_request_proof_budget_accepts_explicit_override() -
         config=AgentConfig(
             provider_request_proof_max_chars=123_456,
             tool_result_provider_request_max_chars=96_000,
-            flush_enabled=False,
         ),
     )
 
@@ -4340,45 +1262,6 @@ async def test_agent_provider_request_proof_budget_accepts_explicit_override() -
     assert provider.configs
     assert provider.configs[0] is not None
     assert provider.configs[0].provider_request_max_chars == 123_456
-
-
-def test_agent_child_config_inherits_tool_failure_loop_thresholds() -> None:
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        config=AgentConfig(
-            tool_failure_loop_block_threshold=7,
-            provider_context_block_feedback=True,
-            identical_request_loop_break_threshold=9,
-            repeated_tool_call_recovery_threshold=11,
-            progress_watchdog_mode="warn_model",
-            progress_watchdog_repeated_tool_error_threshold=5,
-            progress_watchdog_repeated_provider_failure_threshold=4,
-            progress_watchdog_repeated_failure_anchor_threshold=6,
-            tool_loop_observer_mode="log",
-            runtime_recovery_mode="warn_model",
-            runtime_recovery_source_loop_max_nudges=3,
-            post_tool_empty_recovery_mode="warn_model",
-            reasoning_prefill_recovery_mode="recover",
-            runtime_events_path="/tmp/runtime-events.jsonl",
-        ),
-    )
-
-    child = agent._make_child_agent(SubagentSpec(task="child task"), depth=1)
-
-    assert child.config.tool_failure_loop_block_threshold == 7
-    assert child.config.provider_context_block_feedback is True
-    assert child.config.identical_request_loop_break_threshold == 9
-    assert child.config.repeated_tool_call_recovery_threshold == 11
-    assert child.config.progress_watchdog_mode == "warn_model"
-    assert child.config.progress_watchdog_repeated_tool_error_threshold == 5
-    assert child.config.progress_watchdog_repeated_provider_failure_threshold == 4
-    assert child.config.progress_watchdog_repeated_failure_anchor_threshold == 6
-    assert child.config.tool_loop_observer_mode == "log"
-    assert child.config.runtime_recovery_mode == "warn_model"
-    assert child.config.runtime_recovery_source_loop_max_nudges == 3
-    assert child.config.post_tool_empty_recovery_mode == "warn_model"
-    assert child.config.reasoning_prefill_recovery_mode == "recover"
-    assert child.config.runtime_events_path == "/tmp/runtime-events.jsonl"
 
 
 def test_agent_child_tool_context_inherits_parent_full_host_run_mode() -> None:
@@ -4410,22 +1293,15 @@ def test_agent_child_tool_context_inherits_parent_full_host_run_mode() -> None:
     assert child._tool_context.sandbox_run_context.run_mode is RunMode.FULL
 
 
-def test_agent_config_normalizes_flush_triggers_and_clamps_compaction_tail() -> None:
+def test_agent_config_clamps_compaction_tail() -> None:
     config = AgentConfig(
-        flush_triggers=["reset", "inline_overflow"],
         compaction_protected_recent_messages=-4,
     )
 
-    assert config.flush_triggers == ["session_reset", "pre_compaction"]
     assert config.compaction_protected_recent_messages == 0
 
 
-def test_agent_config_rejects_unknown_flush_triggers() -> None:
-    with pytest.raises(ValueError, match="unknown flush trigger"):
-        AgentConfig(flush_triggers=["manual", "bogus"])
-
-
-def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
+def test_agent_child_config_inherits_context_and_budget_policy() -> None:
     agent = Agent(
         provider=_ContextOverflowProvider(success_after=1),
         config=AgentConfig(
@@ -4439,15 +1315,6 @@ def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
             max_turn_output_tokens=70_000,
             max_turn_billed_cost_usd=0.75,
             max_turn_tool_errors=4,
-            flush_enabled=True,
-            flush_triggers=["session_reset", "manual", "idle", "pre_compaction"],
-            flush_pre_compaction=True,
-            flush_timeout_seconds=1.5,
-            flush_background_timeout_seconds=15.0,
-            flush_backoff_initial_seconds=3.0,
-            flush_backoff_max_seconds=30.0,
-            flush_archive_max_bytes=999_999,
-            flush_compaction_requires_safe_receipt=False,
         ),
     )
 
@@ -4462,20 +1329,6 @@ def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
     assert child.config.max_turn_output_tokens == 70_000
     assert child.config.max_turn_billed_cost_usd == 0.75
     assert child.config.max_turn_tool_errors == 4
-    assert child.config.flush_enabled is True
-    assert child.config.flush_triggers == [
-        "session_reset",
-        "manual",
-        "idle",
-        "pre_compaction",
-    ]
-    assert child.config.flush_pre_compaction is True
-    assert child.config.flush_timeout_seconds == 1.5
-    assert child.config.flush_background_timeout_seconds == 15.0
-    assert child.config.flush_backoff_initial_seconds == 3.0
-    assert child.config.flush_backoff_max_seconds == 30.0
-    assert child.config.flush_archive_max_bytes == 999_999
-    assert child.config.flush_compaction_requires_safe_receipt is False
 
 
 def test_agent_config_max_turn_cost_usd_defaults_to_disabled() -> None:
@@ -4514,7 +1367,6 @@ async def test_agent_skips_price_resolution_per_event_when_turn_cost_budget_disa
         provider=provider,
         config=AgentConfig(
             model_id="deepseek/deepseek-v4-pro-20260423",
-            flush_enabled=False,
         ),
         tool_handler=_tool,
     )
@@ -4876,34 +1728,6 @@ class _ProviderHeartbeatThenText:
         return []
 
 
-class _ToolUseProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream()
-
-    async def _stream(self) -> AsyncIterator[Any]:
-        yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="slow")
-        yield ProviderToolUseEnd(
-            tool_use_id="tool-1",
-            tool_name="slow",
-            arguments={},
-        )
-        yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
 @pytest.mark.asyncio
 async def test_provider_heartbeat_reaches_agent_stream() -> None:
     agent = Agent(
@@ -4931,21 +1755,47 @@ async def test_provider_heartbeat_reaches_agent_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_iteration_timeout_interrupts_stalled_provider_stream() -> None:
+async def test_task_deadline_interrupts_stalled_provider_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = _StallingProvider()
     agent = Agent(
         provider=provider,
-        config=AgentConfig(iteration_timeout=0.01, max_provider_retries=0),
+        config=AgentConfig(timeout=60.0, iteration_timeout=0, max_provider_retries=0),
     )
+    real_wait = asyncio.wait
+    deadline_limited_waits = 0
+
+    async def _expire_started_provider_wait(
+        futures: set[asyncio.Future[Any]],
+        *,
+        timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ) -> tuple[set[asyncio.Future[Any]], set[asyncio.Future[Any]]]:
+        nonlocal deadline_limited_waits
+        if provider.calls and deadline_limited_waits == 0:
+            deadline_limited_waits += 1
+            assert timeout is not None and 0 < timeout <= agent.config.timeout
+            # Expire the task deadline after the generator has entered its
+            # cleanup scope. A 10 ms wall-clock budget can expire during prompt
+            # setup, before there is a running provider stream to interrupt.
+            await provider.stream_started.wait()
+            assert len(futures) == 1
+            assert not next(iter(futures)).done()
+            return set(), futures
+        return await real_wait(futures, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(asyncio, "wait", _expire_started_provider_wait)
 
     events = await asyncio.wait_for(
         _collect_events(agent.run_turn("hello")),
         timeout=0.5,
     )
 
+    assert deadline_limited_waits == 1
     error_index = _event_index(
         events,
-        lambda event: isinstance(event, ErrorEvent) and event.code == "iteration_timeout",
+        lambda event: isinstance(event, ErrorEvent) and event.code == "agent_runtime_timeout",
     )
     state_index = _event_index(
         events,
@@ -4961,7 +1811,7 @@ async def test_iteration_timeout_interrupts_stalled_provider_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_iteration_timeout_does_not_interrupt_active_tool_argument_stream() -> None:
+async def test_retired_iteration_timeout_does_not_interrupt_tool_argument_stream() -> None:
     async def write_file_tool(call: object) -> ToolResult:
         return ToolResult(
             tool_use_id=getattr(call, "tool_use_id"),
@@ -4969,15 +1819,12 @@ async def test_iteration_timeout_does_not_interrupt_active_tool_argument_stream(
             content="written",
         )
 
-    # Each provider event stays comfortably inside the per-event watchdog
-    # window, while the complete argument stream lasts longer than that
-    # window.  This proves that active tool-argument streaming resets the
-    # watchdog without depending on sub-10ms event-loop scheduling slack.
+    # Legacy iteration settings cannot interrupt a healthy provider stream.
     provider = _ActiveLongToolArgumentProvider(fragment_delay=0.06)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            iteration_timeout=0.15,
+            iteration_timeout=0.001,
             timeout=1.0,
             max_provider_retries=0,
         ),
@@ -5049,52 +1896,6 @@ async def test_large_tool_argument_stream_emits_progress_heartbeat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_iteration_timeout_caps_tool_execution() -> None:
-    tool_started = asyncio.Event()
-    tool_cancelled = asyncio.Event()
-    never_complete = asyncio.Event()
-
-    async def slow_tool(call: object) -> ToolResult:
-        tool_started.set()
-        try:
-            await never_complete.wait()
-        except asyncio.CancelledError:
-            tool_cancelled.set()
-            raise
-        return ToolResult(
-            tool_use_id=getattr(call, "tool_use_id"),
-            tool_name=getattr(call, "tool_name"),
-            content="late",
-        )
-
-    agent = Agent(
-        provider=_ToolUseProvider(),
-        config=AgentConfig(
-            iteration_timeout=0.1,
-            timeout=5.0,
-            tool_timeout=5.0,
-            max_provider_retries=0,
-        ),
-        tool_definitions=[
-            ToolDefinition(
-                name="slow",
-                description="Slow tool.",
-                input_schema=ToolInputSchema(),
-            )
-        ],
-        tool_handler=slow_tool,
-    )
-
-    events = await asyncio.wait_for(_collect_events(agent.run_turn("hello")), timeout=2.0)
-
-    assert tool_started.is_set()
-    assert tool_cancelled.is_set()
-    assert any(
-        isinstance(event, ErrorEvent) and event.code == "iteration_timeout" for event in events
-    )
-
-
-@pytest.mark.asyncio
 async def test_provider_timeout_error_is_not_reclassified_as_iteration_timeout() -> None:
     provider = _ProviderRaisesTimeout()
     agent = Agent(
@@ -5136,7 +1937,6 @@ async def test_context_overflow_noop_compaction_does_not_resend_unchanged_contex
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -5168,7 +1968,6 @@ async def test_context_overflow_summary_only_larger_payload_does_not_retry(
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -5203,7 +2002,6 @@ async def test_context_overflow_effective_compaction_allows_single_retry(
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -5250,7 +2048,6 @@ async def test_narrow_routed_window_never_durably_compacts_base_session(
             context_window_tokens=8_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     history = [
@@ -5306,7 +2103,6 @@ async def test_inline_compaction_candidate_gets_terminal_when_retry_never_admits
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -5382,7 +2178,6 @@ async def test_inline_compaction_install_wait_obeys_absolute_deadline(
             iteration_timeout=5.0,
             timeout=5.0,
             compaction_total_timeout_seconds=0.5,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -5440,7 +2235,6 @@ async def test_inline_compaction_install_deadline_stops_limiting_accepted_stream
             iteration_timeout=5.0,
             timeout=5.0,
             compaction_total_timeout_seconds=2.0,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -5475,7 +2269,6 @@ async def test_native_overflow_after_final_admission_does_not_compact_history(
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -5518,7 +2311,7 @@ async def test_inline_overflow_compaction_reduces_tool_heavy_structured_context(
         )
     agent = Agent(
         provider=_ContextOverflowProvider(),
-        config=AgentConfig(context_window_tokens=window_tokens, flush_enabled=False),
+        config=AgentConfig(context_window_tokens=window_tokens, ),
     )
     original_chars = session_payload_chars(messages)
 
@@ -5566,7 +2359,7 @@ async def test_inline_overflow_compaction_preserves_original_structured_tail(
     ]
     agent = Agent(
         provider=_ContextOverflowProvider(),
-        config=AgentConfig(context_window_tokens=1000, flush_enabled=False),
+        config=AgentConfig(context_window_tokens=1000, ),
     )
 
     outcome = await agent._check_context_overflow(
@@ -5583,8 +2376,85 @@ async def test_inline_overflow_compaction_preserves_original_structured_tail(
     assert isinstance(outcome.messages[-1].content, list)
 
 
+@pytest.mark.parametrize("pressure", ["tokens", "chars"])
+async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
+    monkeypatch: pytest.MonkeyPatch, pressure: str,
+) -> None:
+    from opensquilla.session.compaction import compact_context as compact_core
+
+    provider = OpenAIProvider(api_key="synthetic-offline", model="synthetic-model")
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="synthetic-model",
+            context_window_tokens=12_000 if pressure == "tokens" else 32_000,
+            max_tokens=8192,
+            provider_request_proof_max_chars=100_000 if pressure == "tokens" else 10_000,
+        ),
+    )
+    summary_config = synthetic_compaction_config()
+    summary_provider = summary_config.llm_plan.primary.provider
+    monkeypatch.setattr(agent, "_build_compaction_config", lambda: summary_config)
+    requests = []
+
+    async def capture_request(request):
+        requests.append(request)
+        return await compact_core(request)
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", capture_request)
+    messages = [
+        Message(role="user" if index % 2 == 0 else "assistant",
+                content="Completed ordinary background. " * 150)
+        for index in range(4)
+    ]
+    current = Message(role="user", content="Continue the active task exactly")
+    messages.append(current)
+    fixed_capacity = agent.preflight_history_capacity(
+        active_user_message="", active_user_in_history=False,
+    )
+    projection = agent._project_compaction_consumer_request(
+        consumer_provider=provider,
+        replay_summary="",
+        kept_entries=agent._message_count_compaction_entries(messages),
+        active_user_message="",
+        active_user_in_history=False,
+        bound_user_message_id=None,
+        attachment_messages=None,
+        runtime_context_message=agent._freeze_preflight_runtime_context_message(),
+        context_window_tokens=agent.config.context_window_tokens,
+        max_output_tokens=8192,
+        consumer_provider_request_max_chars=agent.config.provider_request_proof_max_chars,
+    )
+    assert projection is not None and not projection.fits
+    proof = projection.proof
+    if pressure == "chars":
+        assert proof["estimated_tokens"] < proof["effective_proof_token_budget"] * 0.85
+    else:
+        assert proof["estimated_chars"] < proof["effective_proof_budget"] * 0.85
+
+    outcome = await agent._check_context_overflow(
+        messages,
+        estimated_context_tokens=proof["estimated_tokens"],
+        estimated_context_chars=proof["estimated_chars"],
+        protected_turn_start_index=4,
+        compaction_window_tokens=agent.config.context_window_tokens,
+        request_window_tokens=proof["effective_proof_token_budget"],
+        request_window_chars=proof["effective_proof_budget"],
+        durable_consumer_overflow_proven=True,
+        provider_overflow=True,
+    )
+
+    assert len(requests) == 1
+    assert (requests[0].context_window_tokens, requests[0].context_window_chars) == fixed_capacity
+    assert len(summary_provider.calls) == 1
+    assert outcome is not None and outcome.compacted and not outcome.ephemeral_only
+    assert outcome.removed_count == 4
+    assert outcome.messages[-1] is current
+    assert messages[-1] is current and len(messages) == 5
+
+
 @pytest.mark.asyncio
-async def test_inline_overflow_refuses_when_protected_current_turn_alone_is_too_large(
+async def test_soft_pressure_keeps_protected_current_turn_when_final_request_fits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def _unexpected_compaction(_request: Any) -> CompactionResult:
@@ -5601,7 +2471,6 @@ async def test_inline_overflow_refuses_when_protected_current_turn_alone_is_too_
         config=AgentConfig(
             context_window_tokens=1000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
 
@@ -5611,8 +2480,8 @@ async def test_inline_overflow_refuses_when_protected_current_turn_alone_is_too_
         protected_turn_start_index=2,
     )
 
-    assert outcome is None
-    assert agent._last_compaction_refusal_reason == "provider_recent_tail_too_large"
+    assert outcome is not None and not outcome.compacted
+    assert outcome.messages == messages
 
 
 @pytest.mark.asyncio
@@ -5675,7 +2544,6 @@ async def test_inline_overflow_projects_completed_live_rounds_without_mutating_p
         config=AgentConfig(
             context_window_tokens=1000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
 
@@ -5765,7 +2633,6 @@ async def test_durable_and_live_turn_recovery_share_one_compaction_call_budget(
         config=AgentConfig(
             context_window_tokens=8_000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
 
@@ -5933,7 +2800,6 @@ async def test_stable_consumer_retries_with_completed_live_round_summary(
             context_overflow_threshold=0.85,
             max_overflow_retries=1,
             max_provider_retries=0,
-            flush_enabled=False,
         ),
         tool_handler=_tool,
     )
@@ -6103,7 +2969,6 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
             context_overflow_threshold=0.85,
             max_overflow_retries=1,
             max_provider_retries=0,
-            flush_enabled=False,
         ),
         tool_handler=_tool,
     )
@@ -6147,7 +3012,6 @@ async def test_inline_overflow_rejects_compactor_cut_through_protected_turn(
         config=AgentConfig(
             context_window_tokens=1000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
 
@@ -6168,7 +3032,6 @@ async def test_within_budget_skip_on_string_only_history_is_not_reported_as_comp
         config=AgentConfig(
             context_window_tokens=1000,
             context_overflow_threshold=0.85,
-            flush_enabled=False,
         ),
     )
     messages = [
@@ -6192,7 +3055,6 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
     import opensquilla.engine.agent as agent_module
 
     provider = _HighUsageToolLoopProvider(tool_rounds=3, input_tokens_per_call=4000)
-    flush_calls: list[int] = []
     compact_requests: list[Any] = []
 
     async def _tool(call: Any) -> ToolResult:
@@ -6202,18 +3064,6 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
             content="ok",
         )
 
-    async def _flush(_plan: Any, flush_messages: list[Message]) -> Any:
-        flush_calls.append(len(flush_messages))
-        return SimpleNamespace(
-            mode="llm",
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
-        )
 
     async def _compact(request: Any) -> CompactionResult:
         compact_requests.append(request)
@@ -6229,14 +3079,10 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
         config=AgentConfig(
             context_window_tokens=20_000,
             context_overflow_threshold=0.5,
-            flush_enabled=True,
-            flush_pre_compaction=True,
-            flush_timeout_seconds=0.01,
             max_iterations=10,
         ),
         tool_handler=_tool,
     )
-    monkeypatch.setattr(agent, "_run_flush", _flush)
     monkeypatch.setattr(agent_module, "compact_context", _compact)
 
     events = [event async for event in agent.run_turn("read the files one by one")]
@@ -6245,7 +3091,6 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
     assert done.text == "done"
     assert done.input_tokens == 16_000
     assert len(provider.calls) == 4
-    assert flush_calls == []
     assert compact_requests == []
 
 
@@ -6261,21 +3106,8 @@ async def test_successful_large_request_surface_does_not_compact_durable_history
         description="large live request surface " + ("z" * 6000),
         input_schema=ToolInputSchema(),
     )
-    flush_calls: list[int] = []
     compact_requests: list[Any] = []
 
-    async def _flush(_plan: Any, flush_messages: list[Message]) -> Any:
-        flush_calls.append(len(flush_messages))
-        return SimpleNamespace(
-            mode="llm",
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
-        )
 
     async def _compact(request: Any) -> CompactionResult:
         compact_requests.append(request)
@@ -6291,70 +3123,16 @@ async def test_successful_large_request_surface_does_not_compact_durable_history
         config=AgentConfig(
             context_window_tokens=3000,
             context_overflow_threshold=0.5,
-            flush_enabled=True,
-            flush_pre_compaction=True,
-            flush_timeout_seconds=0.01,
             system_prompt="live request system context " + ("s" * 2000),
         ),
         tool_definitions=[large_tool],
     )
-    monkeypatch.setattr(agent, "_run_flush", _flush)
     monkeypatch.setattr(agent_module, "compact_context", _compact)
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
     assert len(provider.calls) == 1
-    assert flush_calls == []
-    assert compact_requests == []
-
-
-@pytest.mark.asyncio
-async def test_inline_overflow_flush_enabled_without_trigger_skips_flush(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import opensquilla.engine.agent as agent_module
-
-    provider = _HighUsageToolLoopProvider(tool_rounds=0, input_tokens_per_call=1)
-    flush_calls: list[int] = []
-    compact_requests: list[Any] = []
-
-    async def _flush(_plan: Any, flush_messages: list[Message]) -> Any:
-        flush_calls.append(len(flush_messages))
-
-    async def _compact(request: Any) -> CompactionResult:
-        compact_requests.append(request)
-        return CompactionResult(
-            summary="",
-            kept_entries=request.entries,
-            removed_count=0,
-            chunks_processed=0,
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            context_window_tokens=3000,
-            context_overflow_threshold=0.5,
-            flush_enabled=True,
-            flush_pre_compaction=False,
-            system_prompt="live request system context " + ("s" * 2000),
-        ),
-        tool_definitions=[
-            ToolDefinition(
-                name="large_context_tool",
-                description="large live request surface " + ("z" * 6000),
-                input_schema=ToolInputSchema(),
-            )
-        ],
-    )
-    monkeypatch.setattr(agent, "_run_flush", _flush)
-    monkeypatch.setattr(agent_module, "compact_context", _compact)
-
-    events = [event async for event in agent.run_turn("hello")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert flush_calls == []
     assert compact_requests == []
 
 
@@ -6378,7 +3156,6 @@ async def test_provider_request_budget_exhausted_does_not_mutate_durable_history
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
         session_key="agent:main:budget",
     )
@@ -6426,7 +3203,6 @@ async def test_provider_request_budget_does_not_become_a_history_window(
             context_window_tokens=1_048_576,
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -6461,7 +3237,6 @@ async def test_provider_request_budget_failure_is_not_retried_via_history_compac
             context_window_tokens=1_048_576,
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -6509,7 +3284,6 @@ async def test_provider_budget_effective_cap_remains_request_only(
             context_window_tokens=1_048_576,
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -6539,7 +3313,6 @@ async def test_equal_window_routed_cap_does_not_compact_when_stable_consumer_fit
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     history = [
@@ -6599,7 +3372,6 @@ async def test_equal_window_stable_overflow_still_allows_durable_compaction(
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -6654,7 +3426,6 @@ async def test_narrow_route_uses_stable_window_when_stable_consumer_also_overflo
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     agent.set_history(
@@ -6674,7 +3445,14 @@ async def test_narrow_route_uses_stable_window_when_stable_consumer_also_overflo
     events = [event async for event in agent.run_turn("current request stays exact")]
 
     assert len(compact_requests) == 1
-    assert compact_requests[0].context_window_tokens == 16_000
+    assert (compact_requests[0].context_window_tokens,
+            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
+        active_user_message="", active_user_in_history=False,
+        context_window_tokens=16_000, consumer_provider=stable,
+        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+    )
+    assert compact_requests[0].context_window_tokens > 8_000
+    assert compact_requests[0].context_window_chars > 4_000
     assert len(routed.calls) == 2
     assert len(stable.projected_configs) >= 2
     assert all(config.max_tokens == 512 for config in stable.projected_configs)
@@ -6718,7 +3496,6 @@ async def test_narrow_route_cannot_force_stable_compaction_to_its_request_cap(
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     history = [
@@ -6737,7 +3514,14 @@ async def test_narrow_route_cannot_force_stable_compaction_to_its_request_cap(
     events = [event async for event in agent.run_turn("current request stays exact")]
 
     assert len(compact_requests) == 1
-    assert compact_requests[0].context_window_tokens == 16_000
+    assert (compact_requests[0].context_window_tokens,
+            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
+        active_user_message="", active_user_in_history=False,
+        context_window_tokens=16_000, consumer_provider=stable,
+        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+    )
+    assert compact_requests[0].context_window_tokens > 8_000
+    assert compact_requests[0].context_window_chars > 4_000
     assert len(stable.projected_configs) >= 2
     assert len(routed.calls) == 1
     compaction_events = [
@@ -6786,7 +3570,6 @@ async def test_mixed_pressure_does_not_install_candidate_that_stable_consumer_re
             provider_request_proof_max_chars=4_000,
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
     history = [
@@ -6805,7 +3588,14 @@ async def test_mixed_pressure_does_not_install_candidate_that_stable_consumer_re
     events = [event async for event in agent.run_turn("current request stays exact")]
 
     assert len(compact_requests) == 1
-    assert compact_requests[0].context_window_tokens == 16_000
+    assert (compact_requests[0].context_window_tokens,
+            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
+        active_user_message="", active_user_in_history=False,
+        context_window_tokens=16_000, consumer_provider=stable,
+        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+    )
+    assert compact_requests[0].context_window_tokens > 8_000
+    assert compact_requests[0].context_window_chars > 4_000
     assert len(stable.projected_configs) >= 2
     assert len(routed.calls) == 1
     assert not any(isinstance(event, CompactionEvent) for event in events)
@@ -6840,7 +3630,6 @@ async def test_provider_request_budget_recent_tail_reason_survives_noop_compacti
             context_window_tokens=1_048_576,
             max_provider_retries=0,
             max_overflow_retries=2,
-            flush_enabled=False,
         ),
     )
 
@@ -6876,7 +3665,6 @@ async def test_provider_request_budget_recent_tail_exhaustion_is_reported_as_con
         config=AgentConfig(
             max_provider_retries=0,
             max_overflow_retries=1,
-            flush_enabled=False,
         ),
     )
 
@@ -6887,114 +3675,6 @@ async def test_provider_request_budget_recent_tail_exhaustion_is_reported_as_con
     assert errors[-1].code == "provider_request_too_large"
     assert "current turn" not in errors[-1].message.lower()
     assert RAW_CURRENT_TURN_OVERFLOW_MESSAGE not in errors[-1].message
-
-
-@pytest.mark.asyncio
-async def test_context_overflow_degraded_flush_still_runs_live_compaction_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    compact_called = False
-
-    async def _compact_runs_after_degraded_flush(request: Any) -> CompactionResult:
-        nonlocal compact_called
-        compact_called = True
-        protected = int(request.config.protected_recent_messages or 0)
-        cut = max(0, len(request.entries) - protected)
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=request.entries[cut:],
-            removed_count=cut,
-            kept_start_index=cut,
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr(
-        "opensquilla.engine.agent.compact_context",
-        _compact_runs_after_degraded_flush,
-    )
-    provider = _ContextOverflowProvider(success_after=1)
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(max_provider_retries=0, max_overflow_retries=2),
-    )
-    agent.set_history(
-        [
-            Message(role="user", content="old question " + ("q" * 5000)),
-            Message(role="assistant", content="old answer " + ("a" * 5000)),
-        ]
-    )
-
-    events = [event async for event in agent.run_turn("x" * 4000)]
-
-    assert compact_called is True
-    assert len(provider.calls) == 2
-    assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
-    assert not any(
-        isinstance(event, ErrorEvent)
-        and event.code in {"compaction_refused_memory_flush", "compaction_refused_flush_timeout"}
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
-async def test_context_overflow_flush_timeout_records_backoff_and_retries(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _compact_runs_after_flush_timeout(request: Any) -> CompactionResult:
-        protected = int(request.config.protected_recent_messages or 0)
-        cut = max(0, len(request.entries) - protected)
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=request.entries[cut:],
-            removed_count=cut,
-            kept_start_index=cut,
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr(
-        "opensquilla.engine.agent.compact_context",
-        _compact_runs_after_flush_timeout,
-    )
-    provider = _ContextOverflowProvider(success_after=1)
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_provider_retries=0,
-            max_overflow_retries=2,
-            flush_enabled=True,
-            flush_pre_compaction=True,
-            flush_timeout_seconds=0.01,
-            flush_backoff_initial_seconds=10.0,
-        ),
-    )
-    agent.set_history(
-        [
-            Message(role="user", content="old question " + ("q" * 5000)),
-            Message(role="assistant", content="old answer " + ("a" * 5000)),
-        ]
-    )
-
-    async def slow_flush(_plan: Any, _messages: Any) -> None:
-        await asyncio.sleep(1.0)
-
-    monkeypatch.setattr(agent, "_run_flush", slow_flush)
-    try:
-        events = [event async for event in agent.run_turn("x" * 4000)]
-    finally:
-        task = agent._active_flush_task
-        if task is not None and not task.done():
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-    assert len(provider.calls) == 2
-    assert agent._flush_backoff_seconds == 10.0
-    assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
-    assert not any(
-        isinstance(event, ErrorEvent)
-        and event.code in {"compaction_refused_memory_flush", "compaction_refused_flush_timeout"}
-        for event in events
-    )
 
 
 async def _collect_events(stream: AsyncIterator[Any]) -> list[Any]:

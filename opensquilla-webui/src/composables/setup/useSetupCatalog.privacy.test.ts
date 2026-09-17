@@ -4,19 +4,29 @@ import { createApp, nextTick } from 'vue'
 import { localizeImageActionableDetail, useSetupCatalog } from './useSetupCatalog'
 import { LEGACY_OPENROUTER_MODEL_OPTIONS } from './useSetupEnsembleForm'
 import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
+import { SetupWorkflowError } from '@/modules/setupWorkflow'
 
 const rpcCall = vi.hoisted(() => vi.fn())
-const waitForConnection = vi.hoisted(() => vi.fn(async () => {}))
-const supportsMethod = vi.hoisted(() => vi.fn((_method: string) => true))
+const ready = vi.hoisted(() => vi.fn(async () => {}))
+const hasRpcMethod = vi.hoisted(() => vi.fn((_method: string) => true))
+const observeProbeRequest = vi.hoisted(() => vi.fn())
 const pushToast = vi.hoisted(() => vi.fn())
 const confirmAction = vi.hoisted(() => vi.fn(async () => true))
+const confirmChoiceAction = vi.hoisted(() => vi.fn(async () => 'cancel' as 'primary' | 'secondary' | 'cancel'))
+
+function routerConflictForPrimary() {
+  return new SetupWorkflowError('conflict', 'opaque conflict', 'router-provider-conflict', undefined, {
+    reason: 'router_provider_conflict', providerId: 'tokenrhythm', conflictProviders: ['openrouter'],
+    allowedRouterActions: ['use_recommended', 'disable'],
+  })
+}
 
 vi.mock('@/stores/rpc', () => ({
   useRpcStore: () => ({
     isConnected: true,
     isConnecting: false,
-    waitForConnection,
-    supportsMethod,
+    ready,
+    hasRpcMethod,
     call: rpcCall,
   }),
 }))
@@ -26,8 +36,37 @@ vi.mock('@/composables/useToasts', () => ({
 }))
 
 vi.mock('@/composables/useConfirm', () => ({
-  useConfirm: () => ({ confirm: confirmAction }),
+  useConfirm: () => ({ confirm: confirmAction, confirmChoice: confirmChoiceAction }),
 }))
+
+async function primaryTransitionScenario(first = false, mutate: (method: string, params?: Record<string, unknown>) => unknown = () => ({ changed: true })) {
+  const saved = {
+    llm: { provider: 'openrouter', model: 'openai/gpt-4.1-mini' },
+    llm_profiles: first ? {} : { tokenrhythm: { model: 'gpt-4.1-mini' } },
+    squilla_router: { enabled: true, preset_binding: 'custom', default_tier: 'c1', tiers: {
+      c0: { provider: 'openrouter', model: 'openai/gpt-4.1-mini' },
+      c1: { provider: 'openrouter', model: 'openai/gpt-4.1-mini' },
+    } },
+    llm_ensemble: { enabled: false, proposer_max_retries: 1 },
+  }
+  rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+    if (method === 'onboarding.catalog') return { providers: ['openrouter', 'tokenrhythm'].map(providerId => ({
+      providerId, label: providerId, runtimeSupported: true, requiresApiKey: true,
+      envKey: providerId.toUpperCase() + '_API_KEY', defaultDirectModel: 'gpt-4.1-mini',
+      fields: [{ name: 'model', label: 'Model', required: true, default: 'gpt-4.1-mini' }],
+    })) }
+    if (method === 'onboarding.status') return {
+      hasConfig: true, llmConfigured: !first,
+      llmCredentialStatus: { provider: saved.llm.provider, available: !first, source: first ? 'missing' : 'explicit' },
+      llmProfileStatus: first ? [] : [{ provider: 'tokenrhythm', ready: true, primaryEligible: true, primaryBlockReason: '', credentialSource: 'profile' }],
+    }
+    if (method === 'config.get') return structuredClone(saved)
+    if (method === 'config.effective') return { fields: { 'llm.provider': { source: first ? 'default' : 'config', value: saved.llm.provider } } }
+    if (method.includes('discover')) return { ok: true, models: [], source: 'none' }
+    return await mutate(method, params)
+  })
+  return { ...await mountCatalog(), saved }
+}
 
 async function mountCatalog() {
   let api!: ReturnType<typeof useSetupCatalog>
@@ -39,6 +78,137 @@ async function mountCatalog() {
       return () => null
     },
   })
+  const { APP_SETTINGS_KEY } = await import('@/modules/appSettings')
+  const { SETUP_WORKFLOW_KEY } = await import('@/modules/setupWorkflow')
+  const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
+  const { GATEWAY_ACCESS_KEY } = await import('@/modules/gatewayAccess')
+  app.provide(GATEWAY_ACCESS_KEY, {
+    availability: 'available',
+    connectionError: null,
+    requiresCredential: false,
+    isAvailable: true,
+    isLocalOwner: true,
+    isAuthenticated: true,
+    guestSessionOwnerId: null,
+    deliveryIdentity: null,
+    canManageProjectWorkspaces: true,
+    canChooseProject: true,
+    runModePolicy: null,
+    streamIdleTimeoutMs: null,
+    concurrentHistoryReads: false,
+    detachedSessionHydration: false,
+    turnCommittedEvents: false,
+    subscriptionEpoch: 0,
+    loadConnectionEndpoint: () => 'ws://example.invalid/ws',
+    connect: async () => undefined,
+    disconnect: () => undefined,
+    recoverSubscriptionEpoch: () => false,
+  })
+  app.provide(APP_SETTINGS_KEY, {
+    readAll: async () => await rpcCall('config.get') as import('@/modules/appSettings').SettingsObject,
+    read: async () => null,
+    readEffective: async () => await rpcCall('config.effective') as import('@/modules/appSettings').EffectiveSettings,
+    patch: async (changes: readonly { path: string; value: unknown }[]) => await rpcCall(
+      'config.patch',
+      { patches: Object.fromEntries(changes.map(change => [change.path, change.value])) },
+    ) as import('@/modules/appSettings').SettingsMutation,
+    patchSafe: async (changes: readonly { path: string; value: unknown }[]) => await rpcCall(
+      'config.patch.safe',
+      { patches: Object.fromEntries(changes.map(change => [change.path, change.value])) },
+    ) as import('@/modules/appSettings').SettingsMutation,
+    merge: async (patch: Record<string, unknown>) => await rpcCall(
+      'config.patch',
+      { patch },
+    ) as import('@/modules/appSettings').SettingsMutation,
+    setTelemetryConsent: async (scope: 'reliability' | 'growth', enabled: boolean) => await rpcCall(
+      'telemetry.consent.set',
+      { scope, enabled },
+    ) as import('@/modules/appSettings').TelemetryConsentDecision,
+  } as unknown as import('@/modules/appSettings').AppSettings)
+  app.provide(SETUP_WORKFLOW_KEY, {
+    capabilities: {
+      get profileLifecycle() {
+        return hasRpcMethod('onboarding.llmProfile.upsert')
+      },
+      get profileUpsertAndActivate() {
+        return hasRpcMethod('onboarding.llmProfile.upsertAndActivate')
+      },
+      get primaryProviderRemoval() {
+        return hasRpcMethod('onboarding.llmProfile.active.remove')
+      },
+      get imageModelDiscovery() {
+        return hasRpcMethod('onboarding.imageGeneration.models.discover')
+      },
+    },
+    catalog: async () => await rpcCall('onboarding.catalog'),
+    status: async () => await rpcCall('onboarding.status'),
+    discoverImageGenerationModels: (providerId: string) => rpcCall(
+      'onboarding.imageGeneration.models.discover',
+      { providerId },
+    ),
+    provider: {
+      configurePrimary: async (payload: Record<string, unknown>) => await rpcCall('onboarding.provider.configure', payload),
+      probePrimary: (payload: Record<string, unknown>, request?: unknown) => {
+        observeProbeRequest('onboarding.provider.probe', payload, request)
+        return rpcCall('onboarding.provider.probe', payload)
+      },
+      discoverPrimaryModels: (payload: Record<string, unknown>) => rpcCall('onboarding.models.discover', payload),
+      revealActiveCredential: async (providerId: string) => await rpcCall('onboarding.provider.credential.reveal', { providerId }),
+      clearActiveCredential: async (providerId: string) => await rpcCall('onboarding.provider.credential.clear', { providerId }),
+    },
+    profile: {
+      upsertProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.upsert', payload),
+      upsertAndActivateProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.upsertAndActivate', payload),
+      activateProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.activate', payload),
+      probeProfile: (payload: Record<string, unknown>, request?: unknown) => {
+        observeProbeRequest('onboarding.llmProfile.probe', payload, request)
+        return rpcCall('onboarding.llmProfile.probe', payload)
+      },
+      probeDraftProfile: (payload: Record<string, unknown>, request?: unknown) => {
+        observeProbeRequest('onboarding.llmProfile.draft.probe', payload, request)
+        return rpcCall('onboarding.llmProfile.draft.probe', payload)
+      },
+      discoverProfileModels: (payload: Record<string, unknown>) => rpcCall(
+        'onboarding.llmProfile.models.discover',
+        payload,
+      ).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          if (!/method.*not found|unknown method|not registered/i.test(message)) throw error
+          return rpcCall('onboarding.models.discover', payload)
+        }),
+      discoverDraftProfileModels: (payload: Record<string, unknown>) => rpcCall('onboarding.llmProfile.draft.models.discover', payload),
+      removeProfile: async (providerId: string) => await rpcCall('onboarding.llmProfile.remove', { providerId }),
+      removeActiveProfile: async (payload: Record<string, unknown>) => await rpcCall('onboarding.llmProfile.active.remove', payload),
+      clearProfileCredential: async (providerId: string) => await rpcCall('onboarding.llmProfile.credential.clear', { providerId }),
+    },
+    capability: {
+      configureRouter: async (payload: Record<string, unknown>) => await rpcCall('onboarding.router.configure', payload),
+      configureEnsemble: async (payload: Record<string, unknown>) => await rpcCall('onboarding.ensemble.configure', payload),
+      configureSearch: async (payload: Record<string, unknown>) => await rpcCall('onboarding.search.configure', payload),
+      configureImageGeneration: async (payload: Record<string, unknown>) => await rpcCall('onboarding.imageGeneration.configure', payload),
+      configureMemoryEmbedding: async (payload: Record<string, unknown>) => await rpcCall('onboarding.memory_embedding.configure', payload),
+      configureAudio: async (payload: Record<string, unknown>) => await rpcCall('onboarding.audio.configure', payload),
+      resetCapability: async (capabilityId: string) => await rpcCall('onboarding.capability.reset', {
+        capabilityId,
+      }),
+    },
+  } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
+  app.provide(PROVIDER_CONFIGURATION_KEY, {
+    capacitySupported: true,
+    resolveCapacity: async (models: readonly {provider: string; model: string}[]) => ({models: models.map(target => ({
+      ...target, localRuntime: false,
+      contextWindow: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
+      maxOutputTokens: { automatic: 16384, automaticSource: 'default', override: null, value: 16384, source: 'default', editable: true },
+    }))}),
+    catalog: async () => [],
+    list: async () => ({ models: [], errors: [] }),
+    status: async () => ({ activeProvider: null, providerResolution: {}, providers: [], count: 0 }),
+    get: async () => ({ mode: 'direct' }),
+    get resetRecommendedSupported() { return hasRpcMethod('models.routing.resetRecommended') === true },
+    resetRecommended: async (command: Record<string, unknown>) => await rpcCall('models.routing.resetRecommended', command),
+    setRouting: async (mode: string) => await rpcCall('models.routing.set', { mode }),
+    credentials: { reveal: async () => ({}), clear: async () => ({}) },
+  } as unknown as import('@/modules/providerConfiguration').ProviderConfiguration)
   app.mount(el)
   await nextTick()
   await Promise.resolve()
@@ -46,14 +216,176 @@ async function mountCatalog() {
   return { api, app }
 }
 
+describe('primary provider transitions', () => {
+  it.each(['first', 'list', 'save-and-activate', 'routing'] as const)('keeps drafts and submits no resolution when %s is cancelled', async entry => {
+    const { api, app } = await primaryTransitionScenario(entry === 'first', method => {
+      if (['onboarding.provider.configure', 'onboarding.llmProfile.activate', 'onboarding.llmProfile.upsertAndActivate'].includes(method)) throw routerConflictForPrimary()
+      return { changed: true }
+    })
+    try {
+      if (entry === 'first' || entry === 'save-and-activate') {
+        await api.requestAddProvider('tokenrhythm')
+        api.updateProviderField('api_key', 'synthetic-unsaved-key')
+      } else if (entry === 'list') {
+        api.updateProviderField('api_key', 'synthetic-unsaved-key')
+      } else {
+        api.setFixedProvider('tokenrhythm')
+      }
+      const keyBefore = api.providerPanel.value.credentialPanel?.apiKeyValue
+      const primaryBefore = api.config.value.llm?.provider
+      if (entry === 'first') await expect(api.saveProvider()).resolves.toBe(false)
+      if (entry === 'list') await api.activateProvider('tokenrhythm')
+      if (entry === 'save-and-activate') await expect(api.saveProviderAndActivate()).resolves.toBe(false)
+      if (entry === 'routing') await expect(api.saveModelStrategy()).resolves.toBe(false)
+      expect(confirmChoiceAction).toHaveBeenCalledTimes(1)
+      expect(api.config.value.llm?.provider).toBe(primaryBefore)
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe(keyBefore)
+      const submitted = rpcCall.mock.calls.filter(([method]) => ['onboarding.provider.configure', 'onboarding.llmProfile.activate', 'onboarding.llmProfile.upsertAndActivate'].includes(method))
+      expect(submitted).toHaveLength(1)
+      expect(submitted[0]?.[1]).not.toHaveProperty('routerAction')
+      if (entry === 'routing') expect(api.modelStrategyPanel.value.single.providerId).toBe('tokenrhythm')
+    } finally { app.unmount() }
+  })
+
+  it('locks an atomic profile save snapshot through conflict choice and blocks duplicate actions', async () => {
+    let choose!: (value: 'primary') => void
+    confirmChoiceAction.mockImplementationOnce(() => new Promise(resolve => { choose = resolve }))
+    const { api, app } = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.llmProfile.upsertAndActivate' && !params?.routerAction) throw routerConflictForPrimary()
+      return { changed: true }
+    })
+    try {
+      await api.requestAddProvider('tokenrhythm')
+      api.updateProviderField('api_key', 'synthetic-original')
+      const first = api.saveProviderAndActivate()
+      await vi.waitFor(() => expect(confirmChoiceAction).toHaveBeenCalledTimes(1))
+      api.updateProviderField('api_key', 'synthetic-later')
+      await expect(api.saveProviderAndActivate()).resolves.toBe(false)
+      await api.activateProvider('tokenrhythm')
+      await expect(api.saveModelStrategy()).resolves.toBe(false)
+      choose('primary')
+      await expect(first).resolves.toBe(true)
+      const calls = rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.upsertAndActivate')
+      expect(calls).toHaveLength(2)
+      expect(calls[1]?.[1]).toMatchObject({ providerId: 'tokenrhythm', apiKey: 'synthetic-original', routerAction: 'use_recommended' })
+      expect(rpcCall.mock.calls.some(([method]) => ['onboarding.llmProfile.upsert', 'onboarding.llmProfile.activate'].includes(method))).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('keeps ordinary secondary saves separate and refuses atomic saves on older Gateways', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      await api.requestAddProvider('tokenrhythm')
+      api.updateProviderField('api_key', 'synthetic-secondary')
+      hasRpcMethod.mockImplementation(method => method !== 'onboarding.llmProfile.upsertAndActivate')
+      await expect(api.saveProviderAndActivate()).resolves.toBe(false)
+      expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.llmProfile.upsert')).toBe(false)
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Upgrade'), { tone: 'danger' })
+      await expect(api.saveProvider()).resolves.toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.upsert', expect.objectContaining({ providerId: 'tokenrhythm' }))
+      expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.llmProfile.activate')).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('refreshes an uncertain atomic result without replaying or claiming a saved key', async () => {
+    const { api, app, saved } = await primaryTransitionScenario(false, method => {
+      if (method === 'onboarding.llmProfile.upsertAndActivate') {
+        saved.llm.provider = 'tokenrhythm'
+        saved.llm.model = 'gpt-4.1-mini'
+        saved.squilla_router.tiers.c1.provider = 'tokenrhythm'
+        saved.squilla_router.tiers.c1.model = 'gpt-4.1-mini'
+        throw new SetupWorkflowError('unavailable', 'timeout')
+      }
+      return { changed: true }
+    })
+    try {
+      await api.requestAddProvider('tokenrhythm')
+      api.updateProviderField('api_key', 'synthetic-unacknowledged')
+      await expect(api.saveProviderAndActivate()).resolves.toBe(false)
+      expect(api.config.value.llm?.provider).toBe('tokenrhythm')
+      expect(api.providerPanel.value.editingPrimary).toBe(true)
+      expect(api.modelStrategyPanel.value.single).toMatchObject({ providerId: 'tokenrhythm', model: 'gpt-4.1-mini' })
+      expect(api.routerPanel.value.tierRows.find(row => row.name === 'c1')?.provider).toBe('tokenrhythm')
+      expect(api.providerPanel.value.credentialPanel?.apiKeyValue).toBe('synthetic-unacknowledged')
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.llmProfile.upsertAndActivate')).toHaveLength(1)
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('does not confirm'), { tone: 'danger' })
+    } finally { app.unmount() }
+  })
+
+  it.each([
+    new SetupWorkflowError('unavailable', 'timeout'),
+    new Error('connection closed'),
+  ])('keeps partial-save feedback uncertain when activation commits but its response is lost (%s)', async failure => {
+    const { api, app, saved } = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.router.configure') saved.squilla_router.enabled = params?.enabled === true
+      if (method === 'onboarding.ensemble.configure') saved.llm_ensemble.proposer_max_retries = Number(params?.proposerMaxRetries)
+      if (method === 'onboarding.llmProfile.activate') {
+        saved.llm.provider = String(params?.providerId)
+        saved.llm.model = String(params?.model)
+        throw failure
+      }
+      return { changed: true }
+    })
+    try {
+      api.setRouterMode('disabled')
+      api.setEnsembleProposerMaxRetries(2)
+      api.setFixedProvider('tokenrhythm')
+      await expect(api.saveModelStrategy()).resolves.toBe(false)
+      expect(api.config.value.llm?.provider).toBe('tokenrhythm')
+      expect(api.config.value.squilla_router?.enabled).toBe(false)
+      expect(api.config.value.llm_ensemble?.proposer_max_retries).toBe(2)
+      const writes = rpcCall.mock.calls.map(([method]) => method).filter(method => ['onboarding.router.configure', 'onboarding.ensemble.configure', 'onboarding.llmProfile.activate'].includes(method))
+      expect(writes).toEqual(['onboarding.router.configure', 'onboarding.ensemble.configure', 'onboarding.llmProfile.activate'])
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Some model settings were saved. The primary change could not be confirmed'), { tone: 'danger' })
+      expect(pushToast.mock.calls.some(([message]) => String(message).includes('was not completed'))).toBe(false)
+      expect(confirmChoiceAction).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it('rebases saved Router and Ensemble while retaining the cancelled primary draft', async () => {
+    const { api, app, saved } = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.router.configure') {
+        saved.squilla_router.tiers = params?.tiers as typeof saved.squilla_router.tiers
+      }
+      if (method === 'onboarding.ensemble.configure') saved.llm_ensemble.proposer_max_retries = Number(params?.proposerMaxRetries)
+      if (method === 'onboarding.llmProfile.activate') throw routerConflictForPrimary()
+      return { changed: true }
+    })
+    try {
+      api.updateTierField('c1', 'model', 'openai/gpt-custom')
+      api.setEnsembleProposerMaxRetries(2)
+      api.setFixedProvider('tokenrhythm')
+      await expect(api.saveModelStrategy()).resolves.toBe(false)
+      const writes = rpcCall.mock.calls.map(([method]) => method).filter(method => ['onboarding.router.configure', 'onboarding.ensemble.configure', 'onboarding.llmProfile.activate'].includes(method))
+      expect(writes).toEqual(['onboarding.router.configure', 'onboarding.ensemble.configure', 'onboarding.llmProfile.activate'])
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Some model settings were saved'), { tone: 'danger' })
+      expect(api.modelStrategyPanel.value.single.providerId).toBe('tokenrhythm')
+      expect(api.config.value.llm?.provider).toBe('openrouter')
+      rpcCall.mockClear()
+      await api.saveModelStrategy()
+      expect(rpcCall.mock.calls.some(([method]) => ['onboarding.router.configure', 'onboarding.ensemble.configure'].includes(method))).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
 function mockConfigSequence(configs: Array<Record<string, unknown>>) {
   const queue = [...configs]
-  rpcCall.mockImplementation(async (method: string) => {
+  rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'onboarding.catalog') return {}
     if (method === 'onboarding.status') return {}
     if (method === 'channels.status') return { channels: [] }
     if (method === 'config.get') return queue.shift() ?? configs[configs.length - 1] ?? {}
     if (method === 'config.patch.safe') return { restartRequired: false }
+    if (method === 'telemetry.consent.set') {
+      const scope = params?.scope as 'reliability' | 'growth'
+      const enabled = params?.enabled === true
+      return {
+        scope,
+        enabled,
+        noticeVersion: enabled ? (scope === 'reliability' ? 'reliability-v1' : 'growth-v2') : null,
+        consentedAtUtc: enabled ? new Date().toISOString() : null,
+      }
+    }
     if (method === 'models.routing.set') return {}
     throw new Error(`Unexpected RPC method: ${method}`)
   })
@@ -63,16 +395,141 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   rpcCall.mockReset()
-  waitForConnection.mockClear()
-  supportsMethod.mockReset()
-  supportsMethod.mockReturnValue(true)
+  ready.mockClear()
+  hasRpcMethod.mockReset()
+  hasRpcMethod.mockReturnValue(true)
+  observeProbeRequest.mockReset()
   pushToast.mockClear()
   confirmAction.mockReset()
   confirmAction.mockResolvedValue(true)
+  confirmChoiceAction.mockReset()
+  confirmChoiceAction.mockResolvedValue('cancel')
   document.body.innerHTML = ''
 })
 
 describe('useSetupCatalog privacy settings', () => {
+  it.each([
+    {},
+    { privacy: { disable_network_observability: false } },
+  ])('uses the legacy enabled default without separate consent drafts: %j', async config => {
+    mockConfigSequence([
+      config,
+    ])
+    const { api, app } = await mountCatalog()
+
+    expect(api.privacyPanel.value).toEqual({
+      networkReportingEnabled: true,
+      networkReportingForcedOff: false,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    app.unmount()
+  })
+
+  it('updates the unified upload draft without saving until requested', async () => {
+    mockConfigSequence([
+      {
+        privacy: {
+          disable_network_observability: false,
+          reliability_diagnostics_enabled: true,
+          reliability_notice_version: 'reliability-v1',
+          reliability_consented_at_utc: '2026-09-01T08:30:00.000Z',
+          product_analytics_enabled: true,
+          product_analytics_notice_version: 'growth-v2',
+          product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    api.setNetworkReportingEnabled(false)
+
+    expect(api.privacyPanel.value).toMatchObject({
+      networkReportingEnabled: false,
+      networkReportingForcedOff: false,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(rpcCall).not.toHaveBeenCalledWith('config.patch.safe', expect.anything())
+    expect(rpcCall).not.toHaveBeenCalledWith('telemetry.consent.set', expect.anything())
+    app.unmount()
+  })
+
+  it('re-enables reporting through the same safe global setting after a migrated decline', async () => {
+    mockConfigSequence([
+      { privacy: { disable_network_observability: true, product_analytics_enabled: false } },
+      {
+        privacy: {
+          disable_network_observability: false,
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+    api.setNetworkReportingEnabled(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+
+    await api.savePrivacy()
+
+    expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'privacy.disable_network_observability': false },
+    })
+    expect(rpcCall).not.toHaveBeenCalledWith('telemetry.consent.set', expect.anything())
+    expect(api.privacyPanel.value).toEqual({
+      networkReportingEnabled: true,
+      networkReportingForcedOff: false,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    app.unmount()
+  })
+
+  it('blocks reporting from being enabled while the environment disables it', async () => {
+    mockConfigSequence([
+      {
+        privacy: {
+          disable_network_observability: false,
+          network_observability_disabled_effective: true,
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    api.setNetworkReportingEnabled(true)
+
+    expect(api.privacyPanel.value).toMatchObject({
+      networkReportingEnabled: false,
+      networkReportingForcedOff: true,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    app.unmount()
+  })
+
+  it('keeps reporting enabled after a notice-version update without prompting again', async () => {
+    mockConfigSequence([
+      {
+        privacy: {
+          disable_network_observability: false,
+          reliability_diagnostics_enabled: true,
+          reliability_notice_version: 'reliability-v0',
+          reliability_consented_at_utc: '2026-08-01T08:30:00.000Z',
+          product_analytics_enabled: true,
+          product_analytics_notice_version: 'growth-v1',
+          product_analytics_consented_at_utc: '2026-08-01T08:30:00.000Z',
+        },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    expect(api.privacyPanel.value).toEqual({
+      networkReportingEnabled: true,
+      networkReportingForcedOff: false,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    await api.savePrivacy()
+    expect(rpcCall).not.toHaveBeenCalledWith('telemetry.consent.set', expect.anything())
+    expect(confirmAction).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
   it('tracks and saves automatic memory capture from the Advanced section', async () => {
     mockConfigSequence([
       {
@@ -533,7 +990,7 @@ describe('useSetupCatalog image model catalog', () => {
   })
 
   it('uses curated image models when the gateway lacks discovery support', async () => {
-    supportsMethod.mockImplementation(
+    hasRpcMethod.mockImplementation(
       method => method !== 'onboarding.imageGeneration.models.discover',
     )
     rpcCall.mockImplementation(async (method: string) => {
@@ -1229,13 +1686,80 @@ describe('useSetupCatalog model strategy IA', () => {
     api.setEnsembleMinSuccessful(1)
     expect(api.sectionDirty('modelStrategy')).toBe(false)
     expect(pushToast).toHaveBeenCalledWith(
-      expect.stringContaining('routing write failed'),
+      expect.stringContaining('save result is unknown'),
       { tone: 'danger' },
     )
     app.unmount()
   })
 
-  it('preserves Ensemble lineup edits made while the mode write is pending', async () => {
+  it('opens Ensemble as a draft when the primary preset has no two-model lineup', async () => {
+    const saved = {
+      llm: { provider: 'byteplus', model: 'seed-2-0-lite-260228' },
+      squilla_router: {
+        enabled: true,
+        rollout_phase: 'full',
+        preset_binding: 'follow_primary',
+        tier_profile: 'byteplus',
+      },
+      llm_ensemble: { enabled: false, selection_configured: false },
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          providers: [{
+            providerId: 'byteplus', label: 'BytePlus Ark', runtimeSupported: true,
+            requiresApiKey: true, envKey: 'BYTEPLUS_API_KEY', defaultDirectModel: saved.llm.model,
+            fields: [{ name: 'model', label: 'Model', required: true, default: saved.llm.model }],
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: true,
+          llmConfigured: true,
+          llmCredentialStatus: { provider: 'byteplus', available: true, source: 'explicit' },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return structuredClone(saved)
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.models.discover') return { ok: true, source: 'live', models: [] }
+      if (method === 'models.routing.set') throw new Error('Ensemble mode must remain a draft until the lineup is complete')
+      if (method === 'onboarding.router.configure' || method === 'onboarding.ensemble.configure') return {}
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await api.setModelStrategy('ensemble')
+
+    expect(api.modelStrategyPanel.value.activeStrategy).toBe('ensemble')
+    expect(api.modelStrategyPanel.value.ensemble.scheme).toBe('custom')
+    expect(api.modelStrategyPanel.value.ensemble.candidates).toEqual([])
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    expect(rpcCall.mock.calls.some(([method]) => method === 'models.routing.set')).toBe(false)
+    expect(pushToast).not.toHaveBeenCalledWith(expect.stringContaining('Ensemble mode must remain'), expect.anything())
+
+    await expect(api.saveModelStrategy({ reload: false })).resolves.toBe(false)
+    api.addEnsembleCandidate('byteplus', saved.llm.model, 'proposer')
+    await expect(api.saveModelStrategy({ reload: false })).resolves.toBe(false)
+    expect(rpcCall.mock.calls.some(([method]) => (
+      method === 'onboarding.router.configure' || method === 'onboarding.ensemble.configure'
+    ))).toBe(false)
+
+    api.addEnsembleCandidate('byteplus', 'seed-2-0-pro-260228', 'proposer')
+    await expect(api.saveModelStrategy({ reload: false })).resolves.toBe(true)
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.ensemble.configure', expect.objectContaining({
+      enabled: true,
+      candidates: [
+        expect.objectContaining({ provider: 'byteplus', model: saved.llm.model, role: 'proposer' }),
+        expect.objectContaining({ provider: 'byteplus', model: 'seed-2-0-pro-260228', role: 'proposer' }),
+      ],
+    }))
+
+    app.unmount()
+  })
+
+  it('preserves existing Ensemble edits and locks changes while the mode write is pending', async () => {
     let resolveRouting!: (value: Record<string, unknown>) => void
     const routingRequest = new Promise<Record<string, unknown>>(resolve => {
       resolveRouting = resolve
@@ -1256,11 +1780,12 @@ describe('useSetupCatalog model strategy IA', () => {
     })
     const { api, app } = await mountCatalog()
 
+    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
     const mutation = api.setModelStrategy('ensemble')
     await vi.waitFor(() => {
       expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
     })
-    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
+    api.addEnsembleCandidate('openrouter', 'racing/edit', 'proposer')
     resolveRouting({
       mode: 'ensemble',
       selection_mode: 'custom_b5',
@@ -1283,7 +1808,7 @@ describe('useSetupCatalog model strategy IA', () => {
     app.unmount()
   })
 
-  it('preserves Ensemble lineup edits when a pending mode write fails', async () => {
+  it('preserves existing Ensemble edits and locks changes when a pending mode write fails', async () => {
     let rejectRouting!: (error: Error) => void
     const routingRequest = new Promise<Record<string, unknown>>((_resolve, reject) => {
       rejectRouting = reject
@@ -1304,11 +1829,12 @@ describe('useSetupCatalog model strategy IA', () => {
     })
     const { api, app } = await mountCatalog()
 
+    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
     const mutation = api.setModelStrategy('ensemble')
     await vi.waitFor(() => {
       expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
     })
-    api.addEnsembleCandidate('openrouter', 'user/pending-model', 'proposer')
+    api.addEnsembleCandidate('openrouter', 'racing/edit', 'proposer')
     rejectRouting(new Error('routing write failed'))
     await mutation
 
@@ -1318,7 +1844,7 @@ describe('useSetupCatalog model strategy IA', () => {
     ]))
     expect(api.sectionDirty('modelStrategy')).toBe(true)
     expect(pushToast).toHaveBeenCalledWith(
-      expect.stringContaining('routing write failed'),
+      expect.stringContaining('save result is unknown'),
       { tone: 'danger' },
     )
     app.unmount()
@@ -2462,7 +2988,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     app.unmount()
   })
 
-  it('invalidates saved C3 readiness when an independent image-model row is edited', async () => {
+  it('keeps saved C3 readiness when an inactive legacy image row rejects an edit', async () => {
     mockProviderState(
       {
         ...configuredProviderStatus('tokenrhythm'),
@@ -2515,7 +3041,10 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
 
     api.updateTierField('image_model', 'model', 'vision-model-v2')
-    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(false)
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+    expect(api.modelStrategyPanel.value.router.tierRows).not.toContainEqual(expect.objectContaining({
+      name: 'image_model',
+    }))
     expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject({
       runtimeStatus: 'blocked',
       fixedFallbackReady: false,
@@ -2896,6 +3425,7 @@ describe('useSetupCatalog configured provider management', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.probe', {
       providerId: 'deepseek',
       model: 'deepseek-chat',
+      mode: 'reachability',
     })
     expect(rpcCall.mock.calls.filter(([method, params]) => (
       method === 'onboarding.llmProfile.models.discover'
@@ -2998,6 +3528,7 @@ describe('useSetupCatalog configured provider management', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.activate', {
       providerId: 'deepseek',
       model: 'deepseek-chat',
+      imageGenerationIntent: 'preserve',
     })
     expect(rpcCall).not.toHaveBeenCalledWith('config.patch', expect.anything())
     expect(api.modelStrategyPanel.value.single.providerId).toBe('deepseek')
@@ -3199,10 +3730,9 @@ describe('useSetupCatalog configured provider management', () => {
     expect(api.routerPanel.value.tierRows).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: 'c0', provider: 'openrouter', model: 'legacy-model' }),
       expect.objectContaining({ name: 'c1', provider: 'deepseek', model: 'deepseek-chat' }),
-      expect.objectContaining({ name: 'image_model', provider: 'deepseek', model: 'deepseek-vision' }),
     ]))
-    // The dedicated image route is independent and must never be imported as
-    // a text proposer when the user converts a legacy dynamic plan.
+    expect(api.routerPanel.value.tierRows.map(row => row.name)).toEqual(['c0', 'c1'])
+    // A retained image-model configuration must not become an Ensemble member.
     expect(api.ensemblePanel.value.tierCandidates).toEqual([
       expect.objectContaining({ provider: 'deepseek', model: 'deepseek-chat', source: 'tier' }),
     ])
@@ -3740,9 +4270,9 @@ describe('useSetupCatalog configured provider management', () => {
     await api.requestAddProvider('deepseek')
     api.updateProviderField('api_key', 'draft-secret')
     api.updateProviderField('model', 'deepseek-chat')
-    api.probeProviderConnection()
+    api.probeProviderConnection('model')
 
-    await vi.waitFor(() => expect(api.providerPanel.value.connection.phase).toBe('verified'))
+    await vi.waitFor(() => expect(api.providerPanel.value.connection.phase).toBe('model_verified'))
     expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.upsert')).toBe(false)
     expect(api.providerDraftDirty.value).toBe(true)
 
@@ -3760,6 +4290,56 @@ describe('useSetupCatalog configured provider management', () => {
     expect(reopened.api.providerPanel.value.configuredProviders.map(row => row.providerId))
       .toContain('deepseek')
     reopened.app.unmount()
+  })
+
+  it('allows a new provider to be saved after its model test times out', async () => {
+    let saved = false
+    const status = {
+      ...statusWithDeepSeek(),
+      llmProfileStatus: statusWithDeepSeek().llmProfileStatus.filter(
+        profile => profile.provider === 'openai',
+      ),
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return saved ? statusWithDeepSeek() : status
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configWithProfiles(...(saved ? ['deepseek'] : []))
+      if (method === 'onboarding.models.discover') return { ok: true, source: 'none', models: [] }
+      if (method === 'onboarding.provider.probe') {
+        return {
+          ok: false,
+          verificationLevel: 'none',
+          failureStage: 'model',
+          failureKind: 'probe_timeout',
+          message: 'Model probe timed out.',
+        }
+      }
+      if (method === 'onboarding.llmProfile.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.llmProfile.upsert') {
+        saved = true
+        return { changed: true }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await api.requestAddProvider('deepseek')
+    api.updateProviderField('api_key', 'draft-secret')
+    api.updateProviderField('model', 'deepseek-chat')
+    await api.probeProviderConnection('model')
+    expect(api.providerPanel.value.connection.phase).toBe('timed_out')
+
+    await expect(api.saveProvider()).resolves.toBe(true)
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.upsert', {
+      providerId: 'deepseek',
+      apiKey: 'draft-secret',
+      model: 'deepseek-chat',
+      keepCurrentSecret: false,
+    })
+    app.unmount()
   })
 
   it('keeps router and ensemble drafts when a new routing provider is saved', async () => {
@@ -3998,7 +4578,7 @@ describe('useSetupCatalog configured provider management', () => {
   it('replaces the active provider through the legacy configure RPC on an older Gateway', async () => {
     let activeProvider = 'openai'
     let activeModel = 'gpt-4.1-mini'
-    supportsMethod.mockImplementation(method => method !== 'onboarding.llmProfile.upsert')
+    hasRpcMethod.mockImplementation(method => method !== 'onboarding.llmProfile.upsert')
     rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'onboarding.catalog') return { providers }
       if (method === 'onboarding.status') {
@@ -4057,12 +4637,6 @@ describe('useSetupCatalog configured provider management', () => {
     api.updateProviderField('api_key', 'draft-secret')
     expect(api.providerPanel.value.profileSaveSupported).toBe(false)
     expect(api.modelStrategyPanel.value.profileSaveSupported).toBe(false)
-
-    await expect(api.saveProvider()).resolves.toBe(false)
-    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.provider.configure')).toBe(false)
-
-    await api.probeProviderConnection()
-    expect(api.providerPanel.value.connection.phase).toBe('verified')
 
     await expect(api.saveProvider()).resolves.toBe(true)
     expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.upsert')).toBe(false)
@@ -4182,6 +4756,7 @@ describe('useSetupCatalog configured provider management', () => {
       providerId: 'deepseek',
       apiKeyEnv: 'DEEPSEEK_API_KEY',
       model: 'deepseek-chat',
+      mode: 'reachability',
     })
     await api.saveProvider()
 
@@ -4211,12 +4786,13 @@ describe('useSetupCatalog configured provider management', () => {
     api.selectConfiguredProvider('deepseek')
     api.updateProviderField('api_key', 'draft-secret')
     api.updateProviderField('model', 'draft-deepseek-model')
-    api.probeProviderConnection()
+    api.probeProviderConnection('model')
     const expectedDraft = {
       providerId: 'deepseek',
       apiKey: 'draft-secret',
       model: 'draft-deepseek-model',
       keepCurrentSecret: false,
+      mode: 'model',
     }
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.draft.probe',
@@ -4224,10 +4800,16 @@ describe('useSetupCatalog configured provider management', () => {
     ))
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.draft.models.discover',
-      { ...expectedDraft, forceRefresh: true },
+      {
+        providerId: 'deepseek',
+        apiKey: 'draft-secret',
+        model: 'draft-deepseek-model',
+        keepCurrentSecret: false,
+        forceRefresh: true,
+      },
     ))
     expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.probe')).toBe(false)
-    expect(api.providerPanel.value.connection.phase).toBe('verified')
+    expect(api.providerPanel.value.connection.phase).toBe('model_verified')
     expect(api.providerPanel.value.connection.models[0]?.id).toBe('deepseek-chat')
     app.unmount()
   })
@@ -4249,10 +4831,11 @@ describe('useSetupCatalog configured provider management', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.probe', {
       providerId: 'deepseek',
       model: 'deepseek-chat',
+      mode: 'model',
     })
     expect(api.providerPanel.value.providerSelected).toBe('openai')
     expect(api.providerPanel.value.configuredProviderProbes.deepseek).toMatchObject({
-      phase: 'verified',
+      phase: 'model_verified',
       latencyMs: 19,
     })
     expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.draft.probe')).toBe(false)
@@ -4284,6 +4867,7 @@ describe('useSetupCatalog configured provider management', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.probe', {
       providerId: 'deepseek',
       model: 'deepseek-saved-direct',
+      mode: 'model',
     })
     app.unmount()
   })
@@ -4312,7 +4896,48 @@ describe('useSetupCatalog configured provider management', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.probe', {
       providerId: 'deepseek',
       model: 'deepseek-chat',
+      mode: 'model',
     })
+    app.unmount()
+  })
+
+  it('cancels a configured-provider model probe without leaving a failure verdict', async () => {
+    let finishProbe!: (value: { ok: boolean; latencyMs: number }) => void
+    const pendingProbe = new Promise<{ ok: boolean; latencyMs: number }>((resolve) => {
+      finishProbe = resolve
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return statusWithDeepSeek()
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configWithProfiles('deepseek')
+      if (method === 'onboarding.llmProfile.probe') return pendingProbe
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    const pending = api.probeConfiguredProvider('deepseek')
+    await vi.waitFor(() => expect(
+      api.providerPanel.value.configuredProviderProbes.deepseek?.phase,
+    ).toBe('probing'))
+    const observed = observeProbeRequest.mock.calls.find(
+      call => call[0] === 'onboarding.llmProfile.probe',
+    )
+    expect(observed?.[1]).toEqual({
+      providerId: 'deepseek',
+      model: 'deepseek-chat',
+      mode: 'model',
+    })
+    const signal = observed?.[2]?.signal as AbortSignal
+    expect(signal.aborted).toBe(false)
+
+    api.cancelConfiguredProviderProbe('deepseek')
+    expect(signal.aborted).toBe(true)
+    expect(api.providerPanel.value.configuredProviderProbes.deepseek).toBeUndefined()
+
+    finishProbe({ ok: false, latencyMs: 9 })
+    await pending
+    expect(api.providerPanel.value.configuredProviderProbes.deepseek).toBeUndefined()
     app.unmount()
   })
 
@@ -4328,7 +4953,7 @@ describe('useSetupCatalog configured provider management', () => {
     const { api, app } = await mountCatalog()
 
     await api.probeConfiguredProvider('deepseek')
-    expect(api.providerPanel.value.configuredProviderProbes.deepseek?.phase).toBe('verified')
+    expect(api.providerPanel.value.configuredProviderProbes.deepseek?.phase).toBe('model_verified')
 
     await api.loadData()
     expect(api.providerPanel.value.configuredProviderProbes.deepseek).toBeUndefined()
@@ -4402,8 +5027,9 @@ describe('useSetupCatalog configured provider management', () => {
       providerId: 'openai',
       model: 'gpt-4.1-mini',
     })
-    expect(api.routerPanel.value.discoveredModelsByProvider.deepseek?.models[0]?.id)
-      .toBe('deepseek-chat')
+    await vi.waitFor(() => expect(
+      api.routerPanel.value.discoveredModelsByProvider.deepseek?.models[0]?.id,
+    ).toBe('deepseek-chat'))
     app.unmount()
   })
 
@@ -4524,13 +5150,13 @@ describe('useSetupCatalog configured provider management', () => {
 
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.probe',
-      { providerId: 'custom', model: 'local-chat-model' },
+      { providerId: 'custom', model: 'local-chat-model', mode: 'reachability' },
     ))
-    expect(api.providerPanel.value.connection.phase).toBe('verified')
+    expect(api.providerPanel.value.connection.phase).toBe('reachable')
     app.unmount()
   })
 
-  it('blocks a stored profile probe when no representative model exists', async () => {
+  it('allows a saved-profile reachability check without a model but blocks its model test', async () => {
     rpcCall.mockImplementation(async (method: string) => {
       if (method === 'onboarding.catalog') return { providers: [...providers, customProvider] }
       if (method === 'onboarding.status') {
@@ -4551,6 +5177,12 @@ describe('useSetupCatalog configured provider management', () => {
       if (method === 'config.get') {
         return configWithProfiles('custom')
       }
+      if (method === 'onboarding.llmProfile.probe') {
+        return { ok: true, verificationLevel: 'reachable', totalMs: 12 }
+      }
+      if (method === 'onboarding.llmProfile.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
       throw new Error(`Unexpected RPC method: ${method}`)
     })
     const { api, app } = await mountCatalog()
@@ -4558,15 +5190,23 @@ describe('useSetupCatalog configured provider management', () => {
     api.selectConfiguredProvider('custom')
     expect(api.providerPanel.value.credentialPanel).toMatchObject({
       probeReady: false,
+      reachabilityReady: true,
       probeDisabledReason: 'Complete required fields before verifying: Model.',
     })
     api.probeProviderConnection()
 
-    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.draft.probe')).toBe(false)
+    await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
+      'onboarding.llmProfile.probe',
+      { providerId: 'custom', mode: 'reachability' },
+    ))
+    expect(api.providerPanel.value.connection.phase).toBe('reachable')
+
+    api.probeProviderConnection('model')
+    expect(rpcCall.mock.calls.filter(call => call[0] === 'onboarding.llmProfile.probe')).toHaveLength(1)
     app.unmount()
   })
 
-  it('activates with the provider default and turns off an incompatible custom Router', async () => {
+  it('asks before disabling an incompatible custom Router', async () => {
     const status = {
       ...statusWithDeepSeek(),
       sectionDetails: {
@@ -4591,13 +5231,20 @@ describe('useSetupCatalog configured provider management', () => {
       },
       llm_ensemble: { enabled: false },
     }
-    rpcCall.mockImplementation(async (method: string) => {
+    confirmChoiceAction.mockResolvedValueOnce('secondary')
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'onboarding.catalog') return { providers }
       if (method === 'onboarding.status') return status
       if (method === 'channels.status') return { channels: [] }
       if (method === 'config.get') return saved
       if (method === 'onboarding.models.discover') return { ok: true, source: 'none', models: [] }
-      if (method === 'onboarding.llmProfile.activate') return { changed: true }
+      if (method === 'onboarding.llmProfile.activate') {
+        if (!params?.routerAction) throw new SetupWorkflowError('conflict', 'opaque', 'router-provider-conflict', undefined, {
+          reason: 'router_provider_conflict', providerId: 'deepseek', conflictProviders: ['openai'],
+          allowedRouterActions: ['use_recommended', 'disable'],
+        })
+        return { changed: true }
+      }
       throw new Error(`Unexpected RPC method: ${method}`)
     })
     const { api, app } = await mountCatalog()
@@ -4608,6 +5255,7 @@ describe('useSetupCatalog configured provider management', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.activate', {
       providerId: 'deepseek',
       routerAction: 'disable',
+      imageGenerationIntent: 'preserve',
     })
     expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.models.discover'))
       .toBe(false)
@@ -4851,7 +5499,7 @@ describe('useSetupCatalog configured provider management', () => {
     app.unmount()
   })
 
-  it('turns the Router off instead of surfacing router_provider_conflict when active removal would leave a foreign tier', async () => {
+  it('keeps active-profile removal atomic without changing its deletion contract', async () => {
     const status = {
       ...statusWithDeepSeek(),
       llmProfileStatus: statusWithDeepSeek().llmProfileStatus.map(profile => (
@@ -4864,10 +5512,7 @@ describe('useSetupCatalog configured provider management', () => {
       if (method === 'onboarding.catalog') return { providers }
       if (method === 'onboarding.status') return status
       if (method === 'channels.status') return { channels: [] }
-      // A custom Router whose tiers still name the *current* primary (openai).
-      // Removing openai promotes deepseek, which the backend would reject with
-      // router_provider_conflict while cross-provider routing is off. The client
-      // must mirror activateProvider and send routerAction: 'disable' instead.
+      // The server validates first and supplies the only permitted conflict actions.
       if (method === 'config.get') {
         return {
           ...configWithProfiles('deepseek'),
@@ -4883,7 +5528,9 @@ describe('useSetupCatalog configured provider management', () => {
       if (method === 'onboarding.models.discover') {
         return { ok: true, source: 'none', models: [] }
       }
-      if (method === 'onboarding.llmProfile.active.remove') return { changed: true }
+      if (method === 'onboarding.llmProfile.active.remove') {
+        return { changed: true }
+      }
       throw new Error(`Unexpected RPC method: ${method}`)
     })
     const { api, app } = await mountCatalog()
@@ -4893,11 +5540,8 @@ describe('useSetupCatalog configured provider management', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.active.remove', {
       providerId: 'openai',
       replacementProviderId: 'deepseek',
-      routerAction: 'disable',
     })
-    expect(pushToast).toHaveBeenCalledWith(
-      'OpenAI was removed. Model Routing was turned off because its saved tiers use another provider.',
-    )
+    expect(confirmChoiceAction).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -4971,7 +5615,7 @@ describe('useSetupCatalog configured provider management', () => {
   })
 
   it('does not offer a two-RPC fallback when active removal is unsupported', async () => {
-    supportsMethod.mockImplementation(method => (
+    hasRpcMethod.mockImplementation(method => (
       method !== 'onboarding.llmProfile.active.remove'
     ))
     const status = {
@@ -5311,12 +5955,12 @@ describe('useSetupCatalog configured provider management', () => {
     })
     const { api, app } = await mountCatalog()
 
-    api.probeProviderConnection()
-    await vi.waitFor(() => expect(api.providerPanel.value.connection.phase).toBe('verified'))
+    api.probeProviderConnection('model')
+    await vi.waitFor(() => expect(api.providerPanel.value.connection.phase).toBe('model_verified'))
 
     api.setFixedModel('gpt-4.1')
-    expect(api.providerPanel.value.connection.phase).toBe('unverified')
-    api.probeProviderConnection()
+    expect(api.providerPanel.value.connection.phase).toBe('reachable')
+    api.probeProviderConnection('model')
 
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.provider.probe',
@@ -5479,7 +6123,7 @@ describe('useSetupCatalog optional provider credentials', () => {
     ['custom', 'Custom OpenAI-compatible endpoint', 'CUSTOM_LLM_API_KEY'],
     ['custom_anthropic', 'Custom Anthropic-compatible endpoint', 'CUSTOM_ANTHROPIC_API_KEY'],
   ])(
-    'exposes an optional key and blocks %s probes until required fields exist',
+    'allows %s connection checks without a model once required connection fields exist',
     async (providerId, label, envKey) => {
       rpcCall.mockImplementation(async (method: string) => {
         if (method === 'onboarding.catalog') {
@@ -5530,8 +6174,25 @@ describe('useSetupCatalog optional provider credentials', () => {
       api.probeProviderConnection()
       expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.provider.probe')).toBe(false)
 
-      api.updateProviderField('model', 'test-model')
       api.updateProviderField('base_url', 'https://custom.example.test/v1')
+      expect(api.providerPanel.value.credentialPanel).toMatchObject({
+        probeReady: false,
+        reachabilityReady: true,
+        reachabilityDisabledReason: '',
+      })
+      await api.probeProviderConnection()
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.probe', {
+        providerId,
+        baseUrl: 'https://custom.example.test/v1',
+        mode: 'reachability',
+      })
+      await api.probeProviderConnection('model')
+      expect(rpcCall.mock.calls.filter(call => call[0] === 'onboarding.provider.probe')).toHaveLength(1)
+      expect(rpcCall.mock.calls.some(call => (
+        call[0] === 'onboarding.provider.configure' || call[0] === 'onboarding.llmProfile.upsert'
+      ))).toBe(false)
+
+      api.updateProviderField('model', 'test-model')
       credential = api.providerPanel.value.credentialPanel
       expect(credential?.probeReady).toBe(true)
       expect(credential?.probeDisabledReason).toBe('')
@@ -5542,6 +6203,7 @@ describe('useSetupCatalog optional provider credentials', () => {
         providerId,
         baseUrl: 'https://custom.example.test/v1',
         model: 'test-model',
+        mode: 'reachability',
       })
       app.unmount()
     },
@@ -6155,7 +6817,7 @@ describe('useSetupCatalog image-generation onboarding intent', () => {
     },
   )
 
-  it('sends the OpenRouter default intent when activating a stored profile', async () => {
+  it('preserves image configuration when activating a stored profile', async () => {
     const providers = [
       {
         providerId: 'openai',
@@ -6205,12 +6867,12 @@ describe('useSetupCatalog image-generation onboarding intent', () => {
 
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.activate', {
       providerId: 'openrouter',
-      imageGenerationIntent: 'enable_provider_default',
+      imageGenerationIntent: 'preserve',
     })
     app.unmount()
   })
 
-  it('omits the activation intent for an older Gateway without the state contract', async () => {
+  it('explicitly preserves image configuration without the state contract', async () => {
     const providers = [
       {
         providerId: 'openai',
@@ -6264,6 +6926,7 @@ describe('useSetupCatalog image-generation onboarding intent', () => {
 
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.activate', {
       providerId: 'openrouter',
+      imageGenerationIntent: 'preserve',
     })
     app.unmount()
   })
@@ -6374,5 +7037,225 @@ describe('useSetupCatalog image-generation onboarding intent', () => {
     expect(api.capabilitiesPanel.value.form.imageProvider).toBe('tokenrhythm')
     expect(api.sectionDirty('capabilities')).toBe(true)
     app.unmount()
+  })
+})
+
+
+describe('recommended Router reset and activation safety', () => {
+  it('requires explicit reset support and leaves ordinary single-mode operations available', async () => {
+    hasRpcMethod.mockImplementation(method => method !== 'models.routing.resetRecommended')
+    const { api, app } = await primaryTransitionScenario()
+    expect(api.modelStrategyPanel.value.routingSummary?.resetDisabledReason).toContain('Upgrade')
+    expect(await api.resetRecommendedRouter()).toBe(false)
+    await api.setModelStrategy('single')
+    expect(rpcCall).toHaveBeenCalledWith('models.routing.set', { mode: 'direct' })
+    await api.setModelStrategy('router')
+    expect(rpcCall).not.toHaveBeenCalledWith('models.routing.set', { mode: 'router' })
+    app.unmount()
+  })
+
+  it('holds shared locks through reset confirmation and submits the saved provider without changing mode', async () => {
+    const { api, app, saved } = await primaryTransitionScenario(false, (method) => {
+      if (method === 'models.routing.resetRecommended') {
+        saved.squilla_router.tiers.c0.model = 'recommended-reset'
+        saved.squilla_router.preset_binding = 'follow_primary'
+        return { mode: 'router' }
+      }
+      return { changed: true }
+    })
+    api.updateTierField('c0', 'model', 'unsaved-tier')
+    api.setEnsembleMinSuccessful(2)
+    let resolveConfirm!: (value: boolean) => void
+    confirmAction.mockImplementationOnce(() => new Promise(resolve => { resolveConfirm = resolve }))
+    const pending = api.resetRecommendedRouter()
+    expect(api.providerPanel.value.busy).toBe(true)
+    expect(await api.saveProvider()).toBe(false)
+    await api.setModelStrategy('single')
+    api.updateTierField('c0', 'model', 'racing-edit')
+    expect(api.modelStrategyPanel.value.router.tierRows[0]?.model).toBe('unsaved-tier')
+    resolveConfirm(true)
+    expect(await pending).toBe(true)
+    expect(rpcCall).toHaveBeenCalledWith('models.routing.resetRecommended', { providerId: 'openrouter', activateRouter: false })
+    expect(rpcCall).not.toHaveBeenCalledWith('models.routing.set', { mode: 'direct' })
+    expect(api.modelStrategyPanel.value.ensemble.minSuccessfulProposers).toBe(2)
+    expect(api.modelStrategyPanel.value.routingSummary?.hasUnsavedChanges).toBe(true)
+    expect(api.providerPanel.value.busy).toBe(false)
+    app.unmount()
+  })
+
+  it.each(['cancel', 'primary'] as const)('uses only the typed mode conflict choice: %s', async choice => {
+    confirmChoiceAction.mockResolvedValueOnce(choice)
+    const { api, app, saved } = await primaryTransitionScenario(false, method => {
+      if (method === 'models.routing.set') throw routerConflictForPrimary()
+      if (method === 'models.routing.resetRecommended') {
+        saved.squilla_router.enabled = true
+        return { mode: 'router' }
+      }
+      return { changed: true }
+    })
+    saved.squilla_router.enabled = false
+    await api.loadData()
+    api.updateTierField('c0', 'model', 'retained-tier')
+    await api.setModelStrategy('router')
+    if (choice === 'cancel') {
+      expect(api.modelStrategyPanel.value.activeStrategy).toBe('single')
+      expect(api.modelStrategyPanel.value.router.tierRows[0]?.model).toBe('retained-tier')
+      expect(rpcCall).not.toHaveBeenCalledWith('models.routing.resetRecommended', expect.anything())
+    } else {
+      expect(rpcCall).toHaveBeenCalledWith('models.routing.resetRecommended', { providerId: 'openrouter', activateRouter: true })
+    }
+    app.unmount()
+  })
+
+  it('does not authorize conflict actions from prose or replay an uncertain reset', async () => {
+    const { api, app, saved } = await primaryTransitionScenario(false, method => {
+      if (method === 'models.routing.set' || method === 'models.routing.resetRecommended') throw new Error('router_provider_conflict use_recommended')
+      return {}
+    })
+    saved.squilla_router.enabled = false
+    await api.loadData()
+    await api.setModelStrategy('router')
+    expect(confirmChoiceAction).not.toHaveBeenCalled()
+    await api.resetRecommendedRouter()
+    expect(rpcCall.mock.calls.filter(([method]) => method === 'models.routing.resetRecommended')).toHaveLength(1)
+    expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('save result is unknown'), { tone: 'danger' })
+    app.unmount()
+  })
+
+  it('keeps an explicit unready saved primary editable without reporting completed setup', async () => {
+    const { api, app } = await primaryTransitionScenario(true)
+    const original = rpcCall.getMockImplementation()!
+    rpcCall.mockImplementation(async (method, params) => method === 'config.effective'
+      ? { fields: { 'llm.provider': { source: 'config' } } } : original(method, params))
+    await api.loadData()
+    expect(api.providerPanel.value.hasConfiguredPrimaryProvider).toBe(true)
+    expect(api.providerPanel.value.primaryReady).toBe(false)
+    expect(api.providerPanel.value.configuredProviders[0]?.ready).toBe(false)
+    expect(api.sectionStatus('provider').tone).toBe('is-warn')
+    expect(api.providerPanel.value.providerSelected).toBe('openrouter')
+    app.unmount()
+  })
+})
+
+
+describe('capacity save integration', () => {
+  it.each(['131072', ''])('restores the prior routing draft when provider editing is cancelled after entering %s', async value => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.modelCapacity.update(target, { contextWindow: value, maxOutputTokens: '' }, 'provider:openrouter')
+      api.cancelProviderEdit()
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      expect(api.modelCapacity.dirty('modelStrategy')).toBe(true)
+      expect(api.modelCapacity.dirty('provider:openrouter')).toBe(false)
+    } finally { app.unmount() }
+  })
+  it('does not restore a routing draft after its provider edit was saved', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.modelCapacity.update(target, { contextWindow: '131072', maxOutputTokens: '' }, 'provider:openrouter')
+      expect(await api.saveProvider({ reload: false })).toBe(true)
+      api.cancelProviderEdit()
+      expect(api.modelCapacity.dirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+  it('identifies an unsaved routing panel style separately from saved model tiers', async () => {
+    const scenario = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.router.configure') {
+        scenario.saved.squilla_router.tiers.c0.model = String((params?.tiers as Record<string, { model: string }>).c0!.model)
+        return { changed: true }
+      }
+      if (method === 'config.patch.safe') throw new Error('synthetic style save failure')
+      return { changed: true }
+    })
+    const { api, app } = scenario
+    try {
+      const target = { provider: 'openrouter', model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.updateTierField('c0', 'model', 'saved-new-route')
+      api.setRouterVisualMode('legacy_grid')
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      expect(await api.saveModelStrategy()).toBe(false)
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved: Intelligent model routing. Not saved: Routing decision panel style, Model settings.'), { tone: 'danger' })
+      expect(api.modelStrategyPanel.value.router.routerVisualMode).toBe('legacy_grid')
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      rpcCall.mockClear()
+      await api.saveModelStrategy({ reload: false })
+      expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.router.configure')).toBe(false)
+      expect(rpcCall.mock.calls.some(([method]) => method === 'config.patch.safe')).toBe(true)
+    } finally { app.unmount() }
+  })
+  it('rebases acknowledged routing while retaining a rejected capacity draft', async () => {
+    const scenario = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.router.configure') {
+        scenario.saved.squilla_router.tiers.c0.model = String((params?.tiers as Record<string, { model: string }>).c0!.model)
+        return { changed: true }
+      }
+      if (method === 'config.patch' && params?.patch) throw new Error('synthetic capacity save failure')
+      return { changed: true }
+    })
+    const { api, app } = scenario
+    try {
+      const target = { provider: 'openrouter', model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.updateTierField('c0', 'model', 'saved-new-route')
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      expect(await api.saveModelStrategy()).toBe(false)
+      expect(api.modelStrategyPanel.value.router.tierRows[0]?.model).toBe('saved-new-route')
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved: Intelligent model routing. Not saved: Model settings.'), { tone: 'danger' })
+      rpcCall.mockClear()
+      await api.saveModelStrategy({ reload: false })
+      expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.router.configure')).toBe(false)
+    } finally { app.unmount() }
+  })
+  it.each(['provider', 'profile', 'modelStrategy'] as const)('saves capacity-only work through %s without activation or connection validation', async location => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      if (location === 'profile') await api.selectConfiguredProvider('tokenrhythm')
+      const provider = location === 'profile' ? 'tokenrhythm' : 'openrouter'
+      const target = { provider, model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await Promise.resolve(); await Promise.resolve(); await nextTick()
+      const scope = location === 'modelStrategy' ? 'modelStrategy' : `provider:${provider}`
+      api.modelCapacity.update(target, { contextWindow: '262144', maxOutputTokens: '65536' }, scope)
+      rpcCall.mockClear()
+      const saved = location === 'modelStrategy' ? await api.saveModelStrategy({ reload: false }) : await api.saveProvider({ reload: false })
+      expect(saved).toBe(true)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.patch')).toEqual([['config.patch', {
+        patch: { models: { [provider]: { [target.model]: { context_window: 262144, max_output_tokens: 65536 } } } },
+      }]])
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(api.modelCapacity.dirty(scope)).toBe(false)
+    } finally { app.unmount() }
+  })
+  it('retains a rejected capacity patch and submits no second write for invalid values', async () => {
+    const { api, app } = await primaryTransitionScenario(false, method => {
+      if (method === 'config.patch') throw new Error('synthetic disk failure')
+      return { changed: true }
+    })
+    try {
+      const target = { provider: 'openrouter', model: 'example.v1/model:latest' }
+      api.modelCapacity.ensure(target)
+      await Promise.resolve(); await Promise.resolve(); await nextTick()
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      expect(await api.saveModelStrategy({ reload: false })).toBe(false)
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      api.modelCapacity.update(target, { contextWindow: '-1', maxOutputTokens: '' }, 'modelStrategy')
+      rpcCall.mockClear()
+      expect(await api.saveModelStrategy({ reload: false })).toBe(false)
+      expect(rpcCall).not.toHaveBeenCalled()
+    } finally { app.unmount() }
   })
 })

@@ -159,8 +159,7 @@ async def test_gateway_boot_quarantines_only_managed_skills_when_recovery_blocks
         control_ui={"enabled": False},
         channels={"channels": []},
         mcp={"enabled": False},
-        memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
+        memory={},
     )
     profile_lease = ProfileOperationLock(state_root)
     profile_lease.acquire()

@@ -22,11 +22,15 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .protocol import ProviderModelListingResponseError
 from .request_proof import (
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
 from .trace_recorder import LLMTraceRecorder
@@ -274,7 +278,8 @@ class OllamaProvider:
         return project_final_request_payload(
             payload,
             projection_adapter="ollama",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             active_user_message_index=wire_active_user_index,
             message_limit=message_limit,
             protected_tool_result_indexes=protected_result_indexes,
@@ -303,7 +308,8 @@ class OllamaProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="ollama",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             active_user_message_index=wire_active_user_index,
             protected_tool_result_indexes=protected_result_indexes,
         )
@@ -328,6 +334,7 @@ class OllamaProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, cfg),
                 projection_adapter="ollama",
                 active_user_message_index=wire_active_user_index,
                 protected_tool_result_indexes=protected_result_indexes,
@@ -411,6 +418,9 @@ class OllamaProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            retry_after_s=retry_after_from_headers(
+                                response.status_code, getattr(response, "headers", None)
+                            ),
                         )
                         return
 
@@ -736,21 +746,23 @@ class OllamaProvider:
             )
             yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="timeout", message=message)
-            yield ErrorEvent(message=message, code="timeout")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="request_error", message=message)
-            yield ErrorEvent(message=message, code="request_error")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             message = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",
@@ -781,6 +793,7 @@ class OllamaProvider:
         so callers that must distinguish an unreachable/secured host from an
         empty catalog (e.g. onboarding discovery) can classify it.
         """
+        resp: httpx.Response | None = None
         try:
             async with httpx.AsyncClient(
                 timeout=5.0,
@@ -793,6 +806,10 @@ class OllamaProvider:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                if not isinstance(data, dict) or not isinstance(
+                    data.get("models", []), list
+                ):
+                    raise TypeError("Provider model catalog had an unexpected shape")
                 return [
                     ModelInfo(
                         provider=self.provider_id,
@@ -808,5 +825,10 @@ class OllamaProvider:
             return []
         except Exception:
             if raise_on_error:
+                if resp is not None:
+                    raise ProviderModelListingResponseError(
+                        "Provider model catalog response could not be parsed",
+                        status_code=resp.status_code,
+                    ) from None
                 raise
             return []

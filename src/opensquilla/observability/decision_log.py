@@ -15,25 +15,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from opensquilla.bootstrap_types import BootstrapFileReport
+from opensquilla.observability.log_privacy import log_metadata
 from opensquilla.paths import default_opensquilla_home
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _INTENT_SUMMARY_MAX_CHARS = 500
-_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
-_URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
-_SECRET_ASSIGN_RE = re.compile(
-    r"\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*([^\s,;]+)",
-    re.IGNORECASE,
-)
-_LONG_SECRET_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|[A-Za-z0-9_/-]{32,})\b")
-_ABS_PATH_RE = re.compile(r"(?<!\w)(?:/home/[^/\s]+|/Users/[^/\s]+|/root)(?:/[^\s]+)*")
 _VISION_GATE_DECISIONS = {"needs_image", "text_only", "unknown"}
 _VISION_GATE_STATIC_DECISIONS = {"disabled", "current_image", "not_applicable"}
 _VISION_GATE_STATIC_REASONS = {"candidate_window_expired"}
@@ -104,10 +96,21 @@ class PipelineStepRecord:
     step_name: str
     applied: bool
     routed_tier: str | None = None
-    filtered_skill_ids: list[str] | None = None
+    skill_catalog_ids: list[str] | None = None
     routing_source: RoutingSource = "none"
     confidence: float | None = None
     fallback_reason: str | None = None
+    # Capture the outcome before log privacy removes exception text.
+    status: Literal["ok", "skipped", "failed", "unknown"] | None = None
+
+    def __post_init__(self) -> None:
+        if self.status is None:
+            if self.applied:
+                self.status = "ok"
+            elif self.fallback_reason is not None:
+                self.status = "failed"
+            else:
+                self.status = "skipped"
 
 
 @dataclass
@@ -163,9 +166,6 @@ class DecisionEntry:
     cache_dynamic_chars: int = 0
     runtime_context_hash: str | None = None
     runtime_context_chars: int = 0
-    session_flush_extraction_model: str | None = None
-    session_flush_fallback_used: bool = False
-    session_flush_fallback_reason: str | None = None
     image_route_reason: str | None = None
     vision_followup_gate_decision: str | None = None
     vision_followup_gate_confidence: float | None = None
@@ -187,24 +187,8 @@ def _hash16(text: str) -> str:
 
 
 def build_intent_summary(message: str, max_chars: int = _INTENT_SUMMARY_MAX_CHARS) -> str:
-    """Return a bounded, redacted intent hint for history aggregation.
-
-    Default decision logs still avoid raw prompt storage. This derived summary
-    preserves enough task shape for history mining while removing common
-    secrets, emails, URLs, and machine-local absolute paths.
-    """
-
-    text = " ".join(str(message or "").split())
-    if not text:
-        return ""
-    text = _URL_RE.sub("[url]", text)
-    text = _EMAIL_RE.sub("[email]", text)
-    text = _SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=[secret]", text)
-    text = _LONG_SECRET_RE.sub("[secret]", text)
-    text = _ABS_PATH_RE.sub(_redact_path_keep_basename, text)
-    if len(text) > max_chars:
-        text = text[: max(0, max_chars - 1)].rstrip() + "…"
-    return text
+    """Legacy helper: operational logs no longer store prompt-derived prose."""
+    return ""
 
 
 def build_vision_followup_gate_reason_code(
@@ -242,11 +226,6 @@ def build_vision_followup_gate_reason_code(
     if decision_text == "unknown":
         return "unknown"
     return None
-
-
-def _redact_path_keep_basename(match: re.Match[str]) -> str:
-    basename = match.group(0).rstrip("/").rsplit("/", 1)[-1]
-    return f"[path:{basename}]" if basename else "[path]"
 
 
 def _default_log_dir() -> Path:
@@ -287,8 +266,11 @@ def write_decision_entry(
     log_dir.mkdir(parents=True, exist_ok=True)
     day = datetime.now(UTC).strftime("%Y%m%d")
     path = log_dir / f"decisions-{day}.jsonl"
+    payload = log_metadata(asdict(entry))
+    # Old callers must not reintroduce prose, including in the debug mirror.
+    payload["intent_summary"] = None
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     # Debug mirror: opt-in via OPENSQUILLA_DEBUG_LOG=1. Mirrors the *structured*
     # entry, never raw prompt bytes. Reuses `day` so primary and debug files
@@ -300,7 +282,7 @@ def write_decision_entry(
         with debug_path.open("a", encoding="utf-8") as fh:
             fh.write(
                 json.dumps(
-                    {"turn_id": entry.turn_id, "entry": asdict(entry)},
+                    {"turn_id": payload.get("turn_id"), "entry": payload},
                     ensure_ascii=False,
                 )
                 + "\n"
@@ -327,11 +309,20 @@ def load_entries(path: Path) -> list[DecisionEntry]:
         payload = json.loads(line)
         payload = _coerce_decision_payload(payload)
         steps_payload = payload.pop("pipeline_steps", [])
-        steps = [
-            PipelineStepRecord(**_filter_payload(PipelineStepRecord, s))
-            for s in steps_payload
-            if isinstance(s, dict)
-        ]
+        steps = []
+        for step_payload in steps_payload:
+            if not isinstance(step_payload, dict):
+                continue
+            step_fields = _filter_payload(PipelineStepRecord, step_payload)
+            if (
+                step_fields.get("status") is None
+                and not step_fields.get("applied")
+                and "fallback_reason" not in step_fields
+            ):
+                # Older private logs lost the reason for non-applied steps;
+                # they cannot distinguish an exception from a gated skip.
+                step_fields["status"] = "unknown"
+            steps.append(PipelineStepRecord(**step_fields))
         bootstrap_payload = payload.pop("bootstrap_files", [])
         bootstrap_files = [
             BootstrapFileReport(**_filter_payload(BootstrapFileReport, item))

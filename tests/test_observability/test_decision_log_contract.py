@@ -76,7 +76,7 @@ def test_intent_summary_is_redacted_and_persisted(tmp_path) -> None:
         "1234567890abcdef1234567890abcdef and email alice@example.com",
     )
 
-    assert "vendor" in summary
+    assert summary == ""
     assert "/home/alice" not in summary
     assert "sk-1234567890abcdef1234567890abcdef" not in summary
     assert "alice@example.com" not in summary
@@ -100,7 +100,7 @@ def test_intent_summary_is_redacted_and_persisted(tmp_path) -> None:
     write_decision_entry(entry, log_dir=tmp_path)
     loaded = load_entries(next(tmp_path.glob("decisions-*.jsonl")))
 
-    assert loaded[0].intent_summary == summary
+    assert loaded[0].intent_summary is None
 
 
 def test_decision_log_round_trips_daily_notes_policy(tmp_path) -> None:

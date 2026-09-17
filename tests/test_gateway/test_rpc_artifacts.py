@@ -12,6 +12,7 @@ from PIL import Image
 
 import opensquilla.gateway.rpc_artifacts as rpc_artifacts
 from opensquilla.artifacts import ArtifactStore
+from opensquilla.contracts.generated.v4.artifacts_list import ArtifactsListResult
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher, validate_classification
@@ -105,6 +106,7 @@ async def test_artifacts_list_pages_latest_metadata_and_gets_one(
     assert newest.payload["page_size"] == 2
     assert newest.payload["oldest_cursor"] == refs[1].id
     assert newest.payload["newest_cursor"] == refs[2].id
+    assert ArtifactsListResult.model_validate(newest.payload).total_count == 3
 
     older = await get_dispatcher().dispatch(
         "list-older",
@@ -121,6 +123,7 @@ async def test_artifacts_list_pages_latest_metadata_and_gets_one(
     assert [item["id"] for item in older.payload["artifacts"]] == [refs[0].id]
     assert older.payload["has_more"] is False
     assert older.payload["total_count"] == 3
+    assert ArtifactsListResult.model_validate(older.payload).page_size == 2
 
     fetched = await get_dispatcher().dispatch(
         "get-one",

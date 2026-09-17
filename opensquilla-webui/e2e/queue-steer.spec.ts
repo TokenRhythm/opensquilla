@@ -1,4 +1,12 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
+
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-queue-steer'
@@ -36,6 +44,8 @@ type MockGateway = {
   historyCalls: number
   historyMessages: Array<Record<string, unknown>>
   hydrateCalls: number
+  holdHistory: boolean
+  heldHistory: Array<() => void>
   steerRequests: CapturedSteer[]
 }
 
@@ -63,26 +73,32 @@ function activeTask(includeCapability: boolean) {
   }
 }
 
-function staleHistory() {
+function staleHistory(legacyHistory = false) {
   return [{
     role: 'user',
     text: ORIGINAL_TEXT,
     message_id: 'message-e2e-original',
     timestamp: '2026-08-11T09:00:00Z',
-    turn_context: { turn_id: TURN_ID },
+    ...(legacyHistory ? {} : { turn_context: { turn_id: TURN_ID } }),
   }]
 }
 
 async function installMockGateway(
   page: Page,
-  options: { capabilityFromHydration?: boolean } = {},
+  options: {
+    capabilityFromHydration?: boolean
+    legacyHistory?: boolean
+    routerEnabled?: boolean
+  } = {},
 ): Promise<MockGateway> {
   const state: MockGateway = {
     chatSendCalls: 0,
     emit: () => { throw new Error('WebSocket is not connected') },
     historyCalls: 0,
-    historyMessages: staleHistory(),
+    historyMessages: staleHistory(options.legacyHistory),
     hydrateCalls: 0,
+    holdHistory: false,
+    heldHistory: [],
     steerRequests: [],
   }
 
@@ -109,12 +125,14 @@ async function installMockGateway(
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30000, concurrent_history_reads: true },
+        ws.send(helloOkResponse({
+          policy: { concurrent_history_reads: true },
           features: { methods: ['sessions.steer.v2'] },
           auth: {
-            principal: { isOwner: true },
+            principal: {
+              role: 'operator', isOwner: true, authenticated: true, authState: 'authenticated',
+              scopes: ['operator.read', 'operator.write'], capabilities: ['chat.read', 'chat.write'],
+            },
             runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
           },
         }))
@@ -123,47 +141,36 @@ async function installMockGateway(
 
       if (method === 'chat.history') {
         state.historyCalls += 1
-        ws.send(successResponse(frame.id, {
-          messages: state.historyMessages,
-          has_more: false,
-          canonical_available: true,
-          canonical_complete: true,
-        }))
+        const response = successResponse(frame.id, chatHistoryPayload(state.historyMessages))
+        const deliver = () => ws.send(response)
+        if (state.holdHistory) state.heldHistory.push(deliver)
+        else deliver()
         return
       }
 
       if (method === 'sessions.messages.snapshot') {
-        ws.send(successResponse(frame.id, {
-          key: SESSION_KEY,
-          events: [],
+        ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(SESSION_KEY, {
           current_stream_seq: 0,
-        }))
+        })))
         return
       }
 
       if (method === 'sessions.messages.subscribe') {
-        ws.send(successResponse(frame.id, {
-          subscribed: true,
+        ws.send(successResponse(frame.id, sessionMessagesSubscribePayload(SESSION_KEY, {
           hydration_complete: false,
-          replay_complete: true,
-          current_stream_seq: 0,
           run_status: 'running',
           active_task: activeTask(!options.capabilityFromHydration),
-        }))
+        })))
         return
       }
 
       if (method === 'sessions.messages.hydrate') {
         state.hydrateCalls += 1
-        ws.send(successResponse(frame.id, {
-          subscribed: true,
-          hydration_complete: true,
-          replay_complete: true,
-          current_stream_seq: 0,
+        ws.send(successResponse(frame.id, sessionMessagesHydratePayload(SESSION_KEY, {
           run_status: 'running',
           active_task: activeTask(true),
           workspaceId: null,
-        }))
+        })))
         return
       }
 
@@ -191,7 +198,11 @@ async function installMockGateway(
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
         'config.get': {
-          squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
+          squilla_router: {
+            enabled: options.routerEnabled ?? false,
+            rollout_phase: options.routerEnabled ? 'full' : 'observe',
+            tiers: {},
+          },
           permissions: {},
           skills: {},
         },
@@ -210,6 +221,8 @@ async function installMockGateway(
             status: 'ok',
             runStatus: 'running',
           }],
+          count: 1,
+          ts: 1_800_000_000,
           has_more: false,
         },
         'sessions.messages.unsubscribe': { subscribed: false },
@@ -270,6 +283,156 @@ function acceptedSteer(
 }
 
 test.describe('Queue/Steer composer semantics', () => {
+  for (const legacyHistory of [false, true]) {
+    const title = legacyHistory
+      ? 'preserves the router and first segment when legacy history refreshes after a steer'
+      : 'preserves two applied steer boundaries during a running history refresh'
+
+    test(title, async ({ page }) => {
+      await page.addInitScript(() => {
+        window.localStorage.setItem('opensquilla-locale', 'en')
+        window.localStorage.setItem('opensquilla.routerVisualEffects', '1')
+      })
+      const state = await installMockGateway(page, { legacyHistory, routerEnabled: true })
+      await openRunningSession(page)
+      let streamSeq = 1
+      const emit = (name: string, payload: Record<string, unknown>) => {
+        state.emit(`session.event.${name}`, {
+          key: SESSION_KEY,
+          session_key: SESSION_KEY,
+          task_id: TURN_ID,
+          turn_id: TURN_ID,
+          stream_seq: streamSeq++,
+          ...payload,
+        })
+      }
+      const visibleOrder = (labels: string[]) => {
+        return page.getByTestId('chat-message-row').evaluateAll((rows, expected) => (
+          rows.flatMap(row => expected.filter(label => row.textContent?.includes(label)))
+        ), labels)
+      }
+      // This row exists only in the history response. Its changed text proves
+      // the merged DOM has rendered before checking that live rows survived.
+      const historyMarker = (refresh: number) => ({
+        role: 'assistant',
+        text: `Earlier answer restored with history refresh ${refresh}.`,
+        message_id: 'message-e2e-earlier-answer',
+        timestamp: '2026-08-11T08:59:00Z',
+        turn_context: { turn_id: 'turn-e2e-earlier' },
+      })
+      const releaseHistory = async (marker: string) => {
+        await expect.poll(() => state.heldHistory.length).toBeGreaterThan(0)
+        await expect(page.getByText(marker, { exact: true })).toHaveCount(0)
+        state.holdHistory = false
+        for (const deliver of state.heldHistory.splice(0)) deliver()
+        await expect(page.getByText(marker, { exact: true })).toBeVisible()
+      }
+
+      emit('router_decision', {
+        tier: 'c1',
+        model: 'synthetic/steer-model',
+        source: 'squilla_router',
+        routing_applied: true,
+        decision_id: 'router-e2e-steer',
+      })
+      emit('text_delta', {
+        text: 'Segment before first steer.',
+        presentation: 'answer',
+        generation_epoch: 0,
+        model_call_id: '1.0',
+        iteration: 1,
+      })
+      await expect(page.getByText('Segment before first steer.', { exact: true })).toBeVisible()
+      await expect(page.locator('.router-fx')).toHaveCount(1)
+
+      const firstSteer = 'First applied steer in the active turn'
+      const firstCard = await queueAndSteer(page, state, firstSteer)
+      const firstRequest = state.steerRequests[0]!
+      const firstRow = {
+        role: 'user',
+        text: firstSteer,
+        message_id: 'message-e2e-steer-1',
+        timestamp: '2026-08-11T09:00:01Z',
+        turn_context: {
+          turn_id: TURN_ID,
+          intent: 'steer',
+          disposition: 'applied',
+          revision: 2,
+          client_request_id: firstRequest.params.client_request_id,
+          client_message_id: firstRequest.params.client_message_id,
+          model_call_id: '2.0',
+          applied_iteration: 2,
+        },
+      }
+      state.historyMessages = [historyMarker(1), ...staleHistory(legacyHistory), firstRow]
+      state.holdHistory = true
+      firstRequest.resolve({
+        ...acceptedSteer(firstRequest, 'applied'),
+        user_message_id: 'message-e2e-steer-1',
+        model_call_id: '2.0',
+        applied_iteration: 2,
+      })
+      await expect(firstCard).toHaveCount(0)
+      await expect(page.locator('.msg-user').filter({ hasText: firstSteer })).toHaveCount(1)
+      const firstOrder = [ORIGINAL_TEXT, 'Segment before first steer.', firstSteer]
+      expect(await visibleOrder(firstOrder)).toEqual(firstOrder)
+
+      await releaseHistory(historyMarker(1).text)
+      await expect(page.locator('.router-fx')).toHaveCount(1)
+      await expect(page.getByText('Segment before first steer.', { exact: true })).toBeVisible()
+      expect(await visibleOrder(firstOrder)).toEqual(firstOrder)
+      if (legacyHistory) return
+
+      emit('text_delta', {
+        text: 'Segment after first steer.',
+        presentation: 'answer',
+        generation_epoch: 0,
+        model_call_id: '2.0',
+        iteration: 2,
+      })
+      await expect(page.getByText('Segment after first steer.', { exact: true })).toBeVisible()
+
+      const secondSteer = 'Second applied steer in the active turn'
+      const secondCard = await queueAndSteer(page, state, secondSteer)
+      const secondRequest = state.steerRequests[1]!
+      const secondRow = {
+        role: 'user',
+        text: secondSteer,
+        message_id: 'message-e2e-steer-2',
+        timestamp: '2026-08-11T09:00:02Z',
+        turn_context: {
+          turn_id: TURN_ID,
+          intent: 'steer',
+          disposition: 'applied',
+          revision: 2,
+          client_request_id: secondRequest.params.client_request_id,
+          client_message_id: secondRequest.params.client_message_id,
+          model_call_id: '3.0',
+          applied_iteration: 3,
+        },
+      }
+      state.historyMessages = [historyMarker(2), ...staleHistory(), firstRow, secondRow]
+      state.holdHistory = true
+      secondRequest.resolve({
+        ...acceptedSteer(secondRequest, 'applied'),
+        user_message_id: 'message-e2e-steer-2',
+        model_call_id: '3.0',
+        applied_iteration: 3,
+      })
+      await expect(secondCard).toHaveCount(0)
+      const secondOrder = [...firstOrder, 'Segment after first steer.', secondSteer]
+      expect(await visibleOrder(secondOrder)).toEqual(secondOrder)
+
+      await releaseHistory(historyMarker(2).text)
+      await expect(page.locator('.router-fx')).toHaveCount(1)
+      expect(await visibleOrder(secondOrder)).toEqual(secondOrder)
+      await expect(page.getByRole('button', {
+        name: /^(Stop .*response|停止.*回复)$/,
+      })).toBeVisible()
+      expect(state.chatSendCalls).toBe(0)
+    })
+  }
+
   for (const viewport of [
     { label: 'desktop', width: 1280, height: 720 },
     { label: 'narrow', width: 390, height: 720 },

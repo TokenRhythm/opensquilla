@@ -19,10 +19,12 @@ silently grow the RPC surface.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import structlog
@@ -32,7 +34,11 @@ if TYPE_CHECKING:
 
 from opensquilla import __version__
 from opensquilla.gateway.auth import Principal
-from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, GuestRpcPolicyError
+from opensquilla.gateway.guest_rpc_policy import (
+    GuestRpcPolicy,
+    GuestRpcPolicyError,
+    is_guest_rpc_method_allowed,
+)
 from opensquilla.gateway.protocol import (
     ERROR_INVALID_REQUEST,
     ERROR_METHOD_NOT_FOUND,
@@ -58,6 +64,24 @@ from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
+
+_SEND_COMMAND_METHODS = frozenset({
+    "chat.send",
+    "sessions.send",
+    "sessions.steer.v2",
+    "sessions.pending_inputs.enqueue",
+    "sessions.pending_inputs.dispatch",
+    "sessions.pending_inputs.steer",
+})
+_LOG_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+
+
+def _log_correlation_id(value: object) -> str | None:
+    # Request IDs are client-controlled; log a stable digest, never their text.
+    if not isinstance(value, str) or not value:
+        return None
+    return "sha256:" + hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
 
 _ARTIFACT_PRODUCT_METHOD_PREFIXES = (
     "artifacts.",
@@ -168,7 +192,6 @@ class RpcContext:
     cron_scheduler: Any = None  # SchedulerEngine instance (injected at boot)
     turn_runner: TurnRunner | None = None  # TurnRunner instance (injected at boot)
     task_runtime: Any = None  # TaskRuntime instance (injected at boot)
-    flush_service: Any = None  # SessionFlushService | None (injected at boot)
     heartbeat_service: Any = None  # Task-style heartbeat service (injected at boot)
     heartbeat_loop: Any = None  # Background heartbeat loop (injected at boot)
     prompt_cache_keepalive_service: Any = None  # Opt-in, in-memory session lease service.
@@ -182,9 +205,8 @@ class RpcContext:
     originating_envelope: Any = None  # Channel RouteEnvelope for RPC side effects
     protocol: int = 4
     sandbox_schema_version: int = 2
-    # Runtime-only candidate preview materializer.  The value stays inside the
-    # Gateway process and is copied into a turn envelope only for bound
-    # PromptAnnotation turns; no public RPC payload contains it.
+    # Runtime-only preview lease and resource service. It remains inside the
+    # Gateway process; public RPC payloads carry only scoped preview references.
     artifact_preview_service: Any = None
 
     @property
@@ -212,6 +234,7 @@ class RpcMethodEntry:
     name: str
     handler: RpcHandlerFn
     required_scope: str
+    generated_contract_name: str | None = None
 
 
 class RpcUnavailableError(RuntimeError):
@@ -224,9 +247,7 @@ class RpcHandlerError(Exception):
     The dispatcher converts this into a ``ResFrame`` with
     :class:`ErrorShape` populated from the exception's ``code``, ``message``,
     and ``details`` attributes. Handlers use it when a raw exception would
-    lose context the client needs — e.g. ``sessions.reset`` returning a
-    :class:`FlushReceipt` alongside the error so the UI can render the
-    failure mode.
+    lose context the client needs to explain or recover from the failure.
     """
 
     def __init__(
@@ -285,7 +306,25 @@ class RpcRegistry:
             raise ScopeDriftError(
                 f"RPC registry is locked; refusing late registration for {name!r}"
             )
-        self._methods[name] = RpcMethodEntry(name=name, handler=handler, required_scope=scope)
+        generated_contract_name = getattr(
+            handler,
+            "_opensquilla_generated_contract_name",
+            None,
+        )
+        if generated_contract_name is not None:
+            if not isinstance(generated_contract_name, str) or not generated_contract_name:
+                raise TypeError("generated Contract marker must be a non-empty string")
+            if generated_contract_name != name:
+                raise ValueError(
+                    f"generated Contract marker {generated_contract_name!r} "
+                    f"does not match registered method {name!r}"
+                )
+        self._methods[name] = RpcMethodEntry(
+            name=name,
+            handler=handler,
+            required_scope=scope,
+            generated_contract_name=generated_contract_name,
+        )
 
     def lock_registration(self) -> None:
         """Prevent additional methods from being registered after boot."""
@@ -318,6 +357,25 @@ class RpcRegistry:
         return self._methods.get(name)
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: RpcContext) -> ResFrame:
+        response = await self._dispatch(req_id, method, params, ctx)
+        if isinstance(method, str) and method in _SEND_COMMAND_METHODS and response.error:
+            error = response.error
+            # Log the projected outcome even for early authorization/validation
+            # denials. Messages, params and details may contain private inputs.
+            log.warning(
+                "rpc.send_failed",
+                method=method,
+                # Use the existing metadata schema so production privacy
+                # projection retains these explicitly hashed correlations.
+                request_id=_log_correlation_id(req_id),
+                connection_id=_log_correlation_id(getattr(ctx, "conn_id", None)),
+                code=error.code if _LOG_ERROR_CODE.fullmatch(error.code) else "UNKNOWN_ERROR",
+                accepted=error.accepted,
+                retryable=error.retryable,
+            )
+        return response
+
+    async def _dispatch(self, req_id: str, method: str, params: Any, ctx: RpcContext) -> ResFrame:
         safe_req_id = req_id if isinstance(req_id, str) and is_utf8_encodable(req_id) else ""
         if not isinstance(req_id, str) or not isinstance(method, str):
             return make_error_res(
@@ -419,6 +477,19 @@ class RpcRegistry:
                 details=details,
             )
         except ValueError as exc:
+            from opensquilla.onboarding.router_policy import (
+                PrimaryProviderChangedError,
+                RouterProviderConflictError,
+            )
+
+            if isinstance(exc, RouterProviderConflictError):
+                return make_error_res(
+                    req_id, "ROUTER_PROVIDER_CONFLICT", str(exc), details=exc.details
+                )
+            if isinstance(exc, PrimaryProviderChangedError):
+                return make_error_res(
+                    req_id, "CONFLICT", str(exc), details={"reason": "primary_changed"}
+                )
             if _is_artifact_product_method(method):
                 return _safe_artifact_dispatch_failure(
                     req_id,
@@ -445,12 +516,13 @@ class RpcRegistry:
                     exc=exc,
                     may_have_applied=entry.required_scope in _ARTIFACT_WRITE_SCOPES,
                 )
-            log.error(
-                "rpc.dispatch_failed",
-                method=method,
-                error=str(exc),
-                exc_info=True,
-            )
+            if method not in _SEND_COMMAND_METHODS:
+                log.error(
+                    "rpc.dispatch_failed",
+                    method=method,
+                    error=str(exc),
+                    exc_info=True,
+                )
             return make_error_res(req_id, "INTERNAL_ERROR", str(exc))
 
 
@@ -470,67 +542,23 @@ async def _health(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
 
 async def _status(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    from opensquilla.gateway.boot import _boot_time_ms
+    """Compatibility callable for tests and non-registry callers."""
+    from opensquilla.application.observability import RuntimeStatus
+    from opensquilla.gateway.adapters.observability import GatewayRuntimeStatusPort
 
-    now = int(time.time() * 1000)
-    uptime = now - _boot_time_ms if _boot_time_ms > 0 else 0
-
-    provider_name = None
-    if ctx.provider_selector is not None and getattr(
-        ctx.provider_selector, "is_configured", True
-    ):
-        # Configured provider id (e.g. "openrouter"), not the OpenAI-compatible
-        # backend class physically serving it. See app.api_system_status.
-        provider_name = getattr(ctx.provider_selector, "active_provider_id", None)
-        if not provider_name:
-            try:
-                p = ctx.provider_selector.resolve()
-                provider_name = getattr(p, "provider_name", None)
-            except Exception:
-                pass
-
-    active_sessions = 0
-    if ctx.session_manager is not None:
-        storage = get_session_storage(ctx.session_manager)
-        if storage is not None:
-            try:
-                sessions = await storage.list_sessions(limit=1000)
-                active_sessions = len(sessions)
-            except Exception:
-                pass
-
-    return {
-        "status": "running",
-        "version": __version__,
-        "uptime_ms": uptime,
-        "provider": provider_name,
-        "active_sessions": active_sessions,
-    }
+    return cast(dict[str, Any], await RuntimeStatus(GatewayRuntimeStatusPort(ctx)).read())
 
 
 async def _config_get(params: Any, ctx: RpcContext) -> Any:
-    if ctx.config is None:
-        return {}
-    cfg_dict = (
-        ctx.config.to_public_dict()
-        if hasattr(ctx.config, "to_public_dict")
-        else ctx.config.model_dump()
-        if hasattr(ctx.config, "model_dump")
-        else {}
-    )
+    from opensquilla.application.app_settings import AppSettings
+    from opensquilla.gateway.adapters.app_settings import GatewayAppSettingsPort
+
+    settings = AppSettings(GatewayAppSettingsPort(ctx.config))
     if isinstance(params, dict):
         path = params.get("path")
         if path:
-            parts = path.split(".")
-            val: Any = cfg_dict
-            for part in parts:
-                if isinstance(val, dict):
-                    val = val.get(part)
-                else:
-                    val = None
-                    break
-            return val
-    return cfg_dict
+            return await settings.read(str(path))
+    return await settings.read_all()
 
 
 async def _sessions_get(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -571,11 +599,31 @@ async def _last_heartbeat(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
 # Register all built-in methods against the singleton.
 _registry.register("health", _health, "operator.read")
-_registry.register("status", _status, "operator.read")
-_registry.register("config.get", _config_get, "operator.read")
 _registry.register("sessions.get", _sessions_get, "operator.read")
 _registry.register("gateway.identity.get", _gateway_identity_get, "operator.read")
 _registry.register("last-heartbeat", _last_heartbeat, "operator.read")
+
+# Generated descriptors own identity, scope, and validation for contracted
+# methods. The callable stays here so existing imports and behavior remain
+# unchanged while registry provenance becomes explicit.
+from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
+    register_platform_configuration_contract,
+)
+
+_PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
+    "config.get": _config_get,
+}
+
+_PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {
+    method: register_platform_configuration_contract(
+        _registry,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _PLATFORM_CONFIGURATION_IMPLEMENTATIONS.items()
+}
 
 
 def get_registry() -> RpcRegistry:

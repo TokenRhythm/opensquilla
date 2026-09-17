@@ -341,13 +341,21 @@ async def run_single(
             provider_id=provider_hint,
             model=model_hint,
             max_output_tokens=config.max_tokens,
-            provider_request_max_chars=config.provider_request_max_chars,
+            provider_request_max_chars=(
+                config.provider_request_max_chars
+                if config.provider_request_max_chars_explicit_cap is None
+                else config.provider_request_max_chars_explicit_cap
+            ),
         )
         config = config.model_copy(
             update={
                 "max_tokens": request_budget.max_output_tokens,
                 "provider_request_max_chars": (
                     request_budget.provider_request_max_chars
+                ),
+                "provider_context_window_tokens": request_budget.context_window_tokens,
+                "provider_request_max_chars_explicit_cap": (
+                    request_budget.provider_request_max_chars_explicit_cap
                 ),
             }
         )

@@ -1,7 +1,8 @@
 """Real Gateway fixture for the Goal-mode browser regression.
 
 The browser test starts this process with the repository virtualenv.  The
-provider is deterministic, but every other boundary is production code:
+Provider replies are deterministic and token counting uses the production
+conservative offline fallback. Every lifecycle boundary is production code:
 WebSocket RPC, SQLite state, TaskRuntime, GoalService, TurnRunner, tools, and
 the automatic continuation lifecycle.
 """
@@ -16,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from opensquilla import token_estimation
 from opensquilla.gateway.boot import start_gateway_server
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
 from opensquilla.gateway.websocket import SubscriptionManager
@@ -317,6 +319,10 @@ class DeterministicGoalSelector:
 
 
 async def main() -> None:
+    # Every fixture gets a fresh temporary directory, including tiktoken's
+    # default download cache. Use the production conservative fallback so a
+    # chat lifecycle proof never waits for an external tokenizer download.
+    token_estimation._encoding = token_estimation._ENCODING_UNAVAILABLE
     port = int(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_PORT"])
     state_dir = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_STATE"])
     event_log = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_EVENT_LOG"])
@@ -325,6 +331,9 @@ async def main() -> None:
     scenario = os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_SCENARIO", "continuation")
     if scenario not in {"continuation", "lifecycle", "silent-reply"}:
         raise ValueError(f"Unsupported Goal E2E scenario: {scenario}")
+    auth_mode = os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_AUTH_MODE", "none")
+    if auth_mode not in {"none", "token"}:
+        raise ValueError(f"Unsupported Gateway fixture auth mode: {auth_mode}")
     webui_origin = os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_ORIGIN"]
     state_dir.mkdir(parents=True, exist_ok=True)
     workspace_dir = state_dir / "workspace"
@@ -333,7 +342,7 @@ async def main() -> None:
     config = GatewayConfig(
         host="127.0.0.1",
         port=port,
-        auth=AuthConfig(mode="none"),
+        auth=AuthConfig(mode=auth_mode, token="synthetic-real-gateway-owner-token"),
     )
     config.state_dir = str(state_dir)
     config.workspace_dir = str(workspace_dir)
@@ -346,8 +355,6 @@ async def main() -> None:
         tier["model"] = MODEL
     config.naming.enabled = False
     config.compaction.enabled = False
-    config.memory.flush_enabled = False
-    config.memory.repair_enabled = False
     config.memory.ttl_sweep_interval_minutes = 0
     config.meta_skill.enabled = False
     config.heartbeat.enabled = False

@@ -229,9 +229,9 @@ _CORPUS: list[_Case] = [
         expected_done_present=True,
         resolved_model="deepseek-r1",
     ),
-    # 7. Non-DeepSeek: reasoning_content omitted
+    # 7. Non-DeepSeek: reasoning_content is retained for display as well.
     _Case(
-        case_id="non_deepseek_reasoning_omitted",
+        case_id="non_deepseek_reasoning_included",
         events=[
             TextDeltaEvent(text="hi"),
             _done(
@@ -354,7 +354,7 @@ def _build_runner() -> TurnRunner:
         model_catalog=_StubModelCatalog(),
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,

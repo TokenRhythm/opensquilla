@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "uv_version": "0.12.15",
+  "pip_audit_version": "2.10.1",
+  "npm_version": "11.12.1",
+  "timeout_seconds": 600
+}

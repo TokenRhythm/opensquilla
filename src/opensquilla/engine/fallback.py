@@ -8,6 +8,7 @@ MODEL_NOT_FOUND / UNSUPPORTED_FEATURE / INSUFFICIENT_CREDITS into UNKNOWN.
 
 from __future__ import annotations
 
+import asyncio
 import random
 from dataclasses import dataclass, field
 
@@ -15,12 +16,23 @@ from opensquilla.provider.failures import ProviderFailureKind, classify_provider
 
 _RETRYABLE_FAILURE_KINDS = frozenset(
     {
-        ProviderFailureKind.RATE_LIMITED,
         ProviderFailureKind.PROVIDER_OVERLOADED,
         ProviderFailureKind.TRANSPORT_TRANSIENT,
         ProviderFailureKind.CONTEXT_OVERFLOW,
     }
 )
+
+
+async def sleep_before_retry(delay_s: float) -> None:
+    """Honor the requested delay even when an event-loop timer wakes early."""
+    loop = asyncio.get_running_loop()
+    retry_at = loop.time() + delay_s
+    remaining = delay_s
+    while True:
+        await asyncio.sleep(remaining)
+        remaining = retry_at - loop.time()
+        if remaining <= 0:
+            return
 
 
 @dataclass

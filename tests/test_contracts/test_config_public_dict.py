@@ -135,3 +135,21 @@ def test_privacy_carries_the_effective_network_observability_flag(
     # telemetry/update env vars must not make the UI imply correlation is off.
     privacy = public_config.to_public_dict()["privacy"]
     assert "network_observability_disabled_effective" in privacy
+    assert "reliability_diagnostics_forced_off" in privacy
+    assert "product_analytics_forced_off" in privacy
+
+
+def test_legacy_global_privacy_switch_forces_both_scoped_telemetry_controls_off(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        privacy={"disable_network_observability": True},
+    )
+
+    privacy = cfg.to_public_dict()["privacy"]
+
+    assert privacy["reliability_diagnostics_forced_off"] is True
+    assert privacy["product_analytics_forced_off"] is True

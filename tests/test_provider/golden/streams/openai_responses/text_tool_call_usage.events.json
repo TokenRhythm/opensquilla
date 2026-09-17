@@ -39,6 +39,7 @@
     "model_usage_breakdown": [],
     "output_tokens": 11,
     "provider": "openai_responses",
+    "provider_replay": null,
     "reasoning_content": null,
     "reasoning_tokens": 2,
     "stop_reason": "tool_use",

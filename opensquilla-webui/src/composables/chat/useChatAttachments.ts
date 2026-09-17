@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { Attachment } from '@/types/chat'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 
 const INLINE_THRESHOLD_BYTES = 2_000_000
 const ATTACHMENT_TEXT_HARD_CAP_BYTES = INLINE_THRESHOLD_BYTES
@@ -40,6 +41,7 @@ type AttachmentPreparationOptions = {
 // Per-addAttachments-call state so batch-wide rejections (the aggregate size
 // cap) toast once instead of once per rejected file.
 type AttachmentBatch = {
+  generation: number
   totalSizeToastShown: boolean
 }
 
@@ -110,12 +112,13 @@ async function fileLooksLikeUtf8Text(file: File): Promise<boolean> {
   }
 }
 
-export function useChatAttachments() {
+export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
   const { pushToast } = useToasts()
   const pendingAttachments = ref<Attachment[]>([])
   const nextAttachmentId = ref(1)
   const refreshInFlightAttachmentIds = new Set<number>()
   const refreshInFlightAttachmentCount = ref(0)
+  let attachmentGeneration = 0
   const attachmentWorkBusy = computed(() =>
     refreshInFlightAttachmentCount.value > 0
     || pendingAttachments.value.some(
@@ -132,8 +135,12 @@ export function useChatAttachments() {
   }
 
   async function addAttachments(files: File[]) {
-    const batch: AttachmentBatch = { totalSizeToastShown: false }
+    const batch: AttachmentBatch = {
+      generation: attachmentGeneration,
+      totalSizeToastShown: false,
+    }
     for (const file of files) {
+      if (!isAttachmentGenerationCurrent(batch.generation)) return
       // One toast for the whole batch when the count cap is hit — a per-file
       // repeat would only evict more useful toasts.
       if (activeAttachmentCount() >= MAX_ATTACHMENTS) {
@@ -141,6 +148,7 @@ export function useChatAttachments() {
         return
       }
       await addAttachmentFile(file, batch)
+      if (!isAttachmentGenerationCurrent(batch.generation)) return
     }
   }
 
@@ -149,6 +157,7 @@ export function useChatAttachments() {
   }
 
   async function addAttachmentFile(file: File, batch: AttachmentBatch) {
+    if (!isAttachmentGenerationCurrent(batch.generation)) return
     const fileName = file.name || 'Untitled file'
     if (file.size === 0) {
       pushToast(i18n.global.t('chat.toast.emptyFile', { name: fileName }), { tone: 'danger' })
@@ -157,7 +166,9 @@ export function useChatAttachments() {
 
     let mime = resolveAttachmentMime(file)
     if (!isAllowedAttachmentMime(mime)) {
-      if (await fileLooksLikeUtf8Text(file)) {
+      const looksLikeText = await fileLooksLikeUtf8Text(file)
+      if (!isAttachmentGenerationCurrent(batch.generation)) return
+      if (looksLikeText) {
         // Unknown-but-textual uploads degrade to text/plain so the gateway's
         // UTF-8 fallback is reachable from the WebUI (the gateway re-validates).
         mime = 'text/plain'
@@ -178,6 +189,7 @@ export function useChatAttachments() {
       pendingAttachments.value.push({ kind: 'inline_pending', local_id: localId, name: fileName, mime, size: file.size, file })
       const reader = new FileReader()
       reader.onload = (e) => {
+        if (!isAttachmentGenerationCurrent(batch.generation)) return
         const dataUrl = e.target?.result as string
         const b64 = dataUrl?.split(',')[1] || ''
         const idx = pendingAttachments.value.findIndex(a => a.local_id === localId)
@@ -186,6 +198,7 @@ export function useChatAttachments() {
         }
       }
       reader.onerror = () => {
+        if (!isAttachmentGenerationCurrent(batch.generation)) return
         const message = i18n.global.t('chat.toast.couldNotReadFile', { name: fileName })
         markAttachmentFailed(localId, file, mime, message)
         pushToast(message, { tone: 'danger' })
@@ -200,15 +213,22 @@ export function useChatAttachments() {
     }
 
     pendingAttachments.value.push({ kind: 'uploading', local_id: localId, name: fileName, mime, size: file.size, file })
-    uploadAttachmentStaged(file, mime, localId).catch((err) => {
+    uploadAttachmentStaged(file, mime, localId, batch.generation).catch((err) => {
+      if (!isAttachmentGenerationCurrent(batch.generation)) return
       const message = uploadFailureMessage(err)
       markAttachmentFailed(localId, file, mime, message)
       pushToast(`${i18n.global.t('chat.toast.uploadFailed', { name: fileName })}: ${message}`, { tone: 'danger' })
     })
   }
 
-  async function uploadAttachmentStaged(file: File, mime: string, localId: number) {
+  async function uploadAttachmentStaged(
+    file: File,
+    mime: string,
+    localId: number,
+    generation: number,
+  ) {
     const meta = await uploadAttachmentFile(file, mime)
+    if (!isAttachmentGenerationCurrent(generation)) return
     const idx = pendingAttachments.value.findIndex(a => a.local_id === localId)
     if (idx >= 0) {
       pendingAttachments.value[idx] = {
@@ -226,25 +246,19 @@ export function useChatAttachments() {
   }
 
   async function uploadAttachmentFile(file: File, mime: string): Promise<UploadResponseMeta> {
-    const form = new FormData()
-    form.append('file', file, file.name)
-    form.append('mime', mime)
-    const response = await fetch('/api/v1/files/upload', {
-      method: 'POST',
-      body: form,
-      credentials: 'same-origin',
-      headers: uploadAuthHeaders(),
-    })
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '')
-      throw new Error(`HTTP ${response.status} ${detail}`)
-    }
-    const result = await response.json()
-    return uploadResponseMeta(result)
+    if (!artifactContent) throw new Error('Attachment upload is unavailable.')
+    return artifactContent.uploadAttachment(file, mime)
   }
 
   function removeAttachment(index: number) {
     pendingAttachments.value.splice(index, 1)
+  }
+
+  function retireAttachments() {
+    attachmentGeneration += 1
+    pendingAttachments.value = []
+    refreshInFlightAttachmentIds.clear()
+    refreshInFlightAttachmentCount.value = 0
   }
 
   async function retryAttachment(index: number) {
@@ -285,10 +299,14 @@ export function useChatAttachments() {
 
   async function prepareAttachmentsForSend(options: AttachmentPreparationOptions = {}): Promise<boolean> {
     const isCurrent = options.isCurrent ?? (() => true)
+    const generation = attachmentGeneration
+    const preparationIsCurrent = () => (
+      isAttachmentGenerationCurrent(generation) && isCurrent()
+    )
     const attachments = options.attachments ?? pendingAttachments.value
     const staged = [...attachments].filter(stagedUploadNeedsRefresh)
     for (const attachment of staged) {
-      if (!isCurrent()) return false
+      if (!preparationIsCurrent()) return false
       if (refreshInFlightAttachmentIds.has(attachment.local_id)) return false
       const idx = attachments.findIndex(a => a.local_id === attachment.local_id)
       if (idx < 0 || attachments[idx].kind !== 'staged') continue
@@ -308,7 +326,7 @@ export function useChatAttachments() {
       refreshInFlightAttachmentCount.value = refreshInFlightAttachmentIds.size
       try {
         const meta = await uploadAttachmentFile(attachment.file, attachment.mime)
-        if (!isCurrent()) return false
+        if (!preparationIsCurrent()) return false
         const currentIdx = attachments.findIndex(a => a.local_id === attachment.local_id)
         if (currentIdx < 0 || attachments[currentIdx].kind !== 'staged') continue
         attachments[currentIdx] = {
@@ -323,7 +341,7 @@ export function useChatAttachments() {
           file: attachment.file,
         }
       } catch (err: unknown) {
-        if (!isCurrent()) return false
+        if (!preparationIsCurrent()) return false
         const message = uploadFailureMessage(err)
         markAttachmentFailed(
           attachment.local_id,
@@ -335,8 +353,10 @@ export function useChatAttachments() {
         pushToast(`${i18n.global.t('chat.toast.uploadFailed', { name: attachment.name })}: ${message}`, { tone: 'danger' })
         return false
       } finally {
-        refreshInFlightAttachmentIds.delete(attachment.local_id)
-        refreshInFlightAttachmentCount.value = refreshInFlightAttachmentIds.size
+        if (isAttachmentGenerationCurrent(generation)) {
+          refreshInFlightAttachmentIds.delete(attachment.local_id)
+          refreshInFlightAttachmentCount.value = refreshInFlightAttachmentIds.size
+        }
       }
     }
     return true
@@ -347,6 +367,7 @@ export function useChatAttachments() {
   }
 
   function canAcceptAttachment(fileName: string, size: number, batch: AttachmentBatch): boolean {
+    if (!isAttachmentGenerationCurrent(batch.generation)) return false
     const activeAttachments = pendingAttachments.value.filter(attachmentCountsTowardLimits)
     if (activeAttachments.length >= MAX_ATTACHMENTS) {
       pushToast(i18n.global.t('chat.toast.tooManyAttachments', { max: MAX_ATTACHMENTS }), { tone: 'danger' })
@@ -368,6 +389,10 @@ export function useChatAttachments() {
     return true
   }
 
+  function isAttachmentGenerationCurrent(generation: number): boolean {
+    return generation === attachmentGeneration
+  }
+
   return {
     pendingAttachments,
     attachmentWorkBusy,
@@ -375,41 +400,16 @@ export function useChatAttachments() {
     addAttachments,
     addAttachment,
     removeAttachment,
+    retireAttachments,
     retryAttachment,
     hasPendingAttachmentWork,
     prepareAttachmentsForSend,
   }
 }
 
-function uploadAuthHeaders(): HeadersInit | undefined {
-  try {
-    const token = globalThis.sessionStorage?.getItem('opensquilla.wsToken')?.trim()
-    return token ? { Authorization: `Bearer ${token}` } : undefined
-  } catch {
-    return undefined
-  }
-}
-
 function uploadFailureMessage(err: unknown): string {
   if (err instanceof Error) return err.message
   return String(err)
-}
-
-function uploadResponseMeta(result: unknown): UploadResponseMeta {
-  const record = (result && typeof result === 'object' ? result : {}) as {
-    file_uuid?: unknown
-    expires_at?: unknown
-    ttl_seconds?: unknown
-  }
-  const fileUuid = typeof record.file_uuid === 'string' ? record.file_uuid.trim() : ''
-  if (!fileUuid) throw new Error('Upload response missing file_uuid')
-  const expiresAt = typeof record.expires_at === 'number' && Number.isFinite(record.expires_at)
-    ? record.expires_at
-    : undefined
-  const ttlSeconds = typeof record.ttl_seconds === 'number' && Number.isFinite(record.ttl_seconds)
-    ? record.ttl_seconds
-    : undefined
-  return { fileUuid, expiresAt, ttlSeconds }
 }
 
 function stagedUploadNeedsRefresh(attachment: Attachment): boolean {
@@ -427,4 +427,27 @@ function formatMiB(bytes: number): string {
   // email cap) so the stated limit never exceeds the enforced one.
   const mib = bytes / 1024 / 1024
   return `${Number.isInteger(mib) ? mib : Math.floor(mib * 10) / 10} MiB`
+}
+
+
+let nextCapturedAttachmentId = -Date.now()
+
+/** Stage an existing UI capture using the same file upload contract as ordinary attachments. */
+export async function stageCapturedImage(file: File, artifactContent: Pick<ArtifactContentAccess, 'uploadAttachment'>): Promise<Attachment> {
+  const mime = resolveAttachmentMime(file)
+  if (!isImageAttachmentMime(mime) || file.size > ATTACHMENT_IMAGE_HARD_CAP_BYTES) {
+    throw new Error('Captured image exceeds the attachment limit.')
+  }
+  const meta = await artifactContent.uploadAttachment(file, mime)
+  return {
+    kind: 'staged',
+    local_id: nextCapturedAttachmentId--,
+    name: file.name,
+    mime,
+    size: file.size,
+    file_uuid: meta.fileUuid,
+    expires_at: meta.expiresAt,
+    ttl_seconds: meta.ttlSeconds,
+    file,
+  }
 }

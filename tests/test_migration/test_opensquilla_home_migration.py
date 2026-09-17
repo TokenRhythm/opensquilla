@@ -8,7 +8,6 @@ real released-era config shape.
 from __future__ import annotations
 
 import json
-import multiprocessing
 import os
 import shutil
 import sqlite3
@@ -98,17 +97,32 @@ def _isolate_profile_operation_locks(
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
 
 
-def _probe_gateway_lock(state_dir: str, queue: multiprocessing.Queue) -> None:
-    from opensquilla.gateway.pidlock import GatewayPidLock
+def _probe_gateway_lock(state_dir: Path) -> str:
+    # Probe the real OS lock without spawning a re-import of the Gateway test module.
+    script = """
+import sys
+from opensquilla.recovery.locking import (
+    acquire_gateway_legacy_lease,
+    release_gateway_legacy_lease,
+)
 
-    lock = GatewayPidLock(state_dir)
-    try:
-        lock.acquire()
-    except SystemExit:
-        queue.put("busy")
-    else:
-        queue.put("acquired")
-        lock.release()
+assert "opensquilla.gateway" not in sys.modules
+lease = acquire_gateway_legacy_lease(sys.argv[1])
+try:
+    print("busy" if lease is None else "acquired")
+finally:
+    release_gateway_legacy_lease(lease)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(state_dir)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    outcome = result.stdout.strip()
+    assert outcome in {"busy", "acquired"}, result.stdout
+    return outcome
 
 # Base scheduler_jobs DDL as scheduler/persistence.py creates it (the
 # ``enabled`` column arrived later via a conditional column add).
@@ -527,6 +541,40 @@ def test_profile_import_preserves_unmodified_toml_bytes_and_comments(
 
     assert not _errors(report)
     assert (target / "config.toml").read_bytes() == source_config
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_profile_import_removes_retired_inline_memory_fields_without_reformatting(
+    tmp_path: Path, newline: bytes,
+) -> None:
+    source = _build_source_home(tmp_path)
+    header = (
+        f"config_version = {config_migration_module.LATEST_CONFIG_VERSION}\n"
+        "# keep operator comments\nport = 18791\n"
+    ).encode()
+    source_config = header + (
+        b'memory = { flush_enabled=true, "flush_triggers"=["manual"], '
+        b"embedding={model='synthetic, } # model'}, capture_assistant = true, "
+        b"repair_enabled=false } # keep memory comment\n"
+    )
+    expected = header + (
+        b"memory = { embedding={model='synthetic, } # model'}, "
+        b"capture_assistant = true} # keep memory comment\n"
+    )
+    source_config = source_config.replace(b"\n", newline)
+    expected = expected.replace(b"\n", newline)
+    (source / "config.toml").write_bytes(source_config)
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    assert not _errors(report)
+    assert (source / "config.toml").read_bytes() == source_config
+    assert (target / "config.toml").read_bytes() == expected
+    assert tomllib.loads(expected.decode())["memory"] == {
+        "embedding": {"model": "synthetic, } # model"},
+        "capture_assistant": True,
+    }
 
 
 def test_profile_import_losslessly_patches_legacy_paths_and_secret_comments(
@@ -3242,6 +3290,25 @@ def test_windows_lock_reacquire_failure_preserves_profile_transaction(
     assert inspected.stable_code == "transaction_incomplete"
 
 
+@pytest.mark.ci_serial
+def test_gateway_lock_probe_observes_acquire_and_release(tmp_path: Path) -> None:
+    from opensquilla.gateway.pidlock import GatewayPidLock
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    assert _probe_gateway_lock(state_dir) == "acquired"
+
+    lock = GatewayPidLock(state_dir)
+    lock.acquire()
+    try:
+        assert _probe_gateway_lock(state_dir) == "busy"
+    finally:
+        lock.release()
+
+    assert _probe_gateway_lock(state_dir) == "acquired"
+
+
+@pytest.mark.ci_serial
 def test_published_candidate_holds_legacy_gateway_lock_during_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3256,16 +3323,7 @@ def test_published_candidate_holds_legacy_gateway_lock_during_validation(
         journal_snapshot: Any,
         journal_payload: dict[str, Any],
     ) -> dict[str, Any]:
-        context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-        queue = context.Queue()
-        process = context.Process(
-            target=_probe_gateway_lock,
-            args=(str(target / "state"), queue),
-        )
-        process.start()
-        process.join(timeout=10)
-        assert process.exitcode == 0
-        observed.append(queue.get(timeout=1))
+        observed.append(_probe_gateway_lock(target / "state"))
         return original_validate(migrator, journal_snapshot, journal_payload)
 
     monkeypatch.setattr(

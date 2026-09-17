@@ -284,6 +284,23 @@ async def test_raw_ping_pong_uses_bounded_connection_send_and_survives() -> None
     assert ws.close_codes == []
 
 
+async def test_malformed_cancel_frame_gets_error_and_connection_survives() -> None:
+    ws = await _run(
+        [
+            _CONNECT_FRAME,
+            json.dumps({"type": "cancel", "id": "probe", "extra": True}),
+            json.dumps({"type": "req", "id": "after-cancel", "method": "noop"}),
+        ]
+    )
+
+    responses = ws.responses()
+    invalid = next(response for response in responses if response["id"] == "probe")
+    assert invalid["ok"] is False
+    assert invalid["error"]["code"] == "INVALID_REQUEST"
+    assert any(response["ok"] and response["id"] == "after-cancel" for response in responses)
+    assert ws.close_codes == []
+
+
 async def test_non_string_method_gets_error_res_and_connection_survives() -> None:
     ws = await _run(
         [

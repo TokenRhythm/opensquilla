@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { computed } from 'vue'
-import { routerTierProviderParticipates, useSetupRouterForm } from './useSetupRouterForm'
+import { buildRouterPayload, routerTierProviderParticipates, useSetupRouterForm } from './useSetupRouterForm'
 
 // openrouter-mix is backend-supported but was unreachable in the WebUI. The
 // round-trip is subtle: it is the only enabled mode whose tier_profile is null,
@@ -19,6 +19,40 @@ function makePanel(form: ReturnType<typeof useSetupRouterForm>, isOpenrouter: bo
 }
 
 describe('useSetupRouterForm — openrouter-mix round-trip', () => {
+  it('hides the inactive image row without losing saved config or enabling cross-provider routing', () => {
+    const form = useSetupRouterForm()
+    form.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'configured/text-model' },
+        image_model: {
+          provider: 'openai',
+          model: 'saved/vision-model',
+          thinking_level: 'high',
+          supports_image: true,
+        },
+      },
+    }, {}, 'openrouter', 'custom')
+    const saved = form.payload()
+
+    form.updateTierField('image_model', 'model', 'replacement/vision-model')
+    form.updateTierField('image_model', 'provider', 'openrouter')
+    form.updateTierField('image_model', 'supportsImage', false)
+    form.updateTierField('image_model', 'thinkingLevel', 'off')
+
+    expect(form.payload()).toEqual(saved)
+    expect(form.hasMixedTierProviders.value).toBe(false)
+    expect(form.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(makePanel(form, true).value.tierRows.map(row => row.name)).toEqual(['c0'])
+    form.updateTierField('c0', 'model', 'configured/new-text-model')
+    expect(form.payload()).toMatchObject({
+      tiers: {
+        c0: { model: 'configured/new-text-model' },
+        image_model: { model: 'saved/vision-model' },
+      },
+    })
+  })
+
   it('classifies legacy openrouter mix internally but saves canonical custom mode', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({ enabled: true, tier_profile: null }, {}, 'openrouter')
@@ -147,9 +181,75 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
           provider: 'openrouter',
           model: 'deepseek/deepseek-v4-flash',
           thinkingLevel: 'high',
-          supportsImage: false,
         },
       },
+    })
+  })
+
+  it('keeps omitted image support unknown through a model-only save', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: null,
+      tiers: {
+        c0: {
+          provider: 'openrouter',
+          model: 'operator/custom-model',
+        },
+      },
+    }, {}, 'openrouter')
+
+    expect(f.payload()).not.toHaveProperty('tiers.c0.supportsImage')
+  })
+
+  it('clears inherited image support when the deployment model changes', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: 'openai',
+    }, {
+      c0: {
+        provider: 'openai',
+        model: 'preset-model',
+        supportsImage: false,
+      },
+    }, 'openai', 'follow_primary')
+
+    f.updateTierField('c0', 'model', 'operator/custom-model')
+
+    expect(f.payload()).not.toHaveProperty('tiers.c0.supportsImage')
+  })
+
+  it.each([false, true])('ignores a legacy image declaration of %s when saving', (supportsImage) => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: null,
+      tiers: {
+        c0: {
+          provider: 'openrouter',
+          model: 'operator/text-model',
+          supports_image: supportsImage,
+        },
+      },
+    }, {}, 'openrouter')
+
+    f.updateTierField('c0', 'supportsImage', !supportsImage)
+    expect(f.payload()).not.toHaveProperty('tiers.c0.supportsImage')
+    expect(makePanel(f, true).value.tierRows[0]).not.toHaveProperty('supportsImage')
+  })
+
+  it('does not serialize retired capability fields supplied by an older caller', () => {
+    const payload = buildRouterPayload('custom', 'c0', {
+      c0: {
+        provider: 'configured-provider',
+        model: 'configured-model',
+        thinkingLevel: '',
+        supportsImage: true,
+      },
+    })
+    expect(payload.tiers?.c0).toEqual({
+      provider: 'configured-provider', model: 'configured-model', thinkingLevel: '',
     })
   })
 
@@ -355,7 +455,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     expect(f.payload().mode).toBe('custom')
   })
 
-  it('adds cross-provider router fields when tier providers differ', () => {
+  it('does not authorize cross-provider execution merely because tier providers differ', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({
       enabled: true,
@@ -369,11 +469,10 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, {}, 'openai')
 
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.tierTemplateState.value).toBe('custom')
     expect(f.payload()).toMatchObject({
       mode: 'custom',
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
     })
   })
 
@@ -423,9 +522,8 @@ describe('useSetupRouterForm - model strategy semantics', () => {
 
     expect(f.routerProviderRoles.value).toEqual({})
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.payload()).toMatchObject({
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
     })
     expect(f.tierEnsembleStatus.value).toBeNull()
   })
@@ -497,6 +595,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
 
     expect(f.routerProviderRoles.value).toEqual({ c3: 'dynamic_member' })
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(makePanel(f, true).value.routerProviderRoles).toEqual({ c3: 'dynamic_member' })
   })
 
@@ -527,9 +626,8 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       c3: 'direct',
     })
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.payload()).toMatchObject({
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
     })
   })
 
@@ -565,6 +663,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, 'custom_b5', false)
 
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
 
     f.updateTierField('c3', 'ensembleEnabled', true)
     f.updateTierField('c3', 'ensembleSelectionMode', '')
@@ -689,6 +788,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       c3: 'direct',
     })
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.payload()).toMatchObject({
       tiers: {
         c3: {
@@ -731,10 +831,9 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, {}, 'openrouter')
 
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(makePanel(f, true).value.hasMixedTierProviders).toBe(true)
     expect(f.payload()).toMatchObject({
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
     })
   })
 
@@ -756,8 +855,6 @@ describe('useSetupRouterForm - model strategy semantics', () => {
 
     expect(f.payload()).toMatchObject({
       mode: 'custom',
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
       tiers: {
         c0: { provider: 'deepseek', model: '' },
       },
@@ -777,5 +874,17 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, {}, 'openai')
 
     expect(makePanel(f, false).value.hasMixedTierProviders).toBe(true)
+  })
+})
+
+
+describe('saved cross-provider permission', () => {
+  it('preserves an explicit enabled permission and mismatch policy', () => {
+    const form = useSetupRouterForm()
+    form.initFromConfig({ enabled: true, cross_provider_tiers: true, tier_provider_mismatch: 'route', tiers: {
+      c0: { provider: 'openai', model: 'draft' }, c1: { provider: 'openrouter', model: 'saved' },
+    } }, {}, 'openai')
+    form.updateTierField('c0', 'model', 'edited')
+    expect(form.payload()).toMatchObject({ crossProviderTiers: true, tierProviderMismatch: 'route' })
   })
 })

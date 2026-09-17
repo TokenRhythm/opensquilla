@@ -82,8 +82,7 @@ async def test_keyless_boot_never_fetches_live_catalog(
     # provider credentials — the boot warm must therefore skip it entirely.
     config = GatewayConfig(
         llm={"provider": "tokenrhythm", "model": "deepseek-v4-pro"},
-        memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
+        memory={},
     )
 
     services = await build_services(
@@ -155,8 +154,7 @@ async def test_configured_boot_ingests_live_qwen_limit(
             "model": "qwen3.7-max",
             "api_key": "dummy-tokenrhythm-key",
         },
-        memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
+        memory={},
     )
 
     services = await build_services(
@@ -223,8 +221,7 @@ async def test_desktop_deferred_warm_uses_key_saved_after_build(
     )
     config = GatewayConfig(
         llm={"provider": "tokenrhythm", "model": "qwen3.7-max"},
-        memory={"flush_enabled": False},
-        sandbox={"auto_setup": False},
+        memory={},
     )
 
     services = await build_services(

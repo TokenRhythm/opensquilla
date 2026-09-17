@@ -8,14 +8,24 @@ import json
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
 from opensquilla.cli import chat_cmd
-from opensquilla.cli.chat.turn_stream import turn_stream_error_message, wrap_cli_turn_stream
+from opensquilla.cli.chat import turn_stream
+from opensquilla.cli.chat.turn_stream import (
+    _standalone_session_owner_kwargs as _chat_session_owner_kwargs,
+)
+from opensquilla.cli.chat.turn_stream import (
+    default_turn_stream_dependencies,
+    handle_image_command_turnrunner,
+    stream_response_turnrunner,
+    turn_stream_error_message,
+    wrap_cli_turn_stream,
+)
 from opensquilla.cli.main import app
 from opensquilla.cli.repl import commands as repl_commands
 from opensquilla.cli.repl import slash_bridge
@@ -30,6 +40,9 @@ from opensquilla.engine.types import (
     ToolUseStartEvent,
 )
 from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.models import SessionIntent
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 from opensquilla.tools.types import CallerKind, ToolContext
 
 runner = CliRunner()
@@ -639,7 +652,6 @@ class _FakeServices:
         self.memory_sync_managers = {"main": object()}
         self.memory_retrievers = {"main": object()}
         self.turn_capture_services = {"main": object()}
-        self.flush_service = None
         self.model_catalog = object()
         self.provider_selector = MagicMock()
         self.tool_registry = None
@@ -920,7 +932,6 @@ async def test_standalone_repl_wires_memory_services_into_turnrunner(monkeypatch
     assert captured["memory_sync_managers"] is services.memory_sync_managers
     assert captured["memory_retrievers"] is services.memory_retrievers
     assert captured["turn_capture_services"] is services.turn_capture_services
-    assert captured["session_flush_service"] is services.flush_service
     assert captured["model_catalog"] is services.model_catalog
 
 
@@ -969,6 +980,129 @@ async def test_standalone_turnrunner_stream_uses_heartbeat_wrapper(monkeypatch) 
     assert result.text == "ok"
     assert renderer.pulses >= 1
     assert renderer.finalized is True
+
+
+@pytest.mark.parametrize("surface", ["text", "image"])
+@pytest.mark.asyncio
+async def test_standalone_streams_fence_reset_owner_before_runner_write(
+    surface: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / f"cli-{surface}-owner.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    key = f"agent:main:standalone-{surface}-owner"
+    admitted = await manager.create(key)
+    run_call: dict[str, object] = {}
+    replacement = None
+
+    class FakeTurnRunner:
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs,
+        ):
+            nonlocal replacement
+            run_call.update(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
+            replacement, rotated = await manager.apply_intent(
+                key,
+                SessionIntent.RESET_SAME_KEY,
+            )
+            assert rotated is True
+            await manager.append_message(
+                key,
+                role="assistant",
+                content="late answer",
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            yield DoneEvent(text="unreachable")
+
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    runner = FakeTurnRunner()
+    svc = SimpleNamespace(
+        config=SimpleNamespace(
+            agent_stream_heartbeat_interval_seconds=0.0,
+            agent_stream_idle_timeout_seconds=1.0,
+        ),
+        session_manager=manager,
+    )
+    tool_ctx = ToolContext(
+        caller_kind=CallerKind.CLI,
+        channel_kind="cli",
+        channel_id="cli:chat",
+    )
+    deps = default_turn_stream_dependencies(
+        renderer_factory=_RecordingRenderer,
+        image_attachment_builder=lambda _command: (
+            "inspect image",
+            [{"type": "image", "url": "data:image/png;base64,AA=="}],
+        ),
+    )
+    try:
+        with pytest.raises(StaleEpochError, match="owner mismatch"):
+            if surface == "image":
+                await handle_image_command_turnrunner(
+                    runner,
+                    key,
+                    tool_ctx,
+                    "/image example.png",
+                    svc=svc,
+                    deps=deps,
+                )
+            else:
+                await stream_response_turnrunner(
+                    runner,
+                    key,
+                    tool_ctx,
+                    "hello",
+                    svc=svc,
+                    deps=deps,
+                )
+        current = await manager.get_session(key)
+        transcript = await manager.get_transcript(key)
+    finally:
+        await storage.close()
+
+    assert run_call["expected_session_id"] == admitted.session_id
+    assert run_call["expected_session_epoch"] == int(admitted.epoch or 0)
+    assert replacement is not None
+    assert current is not None
+    assert current.session_id == replacement.session_id
+    assert transcript == []
+
+
+@pytest.mark.asyncio
+async def test_chat_owner_guard_rejects_kwargs_only_durable_runner(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "chat-dropping-runner.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    key = "agent:main:chat-dropping-runner"
+    await manager.create(key)
+    run_calls: list[dict[str, object]] = []
+
+    class DroppingRunner:
+        async def run(self, *args, **kwargs):
+            run_calls.append(dict(kwargs))
+            yield DoneEvent(text="unreachable")
+
+    try:
+        with pytest.raises(RuntimeError, match="runner cannot enforce"):
+            await _chat_session_owner_kwargs(manager, DroppingRunner(), key)
+    finally:
+        await storage.close()
+
+    assert run_calls == []
 
 
 @pytest.mark.asyncio
@@ -1202,11 +1336,10 @@ async def test_standalone_slash_compact_uses_selected_physical_deployment(monkey
 
 
 @pytest.mark.asyncio
-async def test_standalone_reset_refuses_non_empty_transcript_without_flush_service(
+async def test_standalone_reset_refuses_non_empty_transcript_without_checkpoint(
     monkeypatch,
 ) -> None:
     services = _FakeServices()
-    services.flush_service = None
     session_key = "standalone:test"
     services.session_manager.transcripts[session_key] = [
         SimpleNamespace(role="user", content="persisted")
@@ -1237,11 +1370,10 @@ async def test_standalone_reset_refuses_non_empty_transcript_without_flush_servi
 
 
 @pytest.mark.asyncio
-async def test_standalone_compact_missing_flush_service_does_not_block_compaction(
+async def test_standalone_compact_runs_without_memory_extraction(
     monkeypatch,
 ) -> None:
     services = _FakeServices()
-    services.flush_service = None
     session_key = "standalone:test"
     services.session_manager.transcripts[session_key] = [
         SimpleNamespace(role="user", content="persisted")
@@ -1272,110 +1404,6 @@ async def test_standalone_compact_missing_flush_service_does_not_block_compactio
 
     await chat_cmd._standalone_repl(model="openrouter/test", session_id=session_key)
 
-    assert len(services.session_manager.compact_calls) == 1
-
-
-class _FakeFlushService:
-    def __init__(self, receipt: object | None = None, error: Exception | None = None) -> None:
-        self.receipt = receipt or SimpleNamespace(
-            mode="llm",
-            error=None,
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
-        )
-        self.error = error
-        self.calls: list[dict[str, object]] = []
-
-    async def execute(self, transcript: object, session_key: str, **kwargs) -> object:
-        self.calls.append({"transcript": transcript, "session_key": session_key, "kwargs": kwargs})
-        if self.error is not None:
-            raise self.error
-        return self.receipt
-
-
-@pytest.mark.asyncio
-async def test_standalone_compact_flushes_before_compacting(monkeypatch) -> None:
-    services = _FakeServices()
-    session_key = "standalone:test"
-    services.session_manager.transcripts[session_key] = [
-        SimpleNamespace(role="user", content="persisted")
-    ]
-    services.flush_service = _FakeFlushService()
-    services.provider_selector = _FakeProviderSelector()
-    services.config = SimpleNamespace(
-        context_budget_tokens=1234,
-        compaction=SimpleNamespace(enabled=True, model=None, timeout_seconds=12.5),
-    )
-    inputs = iter(["/compact", "/quit"])
-
-    class FakeTurnRunner:
-        def __init__(self, **kwargs) -> None:
-            return None
-
-        async def run(self, message: str, session_key: str, **kwargs):
-            yield DoneEvent()
-
-    async def fake_prompt_user(prefix: str = "[you] ", **kwargs):
-        return next(inputs)
-
-    async def fake_build_services() -> _FakeServices:
-        return services
-
-    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
-    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
-    _install_fake_inputs(monkeypatch, inputs)
-
-    await chat_cmd._standalone_repl(model="openrouter/test", session_id=session_key)
-
-    assert len(services.flush_service.calls) == 1
-    assert services.flush_service.calls[0]["session_key"] == session_key
-    assert services.flush_service.calls[0]["kwargs"]["message_window"] == 0
-    assert services.flush_service.calls[0]["kwargs"]["segment_mode"] == "auto"
-    assert len(services.session_manager.compact_calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_standalone_compact_continues_when_flush_fails(monkeypatch) -> None:
-    services = _FakeServices()
-    session_key = "standalone:test"
-    services.session_manager.transcripts[session_key] = [
-        SimpleNamespace(role="user", content="persisted")
-    ]
-    services.flush_service = _FakeFlushService(
-        receipt=SimpleNamespace(mode="error", error="provider down")
-    )
-    services.provider_selector = _FakeProviderSelector()
-    services.config = SimpleNamespace(
-        context_budget_tokens=1234,
-        compaction=SimpleNamespace(enabled=True, model=None, timeout_seconds=12.5),
-    )
-    inputs = iter(["/compact", "/quit"])
-
-    class FakeTurnRunner:
-        def __init__(self, **kwargs) -> None:
-            return None
-
-        async def run(self, message: str, session_key: str, **kwargs):
-            yield DoneEvent()
-
-    async def fake_prompt_user(prefix: str = "[you] ", **kwargs):
-        return next(inputs)
-
-    async def fake_build_services() -> _FakeServices:
-        return services
-
-    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
-    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
-    _install_fake_inputs(monkeypatch, inputs)
-
-    await chat_cmd._standalone_repl(model="openrouter/test", session_id=session_key)
-
-    assert len(services.flush_service.calls) == 1
     assert len(services.session_manager.compact_calls) == 1
 
 
@@ -2131,6 +2159,55 @@ async def test_gateway_stream_cancelled_error_aborts_turn(monkeypatch) -> None:
     assert result.cancelled is True
     assert fake.abort_calls == ["agent:main:abc123"]
     assert fake.send_calls[0]["message"] == "hello"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, asyncio.CancelledError])
+async def test_gateway_stream_interrupt_tolerates_abort_failure(
+    monkeypatch, interrupt_type: type[BaseException]
+) -> None:
+    finalize = AsyncMock(wraps=turn_stream.renderer_finalize)
+    close = AsyncMock(wraps=turn_stream.renderer_close)
+    monkeypatch.setattr(turn_stream, "renderer_finalize", finalize)
+    monkeypatch.setattr(turn_stream, "renderer_close", close)
+
+    class BrokenAbortGatewayClient(_FakeGatewayClient):
+        async def send_message(self, session_key, message, attachments=None, elevated=None):
+            self.send_calls.append(
+                {
+                    "session_key": session_key,
+                    "message": message,
+                    "attachments": attachments,
+                    "elevated": elevated,
+                }
+            )
+            raise interrupt_type
+            yield {}
+
+        async def abort_session(self, session_key: str) -> dict[str, object]:
+            self.abort_calls.append(session_key)
+            raise ConnectionError(
+                "Gateway connection lost; restart chat or reconnect before sending another command."
+            )
+
+    BrokenAbortGatewayClient.instances = []
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", BrokenAbortGatewayClient)
+    fake = BrokenAbortGatewayClient()
+
+    result = await chat_cmd._stream_response_gateway(
+        fake,
+        "agent:main:abc123",
+        "hello",
+        {"mode": None},
+    )
+
+    assert result.cancelled is True
+    assert fake.abort_calls == ["agent:main:abc123"]
+    assert fake.send_calls[0]["message"] == "hello"
+
+    finalize.assert_awaited_once()
+    assert finalize.await_args.kwargs["cancelled"] is True
+    close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

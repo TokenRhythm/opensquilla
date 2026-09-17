@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import math
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -12,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla.contracts.adapters.sessions_list_contract import call_sessions_list
+from opensquilla.contracts.adapters.sessions_resolve_contract import call_sessions_resolve
 from opensquilla.contracts.gateway_transport import (
     ANSWER_GENERATION_RESET_CAPABILITY,
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
@@ -207,6 +210,16 @@ def gateway_base_is_local(base_url: str | None) -> bool:
 
 
 _SUBSCRIPTION_CLOSED = object()
+# These synchronous maintenance operations have no aggregate server deadline.
+# Preserve their existing completion waits; an explicit call(timeout_s=...) can
+# bound them. Chat admission, abort and event subscriptions remain time-limited.
+_SYNCHRONOUS_MAINTENANCE_METHODS = frozenset({
+    "sessions.reset",
+    "skills.install",
+    "skills.update",
+    "skills.deps.install",
+    "memory.index",
+})
 
 
 @dataclass
@@ -353,7 +366,8 @@ class GatewayEventSubscription:
 class GatewayClient:
     """WebSocket client for connecting to OpenSquilla gateway daemon."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, request_timeout_s: float | None = 30.0) -> None:
+        self.request_timeout_s = request_timeout_s
         self._ws: Any = None
         self._recv_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._pending: dict[str, asyncio.Future[dict]] = {}
@@ -627,10 +641,31 @@ class GatewayClient:
             raise ConnectionError("WebSocket is not connected")
         await target.send('{"type":"ping"}')
 
-    async def _call(self, method: str, params: dict | None = None) -> Any:
-        """Send a JSON-RPC request and await its response."""
+    def _discard_pending_response(
+        self,
+        req_id: str,
+        fut: asyncio.Future[dict],
+    ) -> None:
+        """Remove one request without disturbing a newer entry for the same id."""
+
+        if self._pending.get(req_id) is fut:
+            self._pending.pop(req_id, None)
+        if not fut.done():
+            fut.cancel()
+
+    async def _start_call(
+        self,
+        method: str,
+        params: dict | None = None,
+    ) -> tuple[str, asyncio.Future[dict]]:
+        """Send one RPC request and return the future for its response."""
+
         if self._connection_error is not None:
             raise self._connection_error
+        if self._closing:
+            raise ConnectionError(
+                "Gateway connection is closing; reconnect before sending another command."
+            )
         if self._ws is None:
             raise ConnectionError(
                 "Gateway connection lost; restart chat or reconnect before sending another command."
@@ -644,13 +679,38 @@ class GatewayClient:
                 json.dumps({"type": "req", "id": req_id, "method": method, "params": params})
             )
         except asyncio.CancelledError:
-            self._pending.pop(req_id, None)
+            self._discard_pending_response(req_id, fut)
             raise
         except Exception as exc:
-            self._pending.pop(req_id, None)
+            self._discard_pending_response(req_id, fut)
             err = self._mark_connection_failed(exc)
             raise err from exc
-        res = await fut
+        return req_id, fut
+
+    async def _await_call_response(
+        self,
+        method: str,
+        req_id: str,
+        fut: asyncio.Future[dict],
+        *,
+        timeout_s: float | None,
+    ) -> Any:
+        """Await and decode one response with the configured RPC deadline."""
+
+        try:
+            if timeout_s is None:
+                res = await fut
+            else:
+                res = await asyncio.wait_for(fut, timeout=timeout_s)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"{method} timed out after {timeout_s:g}s"
+            ) from exc
+        finally:
+            # The listener normally pops the entry first. Timeout and caller
+            # cancellation arrive without a response, so clean those paths here.
+            self._discard_pending_response(req_id, fut)
+
         if not res.get("ok"):
             err = res.get("error", {})
             raw_details = err.get("data")
@@ -668,9 +728,57 @@ class GatewayClient:
         payload = res.get("payload")
         return {} if payload is None else payload
 
-    async def call(self, method: str, params: dict | None = None) -> Any:
+    async def _operation_response_timeout(self, method: str, params: dict | None) -> float | None:
+        if self.request_timeout_s is None:
+            return None
+        if method in _SYNCHRONOUS_MAINTENANCE_METHODS:
+            return None
+        if method == "sessions.contextCompact" and (params or {}).get("wait", True):
+            # Synchronous compaction runs until the Gateway's absolute deadline
+            # (120 seconds by default). Let its terminal result arrive before
+            # applying a client timeout, including an ordinary response margin.
+            server_budget = 120.0
+            try:
+                configured = await self.get_config("compaction.total_timeout_seconds")
+            except GatewayRPCError:
+                # Older/restricted Gateways may not expose the configuration;
+                # preserve their default compaction budget in that case.
+                configured = None
+        elif method == "cron.run":
+            # This RPC waits for the job's completion, not just its admission.
+            server_budget = 600.0
+            try:
+                job = await self._call("cron.status", {"id": (params or {}).get("id")})
+            except GatewayRPCError:
+                job = None
+            configured = job.get("timeout_seconds") if isinstance(job, dict) else None
+        else:
+            return self.request_timeout_s
+        try:
+            parsed = float(configured) if not isinstance(configured, bool) else server_budget
+        except (TypeError, ValueError):
+            parsed = server_budget
+        if math.isfinite(parsed) and parsed > 0:
+            server_budget = parsed
+        return server_budget + max(30.0, self.request_timeout_s)
+
+    async def _call(
+        self, method: str, params: dict | None = None, *, timeout_s: float | None = None,
+    ) -> Any:
+        """Send one RPC using its operation policy or an explicit response deadline."""
+
+        if timeout_s is None:
+            timeout_s = await self._operation_response_timeout(method, params)
+        req_id, fut = await self._start_call(method, params)
+        return await self._await_call_response(method, req_id, fut, timeout_s=timeout_s)
+
+    async def call(
+        self, method: str, params: dict | None = None, *, timeout_s: float | None = None,
+    ) -> Any:
         """Public thin wrapper for CLI commands that intentionally use RPC names."""
 
+        if timeout_s is not None:
+            return await self._call(method, params, timeout_s=timeout_s)
         return await self._call(method, params)
 
     async def create_session(
@@ -689,7 +797,7 @@ class GatewayClient:
         return cast(str, result["key"])
 
     async def list_sessions(self, limit: int = 50) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.list", {"limit": limit}))
+        return await call_sessions_list(self._call, limit=limit)
 
     async def preview_sessions(
         self,
@@ -702,7 +810,7 @@ class GatewayClient:
         return cast(dict[str, Any], await self._call("sessions.preview", params))
 
     async def resolve_session(self, key: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.resolve", {"key": key}))
+        return await call_sessions_resolve(self._call, key=key)
 
     async def bootstrap_session(
         self,
@@ -937,17 +1045,6 @@ class GatewayClient:
         result = await self._call("config.patch.safe", {"patches": patches})
         return result if isinstance(result, dict) else {}
 
-    async def forget_approvals(self, target: str | None = None) -> dict[str, Any]:
-        """Wipe cached intent approvals on the server.
-
-        ``target`` selects a specific path/command; omit to clear all.
-        Returns the scope reported by the server.
-        """
-        params: dict[str, Any] = {}
-        if target:
-            params["target"] = target
-        return cast(dict[str, Any], await self._call("exec.approval.forget", params))
-
     async def approvals_snapshot(self) -> dict[str, Any]:
         """Return current approval mode + cache contents (diagnostic)."""
         return cast(dict[str, Any], await self._call("exec.approval.snapshot", {}))
@@ -1093,16 +1190,42 @@ class GatewayClient:
             return
         if any(item.session_key == session_key for item in self._event_subscriptions.values()):
             return
+        pending_unsubscribe: tuple[str, asyncio.Future[dict]] | None = None
         async with self._subscription_lock:
+            # A replacement subscription may have been registered while this
+            # coroutine waited for the lock. In that case the server subscription
+            # must remain active.
+            if any(
+                item.session_key == session_key
+                for item in self._event_subscriptions.values()
+            ):
+                return
             if session_key not in self._server_session_subscriptions:
                 return
             self._server_session_subscriptions.discard(session_key)
             if self._closing or self._connection_error is not None or self._ws is None:
                 return
             try:
-                await self._call("sessions.messages.unsubscribe", {"key": session_key})
-            except (ConnectionError, GatewayRPCError):
+                # Send under the lock so a replacement subscribe is ordered after
+                # this frame, but release the lock before waiting for its response.
+                pending_unsubscribe = await self._start_call(
+                    "sessions.messages.unsubscribe",
+                    {"key": session_key},
+                )
+            except ConnectionError:
                 return
+        if pending_unsubscribe is None:
+            return
+        req_id, fut = pending_unsubscribe
+        try:
+            await self._await_call_response(
+                "sessions.messages.unsubscribe",
+                req_id,
+                fut,
+                timeout_s=self.request_timeout_s,
+            )
+        except (ConnectionError, GatewayRPCError, TimeoutError):
+            return
 
     def _preserve_foreign_event(
         self,
@@ -1231,6 +1354,9 @@ class GatewayClient:
     async def close(self) -> None:
         """Close the WebSocket connection."""
         self._closing = True
+        self._fail_pending_requests(
+            ConnectionError("Gateway connection closed before the RPC response was received")
+        )
         for task in (self._heartbeat_task, self._listener_task):
             if task is None:
                 continue
@@ -1252,6 +1378,13 @@ class GatewayClient:
             subscription._close_from_client()
         self._event_subscriptions.clear()
 
+    def _fail_pending_requests(self, error: BaseException) -> None:
+        pending = tuple(self._pending.values())
+        self._pending.clear()
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(error)
+
     def _mark_connection_failed(self, exc: BaseException) -> ConnectionError:
         if isinstance(exc, ConnectionError) and str(exc).startswith("Gateway connection lost"):
             err = exc
@@ -1265,10 +1398,7 @@ class GatewayClient:
             self._connection_error = err
         else:
             err = self._connection_error
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(err)
-        self._pending.clear()
+        self._fail_pending_requests(err)
         for subscription in tuple(self._event_subscriptions.values()):
             subscription._fail(err)
         current_task = asyncio.current_task()

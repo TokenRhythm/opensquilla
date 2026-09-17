@@ -12,6 +12,7 @@ async function mountState(
   state: ChatSessionRecoveryState,
   onRetry = vi.fn(),
   transportState: 'disconnected' | 'connecting' | 'connected' = 'connected',
+  action?: 'retry-history' | 'retry-live',
 ) {
   const host = document.createElement('div')
   host.className = 'chat-thread'
@@ -21,6 +22,7 @@ async function mountState(
     setup: () => () => h(ChatSessionRecoveryStatus, {
       state,
       transportState,
+      action,
       onRetry,
     }),
   })
@@ -56,20 +58,25 @@ describe('ChatSessionRecoveryStatus', () => {
     expect(host.querySelector('button')).toBeNull()
   })
 
-  it('shows a non-blocking history error and emits retry without local latching', async () => {
-    const { host, onRetry } = await mountState('history-error')
+  it('shows history failure as a quiet automatic status without an invalid action', async () => {
+    const { host } = await mountState('history-error')
+    const status = host.querySelector('[data-testid="chat-session-recovery-status"]')
+
+    expect(status?.textContent).toContain('Conversation history temporarily unavailable')
+    expect(status?.textContent).toContain('Conversation history is temporarily unavailable.')
+    expect(status?.getAttribute('data-recovery-state')).toBe('history-error')
+    expect(status?.getAttribute('role')).toBe('status')
+    expect(status?.getAttribute('aria-live')).toBe('polite')
+    expect(host.querySelector('[data-testid="chat-session-recovery-retry"]')).toBeNull()
+  })
+
+  it('renders a retry button only when an explicit user action is provided', async () => {
+    const { host, onRetry } = await mountState('history-error', vi.fn(), 'connected', 'retry-history')
     const alert = host.querySelector('[data-testid="chat-session-recovery-status"]')
     const retry = host.querySelector('[data-testid="chat-session-recovery-retry"]') as HTMLButtonElement
 
-    expect(alert?.textContent).toContain('Conversation history temporarily unavailable')
-    expect(alert?.textContent).toContain(
-      'The connection may have been interrupted, or history is temporarily unavailable.',
-    )
-    expect(alert?.getAttribute('data-recovery-state')).toBe('history-error')
     expect(alert?.getAttribute('role')).toBe('alert')
-    expect(alert?.getAttribute('aria-atomic')).toBe('true')
     expect(retry.textContent).toContain('Reload history')
-
     retry.click()
     await nextTick()
     expect(onRetry).toHaveBeenCalledOnce()
@@ -77,17 +84,16 @@ describe('ChatSessionRecoveryStatus', () => {
     expect(host.querySelector('[data-testid="chat-session-recovery-retry"]')).toBeTruthy()
   })
 
-  it('renders live degradation independently from history', async () => {
-    const { host, onRetry } = await mountState('live-degraded')
+  it('renders live degradation independently from history without asking the user to reconnect', async () => {
+    const { host } = await mountState('live-degraded')
     const status = host.querySelector('[data-testid="chat-session-recovery-status"]')
-    const retry = host.querySelector('[data-testid="chat-session-recovery-retry"]') as HTMLButtonElement
 
     expect(status?.textContent).toContain('Live updates are temporarily unavailable')
-    expect(status?.textContent).toContain('The Gateway is connected and history remains available.')
+    expect(status?.textContent).toContain('The Gateway is connected. Live updates for this session are temporarily unavailable.')
     expect(status?.getAttribute('data-recovery-state')).toBe('live-degraded')
-    expect(retry.textContent).toContain('Reconnect')
-    retry.click()
-    expect(onRetry).toHaveBeenCalledOnce()
+    expect(status?.getAttribute('role')).toBe('status')
+    expect(status?.getAttribute('aria-live')).toBe('polite')
+    expect(host.querySelector('[data-testid="chat-session-recovery-retry"]')).toBeNull()
   })
 
   it('distinguishes session recovery on a healthy socket from a real reconnect', async () => {

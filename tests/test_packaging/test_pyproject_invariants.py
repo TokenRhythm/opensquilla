@@ -7,6 +7,7 @@ is also a user-visible install contract.
 
 from __future__ import annotations
 
+import json
 import tomllib
 from pathlib import Path
 
@@ -167,6 +168,20 @@ def test_standard_distributions_require_verified_generated_webui() -> None:
     ]
     assert (PYPROJECT.parent / "hatch_build.py").is_file()
     assert (PYPROJECT.parent / "scripts" / "verify_webui_artifact.py").is_file()
+    assert (PYPROJECT.parent / "opensquilla-webui" / "scripts" / "stage-dist.mjs").is_file()
+
+
+def test_webui_build_owns_dist_and_stages_the_package_copy() -> None:
+    vite = (PYPROJECT.parent / "opensquilla-webui" / "vite.config.ts").read_text(
+        encoding="utf-8"
+    )
+    package = json.loads(
+        (PYPROJECT.parent / "opensquilla-webui" / "package.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "outDir: resolve(__dirname, 'dist')" in vite
+    assert "scripts/stage-dist.mjs" in package["scripts"]["build:artifact"]
 
 
 def test_homebrew_head_install_builds_the_generated_webui_before_python() -> None:

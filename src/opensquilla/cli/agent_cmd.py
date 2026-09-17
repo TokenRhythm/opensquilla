@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import getpass
 import json
@@ -118,6 +119,47 @@ def _apply_config_tool_policy_to_context(
     )
 
 
+async def _standalone_session_owner_kwargs(
+    session_manager: Any,
+    turn_runner: Any,
+    session_key: str,
+    *,
+    session: Any | None = None,
+) -> dict[str, Any]:
+    from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
+    from opensquilla.gateway.session_services import get_session_storage
+    from opensquilla.session.storage import SessionStorage
+
+    storage = get_session_storage(session_manager)
+    if not isinstance(storage, SessionStorage):
+        return {}
+    if not all(
+        _accepts_explicit_keyword_arg(session_manager.append_message, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError("Session writer cannot enforce a durable owner")
+    if not all(
+        _accepts_explicit_keyword_arg(turn_runner.run, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError("Turn runner cannot enforce a durable owner")
+    session = session if session is not None else await storage.get_session(session_key)
+    session_id = getattr(session, "session_id", None)
+    session_epoch = getattr(session, "epoch", None)
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or isinstance(session_epoch, bool)
+        or not isinstance(session_epoch, int)
+        or session_epoch < 0
+    ):
+        raise RuntimeError("Session has no durable owner")
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
+
+
 async def run_agent_once(
     *,
     message: str,
@@ -187,11 +229,7 @@ async def run_agent_once(
             AcceptedRunModeOverride,
         )
 
-        run_mode = (
-            "full"
-            if permissions_profile in {"bypass", "full"}
-            else "safe"
-        )
+        run_mode = "full" if permissions_profile in {"bypass", "full"} else "safe"
         accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=normalize_run_mode(run_mode),
             run_mode_source="user",
@@ -262,7 +300,15 @@ async def run_agent_once(
     done: DoneEvent | None = None
 
     try:
-        await svc.session_manager.get_or_create(session_key, agent_id=agent_id)
+        session_result = await svc.session_manager.get_or_create(
+            session_key,
+            agent_id=agent_id,
+        )
+        admitted_session = (
+            session_result[0]
+            if isinstance(session_result, tuple) and session_result
+            else session_result
+        )
         attachments_cfg = getattr(service_cfg, "attachments", None)
         opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
         ingested_attachments = await _attachment_ingest.ingest_attachments(
@@ -271,9 +317,28 @@ async def run_agent_once(
             failure_mode="raise",
             accept_opaque=bool(getattr(attachments_cfg, "accept_opaque", True)),
             opaque_limit_bytes=opaque_cap if isinstance(opaque_cap, int) else None,
+            persist_enabled=bool(getattr(attachments_cfg, "persist_transcripts", True)),
         )
         message = ingested_attachments.text
         run_attachments = ingested_attachments.attachments
+        runner = build_turn_runner_from_services(svc)
+        owner_kwargs = await _standalone_session_owner_kwargs(
+            svc.session_manager,
+            runner,
+            session_key,
+            session=admitted_session,
+        )
+        if transcript_path and owner_kwargs:
+            from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
+
+            if not all(
+                _accepts_explicit_keyword_arg(
+                    svc.session_manager.get_transcript,
+                    name,
+                )
+                for name in ("expected_session_id", "expected_session_epoch")
+            ):
+                raise RuntimeError("Session reader cannot enforce a durable owner")
         if run_attachments:
             from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 
@@ -289,17 +354,27 @@ async def run_agent_once(
             persist_content, _writes = build_transcript_attachment_envelope(
                 text=message,
                 attachments=run_attachments,
-                session_id=session_key.split(":")[-1] or session_key,
+                session_id=str(
+                    owner_kwargs.get("expected_session_id")
+                    or session_key.split(":")[-1]
+                    or session_key
+                ),
                 media_root=media_root,
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
             )
             await svc.session_manager.append_message(
-                session_key, role="user", content=persist_content
+                session_key,
+                role="user",
+                content=persist_content,
+                **owner_kwargs,
             )
         else:
             _persisted = await svc.session_manager.append_message(
-                session_key, role="user", content=message
+                session_key,
+                role="user",
+                content=message,
+                **owner_kwargs,
             )
             if _persisted is not None and isinstance(_persisted.content, str):
                 message = _persisted.content
@@ -315,9 +390,18 @@ async def run_agent_once(
             ),
             elevated=elevated,
             run_mode=run_mode,
+            **(
+                {
+                    "session_id": owner_kwargs["expected_session_id"],
+                    "session_epoch": owner_kwargs["expected_session_epoch"],
+                }
+                if owner_kwargs
+                else {}
+            ),
         )
         from opensquilla.gateway.project_workspace_runtime import (
             apply_accepted_run_mode_override,
+            apply_run_context_route_metadata,
             authoritative_project_run_context,
         )
         from opensquilla.gateway.session_services import get_session_storage
@@ -338,11 +422,7 @@ async def run_agent_once(
                 run_context,
                 accepted_run_mode_override,
             )
-            from opensquilla.gateway.rpc_sessions import (
-                _apply_run_context_route_metadata,
-            )
-
-            _apply_run_context_route_metadata(
+            apply_run_context_route_metadata(
                 route_envelope,
                 run_context,
                 principal_is_owner=True,
@@ -369,12 +449,33 @@ async def run_agent_once(
             tool_registry=getattr(svc, "tool_registry", None),
         )
 
-        runner = build_turn_runner_from_services(svc)
         bootstrap_context_mode = _bootstrap_context_mode(
             unattended=unattended,
             stateless=stateless,
             stateless_keep_project_rules=stateless_keep_project_rules,
         )
+
+        from opensquilla.telemetry.contracts.common import (
+            ClientEntrypoint,
+            ClientSurface,
+            ExecutionMode,
+        )
+
+        growth_sink = getattr(svc, "growth_event_sink", None)
+        record_launch = getattr(growth_sink, "record_client_launch", None)
+        # Internal coding Agents retain turn/tool diagnostics, but their
+        # disposable profiles must not inflate CLI users or launch counts.
+        # Stateless is independent: a user's stateless CLI run still counts.
+        if callable(record_launch) and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+            await record_launch(
+                surface=ClientSurface.CLI,
+                entrypoint=ClientEntrypoint.AGENT,
+                execution_mode=ExecutionMode.ONE_SHOT,
+            )
+        record_active = getattr(growth_sink, "record_product_active", None)
+        if callable(record_active) and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+            with contextlib.suppress(Exception):
+                await record_active(surface=ClientSurface.CLI)
 
         async for event in runner.run(
             message,
@@ -393,6 +494,9 @@ async def run_agent_once(
             no_memory_capture=no_memory_capture,
             attachments=run_attachments,
             bootstrap_context_mode=bootstrap_context_mode,
+            telemetry_surface=ClientSurface.CLI,
+            telemetry_execution_mode=ExecutionMode.ONE_SHOT,
+            **owner_kwargs,
         ):
             if event_sink is not None:
                 event_sink(event)
@@ -412,13 +516,9 @@ async def run_agent_once(
                     errors.append(
                         {
                             "message": (
-                                event.terminal_error_message
-                                or "The model provider request failed."
+                                event.terminal_error_message or "The model provider request failed."
                             ),
-                            "code": (
-                                event.terminal_error_code
-                                or "ensemble_fixed_error"
-                            ),
+                            "code": (event.terminal_error_code or "ensemble_fixed_error"),
                         }
                     )
             elif isinstance(event, ErrorEvent):
@@ -430,7 +530,10 @@ async def run_agent_once(
         usage = _usage_from_done(done, effective_model)
         transcript_usage = _to_transcript_usage(usage)
         if transcript_path:
-            transcript = await svc.session_manager.get_transcript(session_key)
+            transcript = await svc.session_manager.get_transcript(
+                session_key,
+                **owner_kwargs,
+            )
             _write_jsonl(transcript_path, _to_benchmark_transcript(transcript, transcript_usage))
     finally:
         await svc.close()
@@ -507,11 +610,16 @@ def _with_agent_workspace_config(config: Any, workspace: str) -> Any:
     if memory is not None:
         update["memory"] = memory
     if hasattr(config, "model_copy"):
-        return config.model_copy(update=update)
-    copied = copy.copy(config)
-    setattr(copied, "workspace_dir", workspace)
-    if memory is not None:
-        setattr(copied, "memory", memory)
+        copied = config.model_copy(update=update)
+    else:
+        copied = copy.copy(config)
+        setattr(copied, "workspace_dir", workspace)
+        if memory is not None:
+            setattr(copied, "memory", memory)
+    # The CLI's effective startup root is trusted, including its legacy
+    # configured default. Gateway task allocation must not replace it.
+    if hasattr(copied, "_workspace_dir_explicit"):
+        copied._workspace_dir_explicit = True
     return copied
 
 
@@ -847,12 +955,14 @@ def run_agent_command(
     iteration_timeout_seconds: float | None = typer.Option(
         None,
         "--iteration-timeout-seconds",
-        help="Per-iteration timeout in seconds (one LLM call + its tool executions)",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     tool_timeout_seconds: float | None = typer.Option(
         None,
         "--tool-timeout-seconds",
-        help="Per-tool execution timeout in seconds",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     request_timeout_seconds: float | None = typer.Option(
         None,

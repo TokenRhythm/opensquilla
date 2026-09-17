@@ -91,13 +91,13 @@ def approval_surface_for_tui_output(
     return _turn_bridge.approval_surface_for_tui_output(tui_output, default)
 
 
-async def flush_before_standalone_rewrite(
+async def checkpoint_before_standalone_rewrite(
     svc: Any,
     session_key: str,
     *,
     operation: str,
 ) -> bool:
-    return await _slash_bridge.flush_before_standalone_rewrite(
+    return await _slash_bridge.checkpoint_before_standalone_rewrite(
         _runtime_bridge.standalone_slash_services_from_runtime(svc),
         session_key,
         operation=operation,
@@ -207,16 +207,6 @@ async def async_file_prompt_and_attachments(
     return await _input_bridge.async_file_prompt_and_attachments(
         command,
         upload_callable=upload_callable,
-    )
-
-
-async def forget_server_approvals(
-    client: object | None,
-    target: str | None = None,
-) -> bool:
-    return await _slash_bridge.forget_server_approvals(
-        client,
-        target,
     )
 
 

@@ -24,6 +24,25 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from opensquilla.contracts.generated.v4.sessions_create_metadata import (
+    SESSIONS_CREATE_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_delete_metadata import (
+    SESSIONS_DELETE_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_rename_metadata import (
+    SESSIONS_RENAME_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_resolve_metadata import (
+    SESSIONS_RESOLVE_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_search_metadata import (
+    SESSIONS_SEARCH_METHOD,
+)
+
 # ---------------------------------------------------------------------------
 # Scope constants
 # ---------------------------------------------------------------------------
@@ -117,15 +136,18 @@ METHOD_SCOPES: dict[str, str] = {
     "config.effective": READ_SCOPE,
     "config.schema.lookup": READ_SCOPE,
     "sessions.get": READ_SCOPE,
-    "sessions.list": READ_SCOPE,
-    "sessions.search": READ_SCOPE,
+    SESSIONS_LIST_METHOD: READ_SCOPE,
+    SESSIONS_SEARCH_METHOD: READ_SCOPE,
     "sessions.preview": READ_SCOPE,
-    "sessions.resolve": READ_SCOPE,
+    SESSIONS_RESOLVE_METHOD: READ_SCOPE,
     "sessions.bootstrap": READ_SCOPE,
+    "sessions.executionLog.read": READ_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
     "sessions.messages.snapshot": READ_SCOPE,
+    "sessions.messages.snapshot.read": READ_SCOPE,
+    "transport.flow.update": READ_SCOPE,
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.hydrate": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
@@ -150,7 +172,6 @@ METHOD_SCOPES: dict[str, str] = {
     "workbench.previews.create": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
     "last-heartbeat": READ_SCOPE,
-    "system-presence": READ_SCOPE,
     "doctor.status": READ_SCOPE,
     "doctor.memory.status": READ_SCOPE,
     "diagnostics.status": READ_SCOPE,
@@ -158,6 +179,7 @@ METHOD_SCOPES: dict[str, str] = {
     "logs.tail": READ_SCOPE,
     "logs.trace": READ_SCOPE,
     "models.list": READ_SCOPE,
+    "models.capacity.resolve": READ_SCOPE,
     "models.routing.get": READ_SCOPE,
     "providers.status": READ_SCOPE,
     # OpenSquilla-only; non-consuming peek at a session's router-control hold
@@ -203,6 +225,7 @@ METHOD_SCOPES: dict[str, str] = {
     "usage.cost": READ_SCOPE,
     "usage.query": READ_SCOPE,
     "meta.list": READ_SCOPE,  # OpenSquilla-only; invokable meta-skill catalog.
+    "meta.inspect": READ_SCOPE,  # OpenSquilla-only; body-free stable dependency tree.
     "meta.setup.plan": READ_SCOPE,  # OpenSquilla-only; dependency setup preview.
     "meta.setup.status": READ_SCOPE,  # OpenSquilla-only; background setup progress.
     "meta.runs.list": READ_SCOPE,
@@ -221,10 +244,6 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.catalog": READ_SCOPE,
     "onboarding.router.catalog": READ_SCOPE,
     # ----- write -----
-    "wake": WRITE_SCOPE,
-    "send": WRITE_SCOPE,
-    "agent": WRITE_SCOPE,
-    "agent.wait": WRITE_SCOPE,
     "chat.send": WRITE_SCOPE,
     "chat.abort": WRITE_SCOPE,
     "chat.clarify_submit": WRITE_SCOPE,
@@ -233,20 +252,12 @@ METHOD_SCOPES: dict[str, str] = {
     "artifacts.documents.rename": WRITE_SCOPE,
     "artifacts.revisions.restore": WRITE_SCOPE,
     "artifacts.changes.revert": WRITE_SCOPE,
-    "artifacts.prompt_annotations.create": WRITE_SCOPE,
-    "artifacts.prompt_annotations.focus": WRITE_SCOPE,
-    "artifacts.prompt_annotations.update": WRITE_SCOPE,
-    "artifacts.prompt_annotations.discard": WRITE_SCOPE,
-    "artifacts.source.patch": WRITE_SCOPE,
     "artifacts.mutations.resolve": WRITE_SCOPE,
     "workbench.resources.open": WRITE_SCOPE,
     "documents.import": WRITE_SCOPE,
     "documents.publish": WRITE_SCOPE,
-    "documents.editSessions.start": WRITE_SCOPE,
-    "documents.editSessions.heartbeat": WRITE_SCOPE,
-    "documents.editSessions.close": WRITE_SCOPE,
     "search.query": WRITE_SCOPE,
-    "sessions.create": WRITE_SCOPE,
+    SESSIONS_CREATE_METHOD: WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
     "sessions.forkThroughTurn": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
@@ -270,12 +281,10 @@ METHOD_SCOPES: dict[str, str] = {
     "goals.pause": WRITE_SCOPE,
     "goals.resume": WRITE_SCOPE,
     "goals.reattach": WRITE_SCOPE,
-    "sessions.steer": WRITE_SCOPE,
     "sessions.steer.v2": WRITE_SCOPE,
     "sessions.abort": WRITE_SCOPE,
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,
-    "sessions.compact": WRITE_SCOPE,
     "sessions.truncate": WRITE_SCOPE,
     "workspaces.open": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded project lifecycle.
     "workspaces.update": WRITE_SCOPE,
@@ -283,16 +292,17 @@ METHOD_SCOPES: dict[str, str] = {
     "workspaces.remove": WRITE_SCOPE,
     "workspaces.history.delete": WRITE_SCOPE,
     "models.routing.set": WRITE_SCOPE,
+    "models.routing.resetRecommended": ADMIN_SCOPE,
     # Deleting a session is a routine, per-user write op like reset/truncate above,
     # so it is write-scoped rather than admin-gated. Admin-gating it broke deletion
     # for every no-auth operator on a non-loopback bind — notably the default Docker
     # 0.0.0.0 listen, where even a 127.0.0.1 peer is not the local owner and so gets
     # REMOTE_OPERATOR_SCOPES (no admin) — surfacing as "Failed to delete session"
     # (issues #357, #307).
-    "sessions.delete": WRITE_SCOPE,
+    SESSIONS_DELETE_METHOD: WRITE_SCOPE,
     # Display-name-only session rename. Deployment/model rebinding remains on
     # the separately admin-gated sessions.patch surface.
-    "sessions.rename": WRITE_SCOPE,
+    SESSIONS_RENAME_METHOD: WRITE_SCOPE,
     "sessions.promptCacheKeepalive.set": WRITE_SCOPE,
     "sandbox.workspace.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.mount.add": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
@@ -312,6 +322,11 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.path.create-directory": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded path creation.
     # OpenSquilla-only; explicit override of `config.` admin prefix.
     "config.patch.safe": WRITE_SCOPE,
+    # Explicit, notice-bound user consent. Server-authored metadata and
+    # withdrawal cleanup keep this separate from generic config mutation.
+    "telemetry.consent.set": WRITE_SCOPE,
+    "telemetry.client_launch.record": WRITE_SCOPE,
+    "telemetry.product_active.record": WRITE_SCOPE,
     # OpenSquilla-only; manual ``/meta`` command launch stamp.
     "meta.run": WRITE_SCOPE,
     # Raw prompts remain owner/admin-gated inside the handlers. WRITE_SCOPE is
@@ -329,7 +344,6 @@ METHOD_SCOPES: dict[str, str] = {
     "exec.approval.waitDecision": APPROVALS_SCOPE,
     "exec.approval.status": APPROVALS_SCOPE,
     "exec.approval.snapshot": APPROVALS_SCOPE,
-    "exec.approval.forget": APPROVALS_SCOPE,
     "exec.approval.resolve": APPROVALS_SCOPE,
     "exec.approval.extend": APPROVALS_SCOPE,
     "plugin.approval.request": APPROVALS_SCOPE,
@@ -360,16 +374,14 @@ METHOD_SCOPES: dict[str, str] = {
     # the `config.` prefix default would already classify it as admin.
     "config.reload": ADMIN_SCOPE,
     "chat.inject": ADMIN_SCOPE,
-    "system-event": ADMIN_SCOPE,
     "set-heartbeats": ADMIN_SCOPE,
-    "secrets.reload": ADMIN_SCOPE,
-    "secrets.resolve": ADMIN_SCOPE,
     "agents.create": ADMIN_SCOPE,
     "agents.update": ADMIN_SCOPE,
     "agents.delete": ADMIN_SCOPE,
     "agents.files.set": ADMIN_SCOPE,
     "skills.install": ADMIN_SCOPE,
     "skills.install.cancel": ADMIN_SCOPE,
+    "skills.install.status": ADMIN_SCOPE,
     "skills.update": ADMIN_SCOPE,
     "skills.uninstall": ADMIN_SCOPE,
     "skills.reload": ADMIN_SCOPE,
@@ -409,8 +421,7 @@ METHOD_SCOPES: dict[str, str] = {
     "diagnostics.set": ADMIN_SCOPE,
     "onboarding.provider.credential.reveal": ADMIN_SCOPE,
     "onboarding.provider.credential.clear": ADMIN_SCOPE,
-    "cron.add": ADMIN_SCOPE,
-    "cron.create": ADMIN_SCOPE,  # OpenSquilla-only alias for cron.add.
+    "cron.create": ADMIN_SCOPE,
     "cron.update": ADMIN_SCOPE,
     "cron.remove": ADMIN_SCOPE,
     "cron.run": ADMIN_SCOPE,
@@ -430,11 +441,6 @@ METHOD_SCOPES: dict[str, str] = {
     "memory.import.apply": ADMIN_SCOPE,
     "memory.import.undo": ADMIN_SCOPE,
     "memory.import.discard": ADMIN_SCOPE,
-    "memory.raw_fallbacks.list": ADMIN_SCOPE,
-    "memory.raw_fallbacks.show": ADMIN_SCOPE,
-    "memory.repair.list": ADMIN_SCOPE,
-    "memory.repair.run": ADMIN_SCOPE,
-    "memory.repair.show": ADMIN_SCOPE,
     # Settings-only profile import discovery. These methods expose no paths
     # and never apply an import, but host-level inventory remains admin-only.
     "migration.sources.list": ADMIN_SCOPE,
@@ -444,6 +450,7 @@ METHOD_SCOPES: dict[str, str] = {
     # The probe persists nothing but carries candidate credentials.
     "onboarding.provider.probe": ADMIN_SCOPE,
     "onboarding.llmProfile.upsert": ADMIN_SCOPE,
+    "onboarding.llmProfile.upsertAndActivate": ADMIN_SCOPE,
     "onboarding.llmProfile.credential.clear": ADMIN_SCOPE,
     "onboarding.llmProfile.remove": ADMIN_SCOPE,
     "onboarding.llmProfile.active.remove": ADMIN_SCOPE,

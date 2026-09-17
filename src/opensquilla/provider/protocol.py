@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
+from .execution_identity import project_execution_identity
 from .types import (
     ChatConfig,
     ContentBlockImage,
@@ -26,6 +27,15 @@ IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
     "The selected model cannot process image input. Choose an image-capable "
     "model or remove the image and try again."
 )
+
+
+class ProviderModelListingResponseError(RuntimeError):
+    """A model-list response arrived but could not be parsed safely."""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 if TYPE_CHECKING:
     from .selector import ProviderConfig, SelectorConfig
@@ -195,7 +205,7 @@ def project_provider_message_count(
         return None
     try:
         projection = projection_fn(
-            messages,
+            project_execution_identity(messages, config),
             config,
             additional_messages=additional_messages,
         )
@@ -227,7 +237,7 @@ def project_provider_final_request(
         return None
     try:
         projection = projection_fn(
-            messages,
+            project_execution_identity(messages, config),
             tools,
             config,
             message_limit=message_limit,
@@ -313,6 +323,7 @@ def validate_provider_chat_admission(
 ) -> ErrorEvent | None:
     """Run typed admission, then the legacy request validator as a fallback."""
 
+    messages = project_execution_identity(messages, config)
     raw_vision_support = getattr(config, "model_vision_support", "unknown")
     vision_support: VisionSupport = (
         cast(VisionSupport, raw_vision_support)

@@ -43,14 +43,13 @@ from opensquilla.observability.network_policy import (
 )
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
-    derive_provider_request_correlation,
 )
 from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
 )
 from opensquilla.session.compaction_lifecycle import (
-    flush_receipt_is_successful_flush,
+    durable_receipt_allows_destructive_compaction,
     new_compaction_id,
 )
 
@@ -139,11 +138,11 @@ class StandaloneCompactSession(Protocol):
     ) -> Awaitable[str]: ...
 
 
-class StandaloneFlushTranscript(Protocol):
+class StandaloneCheckpointTranscript(Protocol):
     def __call__(
         self,
-        transcript: object,
         session_key: str,
+        transcript: object,
         **kwargs: Any,
     ) -> Awaitable[Any]: ...
 
@@ -172,7 +171,7 @@ class StandaloneSlashServices:
     truncate_session: StandaloneTruncateSession | None = None
     compact_session: StandaloneCompactSession | None = None
     compact_with_result: CompactWithResult | None = None
-    flush_transcript: StandaloneFlushTranscript | None = None
+    checkpoint_transcript: StandaloneCheckpointTranscript | None = None
     get_session_routing: StandaloneGetSessionRouting | None = None
     set_session_routing: StandaloneSetSessionRouting | None = None
     config: object | None = None
@@ -334,84 +333,44 @@ async def _read_standalone_transcript(
     return None
 
 
-async def _flush_before_standalone_rewrite(
+async def _checkpoint_before_standalone_rewrite(
     slash_services: StandaloneSlashServices,
     session_key: str,
     *,
     operation: str,
-    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> bool:
-    """Fail closed before reset; compact can continue on flush degradation."""
-    compaction_operation = operation.strip().lower() == "compact"
+    """Preserve the removed transcript before a standalone reset."""
     transcript = await _read_standalone_transcript_handle(
-        slash_services.read_transcript,
-        session_key,
+        slash_services.read_transcript, session_key,
     )
     if transcript is None:
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: could not inspect durable transcript; "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        console.print(
-            f"[yellow]{operation} aborted: could not inspect the durable transcript.[/yellow]"
-        )
+        console.print(f"[yellow]{operation} aborted: could not inspect the transcript.[/yellow]")
         return False
     if not transcript:
         return True
-
-    flush_transcript = slash_services.flush_transcript
-    if flush_transcript is None:
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: flush service is unavailable; "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
+    checkpoint = slash_services.checkpoint_transcript
+    if checkpoint is None or slash_services.get_session is None:
         console.print(
-            f"[yellow]{operation} aborted: flush service is unavailable and "
-            "the durable transcript is non-empty.[/yellow]"
+            f"[yellow]{operation} aborted: transcript checkpoint is unavailable.[/yellow]"
         )
         return False
-
     try:
-        flush_kwargs: dict[str, Any] = {
-            "agent_id": "main",
-            "timeout": 30.0,
-            "message_window": 0,
-            "segment_mode": "auto",
-        }
-        if provider_request_correlation is not None:
-            flush_kwargs["provider_request_correlation"] = (
-                provider_request_correlation
-            )
-            flush_kwargs["turn_id"] = provider_request_correlation.turn_id
-        receipt = await flush_transcript(
-            transcript,
+        session = await _maybe_await(slash_services.get_session(session_key))
+        if session is None:
+            raise RuntimeError("session is unavailable")
+        receipt = await checkpoint(
             session_key,
-            **flush_kwargs,
+            transcript,
+            source="standalone_reset",
+            expected_session_id=session.session_id,
+            expected_session_epoch=getattr(session, "epoch", None),
         )
-    except Exception as exc:  # noqa: BLE001
-        if compaction_operation:
-            console.print(
-                f"[yellow]{operation}: flush failed ({exc}); "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        console.print(f"[yellow]{operation} aborted: flush failed ({exc}).[/yellow]")
-        return False
-
-    if not flush_receipt_is_successful_flush(receipt):
-        if compaction_operation:
-            error = getattr(receipt, "error", None) or "degraded receipt"
-            console.print(
-                f"[yellow]{operation}: flush failed ({error}); "
-                "continuing with compaction only.[/yellow]"
-            )
-            return True
-        error = getattr(receipt, "error", None) or "unknown error"
-        console.print(f"[yellow]{operation} aborted: flush failed ({error}).[/yellow]")
+        if not durable_receipt_allows_destructive_compaction(receipt):
+            raise RuntimeError("transcript checkpoint failed")
+    except Exception:
+        console.print(
+            f"[yellow]{operation} aborted: transcript checkpoint could not be saved.[/yellow]"
+        )
         return False
     return True
 
@@ -539,19 +498,6 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         call_kind="auxiliary.compaction",
         turn_id=compaction_id,
     )
-    safe_to_compact = await _flush_before_standalone_rewrite(
-        slash_services,
-        context.session_key,
-        operation="Compact",
-        provider_request_correlation=derive_provider_request_correlation(
-            compaction_correlation,
-            execution_id=uuid4().hex,
-            call_kind="auxiliary.session_flush",
-        ),
-    )
-    if not safe_to_compact:
-        return
-
     console.print(f"[{ACCENT}]compacting context...[/]")
     config = slash_services.config
     configured_context_cap = (
@@ -853,16 +799,8 @@ async def handle_standalone_slash_command(
     if cmd in {"/clear", "/reset"}:
         truncate_session = context.slash_services.truncate_session
         if truncate_session is not None:
-            flush_correlation = await _standalone_maintenance_correlation(
-                context.slash_services,
-                context.session_key,
-                call_kind="auxiliary.session_flush",
-            )
-            safe_to_reset = await _flush_before_standalone_rewrite(
-                context.slash_services,
-                context.session_key,
-                operation="Reset",
-                provider_request_correlation=flush_correlation,
+            safe_to_reset = await _checkpoint_before_standalone_rewrite(
+                context.slash_services, context.session_key, operation="Reset",
             )
             if not safe_to_reset:
                 return True

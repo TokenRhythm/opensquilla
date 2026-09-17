@@ -70,7 +70,7 @@ async def _open_fork_stack(db_path: Path) -> AsyncIterator[_ForkStack]:
         principal=_PRINCIPAL,
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "workspace"),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
         ),
         session_manager=manager,

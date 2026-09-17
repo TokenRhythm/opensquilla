@@ -1,11 +1,14 @@
 export interface RouterTier {
+  [key: string]: unknown
   provider: string
   model: string
   description?: string
+  /** Read compatibility only; the gateway resolves model capability. */
   supportsImage?: boolean
   imageOnly?: boolean
   thinkingLevel?: string
   ensembleEnabled?: boolean
+  ensembleSelectionMode?: string
 }
 
 const LEGACY_TEXT_TIER_ALIASES: Record<string, string> = {
@@ -20,7 +23,11 @@ function canonicalTierKey(name: string): string {
 }
 
 function cloneRouterTiers(tiers: Record<string, RouterTier>): Record<string, RouterTier> {
-  return Object.fromEntries(Object.entries(tiers).map(([name, tier]) => [name, { ...tier }]))
+  return Object.fromEntries(Object.entries(tiers).map(([name, tier]) => {
+    const copy = { ...tier }
+    delete copy.supportsImage
+    return [name, copy]
+  }))
 }
 
 function normalizeBooleanSetting(raw: unknown, fallback: boolean): boolean {
@@ -58,18 +65,26 @@ export function normalizeRouterTiers(
     const hasEnsembleEnabled = Object.prototype.hasOwnProperty.call(tier, 'ensembleEnabled')
       || Object.prototype.hasOwnProperty.call(tier, 'ensemble_enabled')
     const ensembleEnabled = tier.ensembleEnabled ?? tier.ensemble_enabled
-    out[name] = {
+    const extra = { ...tier }
+    for (const key of ['provider', 'model', 'description', 'supportsImage', 'supports_image',
+      'imageOnly', 'image_only', 'thinkingLevel', 'thinking_level', 'ensembleEnabled',
+      'ensemble_enabled', 'ensembleSelectionMode', 'ensemble_selection_mode']) delete extra[key]
+    const normalizedTier: RouterTier = {
       ...out[name],
+      ...extra,
       provider,
       model,
       description: String(tier.description || out[name]?.description || ''),
-      supportsImage: Boolean(tier.supportsImage ?? tier.supports_image ?? out[name]?.supportsImage),
       imageOnly: Boolean(tier.imageOnly ?? tier.image_only ?? out[name]?.imageOnly),
       thinkingLevel: String(tier.thinkingLevel ?? tier.thinking_level ?? out[name]?.thinkingLevel ?? ''),
+      ...((tier.ensembleSelectionMode ?? tier.ensemble_selection_mode ?? out[name]?.ensembleSelectionMode)
+        ? { ensembleSelectionMode: String(tier.ensembleSelectionMode ?? tier.ensemble_selection_mode ?? out[name]?.ensembleSelectionMode) }
+        : {}),
       ...(hasEnsembleEnabled
         ? { ensembleEnabled: normalizeBooleanSetting(ensembleEnabled, false) }
         : {}),
     }
+    out[name] = normalizedTier
   }
   return out
 }

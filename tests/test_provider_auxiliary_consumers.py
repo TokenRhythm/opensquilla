@@ -9,7 +9,6 @@ import pytest
 from opensquilla.engine.types import AgentConfig
 from opensquilla.gateway.rpc_memory_import import _GatewayFusionCompletion
 from opensquilla.memory.dream.runner import _run_complete
-from opensquilla.memory.session_flush import ProviderCompletionError, _provider_complete
 from opensquilla.provider import auxiliary_budget
 from opensquilla.provider.auxiliary_budget import AuxiliaryRequestTooLargeError
 from opensquilla.provider.protocol import ProviderMetadata
@@ -109,6 +108,8 @@ async def test_media_chat_receives_nonzero_resolved_request_cap(
     assert provider.calls == 1
     assert provider.config is not None
     assert provider.config.provider_request_max_chars > 0
+    assert provider.config.provider_context_window_tokens == small_catalog.context_window
+    assert provider.config.provider_request_max_chars_explicit_cap == 0
     assert provider.config.max_tokens == 64
 
 
@@ -130,24 +131,6 @@ async def test_media_chat_rejects_token_dense_input_before_call(
 
 
 @pytest.mark.asyncio
-async def test_memory_completion_shim_rejects_oversize_before_call(
-    small_catalog: _Catalog,
-) -> None:
-    small_catalog.context_window = 1024
-    provider = _CompletionProvider()
-
-    with pytest.raises(ProviderCompletionError) as exc_info:
-        await _provider_complete(
-            provider,
-            messages=[Message(role="user", content="x" * 5000)],
-            max_tokens=64,
-        )
-
-    assert exc_info.value.code == "provider_request_too_large"
-    assert provider.calls == 0
-
-
-@pytest.mark.asyncio
 async def test_dream_chat_receives_nonzero_resolved_request_cap(
     small_catalog: _Catalog,
 ) -> None:
@@ -161,6 +144,8 @@ async def test_dream_chat_receives_nonzero_resolved_request_cap(
 
     assert provider.config is not None
     assert provider.config.provider_request_max_chars > 0
+    assert provider.config.provider_context_window_tokens == small_catalog.context_window
+    assert provider.config.provider_request_max_chars_explicit_cap == 0
 
 
 @pytest.mark.asyncio
@@ -183,6 +168,8 @@ async def test_meta_chat_binds_base_deployment_budget(
 
     assert provider.config is not None
     assert provider.config.provider_request_max_chars > 0
+    assert provider.config.provider_context_window_tokens == small_catalog.context_window
+    assert provider.config.provider_request_max_chars_explicit_cap == 0
     assert provider.config.max_tokens == 128
 
 
@@ -220,3 +207,5 @@ async def test_profile_import_completion_binds_nonzero_request_cap(
     assert result == "ok"
     assert provider.config is not None
     assert provider.config.provider_request_max_chars > 0
+    assert provider.config.provider_context_window_tokens == small_catalog.context_window
+    assert provider.config.provider_request_max_chars_explicit_cap == 0

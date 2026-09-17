@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from opensquilla.observability.log_privacy import log_metadata
 from opensquilla.paths import default_opensquilla_home
 
 
@@ -56,5 +57,5 @@ def write_safety_event(
     day = datetime.now(UTC).strftime("%Y%m%d")
     path = log_dir / f"safety-{day}.jsonl"
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
+        fh.write(json.dumps(log_metadata(asdict(event)), ensure_ascii=False) + "\n")
     return path

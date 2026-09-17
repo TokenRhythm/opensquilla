@@ -349,6 +349,41 @@ def test_config_set_legacy_ensemble_toggle_persists_canonical_router_mode(
     assert reloaded.llm_ensemble.enabled is True
     assert reloaded.squilla_router.enabled is True
     assert reloaded.squilla_router.rollout_phase == "full"
+    assert all(
+        tier["provider"] == reloaded.llm.provider
+        for tier in reloaded.squilla_router.tiers.values()
+    )
+
+
+def test_config_set_ensemble_toggle_rejects_custom_foreign_router_without_writes(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.onboarding.router_policy import RouterProviderConflictError
+
+    target = tmp_path / "custom-routing.toml"
+    original = '\n'.join([
+        '[llm]',
+        'provider = "tokenrhythm"',
+        '[llm_ensemble]',
+        'enabled = false',
+        'selection_mode = "router_dynamic"',
+        '[squilla_router]',
+        'enabled = false',
+        'preset_binding = "custom"',
+        '[squilla_router.tiers.c1]',
+        'provider = "openrouter"',
+        'model = "synthetic-model"',
+        '',
+    ])
+    target.write_text(original, encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["config", "set", "llm_ensemble.enabled", "true", "--config", str(target)]
+    )
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RouterProviderConflictError)
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_config_set_get_privacy_network_observability_round_trips(tmp_path: Path):
@@ -1277,112 +1312,14 @@ def test_memory_search_and_show_use_gateway_rpcs(monkeypatch):
     ) in fake.calls
 
 
-def test_memory_index_raw_fallback_and_repair_commands_use_admin_rpcs(monkeypatch):
+def test_memory_index_command_uses_admin_rpc(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
-    fake.rpc_payloads = {
-        "memory.index": {"agentId": "main", "force": True},
-        "memory.raw_fallbacks.list": {
-            "agentId": "main",
-            "count": 1,
-            "files": [{"path": "memory/.raw_fallbacks/raw.md", "sizeBytes": 12}],
-        },
-        "memory.raw_fallbacks.show": {
-            "agentId": "main",
-            "path": "memory/.raw_fallbacks/raw.md",
-            "fromLine": 1,
-            "lineCount": 1,
-            "truncated": False,
-            "content": "raw",
-        },
-        "memory.repair.list": {
-            "agentId": "main",
-            "count": 1,
-            "items": [
-                {
-                    "summaryId": 7,
-                    "sessionKey": "agent:main:thread-1",
-                    "compactionId": "cmp-1",
-                    "flushReceiptStatus": "degraded_forensic",
-                }
-            ],
-        },
-        "memory.repair.show": {
-            "agentId": "main",
-            "sessionKey": "agent:main:thread-1",
-            "compactionId": "cmp-1",
-            "entries": [{"role": "user", "content": "preimage fact"}],
-        },
-        "memory.repair.run": {
-            "agentId": "main",
-            "count": 1,
-            "results": [{"compactionId": "cmp-1", "status": "repaired"}],
-        },
-    }
+    fake.rpc_payloads = {"memory.index": {"agentId": "main", "force": True}}
 
     index = runner.invoke(app, ["memory", "index", "--agent", "main", "--force", "--json"])
-    listed = runner.invoke(app, ["memory", "raw-fallbacks", "list", "--json"])
-    shown = runner.invoke(
-        app,
-        ["memory", "raw-fallbacks", "show", "memory/.raw_fallbacks/raw.md", "--json"],
-    )
-    repair_listed = runner.invoke(app, ["memory", "repair", "list", "--json"])
-    repair_shown = runner.invoke(
-        app,
-        [
-            "memory",
-            "repair",
-            "show",
-            "--session-key",
-            "agent:main:thread-1",
-            "--compaction-id",
-            "cmp-1",
-            "--json",
-        ],
-    )
-    repair_run = runner.invoke(
-        app,
-        [
-            "memory",
-            "repair",
-            "run",
-            "--session-key",
-            "agent:main:thread-1",
-            "--compaction-id",
-            "cmp-1",
-            "--json",
-        ],
-    )
 
     assert index.exit_code == 0, index.stdout
-    assert listed.exit_code == 0, listed.stdout
-    assert shown.exit_code == 0, shown.stdout
-    assert repair_listed.exit_code == 0, repair_listed.stdout
-    assert repair_shown.exit_code == 0, repair_shown.stdout
-    assert repair_run.exit_code == 0, repair_run.stdout
     assert ("memory.index", {"agentId": "main", "force": True}) in fake.calls
-    assert ("memory.raw_fallbacks.list", {"agentId": "main"}) in fake.calls
-    assert (
-        "memory.raw_fallbacks.show",
-        {"path": "memory/.raw_fallbacks/raw.md", "agentId": "main"},
-    ) in fake.calls
-    assert ("memory.repair.list", {"agentId": "main", "limit": 50}) in fake.calls
-    assert (
-        "memory.repair.show",
-        {
-            "agentId": "main",
-            "sessionKey": "agent:main:thread-1",
-            "compactionId": "cmp-1",
-        },
-    ) in fake.calls
-    assert (
-        "memory.repair.run",
-        {
-            "agentId": "main",
-            "limit": 50,
-            "sessionKey": "agent:main:thread-1",
-            "compactionId": "cmp-1",
-        },
-    ) in fake.calls
 
 
 def test_cron_run_requires_confirmation_before_gateway_call(monkeypatch):
@@ -1412,7 +1349,7 @@ def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
     fake.rpc_payloads = {
         "cron.list": [{"id": "job-1", "name": "Daily", "agentId": "main"}],
         "cron.status": {"id": "job-1", "name": "Daily"},
-        "cron.add": {"id": "job-2", "expression": "*/5 * * * *"},
+        "cron.create": {"id": "job-2", "expression": "*/5 * * * *"},
         "cron.update": {"id": "job-1", "enabled": False},
         "cron.runs": [{"id": "run-1", "status": "ok"}],
     }
@@ -1448,7 +1385,7 @@ def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
     assert ("cron.list", {"agentId": "main"}) in fake.calls
     assert ("cron.status", {"id": "job-1"}) in fake.calls
     assert (
-        "cron.add",
+        "cron.create",
         {
             "expression": "*/5 * * * *",
             "text": "check in",

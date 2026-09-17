@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import opensquilla.gateway.rpc_chat as rpc_chat_module
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
@@ -13,8 +12,12 @@ from opensquilla.artifact_session import (
     ArtifactKind,
     ArtifactSessionService,
 )
+from opensquilla.engine.turn_runner.turn_finalizer_stage import _turn_usage_payload
+from opensquilla.engine.types import DoneEvent
+from opensquilla.gateway.adapters import session_history_projection
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,
@@ -130,6 +133,74 @@ async def _record_finalized_usage(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_receipt", [False, True])
+async def test_chat_history_restores_physical_fallback_receipt_after_storage_reopen(
+    tmp_path, legacy_receipt,
+) -> None:
+    models = ["deepseek-v4-pro", "kimi-k2.7-code", "deepseek-v4-pro-0813"]
+    route_plan = {"version": 2, "plan_id": "fallback-turn", "model": models[0]}
+    legs = [
+        {
+            "index": index,
+            "kind": "primary" if index == 0 else "provider_fallback",
+            "provider": "synthetic-provider",
+            "model": model,
+            "plan_id": "fallback-turn",
+        }
+        for index, model in enumerate(models)
+    ]
+    receipt = _turn_usage_payload(
+        DoneEvent(model=models[-1], route_plan=route_plan, execution_legs=legs),
+        resolved_model=models[0],
+    )
+    assert receipt is not None
+    if legacy_receipt:
+        receipt.pop("execution_legs")
+    database_path = str(tmp_path / "physical-fallback-history.db")
+    storage = SessionStorage(database_path)
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:physical-fallback"
+    try:
+        session = await manager.create(session_key)
+        with turn_context_scope({"turn_id": "fallback-turn"}):
+            await manager.append_message(
+                session_key, "assistant", "synthetic answer", turn_usage=receipt,
+            )
+        await _record_finalized_usage(
+            storage,
+            session_id=session.session_id,
+            session_epoch=session.epoch,
+            turn_id="fallback-turn",
+            event_id="fallback-usage",
+        )
+    finally:
+        await storage.close()
+
+    reopened = SessionStorage(database_path)
+    await reopened.connect()
+    try:
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=SessionManager(reopened, inject_time_prefix=False),
+            ),
+        )
+        usage = result["messages"][0]["usage"]
+        assert usage["model"] == models[-1]
+        assert usage["route_plan"] == route_plan
+        if legacy_receipt:
+            assert "execution_legs" not in usage
+        else:
+            assert usage["execution_legs"] == legs
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -> None:
     entries = [_entry(idx) for idx in range(1, 4)]
 
@@ -151,6 +222,41 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
     assert result["page_size"] == 2
     assert result["canonical_available"] is True
     assert result["canonical_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_history_keeps_legacy_null_id_rows_without_an_unusable_cursor() -> None:
+    entry = TranscriptEntry(
+        id=None,
+        session_id="legacy",
+        session_key="agent:main:webchat:legacy",
+        role="user",
+        content="legacy row",
+        created_at=2,
+        message_id="legacy-row",
+    )
+    manager = _FakePagedSessionManager(
+        [entry],
+        page={
+            "entries": [entry],
+            "has_more": True,
+            "canonical_complete": False,
+        },
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": entry.session_key, "limit": 1},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=manager,
+        ),
+    )
+
+    assert [message["message_id"] for message in result["messages"]] == ["legacy-row"]
+    assert result["has_more"] is False
+    assert result["oldest_cursor"] is None
+    assert result["newest_cursor"] is None
 
 
 @pytest.mark.asyncio
@@ -1250,12 +1356,23 @@ async def test_chat_history_mutation_ledger_overrides_task_facts_and_is_scoped(
             initial_artifact=blob(f"base-{turn_id}"),
             actor=actor,
         )
-        attempt = await service.reserve_mutation_attempt(
-            document_id=created.document.document_id,
-            turn_id=turn_id,
-            tool_use_id=f"tool-{turn_id}",
-            base_revision_id=created.revision.revision_id,
-            proposal_sha256=hashlib.sha256(turn_id.encode()).hexdigest(),
+        # Seed a receipt written by a previous installation; no retired
+        # execution API is available to create new document mutations.
+        await storage._conn.execute(
+            """INSERT INTO artifact_mutation_attempts (
+                mutation_attempt_id, document_id, turn_id, tool_use_id,
+                base_revision_id, proposal_sha256, status, state_revision,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', 1, 1, 1)""",
+            (
+                f"attempt-{turn_id}", created.document.document_id, turn_id,
+                f"tool-{turn_id}", created.revision.revision_id,
+                hashlib.sha256(turn_id.encode()).hexdigest(),
+            ),
+        )
+        await storage._conn.commit()
+        attempt = await service.get_mutation_attempt_for_resolution(
+            document_id=created.document.document_id, turn_id=turn_id
         )
         return created, attempt
 
@@ -1281,27 +1398,35 @@ async def test_chat_history_mutation_ledger_overrides_task_facts_and_is_scoped(
             expected_document_state_revision=applied_document.document.state_revision,
             actor=actor,
         )
-        applied_attempt = await service.mark_mutation_attempt_applied(
-            document_id=applied_document.document.document_id,
-            turn_id="turn-ledger-applied",
-            tool_use_id="tool-turn-ledger-applied",
-            change_set_id=applied_change.change_set_id,
-            revision_id=applied_result.revision.revision_id,
+        await storage._conn.execute(
+            """UPDATE artifact_mutation_attempts
+               SET status = 'applied', change_set_id = ?, revision_id = ?
+               WHERE turn_id = ?""",
+            (applied_change.change_set_id, applied_result.revision.revision_id,
+             "turn-ledger-applied"),
+        )
+        await storage._conn.commit()
+        applied_attempt = await service.get_mutation_attempt_for_resolution(
+            document_id=applied_document.document.document_id, turn_id="turn-ledger-applied"
         )
 
         failed_document, _ = await reserve("turn-ledger-failed")
-        failed_attempt = await service.mark_mutation_attempt_failed(
-            document_id=failed_document.document.document_id,
-            turn_id="turn-ledger-failed",
-            tool_use_id="tool-turn-ledger-failed",
-            failure_code="restart_commit_not_applied",
-        )
         ambiguous_document, _ = await reserve("turn-ledger-ambiguous")
-        ambiguous_attempt = await service.mark_mutation_attempt_ambiguous(
-            document_id=ambiguous_document.document.document_id,
-            turn_id="turn-ledger-ambiguous",
-            tool_use_id="tool-turn-ledger-ambiguous",
-            failure_code="restart_commit_outcome_unknown",
+        for turn_id, status, code in (
+            ("turn-ledger-failed", "failed", "restart_commit_not_applied"),
+            ("turn-ledger-ambiguous", "ambiguous", "restart_commit_outcome_unknown"),
+        ):
+            await storage._conn.execute(
+                "UPDATE artifact_mutation_attempts SET status = ?, failure_code = ? "
+                "WHERE turn_id = ?",
+                (status, code, turn_id),
+            )
+        await storage._conn.commit()
+        failed_attempt = await service.get_mutation_attempt_for_resolution(
+            document_id=failed_document.document.document_id, turn_id="turn-ledger-failed"
+        )
+        ambiguous_attempt = await service.get_mutation_attempt_for_resolution(
+            document_id=ambiguous_document.document.document_id, turn_id="turn-ledger-ambiguous"
         )
         _reserved_document, reserved_attempt = await reserve("turn-ledger-reserved")
         await reserve("turn-ledger-foreign", owner_session_key=foreign_session_key)
@@ -1404,6 +1529,41 @@ async def test_chat_history_mutation_ledger_overrides_task_facts_and_is_scoped(
         assert reserved["attemptId"] == reserved_attempt.mutation_attempt_id
     finally:
         await service.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_preserves_provider_failure_reference_without_error_row(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "provider-error.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:provider-error"
+    await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "provider-turn"}):
+            await manager.append_message(session_key, "user", "synthetic request")
+            await manager.append_message(session_key, "assistant", "Partial answer")
+        outcome = {
+            "kind": "failed", "reason": "401", "error_class": "401",
+            "failure_kind": "auth_invalid", "error_id": "abcdef01", "retryable": False,
+        }
+        await storage.create_agent_task(AgentTaskRecord(
+            task_id="provider-turn", session_key=session_key, agent_id="main",
+            source_kind="webui", queue_mode="followup", run_kind="session_turn",
+            status=AgentTaskStatus.FAILED, terminal_reason="error", error_class="401",
+            details={"turn_id": "provider-turn", "turn_outcome": outcome},
+        ))
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(conn_id="test", principal=SimpleNamespace(role="operator"),
+                       session_manager=manager),
+        )
+        projected = result["turn_outcomes"][0]
+        assert projected["outcome"] == outcome
+        assert projected["terminal_message"] == (
+            "The model provider rejected the configured credentials. (ref: abcdef01)"
+        )
+        assert [m["text"] for m in result["messages"]] == ["synthetic request", "Partial answer"]
+    finally:
         await storage.close()
 
 
@@ -1645,6 +1805,44 @@ async def test_chat_history_before_cursor_returns_older_page() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_history_keeps_blank_cursor_compatibility_and_before_precedence() -> None:
+    manager = _FakePagedSessionManager(
+        [_entry(4)],
+        page=SimpleNamespace(
+            entries=[_entry(2), _entry(3)],
+            has_more=True,
+            canonical_complete=True,
+        ),
+    )
+
+    await _handle_chat_history(
+        {
+            "sessionKey": "agent:main:webchat:test",
+            "before": "4|4",
+            "after": "malformed-but-ignored",
+        },
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=manager,
+        ),
+    )
+    await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test", "before": "", "after": None},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=manager,
+        ),
+    )
+
+    assert manager.page_calls[0][1]["before"] == (4, 4)
+    assert manager.page_calls[0][1]["after"] is None
+    assert manager.page_calls[1][1]["before"] is None
+    assert manager.page_calls[1][1]["after"] is None
+
+
+@pytest.mark.asyncio
 async def test_chat_history_uses_canonical_transcript_when_available() -> None:
     active_entries = [_entry(3)]
     canonical_entries = [_entry(1), _entry(2), _entry(3)]
@@ -1800,7 +1998,11 @@ async def test_chat_history_waits_for_same_connection_compaction_rewrite(
 async def test_chat_history_session_lock_wait_is_bounded_and_retryable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rpc_chat_module, "_CHAT_HISTORY_LOCK_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(
+        session_history_projection,
+        "_CHAT_HISTORY_LOCK_BUDGET_SECONDS",
+        0.05,
+    )
     session_key = "agent:main:webchat:bounded-history-lock"
     mutation_lock = asyncio.Lock()
     await mutation_lock.acquire()
@@ -1854,7 +2056,11 @@ async def test_chat_history_session_lock_wait_is_bounded_and_retryable(
 async def test_chat_history_busy_maps_to_retryable_wire_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rpc_chat_module, "_CHAT_HISTORY_LOCK_BUDGET_SECONDS", 0.01)
+    monkeypatch.setattr(
+        session_history_projection,
+        "_CHAT_HISTORY_LOCK_BUDGET_SECONDS",
+        0.01,
+    )
     session_key = "agent:main:webchat:history-wire-busy"
     mutation_lock = asyncio.Lock()
     await mutation_lock.acquire()
@@ -1891,6 +2097,49 @@ async def test_chat_history_busy_maps_to_retryable_wire_envelope(
     assert response.error.details["waited_ms"] >= 0
     assert response.error.details["stage"] == "lock_acquire"
     assert response.error.details["resource"] == "session_mutation_lock"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_cursor_failures_have_stable_wire_codes() -> None:
+    cases = (
+        (
+            {"before": "malformed"},
+            _FakeSessionManager([_entry(1)], canonical_entries=[_entry(1)]),
+            "HISTORY_CURSOR_INVALID",
+        ),
+        (
+            {"after": "1|1"},
+            _FakePagedSessionManager(
+                [_entry(1)],
+                page_exception=HistoryCursorInvalidatedError("anchor missing"),
+            ),
+            "HISTORY_CURSOR_INVALIDATED",
+        ),
+    )
+
+    for index, (cursor, manager, expected) in enumerate(cases):
+        response = await get_dispatcher().dispatch(
+            f"history-cursor-{index}",
+            "chat.history",
+            {
+                "sessionKey": "agent:main:webchat:test",
+                "includeSummaries": False,
+                **cursor,
+            },
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(
+                    role="operator",
+                    scopes=frozenset({"operator.read"}),
+                ),
+                session_manager=manager,
+            ),
+        )
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.code == expected
+        assert response.error.retryable is False
 
 
 @pytest.mark.asyncio

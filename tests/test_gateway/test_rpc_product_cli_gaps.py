@@ -23,7 +23,11 @@ from opensquilla.search.registry import register_provider
 from opensquilla.search.types import SearchProviderError, SearchProviderSpec, SearchResult
 from opensquilla.session.models import MemoryDurableReceipt
 from opensquilla.session.storage import SessionStorage
-from opensquilla.tools.builtin.web import configure_search, run_web_discover_payload
+from opensquilla.tools.builtin.web import (
+    configure_search,
+    reset_search_runtime,
+    run_web_discover_payload,
+)
 
 
 @dataclass
@@ -89,7 +93,7 @@ def _ctx(**kwargs: Any) -> RpcContext:
 def _reset_search_config():
     configure_search("duckduckgo", max_results=5)
     yield
-    configure_search("duckduckgo", max_results=5)
+    reset_search_runtime()
 
 
 @pytest.mark.asyncio
@@ -113,11 +117,6 @@ async def test_memory_admin_rpc_methods_are_classified_admin_scope_and_deny_read
     dispatcher = get_dispatcher()
     for method in (
         "memory.index",
-        "memory.raw_fallbacks.list",
-        "memory.raw_fallbacks.show",
-        "memory.repair.list",
-        "memory.repair.run",
-        "memory.repair.show",
     ):
         assert METHOD_SCOPES[method] == ADMIN_SCOPE
         entry = dispatcher.get_entry(method)
@@ -526,10 +525,6 @@ async def test_doctor_memory_status_deep_redacts_paths_and_raw_errors(tmp_path):
     assert res.payload["vecAvailable"] is False
     assert res.payload["ftsAvailable"] is True
     assert res.payload["memorySafety"] == {"status": "ok"}
-    assert res.payload["semanticMemory"] == {
-        "status": "healthy",
-        "repairBacklogCount": 0,
-    }
     assert res.payload["degraded"][0] == {
         "component": "store",
         "operation": "probe",
@@ -567,7 +562,7 @@ async def test_doctor_memory_status_accepts_memory_backend_protocol_health(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_doctor_memory_status_unavailable_includes_split_health_fields():
+async def test_doctor_memory_status_unavailable_includes_checkpoint_health():
     res = await get_dispatcher().dispatch(
         "memory-health-unavailable",
         "doctor.memory.status",
@@ -579,14 +574,10 @@ async def test_doctor_memory_status_unavailable_includes_split_health_fields():
     assert res.payload["backend"] == "none"
     assert res.payload["status"] == "unavailable"
     assert res.payload["memorySafety"] == {"status": "ok"}
-    assert res.payload["semanticMemory"] == {
-        "status": "healthy",
-        "repairBacklogCount": 0,
-    }
 
 
 @pytest.mark.asyncio
-async def test_doctor_memory_status_splits_safety_from_semantic_repair_health(tmp_path):
+async def test_doctor_memory_status_reports_checkpoint_hash_mismatch(tmp_path):
     storage = await SessionStorage.open(tmp_path / "sessions.db")
     now_ms = int(datetime.now(UTC).timestamp() * 1000)
     try:
@@ -602,19 +593,7 @@ async def test_doctor_memory_status_splits_safety_from_semantic_repair_health(tm
                 created_at=now_ms,
             )
         )
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:main:webchat:s1",
-                session_id="session-1",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/raw.md",
-                idempotency_key="repair:raw.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=now_ms,
-            )
-        )
-        session_manager = FakeStorageRepairSessionManager(storage)
+        session_manager = SimpleNamespace(storage=storage)
 
         res = await get_dispatcher().dispatch(
             "memory-health-split",
@@ -628,50 +607,6 @@ async def test_doctor_memory_status_splits_safety_from_semantic_repair_health(tm
 
         assert res.error is None, res.error
         assert res.payload["memorySafety"]["status"] == "error"
-        assert res.payload["semanticMemory"] == {
-            "status": "degraded",
-            "repairBacklogCount": 1,
-        }
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_doctor_memory_status_warns_for_large_semantic_repair_backlog(tmp_path):
-    storage = await SessionStorage.open(tmp_path / "sessions.db")
-    now_ms = int(datetime.now(UTC).timestamp() * 1000)
-    try:
-        for idx in range(11):
-            await storage.upsert_memory_durable_receipt(
-                MemoryDurableReceipt(
-                    session_key="agent:main:webchat:s1",
-                    session_id="session-1",
-                    scope="repair",
-                    source_path=f"memory/.raw_fallbacks/raw-{idx}.md",
-                    idempotency_key=f"repair:raw-{idx}.md",
-                    status="repair_pending",
-                    reason="parse_failed_archived",
-                    created_at=now_ms,
-                )
-            )
-        session_manager = FakeStorageRepairSessionManager(storage)
-
-        res = await get_dispatcher().dispatch(
-            "memory-health-warning",
-            "doctor.memory.status",
-            {"agentId": "main"},
-            _ctx(
-                memory_managers={"main": FakeMemoryManager(workspace_dir=tmp_path)},
-                session_manager=session_manager,
-            ),
-        )
-
-        assert res.error is None, res.error
-        assert res.payload["memorySafety"]["status"] == "ok"
-        assert res.payload["semanticMemory"] == {
-            "status": "warning",
-            "repairBacklogCount": 11,
-        }
     finally:
         await storage.close()
 
@@ -693,19 +628,7 @@ async def test_doctor_memory_status_health_is_agent_scoped(tmp_path):
                 created_at=now_ms,
             )
         )
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:main:webchat:s1",
-                session_id="session-main",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/main.md",
-                idempotency_key="repair:main.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=now_ms,
-            )
-        )
-        session_manager = FakeStorageRepairSessionManager(storage)
+        session_manager = SimpleNamespace(storage=storage)
 
         res = await get_dispatcher().dispatch(
             "memory-health-agent-scope",
@@ -719,49 +642,6 @@ async def test_doctor_memory_status_health_is_agent_scoped(tmp_path):
 
         assert res.error is None, res.error
         assert res.payload["memorySafety"]["status"] == "ok"
-        assert res.payload["semanticMemory"] == {
-            "status": "healthy",
-            "repairBacklogCount": 0,
-        }
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_doctor_memory_status_warns_for_oldest_pending_repair_age(tmp_path):
-    storage = await SessionStorage.open(tmp_path / "sessions.db")
-    old_ms = int(datetime.now(UTC).timestamp() * 1000) - (25 * 60 * 60 * 1000)
-    try:
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:main:webchat:s1",
-                session_id="session-1",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/old.md",
-                idempotency_key="repair:old.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=old_ms,
-            )
-        )
-        session_manager = FakeStorageRepairSessionManager(storage)
-
-        res = await get_dispatcher().dispatch(
-            "memory-health-oldest-warning",
-            "doctor.memory.status",
-            {"agentId": "main"},
-            _ctx(
-                memory_managers={"main": FakeMemoryManager(workspace_dir=tmp_path)},
-                session_manager=session_manager,
-            ),
-        )
-
-        assert res.error is None, res.error
-        assert res.payload["memorySafety"]["status"] == "ok"
-        assert res.payload["semanticMemory"] == {
-            "status": "warning",
-            "repairBacklogCount": 1,
-        }
     finally:
         await storage.close()
 
@@ -800,452 +680,6 @@ async def test_memory_index_non_force_uses_ordinary_sync(tmp_path):
     assert store.rebuild_calls == 0
     assert manager.sync_calls == [("manual", False)]
     assert res.payload["force"] is False
-
-
-@pytest.mark.asyncio
-async def test_raw_fallback_admin_list_show_is_sidecar_only(tmp_path):
-    raw_dir = tmp_path / "memory" / ".raw_fallbacks"
-    raw_dir.mkdir(parents=True)
-    raw_path = raw_dir / "raw.md"
-    raw_path.write_text("# Raw flush (timeout)\nsecret transcript\n", encoding="utf-8")
-    (tmp_path / "memory" / "a.md").write_text("curated\n", encoding="utf-8")
-    manager = FakeMemoryManager(workspace_dir=tmp_path)
-
-    listed = await get_dispatcher().dispatch(
-        "r1",
-        "memory.raw_fallbacks.list",
-        {"agentId": "main"},
-        _ctx(memory_managers={"main": manager}),
-    )
-    shown = await get_dispatcher().dispatch(
-        "r2",
-        "memory.raw_fallbacks.show",
-        {"agentId": "main", "path": "memory/.raw_fallbacks/raw.md"},
-        _ctx(memory_managers={"main": manager}),
-    )
-    traversal = await get_dispatcher().dispatch(
-        "r3",
-        "memory.raw_fallbacks.show",
-        {"agentId": "main", "path": "memory/.raw_fallbacks/../a.md"},
-        _ctx(memory_managers={"main": manager}),
-    )
-
-    assert listed.error is None, listed.error
-    assert listed.payload["files"][0]["path"] == "memory/.raw_fallbacks/raw.md"
-    assert shown.error is None, shown.error
-    assert "secret transcript" in shown.payload["content"]
-    assert traversal.error is not None
-    assert traversal.error.code == "INVALID_REQUEST"
-
-
-class FakeRepairSessionManager:
-    def __init__(self) -> None:
-        self.summary = SimpleNamespace(
-            id=7,
-            session_id="session-1",
-            session_key="agent:main:thread-1",
-            compaction_id="cmp-1",
-            trigger_reason="gateway_auto_summarize",
-            flush_receipt_status="degraded_forensic",
-            removed_count=2,
-            covered_through_id=9,
-            created_at=123,
-        )
-        self.entries = [
-            SimpleNamespace(
-                id=1,
-                message_id="m1",
-                role="user",
-                content="preimage fact",
-                token_count=3,
-                created_at=111,
-            )
-        ]
-        self.status_updates: list[tuple[int | None, str]] = []
-
-    async def list_degraded_compactions(
-        self,
-        *,
-        agent_id: str | None = None,
-        limit: int = 50,
-    ) -> list[Any]:
-        assert agent_id == "main"
-        assert limit > 0
-        return [self.summary]
-
-    async def get_compaction_preimage(self, summary: Any) -> list[Any]:
-        assert summary is self.summary
-        return list(self.entries)
-
-    async def mark_compaction_repair_status(self, summary: Any, status: str) -> None:
-        self.status_updates.append((getattr(summary, "id", None), status))
-
-
-class FakeEmptyRepairSessionManager(FakeRepairSessionManager):
-    async def list_degraded_compactions(
-        self,
-        *,
-        agent_id: str | None = None,
-        limit: int = 50,
-    ) -> list[Any]:
-        assert agent_id == "main"
-        assert limit > 0
-        return []
-
-
-class FakeStorageRepairSessionManager(FakeEmptyRepairSessionManager):
-    def __init__(self, storage: Any) -> None:
-        super().__init__()
-        self.storage = storage
-
-
-class FakeRepairFlushService:
-    def __init__(self) -> None:
-        self.calls: list[tuple[list[Any], str, dict[str, Any]]] = []
-
-    async def execute(self, transcript: list[Any], session_key: str, **kwargs: Any) -> Any:
-        self.calls.append((list(transcript), session_key, dict(kwargs)))
-        return SimpleNamespace(
-            mode="llm",
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
-            to_dict=lambda: {
-                "mode": "llm",
-                "indexed_chunk_count": 1,
-                "integrity_status": "ok",
-                "output_coverage_status": "ok",
-                "invalid_candidate_count": 0,
-                "candidate_missing_ids": [],
-                "obligation_status": "ok",
-                "obligation_missing_ids": [],
-            },
-        )
-
-
-@pytest.mark.asyncio
-async def test_memory_repair_admin_lists_shows_and_runs_preimage():
-    session_manager = FakeRepairSessionManager()
-    flush_service = FakeRepairFlushService()
-    ctx = _ctx(session_manager=session_manager, flush_service=flush_service)
-
-    listed = await get_dispatcher().dispatch(
-        "r1",
-        "memory.repair.list",
-        {"agentId": "main"},
-        ctx,
-    )
-    shown = await get_dispatcher().dispatch(
-        "r2",
-        "memory.repair.show",
-        {"agentId": "main", "sessionKey": "agent:main:thread-1", "compactionId": "cmp-1"},
-        ctx,
-    )
-    repaired = await get_dispatcher().dispatch(
-        "r3",
-        "memory.repair.run",
-        {"agentId": "main", "sessionKey": "agent:main:thread-1", "compactionId": "cmp-1"},
-        ctx,
-    )
-
-    assert listed.error is None, listed.error
-    assert listed.payload["items"][0]["flushReceiptStatus"] == "degraded_forensic"
-    assert shown.error is None, shown.error
-    assert shown.payload["entries"][0]["content"] == "preimage fact"
-    assert shown.payload["preimageHash"]
-    assert shown.payload["entryIdRange"] == [1, 1]
-    assert repaired.error is None, repaired.error
-    assert repaired.payload["results"][0]["status"] == "repaired"
-    assert repaired.payload["results"][0]["preimageHash"] == shown.payload["preimageHash"]
-    assert flush_service.calls[0][1] == "agent:main:thread-1"
-    assert flush_service.calls[0][2]["message_window"] == 0
-    assert session_manager.status_updates == [(7, "repaired")]
-
-
-@pytest.mark.asyncio
-async def test_memory_repair_admin_lists_shows_and_runs_raw_fallback(tmp_path):
-    raw_dir = tmp_path / "memory" / ".raw_fallbacks"
-    raw_dir.mkdir(parents=True)
-    raw_path = raw_dir / "raw.md"
-    raw_path.write_text(
-        "# Raw flush (timeout)\n\n"
-        "user: remember raw repair marker RR-1\n"
-        "assistant: acknowledged\n",
-        encoding="utf-8",
-    )
-    session_manager = FakeEmptyRepairSessionManager()
-    flush_service = FakeRepairFlushService()
-    memory_manager = FakeMemoryManager(workspace_dir=tmp_path)
-    ctx = _ctx(
-        session_manager=session_manager,
-        flush_service=flush_service,
-        memory_managers={"main": memory_manager},
-    )
-
-    listed = await get_dispatcher().dispatch(
-        "rr1",
-        "memory.repair.list",
-        {"agentId": "main"},
-        ctx,
-    )
-    shown = await get_dispatcher().dispatch(
-        "rr2",
-        "memory.repair.show",
-        {"agentId": "main", "path": "memory/.raw_fallbacks/raw.md"},
-        ctx,
-    )
-    repaired = await get_dispatcher().dispatch(
-        "rr3",
-        "memory.repair.run",
-        {"agentId": "main", "path": "memory/.raw_fallbacks/raw.md"},
-        ctx,
-    )
-
-    assert listed.error is None, listed.error
-    assert listed.payload["items"][0]["sourceType"] == "raw_fallback"
-    assert listed.payload["items"][0]["path"] == "memory/.raw_fallbacks/raw.md"
-    assert shown.error is None, shown.error
-    assert shown.payload["sourceType"] == "raw_fallback"
-    assert shown.payload["entries"][0]["content"] == "remember raw repair marker RR-1"
-    assert repaired.error is None, repaired.error
-    assert repaired.payload["results"][0]["sourceType"] == "raw_fallback"
-    assert repaired.payload["results"][0]["status"] == "repaired"
-    assert flush_service.calls[0][0][0].content == "remember raw repair marker RR-1"
-    assert flush_service.calls[0][2]["message_window"] == 0
-
-
-@pytest.mark.asyncio
-async def test_memory_repair_admin_list_uses_durable_ledger_queue(tmp_path):
-    storage = await SessionStorage.open(tmp_path / "sessions.db")
-    try:
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:main:webchat:s1",
-                session_id="session-1",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/raw.md",
-                idempotency_key="repair:raw.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=20,
-            )
-        )
-        session_manager = FakeStorageRepairSessionManager(storage)
-        ctx = _ctx(session_manager=session_manager)
-
-        listed = await get_dispatcher().dispatch(
-            "rr-ledger",
-            "memory.repair.list",
-            {"agentId": "main", "limit": 10},
-            ctx,
-        )
-
-        assert listed.error is None, listed.error
-        assert listed.payload["items"][0]["sourceType"] == "raw_fallback"
-        assert listed.payload["items"][0]["path"] == "memory/.raw_fallbacks/raw.md"
-        assert listed.payload["items"][0]["repairStatus"] == "repair_pending"
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_memory_repair_admin_list_path_filter_searches_beyond_page_limit(tmp_path):
-    storage = await SessionStorage.open(tmp_path / "sessions.db")
-    try:
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:main:webchat:s1",
-                session_id="session-1",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/first.md",
-                idempotency_key="repair:first.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=1,
-            )
-        )
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:main:webchat:s2",
-                session_id="session-2",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/second.md",
-                idempotency_key="repair:second.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=2,
-            )
-        )
-        session_manager = FakeStorageRepairSessionManager(storage)
-        ctx = _ctx(session_manager=session_manager)
-
-        listed = await get_dispatcher().dispatch(
-            "rr-path-limit",
-            "memory.repair.list",
-            {
-                "agentId": "main",
-                "limit": 1,
-                "path": "memory/.raw_fallbacks/second.md",
-            },
-            ctx,
-        )
-
-        assert listed.error is None, listed.error
-        assert listed.payload["count"] == 1
-        assert listed.payload["items"][0]["path"] == "memory/.raw_fallbacks/second.md"
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_memory_repair_admin_list_scopes_durable_queue_by_agent_id(tmp_path):
-    storage = await SessionStorage.open(tmp_path / "sessions.db")
-    try:
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:main:webchat:s1",
-                session_id="session-main",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/main.md",
-                idempotency_key="repair:main.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=1,
-            )
-        )
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:ops:webchat:s2",
-                session_id="session-ops",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/ops.md",
-                idempotency_key="repair:ops.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=2,
-            )
-        )
-        session_manager = FakeStorageRepairSessionManager(storage)
-        ctx = _ctx(session_manager=session_manager)
-
-        listed = await get_dispatcher().dispatch(
-            "rr-agent-scope",
-            "memory.repair.list",
-            {"agentId": "ops", "limit": 10},
-            ctx,
-        )
-
-        assert listed.error is None, listed.error
-        assert listed.payload["count"] == 1
-        assert listed.payload["items"][0]["sessionKey"] == "agent:ops:webchat:s2"
-        assert listed.payload["items"][0]["path"] == "memory/.raw_fallbacks/ops.md"
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_memory_repair_admin_list_treats_agent_scope_prefix_as_literal(tmp_path):
-    storage = await SessionStorage.open(tmp_path / "sessions.db")
-    try:
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:ops:webchat:s1",
-                session_id="session-ops",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/ops.md",
-                idempotency_key="repair:wildcard-ops.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=1,
-            )
-        )
-        session_manager = FakeStorageRepairSessionManager(storage)
-        ctx = _ctx(session_manager=session_manager)
-
-        listed = await get_dispatcher().dispatch(
-            "rr-agent-literal-scope",
-            "memory.repair.list",
-            {"agentId": "op_", "limit": 10},
-            ctx,
-        )
-
-        assert listed.error is None, listed.error
-        assert listed.payload["count"] == 0
-        assert listed.payload["items"] == []
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_memory_repair_admin_list_canonicalizes_percent_agent_before_scoping(tmp_path):
-    storage = await SessionStorage.open(tmp_path / "sessions.db")
-    try:
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:ops:webchat:s1",
-                session_id="session-ops",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/ops.md",
-                idempotency_key="repair:percent-ops.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=1,
-            )
-        )
-        await storage.upsert_memory_durable_receipt(
-            MemoryDurableReceipt(
-                session_key="agent:op:webchat:s2",
-                session_id="session-op",
-                scope="repair",
-                source_path="memory/.raw_fallbacks/op.md",
-                idempotency_key="repair:percent-op.md",
-                status="repair_pending",
-                reason="parse_failed_archived",
-                created_at=2,
-            )
-        )
-        session_manager = FakeStorageRepairSessionManager(storage)
-        ctx = _ctx(session_manager=session_manager)
-
-        listed = await get_dispatcher().dispatch(
-            "rr-agent-percent-scope",
-            "memory.repair.list",
-            {"agentId": "op%", "limit": 10},
-            ctx,
-        )
-
-        assert listed.error is None, listed.error
-        assert listed.payload["count"] == 1
-        assert listed.payload["items"][0]["sessionKey"] == "agent:op:webchat:s2"
-        assert listed.payload["items"][0]["path"] == "memory/.raw_fallbacks/op.md"
-    finally:
-        await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_doctor_memory_status_deep_surfaces_repair_and_raw_sidecars(tmp_path):
-    raw_dir = tmp_path / "memory" / ".raw_fallbacks"
-    raw_dir.mkdir(parents=True)
-    (raw_dir / "raw.md").write_text("# Raw flush (timeout)\npreimage\n", encoding="utf-8")
-    manager = FakeMemoryManager(workspace_dir=tmp_path)
-    session_manager = FakeRepairSessionManager()
-
-    res = await get_dispatcher().dispatch(
-        "r1",
-        "doctor.memory.status",
-        {"agentId": "main", "deep": True},
-        _ctx(memory_managers={"main": manager}, session_manager=session_manager),
-    )
-
-    assert res.error is None, res.error
-    assert res.payload["pendingRepairCount"] == 1
-    assert res.payload["recentPreimages"][0]["compactionId"] == "cmp-1"
-    assert res.payload["rawFallbackCount"] == 1
-    assert res.payload["recentRawFallbacks"][0]["path"] == "memory/.raw_fallbacks/raw.md"
 
 
 @pytest.mark.asyncio

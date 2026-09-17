@@ -127,6 +127,7 @@ class ToolResult:
     # The dispatcher mints this only for explicitly opted-in registered tools;
     # the Agent may use it instead of provisional text emitted before the tool ran.
     terminal_response_text: str | None = None
+    execution_log_handle: str | None = None
 
 
 AgentToolHandler = Callable[[ToolCall], Awaitable[ToolResult]]

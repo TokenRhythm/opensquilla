@@ -6,6 +6,27 @@ updates, and webhook-delivered automation.
 
 Scheduling is managed with the `opensquilla cron` command group.
 
+## Heartbeat Configuration Compatibility
+
+The configuration-driven heartbeat loop and the main-session cron wake modes
+`now` and `next-heartbeat` remain available. Dream scheduling and connection
+keepalives are unchanged.
+
+`HEARTBEAT.md` no longer supplies instructions or scheduling configuration.
+Its frontmatter, quiet hours, and empty-file suppression are ignored.
+`heartbeat.config_path` (also `configPath` and its environment-variable
+spellings) remains accepted for configuration round-tripping, but is deprecated
+and ignored: the referenced path is never read.
+
+Before upgrading, check the effective `heartbeat.enabled` configuration.
+If it is true and the old file previously disabled or limited runs, retiring
+those restrictions can increase execution or change its hours. If only the
+file enabled heartbeat, it stops running when the configuration is false.
+The upgrade does not change enabled settings or migrate any tasks into cron.
+A startup warning is emitted when heartbeat is enabled or the old path setting
+is supplied. Review the configuration explicitly instead of relying on the old
+file to suppress execution.
+
 ## Requirements
 
 Scheduled jobs run through the gateway:
@@ -165,4 +186,4 @@ Read next:
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,10 +28,12 @@ class HeartbeatService:
         turn_runner: Any,
         session_storage: Any,
         channel_manager_ref: Any,
+        prepare_tool_context: Callable[[str, Any], Awaitable[Any]],
     ) -> None:
         self._turn_runner = turn_runner
         self._session_storage = session_storage
         self._channel_manager_ref = channel_manager_ref
+        self._prepare_tool_context = prepare_tool_context
         self._last_run_status: dict[str, Any] | None = None
 
     @property
@@ -209,6 +212,7 @@ class HeartbeatService:
         heartbeat_ack_max_chars: int,
         heartbeat_light_context: bool,
     ) -> str:
+        tool_context = await self._prepare_tool_context(session_key, tool_context)
         parts: list[str] = []
         done_text_present = False
         done_text = ""

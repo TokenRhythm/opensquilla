@@ -1,5 +1,8 @@
 ---
 name: meta-pdf-intelligence
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user needs PDF analysis, pasted PDF excerpt analysis, digesting, comparison, or question answering that benefits from multi-skill orchestration across PDF extraction, summarization, cross-document synthesis, traceable evidence indexing, and memory capture."
 kind: meta
 meta_priority: 55

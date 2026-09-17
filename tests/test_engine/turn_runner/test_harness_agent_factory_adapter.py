@@ -5,10 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
-
 from opensquilla.engine.turn_runner.harness import (
-    _coerce_flush_triggers,
     _TurnRunnerAgentFactoryAdapter,
 )
 from opensquilla.provider import ProviderConfig, ProviderRequestCorrelation
@@ -17,18 +14,6 @@ from opensquilla.provider.tokenrhythm_catalog import (
     parse_tokenrhythm_published,
     tokenrhythm_authority_identity,
 )
-
-
-def test_harness_flush_triggers_normalize_comma_delimited_aliases() -> None:
-    assert _coerce_flush_triggers("reset, inline_overflow") == [
-        "session_reset",
-        "pre_compaction",
-    ]
-
-
-def test_harness_flush_triggers_reject_unknown_aliases() -> None:
-    with pytest.raises(ValueError, match="unknown flush trigger"):
-        _coerce_flush_triggers(["manual", "bogus"])
 
 
 def test_agent_factory_adapter_passes_runner_tool_registry(monkeypatch) -> None:
@@ -48,7 +33,6 @@ def test_agent_factory_adapter_passes_runner_tool_registry(monkeypatch) -> None:
     runner = SimpleNamespace(
         _tool_registry=registry,
         _usage_tracker=None,
-        _session_flush_service=None,
     )
     adapter = _TurnRunnerAgentFactoryAdapter(runner)
     correlation = ProviderRequestCorrelation(
@@ -94,6 +78,7 @@ def test_model_catalog_adapter_defaults_to_200k_without_override() -> None:
     resolved = adapter.lookup("qwen3.6-flash")
 
     assert resolved.context_window == 200_000
+    assert resolved.context_window_known is False
     assert resolved.context_window_tokens_global_override == 0
     assert resolved.max_tokens == 32768
 
@@ -112,6 +97,7 @@ def test_model_catalog_adapter_honors_context_window_tokens_override() -> None:
     resolved = adapter.lookup("qwen3.6-flash")
 
     assert resolved.context_window == 1_000_000
+    assert resolved.context_window_known is True
     assert resolved.context_window_tokens_global_override == 1_000_000
     assert resolved.max_tokens == 32768
 
@@ -322,6 +308,28 @@ def test_model_catalog_adapter_does_not_hard_cap_unknown_fallback() -> None:
     assert resolved.max_tokens == 131_072
     assert resolved.auto_max_tokens == 16_384
     assert resolved.auto_max_tokens_known is False
+    assert resolved.context_window_known is False
+
+
+def test_model_catalog_adapter_rebinds_unknown_deployment_only_with_explicit_window() -> None:
+    from opensquilla.engine.turn_runner.harness import _TurnRunnerModelCatalogAdapter
+    from opensquilla.provider.model_catalog import ModelCatalog
+    from opensquilla.provider.selector import ProviderConfig
+
+    llm = SimpleNamespace(provider="tokenrhythm", context_window_tokens=900_000, max_tokens=0)
+    adapter = _TurnRunnerModelCatalogAdapter(
+        _catalog_runner(llm=llm, model_catalog=ModelCatalog()),
+    )
+    deployment = ProviderConfig(
+        provider="tokenrhythm", model="synthetic-private-model",
+        base_url="https://synthetic.example/v1", api_key="synthetic-key",
+    )
+    unknown = adapter.lookup_deployment(deployment)
+    explicit = adapter.lookup_deployment(deployment, include_global_overrides=True)
+    assert unknown.context_window == 200_000
+    assert unknown.context_window_known is False
+    assert explicit.context_window == 900_000
+    assert explicit.context_window_known is True
 
 
 def test_model_catalog_adapter_ignores_junk_context_window_values() -> None:
