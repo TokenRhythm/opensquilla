@@ -140,7 +140,10 @@ async def test_postflight_settlement_preserves_result_and_recovery_state(
             assert not finished.is_set()
     finally:
         release.set()
-        result = await asyncio.wait_for(waiter, timeout=5)
+        # Settlement includes real filesystem rollback and durable SQLite receipts.
+        # Windows CI can spend more than five seconds flushing those writes; the
+        # cancellation ordering is asserted above while postflight is still held.
+        result = await asyncio.wait_for(waiter, timeout=30 if sys.platform == "win32" else 5)
         cancel_result = await cancellation if cancellation else None
 
     receipt = operations.store.read("owner", operation_id)
