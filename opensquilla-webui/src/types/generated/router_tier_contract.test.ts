@@ -15,11 +15,16 @@ describe('generated router-tier SelectionMode contract', () => {
     ])
     expect(staticB5ModeForProvider('OpenRouter')).toBe('static_openrouter_b5')
     expect(staticB5ModeForProvider('tokenrhythm')).toBe('static_tokenrhythm_b5')
+    expect(STATIC_B5_PROFILES.static_openrouter_b5?.thinkingLevel).toBe('high')
+    expect(STATIC_B5_PROFILES.static_tokenrhythm_b5?.thinkingLevel).toBe('high')
   })
 
   it('keeps provider recommendations and ownership sets in generated data', () => {
     expect(PROVIDER_RECOMMENDED_ENSEMBLE_SELECTION_MODES.tokenrhythm).toBe(
       'static_tokenrhythm_b5',
+    )
+    expect(PROVIDER_RECOMMENDED_ENSEMBLE_SELECTION_MODES.openrouter).toBe(
+      'static_openrouter_b5',
     )
     expect(DORMANT_SHARED_SELECTION_MODES).toEqual([
       'static_openrouter_b5',

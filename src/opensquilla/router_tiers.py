@@ -37,6 +37,7 @@ class StaticB5Profile:
     aggregator_model: str
     label: str
     api_key_env: str
+    thinking_level: str | None = None
     ownership_role: str = "static_profile"
 
 
@@ -45,27 +46,29 @@ STATIC_B5_PROFILES: dict[str, StaticB5Profile] = {
         profile_name=STATIC_OPENROUTER_B5_SELECTION_MODE,
         provider_id="openrouter",
         proposer_models=(
-            "deepseek/deepseek-v4-pro",
-            "z-ai/glm-5.2",
-            "moonshotai/kimi-k2.7-code",
-            "qwen/qwen3.7-max",
+            "deepseek/deepseek-v4.1-flash",
+            "z-ai/glm-5.3-flash",
+            "qwen/qwen3.8-flash",
+            "qwen/qwen3.8-max-0902",
         ),
-        aggregator_model="z-ai/glm-5.2",
+        aggregator_model="deepseek/deepseek-v4.1-flash",
         label="OpenRouter",
         api_key_env="OPENROUTER_API_KEY",
+        thinking_level="high",
     ),
     STATIC_TOKENRHYTHM_B5_SELECTION_MODE: StaticB5Profile(
         profile_name=STATIC_TOKENRHYTHM_B5_SELECTION_MODE,
         provider_id="tokenrhythm",
         proposer_models=(
-            "deepseek-v4-pro",
-            "glm-5.2",
-            "kimi-k2.7-code",
-            "qwen3.7-max",
+            "deepseek-flash",
+            "glm-5.3-flash",
+            "qwen3.8-flash",
+            "qwen3.8-max",
         ),
-        aggregator_model="glm-5.2",
+        aggregator_model="deepseek-flash",
         label="TokenRhythm",
         api_key_env="TOKENRHYTHM_API_KEY",
+        thinking_level="high",
     ),
 }
 
@@ -80,6 +83,7 @@ SELECTION_MODE_OWNERSHIP_ROLES: dict[str, str] = {
     ROUTER_DYNAMIC_SELECTION_MODE: "router_dynamic",
 }
 PROVIDER_RECOMMENDED_ENSEMBLE_SELECTION_MODES: dict[str, str] = {
+    "openrouter": STATIC_OPENROUTER_B5_SELECTION_MODE,
     "tokenrhythm": STATIC_TOKENRHYTHM_B5_SELECTION_MODE,
 }
 ENSEMBLE_SELECTION_MODE_ORDER = (

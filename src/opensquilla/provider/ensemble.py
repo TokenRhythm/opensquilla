@@ -6356,13 +6356,14 @@ def _build_router_dynamic_members(
     return f"{ROUTER_DYNAMIC_SELECTION_MODE}/{routed_tier}", proposers, aggregator, plan
 
 
-def _static_b5_ref(provider_id: str, model: str) -> _DynamicModelRef:
+def _static_b5_ref(profile: StaticB5Profile, model: str) -> _DynamicModelRef:
     # Thinking belongs to the shared plan, not to the C3 tier that happened to
-    # activate it.  OpenRouter's shipped B5 plan preserves the historical C3
-    # high-reasoning default. TokenRhythm rejects thinking-toggle request
-    # fields, so leaving this unset preserves the provider's default payload.
-    thinking = "high" if provider_id == "openrouter" else None
-    return _DynamicModelRef(provider=provider_id, model=model, thinking=thinking)
+    # activate it. Each profile declares its own provider-compatible override.
+    return _DynamicModelRef(
+        provider=profile.provider_id,
+        model=model,
+        thinking=profile.thinking_level,
+    )
 
 
 def _static_default_if_legacy(
@@ -6387,7 +6388,7 @@ def _build_static_b5_members(
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     proposers = [
         _member_from_ref(
-            _static_b5_ref(profile.provider_id, model),
+            _static_b5_ref(profile, model),
             config=config,
             inherited=inherited_provider_config,
             label=f"proposer_{index + 1}",
@@ -6397,7 +6398,7 @@ def _build_static_b5_members(
         for index, model in enumerate(profile.proposer_models)
     ]
     aggregator = _member_from_ref(
-        _static_b5_ref(profile.provider_id, profile.aggregator_model),
+        _static_b5_ref(profile, profile.aggregator_model),
         config=config,
         inherited=inherited_provider_config,
         label="aggregator",
@@ -6671,7 +6672,7 @@ def static_b5_credential_available(
             profile.provider_id,
             model,
             inherited_provider_config=inherited,
-            overrides=_static_b5_ref(profile.provider_id, model),
+            overrides=_static_b5_ref(profile, model),
             credential_pool_acquirer=credential_pool_acquirer,
             session_key=session_key,
         ).ready

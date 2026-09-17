@@ -235,6 +235,7 @@ def _custom_candidate(
     model: str,
     *,
     role: str = "proposer",
+    thinking_level: str | None = None,
 ) -> dict[str, Any]:
     return {
         "provider": provider,
@@ -242,7 +243,7 @@ def _custom_candidate(
         "source": "custom",
         "enabled": True,
         "role": role,
-        "thinking_level": "",
+        "thinking_level": str(thinking_level or "").strip(),
     }
 
 
@@ -271,7 +272,11 @@ def _provider_ensemble_candidates(config: Any) -> list[dict[str, Any]]:
     )
     if static_profile is not None:
         static_candidates = [
-            _custom_candidate(static_profile.provider_id, model)
+            _custom_candidate(
+                static_profile.provider_id,
+                model,
+                thinking_level=static_profile.thinking_level,
+            )
             for model in static_profile.proposer_models
         ]
         static_candidates.append(
@@ -279,6 +284,7 @@ def _provider_ensemble_candidates(config: Any) -> list[dict[str, Any]]:
                 static_profile.provider_id,
                 static_profile.aggregator_model,
                 role="aggregator",
+                thinking_level=static_profile.thinking_level,
             )
         )
         return static_candidates

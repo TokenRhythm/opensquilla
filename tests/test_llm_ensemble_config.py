@@ -47,12 +47,14 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     )
     assert provider.profile_name == "static_openrouter_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
-    assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+    assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
+    assert {member.thinking for member in provider.proposers} == {"high"}
+    assert provider.aggregator.thinking == "high"
     # The fresh/default shared policy is a one-draft admission floor.
     assert provider.min_successful_proposers == 1
     assert provider.target_successful_proposers == 1
@@ -85,15 +87,15 @@ def test_static_openrouter_b5_does_not_need_model_options() -> None:
 
     assert provider.profile_name == "static_openrouter_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
-    assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+    assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
 
 
-def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
+def test_static_tokenrhythm_b5_keeps_its_provider_specific_lineup() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
@@ -114,16 +116,18 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
 
     assert provider.profile_name == "static_tokenrhythm_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek-v4-pro",
-        "glm-5.2",
-        "kimi-k2.7-code",
-        "qwen3.7-max",
+        "deepseek-flash",
+        "glm-5.3-flash",
+        "qwen3.8-flash",
+        "qwen3.8-max",
     ]
     assert all(
         member.provider_config.provider == "tokenrhythm" for member in provider.proposers
     )
+    assert all(member.thinking == "high" for member in provider.proposers)
     assert provider.aggregator.provider_config.provider == "tokenrhythm"
-    assert provider.aggregator.provider_config.model == "glm-5.2"
+    assert provider.aggregator.provider_config.model == "deepseek-flash"
+    assert provider.aggregator.thinking == "high"
     # Same aggregation defaults as the static OpenRouter profile.
     assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 120.0
@@ -443,10 +447,10 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
         provider_routing={"z-ai/glm-5.2": "z-ai"},
     )
     expected_proposers = [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
 
     for tier in ("c0", "c1", "c2", "c3"):
@@ -459,12 +463,12 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
 
         assert provider.profile_name == "static_openrouter_b5"
         assert [member.provider_config.model for member in provider.proposers] == expected_proposers
-        assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+        assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
         assert provider.selection_plan == {
             "strategy": "static_openrouter_b5",
             "profile": "static_openrouter_b5",
             "proposer_models": expected_proposers,
-            "aggregator_model": "z-ai/glm-5.2",
+            "aggregator_model": "deepseek/deepseek-v4.1-flash",
             "proposer_count": 4,
             "configured_min_successful_proposers": 9,
             "effective_min_successful_proposers": 4,
