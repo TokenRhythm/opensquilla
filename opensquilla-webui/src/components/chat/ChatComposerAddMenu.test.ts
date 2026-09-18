@@ -24,7 +24,7 @@ const i18n = createI18n({
         attachFiles: 'Attach files',
         planMode: {
           label: 'Plan mode',
-          readOnly: 'Read-only planning',
+          readOnly: 'Research and discuss before implementation. Tests and builds follow normal permissions.',
           turnOn: 'Turn plan mode on',
         },
         goal: {

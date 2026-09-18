@@ -299,6 +299,16 @@ rmSync(runtimeGatewayDir, { recursive: true, force: true })
 mkdirSync(runtimeGatewayDir, { recursive: true })
 mkdirSync(pyinstallerWorkDir, { recursive: true })
 
+const migrationRegistry = join(pyinstallerWorkDir, 'migration-registry', 'registry.json')
+const freezeRegistry = spawnSync('uv', [
+  ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'freeze_migration_registry.py'),
+  '--migrations', join(repoRoot, 'migrations'), '--output', migrationRegistry,
+], { cwd: repoRoot, encoding: 'utf8', windowsHide: true })
+if (freezeRegistry.error) throw freezeRegistry.error
+if (freezeRegistry.status !== 0) {
+  throw new Error(`Migration registry build failed: ${freezeRegistry.stderr || freezeRegistry.stdout}`)
+}
+
 const lightgbmBinaryArgs = addBinaryArg(
   pythonPackageFile('lightgbm', platformLightgbmLibraryPath()),
   platformLightgbmBundleDir(),
@@ -376,6 +386,8 @@ const args = [
   caRuntimeHookPath,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
+  '--add-data',
+  `${migrationRegistry}${addDataSeparator}opensquilla/_migrations`,
   ...lightgbmBinaryArgs,
   ...macOpenMpBinaryArgs,
   entryPath,

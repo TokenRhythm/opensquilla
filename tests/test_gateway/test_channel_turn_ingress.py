@@ -19,6 +19,7 @@ import opensquilla.gateway.channel_dispatch as channel_dispatch_module
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
 from opensquilla.gateway._debounce import _DefaultDebounceCoordinator
 from opensquilla.gateway.attachment_ingest import AttachmentIngestResult
+from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.channel_dispatch import (
     _accept_channel_runtime_turn,
     _apply_saved_channel_run_context,
@@ -1000,10 +1001,10 @@ async def test_channel_default_turn_claims_goal_without_replacing_web_lease(
     async with _open_stack(tmp_path / "channel-goal-claim.sqlite") as stack:
         goal = await _seed_idle_active_goal(stack)
         service = _install_channel_goal_service(stack)
-        principal = SimpleNamespace(
-            token_public_id="web-owner",
-            guest_owner_id=None,
+        principal = Principal(
+            token_public_id="desktop",
             is_owner=True,
+            authenticated=True,
             role="operator",
             scopes=frozenset({"operator.admin"}),
         )

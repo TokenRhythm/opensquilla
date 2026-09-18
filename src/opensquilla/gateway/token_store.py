@@ -12,6 +12,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -192,6 +193,24 @@ class TokenStore:
                 (int(time.time()), str(public_id)),
             )
         return cursor.rowcount == 1
+
+    def get_active_authorization(
+        self, public_id: str,
+    ) -> tuple[frozenset[str], frozenset[str], frozenset[str]] | None:
+        """Read current roles, scopes and capabilities without loading secrets."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT roles_json, scopes_json, capabilities_json FROM sandbox_tokens "
+                "WHERE public_id = ? AND revoked_at IS NULL",
+                (public_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            _decode_set(row["roles_json"]),
+            _decode_set(row["scopes_json"]),
+            _decode_set(row["capabilities_json"]),
+        )
 
     def list_active(self) -> tuple[TokenRecord, ...]:
         """List active token metadata without ever loading or returning secrets."""

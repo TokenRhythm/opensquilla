@@ -12,6 +12,8 @@ import { PLANS_IMPLEMENT_METHOD } from '@/contracts/generated/v4/plansImplement'
 import { validateResult as validateImplementResult } from '@/contracts/generated/v4/plansImplementValidators.mjs'
 import { PLANS_CANCEL_RUN_METHOD } from '@/contracts/generated/v4/plansCancelRun'
 import { validateResult as validateCancelRunResult } from '@/contracts/generated/v4/plansCancelRunValidators.mjs'
+import { PLANS_SET_PRESENTATION_METHOD } from '@/contracts/generated/v4/plansSetPresentation'
+import { validateResult as validateSetPresentationResult } from '@/contracts/generated/v4/plansSetPresentationValidators.mjs'
 
 interface PlanTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
@@ -40,6 +42,7 @@ function normalizeResult(value: unknown): PlanMutationResult {
     planRevision: (source.planRevision ?? source.plan_revision ?? source.currentPlan ?? source.current_plan) as PlanMutationResult['planRevision'],
     planRun: (source.planRun ?? source.plan_run) as PlanMutationResult['planRun'],
     activePlanRun: (source.activePlanRun ?? source.active_plan_run ?? source.planRun ?? source.plan_run) as PlanMutationResult['activePlanRun'],
+    planPresentations: (source.planPresentations ?? source.plan_presentations) as PlanMutationResult['planPresentations'],
   }
 }
 
@@ -61,9 +64,11 @@ function event(kind: PlanEvent['kind'], payload: unknown): PlanEvent {
   return {
     kind,
     sessionKey: text(source.sessionKey) ?? text(source.session_key) ?? text(source.key),
+    epoch: typeof source.epoch === 'number' ? source.epoch : undefined,
     collaboration: source.collaboration as PlanEvent['collaboration'],
     plan: (source.planRevision ?? source.plan_revision ?? source.currentPlan ?? source.current_plan ?? source.plan) as PlanEvent['plan'],
     run: (source.planRun ?? source.plan_run ?? source.run) as PlanEvent['run'],
+    planPresentations: (source.planPresentations ?? source.plan_presentations) as PlanEvent['planPresentations'],
   }
 }
 
@@ -72,6 +77,7 @@ export function createV4PlanCenter(transport: PlanTransport, events: PlanEvents)
     available(operation = 'mutations') {
       if (!transport.supports) return true
       if (operation === 'mode') return transport.supports(PLANS_SET_MODE_METHOD) && transport.supports('plans.capabilities')
+      if (operation === 'presentation') return transport.supports(PLANS_SET_PRESENTATION_METHOD)
       return transport.supports(PLANS_SET_MODE_METHOD)
         && transport.supports(PLANS_REVISE_METHOD)
         && transport.supports(PLANS_IMPLEMENT_METHOD)
@@ -97,6 +103,9 @@ export function createV4PlanCenter(transport: PlanTransport, events: PlanEvents)
         ...(expectedStateRevision !== undefined ? { expectedStateRevision } : {}),
       }, options?.signal)
     },
+    setPresentation(input, options) {
+      return requestResult(transport, PLANS_SET_PRESENTATION_METHOD, validateSetPresentationResult, { ...input }, options?.signal)
+    },
     subscribe(listener) {
       const subscriptions = [
         ['session.event.collaboration_mode', 'collaboration'],
@@ -105,6 +114,8 @@ export function createV4PlanCenter(transport: PlanTransport, events: PlanEvents)
         ['plan_revision', 'revision'],
         ['session.event.plan_run', 'run'],
         ['plan_run', 'run'],
+        ['session.event.plan_presentation', 'presentation'],
+        ['plan_presentation', 'presentation'],
       ] as const
       const handles = subscriptions.map(([name, kind]) => events.subscribe(name, payload => listener(event(kind, payload))))
       return { close: () => handles.forEach(handle => handle.close()) }

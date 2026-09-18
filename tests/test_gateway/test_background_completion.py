@@ -1202,3 +1202,75 @@ async def _record(
     payload: dict[str, Any],
 ) -> None:
     events.append((event, payload))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release", ["cancel_task", "cancel_session", "close", "quiesce"])
+async def test_final_group_release_notifies_idle_outside_lock(release: str) -> None:
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+    notifications: list[str] = []
+
+    def idle(key: str) -> None:
+        assert not manager._state_lock.locked()
+        notifications.append(key)
+
+    manager.set_idle_listener(idle)
+    await manager.emit_waiting(parent_session_key=PARENT, parent_task_id=PARENT_TASK)
+    if release == "cancel_task":
+        await manager.cancel_task(PARENT, PARENT_TASK)
+        await manager.cancel_task(PARENT, PARENT_TASK)
+    elif release == "cancel_session":
+        await manager.cancel_session(PARENT)
+        await manager.cancel_session(PARENT)
+    elif release == "close":
+        await manager.close()
+        await manager.close()
+    else:
+        async with manager.quiesce_sessions([PARENT]):
+            assert notifications == []
+    assert notifications == [PARENT]
+    assert await manager.active_group_ids(PARENT) == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_authority_failure_keeps_idle_fenced_until_exact_retry() -> None:
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+    notifications: list[str] = []
+    attempts = 0
+
+    async def settle(key: str, task_id: str) -> None:
+        nonlocal attempts
+        assert not manager._state_lock.locked()
+        assert (key, task_id) == (PARENT, PARENT_TASK)
+        assert await manager.active_group_ids(key)
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("synthetic durable cancellation failure")
+
+    manager.set_idle_listener(notifications.append)
+    manager.set_cancel_listener(settle)
+    await manager.emit_waiting(parent_session_key=PARENT, parent_task_id=PARENT_TASK)
+    with pytest.raises(RuntimeError, match="durable cancellation"):
+        await manager.cancel_task(PARENT, PARENT_TASK)
+    assert notifications == []
+    assert await manager.active_group_ids(PARENT)
+    await manager.cancel_task(PARENT, PARENT_TASK)
+    assert notifications == [PARENT]
+    assert await manager.active_group_ids(PARENT) == []
+
+
+@pytest.mark.asyncio
+async def test_quiesce_retires_failed_cancellation_fence_for_old_generation() -> None:
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+
+    async def fail(_key: str, _task_id: str) -> None:
+        raise RuntimeError("synthetic durable cancellation failure")
+
+    manager.set_cancel_listener(fail)
+    await manager.emit_waiting(parent_session_key=PARENT, parent_task_id=PARENT_TASK)
+    with pytest.raises(RuntimeError):
+        await manager.cancel_task(PARENT, PARENT_TASK)
+    assert await manager.active_group_ids(PARENT)
+    async with manager.quiesce_sessions([PARENT]):
+        pass
+    assert await manager.active_group_ids(PARENT) == []

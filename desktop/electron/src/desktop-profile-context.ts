@@ -13,6 +13,14 @@ export interface DesktopProfilePaths {
 
 const RECOVERY_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
+/** Choose once from the running binary, never from its selected update feed. */
+export function channelUserDataPath(userData: string, version: string): string {
+  const normalized = version.trim().toLowerCase()
+  if (/(?:nightly|dev|canary)/.test(normalized)) return `${resolve(userData)}-nightly`
+  if (/(?:rc|alpha|beta|preview)/.test(normalized)) return `${resolve(userData)}-preview`
+  return resolve(userData)
+}
+
 /**
  * The Desktop runtime has one authoritative profile. Historical recovery
  * profiles are never returned from this function and cannot become active.

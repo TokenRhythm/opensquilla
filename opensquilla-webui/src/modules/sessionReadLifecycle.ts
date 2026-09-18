@@ -37,6 +37,7 @@ export interface SessionReadMetadata {
   readonly pendingUserInputs: readonly SessionReadJsonObject[]
   readonly collaboration: SessionReadJsonObject | null
   readonly routing: SessionReadJsonObject | null
+  readonly planPresentations?: readonly SessionReadJsonObject[]
   readonly currentPlan: SessionReadJsonObject | null
   readonly activePlanRun: SessionReadJsonObject | null
   readonly goal: SessionReadJsonObject | null

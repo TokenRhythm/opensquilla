@@ -402,3 +402,94 @@ def test_wait_for_text_times_out_with_last_screen(
 
     with pytest.raises(TimeoutError, match="timed out waiting for 'missing'.*not yet"):
         session.wait_for_text("missing", timeout_s=0, checkpoint="missing")
+
+
+def test_isolated_tmux_commands_share_clean_environment_socket_and_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setenv("SYNTHETIC_PROVIDER_API_KEY", "must-not-reach-tmux")
+    monkeypatch.setattr(driver.time, "monotonic", lambda: 100.0)
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        output = "3,4\n" if "#{cursor_x},#{cursor_y}" in args else "ready\n"
+        if "-e" in args and "capture-pane" in args:
+            output = "\n".join([" " * 80] * 24)
+        return subprocess.CompletedProcess(args, 0, stdout=output)
+
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+    session = TmuxTerminalSession(
+        ["synthetic-cli"], tmp_path, {}, "synthetic-session", TerminalSize(),
+        tmp_path / "terminal.log", driver_env={"PATH": "/synthetic/bin"},
+        tmux_socket="synthetic-private-socket", deadline=103.0,
+    )
+    session.start()
+    session.send_text("hello")
+    session.send_key("Escape")
+    session.paste("/")
+    session.mouse_scroll("down")
+    session.resize(TerminalSize(80, 24))
+    session.capture_text("visible")
+    session.capture_framebuffer("styled")
+    session.capture_scrollback_text("history")
+    session.cursor_position()
+    session.alternate_screen_active()
+    session.is_alive()
+    session.terminate()
+    for args, kwargs in calls:
+        assert args[:5] == ["tmux", "-L", "synthetic-private-socket", "-f", os.devnull]
+        assert kwargs["env"] == {"PATH": "/synthetic/bin"}
+        assert "SYNTHETIC_PROVIDER_API_KEY" not in kwargs["env"]
+        assert kwargs["timeout"] == (5.0 if "kill-server" in args else 3.0)
+    assert calls[-1][0][-1] == "kill-server"
+
+
+def test_expired_tmux_deadline_prevents_commands_but_bounds_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(driver.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(driver.subprocess, "run", lambda *args, **kwargs: calls.append(kwargs))
+    session = TmuxTerminalSession(
+        ["synthetic-cli"], tmp_path, {}, "expired-session", TerminalSize(),
+        tmp_path / "terminal.log", driver_env={}, tmux_socket="expired-private", deadline=9.0,
+    )
+    with pytest.raises(TimeoutError, match="deadline"):
+        session.send_text("must not run")
+    assert calls == []
+    session.terminate()
+    assert calls == [{"timeout": 5.0, "env": {}, "stdout": subprocess.DEVNULL,
+                      "stderr": subprocess.DEVNULL, "check": False}]
+
+
+@pytest.mark.skipif(not driver.shutil.which("tmux"), reason="tmux is not available")
+def test_real_private_tmux_servers_exclude_parent_credentials_and_do_not_share_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYNTHETIC_PROVIDER_API_KEY", "dummy-parent-only")
+    clean = {"PATH": os.environ.get("PATH", os.defpath), "TERM": "xterm-256color",
+             "HOME": str(tmp_path)}
+    sessions = [TmuxTerminalSession(
+        [sys.executable, "-u", "-c",
+         "import os; print('clean=' + str('SYNTHETIC_PROVIDER_API_KEY' not in os.environ)); "
+         "input()"],
+        tmp_path, {}, build_run_id("private-env"), TerminalSize(),
+        tmp_path / f"terminal-{index}.log", driver_env=clean,
+        tmux_socket=build_run_id("private-server"), deadline=driver.time.monotonic() + 20,
+    ) for index in range(2)]
+    try:
+        for session in sessions:
+            session.start()
+            frame = session.wait_for_text("clean=True", timeout_s=5, checkpoint="clean-env")
+            assert "clean=False" not in frame.text
+            server_environment = session._run_tmux(
+                ["tmux", "show-environment", "-g"], check=True, text=True, stdout=subprocess.PIPE,
+            )
+            assert "SYNTHETIC_PROVIDER_API_KEY" not in server_environment.stdout
+        sessions[0].terminate()
+        assert not sessions[0].is_alive()
+        assert sessions[1].is_alive()
+    finally:
+        for session in sessions:
+            session.terminate()

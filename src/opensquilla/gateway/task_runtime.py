@@ -61,6 +61,7 @@ from opensquilla.gateway.terminal_activity import (
 from opensquilla.safety.injection_guard import xml_escape
 from opensquilla.session.goals import (
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
+    GoalClaimCandidate,
     GoalObjectiveUpdate,
     effective_goal_turn_context,
 )
@@ -539,6 +540,8 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
         ):
             metadata.pop(key, None)
     runtime_services = dict(envelope.runtime_services)
+    runtime_services.pop("suspend_compute_slot", None)
+    runtime_services.pop("update_progress", None)
     return replace(
         envelope,
         metadata=metadata,
@@ -2121,6 +2124,44 @@ class TaskRuntime:
             self._driver_tasks_by_session.pop(session_key, None)
         self._signal_driver_state_changed()
 
+    async def _completion_goal_candidate(
+        self, envelope: RouteEnvelope, run_kind: str
+    ) -> Mapping[str, Any] | None:
+        """Carry only a completed child's durable parent Goal into normal claim CAS."""
+        provenance = envelope.input_provenance
+        if (
+            run_kind != "runtime_send"
+            or not isinstance(provenance, Mapping)
+            or provenance.get("kind") != "internal_system"
+            or provenance.get("source_tool") != "subagent_completion"
+        ):
+            return None
+        parent_task_id = provenance.get("parent_task_id")
+        if not isinstance(parent_task_id, str) or not parent_task_id:
+            return None
+        parent = await self._storage.get_agent_task(parent_task_id)
+        if parent is None or parent.session_key != envelope.session_key:
+            return None
+        details = parent.details or {}
+        context = effective_goal_turn_context(details)
+        if (
+            context is None
+            or context.task_id != parent_task_id
+            or context.session_id != envelope.session_id
+            or context.epoch != envelope.session_epoch
+            or details.get("session_id") != context.session_id
+            or details.get("session_epoch") != context.epoch
+        ):
+            return None
+        # A later Goal in the same session must never inherit this old group's
+        # authority. The existing activation claim checks this frozen identity
+        # against the live Goal and keeps paused/complete/replaced Goals closed.
+        return GoalClaimCandidate(
+            session_id=context.session_id,
+            epoch=context.epoch,
+            goal_id=context.goal_id,
+        ).as_task_detail()
+
     async def _reserve_persist_and_activate(
         self,
         envelope: RouteEnvelope,
@@ -2145,6 +2186,7 @@ class TaskRuntime:
     ) -> TaskHandle:
         """Persist and activate one direct enqueue without cancellation drift."""
 
+        goal_candidate = await self._completion_goal_candidate(envelope, run_kind)
         reservation = await self.reserve(
             envelope,
             message,
@@ -2162,12 +2204,16 @@ class TaskRuntime:
             accepted_run_mode_override=accepted_run_mode_override,
             task_id=task_id,
             provider_request_correlation=provider_request_correlation,
-
             update_envelope_cache=update_envelope_cache,
             overflow_policy=overflow_policy,
+            goal_candidate=goal_candidate,
         )
         try:
-            if self._accepted_config_provider is not None:
+            if (
+                self._accepted_config_provider is not None
+                or str(reservation.runtime_task.envelope.source_kind) == "subagent"
+                or goal_candidate is not None
+            ):
                 await self.freeze_acceptance(reservation)
             # ``enqueue`` holds the per-session admission gate across this
             # owner CAS, task commit, and activation. Reset takes the same
@@ -2598,6 +2644,31 @@ class TaskRuntime:
         accepted_config: Any = _USE_ACCEPTED_CONFIG_PROVIDER,
     ) -> None:
         """Capture once, optionally backfilling callers that already committed."""
+
+        task = reservation.runtime_task
+        metadata = dict(task.envelope.metadata)
+        parent_task_id = metadata.get("parent_task_id")
+        if str(task.envelope.source_kind) == "subagent" and isinstance(parent_task_id, str):
+            parent = await self._storage.get_agent_task(parent_task_id)
+            if parent is None:
+                raise ValueError("Subagent usage attribution requires its durable parent task")
+            parent_details = parent.details or {}
+            if (
+                metadata.get("parent_session_key") != parent.session_key
+                or metadata.get("parent_session_id") != parent_details.get("session_id")
+                or metadata.get("parent_session_epoch") != parent_details.get("session_epoch")
+            ):
+                raise ValueError("Subagent parent generation changed before admission")
+            parent_metadata = parent_details.get("metadata") or {}
+            metadata["usage_root_turn_id"] = (
+                parent_metadata.get("usage_root_turn_id") or parent_task_id
+            )
+        else:
+            metadata["usage_root_turn_id"] = task.task_id
+        task.envelope = replace(task.envelope, metadata=metadata)
+        details = dict(reservation.task_record.details or {})
+        details["metadata"] = metadata
+        reservation.task_record.details = details
 
         await self.validate_acceptance(
             reservation.runtime_task.envelope,
@@ -3275,6 +3346,39 @@ class TaskRuntime:
                 persisted=persisted,
                 capability=capability,
             )
+
+    async def adopt_created_goal(
+        self,
+        session_key: str,
+        task_id: str,
+        *,
+        persist: Callable[[RouteEnvelope], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Attach Goal control to an admitted turn under its existing steer gate."""
+        from opensquilla.session.goals import GoalConflictError
+
+        key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            task = self._running_by_session.get(key)
+        if task is None or task.task_id != task_id:
+            raise GoalConflictError("STALE_GOAL", "The creating task is no longer running")
+        async with task.steer_claim:
+            async with self._state_lock:
+                if (
+                    self._running_by_session.get(key) is not task
+                    or task.terminal_closing
+                    or task.cancel_requested
+                    or task.status is not AgentTaskStatus.RUNNING
+                ):
+                    raise GoalConflictError("STALE_GOAL", "The creating task is closing")
+            result = await persist(task.envelope)
+            context = result["context"]
+            task.goal_context = dict(context)
+            task.goal_candidate = None
+            services = dict(task.envelope.runtime_services)
+            services["goal_context"] = dict(context)
+            task.envelope = replace(task.envelope, runtime_services=services)
+            return result
 
     async def apply_goal_objective_edit(
         self,
@@ -4690,10 +4794,43 @@ class TaskRuntime:
                 raise RuntimeError("Invalid required collaboration revision")
             metadata["collaboration_revision"] = required_revision
         metadata["task_id"] = task.task_id
+        async def update_progress(
+            steps: list[dict[str, Any]], explanation: str | None = None,
+        ) -> dict[str, Any]:
+            progress = await self._storage.update_task_progress(
+                task.task_id, session_key=task.envelope.session_key,
+                session_id=task.envelope.session_id,
+                session_epoch=task.envelope.session_epoch,
+                steps=steps, explanation=explanation,
+            )
+            task.envelope.metadata["progress"] = progress
+            try:
+                await self._emit(task.envelope.session_key, "session.event.progress", {
+                    "session_key": task.envelope.session_key,
+                    "sessionKey": task.envelope.session_key,
+                    "epoch": task.envelope.session_epoch,
+                    "task_id": task.task_id, "progress": progress,
+                })
+                run_id = str(task.envelope.metadata.get("plan_run_id") or "")
+                if run_id:
+                    run = await self._storage.get_plan_run(run_id)
+                    if run is not None:
+                        await self._emit_plan_run(task.envelope.session_key, run)
+                if self._goal_service is not None and task.goal_context:
+                    await self._goal_service.progress_updated(
+                        task.goal_context, session_key=task.envelope.session_key,
+                    )
+            except Exception:
+                log.warning("task_runtime.progress_projection_failed", task_id=task.task_id)
+            return cast(dict[str, Any], progress)
+
         runtime_services = {
             **task.envelope.runtime_services,
+            "update_progress": update_progress,
             "plan_storage": self._storage,
+            "goal_service": self._goal_service,
             "plan_event_emitter": self._emit,
+            "suspend_compute_slot": lambda: self._suspend_compute_slot(task),
         }
         # WebChat has a request-id response RPC and reconnect hydration. Other
         # interactive surfaces retain the terminating compatibility protocol
@@ -4835,7 +4972,7 @@ class TaskRuntime:
         return updated
 
     async def _settle_attached_plan_run(self, task: _RuntimeTask) -> None:
-        """Pause an unfinished manual run when its single turn terminates."""
+        """Project the ordinary task outcome onto its attached plan run."""
 
         run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
         if not run_id:
@@ -4860,20 +4997,8 @@ class TaskRuntime:
                 )
             elif status == "running" and callable(pause):
                 driver_kind = str(getattr(current, "driver_kind", "manual"))
-                step_states = list(getattr(current, "step_states", []) or [])
-                delivery_ready = (
-                    getattr(current, "current_step_id", None) is None
-                    and bool(step_states)
-                    and all(
-                        isinstance(state, dict)
-                        and str(state.get("status") or "")
-                        in {"completed", "skipped"}
-                        for state in step_states
-                    )
-                )
                 if (
                     task.status == AgentTaskStatus.SUCCEEDED
-                    and delivery_ready
                     and callable(complete)
                 ):
                     updated = await complete(
@@ -4929,40 +5054,43 @@ class TaskRuntime:
         )
 
     async def _emit_plan_revision_if_changed(self, task: _RuntimeTask) -> None:
+        # A normal successful answer in Plan mode may be discussion. Persist
+        # that distinction without making submit_plan a completion gate.
+        task.envelope.metadata.pop("plan_result", None)
+        if (
+            task.run_kind == "subagent"
+            or task.envelope.metadata.get("collaboration_mode") != "plan"
+        ):
+            return
         getter = getattr(self._storage, "get_session", None)
         get_revision = getattr(self._storage, "get_plan_revision", None)
         if not callable(getter) or not callable(get_revision):
             return
         try:
             node_candidate = getter(task.envelope.session_key)
-            node = (
-                await node_candidate
-                if inspect.isawaitable(node_candidate)
-                else node_candidate
-            )
-            if getattr(node, "active_plan_revision_id", None) is not None and not isinstance(
-                getattr(node, "active_plan_revision_id", None),
-                str,
-            ):
+            node = await node_candidate if inspect.isawaitable(node_candidate) else node_candidate
+            current_id = getattr(node, "active_plan_revision_id", None)
+            if current_id is not None and not isinstance(current_id, str):
                 return
-            current_id = (
-                str(getattr(node, "active_plan_revision_id", "") or "")
-                if node is not None
-                else ""
+            starting_id = str(task.envelope.metadata.get("active_plan_revision_id") or "")
+            revision = None
+            if current_id and current_id != starting_id:
+                candidate = get_revision(current_id)
+                revision = await candidate if inspect.isawaitable(candidate) else candidate
+            submitted = (
+                revision is not None
+                and revision.source_turn_id == task.task_id
+                and revision.source_session_id == getattr(node, "session_id", None)
+                and revision.source_epoch == getattr(node, "epoch", None)
             )
-            starting_id = str(
-                task.envelope.metadata.get("active_plan_revision_id") or ""
-            )
-            if not current_id or current_id == starting_id:
+            task.envelope.metadata["plan_result"] = {
+                "status": "submitted" if submitted else "discussion",
+                "previousRevisionId": starting_id or None,
+                "revisionId": current_id or None,
+            }
+            if not submitted:
                 return
-            revision_candidate = get_revision(current_id)
-            revision = (
-                await revision_candidate
-                if inspect.isawaitable(revision_candidate)
-                else revision_candidate
-            )
-            if revision is None:
-                return
+            assert revision is not None
             from opensquilla.session.plans import plan_revision_snapshot
 
             await self._emit(
@@ -5904,7 +6032,44 @@ class TaskRuntime:
             self._fair_cond = asyncio.Condition()
         return self._fair_cond
 
-    async def _acquire_fair_slot(self, task: _RuntimeTask) -> None:
+    @contextlib.asynccontextmanager
+    async def _suspend_compute_slot(
+        self, task: _RuntimeTask,
+    ) -> AsyncIterator[Callable[[], None]]:
+        """Lend capacity during an external wait while retaining the session lane.
+
+        The task, frozen context and execution lock remain owned by the same
+        turn. Only a successful wait rejoins the ordinary capacity queue; an
+        error or cancellation goes directly to the existing terminal cleanup.
+        A wait that decides the turn must end can call the yielded function;
+        that path may only report the terminal outcome, never resume execution.
+        """
+
+        if task.cancel_requested or task.terminal_closing:
+            raise asyncio.CancelledError
+        if task.status is not AgentTaskStatus.RUNNING or not task.acquired_slot:
+            raise RuntimeError("Only a running task holding capacity can suspend it")
+        resume_compute = True
+
+        def finish_without_compute() -> None:
+            nonlocal resume_compute
+            resume_compute = False
+
+        await self._release_slot(task)
+        yield finish_without_compute
+        if task.cancel_requested or task.terminal_closing:
+            raise asyncio.CancelledError
+        if not resume_compute:
+            return
+        await self._wait_for_subagent_slot(task)
+        await self._acquire_fair_slot(task, mark_running=False)
+
+    async def _acquire_fair_slot(
+        self,
+        task: _RuntimeTask,
+        *,
+        mark_running: bool = True,
+    ) -> None:
         """Acquire one global slot with round-robin among genuine slot waiters.
 
         A task must satisfy one predicate before it is granted a slot:
@@ -5933,6 +6098,8 @@ class TaskRuntime:
             waiters.add(session_key)
             try:
                 while True:
+                    if task.cancel_requested or task.terminal_closing:
+                        raise asyncio.CancelledError
                     # Predicate 1: global slot available.
                     if self._global_in_flight >= self._max_concurrency:
                         await cond.wait()
@@ -5969,6 +6136,11 @@ class TaskRuntime:
                 # Cancellation or a successful grant changes the genuine RR
                 # head. Wake peers even when no global slot count changed.
                 cond.notify_all()
+
+        if not mark_running:
+            # Resuming a suspended turn must not repeat task activation, Goal
+            # claims, context freezing, started_at writes or running events.
+            return
 
         # Update storage and emit running metric outside the condition lock. A
         # collect claim can keep this await open; if cancellation or persistence
@@ -6461,6 +6633,9 @@ class TaskRuntime:
                     user_message_id=task.persisted_user_message_id,
                 ),
             }
+            plan_result = task.envelope.metadata.get("plan_result")
+            if status == AgentTaskStatus.SUCCEEDED and isinstance(plan_result, dict):
+                payload["plan_result"] = dict(plan_result)
             if status != AgentTaskStatus.SUCCEEDED:
                 payload["terminal_message"] = append_error_ref(
                     build_terminal_reply(terminal_payload), safe_error_id(error_id)
@@ -6999,6 +7174,13 @@ class TaskRuntime:
         existing = await self._storage.get_agent_task(task.task_id)
         current_details = getattr(existing, "details", None)
         details = dict(current_details) if isinstance(current_details, dict) else {}
+        metadata = dict(details.get("metadata") or {})
+        metadata.pop("plan_result", None)
+        plan_result = task.envelope.metadata.get("plan_result")
+        if status == AgentTaskStatus.SUCCEEDED and isinstance(plan_result, dict):
+            metadata["plan_result"] = dict(plan_result)
+        if metadata or "metadata" in details:
+            details["metadata"] = metadata
         durable_activity_snapshot: dict[str, Any] | None = None
         try:
             from opensquilla.gateway.session_streams import get_session_streams

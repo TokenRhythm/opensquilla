@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GoalConfig
 from opensquilla.gateway.goal_service import GoalService
 from opensquilla.gateway.task_runtime import TaskRuntime
@@ -158,11 +159,12 @@ async def test_goal_registries_reclaim_after_one_thousand_idle_and_fence_operati
     assert service._kick_tasks == {}
     assert service._kick_dirty == set()
 
-    principal = SimpleNamespace(
-        token_public_id="registry-test-owner",
-        guest_owner_id=None,
+    principal = Principal(
+        token_public_id="desktop",
         is_owner=True,
+        authenticated=True,
         role="operator",
+        scopes=frozenset({"operator.admin"}),
     )
     ctx = SimpleNamespace(conn_id=conn_id, principal=principal, agent_id="main")
     for index, session_key in enumerate(session_keys):

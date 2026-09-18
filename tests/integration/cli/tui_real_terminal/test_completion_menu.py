@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from wcwidth import wcswidth
 
 from tui_real_terminal.assertions import (
     assert_no_completion_menu_overlap,
@@ -45,6 +46,25 @@ def test_completion_menu_overlap_assertion_rejects_interleaved_output() -> None:
     )
 
     with pytest.raises(AssertionError, match="completion menu overlap"):
+        assert_no_completion_menu_overlap(frame)
+
+
+@pytest.mark.parametrize("description", ["中文说明", "👩‍💻 编程", "cafe\u0301", "🦐 tools"])
+@pytest.mark.parametrize("displaced_edge", [False, True])
+def test_completion_menu_checks_unicode_cell_geometry(description, displaced_edge) -> None:
+    width = 40
+    text = f" › /example  {description}"
+    padding = width - wcswidth(text) + int(displaced_edge)
+    frame = _frame("\n".join((
+        " ╭ commands " + "─" * (width - len(" commands ")) + "╮",
+        " │" + text + " " * padding + "│",
+        " ╰" + "─" * width + "╯",
+    )))
+
+    if displaced_edge:
+        with pytest.raises(AssertionError, match="broken vertical border"):
+            assert_no_completion_menu_overlap(frame)
+    else:
         assert_no_completion_menu_overlap(frame)
 
 

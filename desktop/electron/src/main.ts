@@ -17,6 +17,7 @@ import {
 } from './desktop-locale.js'
 import {
   allProfileContexts as enumerateLegacyDesktopProfiles,
+  channelUserDataPath,
   isRecoveryProfileId,
   primaryProfilePaths,
   type DesktopProfilePaths,
@@ -507,6 +508,14 @@ interface MacInstallContext {
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+// Keep stable data in its established location. Prerelease binaries receive
+// independent Chromium, credential and Gateway state before any writer starts.
+// Changing the update feed never changes this process's active profile.
+const channelUserData = channelUserDataPath(app.getPath('userData'), app.getVersion())
+if (channelUserData !== resolve(app.getPath('userData'))) {
+  mkdirSync(channelUserData, { recursive: true })
+  app.setPath('userData', channelUserData)
+}
 const packageRoot = resolve(__dirname, '..')
 const defaultRepoRoot = resolve(packageRoot, '..', '..')
 const repoRoot = process.env.OPENSQUILLA_DESKTOP_REPO_ROOT

@@ -681,6 +681,12 @@ async def sessions_spawn(
         )
         session_key = build_subagent_session_key(resolved_agent_id, uuid.uuid4().hex[:8])
         envelope = build_subagent_route_envelope(
+            collaboration_mode=getattr(ctx, "collaboration_mode", "default"),
+            allowed_tools=(
+                ctx.authorized_tool_names if ctx.authorized_tool_names is not None
+                else ctx.allowed_tools
+            ) if ctx is not None else None,
+            denied_tools=ctx.denied_tools if ctx is not None else frozenset(),
             session_key=session_key,
             parent_session_key=parent_session_key,
             agent_id=resolved_agent_id,

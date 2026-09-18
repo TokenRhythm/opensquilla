@@ -109,6 +109,7 @@ class SessionPlanningState:
     active_plan_run: JsonObject | None
     goal: JsonObject | None
     epoch: int | None
+    plan_presentations: tuple[JsonObject, ...] = ()
 
 
 class SessionStreamPositionReader(Protocol):
@@ -185,6 +186,7 @@ class SessionReadMetadata:
     epoch: int | None
     hydration_complete: bool
     deferred_fields: tuple[SessionMetadataFacet, ...]
+    plan_presentations: tuple[JsonObject, ...] = ()
 
 
 def _copy_object(value: JsonObject | None) -> dict[str, Any] | None:
@@ -346,6 +348,7 @@ class SessionReadApplication:
             pending_user_inputs=_copy_objects(pending_inputs),
             collaboration=_copy_object(planning.collaboration),
             routing=_copy_object(routing),
+            plan_presentations=_copy_objects(planning.plan_presentations),
             current_plan=_copy_object(planning.current_plan),
             active_plan_run=_copy_object(planning.active_plan_run),
             goal=_copy_object(planning.goal),

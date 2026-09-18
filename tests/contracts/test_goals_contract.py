@@ -19,6 +19,7 @@ from opensquilla.contracts.adapters.goals_contract import (
 
 def test_capabilities_observer_preserves_optional_and_legacy_request_shapes() -> None:
     assert goals_capabilities_params_contract_errors(None) == ()
+    assert goals_capabilities_params_contract_errors({}) == ()
     assert goals_capabilities_params_contract_errors({"session_key": "agent:demo"}) == ()
     assert goals_capabilities_params_contract_errors({"sessionKey": 1})
     assert goals_capabilities_params_contract_errors("legacy") == ()

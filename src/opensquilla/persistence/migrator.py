@@ -26,6 +26,14 @@ import structlog
 from yoyo import exceptions, get_backend, read_migrations
 from yoyo import migrations as yoyo_migrations
 
+from opensquilla.migration_compatibility import (
+    LEGACY_MIGRATION_ALIASES,
+    REGISTRY_FILENAME,
+    classify_migration_ledger,
+    frozen_migration_registry,
+    read_migration_ledger,
+)
+
 log = logging.getLogger(__name__)
 #: Separate structured logger: migration-directory resolution emits an
 #: operator-facing event whose fields are asserted by contract tests, while the
@@ -56,24 +64,7 @@ _MIGRATION_PROCESS_LOCK_TIMEOUT_SECONDS = 120.0
 # though the released migration chain must use unique V037-V040 prefixes. Each
 # alias is accepted only when its exact historical hash matches; the replacement
 # is then marked under yoyo's lock without replaying the already-applied schema.
-_LEGACY_MIGRATION_ALIASES: dict[str, tuple[str, str]] = {
-    "V036__artifact_sessions": (
-        "V037__artifact_sessions",
-        "629c36c68995c8ad03b3ede54698658fa4ca1885bc66bca257b2961d5e01df4e",
-    ),
-    "V037__artifact_prompt_annotations": (
-        "V038__artifact_prompt_annotations",
-        "adeb19ffbc8c3dd64921b8282daec79e8cbf875ef010dacf00a41cbcee637ce7",
-    ),
-    "V038__artifact_mutation_attempts": (
-        "V039__artifact_mutation_attempts",
-        "9775f8aa161c6172d3f0010a6016d2881894f7b0bc504c59ca79f3e67138b11c",
-    ),
-    "V039__document_resources": (
-        "V040__document_resources",
-        "d3c739ce2989470f11cd8a8d8aef811a1e12fa7ac6dbc4dfccd5ce7323762390",
-    ),
-}
+_LEGACY_MIGRATION_ALIASES = LEGACY_MIGRATION_ALIASES
 
 
 class SchemaAheadError(RuntimeError):
@@ -98,7 +89,7 @@ def resolve_migrations_dir() -> Path:
     env_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
     if env_dir:
         candidate = Path(env_dir)
-        if any(candidate.glob("V*.py")):
+        if (candidate / REGISTRY_FILENAME).is_file() or any(candidate.glob("V*.py")):
             return candidate
         # A pinned-but-unusable override silently falling through to a
         # different migration set is a misconfiguration operators must see.
@@ -120,7 +111,7 @@ def resolve_migrations_dir() -> Path:
         package_dir = importlib_resources.files("opensquilla").joinpath("_migrations")
         if package_dir.is_dir():
             path = Path(str(package_dir))
-            if any(path.glob("V*.py")):
+            if (path / REGISTRY_FILENAME).is_file() or any(path.glob("V*.py")):
                 return path
     except Exception:
         pass
@@ -556,16 +547,36 @@ def assert_schema_not_ahead(db_url: str, migrations_dir: Path) -> None:
     applied = _read_applied_migration_ids(db_path)
     if not applied:
         return
-    with _yoyo_utf8_open():
-        known = {migration.id for migration in _discover_migrations(path)}
-    known.update(
-        legacy_id
-        for legacy_id, (replacement_id, _legacy_hash) in _LEGACY_MIGRATION_ALIASES.items()
-        if replacement_id in known
+    registry = frozen_migration_registry(path)
+    if registry is None:
+        with _yoyo_utf8_open():
+            known = {migration.id for migration in _discover_migrations(path)}
+    else:
+        known = set(registry)
+    with contextlib.closing(sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)) as conn:
+        ledger = read_migration_ledger(conn)
+    compatibility = classify_migration_ledger(
+        {migration_id: ledger.get(migration_id) for migration_id in applied},
+        known,
+        aliases=_LEGACY_MIGRATION_ALIASES,
     )
-    unknown = sorted(applied - known)
-    if not unknown:
+    if compatibility.code is None:
         return
+    if compatibility.code == "state_migration_set_unavailable":
+        raise RuntimeError("No migration set is available to inspect the existing profile")
+    unknown = compatibility.conflicting_ids
+    if compatibility.code == "state_unsupported_goal_lineage":
+        raise SchemaAheadError(
+            "This profile uses an unsupported development Goal migration lineage "
+            f"({', '.join(unknown)}). Its database and WAL are preserved. "
+            "Use the build that created it or choose a separate profile; "
+            "these migrations cannot be aliased to the current Goal schema."
+        )
+    if compatibility.code == "state_migration_alias_mismatch":
+        raise SchemaAheadError(
+            f"Migration {', '.join(unknown)} does not match the exact historical "
+            "alias hash. The profile has not been changed."
+        )
     log.error(
         "migrator.schema_ahead",
         extra={"db_path": str(db_path), "unknown_migrations": unknown},
@@ -858,6 +869,16 @@ def apply_pending(db_url: str, migrations_dir: Path) -> list[str]:
         # same cross-process boundary as backend creation. Otherwise a second
         # caller can inspect a schema while the lock owner is rewriting it.
         assert_schema_not_ahead(db_url, path)
+
+        registry = frozen_migration_registry(path)
+        if registry is not None and db_path is not None and db_path.exists():
+            with contextlib.closing(
+                sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)
+            ) as conn:
+                if read_migration_ledger(conn) == registry:
+                    # The complete frozen chain is already applied. Healthy
+                    # packaged startup needs neither discovery nor a backup.
+                    return []
 
         _ensure_sqlite_datetime_adapter()
         _ensure_yoyo_audit_user()

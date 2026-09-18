@@ -163,8 +163,12 @@ def test_mixed_quoted_or_ambiguous_requests_do_not_finalize(user_text: str) -> N
 
 
 @pytest.mark.asyncio
-async def test_install_only_blocks_same_batch_verification_and_finishes_once(setup) -> None:
+@pytest.mark.parametrize("plan_run_id", [None, "approved-run"])
+async def test_install_only_blocks_same_batch_verification_and_finishes_once(
+    setup, plan_run_id: str | None,
+) -> None:
     source, loader, ctx, calls, make_agent = setup
+    ctx.plan_run_id = plan_run_id
     provider = ScriptedProvider([[('skill_install_community', {'identifier': 'demo'}),
                                   ('skill_list', {})], [('skill_view', {'name': 'demo'})]])
     agent = make_agent(provider)
@@ -240,7 +244,8 @@ def test_first_schema_surfaces_install_but_preserves_authority(setup, overrides)
     runner = TurnRunner(provider_selector=None, config=GatewayConfig())
     runner._tool_registry = get_default_registry()
     definitions, _ = runner._build_tools(ctx)
-    assert ("skill_install_community" in {item.name for item in definitions}) == (not overrides)
+    expected = not overrides or overrides == {"collaboration_mode": "plan"}
+    assert ("skill_install_community" in {item.name for item in definitions}) == expected
 
 
 def test_install_tool_has_dedicated_execution_budget(setup) -> None:

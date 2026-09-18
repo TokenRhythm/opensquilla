@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,15 @@ def _build_contract_probe(tmp_path: Path) -> Path:
         REPO_ROOT / "scripts" / "verify_webui_artifact.py",
         scripts / "verify_webui_artifact.py",
     )
+    shutil.copy2(
+        REPO_ROOT / "scripts" / "freeze_migration_registry.py",
+        scripts / "freeze_migration_registry.py",
+    )
+    migrations = probe / "migrations"
+    migrations.mkdir()
+    (migrations / "V001__build_probe.py").write_text(
+        "from yoyo import step\nsteps = [step('SELECT 1')]\n", encoding="utf-8",
+    )
     shutil.copy2(REPO_ROOT / ".gitignore", probe / ".gitignore")
     (probe / "pyproject.toml").write_text(
         """\
@@ -114,6 +124,9 @@ requires-python = ">=3.12"
 [tool.hatch.build.targets.wheel]
 packages = ["src/probe"]
 artifacts = ["src/opensquilla/gateway/static/dist/**"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"migrations/" = "opensquilla/_migrations/"
 
 [tool.hatch.build.targets.sdist]
 artifacts = ["src/opensquilla/gateway/static/dist/**"]
@@ -253,6 +266,13 @@ def test_ignored_junk_survives_sdist_to_wheel_fingerprint_round_trip(
     assert len(sdists) == 1
     with tarfile.open(sdists[0], "r:gz") as archive:
         assert not any(Path(name).name == ".DS_Store" for name in archive.getnames())
+        registries = [
+            name for name in archive.getnames() if name.endswith("migrations/registry.json")
+        ]
+        assert len(registries) == 1
+        registry_file = archive.extractfile(registries[0])
+        assert registry_file is not None
+        source_registry = registry_file.read()
 
     wheel_dir = tmp_path / "round-trip-wheel"
     wheel_result = _run(
@@ -265,7 +285,38 @@ def test_ignored_junk_survives_sdist_to_wheel_fingerprint_round_trip(
         cwd=probe,
     )
     assert wheel_result.returncode == 0, wheel_result.stderr
-    assert len(list(wheel_dir.glob("*.whl"))) == 1
+    wheels = list(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1
+    with zipfile.ZipFile(wheels[0]) as archive:
+        registry_path = "opensquilla/_migrations/registry.json"
+        assert archive.namelist().count(registry_path) == 1
+        assert archive.read(registry_path) == source_registry
+        registry = json.loads(source_registry)["migrations"]["V001__build_probe"]
+        migration = archive.read("opensquilla/_migrations/V001__build_probe.py")
+        assert registry["source_sha256"] == hashlib.sha256(migration).hexdigest()
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv not on PATH")
+@pytest.mark.parametrize("target", ["--wheel", "--sdist"])
+def test_frozen_migration_registry_must_match_source_archive(
+    tmp_path: Path, target: str,
+) -> None:
+    probe = _build_contract_probe(tmp_path)
+    _write_verified_artifact(probe)
+    from scripts.freeze_migration_registry import freeze_registry
+
+    migrations = probe / "migrations"
+    freeze_registry(migrations, migrations / "registry.json")
+    (migrations / "V001__build_probe.py").write_text(
+        "from yoyo import step\nsteps = [step('SELECT 2')]\n", encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "stale-registry-artifacts"
+    result = _run("uv", "build", target, "--out-dir", str(output_dir), cwd=probe)
+    assert result.returncode != 0
+    assert "Frozen migration registry does not match migration sources" in result.stderr
+    assert not list(output_dir.glob("*.whl"))
+    assert not list(output_dir.glob("*.tar.gz"))
 
 
 @pytest.mark.skipif(

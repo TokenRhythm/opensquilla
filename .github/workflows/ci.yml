@@ -9,6 +9,12 @@ name: CI
   schedule:
     - cron: "23 18 * * *"
   workflow_dispatch:
+    inputs:
+      gateway_timing_base:
+        description: "Optional full baseline SHA for same-runner offline Gateway timing"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
@@ -824,6 +830,8 @@ jobs:
           ensemble-new-task-legacy-turn.spec.ts
           goal-mode.spec.ts
           plan-questionnaire-lifecycle.spec.ts
+          plan-presentation.spec.ts
+          task-progress.spec.ts
           queue-steer.spec.ts
           share.spec.ts
           --project=chromium
@@ -1029,6 +1037,33 @@ jobs:
         shell: bash
         run: uv run mypy src/opensquilla --show-error-codes
 
+      - name: Compare offline Gateway startup and Default first turn
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.gateway_timing_base != '' }}
+        shell: bash
+        env:
+          TIMING_BASE: ${{ inputs.gateway_timing_base }}
+        run: |
+          set -euo pipefail
+          [[ "$TIMING_BASE" =~ ^[0-9a-f]{40}$ ]] || { echo "Expected a full baseline commit SHA" >&2; exit 2; }
+          git fetch --no-tags --depth=1 origin "$TIMING_BASE"
+          baseline_dir="$(mktemp -d "$(dirname "$GITHUB_WORKSPACE")/gateway-timing-baseline.XXXXXX")"
+          trap 'rm -rf "$baseline_dir"' EXIT
+          git archive "$TIMING_BASE" > "$RUNNER_TEMP/gateway-timing-baseline.tar"
+          git get-tar-commit-id < "$RUNNER_TEMP/gateway-timing-baseline.tar" > "$baseline_dir/.gateway-timing-source-sha"
+          tar -xf "$RUNNER_TEMP/gateway-timing-baseline.tar" -C "$baseline_dir"
+          uv run --no-sync python scripts/compare_gateway_timing.py \
+            --baseline-root "$baseline_dir" --candidate-root "$GITHUB_WORKSPACE" \
+            --baseline-sha "$TIMING_BASE" --candidate-sha "$(git rev-parse HEAD)" \
+            --samples 3 --output "$RUNNER_TEMP/gateway-timing.json"
+
+      - name: Preserve offline Gateway timing evidence
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.gateway_timing_base != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-timing-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gateway-timing.json
+          if-no-files-found: error
+
       - name: Test targeted PR suite
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-targeted') && !contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-full') }}
         shell: bash
@@ -1133,6 +1168,53 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
+      - name: Preflight offline test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
+          regression_args=()
+          if [[ "${{ matrix.shard }}" == "desktop-installer-contracts" ]]; then
+            # Recheck every failed or unfinished file from this shard before
+            # starting its full run; other shards retain the environment probe.
+            regression_args+=(
+              tests/test_ci/test_architecture_import_contracts.py
+              tests/test_engine/turn_runner/test_stage_test_boundaries.py
+              tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tokenjuice_tool_result_projection.py
+              tests/test_tools/test_tool_upgrade_compatibility.py
+              tests/test_gateway/test_goal_rpc.py
+              tests/test_tools/test_dispatch_legacy_coverage.py
+              tests/unit/cli/repl/test_slash_bridge.py
+            )
+          elif [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+            regression_args+=(
+              tests/test_gateway/test_channel_turn_ingress.py
+              tests/test_gateway/test_goal_registry_cleanup.py
+              tests/test_gateway/test_task_runtime_terminal_cleanup.py
+              tests/test_gateway/test_goal_turn_authority.py
+              tests/test_gateway/test_task_progress_projection.py
+              tests/functional/test_gateway_silent_reply_process_e2e.py
+            )
+          elif [[ "${{ matrix.shard }}" == "recovery-migration" ]]; then
+            regression_args+=(tests/test_sandbox/test_windows_shell_process_runtime.py)
+          elif [[ "${{ matrix.shard }}" == "core" ]]; then
+            regression_args+=(
+              tests/test_engine/test_cancelled_turn_segments.py
+              tests/test_tools/test_shell_workdir.py
+              tests/test_sandbox/test_shell_code_network_hints.py
+              tests/test_tools/test_shell_runtime_preflight.py
+            )
+          fi
+          uv run pytest \
+            tests/test_sandbox/test_trusted_sandbox_execution.py \
+            tests/test_tools/test_approval_unification.py \
+            tests/test_live_multi_provider_matrix.py \
+            tests/test_live_provider_profile_smoke.py \
+            "${regression_args[@]}" \
+            -vv --tb=short -o faulthandler_timeout=60 --maxfail=3 \
+            2>&1 | tee "${CI_REPORT_DIR}/preflight.log"
+
       - name: Test Ubuntu full shard
         shell: bash
         run: |
@@ -1158,7 +1240,7 @@ jobs:
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
             "${worker_args[@]}" \
             -- \
-            -q \
+            -vv --tb=short -o faulthandler_timeout=60 \
             -m "${markers}" \
             --durations=50 \
             "${maxfail_args[@]}" \
@@ -1361,6 +1443,55 @@ jobs:
             throw
           }
 
+      - name: Preflight offline test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
+          regression_args=()
+          if [[ "${{ matrix.shard }}" == "desktop-installer-contracts" ]]; then
+            # Recheck every failed or unfinished file from this shard before
+            # starting its full run; other shards retain the environment probe.
+            regression_args+=(
+              tests/test_ci/test_architecture_import_contracts.py
+              tests/test_engine/turn_runner/test_stage_test_boundaries.py
+              tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tokenjuice_tool_result_projection.py
+              tests/test_tools/test_tool_upgrade_compatibility.py
+              tests/test_gateway/test_goal_rpc.py
+              tests/test_tools/test_dispatch_legacy_coverage.py
+              tests/unit/cli/repl/test_slash_bridge.py
+            )
+          elif [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+            regression_args+=(
+              tests/test_gateway/test_channel_turn_ingress.py
+              tests/test_gateway/test_goal_registry_cleanup.py
+              tests/test_gateway/test_task_runtime_terminal_cleanup.py
+              tests/test_gateway/test_goal_turn_authority.py
+              tests/test_gateway/test_task_progress_projection.py
+              tests/functional/test_gateway_silent_reply_process_e2e.py
+            )
+          elif [[ "${{ matrix.shard }}" == "recovery-migration" ]]; then
+            regression_args+=(tests/test_sandbox/test_windows_shell_process_runtime.py)
+          elif [[ "${{ matrix.shard }}" == "core" ]]; then
+            regression_args+=(
+              tests/test_ci/test_windows_signatures.py
+              tests/test_tools/test_shell_process_isolation.py
+              tests/test_engine/test_cancelled_turn_segments.py
+              tests/test_tools/test_shell_workdir.py
+              tests/test_sandbox/test_shell_code_network_hints.py
+              tests/test_tools/test_shell_runtime_preflight.py
+            )
+          fi
+          uv run pytest \
+            tests/test_sandbox/test_trusted_sandbox_execution.py \
+            tests/test_tools/test_approval_unification.py \
+            tests/test_live_multi_provider_matrix.py \
+            tests/test_live_provider_profile_smoke.py \
+            "${regression_args[@]}" \
+            -vv --tb=short -o faulthandler_timeout=60 --maxfail=3 \
+            2>&1 | tee "${CI_REPORT_DIR}/preflight.log"
+
       - name: Test Windows shard
         shell: bash
         run: |
@@ -1394,7 +1525,7 @@ jobs:
             --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
             "${worker_args[@]}" \
             -- \
-            -q \
+            -vv --tb=short -o faulthandler_timeout=60 \
             -m "${markers}" \
             --durations=50 \
             "${maxfail_args[@]}" \
@@ -1489,6 +1620,19 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
+      - name: Preflight offline test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
+          uv run pytest \
+            tests/test_sandbox/test_trusted_sandbox_execution.py \
+            tests/test_tools/test_approval_unification.py \
+            tests/test_live_multi_provider_matrix.py \
+            tests/test_live_provider_profile_smoke.py \
+            -vv --tb=short --maxfail=3 \
+            2>&1 | tee "${CI_REPORT_DIR}/preflight.log"
+
       - name: Test native profile recovery contracts
         shell: bash
         run: |
@@ -1502,7 +1646,28 @@ jobs:
             tests/test_tools/test_execution_status.py
             tests/test_tools/test_shell_native_argv.py
             tests/test_provider_ensemble.py
-            -q
+            tests/test_gateway/test_goal_rpc.py
+            tests/test_gateway/test_goal_child_wait.py
+            tests/test_gateway/test_goal_plan_rpc_admission.py
+            tests/test_gateway/test_plan_cancel_tree.py
+            tests/test_gateway/test_plan_rpc.py
+            tests/test_gateway/test_task_runtime_wait_slots.py
+            tests/test_gateway/test_task_progress_projection.py
+            tests/test_gateway/test_usage_ledger_runtime.py
+            tests/test_engine/test_plan_run_reconciliation.py
+            tests/test_engine/test_goal_context_prompt.py
+            tests/test_session/test_goal_storage.py
+            tests/test_session/test_goal_plan_admission.py
+            tests/test_session/test_plan_storage.py
+            tests/test_session/test_plan_presentation.py
+            tests/test_session/test_task_progress.py
+            tests/test_persistence/test_usage_ledger.py
+            tests/test_persistence/test_migration_compatibility.py
+            tests/test_migrations/test_v045_goal_runtime_accounting.py
+            tests/test_tools/test_plan_access.py
+            -vv
+            --tb=short
+            -o faulthandler_timeout=60
             --durations=50
             --junitxml="${CI_REPORT_DIR}/junit.xml"
           )
@@ -1701,6 +1866,11 @@ jobs:
             --grep "@session-hang-recovery" \
             --retries=0 \
             2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
+          npm run test:e2e -- \
+            plan-presentation.spec.ts task-progress.spec.ts goal-mode.spec.ts \
+            --project=chromium --workers=1 --retries=0 \
+            --grep "@plan-goal-runtime" \
+            2>&1 | tee "${CI_REPORT_DIR}/plan-goal-runtime.log"
 
       - name: Install Desktop workbench browser
         if: ${{ matrix.shard == 'all' || matrix.shard == 'ownership-workbench' || matrix.shard == 'workbench' }}

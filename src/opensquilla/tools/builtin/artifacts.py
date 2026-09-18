@@ -34,10 +34,6 @@ from opensquilla.artifacts import (
 )
 from opensquilla.html_format import is_html
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
-from opensquilla.session.plans import (
-    PLAN_STEP_TERMINAL_STATUSES,
-    PlanRunConflictError,
-)
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
@@ -205,153 +201,6 @@ def _publish_artifact_metadata(
     return artifact_name, artifact_mime
 
 
-def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
-    current_step_id = str(getattr(run, "current_step_id", "") or "")
-    step_states = list(getattr(run, "step_states", []) or [])
-    return (
-        not current_step_id
-        and bool(step_states)
-        and all(
-            isinstance(state, dict)
-            and str(state.get("status") or "") in {"completed", "skipped"}
-            for state in step_states
-        )
-    )
-
-
-def _plan_run_allows_delivery(ctx: ToolContext, run: Any) -> bool:
-    """Return whether the current task may deliver from this PlanRun state."""
-
-    status = str(getattr(run, "status", "") or "")
-    if status == "completed":
-        return True
-    if status != "running":
-        return False
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
-    return (
-        bool(task_id)
-        and active_task_id == task_id
-        and _plan_run_steps_ready_for_delivery(run)
-    )
-
-
-def _plan_run_final_step_ready_for_publish(run: Any) -> str | None:
-    """Return the sole unfinished current step that publication can finalize."""
-
-    current_step_id = str(getattr(run, "current_step_id", "") or "")
-    if not current_step_id:
-        return None
-    step_states = list(getattr(run, "step_states", []) or [])
-    current_matches = [
-        state
-        for state in step_states
-        if isinstance(state, dict)
-        and str(state.get("step_id") or "") == current_step_id
-    ]
-    if len(current_matches) != 1:
-        return None
-    if str(current_matches[0].get("status") or "") != "in_progress":
-        return None
-    if any(
-        not isinstance(state, dict)
-        or (
-            str(state.get("step_id") or "") != current_step_id
-            and str(state.get("status") or "") not in PLAN_STEP_TERMINAL_STATUSES
-        )
-        for state in step_states
-    ):
-        return None
-    return current_step_id
-
-
-async def _checkpoint_final_plan_step_for_publish(
-    ctx: ToolContext,
-    run: Any,
-) -> Any:
-    """Atomically enter delivery when publish is the final step operation."""
-
-    step_id = _plan_run_final_step_ready_for_publish(run)
-    if step_id is None:
-        return run
-    storage = getattr(ctx, "plan_storage", None)
-    if storage is None:
-        return run
-    checkpoint_plan_run = getattr(storage, "checkpoint_plan_run", None)
-    if not callable(checkpoint_plan_run):
-        return run
-    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    try:
-        return await checkpoint_plan_run(
-            run_id,
-            expected_state_revision=int(getattr(run, "state_revision", 0)),
-            step_id=step_id,
-            step_status="completed",
-            next_step_id=None,
-            expected_active_task_id=task_id,
-        )
-    except PlanRunConflictError:
-        refreshed = await storage.get_plan_run(run_id)
-        if refreshed is not None and _plan_run_allows_delivery(ctx, refreshed):
-            return refreshed
-        raise RetryableToolInputError(
-            "publish_artifact was not executed because the attached PlanRun "
-            "changed while entering artifact delivery. Retry publish_artifact "
-            "with the current PlanRun state."
-        ) from None
-
-
-async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> Any | None:
-    """Validate delivery state and return a final step to checkpoint if needed."""
-
-    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
-    if not run_id:
-        return None
-    storage = getattr(ctx, "plan_storage", None)
-    get_plan_run = getattr(storage, "get_plan_run", None)
-    if not callable(get_plan_run):
-        raise ToolError("PlanRun storage is unavailable for artifact publication")
-    run = await get_plan_run(run_id)
-    if run is None:
-        raise ToolError("The active PlanRun no longer exists")
-    status = str(getattr(run, "status", "") or "")
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
-    if _plan_run_allows_delivery(ctx, run):
-        return None
-    if status == "running":
-        if not task_id or active_task_id != task_id:
-            raise ToolError(
-                "Artifact publication is unavailable because this task no longer "
-                "owns the attached PlanRun."
-            )
-        if _plan_run_steps_ready_for_delivery(run):
-            return None
-        if _plan_run_final_step_ready_for_publish(run) is not None:
-            return run
-    current_step_id = str(getattr(run, "current_step_id", "") or "")
-    current_detail = (
-        f" The current step is {current_step_id}."
-        if current_step_id
-        else ""
-    )
-    message = (
-        "publish_artifact was not executed because the attached PlanRun is "
-        f"{status or 'unavailable'}.{current_detail}"
-    )
-    if status == "running":
-        raise RetryableToolInputError(
-            f"{message} Record truthful checkpoints for the current step in plan "
-            "order, then retry publish_artifact only after the final checkpoint "
-            "returns no current step."
-        )
-    raise ToolError(
-        f"{message} Artifact publication is unavailable for this terminal or "
-        "unowned PlanRun state."
-    )
-
-
 def _record_publication_source(
     ctx: ToolContext, payload: dict[str, Any], source: ArtifactSource, *, source_is_html: bool,
 ) -> None:
@@ -425,7 +274,6 @@ async def publish_artifact(
     ctx = current_tool_context.get()
     if ctx is None:
         raise ToolError("publish_artifact requires tool context")
-    final_step_to_checkpoint = await _require_plan_run_ready_for_publish(ctx)
     if not ctx.workspace_dir:
         raise ToolError("publish_artifact requires an active workspace")
     if not ctx.artifact_media_root:
@@ -541,17 +389,6 @@ async def publish_artifact(
             for item in bundle_manifest.files
             if item.path == bundle_manifest.entrypoint
         )
-    if final_step_to_checkpoint is not None:
-        checkpointed_run = await _checkpoint_final_plan_step_for_publish(
-            ctx,
-            final_step_to_checkpoint,
-        )
-        if not _plan_run_steps_ready_for_delivery(checkpointed_run):
-            raise RetryableToolInputError(
-                "publish_artifact was not executed because the attached PlanRun "
-                "could not enter artifact delivery. Retry after checkpointing the "
-                "current final step."
-            )
     store = ArtifactStore(ctx.artifact_media_root)
     with target.open("rb") as stream:
         source_is_html = is_html(artifact_name, artifact_mime, stream.read(4096))

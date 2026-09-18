@@ -1,11 +1,22 @@
 <template>
   <article
     class="plan-card"
-    :class="{ 'plan-card--superseded': !plan.current }"
+    :class="{ 'plan-card--superseded': !plan.current, 'plan-card--dismissed': dismissed }"
     :data-plan-id="plan.planId"
     :data-plan-revision-id="plan.revisionId"
     :aria-labelledby="titleId"
   >
+    <div v-if="dismissed" class="plan-card__restoration">
+      <h3 :id="titleId" class="plan-card__title">{{ plan.title }}</h3>
+      <button
+        v-if="presentationAvailable"
+        type="button"
+        class="btn btn--ghost plan-card__show"
+        :disabled="presentationBusy"
+        @click="changePresentation(false)"
+      >{{ t('chat.plan.showPlan') }}</button>
+    </div>
+    <template v-else>
     <header class="plan-card__header">
       <div class="plan-card__identity">
         <span class="plan-card__icon" aria-hidden="true">
@@ -15,6 +26,13 @@
         <span class="plan-card__revision">{{ t('chat.plan.revision', { id: plan.revisionId }) }}</span>
       </div>
       <div class="plan-card__header-actions">
+        <button
+          v-if="presentationAvailable"
+          type="button"
+          class="btn btn--ghost plan-card__hide"
+          :disabled="presentationBusy"
+          @click="changePresentation(true)"
+        >{{ t('chat.plan.hidePlan') }}</button>
         <span
           class="plan-card__state"
           :class="{ 'plan-card__state--current': plan.current }"
@@ -122,6 +140,7 @@
         {{ actionLabel('replan', 'chat.plan.replan') }}
       </button>
     </footer>
+    </template>
   </article>
 </template>
 
@@ -143,6 +162,7 @@ import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import type {
   PlanCardAction,
   PlanCardActionTarget,
+  PlanPresentationRequest,
   PlanRevisionSnapshot,
 } from '@/types/plans'
 import {
@@ -154,15 +174,22 @@ const props = withDefaults(defineProps<{
   plan: PlanRevisionSnapshot
   disabled?: boolean
   pendingAction?: PlanCardAction | null
+  dismissed?: boolean
+  presentationAvailable?: boolean
+  presentationBusy?: boolean
 }>(), {
   disabled: false,
   pendingAction: null,
+  dismissed: false,
+  presentationAvailable: false,
+  presentationBusy: false,
 })
 
 const emit = defineEmits<{
   'implement-current': [target: PlanCardActionTarget]
   'implement-new': [target: PlanCardActionTarget]
   replan: [target: PlanCardActionTarget]
+  'presentation-change': [request: PlanPresentationRequest]
 }>()
 
 const { t } = useI18n()
@@ -211,6 +238,13 @@ const bodyStyle = computed<CSSProperties>(() =>
   bodyHeight.value ? { height: bodyHeight.value } : {},
 )
 const actionsDisabled = computed(() => props.disabled || props.pendingAction !== null)
+
+function changePresentation(dismissed: boolean) {
+  if (!props.presentationAvailable || props.presentationBusy) return
+  emit('presentation-change', {
+    planId: props.plan.planId, revisionId: props.plan.revisionId, dismissed,
+  })
+}
 
 function collapsedBodyHeight(): number {
   const element = bodyElement.value
@@ -330,6 +364,20 @@ watch(
   },
 )
 
+watch(() => props.dismissed, async () => {
+  cancelBodyAnimationFrame()
+  bodyAnimationToken += 1
+  bodyMotion.value = null
+  bodyHeight.value = ''
+  bodyResizeObserver?.disconnect()
+  await nextTick()
+  measureBodyOverflow()
+  if (typeof ResizeObserver !== 'undefined' && bodyContentElement.value) {
+    bodyResizeObserver = new ResizeObserver(measureBodyOverflow)
+    bodyResizeObserver.observe(bodyContentElement.value)
+  }
+})
+
 onBeforeUnmount(() => {
   cancelBodyAnimationFrame()
   bodyResizeObserver?.disconnect()
@@ -338,6 +386,23 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.plan-card__restoration {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.plan-card__restoration .plan-card__title {
+  margin: 0;
+}
+
+.plan-card__show,
+.plan-card__hide {
+  min-height: 44px;
+  flex-shrink: 0;
+}
+
 .plan-card {
   --plan-card-collapsed-height: 220px;
 

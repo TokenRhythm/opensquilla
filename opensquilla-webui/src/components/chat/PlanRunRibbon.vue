@@ -159,6 +159,15 @@
         <span v-if="statusReason" class="plan-run__reason">{{ statusReason }}</span>
       </span>
     </div>
+    <button
+      v-if="run.status === 'queued' || run.status === 'running' || (canCancel && !hasInspectableSteps)"
+      type="button"
+      class="plan-run__end plan-run__cancel"
+      :disabled="cancelBusy || disabled"
+      @click.stop="onEndPlan"
+    >{{ canCancel
+      ? (cancelBusy ? t('chat.planRun.endingPlan') : t('chat.planRun.endPlan'))
+      : (cancelBusy ? t('chat.planRun.cancelling') : t('chat.planRun.cancel')) }}</button>
   </section>
 </template>
 
@@ -485,7 +494,11 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
 <style scoped>
 .plan-run {
   position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
   width: min(440px, calc(100vw - 24px));
+  box-sizing: border-box;
   max-width: 100%;
   flex-shrink: 0;
   color: var(--text);
@@ -493,6 +506,7 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
 
 .plan-run__control {
   display: grid;
+  min-width: 0;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   width: 100%;
   max-width: calc(100vw - 24px);
@@ -821,6 +835,11 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
   cursor: not-allowed;
 }
 
+.plan-run__cancel {
+  flex-shrink: 0;
+  min-height: 44px;
+}
+
 .plan-run-popover-enter-active {
   transition:
     opacity var(--dur-base) var(--ease-out),
@@ -872,8 +891,8 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
 
 @media (max-width: 640px) {
   .plan-run {
-    width: calc(100vw - 16px);
-    max-width: calc(100vw - 16px);
+    width: 100%;
+    max-width: 100%;
   }
 
   .plan-run__summary,

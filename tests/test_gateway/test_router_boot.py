@@ -1700,8 +1700,13 @@ async def test_start_gateway_server_creates_default_subscription_manager(
 
     try:
         assert isinstance(captured_bridge["subscription_manager"], SubscriptionManager)
+        registry = captured_bridge["connection_registry"]
+        assert registry._unregister_listener == (
+            server._services.goal_service.on_connection_unregistered
+        )
     finally:
         await server.close()
+    assert captured_bridge["connection_registry"]._unregister_listener is None
 
 
 @pytest.mark.asyncio

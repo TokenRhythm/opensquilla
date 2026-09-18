@@ -4,12 +4,19 @@ import type {
   CollaborationSnapshot,
   PlanCardAction,
   PlanCardActionTarget,
+  PlanPresentationRequest,
+  PlanPresentationSnapshot,
   PlanRevisionRequest,
   PlanRevisionSnapshot,
   PlanRunSnapshot,
 } from '@/types/plans'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
+import {
+  forgetPlanImplementation,
+  planImplementationIdentity,
+  recoverPlanImplementation,
+} from '@/utils/chat/planImplementationRecovery'
 import {
   normalizeCollaborationSnapshot,
   normalizePlanRevisionSnapshot,
@@ -169,6 +176,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
     () => collaboration.value.mode,
   )
   const currentPlan = ref<PlanRevisionSnapshot | null>(null)
+  const planPresentations = ref<Record<string, PlanPresentationSnapshot>>({})
+  const presentationPending = ref<string | null>(null)
   const activePlanRun = ref<PlanRunSnapshot | null>(null)
   const settledTaskIds = ref<ReadonlySet<string>>(new Set())
   const visiblePlanRun = computed<PlanRunSnapshot | null>(() => {
@@ -195,14 +204,18 @@ export function useChatPlans(options: UseChatPlansOptions) {
   let acceptedEpoch = 0
   let modeMutationOwner: symbol | null = null
   let actionMutationOwner: symbol | null = null
+  let presentationMutationOwner: symbol | null = null
 
   function clearPlanState() {
     // Reset/session changes invalidate in-flight UI mutations. Their delayed
     // catch/finally blocks must not report into, or unlock, the new epoch.
     modeMutationOwner = null
     actionMutationOwner = null
+    presentationMutationOwner = null
     collaboration.value = { mode: 'default', revision: 0 }
     currentPlan.value = null
+    planPresentations.value = {}
+    presentationPending.value = null
     activePlanRun.value = null
     settledTaskIds.value = new Set()
     modeBusy.value = false
@@ -299,6 +312,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
 
   function applyResponse(value: unknown) {
     const source = objectRecord(value) ?? {}
+    applyPresentations(source.planPresentations ?? source.plan_presentations)
     const incomingCollaborationRevision = collaborationRevisionFrom(source)
     const staleEnvelope = incomingCollaborationRevision !== undefined
       && incomingCollaborationRevision < collaboration.value.revision
@@ -337,6 +351,26 @@ export function useChatPlans(options: UseChatPlansOptions) {
     }
   }
 
+  function applyPresentations(value: unknown) {
+    if (!Array.isArray(value)) return
+    const next = { ...planPresentations.value }
+    for (const item of value) {
+      const source = objectRecord(item)
+      if (!source || typeof source.revisionId !== 'string' || !source.revisionId
+        || typeof source.dismissed !== 'boolean'
+        || typeof source.stateRevision !== 'number'
+        || !Number.isInteger(source.stateRevision) || source.stateRevision < 0) continue
+      const current = next[source.revisionId]
+      if (current && current.stateRevision >= source.stateRevision) continue
+      next[source.revisionId] = {
+        revisionId: source.revisionId,
+        dismissed: source.dismissed,
+        stateRevision: source.stateRevision,
+      }
+    }
+    planPresentations.value = next
+  }
+
   function applyBootstrap(snapshot: unknown) {
     if (!payloadBelongsToSession(snapshot, options.sessionKey.value)) return
     if (!acceptEpoch(snapshot, true)) return
@@ -364,9 +398,12 @@ export function useChatPlans(options: UseChatPlansOptions) {
 
   function subscribe(): () => void {
     const subscription = options.planCenter.subscribe(event => {
-      if (event.kind === 'collaboration') applyCollaborationEvent({ sessionKey: event.sessionKey, collaboration: event.collaboration })
-      if (event.kind === 'revision') applyPlanRevisionEvent({ sessionKey: event.sessionKey, planRevision: event.plan, collaboration: event.collaboration })
-      if (event.kind === 'run') applyPlanRunEvent({ sessionKey: event.sessionKey, planRun: event.run })
+      const identity = { sessionKey: event.sessionKey, epoch: event.epoch }
+      if (event.kind === 'collaboration') applyCollaborationEvent({ ...identity, collaboration: event.collaboration })
+      if (event.kind === 'revision') applyPlanRevisionEvent({ ...identity, planRevision: event.plan, collaboration: event.collaboration })
+      if (event.kind === 'run') applyPlanRunEvent({ ...identity, planRun: event.run })
+      if (event.kind === 'presentation' && payloadBelongsToSession(identity, options.sessionKey.value)
+        && acceptEpoch(identity)) applyPresentations(event.planPresentations)
     })
     return () => subscription.close()
   }
@@ -488,9 +525,11 @@ export function useChatPlans(options: UseChatPlansOptions) {
     if (!options.sessionKey.value || modeBusy.value || pendingAction.value) return
     const sourceKey = options.sessionKey.value
     const sourceEpoch = acceptedEpoch
-    const targetKey = inNewSession
+    const identity = planImplementationIdentity(sourceKey, sourceEpoch, target.revisionId, inNewSession)
+    const recovery = recoverPlanImplementation(identity, () => inNewSession
       ? options.createSessionKey(options.agentId())
-      : sourceKey
+      : sourceKey)
+    const targetKey = recovery.targetSessionKey
     const owner = Symbol('plan-action-mutation')
     actionMutationOwner = owner
     pendingAction.value = inNewSession ? 'implement-new' : 'implement-current'
@@ -498,7 +537,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
       const response = await options.planCenter.implement(
         targetKey,
         target,
-        createClientRequestId(),
+        recovery.clientRequestId,
         inNewSession ? { intent: 'new_chat' } : undefined,
       )
       if (sourceKey !== options.sessionKey.value || sourceEpoch !== acceptedEpoch) return
@@ -509,6 +548,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
         applyResponse(response)
         options.onMutationAccepted?.()
       }
+      forgetPlanImplementation(identity)
     } catch (error) {
       if (
         actionMutationOwner === owner
@@ -521,6 +561,44 @@ export function useChatPlans(options: UseChatPlansOptions) {
       if (actionMutationOwner === owner) {
         actionMutationOwner = null
         pendingAction.value = null
+      }
+    }
+  }
+
+  async function setPresentation(request: PlanPresentationRequest): Promise<boolean> {
+    if (!options.sessionKey.value || presentationPending.value
+      || !options.planCenter.available('presentation')) return false
+    const key = options.sessionKey.value
+    const epoch = acceptedEpoch
+    const owner = Symbol('plan-presentation-mutation')
+    presentationMutationOwner = owner
+    presentationPending.value = request.revisionId
+    try {
+      const response = await options.planCenter.setPresentation({
+        sessionKey: key,
+        revisionId: request.revisionId,
+        dismissed: request.dismissed,
+        expectedEpoch: epoch,
+        expectedPresentationRevision: planPresentations.value[request.revisionId]?.stateRevision ?? 0,
+        clientRequestId: createClientRequestId(),
+      })
+      if (key !== options.sessionKey.value || epoch !== acceptedEpoch) return false
+      applyResponse(response)
+      return true
+    } catch (error) {
+      if (presentationMutationOwner === owner && key === options.sessionKey.value
+        && epoch === acceptedEpoch) {
+        const details = objectRecord(objectRecord(error)?.details)
+        if (details && payloadBelongsToSession(details, key) && acceptEpoch(details)) {
+          applyPresentations(details.planPresentations)
+        }
+        options.notifyError(error instanceof Error ? error.message : String(error))
+      }
+      return false
+    } finally {
+      if (presentationMutationOwner === owner) {
+        presentationMutationOwner = null
+        presentationPending.value = null
       }
     }
   }
@@ -544,6 +622,9 @@ export function useChatPlans(options: UseChatPlansOptions) {
         && key === options.sessionKey.value
         && epoch === acceptedEpoch
       ) {
+        const details = objectRecord(objectRecord(error)?.details)
+        const latest = normalizePlanRunSnapshot(details?.planRun)
+        if (latest?.runId === run.runId) applyPlanRun(latest)
         options.notifyError(error instanceof Error ? error.message : String(error))
       }
     } finally {
@@ -560,6 +641,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
     collaboration,
     initialCollaborationMode,
     currentPlan,
+    planPresentations,
+    presentationPending,
     currentPlanRevisionId,
     activePlanRun: visiblePlanRun,
     modeBusy,
@@ -577,6 +660,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     cancelReplan,
     revise,
     implement,
+    setPresentation,
     cancelRun,
   }
 }

@@ -80,6 +80,7 @@ class _ReconcilesCheckpointProvider:
         self.calls = 0
         self.model = "test/model"
         self.requests: list[list[Message]] = []
+        self.system_prompts: list[str] = []
         self.tool_names_per_request: list[set[str]] = []
 
     def chat(
@@ -90,6 +91,7 @@ class _ReconcilesCheckpointProvider:
     ) -> AsyncIterator[Any]:
         self.calls += 1
         self.requests.append(list(messages))
+        self.system_prompts.append(config.system or "")
         self.tool_names_per_request.append({tool.name for tool in tools or []})
         return self._stream(self.calls)
 
@@ -420,46 +422,23 @@ async def _preview_opener(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_plan_run_final_response_gets_one_checkpoint_reconciliation(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "provider_type", [_ReconcilesCheckpointProvider, _IgnoresReconciliationProvider],
+)
+async def test_plan_run_finishes_without_checkpoint_or_extra_model_call(
+    tmp_path: Path, provider_type: Any,
 ) -> None:
     plan_storage = _PlanStorage()
-    provider = _ReconcilesCheckpointProvider()
-
+    provider = provider_type()
     events = await _run(tmp_path, provider, plan_storage)
-
-    assert provider.calls == 3
-    assert plan_storage.run.status == "running"
-    assert plan_storage.run.current_step_id is None
-    assert any(
-        isinstance(event, WarningEvent) and event.code == "plan_run_reconciliation"
-        for event in events
-    )
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.text == "Implementation and verification are complete."
-    second_request = "\n".join(str(message.content) for message in provider.requests[1])
-    assert "[PlanRun reconciliation]" in second_request
-    assert '"currentStepId": "step-1"' in second_request
+    assert provider.calls == 1
+    assert plan_storage.run.current_step_id == "step-1"
+    assert not any(isinstance(event, (ErrorEvent, WarningEvent)) for event in events)
+    assert next(event for event in events if isinstance(event, DoneEvent)).text
 
 
 @pytest.mark.asyncio
-async def test_plan_run_cannot_succeed_after_ignoring_reconciliation(
-    tmp_path: Path,
-) -> None:
-    plan_storage = _PlanStorage()
-    provider = _IgnoresReconciliationProvider()
-
-    events = await _run(tmp_path, provider, plan_storage)
-
-    assert provider.calls == 2
-    errors = [event for event in events if isinstance(event, ErrorEvent)]
-    assert [event.code for event in errors] == ["plan_run_checkpoint_required"]
-    assert plan_storage.run.status == "running"
-
-
-@pytest.mark.asyncio
-async def test_final_checkpoint_rejects_later_workspace_mutation(
+async def test_final_checkpoint_allows_later_verification_and_repair(
     tmp_path: Path,
 ) -> None:
     plan_storage = _PlanStorage()
@@ -473,7 +452,7 @@ async def test_final_checkpoint_rejects_later_workspace_mutation(
         observed_calls=observed_calls,
     )
 
-    assert observed_calls == []
+    assert observed_calls == ["write_file:after-completion.txt:must not run"]
     assert plan_storage.run.status == "running"
     assert plan_storage.run.current_step_id is None
     assert not any(isinstance(event, ErrorEvent) for event in events)
@@ -481,7 +460,8 @@ async def test_final_checkpoint_rejects_later_workspace_mutation(
         "The implementation is complete."
     )
     denied_result = "\n".join(str(message.content) for message in provider.requests[1])
-    assert "plan_run_delivery_only" in denied_result
+    assert "plan_run_delivery_only" not in denied_result
+    assert "written" in denied_result
 
 
 @pytest.mark.asyncio
@@ -518,28 +498,31 @@ async def test_final_checkpoint_allows_prepared_preview_without_publication(tmp_
 
     assert observed_calls == ["open_workspace_preview:site/index.html"]
     assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert provider.tool_names_per_request[1] == {"publish_artifact", "open_workspace_preview"}
+    assert {"write_file", "exec_command", "publish_artifact"} <= provider.tool_names_per_request[1]
     assert plan_storage.run.current_step_id is None
-    approved = "\n".join(str(message.content) for message in provider.requests[0])
-    assert "only when the user explicitly requested" in approved
+    assert len(provider.system_prompts) == 2
+    for system_prompt in provider.system_prompts:
+        assert "## Approved Plan Execution" in system_prompt
+        assert "Only publish artifacts when the user requested" in system_prompt
 
 
 @pytest.mark.asyncio
-async def test_final_checkpoint_rejects_server_start(tmp_path: Path) -> None:
+async def test_final_checkpoint_preserves_ordinary_shell_tools(tmp_path: Path) -> None:
     plan_storage = _PlanStorage()
     provider = _CheckpointThenStartServerProvider()
     observed_calls: list[str] = []
 
     events = await _run(tmp_path, provider, plan_storage, observed_calls=observed_calls)
 
-    assert observed_calls == []
+    assert observed_calls == ["exec_command:python -m http.server"]
     assert not any(isinstance(event, ErrorEvent) for event in events)
     denied_result = "\n".join(str(message.content) for message in provider.requests[1])
-    assert "plan_run_delivery_only" in denied_result
+    assert "plan_run_delivery_only" not in denied_result
+    assert "started" in denied_result
 
 
 @pytest.mark.asyncio
-async def test_attached_plan_run_rejects_submit_control(
+async def test_attached_plan_run_uses_ordinary_submit_control(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -555,12 +538,12 @@ async def test_attached_plan_run_rejects_submit_control(
         observed_calls=observed_calls,
     )
 
-    assert "submit" not in observed_calls
+    assert "submit" in observed_calls
     assert plan_storage.run.status == "running"
     assert plan_storage.run.current_step_id is None
     assert not any(isinstance(event, ErrorEvent) for event in events)
     submit_result = "\n".join(str(message.content) for message in provider.requests[1])
-    assert "plan_run_checkpoint_required" in submit_result
+    assert "plan_run_checkpoint_required" not in submit_result
 
 
 @pytest.mark.asyncio

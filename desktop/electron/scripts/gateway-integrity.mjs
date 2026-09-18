@@ -89,6 +89,20 @@ export function assertGatewayResources(repoRoot, runtimeRoot) {
   const expected = migrationFiles(join(repoRoot, 'migrations'))
   if (Object.keys(expected).length === 0) fail('source migration set is empty')
   assertInventory(migrationFiles(join(packageDir, '_migrations')), expected, 'migrations')
+  const registryPath = join(packageDir, '_migrations', 'registry.json')
+  if (!existsSync(registryPath)) fail('frozen migration registry: missing')
+  const registry = JSON.parse(readFileSync(registryPath, 'utf8'))
+  if (registry.version !== 1 || !registry.migrations) fail('frozen migration registry: invalid')
+  const expectedRegistry = Object.fromEntries(Object.entries(expected).map(([filename, hash]) => {
+    const id = filename.slice(0, -3)
+    return [id, JSON.stringify({
+      ledger_hash: createHash('sha256').update(id).digest('hex'), source_sha256: hash,
+    })]
+  }))
+  const actualRegistry = Object.fromEntries(Object.entries(registry.migrations).map(([id, item]) => [
+    id, JSON.stringify({ ledger_hash: item.ledger_hash, source_sha256: item.source_sha256 }),
+  ]))
+  assertInventory(actualRegistry, expectedRegistry, 'frozen migration registry')
   assertRouterIntegrity(join(packageDir, routerRelative), join(repoRoot, 'src', 'opensquilla', routerRelative))
 }
 
@@ -114,6 +128,7 @@ export function gatewayInputs(repoRoot) {
     'desktop/electron/scripts/build-gateway.mjs', 'desktop/electron/scripts/gateway-entry.py',
     'desktop/electron/scripts/gateway-integrity.mjs',
     'scripts/release_dependency_inventory.py',
+    'scripts/freeze_migration_registry.py',
   ]) inputs[path] = fileHash(join(repoRoot, path))
   return inputs
 }

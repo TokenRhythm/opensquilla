@@ -15,6 +15,8 @@ pytestmark = pytest.mark.ci_serial
 
 
 def _windows_runtime() -> SimpleNamespace:
+    # Execution fixtures use workdir="." so a POSIX host's real /tmp workspace
+    # is not interpreted as the simulated Windows backend's virtual /tmp alias.
     return SimpleNamespace(
         effective=SimpleNamespace(sandbox_enabled=True),
         backend=SimpleNamespace(name="windows_default"),
@@ -759,7 +761,7 @@ async def test_exact_elevation_adds_user_windowsapps_to_host_path(
     try:
         result = await shell.exec_command(
             "winget install Tencent.QQ.NT",
-            workdir=str(tmp_path),
+            workdir=".",
             sandbox_permissions="require_escalated",
             justification="Install the exact package requested by the user.",
         )
@@ -769,8 +771,9 @@ async def test_exact_elevation_adds_user_windowsapps_to_host_path(
 
     assert "host-ok" in result
     assert host_calls
+    assert Path(str(host_calls[0]["cwd"])).resolve() == tmp_path.resolve()
     path_entries = host_calls[0]["env"]["PATH"].split(";")
-    assert path_entries[-1] == str(windows_apps)
+    assert path_entries[-1] == str(windows_apps.resolve())
 
 
 @pytest.mark.asyncio
@@ -1211,7 +1214,7 @@ async def test_exact_windows_host_probe_adds_user_windowsapps_to_host_env(
     try:
         result = await shell.exec_command(
             "where winget",
-            workdir=str(tmp_path),
+            workdir=".",
             sandbox_permissions="require_escalated",
             justification="Locate the exact host executable requested by the user.",
         )
@@ -1221,8 +1224,9 @@ async def test_exact_windows_host_probe_adds_user_windowsapps_to_host_env(
 
     assert "host-ok" in result
     assert host_calls
+    assert Path(str(host_calls[0]["cwd"])).resolve() == tmp_path.resolve()
     assert host_calls[0]["command"] == "where winget"
-    assert host_calls[0]["env"]["PATH"].split(";")[-1] == str(windows_apps)
+    assert host_calls[0]["env"]["PATH"].split(";")[-1] == str(windows_apps.resolve())
 
 
 def test_windows_shell_host_blocks_icmp_diagnostics_when_proxy_allowlist(
@@ -1372,7 +1376,7 @@ async def test_windows_exec_command_does_not_mount_program_files_tools_per_comma
                 "npm view lodash version && "
                 "git ls-remote https://github.com/opensquilla/opensquilla.git HEAD"
             ),
-            workdir=str(tmp_path),
+            workdir=".",
             env={"PATH": f"{node_root}{os.pathsep}{git_root / 'cmd'}"},
         )
     finally:
@@ -1380,6 +1384,7 @@ async def test_windows_exec_command_does_not_mount_program_files_tools_per_comma
 
     assert "ok" in result
     assert backend_requests
+    assert backend_requests[0].cwd == tmp_path.resolve()
     mount_paths = {mount.host_path for mount in backend_requests[0].policy.mounts}
     assert node_root not in mount_paths
     assert git_root not in mount_paths
@@ -1424,6 +1429,7 @@ async def test_windows_exec_command_preserves_terminal_backend_failure(
         return None
 
     async def _fake_run_backend(request, *, runtime=None):
+        assert request.cwd == tmp_path.resolve()
         raise SandboxBackendError("execution lease is busy")
 
     async def _fake_escalation(*args, **kwargs):
@@ -1455,7 +1461,7 @@ async def test_windows_exec_command_preserves_terminal_backend_failure(
     )
     try:
         with pytest.raises(SandboxBackendError, match="execution lease"):
-            await shell.exec_command("Write-Output ok", workdir=str(tmp_path))
+            await shell.exec_command("Write-Output ok", workdir=".")
     finally:
         current_tool_context.reset(token)
 

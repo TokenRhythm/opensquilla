@@ -149,8 +149,46 @@ class BackgroundCompletionManager:
         self._watch_task_owners: dict[asyncio.Task[None], tuple[str, str]] = {}
         self._parent_fence_refcounts: dict[str, int] = {}
         self._group_admissions: dict[str, dict[str, int]] = {}
+        self._pending_evictions: set[str] = set()
+        self._cancelling_groups: set[str] = set()
         self._watch_state_changed = asyncio.Event()
         self._closing = False
+        self._idle_listener: Callable[[str], None] | None = None
+        self._cancel_listener: Callable[[str, str], Awaitable[None]] | None = None
+
+    def set_idle_listener(self, listener: Callable[[str], None] | None) -> None:
+        """Notify ordinary producers after a completion group releases its parent."""
+        self._idle_listener = listener
+
+    def set_cancel_listener(
+        self, listener: Callable[[str, str], Awaitable[None]] | None,
+    ) -> None:
+        """Settle parent authority before a cancelled group releases its idle fence."""
+        self._cancel_listener = listener
+
+    def _notify_parent_idle(self, parent_session_key: str) -> None:
+        if self._idle_listener is not None:
+            try:
+                self._idle_listener(parent_session_key)
+            except Exception:
+                log.exception("background_completion.idle_listener_failed")
+
+    async def _finish_group_cancellations(
+        self, parent_session_key: str, group_ids: set[str],
+    ) -> None:
+        # Tombstones already block late wakes, while these groups stay visible
+        # to ordinary idle producers until cancellation authority is durable.
+        # On failure retain the fence; an exact cancellation retry can finish it.
+        if self._cancel_listener is not None:
+            prefix = f"subagent:{parent_session_key}:"
+            for group_id in sorted(group_ids):
+                await self._cancel_listener(parent_session_key, group_id.removeprefix(prefix))
+        async with self._state_lock:
+            released = bool(self._cancelling_groups.intersection(group_ids))
+            self._cancelling_groups.difference_update(group_ids)
+            self._notify_watch_state_changed()
+        if released:
+            self._notify_parent_idle(parent_session_key)
 
     @staticmethod
     def group_id(parent_session_key: str, parent_task_id: str) -> str:
@@ -247,8 +285,13 @@ class BackgroundCompletionManager:
         """Prevent existing subagent groups from waking an aborted parent."""
         async with self._state_lock:
             group_ids = self._group_ids_for_parent_sessions_locked((parent_session_key,))
+            active = group_ids & (
+                self._waiting_groups | self._wake_groups | self._cancelling_groups
+            )
             for group_id in group_ids:
                 self._cancel_group_locked(group_id)
+            self._cancelling_groups.update(active)
+        await self._finish_group_cancellations(parent_session_key, active)
         return len(group_ids)
 
     async def cancel_task(self, parent_session_key: str, parent_task_id: str) -> int:
@@ -259,11 +302,18 @@ class BackgroundCompletionManager:
                 (parent_session_key,)
             )
             was_known = group_id in known_group_ids
+            active = group_id in (
+                self._waiting_groups | self._wake_groups | self._cancelling_groups
+            )
             # Remember the exact cancellation even if group admission is racing
             # this call. A later admission for the same task must not revive it.
             self._group_parents.setdefault(group_id, parent_session_key)
             self._cancel_group_locked(group_id)
+            if active:
+                self._cancelling_groups.add(group_id)
             self._notify_watch_state_changed()
+        if active:
+            await self._finish_group_cancellations(parent_session_key, {group_id})
         return int(was_known)
 
     @contextlib.asynccontextmanager
@@ -313,9 +363,11 @@ class BackgroundCompletionManager:
         async with self._state_lock:
             return sorted(
                 group_id
-                for group_id in self._waiting_groups | self._wake_groups
+                for group_id in (
+                    self._waiting_groups | self._wake_groups | self._cancelling_groups
+                )
                 if self._group_parents.get(group_id) == parent_session_key
-                and group_id not in self._cancelled_groups
+                and (group_id not in self._cancelled_groups or group_id in self._cancelling_groups)
             )
 
     async def active_run_mode_override(self, parent_session_key: str) -> Any | None:
@@ -450,6 +502,13 @@ class BackgroundCompletionManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         async with self._state_lock:
+            released_parents = {
+                self._group_parents[group_id]
+                for group_id in (
+                    self._waiting_groups | self._wake_groups | self._cancelling_groups
+                )
+                if group_id in self._group_parents
+            }
             self._waiting_groups.clear()
             self._wake_groups.clear()
             self._delivery_attempted.clear()
@@ -462,8 +521,12 @@ class BackgroundCompletionManager:
             self._watch_task_owners.clear()
             self._parent_fence_refcounts.clear()
             self._group_admissions.clear()
+            self._pending_evictions.clear()
+            self._cancelling_groups.clear()
             self._notify_watch_state_changed()
             self._closing = True
+        for parent_session_key in released_parents:
+            self._notify_parent_idle(parent_session_key)
 
     async def _snapshot_watch_tasks(self) -> list[asyncio.Task[None]]:
         async with self._state_lock:
@@ -504,6 +567,9 @@ class BackgroundCompletionManager:
                 if not groups:
                     self._group_admissions.pop(parent_session_key, None)
             self._notify_watch_state_changed()
+            retry_eviction = group_id in self._pending_evictions
+        if retry_eviction:
+            await self._evict_group(group_id)
 
     async def _finish_quiesce_drain(self, keys: tuple[str, ...]) -> None:
         drain = asyncio.create_task(self._cancel_and_drain_parent_watchers(keys))
@@ -550,6 +616,7 @@ class BackgroundCompletionManager:
             await state_changed.wait()
 
     async def _release_parent_fences(self, keys: tuple[str, ...]) -> None:
+        released = []
         async with self._state_lock:
             for session_key in keys:
                 remaining = self._parent_fence_refcounts.get(session_key, 0) - 1
@@ -557,7 +624,10 @@ class BackgroundCompletionManager:
                     self._parent_fence_refcounts[session_key] = remaining
                 else:
                     self._parent_fence_refcounts.pop(session_key, None)
+                    released.append(session_key)
             self._notify_watch_state_changed()
+        for session_key in released:
+            self._notify_parent_idle(session_key)
 
     def _discard_watch_task(self, task: asyncio.Task[None]) -> None:
         self._watch_tasks.discard(task)
@@ -581,6 +651,7 @@ class BackgroundCompletionManager:
             *self._delivery_targets,
             *self._parent_envelopes,
             *self._parent_run_mode_overrides,
+            *self._cancelling_groups,
         }
         group_ids = {
             group_id for group_id in candidates if self._group_parents.get(group_id) in key_set
@@ -599,6 +670,8 @@ class BackgroundCompletionManager:
         return group_ids
 
     def _cancel_group_locked(self, group_id: str) -> None:
+        self._pending_evictions.discard(group_id)
+        self._cancelling_groups.discard(group_id)
         self._cancelled_groups.add(group_id)
         self._waiting_groups.discard(group_id)
         self._wake_groups.discard(group_id)
@@ -980,6 +1053,7 @@ class BackgroundCompletionManager:
             )
 
     async def _evict_group(self, group_id: str) -> None:
+        released_parent = None
         async with self._state_lock:
             current_task = asyncio.current_task()
             if any(
@@ -988,7 +1062,15 @@ class BackgroundCompletionManager:
             ):
                 return
             if any(groups.get(group_id, 0) > 0 for groups in self._group_admissions.values()):
+                self._pending_evictions.add(group_id)
                 return
+            self._pending_evictions.discard(group_id)
+            if (
+                not self._closing
+                and group_id not in self._cancelled_groups
+                and group_id in self._waiting_groups | self._wake_groups
+            ):
+                released_parent = self._group_parents.get(group_id)
             self._waiting_groups.discard(group_id)
             self._wake_groups.discard(group_id)
             self._delivery_attempted.discard(group_id)
@@ -997,6 +1079,8 @@ class BackgroundCompletionManager:
             self._parent_run_mode_overrides.pop(group_id, None)
             if group_id not in self._cancelled_groups:
                 self._group_parents.pop(group_id, None)
+        if released_parent is not None:
+            self._notify_parent_idle(released_parent)
 
 
 async def _require_current_parent_owner(

@@ -13,7 +13,6 @@ class CustomBuildHook(BuildHookInterface):
     """Fail standard distributions closed when their embedded WebUI is stale."""
 
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
-        del build_data
         if self.target_name == "wheel" and version == "editable":
             return
         if self.target_name not in {"wheel", "sdist"}:
@@ -27,6 +26,7 @@ class CustomBuildHook(BuildHookInterface):
         root = Path(self.root).resolve()
         sys.path.insert(0, str(root))
         try:
+            from scripts.freeze_migration_registry import freeze_registry
             from scripts.verify_webui_artifact import (
                 STAGED_DIST_RELATIVE,
                 verify_dist,
@@ -44,6 +44,21 @@ class CustomBuildHook(BuildHookInterface):
             )
             if self.target_name == "sdist":
                 verify_sdist_source_inventory(root / "opensquilla-webui")
+            registry = root / "build" / "migration-registry" / "registry.json"
+            freeze_registry(root / "migrations", registry)
+            source_registry = root / "migrations" / "registry.json"
+            if source_registry.is_file():
+                # An sdist already carries the frozen inventory. Its migrations
+                # directory is included by both standard targets, so adding the
+                # generated copy would publish the same archive path twice.
+                if source_registry.read_bytes() != registry.read_bytes():
+                    raise RuntimeError("Frozen migration registry does not match migration sources")
+            else:
+                build_data.setdefault("force_include", {})[str(registry)] = (
+                    "opensquilla/_migrations/registry.json"
+                    if self.target_name == "wheel"
+                    else "migrations/registry.json"
+                )
         except (ImportError, OSError, RuntimeError) as exc:
             privacy_note = (
                 " Standard sdists intentionally reject personal BGM; build a "

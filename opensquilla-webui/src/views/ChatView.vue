@@ -203,6 +203,9 @@
           :fork-busy="forkInFlight"
           :plan-action-pending="planCardPendingAction"
           :plan-actions-disabled="planActionsDisabled"
+          :plan-presentations="planPresentations"
+          :plan-presentation-available="planPresentationAvailable"
+          :plan-presentation-pending="planPresentationPending"
           :is-streaming="isStreaming"
           :follow-live-edge="autoScroll"
           :scroll-epoch="scrollEpoch"
@@ -234,6 +237,7 @@
           @plan-implement-current="implementCurrentPlan"
           @plan-implement-new="implementPlanInNewTask"
           @plan-replan="beginPlanRevision"
+          @plan-presentation-change="chatPlans.setPresentation"
           @goal-clear="clearGoal"
         >
           <template #router-strip="{ message: msg }">
@@ -285,9 +289,13 @@
           :plan="currentPlan"
           :disabled="planActionsDisabled"
           :pending-action="planCardPendingAction"
+          :dismissed="planPresentations[currentPlan.revisionId]?.dismissed"
+          :presentation-available="planPresentationAvailable"
+          :presentation-busy="Boolean(planPresentationPending)"
           @implement-current="implementCurrentPlan"
           @implement-new="implementPlanInNewTask"
           @replan="beginPlanRevision"
+          @presentation-change="chatPlans.setPresentation"
         />
 
         <!-- MetaSkill run cards: preflight checkpoint + progress ribbon,
@@ -523,6 +531,22 @@
     </Transition>
     <!-- Long-running goal progress lives in the same dock as plan execution so
          the active objective stays visible above the composer across turns. -->
+    <div
+      v-if="ordinaryTaskProgress && !executionDockRun && !activeGoalRun"
+      class="task-progress-dock"
+      :data-task-progress-id="taskProgress.taskId.value"
+    >
+      <ExecutionProgress :progress="ordinaryTaskProgress" />
+    </div>
+    <details v-if="goalDraftArmed && !shareMode && (goalTokenBudgetSupported || goalBackgroundExecutionSupported)" class="goal-draft-settings">
+      <summary>{{ t('chat.goal.settings') }}</summary>
+      <GoalExecutionSettings
+        v-model="goalDraftSettings"
+        :disabled="goalBusy"
+        :token-budget-supported="goalTokenBudgetSupported"
+        :background-execution-supported="goalBackgroundExecutionSupported"
+      />
+    </details>
     <Transition name="goal-run-dock">
       <div v-if="activeGoalRun" ref="goalRunDockRef" class="goal-run-dock">
         <GoalRibbon
@@ -532,6 +556,9 @@
           :plan-mode-active="initialCollaborationMode === 'plan'"
           :connection-takeover-available="goalConnectionTakeoverAvailable"
           :reattaching="goalReattaching"
+          :token-budget-supported="goalTokenBudgetSupported"
+          :background-execution-supported="goalBackgroundExecutionSupported"
+          @edit-open="prepareGoalExecutionSettings"
           @edit="editGoalFromRibbon"
           @pause="pauseGoal"
           @resume="resumeGoal"
@@ -817,6 +844,10 @@ import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
 import GoalRibbon from '@/components/chat/GoalRibbon.vue'
+import GoalExecutionSettings from '@/components/chat/GoalExecutionSettings.vue'
+import ExecutionProgress from '@/components/chat/ExecutionProgress.vue'
+import { useChatTaskProgress } from '@/composables/chat/useChatTaskProgress'
+import type { GoalExecutionOptions } from '@/modules/goalCenter'
 import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
@@ -1683,6 +1714,10 @@ const activeStreamSessionKey = ref<string>('')
 const acceptanceStopPending = ref(false)
 const acceptanceRecoveryPending = ref(false)
 const taskOwnership = useChatTaskOwnership()
+const taskProgress = useChatTaskProgress({
+  sessionKey, currentEpoch, activeTaskId: taskOwnership.stopTargetTaskId,
+})
+const ordinaryTaskProgress = taskProgress.progress
 const isStopPending = computed(() => (
   Boolean(taskOwnership.stopRequestedTaskId.value)
   || acceptanceStopPending.value
@@ -2282,6 +2317,8 @@ const {
   initialCollaborationMode,
   currentPlan,
   currentPlanRevisionId,
+  planPresentations,
+  presentationPending: planPresentationPending,
   activePlanRun,
   modeBusy: planModeBusy,
   modeAppliesNextTurn: planModeAppliesNextTurn,
@@ -2651,6 +2688,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   onSnapshot: snapshot => {
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
+    taskProgress.applySnapshot(snapshot)
     applyGoalSnapshot(snapshot)
     applyPendingUserInputSnapshot(snapshot)
   },
@@ -3218,6 +3256,10 @@ const chatGoals = useChatGoals({
 applyGoalSnapshot = snapshot => { chatGoals.applyHydration(snapshot) }
 const {
   draftArmed: goalDraftArmed,
+  draftSettings: goalDraftSettings,
+  tokenBudgetSupported: goalTokenBudgetSupported,
+  backgroundExecutionSupported: goalBackgroundExecutionSupported,
+  prepareExecutionSettings: prepareGoalExecutionSettings,
   goal: currentGoalRun,
   activeGoal: activeGoalRun,
   lastGoal: lastGoalRun,
@@ -3241,10 +3283,11 @@ disarmGoalDraftForMetaRestore = disarmGoalMode
 async function editGoalFromRibbon(
   objective: string,
   settle?: (accepted: boolean) => void,
+  executionOptions?: GoalExecutionOptions,
 ) {
   let accepted = false
   try {
-    accepted = await editGoal(objective)
+    accepted = await editGoal(objective, executionOptions)
     if (accepted) {
       pushToast(t('chat.goal.editNextTurn'), { tone: 'info', duration: 6000 })
     }
@@ -3947,7 +3990,11 @@ function onPlanQuestionnaireTouchEnd() {
 
 const rpcEventHandlers = useChatRpcEventHandlers({
   onRecoveryRequired: () => { void recoverCurrentSession() },
-  onTaskSettled: (taskId, epoch) => chatPlans.noteTaskSettled(taskId, epoch),
+  onTaskProgress: taskProgress.applyEvent,
+  onTaskSettled: (taskId, epoch) => {
+    chatPlans.noteTaskSettled(taskId, epoch)
+    taskProgress.noteTaskSettled(taskId, epoch)
+  },
   conversationRuntime,
   sessionKey,
   currentEpoch,
@@ -4542,6 +4589,9 @@ const composerHasSendContent = computed(() =>
 // contract. Hide Plan rather than claim a read-only turn that would run Default.
 const planUiAvailable = computed(() =>
   planCenter.available('mode'),
+)
+const planPresentationAvailable = computed(() =>
+  !shareMode.value && !forkTransition.value && planCenter.available('presentation'),
 )
 const goalUiAvailable = computed(() => goalCenter.available('goal-mode'))
 const goalComposerExisting = computed(() => (
@@ -7435,6 +7485,26 @@ watch(
 <style scoped src="../styles/chat-view.css"></style>
 
 <style scoped>
+.task-progress-dock {
+  width: var(--chat-col, min(calc(100% - 48px), 980px));
+  margin: var(--sp-2) auto;
+  font-size: var(--fs-xs);
+}
+
+.goal-draft-settings {
+  width: var(--chat-col, min(calc(100% - 48px), 980px));
+  max-width: 100%;
+  box-sizing: border-box;
+  margin: var(--sp-2) auto;
+  padding: var(--sp-2);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+.goal-draft-settings summary {
+  min-height: 44px;
+  cursor: pointer;
+}
+
 /* No shared sr-only utility exists in this repo (each component scopes its
    own), so the completion announcer's clip-out lives here: zero visual
    footprint, still exposed to assistive tech. */

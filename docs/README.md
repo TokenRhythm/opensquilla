@@ -23,6 +23,8 @@ root release README with task-oriented guides.
 ## Feature Guides
 
 - [`features.md`](features.md) - capability catalog.
+- [`plan-mode.md`](plan-mode.md) - investigation, versioned proposals, flexible
+  implementation, progress, cancellation and continuation.
 - [`features/squilla-router.md`](features/squilla-router.md) - model routing.
 - [`features/tui-frontend.md`](features/tui-frontend.md) - terminal backend
   architecture, plugin slots, Router HUD, and OpenTUI validation.

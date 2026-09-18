@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from wcwidth import iter_graphemes, wcswidth
+
 from tui_real_terminal.driver import TerminalFrame
 
 _ANSI_RE = re.compile(
@@ -197,6 +199,14 @@ def _screen_lines(frame: TerminalFrame, text: str) -> list[str]:
     lines: list[str] = []
     cols = frame.size.cols
     for line in text.splitlines():
+        # Geometry uses terminal cells, not Python character offsets. Keep the
+        # first codepoint of each visible grapheme and reserve continuation
+        # cells so CJK, emoji and combining sequences cannot move an edge.
+        line = "".join(
+            cluster[0] + " " * (width - 1)
+            for cluster in iter_graphemes(line)
+            if (width := wcswidth(cluster)) > 0
+        )
         if cols > 0 and len(line) > cols:
             lines.extend(
                 line[index : index + cols] for index in range(0, len(line), cols)

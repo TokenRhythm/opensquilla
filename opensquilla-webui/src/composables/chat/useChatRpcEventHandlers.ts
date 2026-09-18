@@ -156,6 +156,7 @@ export interface UseChatRpcEventHandlersOptions {
   normalizeRunStatus: (status: string) => string
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
+  onTaskProgress?: (payload: ConversationEventData) => void
   updateRouterExecutionModel?: (model: string, turnId?: string) => void
   onTaskSettled?: (taskId: string, epoch?: number) => void
   queueRouterDecision: (payload: ConversationRoutingDecision, identityStreamSeq?: number) => void
@@ -2552,6 +2553,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           break
         case 'session-epoch-changed':
           handleRpcEpochChanged(event.payload)
+          break
+        case 'execution-progress':
+          options.onTaskProgress?.(event.payload)
           break
         case 'task-queued':
           handleRpcTaskQueued(event.payload)

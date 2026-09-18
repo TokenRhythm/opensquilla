@@ -1,7 +1,9 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
+import i18n from '@/i18n'
+import { forgetGoalSet, forgetGoalSetsForSession, goalSetIdentity, recoverGoalSet } from '@/utils/chat/goalSetRecovery'
 import { goalErrorMessage as localizeGoalRpcError } from '@/utils/goalErrorPresentation'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
-import { GoalCenterError, type GoalCenter } from '@/modules/goalCenter'
+import { GoalCenterError, goalUsageSupportsBudget, normalizeGoalUsageCoverage, supportedGoalExecutionOptions, type GoalCenter, type GoalExecutionOptions } from '@/modules/goalCenter'
 import type { GoalContinuity, GoalEvent } from '@/modules/goalContinuity'
 
 export type GoalStatus = 'active' | 'paused' | 'blocked' | 'usage_limited' | 'complete'
@@ -57,6 +59,11 @@ export interface GoalSnapshot {
   activeTimeMs: number
   windowActiveTimeMs: number
   usage: GoalUsage
+  tokenBudget?: number | null
+  budgetTokensUsed?: number
+  usageCoverage?: 'complete' | 'partial_history' | 'partial_usage'
+  usageAccountingStartedAtMs?: number | null
+  executionPolicy?: 'foreground' | 'background'
   pauseReason: string | null
   blockedReason: string | null
   terminalReason: string | null
@@ -182,6 +189,11 @@ export function goalHasRenderedTerminalAnchor(
     && !message.stopNotice
     && message.turnId === terminalTurnId
   ))
+}
+
+export function goalExecutionOptionsValid(options: GoalExecutionOptions): boolean {
+  return (options.tokenBudget == null || (Number.isSafeInteger(options.tokenBudget) && options.tokenBudget > 0))
+    && (options.executionPolicy === undefined || options.executionPolicy === 'foreground' || options.executionPolicy === 'background')
 }
 
 function goalObjectiveIsValid(objective: string): boolean {
@@ -374,6 +386,11 @@ export function normalizeGoal(value: unknown): GoalSnapshot | null {
     activeTimeMs: integerField(source, 'activeTimeMs', 'active_time_ms') ?? 0,
     windowActiveTimeMs: integerField(source, 'windowActiveTimeMs', 'window_active_time_ms') ?? 0,
     usage: normalizeUsage(source.usage),
+    tokenBudget: integerField(source, 'tokenBudget', 'token_budget') ?? null,
+    budgetTokensUsed: integerField(source, 'budgetTokensUsed', 'budget_tokens_used') ?? 0,
+    usageAccountingStartedAtMs: integerField(source, 'usageAccountingStartedAtMs', 'usage_accounting_started_at_ms') ?? null,
+    usageCoverage: normalizeGoalUsageCoverage(stringField(source, 'usageCoverage', 'usage_coverage')),
+    executionPolicy: stringField(source, 'executionPolicy', 'execution_policy') === 'background' ? 'background' : 'foreground',
     pauseReason: nullableStringField(source, 'pauseReason', 'pause_reason'),
     blockedReason: nullableStringField(source, 'blockedReason', 'blocked_reason'),
     terminalReason: nullableStringField(source, 'terminalReason', 'terminal_reason'),
@@ -427,10 +444,53 @@ function goalSnapshotStreamSeq(value: unknown): number | undefined {
 
 export function useChatGoals(options: UseChatGoalsOptions) {
   const draftArmed = ref(false)
+  const draftSettings = ref<GoalExecutionOptions>({})
+  const draftSettingsValid = computed(() => goalExecutionOptionsValid(executionOptionsForConnection(draftSettings.value)))
   const goal = ref<GoalSnapshot | null>(null)
   const busy = ref(false)
   const connectionTakeoverAvailable = ref(false)
   const reattaching = ref(false)
+  const tokenBudgetSupported = ref(false)
+  const backgroundExecutionSupported = ref(false)
+  let capabilitiesGeneration = 0
+  let capabilitiesLoaded = false
+  let capabilitiesRequest: Promise<void> | null = null
+
+  function invalidateExecutionCapabilities() {
+    capabilitiesGeneration += 1
+    capabilitiesLoaded = false
+    capabilitiesRequest = null
+    tokenBudgetSupported.value = false
+    backgroundExecutionSupported.value = false
+  }
+
+  // Load only for Goal settings/submit gestures, never during startup or automatic reconnect.
+  function prepareExecutionSettings(): Promise<void> {
+    if (capabilitiesLoaded) return Promise.resolve()
+    if (capabilitiesRequest) return capabilitiesRequest
+    if (options.connectionAvailable?.() === false || !options.goalCenter.available('goal-mode')) {
+      return Promise.resolve()
+    }
+    const generation = capabilitiesGeneration
+    capabilitiesRequest = options.goalCenter.capabilities().then(capabilities => {
+      if (generation !== capabilitiesGeneration) return
+      tokenBudgetSupported.value = capabilities.tokenBudgetSupported === true
+      backgroundExecutionSupported.value = capabilities.backgroundExecutionSupported === true
+      capabilitiesLoaded = true
+    }).catch(() => {
+      // Optional settings stay unavailable; ordinary Goal commands remain usable.
+    }).finally(() => {
+      if (generation === capabilitiesGeneration) capabilitiesRequest = null
+    })
+    return capabilitiesRequest
+  }
+
+  function executionOptionsForConnection(settings: GoalExecutionOptions) {
+    return supportedGoalExecutionOptions(settings, {
+      tokenBudgetSupported: tokenBudgetSupported.value,
+      backgroundExecutionSupported: backgroundExecutionSupported.value,
+    })
+  }
 
   let acceptedSessionId = ''
   let acceptedEpoch = 0
@@ -482,10 +542,12 @@ export function useChatGoals(options: UseChatGoalsOptions) {
 
   function arm() {
     draftArmed.value = true
+    void prepareExecutionSettings()
   }
 
   function disarm() {
     draftArmed.value = false
+    draftSettings.value = {}
   }
 
   function continuityKeysForSession(sessionKey: string): string[] {
@@ -969,6 +1031,8 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   }
 
   async function startGoal(text: string): Promise<boolean> {
+    if (!draftSettingsValid.value) return false
+    const requestedExecutionOptions = { ...draftSettings.value }
     const objective = String(text || '').trim()
     if (!goalObjectiveIsValid(objective)) return false
     if (busy.value || startGoalOwner !== null) return false
@@ -977,6 +1041,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     busy.value = true
     const resolveKey = options.ensureSessionKey ?? (async () => options.sessionKey.value)
     let key = ''
+    let requestIdentity = ''
     try {
       key = await resolveKey()
       if (owner !== startGoalOwner || !key || key !== options.sessionKey.value) return false
@@ -984,15 +1049,33 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       if (owner !== startGoalOwner || key !== options.sessionKey.value) return false
       mutationOwner = owner
       busy.value = true
-      const clientRequestId = createClientRequestId()
-      const clientMessageId = createClientRequestId()
+      // A selected budget/background policy is part of the operation being retried.
+      // Confirm support on the current connection; never silently weaken that intent.
+      if (requestedExecutionOptions.tokenBudget != null || requestedExecutionOptions.executionPolicy === 'background') {
+        await prepareExecutionSettings()
+        if (owner !== mutationOwner || key !== options.sessionKey.value) return false
+        if ((requestedExecutionOptions.tokenBudget != null && !tokenBudgetSupported.value)
+          || (requestedExecutionOptions.executionPolicy === 'background' && !backgroundExecutionSupported.value)) {
+          options.notify?.(i18n.global.t('chat.goal.settingsNotConfirmed'))
+          return false
+        }
+      }
+      // Capability discovery must not change the recovery identity of a user intent.
+      requestIdentity = goalSetIdentity(key, options.currentEpoch?.value ?? 0, objective, requestedExecutionOptions)
+      const executionOptions = executionOptionsForConnection(requestedExecutionOptions)
+      const { clientRequestId, clientMessageId } = recoverGoalSet(requestIdentity)
       const result = await options.goalCenter.set({
         sessionKey: key,
         objective,
         clientRequestId,
         clientMessageId,
+        ...executionOptions,
       })
-      if (result.accepted !== true) return false
+      if (result.accepted !== true) {
+        if (result.accepted === false) forgetGoalSet(requestIdentity)
+        return false
+      }
+      forgetGoalSet(requestIdentity)
       const response: GoalMutationResponse = {
         accepted: true,
         clientRequestId: result.clientRequestId ?? clientRequestId,
@@ -1008,6 +1091,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       if (owner !== mutationOwner || key !== options.sessionKey.value) return false
       const applied = applyMutationResponse(response)
       if (applied) {
+        forgetGoalSetsForSession(key)
         rememberContinuityToken(response)
         try {
           await options.onSetAccepted?.({ objective, clientMessageId, response })
@@ -1020,6 +1104,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       }
       return applied && response.accepted === true
     } catch (error) {
+      if (requestIdentity && record(error)?.accepted === false) forgetGoalSet(requestIdentity)
       applyConflictSnapshot(error)
       options.notify?.(localizeGoalRpcError(error))
       return false
@@ -1073,6 +1158,9 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       if (method === 'goals.pause' || method === 'goals.clear') {
         removeContinuityRecord(current)
       }
+      if (method === 'goals.clear' && response.accepted === true) {
+        forgetGoalSetsForSession(key)
+      }
       return response.accepted === true
     } catch (error) {
       applyConflictSnapshot(error)
@@ -1089,15 +1177,37 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   const pause = () => mutate('goals.pause')
   const resume = () => mutate('goals.resume')
   const clear = () => mutate('goals.clear')
-  const edit = (objective: string) => {
+  const edit = async (objective: string, executionOptions: GoalExecutionOptions = {}) => {
+    if (!goalExecutionOptionsValid(executionOptions)) return false
     const normalized = String(objective || '').trim()
     if (!goalObjectiveIsValid(normalized)) {
       options.notify?.(localizeGoalRpcError(
         new GoalCenterError('invalid', '', { reason: 'invalid-objective' }),
       ))
-      return Promise.resolve(false)
+      return false
     }
-    return mutate('goals.edit', { objective: normalized })
+    if (executionOptions.tokenBudget !== undefined || executionOptions.executionPolicy !== undefined) {
+      const target = goal.value
+      const key = options.sessionKey.value
+      if (!target) return false
+      await prepareExecutionSettings()
+      if (options.sessionKey.value !== key || goal.value?.goalId !== target.goalId
+        || goal.value.epoch !== target.epoch) return false
+      if ((executionOptions.tokenBudget !== undefined && !tokenBudgetSupported.value)
+        || (executionOptions.executionPolicy !== undefined && !backgroundExecutionSupported.value)) {
+        options.notify?.(i18n.global.t('chat.goal.settingsNotConfirmed'))
+        return false
+      }
+      if (executionOptions.tokenBudget != null && !goalUsageSupportsBudget(goal.value.usageCoverage)) {
+        options.notify?.(i18n.global.t(goal.value.usageCoverage === 'partial_usage'
+          ? 'chat.goal.pendingUsageReceipts' : 'chat.goal.usageCoverageUnavailable'))
+        return false
+      }
+    }
+    return mutate('goals.edit', {
+      objective: normalized,
+      ...executionOptions,
+    })
   }
 
   async function status(): Promise<GoalSnapshot | null> {
@@ -1137,13 +1247,19 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   }
 
   if (options.connectionEpoch) watch(options.connectionEpoch, () => {
+    invalidateExecutionCapabilities()
     automaticReattachWatermarks.clear()
     clearContinuityRetry()
   }, { flush: 'sync' })
-  onBeforeUnmount(() => { goalSubscription.close(); clearContinuityRetry() })
+  onBeforeUnmount(() => { invalidateExecutionCapabilities(); goalSubscription.close(); clearContinuityRetry() })
 
   return {
     draftArmed,
+    draftSettings,
+    draftSettingsValid,
+    tokenBudgetSupported,
+    backgroundExecutionSupported,
+    prepareExecutionSettings,
     goal,
     activeGoal,
     lastGoal,

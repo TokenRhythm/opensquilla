@@ -10,7 +10,10 @@ import pytest
 
 from opensquilla import browser as module
 from opensquilla.browser import DesktopBrowserClient, DesktopBrowserError
+from opensquilla.tool_boundary import ToolCall
 from opensquilla.tools.builtin.browser import browser
+from opensquilla.tools.dispatch import build_tool_handler
+from opensquilla.tools.registry import ToolRegistry, get_default_registry
 from opensquilla.tools.types import SafeToolError, ToolContext, current_tool_context
 
 
@@ -77,7 +80,7 @@ async def test_request_authenticates_and_keeps_exact_target_identity(monkeypatch
         )
 
 
-async def test_image_bytes_use_ephemeral_media_and_plan_blocks_mutation():
+async def test_image_bytes_use_ephemeral_media():
     captured = base64.b64encode(b"\x89PNG\r\n\x1a\nsynthetic").decode()
 
     async def request(**kwargs):
@@ -98,11 +101,87 @@ async def test_image_bytes_use_ephemeral_media_and_plan_blocks_mutation():
         result = json.loads(await browser("screenshot", "target-one", _tool_use_id="tool-one"))
         assert "dataBase64" not in result
         assert context.tool_result_media["tool-one"][0]["data"] == captured
-        context.collaboration_mode = "plan"
-        with pytest.raises(SafeToolError, match="READ_ONLY"):
-            await browser("act", "target-one", action="click", ref="node-one")
     finally:
         current_tool_context.reset(token)
+
+
+def _browser_dispatch(context):
+    registry = ToolRegistry()
+    registered = get_default_registry().get("browser")
+    assert registered is not None
+    registry.register(registered.spec, browser)
+    return build_tool_handler(registry, context)
+
+
+@pytest.mark.parametrize("mode", ["default", "plan"])
+@pytest.mark.parametrize("operation,arguments", [
+    ("open", {"url": "https://example.invalid/research"}),
+    ("act", {"targetRef": "target-one", "action": "click", "ref": "node-one"}),
+    ("reload", {"targetRef": "target-one"}),
+])
+async def test_browser_investigation_uses_ordinary_dispatch(mode, operation, arguments):
+    requests = []
+
+    async def request(**kwargs):
+        requests.append(kwargs)
+        return {"targetRef": "target-one"}
+
+    context = ToolContext(
+        is_owner=True, session_key="session-one", collaboration_mode=mode,
+        allowed_tools={"browser"}, desktop_browser=SimpleNamespace(request=request),
+        run_mode="safe",
+    )
+    result = await _browser_dispatch(context)(ToolCall(
+        tool_use_id="investigate", tool_name="browser",
+        arguments={"operation": operation, **arguments},
+    ))
+    assert not result.is_error, result.content
+    assert json.loads(result.content) == {"targetRef": "target-one"}
+    expected = {"session_key": "session-one", "operation": operation,
+                "target_ref": arguments.get("targetRef")}
+    expected.update({k: v for k, v in arguments.items() if k != "targetRef"})
+    assert requests == [expected]
+
+
+@pytest.mark.parametrize("restriction,error_class", [
+    ("non_owner", "OwnerOnly"), ("denied_tool", "PolicyDenied"),
+])
+async def test_plan_browser_preserves_ordinary_authorization(restriction, error_class):
+    async def must_not_request(**kwargs):
+        raise AssertionError("A denied tool must not reach the desktop browser")
+
+    context = ToolContext(
+        is_owner=restriction != "non_owner", session_key="session-one",
+        collaboration_mode="plan", allowed_tools={"browser"},
+        denied_tools={"browser"} if restriction == "denied_tool" else set(),
+        desktop_browser=SimpleNamespace(request=must_not_request), run_mode="safe",
+    )
+    result = await _browser_dispatch(context)(ToolCall(
+        tool_use_id="denied", tool_name="browser",
+        arguments={"operation": "open", "url": "https://example.invalid/research"},
+    ))
+    assert result.is_error
+    assert json.loads(result.content)["error_class"] == error_class
+
+
+async def test_plan_browser_preserves_native_navigation_policy(monkeypatch):
+    async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda _request: httpx.Response(
+        403, json={"ok": False, "code": "NAVIGATION_BLOCKED"},
+    ))
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient", lambda **kwargs: async_client(**kwargs, transport=transport),
+    )
+    context = ToolContext(
+        is_owner=True, session_key="session-one", collaboration_mode="plan",
+        allowed_tools={"browser"}, run_mode="safe",
+        desktop_browser=DesktopBrowserClient("http://127.0.0.1:9000/v1/browser", "x" * 48),
+    )
+    result = await _browser_dispatch(context)(ToolCall(
+        tool_use_id="blocked-navigation", tool_name="browser",
+        arguments={"operation": "open", "url": "file:///private/synthetic"},
+    ))
+    assert result.is_error and "BROWSER_NAVIGATION_BLOCKED" in result.content
 
 
 @pytest.mark.parametrize(

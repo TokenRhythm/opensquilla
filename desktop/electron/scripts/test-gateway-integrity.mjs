@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -32,11 +33,21 @@ function fixture(t) {
     'desktop/electron/scripts/build-gateway.mjs', 'desktop/electron/scripts/gateway-entry.py',
     'desktop/electron/scripts/gateway-integrity.mjs',
     'scripts/release_dependency_inventory.py',
+    'scripts/freeze_migration_registry.py',
   ]) write(path, path)
   const runtime = join(repo, 'runtime')
   const packageDir = join(runtime, 'opensquilla-gateway', '_internal', 'opensquilla')
   mkdirSync(packageDir, { recursive: true })
   cpSync(join(repo, 'migrations'), join(packageDir, '_migrations'), { recursive: true })
+  writeFileSync(join(packageDir, '_migrations', 'registry.json'), JSON.stringify({
+    version: 1,
+    migrations: Object.fromEntries([
+      'V010__one', 'V010__two', 'V040__document_resources',
+    ].map(id => [id, {
+      ledger_hash: createHash('sha256').update(id).digest('hex'),
+      source_sha256: fileHash(join(repo, 'migrations', `${id}.py`)),
+    }])),
+  }))
   cpSync(join(repo, router), join(packageDir, 'squilla_router/models/v4.2_phase3_inference'), { recursive: true })
   write('runtime/opensquilla-gateway/opensquilla-gateway.exe', 'unsigned gateway')
   write('runtime/dependency-inventory.json', JSON.stringify({
@@ -58,6 +69,21 @@ test('prepared output and a separately copied final bundle match source', (t) =>
   verifyGatewayIntegrity(repo, bundle)
   assert.throws(() => verifyGatewayIntegrity(repo, bundle, { prepared: true }), /prepared Gateway outputs/)
 })
+
+for (const fault of ['missing', 'incomplete', 'changed']) {
+  test(`frozen migration registry ${fault} is rejected`, (t) => {
+    const { repo, runtime, packageDir } = fixture(t)
+    const path = join(packageDir, '_migrations', 'registry.json')
+    if (fault === 'missing') rmSync(path)
+    else {
+      const registry = JSON.parse(readFileSync(path, 'utf8'))
+      if (fault === 'incomplete') delete registry.migrations.V010__two
+      else registry.migrations.V010__one.source_sha256 = '0'.repeat(64)
+      writeFileSync(path, JSON.stringify(registry))
+    }
+    assert.throws(() => assertGatewayResources(repo, runtime), /frozen migration registry/)
+  })
+}
 
 test('dependency inventory stays bound to the build after executable signing', (t) => {
   const { repo, runtime, write } = fixture(t)

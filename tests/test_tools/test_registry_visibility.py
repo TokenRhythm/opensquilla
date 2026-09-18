@@ -113,7 +113,7 @@ def test_default_registry_removes_obsolete_wrapper_tools_but_keeps_canonical_too
     assert registry.get("subagents") is not None
 
 
-def test_retired_update_plan_selector_is_ignored_for_upgrade_compatibility() -> None:
+def test_existing_update_plan_selector_allows_the_registered_progress_tool() -> None:
     import opensquilla.tools.builtin  # noqa: F401
     from opensquilla.gateway.config import GatewayConfig, ToolsConfig
     from opensquilla.tools.policy import apply_tool_policy_from_config
@@ -126,8 +126,19 @@ def test_retired_update_plan_selector_is_ignored_for_upgrade_compatibility() -> 
         config=GatewayConfig(tools=ToolsConfig(profile="minimal", also_allow=["update_plan"])),
     )
 
-    assert registry.get("update_plan") is None
-    assert "update_plan" not in {tool.name for tool in registry.to_tool_definitions(ctx)}
+    assert registry.get("update_plan") is not None
+    assert "update_plan" in {tool.name for tool in registry.to_tool_definitions(ctx)}
+
+    denied_ctx = apply_tool_policy_from_config(
+        ToolContext(is_owner=True, caller_kind=CallerKind.AGENT),
+        available_tools=registry.list_names(),
+        config=GatewayConfig(tools=ToolsConfig(
+            profile="minimal", also_allow=["update_plan"], deny=["update_plan"],
+        )),
+    )
+    assert "update_plan" not in {
+        tool.name for tool in registry.to_tool_definitions(denied_ctx)
+    }
 
 
 def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() -> None:

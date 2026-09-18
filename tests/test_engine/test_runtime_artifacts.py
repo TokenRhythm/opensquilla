@@ -170,14 +170,14 @@ class _GoalPostPublishLoopProvider:
         post_publish_error_code: str | None = None,
         post_publish_tool_failure: bool = False,
         terminal_status: str = "complete",
-        illegal_terminal_summary_tool: bool = False,
+        post_terminal_tool: bool = False,
         terminal_summary_mode: str = "normal",
     ) -> None:
         self.plain_final = plain_final
         self.post_publish_error_code = post_publish_error_code
         self.post_publish_tool_failure = post_publish_tool_failure
         self.terminal_status = terminal_status
-        self.illegal_terminal_summary_tool = illegal_terminal_summary_tool
+        self.post_terminal_tool = post_terminal_tool
         self.terminal_summary_mode = terminal_summary_mode
         self.calls = 0
         self.model = "test/model"
@@ -260,19 +260,19 @@ class _GoalPostPublishLoopProvider:
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
-        if self.illegal_terminal_summary_tool:
-            yield ProviderToolUseStart(tool_use_id="qa-illegal", tool_name="qa_check")
+        if call_number == 4 and self.post_terminal_tool:
+            yield ProviderToolUseStart(tool_use_id="qa-after-terminal", tool_name="qa_check")
             yield ProviderToolUseEnd(
-                tool_use_id="qa-illegal",
+                tool_use_id="qa-after-terminal",
                 tool_name="qa_check",
                 arguments={"path": "report.html"},
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
-        if self.terminal_summary_mode == "empty":
+        if call_number == 4 and self.terminal_summary_mode == "empty":
             yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=0)
             return
-        if self.terminal_summary_mode == "reasoning_only":
+        if call_number == 4 and self.terminal_summary_mode == "reasoning_only":
             yield ProviderDone(
                 stop_reason="stop",
                 input_tokens=1,
@@ -281,14 +281,14 @@ class _GoalPostPublishLoopProvider:
                 reasoning_content="Synthetic internal reasoning.",
             )
             return
-        if self.terminal_summary_mode == "stream_incomplete":
+        if call_number == 4 and self.terminal_summary_mode == "stream_incomplete":
             yield ProviderText(text="Partial terminal summary")
             return
-        if self.terminal_summary_mode == "length_capped":
+        if call_number == 4 and self.terminal_summary_mode == "length_capped":
             yield ProviderText(text="Partial terminal summary")
             yield ProviderDone(stop_reason="length", input_tokens=1, output_tokens=1)
             return
-        yield ProviderText(text="The Goal is complete.")
+        yield ProviderText(text=f"The Goal is {self.terminal_status}.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     async def list_models(self) -> list[ModelInfo]:
@@ -1438,7 +1438,7 @@ async def _run_goal_publish_loop(
     post_publish_error_code: str | None = None,
     post_publish_tool_failure: bool = False,
     terminal_status: str = "complete",
-    illegal_terminal_summary_tool: bool = False,
+    post_terminal_tool: bool = False,
     terminal_summary_mode: str = "normal",
     max_iterations: int | None = None,
 ) -> tuple[
@@ -1461,7 +1461,7 @@ async def _run_goal_publish_loop(
         post_publish_error_code=post_publish_error_code,
         post_publish_tool_failure=post_publish_tool_failure,
         terminal_status=terminal_status,
-        illegal_terminal_summary_tool=illegal_terminal_summary_tool,
+        post_terminal_tool=post_terminal_tool,
         terminal_summary_mode=terminal_summary_mode,
     )
     registry, control_calls, qa_calls = _goal_publish_loop_registry(
@@ -1544,8 +1544,7 @@ async def test_goal_publish_continues_normal_loop_through_terminal_and_final_sum
         "update_goal",
         "update_goal_progress",
     }
-    assert all(set(tool_names) == expected_tools for tool_names in provider.tool_names_seen[:3])
-    assert provider.tool_names_seen[3] == []
+    assert all(set(tool_names) == expected_tools for tool_names in provider.tool_names_seen)
     assert isinstance(provider.requests[3][-1].content, list)
     assert any(
         isinstance(block, ContentBlockToolResult)
@@ -1578,7 +1577,7 @@ async def test_goal_publish_continues_normal_loop_through_terminal_and_final_sum
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_status", ["complete", "blocked"])
-async def test_goal_terminal_summary_disables_and_ignores_provider_tool_calls(
+async def test_goal_terminal_keeps_tools_available_for_final_checks(
     tmp_path,
     terminal_status: str,
 ) -> None:
@@ -1586,26 +1585,29 @@ async def test_goal_terminal_summary_disables_and_ignores_provider_tool_calls(
         tmp_path,
         plain_final=False,
         terminal_status=terminal_status,
-        illegal_terminal_summary_tool=True,
+        post_terminal_tool=True,
     )
 
-    assert provider.calls == 4
-    assert provider.tool_names_seen[3] == []
+    assert provider.calls == 5
+    assert all(
+        set(names) == {"publish_artifact", "qa_check", "update_goal", "update_goal_progress"}
+        for names in provider.tool_names_seen
+    )
     assert control_calls == ["progress:completed", f"goal:{terminal_status}"]
-    assert qa_calls == []
+    assert qa_calls == ["report.html"]
     _assert_goal_artifact_published_once(events)
     assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert not any(
+    assert sum(
         isinstance(event, ToolUseStartEvent) and event.tool_name == "qa_check"
         for event in events
-    )
+    ) == 1
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.text == f"The Goal is {terminal_status}."
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_status", ["complete", "blocked"])
-async def test_goal_terminal_on_last_iteration_uses_terminal_summary_not_partial(
+async def test_goal_terminal_on_last_iteration_obeys_normal_iteration_limit(
     tmp_path,
     terminal_status: str,
 ) -> None:
@@ -1613,7 +1615,6 @@ async def test_goal_terminal_on_last_iteration_uses_terminal_summary_not_partial
         tmp_path,
         plain_final=False,
         terminal_status=terminal_status,
-        illegal_terminal_summary_tool=True,
         max_iterations=3,
     )
 
@@ -1622,8 +1623,8 @@ async def test_goal_terminal_on_last_iteration_uses_terminal_summary_not_partial
     final_request_text = "\n".join(
         str(message.content) for message in provider.requests[3]
     )
-    assert "The configured iteration limit has been reached" not in final_request_text
-    assert "best concise final answer from the work completed so far" not in final_request_text
+    assert "The configured iteration limit has been reached" in final_request_text
+    assert "best concise final answer from the work completed so far" in final_request_text
     assert control_calls == ["progress:completed", f"goal:{terminal_status}"]
     assert qa_calls == []
     _assert_goal_artifact_published_once(events)
@@ -1634,12 +1635,18 @@ async def test_goal_terminal_on_last_iteration_uses_terminal_summary_not_partial
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "terminal_summary_mode",
-    ["empty", "reasoning_only", "stream_incomplete", "length_capped"],
+    ("terminal_summary_mode", "expected_error"),
+    [
+        ("empty", "empty_response"),
+        ("reasoning_only", "empty_response"),
+        ("stream_incomplete", "provider_stream_incomplete"),
+        ("length_capped", "provider_output_truncated"),
+    ],
 )
-async def test_goal_terminal_invalid_summary_degrades_without_system_error(
+async def test_goal_terminal_preserves_normal_provider_errors(
     tmp_path,
     terminal_summary_mode: str,
+    expected_error: str,
 ) -> None:
     provider, control_calls, qa_calls, events = await _run_goal_publish_loop(
         tmp_path,
@@ -1650,9 +1657,9 @@ async def test_goal_terminal_invalid_summary_degrades_without_system_error(
     assert provider.calls == 4
     assert control_calls == ["progress:completed", "goal:complete"]
     assert qa_calls == []
-    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [expected_error]
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.text.endswith("The Goal is complete.")
+    assert done.text == ""
 
 
 @pytest.mark.asyncio
@@ -1661,7 +1668,7 @@ async def test_goal_terminal_invalid_summary_degrades_without_system_error(
     ["request_assembly", "request_validation"],
 )
 @pytest.mark.parametrize("terminal_status", ["complete", "blocked"])
-async def test_goal_terminal_summary_preflight_failure_degrades_without_system_error(
+async def test_goal_terminal_preserves_normal_request_preflight_errors(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     preflight_failure: str,
@@ -1713,9 +1720,15 @@ async def test_goal_terminal_summary_preflight_failure_degrades_without_system_e
     assert provider.calls == 3
     assert control_calls == ["progress:completed", f"goal:{terminal_status}"]
     assert qa_calls == []
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.text == f"The Goal is {terminal_status}."
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    if preflight_failure == "request_validation":
+        assert errors[0].code == "synthetic_terminal_summary_validation_failure"
+        done = next(event for event in events if isinstance(event, DoneEvent))
+        assert done.text == ""
+    else:
+        assert "synthetic terminal summary assembly failure" in errors[0].message
+        assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 @pytest.mark.asyncio
@@ -1801,7 +1814,7 @@ async def test_goal_publish_then_tool_failure_returns_to_normal_provider_loop(
 
 
 @pytest.mark.asyncio
-async def test_goal_terminal_batch_skips_sessions_yield_then_summarizes(
+async def test_goal_terminal_allows_same_batch_yield_without_extra_summary_call(
     tmp_path,
 ) -> None:
     # Exercise the shared Agent state machine directly: surface policy decides
@@ -1894,9 +1907,8 @@ async def test_goal_terminal_batch_skips_sessions_yield_then_summarizes(
 
     events = [event async for event in agent.run_turn("publish and yield")]
 
-    assert provider.calls == 2
-    assert provider.tools_by_call[1] == []
-    assert executed == ["publish_artifact", "update_goal"]
+    assert provider.calls == 1
+    assert executed == ["publish_artifact", "update_goal", "sessions_yield"]
     _assert_goal_artifact_published_once(events)
     assert [
         event.tool_name
@@ -1908,15 +1920,10 @@ async def test_goal_terminal_batch_skips_sessions_yield_then_summarizes(
         for event in events
         if isinstance(event, ToolResultEvent) and event.tool_name == "sessions_yield"
     )
-    assert json.loads(str(yield_result.result)) == {
-        "status": "not_executed",
-        "reason": "prior_tool_dispatch_boundary",
-        "boundary_tool": "update_goal",
-        "boundary_tool_use_id": "goal-1",
-    }
-    assert yield_result.is_error is True
+    assert json.loads(str(yield_result.result)) == {"status": "yielded"}
+    assert yield_result.is_error is False
     assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert "The Goal is complete and the artifact is ready." in "".join(
+    assert "The Goal is complete and the artifact is ready." not in "".join(
         event.text for event in events if isinstance(event, TextDeltaEvent)
     )
 
@@ -1932,11 +1939,13 @@ async def test_goal_terminal_batch_skips_sessions_yield_then_summarizes(
         (True, 0, "thinking_error"),
     ],
 )
-async def test_goal_terminal_result_is_an_immediate_tool_dispatch_boundary(
+@pytest.mark.parametrize("goal_owned", [False, True])
+async def test_goal_terminal_uses_normal_batch_tools_and_request_budgets(
     tmp_path,
     terminal_accepted: bool,
     max_turn_llm_calls: int,
     summary_mode: str,
+    goal_owned: bool,
 ) -> None:
     provider = _GoalTerminalThenPublishProvider(summary_mode=summary_mode)
     executed: list[str] = []
@@ -2019,37 +2028,35 @@ async def test_goal_terminal_result_is_an_immediate_tool_dispatch_boundary(
         ),
     )
 
+    if not goal_owned:
+        assert agent._tool_context is not None
+        agent._tool_context.goal_context = None
     events = [event async for event in agent.run_turn("finish the Goal")]
 
-    summary_has_headroom = not terminal_accepted or max_turn_llm_calls == 0
-    assert provider.calls == (2 if summary_has_headroom else 1)
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    if terminal_accepted:
-        assert executed == ["update_goal"]
-        if summary_has_headroom:
-            assert provider.tools_by_call[1] == []
-        assert not any(isinstance(event, ArtifactEvent) for event in events)
-        skipped = next(
-            event
-            for event in events
-            if isinstance(event, ToolResultEvent)
-            and event.tool_name == "publish_artifact"
-        )
-        assert json.loads(str(skipped.result))["status"] == "not_executed"
-        assert skipped.is_error is True
+    has_headroom = max_turn_llm_calls == 0
+    assert provider.calls == (2 if has_headroom else 1)
+    assert executed == ["update_goal", "publish_artifact"]
+    _assert_goal_artifact_published_once(events)
+    published = next(
+        event for event in events
+        if isinstance(event, ToolResultEvent) and event.tool_name == "publish_artifact"
+    )
+    assert json.loads(str(published.result)) == {"status": "published"}
+    assert published.is_error is False
+    if has_headroom:
+        assert set(provider.tools_by_call[1]) == {"update_goal", "publish_artifact"}
+    expected_errors = (
+        ["turn_llm_call_budget_exceeded"] if not has_headroom
+        else ["empty_response"] if summary_mode == "reasoning_stream"
+        else ["provider_error"] if summary_mode == "thinking_error"
+        else []
+    )
+    assert [event.code for event in events if isinstance(event, ErrorEvent)] == expected_errors
+    text = "".join(event.text for event in events if isinstance(event, TextDeltaEvent))
+    assert text == ("" if expected_errors else "Final Goal summary.")
+    if not expected_errors:
         done = next(event for event in events if isinstance(event, DoneEvent))
-        assert done.text == (
-            "Final Goal summary."
-            if summary_has_headroom and summary_mode == "normal"
-            else "The Goal is complete."
-        )
-    else:
-        assert executed == ["update_goal", "publish_artifact"]
-        assert set(provider.tools_by_call[1]) == {
-            "update_goal",
-            "publish_artifact",
-        }
-        assert any(isinstance(event, ArtifactEvent) for event in events)
+        assert done.text == "Final Goal summary."
 
 
 @pytest.mark.asyncio
@@ -3609,9 +3616,8 @@ async def test_goal_post_publish_selector_keeps_the_active_fallback_leg(
     assert all(
         set(tool_names)
         == {"publish_artifact", "qa_check", "update_goal", "update_goal_progress"}
-        for tool_names in fallback.tool_names_seen[:3]
+        for tool_names in fallback.tool_names_seen
     )
-    assert fallback.tool_names_seen[3] == []
 
 
 @pytest.mark.asyncio

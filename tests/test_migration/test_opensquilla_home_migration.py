@@ -7,6 +7,7 @@ real released-era config shape.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -53,6 +54,7 @@ from opensquilla.session.storage import SessionStorage
 
 FIXTURE_CONFIG = Path(__file__).parent / "fixtures" / "homes" / "cli-0.1" / "config.toml"
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+LEGACY_GOAL_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "legacy-goal-lineage"
 PORTABLE_RELEASE_MANIFEST = (
     Path(__file__).resolve().parents[1]
     / "test_recovery"
@@ -1122,6 +1124,87 @@ def test_schema_ahead_source_refused(tmp_path: Path) -> None:
     assert any("newer OpenSquilla" in item["reason"] for item in errors)
     assert any("V999__future_thing" in item["reason"] for item in errors)
     assert not target.exists()
+
+
+@pytest.mark.parametrize("with_retry", [False, True], ids=["v029", "v029-v030"])
+@pytest.mark.parametrize("with_unknown", [False, True], ids=["legacy", "mixed-unknown"])
+def test_unsupported_goal_lineage_is_not_imported_or_relabelled(
+    tmp_path: Path, with_retry: bool, with_unknown: bool,
+) -> None:
+    # Historical Goal schema is added only to WAL, which every inspection
+    # entry point must preserve along with the original main database.
+    source = _build_source_home(tmp_path)
+    database = source / "state" / "sessions.db"
+    target = tmp_path / "target-home"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        migration_ids = ["V029__goal_runs"]
+        if with_retry:
+            migration_ids.append("V030__goal_run_retry")
+        for migration_id in migration_ids:
+            connection.executescript(
+                (LEGACY_GOAL_FIXTURES / f"{migration_id}.sql").read_text(encoding="utf-8")
+            )
+        if with_unknown:
+            migration_ids.append("V999__synthetic_future")
+        connection.executemany(
+            "INSERT INTO _yoyo_migration VALUES (?, ?, '2000-01-01 00:00:00')",
+            [(hashlib.sha256(item.encode()).hexdigest(), item) for item in migration_ids],
+        )
+        connection.commit()
+        rows = connection.execute("SELECT * FROM goal_runs ORDER BY goal_id").fetchall()
+        schema = connection.execute(
+            "SELECT type,name,sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+        ledger = connection.execute(
+            "SELECT * FROM _yoyo_migration ORDER BY migration_id"
+        ).fetchall()
+        assert len(rows) == 3
+        wal = database.with_name(database.name + "-wal")
+        before = (database.read_bytes(), wal.read_bytes())
+        assert len(before[1]) > 32
+        for apply in (False, True):
+            report = _run(source, target, apply=apply)
+            assert report["preflight"]["schema_ahead"] is True
+            assert any(
+                "unsupported development Goal lineage" in item["reason"]
+                for item in _errors(report)
+            )
+            assert (database.read_bytes(), wal.read_bytes()) == before
+            assert not target.exists()
+        assert connection.execute("SELECT * FROM goal_runs ORDER BY goal_id").fetchall() == rows
+        assert connection.execute(
+            "SELECT type,name,sql FROM sqlite_master ORDER BY name"
+        ).fetchall() == schema
+        assert connection.execute(
+            "SELECT * FROM _yoyo_migration ORDER BY migration_id"
+        ).fetchall() == ledger
+        assert not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='session_goals'"
+        ).fetchone()
+        assert "V033__goal_runs" not in {row[1] for row in ledger}
+        assert not list((source / "state").glob("*.bak"))
+    finally:
+        connection.close()
+
+
+def test_home_import_recognizes_only_verified_released_alias(tmp_path: Path) -> None:
+    from opensquilla.migration_compatibility import LEGACY_MIGRATION_ALIASES
+
+    migration_id, (_, expected_hash) = next(iter(LEGACY_MIGRATION_ALIASES.items()))
+    source = _build_source_home(tmp_path, applied_ids=(migration_id,))
+    database = source / "state" / "sessions.db"
+    rejected = _run(source, tmp_path / "unverified-target", apply=False)
+    assert rejected["preflight"]["schema_ahead"] is True
+    assert any(
+        "unverified historical migration alias" in item["reason"] for item in _errors(rejected)
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE _yoyo_migration SET migration_hash = ?", (expected_hash,))
+    accepted = _run(source, tmp_path / "verified-target", apply=False)
+    assert accepted["preflight"]["schema_ahead"] is False
 
 
 def test_insufficient_disk_space_refused(tmp_path: Path, monkeypatch) -> None:

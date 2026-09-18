@@ -41,6 +41,7 @@ def test_metadata_projection_preserves_deferred_v4_ack_shape() -> None:
         "routing": None,
         "currentPlan": None,
         "activePlanRun": None,
+        "planPresentations": [],
         "goal": None,
         "goalSnapshotStreamSeq": None,
         "tasks": [],
@@ -62,6 +63,7 @@ def test_metadata_projection_preserves_deferred_v4_ack_shape() -> None:
             "routing",
             "currentPlan",
             "activePlanRun",
+            "planPresentations",
             "goal",
             "goalSnapshotStreamSeq",
             "epoch",
@@ -126,6 +128,7 @@ async def test_composed_gateway_ports_project_complete_v4_metadata() -> None:
         return SessionPlanningState(
             collaboration={"mode": "plan"},
             current_plan={"revision_id": "plan-1"},
+            plan_presentations=({"revisionId": "plan-1", "dismissed": True, "stateRevision": 2},),
             active_plan_run=None,
             goal={"goal_id": "goal-1"},
             epoch=4,
@@ -167,6 +170,9 @@ async def test_composed_gateway_ports_project_complete_v4_metadata() -> None:
     assert payload["pendingUserInputs"] == [{"request_id": "input-1"}]
     assert payload["routing"] == {"mode": "router"}
     assert payload["currentPlan"] == {"revision_id": "plan-1"}
+    assert payload["planPresentations"] == [
+        {"revisionId": "plan-1", "dismissed": True, "stateRevision": 2}
+    ]
     assert payload["goal"] == {"goal_id": "goal-1"}
     assert payload["epoch"] == 4
 

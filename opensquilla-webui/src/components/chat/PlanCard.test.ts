@@ -18,6 +18,8 @@ const i18n = createI18n({
       chat: {
         plan: {
           label: 'Plan',
+          hidePlan: 'Hide plan',
+          showPlan: 'Show plan',
           revision: 'Revision {id}',
           current: 'Current',
           superseded: 'Updated version available',
@@ -71,6 +73,42 @@ afterEach(() => {
 })
 
 describe('PlanCard', () => {
+  it('hides a plan independently of disabled implementation actions', async () => {
+    const presentation = vi.fn()
+    const implement = vi.fn()
+    const host = mountPlanCard(plan(), {
+      disabled: true, presentationAvailable: true,
+      'onPresentation-change': presentation, 'onImplement-current': implement,
+    })
+    await nextTick()
+    host.querySelector<HTMLButtonElement>('.plan-card__hide')?.click()
+    expect(presentation).toHaveBeenCalledWith({ planId: 'plan-1', revisionId: 'revision-2', dismissed: true })
+    expect(implement).not.toHaveBeenCalled()
+  })
+
+  it.each([true, false])('retains a compact restoration entry for a hidden plan (current: %s)', async current => {
+    const presentation = vi.fn()
+    const host = mountPlanCard(plan({ current }), {
+      dismissed: true, presentationAvailable: true, 'onPresentation-change': presentation,
+    })
+    await nextTick()
+    expect(host.querySelector('.plan-card__title')?.textContent).toBe('Ship plan mode')
+    expect(host.querySelector('.plan-card__body')).toBeNull()
+    expect(host.querySelector('.plan-card__actions')).toBeNull()
+    const button = host.querySelector<HTMLButtonElement>('.plan-card__show')
+    expect(button?.textContent).toBe('Show plan')
+    button?.click()
+    expect(presentation).toHaveBeenCalledWith({ planId: 'plan-1', revisionId: 'revision-2', dismissed: false })
+  })
+
+  it('disables repeated presentation actions until acknowledgement', async () => {
+    const presentation = vi.fn()
+    const host = mountPlanCard(plan(), { presentationAvailable: true, presentationBusy: true, 'onPresentation-change': presentation })
+    await nextTick()
+    host.querySelector<HTMLButtonElement>('.plan-card__hide')?.click()
+    expect(presentation).not.toHaveBeenCalled()
+  })
+
   it('renders plan content as a numbered plan without execution controls', async () => {
     const host = mountPlanCard(plan())
     await nextTick()

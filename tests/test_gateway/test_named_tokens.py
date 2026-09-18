@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -39,6 +42,48 @@ def test_named_token_revoke_prevents_future_verification(tmp_path) -> None:
 
     assert store.revoke(issued.record.public_id) is True
     assert store.verify(issued.token) is None
+
+
+def test_active_token_authorization_uses_current_record_without_loading_secret(tmp_path) -> None:
+    store = TokenStore(tmp_path / "sessions.db")
+    issued = store.create(
+        name="Synthetic Goal operator", roles={"operator"},
+        scopes={"operator.read", "operator.write"}, capabilities={"task.submit"},
+    )
+    assert store.get_active_authorization(issued.record.public_id) == (
+        frozenset({"operator"}), frozenset({"operator.read", "operator.write"}),
+        frozenset({"task.submit"}),
+    )
+    assert store.get_active_authorization("unknown-public-id") is None
+    store.revoke(issued.record.public_id)
+    assert store.get_active_authorization(issued.record.public_id) is None
+
+
+@pytest.mark.parametrize("state", ["active", "missing", "revoked", "query_error"])
+def test_active_token_authorization_closes_connection(tmp_path, monkeypatch, state) -> None:
+    store = TokenStore(tmp_path / "sessions.db")
+    issued = store.create(
+        name="Synthetic authorization lookup", roles={"operator"},
+        scopes={"operator.write"}, capabilities={"task.submit"},
+    )
+    if state == "revoked":
+        assert store.revoke(issued.record.public_id)
+    connection = store._connect()
+    if state == "query_error":
+        connection.execute("DROP TABLE sandbox_tokens")
+    monkeypatch.setattr(store, "_connect", lambda: connection)
+    public_id = "missing-public-id" if state == "missing" else issued.record.public_id
+    try:
+        if state == "query_error":
+            with pytest.raises(sqlite3.OperationalError, match="no such table"):
+                store.get_active_authorization(public_id)
+        else:
+            result = store.get_active_authorization(public_id)
+            assert (result is not None) is (state == "active")
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+    finally:
+        connection.close()
 
 
 def test_named_token_list_never_returns_secret_material(tmp_path) -> None:

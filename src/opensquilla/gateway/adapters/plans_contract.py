@@ -58,6 +58,15 @@ from opensquilla.contracts.generated.v4.plans_set_mode import (
 from opensquilla.contracts.generated.v4.plans_set_mode_metadata import (
     PLANS_SET_MODE_METHOD,
 )
+from opensquilla.contracts.generated.v4.plans_set_presentation import (
+    Params as PlansSetPresentationParams,
+)
+from opensquilla.contracts.generated.v4.plans_set_presentation import (
+    Result as PlansSetPresentationResult,
+)
+from opensquilla.contracts.generated.v4.plans_set_presentation_metadata import (
+    PLANS_SET_PRESENTATION_METHOD,
+)
 from opensquilla.gateway.adapters.contract_method import (
     GatewayContractBinding,
     GuestAllowedChecker,
@@ -150,6 +159,17 @@ _CANCEL_RUN_BINDING: GatewayContractBinding[dict[str, Any]] = GatewayContractBin
     response_error_message="plans.cancelRun response violated its v4 contract",
     request_mismatch_event="plans.cancelRun.request_contract_mismatch",
     response_violation_event="plans.cancelRun.contract_violation",
+)
+_SET_PRESENTATION_BINDING: GatewayContractBinding[dict[str, Any]] = GatewayContractBinding(
+    descriptor=GATEWAY_METHOD_CONTRACTS[PLANS_SET_PRESENTATION_METHOD],
+    observe_params=lambda params: _observe(params, PlansSetPresentationParams),
+    validate_result=lambda payload: _validate_result(
+        payload, PlansSetPresentationResult, PLANS_SET_PRESENTATION_METHOD
+    ),
+    result_validation_errors=(PlansContractError,),
+    response_error_message="plans.setPresentation response violated its v4 contract",
+    request_mismatch_event="plans.setPresentation.request_contract_mismatch",
+    response_violation_event="plans.setPresentation.contract_violation",
 )
 _CAPABILITIES_BINDING: GatewayContractBinding[dict[str, Any]] = GatewayContractBinding(
     descriptor=GATEWAY_METHOD_CONTRACTS[PLANS_CAPABILITIES_METHOD],
@@ -245,6 +265,22 @@ def register_plans_cancel_run_contract[ContextT](
     )
 
 
+def register_plans_set_presentation_contract[ContextT](
+    registry: MethodRegistry[ContextT],
+    implementation: Callable[[Any, ContextT], Awaitable[dict[str, Any]]],
+    *,
+    internal_error: ErrorFactory,
+    guest_allowed_checker: GuestAllowedChecker,
+) -> Callable[[Any, ContextT], Awaitable[dict[str, Any]]]:
+    return _register(
+        registry,
+        _SET_PRESENTATION_BINDING,
+        implementation,
+        internal_error=internal_error,
+        guest_allowed_checker=guest_allowed_checker,
+    )
+
+
 def register_plans_capabilities_contract[ContextT](
     registry: MethodRegistry[ContextT],
     implementation: Callable[[Any, ContextT], Awaitable[dict[str, Any]]],
@@ -267,4 +303,5 @@ __all__ = [
     "register_plans_implement_contract",
     "register_plans_revise_contract",
     "register_plans_set_mode_contract",
+    "register_plans_set_presentation_contract",
 ]

@@ -295,21 +295,6 @@ def _registered_terminal_response_text(
     return text
 
 
-def _plan_checkpoint_terminates_turn(tool_name: str, content: Any) -> bool:
-    """A blocked checkpoint is a hard execution boundary."""
-
-    if tool_name != "plan_run_checkpoint":
-        return False
-    try:
-        payload = json.loads(content) if isinstance(content, str) else content
-    except (json.JSONDecodeError, TypeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    run = payload.get("plan_run")
-    return isinstance(run, dict) and run.get("status") == "blocked"
-
-
 def _user_input_terminates_turn(tool_name: str, content: Any) -> bool:
     """Fallback surfaces without a deferred broker stop at the request."""
 
@@ -683,7 +668,6 @@ async def finalize(
             execution_status = mark_execution_status_truncated(execution_status)
     terminates_turn = (
         (_registered_terminates_turn(registered) and not is_error)
-        or _plan_checkpoint_terminates_turn(call.tool_name, content)
         or _user_input_terminates_turn(call.tool_name, content)
         or (
             call.tool_name == "router_control"

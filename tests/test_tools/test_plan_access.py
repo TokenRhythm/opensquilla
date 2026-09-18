@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
 from opensquilla.engine.types import ToolCall
-from opensquilla.session.plans import PlanRunConflictError
 from opensquilla.tools.dispatch import build_tool_handler, preflight_tool_call
 from opensquilla.tools.registry import ToolRegistry, get_default_registry, tool
 from opensquilla.tools.types import (
@@ -45,7 +43,7 @@ def test_plan_access_defaults_to_deny_and_decorator_preserves_metadata() -> None
     assert registered.spec.terminates_turn is True
 
 
-def test_plan_visibility_is_fail_closed_but_default_visibility_is_unchanged() -> None:
+def test_plan_visibility_uses_ordinary_tool_policy() -> None:
     registry = ToolRegistry()
     registry.register(
         ToolSpec(
@@ -91,11 +89,13 @@ def test_plan_visibility_is_fail_closed_but_default_visibility_is_unchanged() ->
         run_mode="full",
         elevated="full",
     )
-    assert _names(registry, plan_ctx) == {"read", "control"}
+    assert _names(registry, plan_ctx) == _names(registry, default_ctx)
+    plan_ctx.denied_tools.add("write")
+    assert "write" not in _names(registry, plan_ctx)
 
 
 @pytest.mark.asyncio
-async def test_plan_dispatch_denial_precedes_validation_hooks_and_handler() -> None:
+async def test_plan_dispatch_preserves_explicit_denial_before_handler() -> None:
     registry = ToolRegistry()
     handler_calls: list[str] = []
     hook_calls: list[str] = []
@@ -125,19 +125,20 @@ async def test_plan_dispatch_denial_precedes_validation_hooks_and_handler() -> N
     ctx = ToolContext(
         collaboration_mode="plan",
         allowed_tools={"write"},
+        denied_tools={"write"},
         surfaced_tools={"write"},
         run_mode="full",
         elevated="full",
     )
     result = await build_tool_handler(registry, ctx, tool_hooks=[Hook()])(
-        ToolCall(tool_use_id="p1", tool_name="write", arguments={})
+        ToolCall(tool_use_id="p1", tool_name="write", arguments={"path": "example.txt"})
     )
 
     assert result.is_error is True
     assert result.execution_status is not None
-    assert result.execution_status["reason"] == "plan_mode_denied"
+    assert result.execution_status["reason"] != "plan_mode_denied"
     assert json.loads(result.content)["error_class"] == "PolicyDenied"
-    assert hook_calls == []
+    assert hook_calls == ["before", "after"]
     assert handler_calls == []
 
 
@@ -160,9 +161,7 @@ async def test_standalone_preflight_uses_same_plan_boundary() -> None:
         ),
     )
 
-    assert result is not None
-    assert result.execution_status is not None
-    assert result.execution_status["reason"] == "plan_mode_denied"
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -409,184 +408,15 @@ async def test_request_user_input_failure_does_not_end_plan_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_out_of_order_plan_checkpoint_returns_actionable_retry_contract() -> None:
-    from opensquilla.tools.builtin import plan_control as _plan_control  # noqa: F401
-
-    registered = get_default_registry().get("plan_run_checkpoint")
-    assert registered is not None
-    registry = ToolRegistry()
-    registry.register(registered.spec, registered.handler)
-
-    current = SimpleNamespace(
-        state_revision=3,
-        status="running",
-        current_step_id="step-3",
-        active_task_id="implementation-task",
-        step_states=[
-            {"step_id": "step-1", "status": "completed"},
-            {"step_id": "step-2", "status": "completed"},
-            {"step_id": "step-3", "status": "in_progress"},
-            {"step_id": "step-4", "status": "pending"},
-            {"step_id": "step-5", "status": "pending"},
-        ],
-    )
-
-    class OutOfOrderStorage:
-        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
-            assert run_id == "run-1"
-            return current
-
-        async def checkpoint_plan_run(self, *_args, **_kwargs) -> None:
-            raise PlanRunConflictError(
-                "only the current plan step may be checkpointed; storage-secret"
-            )
-
-    ctx = ToolContext(
-        collaboration_mode="default",
-        task_id="implementation-task",
-        session_key="agent:main:webchat:checkpoint-recovery",
-        plan_run_id="run-1",
-        plan_storage=OutOfOrderStorage(),
-        allowed_tools={"plan_run_checkpoint"},
-        surfaced_tools={"plan_run_checkpoint"},
-    )
-    result = await build_tool_handler(registry, ctx)(
-        ToolCall(
-            tool_use_id="checkpoint-out-of-order",
-            tool_name="plan_run_checkpoint",
-            arguments={
-                "step_id": "step-5",
-                "step_status": "completed",
-            },
-        )
-    )
-
-    assert result.is_error is True
-    assert result.terminates_turn is False
-    envelope = json.loads(result.content)
-    assert envelope["error_class"] == "RetryableToolInputError"
-    assert envelope["retry_allowed"] is True
-    recovery = json.loads(envelope["user_message"])
-    assert recovery["error"] == "plan_checkpoint_conflict"
-    assert recovery["requested_step_id"] == "step-5"
-    assert recovery["plan_run_status"] == "running"
-    assert recovery["current_step"] == {
-        "step_id": "step-3",
-        "status": "in_progress",
-    }
-    assert recovery["recovery"]["action"] == "checkpoint_current_step"
-    assert recovery["recovery"]["step_id"] == "step-3"
-    assert "one at a time in plan order" in recovery["recovery"]["instruction"]
-    assert "storage-secret" not in result.content
-    assert "internal error" not in result.content
-
-
-@pytest.mark.asyncio
-async def test_plan_checkpoint_event_failure_does_not_undo_committed_state() -> None:
-    from opensquilla.tools.builtin import plan_control as _plan_control  # noqa: F401
-
-    registered = get_default_registry().get("plan_run_checkpoint")
-    assert registered is not None
-    registry = ToolRegistry()
-    registry.register(registered.spec, registered.handler)
-    updated = SimpleNamespace(
-        run_id="run-committed",
-        plan_revision_id="revision-1",
-        status="running",
-        current_step_id=None,
-        step_states=[
-            {
-                "step_id": "step-1",
-                "title": "Finish",
-                "status": "completed",
-            }
-        ],
-        state_revision=8,
-        driver_kind="manual",
-        driver_id=None,
-        active_task_id="implementation-task",
-        pause_reason=None,
-        terminal_reason=None,
-        created_at=100,
-        updated_at=200,
-        started_at=120,
-        finished_at=None,
-    )
-
-    class Storage:
-        def __init__(self) -> None:
-            self.checkpoint_calls = 0
-
-        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
-            assert run_id == updated.run_id
-            return SimpleNamespace(state_revision=7)
-
-        async def checkpoint_plan_run(
-            self,
-            run_id: str,
-            **kwargs: object,
-        ) -> SimpleNamespace:
-            assert run_id == updated.run_id
-            assert kwargs["expected_state_revision"] == 7
-            assert kwargs["next_step_id"] == "legacy-sensitive-step"
-            self.checkpoint_calls += 1
-            return updated
-
-    storage = Storage()
-    emitted: list[tuple[str, str, dict[str, object]]] = []
-
-    async def failing_emitter(
-        session_key: str,
-        event_name: str,
-        payload: dict[str, object],
-    ) -> None:
-        emitted.append((session_key, event_name, payload))
-        raise RuntimeError("subscriber disconnected")
-
-    ctx = ToolContext(
-        collaboration_mode="default",
-        task_id="implementation-task",
-        session_key="agent:main:webchat:checkpoint-committed",
-        plan_run_id=updated.run_id,
-        plan_storage=storage,
-        plan_event_emitter=failing_emitter,
-        allowed_tools={"plan_run_checkpoint"},
-        surfaced_tools={"plan_run_checkpoint"},
-    )
-    result = await build_tool_handler(registry, ctx)(
-        ToolCall(
-            tool_use_id="checkpoint-committed",
-            tool_name="plan_run_checkpoint",
-            arguments={
-                "step_id": "step-1",
-                "step_status": "completed",
-                "next_step_id": "legacy-sensitive-step",
-            },
-        )
-    )
-
-    assert result.is_error is False
-    assert storage.checkpoint_calls == 1
-    assert len(emitted) == 1
-    payload = json.loads(result.content)
-    assert payload["status"] == "checkpoint_recorded"
-    assert payload["plan_run"]["status"] == "running"
-    assert payload["plan_run"]["currentStepId"] is None
-    assert payload["plan_run"]["stateRevision"] == 8
-    assert "legacy-sensitive-step" not in result.content
-    assert "legacy-sensitive-step" not in json.dumps(emitted)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("run_status", "terminates_turn"),
     [
         ("running", False),
-        ("blocked", True),
+        ("blocked", False),
         ("completed", False),
     ],
 )
-async def test_only_blocked_plan_checkpoint_terminates_turn(
+async def test_checkpoint_progress_never_terminates_turn(
     run_status: str,
     terminates_turn: bool,
 ) -> None:

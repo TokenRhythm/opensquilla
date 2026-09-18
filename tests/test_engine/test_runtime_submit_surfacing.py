@@ -58,7 +58,7 @@ def test_retired_submit_env_does_not_expand_scaffold_tool_surface(
     assert ctx.allowed_tools is None or "submit" not in ctx.allowed_tools
 
 
-def test_build_tools_exposes_plan_run_delivery_controls_under_scaffold_profile(
+def test_plan_run_preserves_scaffold_tool_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -73,12 +73,11 @@ def test_build_tools_exposes_plan_run_delivery_controls_under_scaffold_profile(
     tool_defs, _handler = runner._build_tools(ctx)
     names = {getattr(td, "name", "") for td in tool_defs}
 
-    assert "plan_run_checkpoint" in names
-    assert "publish_artifact" in names
-    plan_run_tools = {"plan_run_checkpoint", "publish_artifact"}
-    assert names == _MODEL_SCAFFOLD_TOOLS | plan_run_tools
+    assert "plan_run_checkpoint" not in names
+    assert "publish_artifact" not in names
+    assert names == _MODEL_SCAFFOLD_TOOLS
     assert ctx.surfaced_tools is not None
-    assert plan_run_tools <= ctx.surfaced_tools
+    assert "plan_run_checkpoint" in ctx.surfaced_tools
 
 
 async def _preview_opener(*args, **kwargs):
@@ -106,8 +105,9 @@ def test_preview_is_exposed_by_default_only_with_web_capability(
 
     definitions, _handler = runner._build_tools(ctx)
 
-    assert ("open_workspace_preview" in {tool.name for tool in definitions}) is supported
-    assert ("open_workspace_preview" in ctx.authorized_tool_names) is supported
+    expected = supported and not plan_run
+    assert ("open_workspace_preview" in {tool.name for tool in definitions}) is expected
+    assert ("open_workspace_preview" in ctx.authorized_tool_names) is (supported and not plan_run)
 
 
 @pytest.mark.parametrize("caller_kind", [CallerKind.AGENT, CallerKind.CHANNEL, CallerKind.CRON])
@@ -157,13 +157,13 @@ def test_build_tools_plan_run_ignores_retired_submit_env(
     tool_defs, _handler = runner._build_tools(ctx)
     names = {getattr(td, "name", "") for td in tool_defs}
 
-    assert {"plan_run_checkpoint", "publish_artifact"} <= names
+    assert {"plan_run_checkpoint", "publish_artifact"}.isdisjoint(names)
     assert "submit" not in names
     assert ctx.surfaced_tools is not None
     assert "submit" not in ctx.surfaced_tools
 
 
-def test_build_tools_exposes_goal_controls_under_scaffold_profile(
+def test_goal_controls_preserve_scaffold_tool_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -180,8 +180,8 @@ def test_build_tools_exposes_goal_controls_under_scaffold_profile(
     names = {getattr(definition, "name", "") for definition in tool_defs}
 
     goal_tools = {"update_goal", "update_goal_progress"}
-    assert goal_tools <= names
-    assert names == _MODEL_SCAFFOLD_TOOLS | goal_tools
+    assert goal_tools.isdisjoint(names)
+    assert names == _MODEL_SCAFFOLD_TOOLS
     assert ctx.surfaced_tools is not None
     assert goal_tools <= ctx.surfaced_tools
 
@@ -204,7 +204,7 @@ def test_build_tools_goal_control_explicit_deny_remains_authoritative(
     names = {getattr(definition, "name", "") for definition in tool_defs}
 
     assert "update_goal" not in names
-    assert "update_goal_progress" in names
+    assert "update_goal_progress" not in names
 
 
 @pytest.mark.parametrize("allowed_tools", [{"submit"}, set()])

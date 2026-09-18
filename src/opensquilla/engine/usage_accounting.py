@@ -118,6 +118,7 @@ class UsageExecutionContext:
     session_epoch: int = 0
     agent_id: str = ""
     run_kind: str = "agent"
+    root_turn_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +140,7 @@ class UsageCallStart:
     # Appended with a default so independently constructed sinks/tests keep
     # source compatibility while TurnRunner supplies the real reset epoch.
     session_epoch: int = 0
+    root_turn_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +225,7 @@ class UsageAccountingScope:
             call_index=self.call_index,
             agent_run_id=context.agent_run_id,
             turn_id=context.turn_id,
+            root_turn_id=context.root_turn_id or context.turn_id,
             parent_turn_id=context.parent_turn_id,
             session_id=context.session_id,
             session_epoch=context.session_epoch,

@@ -16,6 +16,25 @@ OpenSquilla reads configuration in this order:
 Use `--config ./opensquilla.toml` when you want to write or inspect a
 project-local config file.
 
+## Release Profiles and Older Databases
+
+Stable Desktop releases keep their existing profile. Preview and nightly
+binaries use separate profiles selected from the running binary's version.
+Changing the update feed does not move the current profile or its database.
+
+An unsupported development Goal database is preserved, including its SQLite
+WAL, and is rejected consistently by Gateway startup, home import and recovery.
+Open it with the build that created it. The current release does not convert
+that Goal lineage or mark its migrations as already applied.
+
+To start separately in the CLI, select a new named profile, for example
+`opensquilla --profile clean onboard`, then use the same `--profile clean`
+option for subsequent commands. Use a directory without a project-local
+configuration, and remove explicit config/state path overrides that point to
+the old profile. Keep the original profile intact; do not copy its database
+into the new profile. See [independent CLI state](cli.md) for explicit state
+directory configuration.
+
 ## Task Runtime Concurrency
 
 Fresh installations allow up to eight cross-session turns to run at once:
@@ -517,15 +536,31 @@ turn, active-time, and token totals. Goal mode does not replay a failed or timed
 out whole turn: tools may already have produced side effects. Provider/core
 request retries remain governed by their existing policies.
 
-An execution lease belongs to the subscribed Web UI or CLI connection that
-started or resumed the Goal. Losing that client connection detaches the lease:
-the Goal stays active, its current accepted turn may finish, and no new
-automatic continuation starts until an authorized client reattaches. A Web UI
-refresh reattaches with a tab-local continuity token; an explicit takeover is
-available when that token was lost. Disabling execution or restarting the
-Gateway still pauses unattended work. Read the complete workflow, state model,
-Plan-mode interaction, upgrade notes, and recovery guidance in
-[`goal-mode.md`](goal-mode.md).
+Goal token budgets are disabled by default and are configured per Goal with
+optional `tokenBudget`, not through a global TOML ceiling. Budget usage is
+`max(0, input_tokens - cache_read_tokens) + output_tokens`, counted once per
+physical root/descendant request at finalization, including late receipts.
+Upgraded Goals can set a budget for usage recorded after the accounting boundary;
+earlier incomplete history is not included. Missing receipts within the current
+accounting period prevent setting a budget or resuming a budgeted Goal.
+Snapshots expose `usageAccountingStartedAtMs`: the creation time for new Goals,
+or the first newly attributed request time for upgraded Goals (`null` until then).
+This boundary does not make an upgraded Goal's earlier history complete.
+Reaching a budget pauses continuation and steers the current task to wrap up;
+already-started requests and safe finalization can exceed it.
+
+The default per-Goal `executionPolicy` is `foreground`: losing the owning Web UI
+or CLI subscription defers continuation until authorized reattachment. Explicit
+`background` execution keeps its process-local authorization across transport
+disconnects and uses the same ordinary task scheduler, sandbox and approval
+checks. Both policies pause on Gateway restart and require explicit resume.
+Questions and approvals keep their existing task while releasing its compute
+slot; they never authorize another automatic Goal turn. Natural create, edit
+and resume controls reuse the current task. Progress uses ordinary `update_plan`.
+Three proven empty automatic turns pause rather than loop indefinitely.
+
+Read the complete workflow, coverage semantics, state model, Plan interaction
+and recovery guidance in [`goal-mode.md`](goal-mode.md).
 
 ## Raw Config Editing
 

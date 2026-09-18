@@ -754,7 +754,8 @@ async def test_trusted_windows_shell_receives_managed_proxy_without_network_hint
     try:
         result = await shell.exec_command(
             "powershell -NoProfile -Command \"Write-Output $env:HTTP_PROXY\"",
-            workdir=str(tmp_path),
+            # The POSIX pytest directory is not a simulated Windows /tmp alias.
+            workdir=".",
         )
     finally:
         current_tool_context.reset(token)
@@ -763,6 +764,7 @@ async def test_trusted_windows_shell_receives_managed_proxy_without_network_hint
 
     assert result.startswith("exit_code=0")
     assert backend_calls
+    assert backend_calls[0].cwd == tmp_path.resolve()
     assert backend_calls[0].policy.network is NetworkMode.PROXY_ALLOWLIST
     assert backend_calls[0].env["HTTP_PROXY"].startswith("http://127.0.0.1:")
 

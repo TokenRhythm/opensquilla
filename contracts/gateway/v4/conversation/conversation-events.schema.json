@@ -62,6 +62,8 @@
       "session.event.meta_step_state",
       "session.event.plan_revision",
       "session.event.plan_run",
+      "session.event.progress",
+      "session.event.plan_presentation",
       "session.event.provider_activity",
       "session.event.router_control_replay",
       "session.event.router_decision",

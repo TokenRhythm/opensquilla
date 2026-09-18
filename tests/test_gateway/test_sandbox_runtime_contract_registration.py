@@ -159,7 +159,8 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    assert len(registry.list_methods()) == 292
+    assert len(registry.list_methods()) == 293
+    assert registry.get_entry("plans.setPresentation") is not None
     assert registry.get_entry("models.capacity.resolve") is not None
     assert registry.get_entry("skills.install.status") is not None
     assert registry.get_entry("telemetry.product_active.record") is not None

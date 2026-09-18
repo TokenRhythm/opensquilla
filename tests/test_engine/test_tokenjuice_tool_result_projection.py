@@ -1458,17 +1458,11 @@ async def test_custom_provider_blocks_oversized_final_envelope_before_chat(
 
 
 @pytest.mark.asyncio
-async def test_goal_terminal_custom_provider_admission_failure_synthesizes_summary(
+async def test_goal_terminal_keeps_retrieval_and_projection_for_custom_provider(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    """A durable Goal terminal result must not regress to an Agent error.
-
-    The final summary call hides tools, so a prior projected tool result must be
-    restored before request admission.  If that expanded request cannot fit a
-    custom provider's conservative envelope, finish from the durable Goal state
-    without calling the provider again.
-    """
+    """Goal completion keeps the ordinary, recoverable tool-result envelope."""
 
     monkeypatch.setattr(
         agent_mod,
@@ -1494,11 +1488,15 @@ async def test_goal_terminal_custom_provider_admission_failure_synthesizes_summa
         def chat(self, messages, tools=None, config=None):
             self.calls.append({"messages": messages, "tools": tools})
             call_number = len(self.calls)
-            if call_number > 2:  # pragma: no cover - admission must stop this call
-                raise AssertionError("terminal summary provider call must be skipped")
+            if call_number > 3:  # pragma: no cover - the scripted turn is complete
+                raise AssertionError("unexpected provider call")
             return self._stream(call_number)
 
         async def _stream(self, call_number: int):
+            if call_number == 3:
+                yield TextDeltaEvent(text="Goal complete; diagnostic remains retrievable.")
+                yield ProviderDoneEvent(stop_reason="stop", input_tokens=1, output_tokens=1)
+                return
             if call_number == 1:
                 tool_use_id = "tool-diagnostic"
                 tool_name = "exec_command"
@@ -1574,24 +1572,34 @@ async def test_goal_terminal_custom_provider_admission_failure_synthesizes_summa
 
     events = [event async for event in agent.run_turn("finish the goal")]
 
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 3
     assert all(
         any(tool.name == "retrieve_tool_result" for tool in call["tools"])
         for call in provider.calls
     )
     assert not any(event.kind == "error" for event in events)
-    assert "The Goal is complete." in "".join(
+    assert "Goal complete; diagnostic remains retrievable." in "".join(
         event.text for event in events if event.kind == "text_delta"
     )
+    diagnostic = next(
+        block
+        for message in provider.calls[2]["messages"]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolResult)
+        and block.tool_use_id == "tool-diagnostic"
+    )
+    assert "[tool_result_projection]" in diagnostic.content
+    assert raw not in diagnostic.content
     done = next(event for event in events if event.kind == "done")
-    assert done.text == "The Goal is complete."
+    assert done.text == "Goal complete; diagnostic remains retrievable."
 
 
 @pytest.mark.asyncio
-async def test_goal_terminal_without_projection_keeps_custom_provider_summary_call(
+async def test_goal_terminal_without_projection_keeps_normal_tools_and_provider_call(
     tmp_path,
 ) -> None:
-    """Hiding retrieval alone must not invoke the raw-restoration admission gate."""
+    """A terminal Goal does not remove retrieval from the next ordinary call."""
 
     large_system = "goal system contract\n" + ("s" * 35_000)
 
@@ -1674,7 +1682,9 @@ async def test_goal_terminal_without_projection_keeps_custom_provider_summary_ca
     events = [event async for event in agent.run_turn("finish the goal")]
 
     assert len(provider.calls) == 2
-    assert provider.calls[1]["tools"] is None
+    assert {tool.name for tool in provider.calls[1]["tools"]} == {
+        "update_goal", "retrieve_tool_result",
+    }
     assert not any(event.kind == "error" for event in events)
     done = next(event for event in events if event.kind == "done")
     assert done.text == "deterministic provider summary"

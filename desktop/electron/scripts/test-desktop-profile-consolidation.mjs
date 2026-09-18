@@ -11,6 +11,7 @@ import { join } from 'node:path'
 
 import {
   allProfileContexts,
+  channelUserDataPath,
   isRecoveryProfileId,
   primaryProfilePaths,
   recoveryProfilePaths,
@@ -18,6 +19,15 @@ import {
 
 const root = mkdtempSync(join(tmpdir(), 'opensquilla-profile-consolidation-'))
 try {
+  assert.equal(channelUserDataPath(root, '0.5.4'), root)
+  assert.equal(channelUserDataPath(root, '0.6.0-rc.1'), `${root}-preview`)
+  assert.equal(channelUserDataPath(root, '0.6.0rc2'), `${root}-preview`)
+  assert.equal(channelUserDataPath(root, '0.6.0-nightly.20260917'), `${root}-nightly`)
+  assert.equal(channelUserDataPath(root, '0.6.0.dev1'), `${root}-nightly`)
+  assert.notEqual(
+    primaryProfilePaths(channelUserDataPath(root, '0.6.0rc1')).home,
+    primaryProfilePaths(root).home,
+  )
   const primary = primaryProfilePaths(root)
   assert.deepEqual(primary, {
     kind: 'primary',

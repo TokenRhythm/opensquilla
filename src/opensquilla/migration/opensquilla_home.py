@@ -2767,9 +2767,11 @@ def _migration_dir_candidates() -> list[Path]:
 
 def _known_migration_ids() -> set[str]:
     """Return the migration ids shipped with this binary (yoyo id == file stem)."""
+    from opensquilla.migration_compatibility import known_migration_ids
+
     for candidate in _migration_dir_candidates():
         try:
-            ids = {entry.stem for entry in candidate.glob("V*.py")}
+            ids = known_migration_ids(candidate)
         except OSError:
             continue
         if ids:
@@ -2777,8 +2779,10 @@ def _known_migration_ids() -> set[str]:
     return set()
 
 
-def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
+def _read_applied_migration_ledger(db_path: Path) -> dict[str, str | None] | None:
     """Read the yoyo ledger read-only; ``None`` when the db cannot be inspected."""
+    from opensquilla.migration_compatibility import read_migration_ledger
+
     try:
         with tempfile.TemporaryDirectory(prefix="opensquilla-sqlite-inspect-") as temporary:
             copied_db = _copy_sqlite_bundle(
@@ -2791,26 +2795,11 @@ def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
                 uri=True,
             )
             try:
-                table_rows = connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name LIKE '%yoyo_migration'"
-                ).fetchall()
-                table = next(
-                    (
-                        name
-                        for (name,) in table_rows
-                        if isinstance(name, str) and name.endswith("yoyo_migration")
-                    ),
-                    None,
-                )
-                if table is None:
-                    return set()
-                rows = connection.execute(f'SELECT migration_id FROM "{table}"').fetchall()
+                return read_migration_ledger(connection)
             finally:
                 connection.close()
     except (OSError, sqlite3.Error):
         return None
-    return {str(migration_id) for (migration_id,) in rows if migration_id}
 
 
 def _read_session_count(db_path: Path) -> int | None:
@@ -4340,7 +4329,7 @@ class OpenSquillaHomeMigrator:
                     f"source sessions.db could not be snapshotted safely ({exc})",
                 )
                 return True
-            applied = _read_applied_migration_ids(copied_db)
+            applied = _read_applied_migration_ledger(copied_db)
             if applied is None:
                 self._record(
                     "preflight/schema",
@@ -4351,15 +4340,25 @@ class OpenSquillaHomeMigrator:
                     "refusing an unverifiable import",
                 )
                 return True
-            unknown = sorted(applied - known)
-            if unknown:
+            from opensquilla.migration_compatibility import classify_migration_ledger
+
+            compatibility = classify_migration_ledger(applied, known)
+            if compatibility.code is not None:
+                unknown = compatibility.conflicting_ids
+                detail = (
+                    "source home uses an unsupported development Goal lineage; "
+                    "keep the original database and WAL and use its original build"
+                    if compatibility.code == "state_unsupported_goal_lineage"
+                    else "source home has an unverified historical migration alias"
+                    if compatibility.code == "state_migration_alias_mismatch"
+                    else "source home was written by a newer OpenSquilla; update OpenSquilla first"
+                )
                 self._record(
                     "preflight/schema",
                     sessions_db,
                     None,
                     "error",
-                    "source home was written by a newer OpenSquilla "
-                    f"(unknown migrations: {', '.join(unknown)}); update OpenSquilla first",
+                    f"{detail} (migrations: {', '.join(unknown)})",
                 )
                 return True
             self._record("preflight/schema", sessions_db, None, "skipped", "ok")

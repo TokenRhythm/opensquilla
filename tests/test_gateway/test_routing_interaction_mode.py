@@ -351,3 +351,17 @@ def test_host_capable_cron_route_keeps_non_owner_identity_with_host_tools() -> N
     assert handler_ctx.allowed_tools is None
     assert "exec_command" not in handler_ctx.denied_tools
     assert handler_ctx.run_mode == "full"
+
+
+def test_plan_subagent_keeps_parent_intent_and_tool_ceiling() -> None:
+    envelope = build_subagent_route_envelope(
+        session_key="agent:main:subagent:investigate",
+        parent_session_key="agent:main:webchat:planning",
+        agent_id="main", run_id="child-1", parent_task_id="parent-1", spawn_depth=1,
+        collaboration_mode="plan", allowed_tools={"read_file", "exec_command"},
+        denied_tools={"write_file"},
+    )
+    assert envelope.metadata["required_collaboration_mode"] == "plan"
+    ctx = envelope.tool_context(is_owner=True)
+    assert ctx.allowed_tools == {"read_file", "exec_command"}
+    assert {"write_file", "submit_plan", "create_goal", "update_goal"} <= ctx.denied_tools

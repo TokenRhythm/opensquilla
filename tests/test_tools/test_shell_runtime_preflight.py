@@ -275,11 +275,13 @@ async def test_windows_sandbox_preflight_uses_backend_path_and_executable_candid
     try:
         tool = shell.background_process if background else shell.exec_command
         with pytest.raises(Exception, match="synthetic backend reached"):
-            await tool(f"{command} --version", workdir=str(tmp_path))
+            # Keep the real fixture cwd, independent of Windows /tmp alias translation.
+            await tool(f"{command} --version", workdir=".")
     finally:
         current_tool_context.reset(token)
 
     assert len(observed) == 1
+    assert Path(observed[0].cwd).resolve() == tmp_path.resolve()
 
 
 @pytest.mark.parametrize("guest", [False, True])

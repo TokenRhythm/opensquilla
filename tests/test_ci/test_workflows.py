@@ -1903,6 +1903,12 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     # Select by a stable contract tag, not the scenario's human-readable title.
     # Renaming the test must not silently leave this release-platform gate empty.
     assert '--grep "@session-hang-recovery"' in session_recovery["run"]
+    assert '--grep "@plan-goal-runtime"' in session_recovery["run"]
+    for spec in ("plan-presentation.spec.ts", "task-progress.spec.ts", "goal-mode.spec.ts"):
+        assert spec in session_recovery["run"]
+        assert "@plan-goal-runtime" in Path("opensquilla-webui/e2e", spec).read_text(
+            encoding="utf-8"
+        )
     assert "--retries=0" in session_recovery["run"]
     recovery_spec = Path("opensquilla-webui/e2e/history-hydration.spec.ts").read_text(
         encoding="utf-8"
@@ -2355,6 +2361,8 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "idle-chat-recovery.spec.ts",
         "new-task-ensemble-race.spec.ts",
         "plan-questionnaire-lifecycle.spec.ts",
+        "plan-presentation.spec.ts",
+        "task-progress.spec.ts",
         "provider-error-experience.spec.ts",
         "router-physical-model.spec.ts",
         "queue-steer.spec.ts",
@@ -2546,6 +2554,11 @@ def test_macos_recovery_planner_inputs_match_workflow_pytest_targets() -> None:
         for line in array.group("body").splitlines()
         if line.strip().startswith("tests/")
     }
+    preflight_step = next(
+        step for step in job["steps"]
+        if step.get("name") == "Preflight offline test environment"
+    )
+    workflow_targets.update(re.findall(r"tests/[a-zA-Z0-9_/.]+\.py", preflight_step["run"]))
     assert workflow_targets == expected_targets
 
 
@@ -2923,3 +2936,66 @@ def test_desktop_cleanup_flow_allows_windows_helper_release_latency() -> None:
 
     assert "process.platform === 'win32' ? 90_000 : 30_000" in source
     assert "pending synthetic targets" in source
+
+
+@pytest.mark.parametrize(("job_name", "test_step_name"), [
+    ("ubuntu-full", "Test Ubuntu full shard"),
+    ("windows-full", "Test Windows shard"),
+    ("macos-recovery", "Test native profile recovery contracts"),
+])
+def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_name):
+    steps = _workflow("ci.yml")["jobs"][job_name]["steps"]
+    preflight = next(step for step in steps if step.get("name") == (
+        "Preflight offline test environment"
+    ))
+    main = next(step for step in steps if step.get("name") == test_step_name)
+    assert steps.index(preflight) < steps.index(main)
+    assert preflight.get("continue-on-error") is not True
+    assert "set -euo pipefail" in preflight["run"]
+    assert "sys.executable" in preflight["run"]
+    assert "opensquilla.__file__" in preflight["run"]
+    expected_preflight_files = {
+        "tests/test_sandbox/test_trusted_sandbox_execution.py",
+        "tests/test_tools/test_approval_unification.py",
+        "tests/test_live_multi_provider_matrix.py",
+        "tests/test_live_provider_profile_smoke.py",
+    }
+    if job_name in {"ubuntu-full", "windows-full"}:
+        expected_preflight_files.update({
+            "tests/test_ci/test_architecture_import_contracts.py",
+            "tests/test_engine/turn_runner/test_stage_test_boundaries.py",
+            "tests/test_engine/test_runtime_artifacts.py",
+            "tests/test_engine/test_tokenjuice_tool_result_projection.py",
+            "tests/test_tools/test_tool_upgrade_compatibility.py",
+            "tests/test_gateway/test_goal_rpc.py",
+            "tests/test_tools/test_dispatch_legacy_coverage.py",
+            "tests/unit/cli/repl/test_slash_bridge.py",
+            "tests/test_gateway/test_channel_turn_ingress.py",
+            "tests/test_gateway/test_goal_registry_cleanup.py",
+            "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
+            "tests/test_gateway/test_goal_turn_authority.py",
+            "tests/test_gateway/test_task_progress_projection.py",
+            "tests/functional/test_gateway_silent_reply_process_e2e.py",
+            "tests/test_engine/test_cancelled_turn_segments.py",
+            "tests/test_tools/test_shell_workdir.py",
+            "tests/test_sandbox/test_shell_code_network_hints.py",
+            "tests/test_tools/test_shell_runtime_preflight.py",
+            "tests/test_sandbox/test_windows_shell_process_runtime.py",
+        })
+        assert '"${{ matrix.shard }}" == "desktop-installer-contracts"' in preflight["run"]
+        assert '"${{ matrix.shard }}" == "gateway-sqlite"' in preflight["run"]
+        assert '"${regression_args[@]}"' in preflight["run"]
+        assert "-o faulthandler_timeout=60" in preflight["run"]
+    if job_name == "windows-full":
+        expected_preflight_files.update({
+            "tests/test_ci/test_windows_signatures.py",
+            "tests/test_tools/test_shell_process_isolation.py",
+        })
+        assert '"${{ matrix.shard }}" == "core"' in preflight["run"]
+    assert set(re.findall(r"tests/[a-zA-Z0-9_/.]+\.py", preflight["run"])) == (
+        expected_preflight_files
+    )
+    assert "-vv --tb=short" in preflight["run"]
+    assert "-o faulthandler_timeout=60" in main["run"]
+    assert "--showlocals" not in preflight["run"]
+    assert "--showlocals" not in main["run"]

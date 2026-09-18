@@ -16,7 +16,7 @@ const i18n = createI18n({
       chat: {
         planMode: {
           label: 'Plan mode',
-          readOnly: 'Research and propose a plan without changing files.',
+          readOnly: 'Research and discuss before implementation. Tests and builds follow normal permissions.',
           nextTurn: 'Applies to the next turn',
           updating: 'Updating…',
           turnOff: 'Turn plan mode off',
@@ -53,7 +53,7 @@ afterEach(() => {
 })
 
 describe('ChatComposerPlanMode', () => {
-  it('shows the active read-only contract and requests an explicit mode change', async () => {
+  it('shows the active planning contract and requests an explicit mode change', async () => {
     const setMode = vi.fn()
     const host = mountMode({
       available: true,

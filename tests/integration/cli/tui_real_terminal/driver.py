@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from tui_real_terminal.framebuffer import (
     StyledFramebuffer,
@@ -182,10 +182,30 @@ class _BaseTerminalSession:
 @dataclass
 class TmuxTerminalSession(_BaseTerminalSession):
     kind: DriverKind = field(init=False, default="tmux")
+    driver_env: dict[str, str] | None = None
+    tmux_socket: str | None = None
+    deadline: float | None = None
+    command_timeout: float = 10.0
+
+    def _run_tmux(
+        self, args: list[str], *, cleanup: bool = False, **kwargs: Any,
+    ) -> subprocess.CompletedProcess[Any]:
+        timeout = min(self.command_timeout, 5.0) if cleanup else self.command_timeout
+        if not cleanup and self.deadline is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError("terminal case deadline exceeded")
+        if self.tmux_socket is not None:
+            # An isolated server must not load operator configuration or reuse
+            # the default server's environment. Every command selects it.
+            args = [args[0], "-L", self.tmux_socket, "-f", os.devnull, *args[1:]]
+        if self.driver_env is not None:
+            kwargs["env"] = dict(self.driver_env)
+        return subprocess.run(args, timeout=timeout, **kwargs)
 
     def start(self) -> None:
         env_prefix = ["env", *[f"{key}={value}" for key, value in sorted(self.env.items())]]
-        subprocess.run(
+        self._run_tmux(
             [
                 "tmux",
                 "new-session",
@@ -205,20 +225,20 @@ class TmuxTerminalSession(_BaseTerminalSession):
         )
 
     def send_text(self, text: str) -> None:
-        subprocess.run(["tmux", "send-keys", "-t", self.run_id, "-l", text], check=True)
-        subprocess.run(["tmux", "send-keys", "-t", self.run_id, "Enter"], check=True)
+        self._run_tmux(["tmux", "send-keys", "-t", self.run_id, "-l", text], check=True)
+        self._run_tmux(["tmux", "send-keys", "-t", self.run_id, "Enter"], check=True)
 
     def send_key(self, key: str) -> None:
-        subprocess.run(["tmux", "send-keys", "-t", self.run_id, key], check=True)
+        self._run_tmux(["tmux", "send-keys", "-t", self.run_id, key], check=True)
 
     def paste(self, text: str) -> None:
-        subprocess.run(
+        self._run_tmux(
             ["tmux", "load-buffer", "-b", self.run_id, "-"],
             check=True,
             input=text,
             text=True,
         )
-        subprocess.run(
+        self._run_tmux(
             ["tmux", "paste-buffer", "-p", "-t", self.run_id, "-b", self.run_id],
             check=True,
         )
@@ -239,14 +259,14 @@ class TmuxTerminalSession(_BaseTerminalSession):
         report = f"\x1b[<{button};{max(1, x)};{max(1, y)}M".encode()
         hex_bytes = [f"{byte:02x}" for byte in report]
         for _ in range(max(1, ticks)):
-            subprocess.run(
+            self._run_tmux(
                 ["tmux", "send-keys", "-H", "-t", self.run_id, *hex_bytes],
                 check=True,
             )
 
     def resize(self, size: TerminalSize) -> None:
         self.size = size
-        subprocess.run(
+        self._run_tmux(
             [
                 "tmux",
                 "resize-window",
@@ -261,7 +281,7 @@ class TmuxTerminalSession(_BaseTerminalSession):
         )
 
     def capture_text(self, checkpoint: str) -> TerminalFrame:
-        result = subprocess.run(
+        result = self._run_tmux(
             ["tmux", "capture-pane", "-t", self.run_id, "-p", "-J"],
             check=True,
             text=True,
@@ -276,7 +296,7 @@ class TmuxTerminalSession(_BaseTerminalSession):
         # tmux's saved normal screen while the TUI is in alternate-screen mode,
         # so it is deliberately absent. `-J` is likewise absent because it
         # joins wrapped rows and destroys exact cell geometry.
-        result = subprocess.run(
+        result = self._run_tmux(
             ["tmux", "capture-pane", "-t", self.run_id, "-e", "-N", "-p"],
             check=True,
             text=True,
@@ -292,7 +312,7 @@ class TmuxTerminalSession(_BaseTerminalSession):
         )
 
     def capture_scrollback_text(self, checkpoint: str) -> TerminalFrame:
-        result = subprocess.run(
+        result = self._run_tmux(
             ["tmux", "capture-pane", "-t", self.run_id, "-S", "-", "-p", "-J"],
             check=True,
             text=True,
@@ -303,7 +323,7 @@ class TmuxTerminalSession(_BaseTerminalSession):
         return frame
 
     def cursor_position(self) -> tuple[int, int]:
-        result = subprocess.run(
+        result = self._run_tmux(
             [
                 "tmux",
                 "display-message",
@@ -324,7 +344,7 @@ class TmuxTerminalSession(_BaseTerminalSession):
         # real terminal state rather than inferring it from captured text: an
         # app that exited without leaving the alternate screen still shows
         # later shell output, just drawn over the stale alternate screen.
-        result = subprocess.run(
+        result = self._run_tmux(
             ["tmux", "display-message", "-p", "-t", self.run_id, "#{alternate_on}"],
             check=True,
             text=True,
@@ -352,7 +372,7 @@ class TmuxTerminalSession(_BaseTerminalSession):
 
     def is_alive(self) -> bool:
         return (
-            subprocess.run(
+            self._run_tmux(
                 ["tmux", "has-session", "-t", self.run_id],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -362,8 +382,10 @@ class TmuxTerminalSession(_BaseTerminalSession):
         )
 
     def terminate(self) -> None:
-        subprocess.run(
-            ["tmux", "kill-session", "-t", self.run_id],
+        self._run_tmux(
+            (["tmux", "kill-server"] if self.tmux_socket is not None
+             else ["tmux", "kill-session", "-t", self.run_id]),
+            cleanup=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -551,13 +573,21 @@ def open_real_terminal_session(
     size: TerminalSize,
     artifact_dir: Path,
     driver: DriverSelection = "auto",
+    driver_env: dict[str, str] | None = None,
+    tmux_socket: str | None = None,
+    deadline: float | None = None,
 ) -> RealTerminalSession:
     capabilities = probe_terminal_capabilities()
     selected = capabilities.preferred_driver if driver == "auto" else driver
     terminal_log = artifact_dir / "terminal.log"
     if selected == "tmux" and capabilities.tmux_available:
-        return TmuxTerminalSession(command, cwd, env, run_id, size, terminal_log)
+        return TmuxTerminalSession(
+            command, cwd, env, run_id, size, terminal_log,
+            driver_env=driver_env, tmux_socket=tmux_socket, deadline=deadline,
+        )
     if selected == "pty" and capabilities.pty_available:
+        if driver_env is not None or tmux_socket is not None or deadline is not None:
+            raise ValueError("isolated driver environment and deadline require tmux")
         return PtyTerminalSession(command, cwd, env, run_id, size, terminal_log)
     if driver != "auto":
         raise RuntimeError(f"requested terminal driver {selected!r} is unavailable")

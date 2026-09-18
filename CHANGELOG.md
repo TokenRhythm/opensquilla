@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Plan proposals can be hidden and restored without losing history or stopping
+  work. Queued and running implementations expose the normal task cancellation
+  control. Retried implementation requests preserve their original identity.
+- Ordinary tasks, Plan implementation and Goals share adjustable `update_plan`
+  progress. Planning can investigate with normal tools and permissions;
+  implementation no longer requires ordered checkpoints or a delivery-only phase.
+- Goals support natural control within the current task, optional token budgets
+  and explicitly enabled background continuation. Physical usage is attributed
+  to the root Goal across children and late results. Unknown usage pauses
+  budget-driven continuation; Gateway restart always requires explicit resume.
+  Upgraded Goals can budget newly recorded usage. Clients check Gateway support
+  before offering budget and background settings.
+- Human input and approval waits release compute capacity while preserving task
+  identity and session exclusion. Cancelled questionnaires are closed in the
+  history used by subsequent turns, while their original questions are preserved.
+  Unsupported legacy database lineages are
+  preserved and rejected consistently, and preview/nightly Desktop profiles
+  are isolated from stable data.
+- Shell calls with an authorized but invalid working directory now report a
+  correctable argument error without executing the command or requesting broader
+  sandbox permissions.
+
 - Browser extensions can now reach state-changing HTTP and WebSocket endpoints
   through a loopback request authority when their exact custom-scheme origin
   (for example `chrome-extension://<id>`) is listed in `cors.allowed_origins`.

@@ -273,6 +273,7 @@ METHOD_SCOPES: dict[str, str] = {
     "plans.implement": WRITE_SCOPE,
     "plans.revise": WRITE_SCOPE,
     "plans.cancelRun": WRITE_SCOPE,
+    "plans.setPresentation": WRITE_SCOPE,
     "goals.capabilities": READ_SCOPE,
     "goals.status": READ_SCOPE,
     "goals.set": WRITE_SCOPE,

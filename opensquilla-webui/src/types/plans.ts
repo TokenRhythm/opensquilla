@@ -16,6 +16,17 @@ export interface PlanRevisionSnapshot {
   createdAt?: number
 }
 
+/** Presentation is independent of immutable plan content and execution state. */
+export interface PlanPresentationSnapshot {
+  revisionId: string
+  dismissed: boolean
+  stateRevision: number
+}
+
+export interface PlanPresentationRequest extends PlanCardActionTarget {
+  dismissed: boolean
+}
+
 export type CollaborationMode = 'default' | 'plan'
 
 export interface CollaborationSnapshot {

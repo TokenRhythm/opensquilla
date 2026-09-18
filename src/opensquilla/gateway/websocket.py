@@ -1464,12 +1464,27 @@ class ConnectionRegistry:
 
     def __init__(self) -> None:
         self._connections: dict[str, WsConnection] = {}
+        self._unregister_listener: Callable[[WsConnection], None] | None = None
+
+    def set_unregister_listener(self, listener: Callable[[WsConnection], None]) -> None:
+        self._unregister_listener = listener
+
+    def clear_unregister_listener(self, listener: Callable[[WsConnection], None]) -> None:
+        if self._unregister_listener == listener:
+            self._unregister_listener = None
 
     def register(self, conn: WsConnection) -> None:
         self._connections[conn.conn_id] = conn
 
     def unregister(self, conn_id: str) -> None:
-        self._connections.pop(conn_id, None)
+        connection = self._connections.get(conn_id)
+        try:
+            if connection is not None and self._unregister_listener is not None:
+                self._unregister_listener(connection)
+        except Exception:
+            log.warning("gateway.ws_unregister_listener_failed", exc_info=True)
+        finally:
+            self._connections.pop(conn_id, None)
 
     def get(self, conn_id: str) -> WsConnection | None:
         return self._connections.get(conn_id)

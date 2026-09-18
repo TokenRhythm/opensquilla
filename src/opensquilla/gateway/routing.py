@@ -385,6 +385,9 @@ def build_subagent_route_envelope(
     run_mode: str | RunMode | None = None,
     sandbox_run_context: Any | None = None,
     sandbox_mounts: list[dict[str, Any]] | None = None,
+    collaboration_mode: str = "default",
+    allowed_tools: set[str] | frozenset[str] | None = None,
+    denied_tools: set[str] | frozenset[str] = frozenset(),
 ) -> RouteEnvelope:
     """Build a route for a child subagent run."""
     metadata: dict[str, Any] = {
@@ -394,6 +397,11 @@ def build_subagent_route_envelope(
         "spawn_depth": spawn_depth,
         "origin": origin,
     }
+    if collaboration_mode == "plan":
+        metadata["required_collaboration_mode"] = "plan"
+    if allowed_tools is not None:
+        metadata["parent_allowed_tools"] = sorted(allowed_tools)
+    metadata["parent_denied_tools"] = sorted(denied_tools)
     if isinstance(parent_session_id, str) and parent_session_id:
         metadata["parent_session_id"] = parent_session_id
     if (
@@ -559,6 +567,10 @@ def tool_context_from_envelope(
             denied_tools = set(CRON_AGENT_DENY)
     elif caller_kind is CallerKind.SUBAGENT:
         denied_tools = set(SUBAGENT_TOOL_DENY)
+        denied_tools.update(envelope.metadata.get("parent_denied_tools") or ())
+        parent_allowlist = envelope.metadata.get("parent_allowed_tools")
+        if isinstance(parent_allowlist, list):
+            allowed_tools = set(parent_allowlist)
     guest_safe = bool(envelope.metadata.get("guest_safe"))
     if guest_safe:
         from opensquilla.tools.visibility import guest_safe_tool_allowlist
@@ -697,6 +709,9 @@ def tool_context_from_envelope(
         plan_storage=envelope.runtime_services.get("plan_storage"),
         plan_event_emitter=envelope.runtime_services.get("plan_event_emitter"),
         user_input_provider=envelope.runtime_services.get("user_input_provider"),
+        suspend_compute_slot=envelope.runtime_services.get("suspend_compute_slot"),
+        update_progress=envelope.runtime_services.get("update_progress"),
+        usage_root_turn_id=envelope.metadata.get("usage_root_turn_id"),
         plan_revision=envelope.runtime_services.get("plan_revision"),
         plan_run=envelope.runtime_services.get("plan_run"),
         goal_context=envelope.runtime_services.get("goal_context"),

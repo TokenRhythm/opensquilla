@@ -303,67 +303,40 @@ def prepare_plan_run(
     )
 
 
-def checkpoint_plan_step_states(
-    states: Sequence[Mapping[str, Any]],
+def checkpoint_plan_progress(
+    proposed: Sequence[Mapping[str, Any]],
+    progress: Sequence[Mapping[str, Any]],
     *,
     step_id: str,
     step_status: str,
     next_step_id: str | None = None,
     reason: str | None = None,
-) -> tuple[list[dict[str, Any]], str | None, str]:
-    """Apply one monotonic checkpoint and derive current step/run status."""
+) -> list[dict[str, Any]]:
+    """Adapt an old proposed-step reference to the current descriptive progress.
 
+    Accept legacy next_step_id without imposing execution order. Blocked and
+    skipped are represented as pending work with the caller's explanation;
+    neither is a task lifecycle operation. Completed items may be reopened.
+    """
     if step_status not in {"in_progress", "completed", "blocked", "skipped"}:
         raise PlanValidationError(f"invalid checkpoint step status: {step_status}")
-    updated = [dict(state) for state in states]
-    by_id = {str(state.get("step_id")): index for index, state in enumerate(updated)}
-    if step_id not in by_id:
-        raise PlanValidationError(f"unknown plan step id: {step_id}")
-    index = by_id[step_id]
-    previous = updated[index].get("status")
-    if previous in PLAN_STEP_TERMINAL_STATUSES:
-        raise PlanValidationError(f"terminal plan step cannot transition from {previous}")
-    updated[index]["status"] = step_status
     if step_status in {"blocked", "skipped"}:
-        updated[index]["reason"] = _bounded_text(
-            reason,
-            field="reason",
-            maximum=MAX_PLAN_STEP_REASON_CHARS,
-        )
-    else:
-        updated[index].pop("reason", None)
-
-    if step_status == "blocked":
-        return updated, step_id, PlanRunStatus.BLOCKED.value
+        _bounded_text(reason, field="reason", maximum=MAX_PLAN_STEP_REASON_CHARS)
+    selected = next((step for step in proposed if step.get("step_id") == step_id), None)
+    if selected is None:
+        raise PlanValidationError(f"unknown proposed step id: {step_id}; use update_plan")
+    updated = [dict(item) for item in progress]
+    title = str(selected["title"])
+    target = next((item for item in updated if item.get("step") == title), None)
+    if target is None:
+        target = {"step": title, "status": "pending"}
+        updated.append(target)
     if step_status == "in_progress":
-        return updated, step_id, PlanRunStatus.RUNNING.value
-
-    if all(state.get("status") in PLAN_STEP_TERMINAL_STATUSES for state in updated):
-        # A final step checkpoint records execution progress only. The owning
-        # task must still finish its reply/artifact work before storage marks
-        # the run terminal through complete_plan_run().
-        return updated, None, PlanRunStatus.RUNNING.value
-
-    # The revision order is authoritative. ``next_step_id`` remains in the
-    # internal signature only so persisted/cached legacy calls keep decoding;
-    # callers may not reorder the execution overlay with it. Selecting from
-    # the beginning also lets a pre-fix out-of-order run lazily converge after
-    # its truthful current step is closed.
-    candidate = next(
-        (
-            str(state["step_id"])
-            for state in updated
-            if state.get("status") not in PLAN_STEP_TERMINAL_STATUSES
-        ),
-        None,
-    )
-    if candidate is None or candidate not in by_id:
-        raise PlanValidationError("next_step_id must identify a non-terminal plan step")
-    candidate_state = updated[by_id[candidate]]
-    if candidate_state.get("status") in PLAN_STEP_TERMINAL_STATUSES:
-        raise PlanValidationError("next_step_id cannot identify a terminal plan step")
-    candidate_state["status"] = "in_progress"
-    return updated, candidate, PlanRunStatus.RUNNING.value
+        for item in updated:
+            if item.get("status") == "in_progress":
+                item["status"] = "pending"
+    target["status"] = step_status if step_status in {"completed", "in_progress"} else "pending"
+    return updated
 
 
 def plan_revision_snapshot(

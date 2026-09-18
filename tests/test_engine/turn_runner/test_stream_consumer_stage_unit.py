@@ -33,6 +33,7 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
     StreamConsumerStage,
     StreamConsumerStageInput,
     _ArtifactHandler,
+    _cancel_pending_user_input_results,
     _CompactionHandler,
     _DoneHandler,
     _ErrorHandler,
@@ -1361,6 +1362,41 @@ def test_tool_result_handler_preserves_initial_user_input_request() -> None:
             "user_input_request": request,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["foreign-task", "foreign-tool", "unpaired-tool", "missing-request", "answered", "cancelled"],
+)
+def test_cancelled_user_input_projection_preserves_other_ownership_and_terminal_results(
+    boundary: str,
+) -> None:
+    state = _make_state()
+    pending = {
+        "status": "input_required", "kind": "user_input", "paused": True,
+        "request_id": "request-1", "run_id": "task-1",
+    }
+    if boundary == "foreign-task":
+        pending["run_id"] = "other-task"
+    elif boundary == "missing-request":
+        pending.pop("request_id")
+    elif boundary in {"answered", "cancelled"}:
+        pending.update(status=boundary, paused=False)
+    state.turn_segments.extend([
+        {"type": "tool_use", "tool_use_id": "call-1",
+         "name": "lookup" if boundary == "foreign-tool" else "request_user_input"},
+        {"type": "tool_result", "name": "request_user_input",
+         "tool_use_id": "other-call" if boundary == "unpaired-tool" else "call-1",
+         "result": json.dumps(pending), "is_error": False},
+    ])
+    before = json.dumps(state.turn_segments, sort_keys=True)
+    replay = {"version": 1, "messages": []}
+    for _ in range(2):
+        result = _cancel_pending_user_input_results(
+            state, task_id="task-1", assistant_replay=replay,
+        )
+        assert result is replay
+        assert json.dumps(state.turn_segments, sort_keys=True) == before
 
 
 def test_artifact_handler_appends_payload() -> None:
@@ -2842,7 +2878,7 @@ async def test_auto_published_artifact_is_adopted_before_public_yield(
             "step-1",
             "in_progress",
             "task-artifact",
-            0,
+            1,
             id="running-current-step",
         ),
         pytest.param(
@@ -2858,7 +2894,7 @@ async def test_auto_published_artifact_is_adopted_before_public_yield(
             None,
             "completed",
             "other-task",
-            0,
+            1,
             id="running-delivery-ready-other-owner",
         ),
         pytest.param(
@@ -2871,7 +2907,7 @@ async def test_auto_published_artifact_is_adopted_before_public_yield(
         ),
     ],
 )
-async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
+async def test_plan_run_auto_publish_uses_normal_delivery_rules_without_checkpoint_reads(
     tmp_path: Path,
     run_status: str,
     current_step_id: str | None,
@@ -2915,7 +2951,7 @@ async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
 
     await _drain(stage, _make_input(state=state, tool_context=ctx))
 
-    assert storage.calls == ["run-artifact"]
+    assert storage.calls == []
     assert len(ctx.published_artifacts) == expected_artifact_count
     assert state.turn_artifacts == ctx.published_artifacts
 

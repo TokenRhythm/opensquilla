@@ -13,7 +13,7 @@ import { GOALS_CLEAR_METHOD } from '@/contracts/generated/v4/goalsClear'
 import { validateResult as validateGoalClearResult } from '@/contracts/generated/v4/goalsClearValidators.mjs'
 import { GOALS_STATUS_METHOD, type Params as GoalStatusParams, type Result as GoalStatusWireResult } from '@/contracts/generated/v4/goalsStatus'
 import { validateParams as validateGoalStatusParams, validateResult as validateGoalStatusResult } from '@/contracts/generated/v4/goalsStatusValidators.mjs'
-import type { GoalCapabilities, GoalCenter, GoalMutationInput, GoalMutationResult, GoalSetResult, GoalStatusResult } from '@/modules/goalCenter'
+import type { GoalCapabilities, GoalCenter, GoalMutationInput, GoalExecutionOptions, GoalMutationResult, GoalSetResult, GoalStatusResult } from '@/modules/goalCenter'
 import { GoalCenterError } from '@/modules/goalCenter'
 import { projectGoalSnapshot } from './goalSnapshotProjection'
 import { mapGoalError } from './goalErrorMapping'
@@ -38,7 +38,7 @@ function optionsFor(signal: AbortSignal | undefined): RpcCallOptions | undefined
 export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
     const mutate = async (
       method: 'goals.edit' | 'goals.pause' | 'goals.resume' | 'goals.clear',
-      input: GoalMutationInput & { objective?: string },
+      input: GoalMutationInput & GoalExecutionOptions & { objective?: string },
       options?: { signal?: AbortSignal },
     ): Promise<GoalMutationResult> => {
       const params: Record<string, unknown> = {
@@ -48,6 +48,8 @@ export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
         clientRequestId: input.clientRequestId,
         ...(input.sourceKind ? { sourceKind: input.sourceKind } : {}),
         ...(input.objective !== undefined ? { objective: input.objective } : {}),
+        ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
+        ...(input.executionPolicy !== undefined ? { executionPolicy: input.executionPolicy } : {}),
       }
       try {
         const raw = await transport.request<Record<string, unknown>>(method, params, optionsFor(options?.signal))
@@ -96,6 +98,8 @@ export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
           maxTurns: raw.maxTurns,
           runtimeBudgetSeconds: raw.runtimeBudgetSeconds,
           methods: [...raw.methods],
+          tokenBudgetSupported: raw.tokenBudgetSupported === true,
+          backgroundExecutionSupported: raw.backgroundExecutionSupported === true,
         }
       } catch (error) { throw mapGoalError(error) }
     },
@@ -117,7 +121,13 @@ export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
       } catch (error) { throw mapGoalError(error) }
     },
     async set(input, options): Promise<GoalSetResult> {
-      const params: GoalSetParams = { sessionKey: input.sessionKey, objective: input.objective, clientRequestId: input.clientRequestId, clientMessageId: input.clientMessageId, ...(input.sourceKind ? { sourceKind: input.sourceKind } : {}) }
+      const params: GoalSetParams = {
+        sessionKey: input.sessionKey, objective: input.objective,
+        clientRequestId: input.clientRequestId, clientMessageId: input.clientMessageId,
+        ...(input.sourceKind ? { sourceKind: input.sourceKind } : {}),
+        ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
+        ...(input.executionPolicy !== undefined ? { executionPolicy: input.executionPolicy } : {}),
+      }
       if (!validateGoalSetParams(params)) throw new GoalCenterError('invalid', 'goals.set params violated Contract')
       try {
         const raw = await transport.request<GoalSetWireResult>(GOALS_SET_METHOD, params, optionsFor(options?.signal))

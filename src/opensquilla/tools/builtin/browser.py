@@ -78,8 +78,6 @@ async def browser(
         raise SafeToolError(
             "BROWSER_UNAVAILABLE: No browser connection is available for this session."
         )
-    if context.collaboration_mode == "plan" and operation in {"open", "act", "reload"}:
-        raise SafeToolError("BROWSER_READ_ONLY: Planning permits browser observations only.")
     args: dict[str, Any] = {
         k: v
         for k, v in {

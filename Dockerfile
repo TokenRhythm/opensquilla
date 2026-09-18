@@ -62,6 +62,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md README.release.md ./
 COPY hatch_build.py ./
 COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py
+COPY scripts/freeze_migration_registry.py ./scripts/freeze_migration_registry.py
 COPY opensquilla-webui/ ./opensquilla-webui/
 COPY src/ ./src/
 COPY migrations/ ./migrations/

@@ -163,9 +163,15 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "execution_status_snapshot",
         "router_control_routing_revision",
         "skill_install_turn",
+        "suspend_compute_slot",
+        "update_progress",
+        "usage_root_turn_id",
     ]
 
     assert ToolContext().skill_install_turn is None
+    assert ToolContext().suspend_compute_slot is None
+    assert ToolContext().update_progress is None
+    assert ToolContext().usage_root_turn_id is None
 
 
 def test_tool_context_preserves_complete_legacy_positional_constructor() -> None:

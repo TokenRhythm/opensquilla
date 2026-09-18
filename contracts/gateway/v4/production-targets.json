@@ -907,6 +907,11 @@
     },
     {
       "kind": "method",
+      "wireName": "plans.setPresentation",
+      "roles": ["result"]
+    },
+    {
+      "kind": "method",
       "wireName": "plans.cancelRun",
       "roles": [
         "result"

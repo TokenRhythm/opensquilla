@@ -563,9 +563,11 @@ def _migration_dir_candidates() -> tuple[Path, ...]:
 
 
 def _known_migration_ids() -> set[str]:
+    from opensquilla.migration_compatibility import known_migration_ids
+
     for directory in _migration_dir_candidates():
         try:
-            known = {entry.stem for entry in directory.glob("V*.py") if entry.is_file()}
+            known = known_migration_ids(directory)
         except OSError:
             continue
         if known:
@@ -732,6 +734,10 @@ def _bundle_names(path: Path) -> tuple[Path, ...]:
 
 def _database_safety_code(path: Path) -> str | None:
     """Validate a stable private SQLite snapshot without opening the source."""
+    from opensquilla.migration_compatibility import (
+        classify_migration_ledger,
+        read_migration_ledger,
+    )
 
     bundle = _bundle_names(path)
     try:
@@ -768,25 +774,7 @@ def _database_safety_code(path: Path) -> str | None:
                     check = connection.execute("PRAGMA quick_check").fetchone()
                     if not check or str(check[0]).lower() != "ok":
                         return "state_database_invalid"
-                    tables = connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' "
-                        "AND name LIKE '%yoyo_migration'"
-                    ).fetchall()
-                    ledger = next(
-                        (
-                            name
-                            for (name,) in tables
-                            if isinstance(name, str) and name.endswith("yoyo_migration")
-                        ),
-                        None,
-                    )
-                    if ledger is None:
-                        rows: list[tuple[Any, ...]] = []
-                    else:
-                        quoted_ledger = ledger.replace('"', '""')
-                        rows = connection.execute(
-                            f'SELECT migration_id FROM "{quoted_ledger}"'
-                        ).fetchall()
+                    applied = read_migration_ledger(connection)
                 finally:
                     connection.close()
             except sqlite3.Error:
@@ -804,15 +792,12 @@ def _database_safety_code(path: Path) -> str | None:
     except RecoveryError as exc:
         return exc.stable_code
 
-    applied = {str(migration_id) for (migration_id,) in rows if migration_id}
     if not applied:
         return None
     known = _known_migration_ids()
     if not known:
         return "state_migration_set_unavailable"
-    if applied - known:
-        return "state_schema_too_new"
-    return None
+    return classify_migration_ledger(applied, known).code
 
 
 def _state_safety_code(state_dir: Path) -> str | None:

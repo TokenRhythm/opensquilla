@@ -64,10 +64,11 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
     setMode: (sessionKey: string, mode: string, expectedRevision: number) => rpc.call('plans.setMode', { sessionKey, mode, expectedRevision }),
     revise: (sessionKey: string, request: { revisionId: string; prompt: string }, clientRequestId: string) => rpc.call('plans.revise', { sessionKey, planRevisionId: request.revisionId, prompt: request.prompt, clientRequestId }),
     implement: (sessionKey: string, target: { revisionId: string }, clientRequestId: string, options?: { intent?: string }) => rpc.call('plans.implement', { sessionKey, planRevisionId: target.revisionId, clientRequestId, ...(options?.intent ? { intent: options.intent } : {}) }),
+    setPresentation: (input: import('@/modules/planCenter').PlanPresentationInput) => rpc.call('plans.setPresentation', input),
     cancelRun: (sessionKey: string, runId: string, expectedStateRevision?: number) => rpc.call('plans.cancelRun', { sessionKey, runId, ...(expectedStateRevision !== undefined ? { expectedStateRevision } : {}) }),
     subscribe: (listener: (event: any) => void) => {
-      const unsubs = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run'].map(name => {
-        const handler = (...args: unknown[]) => listener({ kind: name.endsWith('run') ? 'run' : name.endsWith('revision') ? 'revision' : 'collaboration', sessionKey: (args[0] as Record<string, unknown>)?.session_key, collaboration: (args[0] as Record<string, unknown>)?.collaboration, plan: (args[0] as Record<string, unknown>)?.plan_revision, run: (args[0] as Record<string, unknown>)?.plan_run })
+      const unsubs = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run', 'session.event.plan_presentation'].map(name => {
+        const handler = (...args: unknown[]) => listener({ kind: name.endsWith('presentation') ? 'presentation' : name.endsWith('run') ? 'run' : name.endsWith('revision') ? 'revision' : 'collaboration', sessionKey: (args[0] as Record<string, unknown>)?.session_key, epoch: (args[0] as Record<string, unknown>)?.epoch, planPresentations: (args[0] as Record<string, unknown>)?.planPresentations, collaboration: (args[0] as Record<string, unknown>)?.collaboration, plan: (args[0] as Record<string, unknown>)?.plan_revision, run: (args[0] as Record<string, unknown>)?.plan_run })
         return rpc.on(name, handler)
       })
       return { close: () => unsubs.forEach(unsub => unsub()) }
@@ -109,6 +110,74 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
 }
 
 describe('useChatPlans', () => {
+  it('hides and restores a historical plan without changing mode or stopping execution', async () => {
+    const { api, rpc, isStreaming } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 4, collaboration: { mode: 'plan', revision: 2 }, currentPlan: revision(), activePlanRun: run() })
+    isStreaming.value = true
+    const target = { planId: 'plan-1', revisionId: 'historical-revision' }
+    rpc.call.mockResolvedValueOnce({ planPresentations: [{ ...target, dismissed: true, stateRevision: 1 }] })
+    expect(await api.setPresentation({ ...target, dismissed: true })).toBe(true)
+    expect(rpc.call).toHaveBeenLastCalledWith('plans.setPresentation', {
+      sessionKey: SESSION_ONE, revisionId: target.revisionId, dismissed: true,
+      expectedEpoch: 4, expectedPresentationRevision: 0, clientRequestId: expect.any(String),
+    })
+    expect(api.currentPlan.value?.revisionId).toBe('revision-2')
+    expect(api.collaboration.value.mode).toBe('plan')
+    expect(api.activePlanRun.value?.status).toBe('running')
+    rpc.call.mockResolvedValueOnce({ planPresentations: [{ ...target, dismissed: false, stateRevision: 2 }] })
+    await api.setPresentation({ ...target, dismissed: false })
+    expect(rpc.call).toHaveBeenLastCalledWith('plans.setPresentation', expect.objectContaining({ expectedPresentationRevision: 1, dismissed: false }))
+    expect(api.planPresentations.value[target.revisionId]?.dismissed).toBe(false)
+    expect(rpc.call.mock.calls.map(call => call[0])).toEqual(['plans.setPresentation', 'plans.setPresentation'])
+  })
+
+  it('merges durable presentation independently and rejects stale session, epoch, and revision events', () => {
+    const { api, handlers, currentEpoch, sessionKey } = harness()
+    api.subscribe()
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 2, collaboration: { mode: 'default', revision: 5 }, planPresentations: [{ revisionId: 'r1', dismissed: true, stateRevision: 3 }] })
+    // A snapshot's collaboration order cannot roll presentation back or erase historical entries.
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 2, collaboration: { mode: 'plan', revision: 2 }, planPresentations: [{ revisionId: 'r1', dismissed: false, stateRevision: 2 }, { revisionId: 'r2', dismissed: true, stateRevision: 1 }] })
+    const event = handlers.get('session.event.plan_presentation')!
+    event({ session_key: SESSION_TWO, epoch: 2, planPresentations: [{ revisionId: 'r1', dismissed: false, stateRevision: 8 }] })
+    event({ session_key: SESSION_ONE, epoch: 1, planPresentations: [{ revisionId: 'r1', dismissed: false, stateRevision: 8 }] })
+    expect(api.planPresentations.value.r1).toMatchObject({ dismissed: true, stateRevision: 3 })
+    expect(api.planPresentations.value.r2?.dismissed).toBe(true)
+    event({ session_key: SESSION_ONE, epoch: 2, planPresentations: [{ revisionId: 'r1', dismissed: false, stateRevision: 4 }] })
+    expect(api.planPresentations.value.r1?.dismissed).toBe(false)
+    currentEpoch.value = 3
+    expect(api.planPresentations.value).toEqual({})
+    event({ session_key: SESSION_ONE, epoch: 3, planPresentations: [{ revisionId: 'r1', dismissed: true, stateRevision: 1 }] })
+    sessionKey.value = SESSION_TWO
+    expect(api.planPresentations.value).toEqual({})
+  })
+
+  it('ignores a delayed presentation response after the session changes', async () => {
+    const { api, rpc, sessionKey, notifyError } = harness()
+    const pending = deferred()
+    rpc.call.mockReturnValueOnce(pending.promise)
+    const operation = api.setPresentation({ planId: 'p1', revisionId: 'r1', dismissed: true })
+    sessionKey.value = SESSION_TWO
+    pending.resolve({ planPresentations: [{ revisionId: 'r1', dismissed: true, stateRevision: 1 }] })
+    expect(await operation).toBe(false)
+    expect(api.planPresentations.value).toEqual({})
+    expect(api.presentationPending.value).toBeNull()
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('reuses an uncertain implementation request and destination (new session: %s)', async inNewSession => {
+    const { api, rpc } = harness()
+    const target = { planId: 'retry-plan', revisionId: `retry-revision-${inNewSession}` }
+    rpc.call.mockRejectedValueOnce(new Error('Connection closed before response'))
+    await api.implement(target, inNewSession)
+    const first = rpc.call.mock.calls[0]![1]
+    rpc.call.mockResolvedValueOnce({ accepted: true, replayed: true, sessionKey: first.sessionKey })
+    await api.implement(target, inNewSession)
+    expect(rpc.call.mock.calls[1]![1]).toEqual(first)
+    rpc.call.mockResolvedValueOnce({ accepted: true })
+    await api.implement(target, inNewSession)
+    expect(rpc.call.mock.calls[2]![1].clientRequestId).not.toBe(first.clientRequestId)
+  })
+
   it.each(['queued', 'running'])('pauses only the visible %s run when its owning task settles', status => {
     const { api } = harness()
     api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run(status, {
@@ -750,6 +819,33 @@ describe('useChatPlans', () => {
     expect(api.pendingAction.value).toBe('revise')
     newRequest.resolve({ collaboration: { mode: 'plan', revision: 1 } })
     await newMutation
+    expect(api.pendingAction.value).toBeNull()
+  })
+
+  it('adopts a cancellation conflict snapshot so the next explicit retry uses its current revision', async () => {
+    const { api, rpc } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run() })
+    rpc.call.mockRejectedValueOnce(Object.assign(new Error('Plan run changed'), {
+      details: { planRun: run('running', { stateRevision: 4 }) },
+    }))
+    await api.cancelRun()
+    expect(api.activePlanRun.value?.stateRevision).toBe(4)
+    expect(api.activePlanRun.value?.status).toBe('running')
+    expect(rpc.call).toHaveBeenCalledTimes(1)
+    rpc.call.mockResolvedValueOnce({ planRun: run('cancelled', { stateRevision: 5 }) })
+    await api.cancelRun()
+    expect(rpc.call.mock.calls[1]![1].expectedStateRevision).toBe(4)
+    expect(api.activePlanRun.value?.status).toBe('cancelled')
+  })
+
+  it('does not claim cancellation before terminal acknowledgement or adopt another run from an error', async () => {
+    const { api, rpc } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run() })
+    rpc.call.mockRejectedValueOnce(Object.assign(new Error('The implementation is still stopping'), {
+      code: 'PLAN_RUN_CANCEL_PENDING', details: { planRun: run('cancelled', { runId: 'other-run', stateRevision: 20 }) },
+    }))
+    await api.cancelRun()
+    expect(api.activePlanRun.value).toMatchObject({ runId: 'run-1', status: 'running', stateRevision: 3 })
     expect(api.pendingAction.value).toBeNull()
   })
 

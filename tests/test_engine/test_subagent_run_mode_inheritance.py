@@ -81,3 +81,41 @@ async def test_direct_subagent_tool_context_inherits_full_host_run_mode() -> Non
     assert child_run_context.run_mode == RunMode.FULL
     assert {grant.path for grant in child_run_context.mounts} == {"/durable"}
     assert child_run_context.temporary_grants == ()
+
+
+@pytest.mark.asyncio
+async def test_plan_child_inherits_intent_permission_ceiling_and_root_usage() -> None:
+    from opensquilla.engine.usage_accounting import UsageExecutionContext
+    from opensquilla.tools.registry import ToolRegistry
+    from opensquilla.tools.types import ToolSpec
+
+    registry = ToolRegistry()
+    for name in ("read_file", "exec_command", "write_file", "submit_plan", "update_goal"):
+        registry.register(ToolSpec(name=name, description=name, parameters={}), lambda: "ok")
+    context = ToolContext(
+        is_owner=True, caller_kind=CallerKind.WEB, collaboration_mode="plan",
+        run_mode="safe", allowed_tools={"read_file", "exec_command", "submit_plan"},
+        denied_tools={"write_file"},
+    )
+    parent = Agent(
+        provider=_Provider(), config=AgentConfig(), tool_context=context,
+        tool_registry=registry, tool_definitions=registry.to_tool_definitions(context),
+        usage_event_sink=object(),
+        usage_execution_context=UsageExecutionContext(
+            execution_id="root-task", agent_run_id="root-task",
+            turn_id="root-task", session_id="session-root",
+        ),
+    )
+    child = parent._make_child_agent(SubagentSpec(task="Investigate the build"), depth=1)
+    assert child._tool_context.collaboration_mode == "plan"
+    assert child._tool_context.run_mode == "safe"
+    assert "Current Collaboration Mode: Plan" in child.config.system_prompt
+    assert "Return investigation findings to the parent" in child.config.system_prompt
+    names = {definition.name for definition in child.tool_definitions}
+    assert {"read_file", "exec_command"} <= names
+    assert {"write_file", "submit_plan", "update_goal"}.isdisjoint(names)
+    assert child._usage_execution_context.root_turn_id == "root-task"
+    grandchild = child._make_child_agent(SubagentSpec(task="Inspect a dependency"), depth=2)
+    assert grandchild._usage_execution_context.root_turn_id == "root-task"
+    assert (grandchild._usage_execution_context.parent_turn_id
+            == child._usage_execution_context.turn_id)

@@ -102,6 +102,7 @@
         "pendingUserInputs": { "type": "array", "items": { "$ref": "#/$defs/OpenObject" } },
         "collaboration": { "$ref": "#/$defs/NullableOpenObject" },
         "routing": { "$ref": "#/$defs/NullableOpenObject" },
+        "planPresentations": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
         "currentPlan": { "$ref": "#/$defs/NullableOpenObject" },
         "activePlanRun": { "$ref": "#/$defs/NullableOpenObject" },
         "goal": { "$ref": "#/$defs/NullableOpenObject" },

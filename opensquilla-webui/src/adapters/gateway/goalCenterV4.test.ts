@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createV4GoalCenter } from './goalCenterV4'
+import { projectGoalSnapshot } from './goalSnapshotProjection'
 
 function transport(response: unknown, supported = true) {
   const requests: Array<{ method: string; params?: Record<string, unknown> }> = []
@@ -14,6 +15,17 @@ function transport(response: unknown, supported = true) {
 }
 
 describe('createV4GoalCenter', () => {
+  it('preserves explicit no-budget and background options and projects total budget accounting', async () => {
+    const source = transport({ accepted: true, goal: { status: 'active', tokenBudget: null, budgetTokensUsed: 321, usageCoverage: 'complete', executionPolicy: 'background' } })
+    const center = createV4GoalCenter(source)
+    const result = await center.edit({ sessionKey: 'agent:demo', expectedGoalId: 'g1', expectedStateRevision: 2, clientRequestId: 'budget-edit', objective: 'ship', tokenBudget: null, executionPolicy: 'background' })
+    expect(source.requests[0]?.params).toMatchObject({ tokenBudget: null, executionPolicy: 'background' })
+    expect(result.goal).toMatchObject({ tokenBudget: null, budgetTokensUsed: 321, usageCoverage: 'complete', executionPolicy: 'background' })
+    await center.edit({ sessionKey: 'agent:demo', expectedGoalId: 'g1', expectedStateRevision: 3, clientRequestId: 'objective-only', objective: 'ship again' })
+    expect(source.requests[1]?.params).not.toHaveProperty('tokenBudget')
+    expect(source.requests[1]?.params).not.toHaveProperty('executionPolicy')
+  })
+
   it('keeps goal-mode availability behind the semantic module boundary', () => {
     const source = {
       supports: (method: string) => method === 'goals.set' || method === 'goals.capabilities',
@@ -40,11 +52,37 @@ describe('createV4GoalCenter', () => {
       maxTurns: 50,
       runtimeBudgetSeconds: 3600,
       methods: ['goals.status'],
+      tokenBudgetSupported: false,
+      backgroundExecutionSupported: false,
     })
     expect(source.requests[0]).toEqual({
       method: 'goals.capabilities',
       params: undefined,
     })
+  })
+
+  it('projects explicit current-server budget and background capabilities', async () => {
+    const center = createV4GoalCenter(transport({
+      supported: true, executionEnabled: true, maxTurns: 50, runtimeBudgetSeconds: 3600,
+      methods: ['goals.set', 'goals.edit'],
+      tokenBudgetSupported: true, backgroundExecutionSupported: true,
+    }))
+    await expect(center.capabilities()).resolves.toMatchObject({
+      tokenBudgetSupported: true, backgroundExecutionSupported: true,
+    })
+  })
+
+  it.each([undefined, 'future_coverage'])('does not invent historical accounting for coverage %s', usageCoverage => {
+    expect(projectGoalSnapshot({ status: 'active', usageCoverage })?.usageCoverage).toBeUndefined()
+    expect(projectGoalSnapshot({ status: 'active', usage_coverage: usageCoverage })?.usageCoverage).toBeUndefined()
+  })
+
+  it('rejects explicit unknown coverage in a validated status response', async () => {
+    const center = createV4GoalCenter(transport({
+      sessionKey: 'agent:demo', sessionId: 's1', epoch: 1,
+      goal: { status: 'active', usageCoverage: 'future_coverage' },
+    }))
+    await expect(center.status('agent:demo')).rejects.toThrow('invalid response')
   })
 
   it('rejects an incomplete capability response at the adapter boundary', async () => {

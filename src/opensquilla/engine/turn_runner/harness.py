@@ -1564,7 +1564,13 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
         refreshed_prompt = (
             assembled[0] if isinstance(assembled, tuple) else assembled
         )
-        agent.refresh_system_prompt(refreshed_prompt)
+        from opensquilla.engine.collaboration_prompt import with_collaboration_instructions
+
+        refreshed_with_intent = with_collaboration_instructions(
+            refreshed_prompt, getattr(agent, "_tool_context", None),
+        )
+        assert isinstance(refreshed_with_intent, str)
+        agent.refresh_system_prompt(refreshed_with_intent)
 
 class _TurnRunnerMemorySyncNotifyAdapter(MemorySyncNotifyPort):
     """Notify ``sync_manager.notify_message(byte_count)`` post-stream.

@@ -147,10 +147,10 @@ methods = (
 )
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
-# Includes product activity and execution logs; excludes retired memory flush/repair methods.
-assert len(registry.list_methods()) == 292
+# Includes plan presentation and model capacity; excludes retired memory repair methods.
+assert len(registry.list_methods()) == 293
+assert registry.get_entry("plans.setPresentation") is not None
 assert registry.get_entry("models.capacity.resolve") is not None
-assert registry.get_entry("skills.install.status") is not None
 assert registry.get_entry("telemetry.product_active.record") is not None
 assert registry.get_entry("sessions.executionLog.read") is not None
 for method in methods:
