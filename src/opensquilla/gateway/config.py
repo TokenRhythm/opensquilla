@@ -203,7 +203,7 @@ class AttachmentsConfig(BaseSettings):
     # tool access only. False restores the rendered-types-only admission gate.
     accept_opaque: bool = True
     opaque_max_bytes: int = 30 * 1024 * 1024
-    # Aggregate RAM ceiling for the in-memory staged-upload store. When
+    # Aggregate byte ceiling for the temporary staged-upload store. When
     # reached, new uploads are rejected (HTTP 507 UPLOAD_STORE_FULL) instead
     # of evicting staged entries, preserving the file_uuid TTL promise.
     # Applied at gateway construction; changing it requires a restart.

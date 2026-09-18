@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -19,8 +20,10 @@ from typing import Any, Protocol, cast
 import structlog
 
 from opensquilla.engine.capacity_admission import (
+    CAPACITY_REDUCTION_HINT,
     MAX_THINKING_BUDGET_TOKENS,
-    model_has_request_capacity,
+    ModelRequestCapacityAssessment,
+    assess_model_request_capacity,
 )
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import lookup_price
@@ -1039,6 +1042,9 @@ def _complete_request_estimated_tokens(
     history_messages = _token_estimate(
         metadata.get("routing_history_capacity_message_count")
     ) or 0
+    additional_context_tokens = _token_estimate(
+        metadata.get("routing_additional_request_context_tokens")
+    ) or 0
 
     fixed_payload: dict[str, Any] = {
         "system": _request_jsonable(ctx.system_prompt),
@@ -1076,7 +1082,7 @@ def _complete_request_estimated_tokens(
     )
 
     request_context_wrapper_tokens = 0
-    if (
+    if additional_context_tokens or (
         isinstance(ctx.system_prompt, tuple)
         and len(ctx.system_prompt) == 2
         and str(ctx.system_prompt[1] or "").strip()
@@ -1117,6 +1123,7 @@ def _complete_request_estimated_tokens(
         + history_tokens
         + fixed_tokens
         + skills_context_tokens
+        + additional_context_tokens
         + request_context_wrapper_tokens
         + runtime_context_tokens
         + framing_tokens
@@ -1218,7 +1225,15 @@ def _block_large_context_route(
     return ctx
 
 
-def _capacity_safe_tier(
+@dataclass(frozen=True, slots=True)
+class _TierCapacityAssessment:
+    name: str
+    provider: str
+    model: str
+    assessment: ModelRequestCapacityAssessment
+
+
+def _capacity_tier_assessments(
     ctx: TurnContext,
     router_cfg: object,
     tiers: dict,
@@ -1231,8 +1246,8 @@ def _capacity_safe_tier(
     active_provider_only: bool = False,
     thinking_mode: str | None = None,
     rollout_phase: str = "full",
-) -> str | None:
-    """Pick the first candidate whose deployment definitely fits this turn."""
+) -> list[_TierCapacityAssessment]:
+    """Keep unknown capacity distinct from known, recoverable history pressure."""
 
     minimum_index = tier_index(minimum_tier)
     active_provider = str(
@@ -1242,6 +1257,7 @@ def _capacity_safe_tier(
         _llm_capacity_overrides(ctx)
     )
     ordered = list(dict.fromkeys(candidate_names))
+    assessments: list[_TierCapacityAssessment] = []
     for name in ordered:
         candidate_index = tier_index(name)
         if minimum_index >= 0:
@@ -1273,7 +1289,7 @@ def _capacity_safe_tier(
             thinking_mode=thinking_mode,
             rollout_phase=rollout_phase,
         )
-        if model_has_request_capacity(
+        assessment = assess_model_request_capacity(
             provider=provider,
             model=tier.model,
             material_tokens=material_tokens,
@@ -1285,12 +1301,44 @@ def _capacity_safe_tier(
             api_key=api_key,
             base_url=base_url,
             proxy=proxy,
-        ):
-            return name
-    return None
+        )
+        assessments.append(_TierCapacityAssessment(name, provider, tier.model, assessment))
+    return assessments
 
 
-async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
+def _capacity_safe_tier(
+    ctx: TurnContext,
+    router_cfg: object,
+    tiers: dict,
+    candidate_names: list[str],
+    *,
+    minimum_tier: str | None,
+    material_tokens: int,
+    request_input_tokens: int = 0,
+    requires_image: bool = False,
+    active_provider_only: bool = False,
+    thinking_mode: str | None = None,
+    rollout_phase: str = "full",
+) -> str | None:
+    """Pick the first candidate whose deployment definitely fits this turn."""
+
+    return next((
+        candidate.name for candidate in _capacity_tier_assessments(
+            ctx, router_cfg, tiers, candidate_names,
+            minimum_tier=minimum_tier, material_tokens=material_tokens,
+            request_input_tokens=request_input_tokens, requires_image=requires_image,
+            active_provider_only=active_provider_only, thinking_mode=thinking_mode,
+            rollout_phase=rollout_phase,
+        ) if candidate.assessment.fits
+    ), None)
+
+
+async def finalize_squilla_router_capacity(
+    ctx: TurnContext,
+    *,
+    allow_compaction_retry: bool = False,
+    retry_after_compaction: bool = False,
+) -> TurnContext:
     """Revalidate attachment routes against the complete pipeline request.
 
     This runs after prompt/tool/skill shaping but before selector binding. It
@@ -1307,6 +1355,19 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
     ):
         return ctx
     if ctx.metadata.get("large_context_capacity_blocked") is True:
+        return ctx
+    retry_pending = ctx.metadata.get("large_context_capacity_retry_pending") is True
+    if retry_after_compaction:
+        if not retry_pending or ctx.metadata.get("large_context_capacity_retry_attempted") is True:
+            return _block_large_context_route(
+                ctx, "Attachment capacity re-admission was already consumed or not scheduled.",
+                include_configuration_hint=False,
+            )
+        ctx.metadata["large_context_capacity_retry_pending"] = False
+        ctx.metadata["large_context_capacity_retry_attempted"] = True
+    elif retry_pending:
+        # Bootstrap may revisit the pipeline. Only the post-compaction boundary
+        # can consume the one retry, with a fresh complete history estimate.
         return ctx
     if ctx.metadata.get("routing_history_capacity_estimate_complete") is False:
         return _block_large_context_route(
@@ -1379,6 +1440,9 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
         key=lambda name: (0, tier_index(name)) if tier_index(name) >= 0 else (1, 0),
     )
     candidates = ([selected_tier] if selected_tier else []) + valid_tiers
+    if retry_after_compaction:
+        provisional_tier = str(ctx.metadata.get("large_context_capacity_provisional_tier") or "")
+        candidates = [provisional_tier] if provisional_tier in tiers else []
     admission_minimum_tier = minimum_tier
     selected_index = tier_index(selected_tier)
     minimum_index = tier_index(minimum_tier)
@@ -1387,7 +1451,7 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
         # never turn a c2/c3 decision into a cheaper lower-complexity route.
         admission_minimum_tier = selected_tier
     thinking_mode = ctx.metadata.get("thinking_mode")
-    capacity_tier = _capacity_safe_tier(
+    assessments = _capacity_tier_assessments(
         ctx,
         router_cfg,
         tiers,
@@ -1400,12 +1464,55 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
         thinking_mode=(thinking_mode if isinstance(thinking_mode, str) else None),
         rollout_phase=str(ctx.metadata.get("rollout_phase") or "full"),
     )
+    capacity_tier = next((item.name for item in assessments if item.assessment.fits), None)
+    if capacity_tier is None and not retry_after_compaction:
+        history_tokens = _token_estimate(ctx.metadata.get("large_context_history_tokens")) or 0
+        fixed_tokens = max(0, request_input_tokens - history_tokens)
+        eligible = [
+            candidate for candidate in assessments
+            if candidate.assessment.status == "known_capacity_request_too_large"
+            and candidate.assessment.safe_input_tokens is not None
+            and fixed_tokens <= candidate.assessment.safe_input_tokens
+            and not tier_ensemble_active(tiers, candidate.name)
+        ]
+        if (
+            allow_compaction_retry
+            and ctx.metadata.get("large_context_capacity_retry_attempted") is not True
+            and ctx.metadata.get("routing_history_capacity_estimate_complete") is True
+            and history_tokens > 0
+            and eligible
+            and getattr(getattr(ctx.config, "compaction", None), "enabled", True)
+            and not getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
+            and not ctx.session_key.startswith(("cron:", "subagent:"))
+        ):
+            provisional = max(eligible, key=lambda item: item.assessment.safe_input_tokens or 0)
+            capacity_tier = provisional.name
+            ctx.metadata.update({
+                "large_context_capacity_status": "known_capacity_request_too_large",
+                "large_context_capacity_retry_pending": True,
+                "large_context_capacity_provisional_tier": provisional.name,
+                "large_context_capacity_provisional_provider": provisional.provider,
+                "large_context_capacity_provisional_model": provisional.model,
+                "large_context_capacity_provisional_safe_input_tokens": (
+                    provisional.assessment.safe_input_tokens
+                ),
+            })
     if capacity_tier is None:
+        unknown = not assessments or any(
+            item.assessment.status == "capacity_unknown" for item in assessments
+        )
+        ctx.metadata["large_context_capacity_status"] = (
+            "capacity_unknown" if unknown else "known_capacity_request_too_large"
+        )
         return _block_large_context_route(
             ctx,
             "No SquillaRouter deployment has proven capacity for the complete "
-            "attachment request.",
+            "attachment request."
+            + ("" if unknown else f" {CAPACITY_REDUCTION_HINT}"),
+            include_configuration_hint=unknown,
         )
+    if retry_after_compaction:
+        ctx.metadata["large_context_capacity_status"] = "fits"
 
     tier_cfg = tiers[capacity_tier]
     prior_tier = selected_tier

@@ -12,7 +12,8 @@ import { isControlInput } from '@/utils/chat/inputSemantics'
 import { createClientMessageId, createClientRequestId } from '@/utils/chat/messageIdentity'
 import {
   isSendableAttachment,
-  serializeSendableAttachment,
+  serializeChatFiles,
+  snapshotAttachment,
 } from '@/utils/chat/attachments'
 import type {
   AcceptedHandoffCommit,
@@ -51,6 +52,7 @@ interface PendingReorderSnapshot {
 interface ComposerAttachmentSnapshotEntry {
   readonly identity: Attachment
   readonly content: Readonly<Record<string, unknown>>
+  readonly workspaceFile: string | undefined
 }
 
 type ComposerAttachmentSnapshot = ReadonlyArray<ComposerAttachmentSnapshotEntry>
@@ -61,6 +63,7 @@ function snapshotComposerAttachments(
   return Object.freeze(attachments.map(attachment => Object.freeze({
     identity: attachment,
     content: Object.freeze({ ...attachment }) as Readonly<Record<string, unknown>>,
+    workspaceFile: JSON.stringify(attachment.workspaceFile),
   })))
 }
 
@@ -76,6 +79,7 @@ function composerAttachmentsMatch(
     const currentKeys = Object.keys(current)
     const expectedKeys = Object.keys(expected.content)
     return currentKeys.length === expectedKeys.length
+      && JSON.stringify(attachment.workspaceFile) === expected.workspaceFile
       && expectedKeys.every(key => (
         Object.prototype.hasOwnProperty.call(current, key)
         && Object.is(current[key], expected.content[key])
@@ -293,7 +297,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(item.draftIds?.length
         ? { draftIds: normalizeAnnotationDraftIds(item.draftIds) }
         : {}),
-      attachments: (item.attachments || []).map(attachment => ({ ...attachment })),
+      attachments: (item.attachments || []).map(snapshotAttachment),
       intent: item.intent,
       ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ...(item.ownerRequestId ? { ownerRequestId: item.ownerRequestId } : {}),
@@ -335,7 +339,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(normalizeAnnotationDraftIds(record.draftIds).length
         ? { draftIds: normalizeAnnotationDraftIds(record.draftIds) }
         : {}),
-      attachments: record.attachments.map(attachment => ({ ...attachment })),
+      attachments: record.attachments.map(snapshotAttachment),
       intent: record.intent,
       ...(record.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ownerSessionKey: record.sessionKey,
@@ -472,6 +476,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function durableAttachmentMetadata(attachment: Attachment): Attachment {
+    if (attachment.kind === 'workspace') return { ...snapshotAttachment(attachment), file: undefined, durable_material: true }
     return {
       kind: 'staged',
       local_id: attachment.local_id,
@@ -483,7 +488,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function attachmentsFromServerItem(serverItem: PendingInputServerItem): Attachment[] {
-    return (serverItem.attachments || []).map((attachment, index) => ({
+    const imported: Attachment[] = (serverItem.attachments || []).map((attachment, index) => ({
       kind: 'staged' as const,
       local_id: -(index + 1),
       name: attachment.name,
@@ -491,6 +496,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       durable_material: true as const,
       ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
     }))
+    return [...imported, ...(serverItem.workspaceFiles || []).map((ref, index): Attachment => ({
+      kind: 'workspace', local_id: -(imported.length + index + 1), name: ref.name,
+      mime: ref.mime, size: ref.size, workspaceFile: { ...ref }, durable_material: true,
+    }))]
   }
 
   async function ensureServerStaged(item: ChatPendingItem): Promise<void> {
@@ -577,7 +586,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 clientRequestId: item.pendingClientRequestId,
                 clientMessageId: item.pendingClientMessageId,
                 message: providerMessage || item.pageContext?.annotations?.map(item => item.text).join('\n') || 'Describe these attachments',
-                attachments: sendable.map(serializeSendableAttachment),
+                ...serializeChatFiles(sendable),
                 ...(item.pageContext ? { pageContext: item.pageContext } : {}),
                 ...(item.selectedSkills?.length ? { selectedSkills: copySelectedSkills(item.selectedSkills) } : {}),
                 ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
@@ -971,7 +980,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(payload.pageContext ? { pageContext: normalizePageContext(payload.pageContext)! } : {}),
       ...(payload.selectedSkills?.length ? { selectedSkills: copySelectedSkills(payload.selectedSkills) } : {}),
       ...(draftIds.length ? { draftIds } : {}),
-      attachments: (payload.attachments || []).map(a => ({ ...a })),
+      attachments: (payload.attachments || []).map(snapshotAttachment),
       // Creation belongs to the in-flight first turn, never to its follow-ups.
       intent: payload.intent === 'new_chat' ? null : payload.intent ?? null,
       ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),

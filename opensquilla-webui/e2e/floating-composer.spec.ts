@@ -1,10 +1,19 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-floating-a'
 const SESSION_B = 'agent:main:webchat:e2e-floating-b'
 const SESSION_LONG = 'agent:main:webchat:e2e-floating-long'
+const SESSION_ATTACHMENTS = 'agent:main:webchat:e2e-floating-attachments'
+const HISTORY_ATTACHMENT_ID = 'synthetic-floating-html-attachment'
+const HISTORY_ATTACHMENT_NAME = 'synthetic-quarterly-report-with-a-long-layout-regression-name.html'
 
 // The 1000-line geometry case deliberately keeps Chromium busy across several
 // animation frames. Keep this spec serial locally as it already is in CI, so
@@ -36,13 +45,31 @@ function historyFor(sessionKey: string) {
   const label = sessionKey === SESSION_B ? 'Session B' : 'Session A'
   return Array.from({ length: 48 }, (_, index) => ({
     role: index % 2 === 0 ? 'user' : 'assistant',
-    text: `${label} message ${index + 1}. ${'Synthetic conversation detail. '.repeat(8)}`,
+    text: sessionKey === SESSION_ATTACHMENTS && index === 46
+      ? 'Synthetic attachment.'
+      : `${label} message ${index + 1}. ${'Synthetic conversation detail. '.repeat(8)}`,
+    ...(sessionKey === SESSION_ATTACHMENTS && index === 46 ? {
+      attachments: [{
+        attachment_id: HISTORY_ATTACHMENT_ID,
+        name: HISTORY_ATTACHMENT_NAME,
+        mime: 'text/html',
+        size: 128,
+        sha256_ref: 'c'.repeat(64),
+        download_url: `/api/v1/attachments/${'c'.repeat(64)}?variant=download`,
+      }, {
+        name: 'short.pdf',
+        mime: 'application/pdf',
+        size: 128,
+        sha256_ref: 'd'.repeat(64),
+        download_url: `/api/v1/attachments/${'d'.repeat(64)}?variant=download`,
+      }],
+    } : {}),
     message_id: `${sessionKey.split(':').at(-1)}-${index + 1}`,
     timestamp: `2026-07-22T10:${String(index).padStart(2, '0')}:00Z`,
   }))
 }
 
-async function installMockGateway(page: Page) {
+async function installMockGateway(page: Page, withAttachment = false) {
   await page.route('**/api/system/update', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -68,12 +95,19 @@ async function installMockGateway(page: Page) {
       } catch {
         return
       }
+      if (frame.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }))
+        return
+      }
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
+      const key = String(frame.params?.key || frame.params?.sessionKey || SESSION_A)
 
       if (method === 'connect') {
         ws.send(helloOkResponse({
+          features: { methods: withAttachment ? ['workbench.resources.list'] : [] },
           auth: {
+            principal: { isOwner: true, authenticated: true, authState: 'authenticated' },
             runModePolicy: {
               allowedRunModes: ['safe', 'full'],
               defaultRunMode: 'full',
@@ -84,23 +118,7 @@ async function installMockGateway(page: Page) {
       }
 
       if (method === 'chat.history') {
-        const key = String(frame.params?.key || frame.params?.sessionKey || SESSION_A)
-        ws.send(response(frame.id, {
-          messages: historyFor(key),
-          has_more: false,
-          canonical_complete: true,
-        }))
-        return
-      }
-
-      if (method === 'sessions.messages.subscribe') {
-        ws.send(response(frame.id, {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-          active_task: null,
-        }))
+        ws.send(response(frame.id, chatHistoryPayload(historyFor(key))))
         return
       }
 
@@ -110,6 +128,27 @@ async function installMockGateway(page: Page) {
       }
 
       const payloads: Record<string, unknown> = {
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
+        'workbench.resources.list': {
+          resources: withAttachment ? [{
+            resource: { type: 'attachment', attachmentId: HISTORY_ATTACHMENT_ID },
+            name: HISTORY_ATTACHMENT_NAME,
+            mime: 'text/html',
+            size: 128,
+            capabilities: {
+              preview: true, download: true, selectionContext: false,
+              manualEdit: false, agentEdit: false, edit: false, publish: false,
+            },
+            relations: {},
+          }] : [],
+          totalCount: withAttachment ? 1 : 0,
+          pageSize: 50,
+          returnedCount: withAttachment ? 1 : 0,
+          hasMore: false,
+          nextCursor: null,
+        },
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
         'config.get': {
@@ -162,7 +201,7 @@ async function openChat(page: Page, sessionKey = SESSION_A, enabled = true) {
   await page.addInitScript((preference: boolean) => {
     localStorage.setItem('opensquilla.composerFx', JSON.stringify({ enabled: preference }))
   }, enabled)
-  await installMockGateway(page)
+  await installMockGateway(page, sessionKey === SESSION_ATTACHMENTS)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(sessionKey))
   await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
   const expectedText = sessionKey === SESSION_LONG
@@ -208,11 +247,15 @@ async function visibleRowAnchor(page: Page, expectedKey?: string) {
 }
 
 async function expectDockClearance(page: Page) {
-  await expect.poll(() => page.evaluate(() => {
-    const dock = document.querySelector<HTMLElement>('.chat-composer-dock')!
-    const thread = document.querySelector<HTMLElement>('.chat-thread')!
-    return dock.getBoundingClientRect().top - thread.getBoundingClientRect().bottom
-  })).toBeGreaterThanOrEqual(0)
+  await expect(async () => {
+    const gap = await page.evaluate(() => {
+      const dock = document.querySelector<HTMLElement>('.chat-composer-dock')!
+      const thread = document.querySelector<HTMLElement>('.chat-thread')!
+      return dock.getBoundingClientRect().top - thread.getBoundingClientRect().bottom
+    })
+    expect(gap).toBeGreaterThanOrEqual(0)
+    expect(gap).toBeLessThanOrEqual(12)
+  }).toPass({ timeout: 5000 })
 }
 
 async function expectClearanceThroughout(
@@ -325,6 +368,98 @@ test('hands keyboard focus to the thread when Jump to latest disappears', async 
   await expect(thread).toBeFocused()
   await expect.poll(() => scrollGap(page)).toBeLessThan(2)
 })
+
+test('reserves only the actual dock height after adding and removing eight attachments', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.addInitScript(() => {
+    sessionStorage.setItem('opensquilla.wsToken', 'token-e2e')
+  })
+  let uploadCount = 0
+  await page.route('**/api/v1/files/upload', route => {
+    uploadCount += 1
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        file_uuid: `u-e2e-floating-${uploadCount}`,
+        filename: `synthetic-attachment-${uploadCount}.pdf`,
+        mime: 'application/pdf',
+        size: 2_000_001,
+      }),
+    })
+  })
+  await openChat(page, SESSION_ATTACHMENTS)
+
+  const dock = page.locator('.chat-composer-dock')
+  const chips = page.locator('.chat-composer .attachment-chip')
+  const dockHeight = () => dock.evaluate(el => el.getBoundingClientRect().height)
+  const expectMeasuredDockHeight = async () => {
+    await expectDockClearance(page)
+    await expect.poll(() => page.evaluate(() => {
+      const chat = document.querySelector<HTMLElement>('.chat')!
+      const dock = document.querySelector<HTMLElement>('.chat-composer-dock')!
+      const reserved = Number.parseFloat(getComputedStyle(chat).getPropertyValue('--composer-dock-h'))
+      return Math.abs(reserved - dock.getBoundingClientRect().height)
+    })).toBeLessThanOrEqual(1)
+  }
+  await expectMeasuredDockHeight()
+  const initialHeight = await dockHeight()
+
+  // One real input change adds the whole synthetic batch. Staged uploads are
+  // fulfilled above, so the test never sends attachment bytes to a gateway.
+  await page.locator('.chat-composer input[type="file"]').setInputFiles(
+    Array.from({ length: 8 }, (_, index) => ({
+      name: `synthetic-quarterly-report-for-layout-${index + 1}.pdf`,
+      mimeType: 'application/pdf',
+      buffer: Buffer.alloc(2_000_001),
+    })),
+  )
+  await expect(chips).toHaveCount(8)
+  await expect.poll(() => uploadCount).toBe(8)
+  await expect(page.locator('.chat-composer .attachment-chip--busy')).toHaveCount(0)
+  await expect(page.locator('.chat-composer .attachment-chip--failed')).toHaveCount(0)
+  await expect.poll(dockHeight).toBeGreaterThan(initialHeight + 40)
+  await expectMeasuredDockHeight()
+
+  for (let remaining = 8; remaining > 0; remaining -= 1) {
+    await chips.first().locator('.attachment-remove').click()
+    await expect(chips).toHaveCount(remaining - 1)
+  }
+  await expectMeasuredDockHeight()
+  await expect.poll(async () => Math.abs(await dockHeight() - initialHeight)).toBeLessThanOrEqual(1)
+  expect(uploadCount).toBe(8)
+})
+
+for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+  test(`keeps openable history attachments within the thread at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport)
+    await openChat(page, SESSION_ATTACHMENTS)
+    const resource = page.locator('.msg-file-resource--file').filter({ hasText: HISTORY_ATTACHMENT_NAME })
+    await expect(resource.getByRole('button', { name: `Open ${HISTORY_ATTACHMENT_NAME}`, exact: true }))
+      .toBeVisible()
+    await expect(resource.locator('.msg-file-resource__actions').getByRole('button', {
+      name: `Download ${HISTORY_ATTACHMENT_NAME}`, exact: true,
+    })).toBeVisible()
+
+    await expect.poll(() => page.locator('.chat-thread').evaluate(el => (
+      el.scrollWidth - el.clientWidth
+    ))).toBe(0)
+    const actionOverflow = await resource.evaluate(el => {
+      const action = el.querySelector<HTMLElement>('.msg-file-resource__actions')!
+      return action.getBoundingClientRect().right - el.getBoundingClientRect().right
+    })
+    expect(actionOverflow).toBeLessThanOrEqual(1)
+    const shortResource = page.locator('.msg-file-resource--file').filter({ hasText: 'short.pdf' })
+    await expect(shortResource.getByRole('button', { name: 'Download short.pdf', exact: true }))
+      .toBeVisible()
+    await expect(shortResource.locator('.msg-file-resource__actions')).toHaveCount(0)
+    const unusedCardWidth = await shortResource.evaluate(el => {
+      const chip = el.querySelector<HTMLElement>('.msg-file-chip')!
+      return Math.abs(el.getBoundingClientRect().right - chip.getBoundingClientRect().right)
+    })
+    expect(unusedCardWidth).toBeLessThanOrEqual(1)
+  })
+}
 
 test('treats a native-scrollbar-only event as reader navigation and resumes on fine wheel input', async ({ page }) => {
   await openChat(page)
@@ -576,6 +711,11 @@ test.describe('long-answer viewport clearance', () => {
     await expect.poll(() => scrollGap(page)).toBeLessThan(2)
     await expectDockClearance(page)
 
+    // Establish the programmatic pin's scroll baseline before the first real
+    // gesture. The large row can paint before its queued scroll event runs.
+    await thread.evaluate(() => new Promise<void>(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    }))
     await thread.hover({ position: { x: 120, y: 120 } })
     await expectClearanceThroughout(page, () => page.mouse.wheel(0, -400))
     await expect(chat).toHaveClass(/chat--composer-collapsed/)

@@ -1,11 +1,12 @@
 import type { Attachment, DisplayAttachment } from '@/types/chat'
-import type { ChatSendAttachmentPayload } from '@/types/chat'
+import type { ChatSendAttachmentPayload, WorkspaceFileReference } from '@/types/chat'
 
 type AttachmentProjectionInput = Attachment | DisplayAttachment | Readonly<Record<string, unknown>>
 
 export type SendableAttachment = Attachment & (
   | { kind: 'inline'; data: string }
   | { kind: 'staged'; file_uuid: string }
+  | { kind: 'workspace'; workspaceFile: WorkspaceFileReference }
 )
 
 export function isAttachmentBusy(attachment: Attachment): boolean {
@@ -110,6 +111,7 @@ function safeImageDataUrl(value: unknown, declaredMime: string): string | undefi
 }
 
 export function isSendableAttachment(attachment: Attachment): attachment is SendableAttachment {
+  if (attachment.kind === 'workspace') return Boolean(attachment.workspaceFile)
   if (attachment.kind === 'inline') return Boolean(attachment.data)
   if (attachment.kind === 'staged') return Boolean(attachment.file_uuid)
   return false
@@ -130,6 +132,7 @@ export function hasModelInputImageAttachment(attachments: readonly Attachment[])
 }
 
 export function serializeSendableAttachment(attachment: SendableAttachment): ChatSendAttachmentPayload {
+  if (attachment.kind === 'workspace') throw new Error('Workspace files use workspaceFiles input')
   if (attachment.kind === 'staged') {
     return {
       type: attachment.mime,
@@ -146,6 +149,24 @@ export function serializeSendableAttachment(attachment: SendableAttachment): Cha
   }
 }
 
+/** Copy nested reference metadata out of reactive state before durable storage. */
+export function snapshotAttachment<T extends Attachment>(attachment: T): T {
+  return { ...attachment,
+    ...(attachment.workspaceFile ? { workspaceFile: { ...attachment.workspaceFile } } : {}),
+  }
+}
+
+export function serializeChatFiles(attachments: readonly SendableAttachment[]): {
+  attachments: ChatSendAttachmentPayload[]
+  workspaceFiles?: WorkspaceFileReference[]
+} {
+  const workspaceFiles = attachments.flatMap(item => item.kind === 'workspace' ? [{ ...item.workspaceFile }] : [])
+  return {
+    attachments: attachments.filter(item => item.kind !== 'workspace').map(serializeSendableAttachment),
+    ...(workspaceFiles.length ? { workspaceFiles } : {}),
+  }
+}
+
 export function serializeDisplayAttachment(attachment: SendableAttachment): DisplayAttachment {
   const displayId = `local:${attachment.local_id}`
   const base = {
@@ -154,6 +175,9 @@ export function serializeDisplayAttachment(attachment: SendableAttachment): Disp
     name: attachment.name,
     mime: attachment.mime,
     size: attachment.size,
+  }
+  if (attachment.kind === 'workspace') {
+    return { ...base, kind: 'file', workspaceFile: attachment.workspaceFile }
   }
   if (attachment.kind === 'staged') {
     return { ...base, kind: 'staged', localFile: attachment.file }
@@ -226,6 +250,8 @@ export function normalizeDisplayAttachment(
     name,
     mime,
     size,
+    ...(normalizeWorkspaceFileReferences([record.workspaceFile])[0]
+      ? { workspaceFile: normalizeWorkspaceFileReferences([record.workspaceFile])[0] } : {}),
     data: image ? data : undefined,
     dataUrl: image ? dataUrl : undefined,
     downloadData,
@@ -255,4 +281,18 @@ export function normalizeDisplayAttachments(
   return (attachments || []).map((attachment, index) =>
     normalizeDisplayAttachment(attachment, { messageId: options.messageId, index }),
   )
+}
+
+/** Public display metadata only; server revalidates binding and permissions at use. */
+export function normalizeWorkspaceFileReferences(value: unknown): WorkspaceFileReference[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap(item => {
+    if (!item || typeof item !== 'object' || typeof item.workspaceId !== 'string'
+      || typeof item.relativePath !== 'string' || typeof item.name !== 'string'
+      || typeof item.mime !== 'string') return []
+    return [{ workspaceId: item.workspaceId, relativePath: item.relativePath,
+      name: item.name, mime: item.mime,
+      ...(typeof item.size === 'number' && item.size >= 0 ? { size: item.size } : {}),
+    }]
+  })
 }

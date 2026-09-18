@@ -871,6 +871,7 @@ async def test_close_uploads_other_scope_while_inflight_request_stalls(
         await asyncio.wait_for(acknowledged_growth.wait(), timeout=1)
         assert not cancelled_reliability.is_set()
         timeouts = await expire_shutdown_deadline(runtime)
+        assert len(timeouts) == 2
         await asyncio.wait_for(closing, timeout=1)
         assert any(timeout.expired() for timeout in timeouts)
     finally:

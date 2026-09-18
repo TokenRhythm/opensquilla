@@ -1,5 +1,6 @@
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { IconName } from '@/utils/icons'
+import { fileTypeLabel } from '@/utils/fileType'
 
 const ARTIFACT_MIME_CATEGORIES: Record<string, string> = {
   'application/json': 'data', 'application/ndjson': 'data', 'application/pdf': 'document',
@@ -91,12 +92,7 @@ export function artifactFileTitle(artifact: ArtifactPayload): string {
 
 /** Short uppercase type badge, e.g. PNG, CSV, PDF, SQL. */
 export function artifactKindPill(artifact: ArtifactPayload): string {
-  const ext = artifactExtension(artifactName(artifact))
-  if (ext) return ext.toUpperCase()
-  const mime = artifactMime(artifact)
-  const subtype = mime.includes('/') ? mime.slice(mime.indexOf('/') + 1) : mime
-  const cleaned = subtype.replace(/^x[-.]/, '').replace(/[+.].*$/, '')
-  return cleaned ? cleaned.toUpperCase() : artifactCategoryLabel(artifact).toUpperCase()
+  return fileTypeLabel(artifact, artifactCategoryLabel(artifact).toUpperCase())
 }
 
 /** Human-readable byte size, e.g. "727 KB". Empty when size is unknown. */

@@ -1165,7 +1165,7 @@ def _chunk_entries(
     entries: list[dict[str, Any]],
     max_input_tokens: int,
     *,
-    request_fits: Callable[[list[dict[str, Any]]], bool] | None = None,
+    request_fits: Callable[[list[dict[str, Any]], bool], bool] | None = None,
 ) -> list[list[dict[str, Any]]]:
     """Pack complete API rounds within the token and final request limits."""
 
@@ -1197,11 +1197,11 @@ def _chunk_entries(
             end = start + 1
             probe = end
             while True:
-                if not request_fits(entries[offsets[start]:offsets[probe]]):
+                if not request_fits(entries[offsets[start]:offsets[probe]], bool(chunks)):
                     low, high = end + 1, probe - 1
                     while low <= high:
                         middle = (low + high) // 2
-                        if request_fits(entries[offsets[start]:offsets[middle]]):
+                        if request_fits(entries[offsets[start]:offsets[middle]], bool(chunks)):
                             end = middle
                             low = middle + 1
                         else:
@@ -1302,6 +1302,7 @@ def _fit_compaction_input_to_target(
     chunk: list[dict[str, Any]],
     identifier_instruction: str = "",
     custom_instructions: str | None = None,
+    input_reserve_tokens: int = 0,
 ) -> str | None:
     """Replan one summary input against the candidate that will execute it."""
 
@@ -1334,7 +1335,9 @@ def _fit_compaction_input_to_target(
                 provider_request_correlation=request.provider_request_correlation,
             )
             tools = None
-        _compaction_generation_budget(target, messages, tools, config)
+        _compaction_generation_budget(
+            target, messages, tools, config, input_reserve_tokens=input_reserve_tokens,
+        )
     except _CompactionProviderError:
         return None
     return raw
@@ -1447,6 +1450,19 @@ def _summarize_if_envelope(
         if not isinstance(atts, list) or not atts:
             return content
         text = ""
+    if parsed.get("workspace_files"):
+        from opensquilla.workspace_files import normalize_workspace_files
+
+        try:
+            refs = normalize_workspace_files(parsed["workspace_files"])
+        except ValueError:
+            refs = []
+        if refs:
+            text += (
+                "\n[live project file references: " + json.dumps(refs, ensure_ascii=False)
+                + "; preserve workspace identities and relative paths. These name current files; "
+                "historical contents are not retained and current access must be revalidated.]"
+            )
     if not isinstance(atts, list) or not atts:
         return text
     descs: list[str] = []
@@ -1496,7 +1512,12 @@ def _prepare_compaction_image_paths(
     session_id: str,
     resolver: Callable[[dict[str, Any], str], str | None],
 ) -> list[dict[str, Any]]:
-    """Resolve retained images once, without changing canonical transcript rows."""
+    """Resolve retained attachments once without changing canonical transcript rows.
+
+    The internal image-path key also carries ordinary file paths for compatibility
+    with existing compaction projections. The resolver alone establishes that
+    bytes are available; an envelope's arbitrary path is never adopted.
+    """
     prepared: list[dict[str, Any]] = []
     for entry in entries:
         image_paths: dict[int, str] = {}
@@ -1925,6 +1946,8 @@ def _compaction_generation_budget(
     messages: list[Message],
     tools: list[ToolDefinition] | None,
     config: ChatConfig,
+    *,
+    input_reserve_tokens: int = 0,
 ) -> int:
     """Check the final input and reserve the adapter's effective generation cap."""
 
@@ -1939,6 +1962,14 @@ def _compaction_generation_budget(
         input_tokens = int(projection.proof.get("estimated_tokens") or 0)
         if input_tokens <= 0:
             input_tokens = _estimate_tokens(_json_text(payload))
+        effective_budget = projection.proof.get("effective_proof_token_budget")
+        if (
+            input_reserve_tokens > 0
+            and isinstance(effective_budget, int)
+            and not isinstance(effective_budget, bool)
+            and input_tokens + input_reserve_tokens > effective_budget
+        ):
+            raise _CompactionProviderError("compaction input leaves insufficient checkpoint budget")
     else:
         # Extension providers may not implement final-request projection. Keep
         # compatibility while accounting for all known input, including tools.
@@ -1954,7 +1985,7 @@ def _compaction_generation_budget(
             raise _CompactionProviderError("request_exceeds_character_limit")
     if generation_budget <= 0 or (
         target.context_window_tokens > 0
-        and input_tokens + generation_budget > target.context_window_tokens
+        and input_tokens + input_reserve_tokens + generation_budget > target.context_window_tokens
     ):
         raise _CompactionProviderError("insufficient_output_budget")
     return generation_budget
@@ -2323,6 +2354,8 @@ async def call_compaction_provider(
                 elif isinstance(event, DoneEvent) or getattr(event, "kind", "") == "done":
                     # Usage accounting finalizes on the same terminal event.
                     saw_done = True
+                    if getattr(event, "refusal", False):
+                        raise _CompactionProviderError("provider refused the summary")
                     if str(getattr(event, "stop_reason", "") or "").lower() not in {
                         "end_turn", "stop", "stop_sequence", "completed",
                     }:
@@ -2803,6 +2836,17 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         input_budget = await await_compaction_phase(
             asyncio.to_thread(_compaction_target_input_budget, request), cfg, phase="summarizing",
         )
+        # Later calls consume the preceding call's output in addition to their
+        # own generation allowance. Keep nonempty checkpoint framing in the
+        # projection even when the operation starts without a checkpoint.
+        planning_summary = prev_summary or " "
+        planning_summary_tokens = await await_compaction_phase(
+            asyncio.to_thread(_estimate_tokens, planning_summary), cfg, phase="summarizing",
+        )
+        rolling_tokens = max(
+            planning_summary_tokens,
+            *(target.max_output_tokens for target in cfg.llm_plan.candidates),
+        )
         first_chunk_budget = max(
             1,
             input_budget - min(previous_summary_tokens, input_budget // 2),
@@ -2812,13 +2856,14 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 _chunk_entries,
                 to_compact,
                 first_chunk_budget,
-                request_fits=lambda chunk: _fit_compaction_input_to_target(
+                request_fits=lambda chunk, later: _fit_compaction_input_to_target(
                     request=request,
                     target=primary,
-                    previous_summary=prev_summary,
+                    previous_summary=planning_summary if later else prev_summary,
                     chunk=chunk,
                     identifier_instruction=id_instruction,
                     custom_instructions=custom_instructions or None,
+                    input_reserve_tokens=(rolling_tokens - planning_summary_tokens if later else 0),
                 ) is not None,
             ),
             cfg, phase="summarizing",
@@ -2859,18 +2904,50 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         if cfg.llm_plan is not None:
             while candidate_index < len(cfg.llm_plan.candidates):
                 deployment = cfg.llm_plan.candidates[candidate_index]
-                candidate_chunk_text = await await_compaction_phase(
-                    asyncio.to_thread(
-                        _fit_compaction_input_to_target,
+                def fit_chunk(source: list[dict[str, Any]]) -> str | None:
+                    return _fit_compaction_input_to_target(
                         request=request,
                         target=deployment,
                         previous_summary=rolling_summary,
-                        chunk=chunk,
+                        chunk=source,
                         identifier_instruction=id_instruction,
                         custom_instructions=custom_instructions or None,
-                    ),
-                    cfg, phase="summarizing",
+                    )
+
+                candidate_chunk_text = await await_compaction_phase(
+                    asyncio.to_thread(fit_chunk, chunk), cfg, phase="summarizing",
                 )
+                if (
+                    candidate_chunk_text is None
+                    and forced_cut is None
+                    and 1 < chunk_index == len(chunks)
+                ):
+                    # A token-bounded checkpoint can still grow past an
+                    # independent character limit. Use its actual text to
+                    # select a complete final prefix; unread rounds stay raw.
+                    # A caller's forced cut must never be reduced this way.
+                    remaining_input_budget = await await_compaction_phase(
+                        asyncio.to_thread(_compaction_target_input_budget, request, deployment),
+                        cfg, phase="summarizing",
+                    )
+                    remaining_chunks = await await_compaction_phase(
+                        asyncio.to_thread(
+                            _chunk_entries, chunk, remaining_input_budget,
+                            request_fits=lambda prefix, _later: fit_chunk(prefix) is not None,
+                        ),
+                        cfg, phase="summarizing",
+                    )
+                    if remaining_chunks and len(remaining_chunks[0]) < len(chunk):
+                        candidate_chunk_text = await await_compaction_phase(
+                            asyncio.to_thread(fit_chunk, remaining_chunks[0]), cfg,
+                            phase="summarizing",
+                        )
+                        if candidate_chunk_text is not None:
+                            chunk = remaining_chunks[0]
+                            chunks[chunk_index - 1] = chunk
+                            to_compact = [entry for part in chunks for entry in part]
+                            cut = len(to_compact)
+                            kept = entries[cut:]
                 if candidate_chunk_text is None:
                     log.info(
                         "compaction.target_skipped_input_unfit",

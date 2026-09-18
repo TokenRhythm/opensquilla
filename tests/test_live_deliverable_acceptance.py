@@ -175,20 +175,83 @@ def test_relay_rejects_non_single_completion_before_dispatch(offline_relay, comp
     )
 
 
-def test_relay_allows_exactly_ninety_requests_then_rejects_without_counting(offline_relay) -> None:
+def test_relay_allows_exactly_sixty_requests_then_rejects_without_counting(offline_relay) -> None:
     relay, request_log, sent = offline_relay
     body = _body(max_tokens=1)
 
-    for expected_calls in range(1, 91):
+    for expected_calls in range(1, 61):
         _forward(relay, body)
         assert relay.calls == expected_calls
         assert len(sent) == expected_calls
 
     rows = request_log.snapshot()["requests"]
-    assert len(rows) == 90
+    assert len(rows) == 60
     assert all(row["status"] == "completed" for row in rows)
     for _ in range(2):
-        _assert_rejected(offline_relay, body, "acceptance_request_limit")
+        _assert_rejected(offline_relay, body, "model_call_limit_exhausted")
+
+
+@pytest.fixture
+def relay_at_last_counter_slot(offline_relay):
+    relay, _, _ = offline_relay
+    # Simulate earlier dispatches to test this independent guard without lifting
+    # the real ledger's hard 60-call limit or making additional requests.
+    relay.calls = 89
+    return offline_relay
+
+
+def test_relay_ninety_call_guard_rejects_before_ledger_and_dispatch(
+    relay_at_last_counter_slot,
+) -> None:
+    relay, request_log, sent = relay_at_last_counter_slot
+    body = _body(max_tokens=1)
+
+    _forward(relay, body)
+
+    assert relay.calls == 90
+    assert len(sent) == 1
+    assert len(request_log.snapshot()["requests"]) == 1
+    for _ in range(2):
+        _assert_rejected(relay_at_last_counter_slot, body, "acceptance_request_limit")
+
+
+def test_relay_does_not_count_a_rejected_in_flight_reservation(offline_relay) -> None:
+    _, request_log, _ = offline_relay
+    request_log.start_request(model=MODEL, request_bytes=1)
+
+    _assert_rejected(offline_relay, _body(max_tokens=1), "request_already_in_flight")
+
+
+def test_relay_counts_dispatched_request_when_consumer_rejects(offline_relay) -> None:
+    relay, request_log, sent = offline_relay
+
+    with pytest.raises(BudgetRejectedError, match="^synthetic_consumer_rejection$"):
+        with relay.forward(_body(max_tokens=1)):
+            raise BudgetRejectedError("synthetic_consumer_rejection")
+
+    assert relay.calls == 1
+    assert len(sent) == 1
+    rows = request_log.snapshot()["requests"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "interrupted"
+
+
+def test_relay_counts_reserved_dispatch_when_transport_fails(offline_relay, monkeypatch) -> None:
+    relay, request_log, sent = offline_relay
+
+    def fail_transport(*args, **kwargs):
+        raise httpx.ConnectError("synthetic offline transport failure")
+
+    monkeypatch.setattr(relay._client, "stream", fail_transport)
+    with pytest.raises(httpx.ConnectError, match="synthetic offline transport failure"):
+        _forward(relay, _body(max_tokens=1))
+
+    assert relay.calls == 1
+    assert sent == []
+    rows = request_log.snapshot()["requests"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "interrupted"
+    assert rows[0]["reason"] == "transport_error"
 
 
 def _pdf_bytes() -> bytes:

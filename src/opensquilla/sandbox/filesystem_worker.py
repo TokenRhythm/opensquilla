@@ -75,6 +75,8 @@ def _load_payload(source: str | Path) -> dict[str, Any]:
 
 def _run(payload: dict[str, Any]) -> dict[str, object]:
     kind = payload.get("kind")
+    if kind == "probe_file":
+        return _probe_file(payload)
     if kind == "read_file":
         return _read_file(payload)
     if kind == "list_dir":
@@ -83,6 +85,10 @@ def _run(payload: dict[str, Any]) -> dict[str, object]:
         return _glob_search(payload)
     if kind == "grep_search":
         return _grep_search(payload)
+    if kind == "fork_attachment":
+        return _fork_attachment(payload)
+    if kind == "copy_attachment":
+        return _copy_attachment(payload)
     if kind == "write_text":
         return _write_text(payload)
     if kind == "edit_text":
@@ -245,6 +251,13 @@ def _enforce_candidate_access(
     token plus ACLs, bwrap, or Seatbelt).  This check mirrors that policy for
     useful errors and prunes workspace-strict session data before access.
     """
+    if write:
+        from opensquilla.attachment_working_files import attachment_original_key
+
+        if len(candidate.parents) >= 4 and attachment_original_key(
+            candidate, candidate.parents[3],
+        ) is not None:
+            raise PermissionError("Immutable attachment original requires an editable working file")
     logical = Path(logical_absolute_path(candidate))
     profile = _filesystem_profile(payload)
     if profile is not None:
@@ -399,6 +412,31 @@ def _relative_glob_match(base: Path, candidate: Path, pattern: str) -> bool:
     return False
 
 
+def _probe_file(payload: dict[str, Any]) -> dict[str, object]:
+    path = _enforce_candidate_access(payload, _required_path(payload, "path"))
+    if not path.is_file():
+        raise FileNotFoundError("Workspace file is missing or is not a regular file")
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("Workspace file is not a regular file")
+        stream.read(1)
+    after = path.lstat()
+    if (
+        path.resolve(strict=True) != path
+        or not stat.S_ISREG(after.st_mode)
+        or (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino)
+        or bool(getattr(after, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    ):
+        raise ValueError("Workspace file mapping changed during the access probe")
+    return {"message": "File is readable", "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns, "device": metadata.st_dev, "inode": metadata.st_ino}
+
+
 def _read_file(payload: dict[str, Any]) -> dict[str, object]:
     from opensquilla.tools.builtin import filesystem as filesystem_tool
 
@@ -409,6 +447,30 @@ def _read_file(payload: dict[str, Any]) -> dict[str, object]:
         raise FileNotFoundError(f"File not found: {display_path}")
     if not path.is_file():
         raise IsADirectoryError(f"Path is a directory: {display_path}")
+
+    from opensquilla.tools.document_readers import complete_document_read, read_document
+
+    options = payload.get("documentOptions") or {}
+    if options.get("pdf_request"):
+        from opensquilla.tools.document_readers import read_pdf_request
+
+        return read_pdf_request(
+            path, pages=options.get("pages"), render=bool(options.get("render")),
+        )
+    document = read_document(
+        path, offset=_optional_positive_int(payload, "offset"),
+        limit=_optional_positive_int(payload, "limit"),
+        character_offset=options.get("character_offset", 0), sheet=options.get("sheet"),
+    )
+    if document is not None:
+        return {
+            "message": json.dumps(document, ensure_ascii=False),
+            "complete_read": complete_document_read(
+                document, offset=_optional_positive_int(payload, "offset"),
+                limit=_optional_positive_int(payload, "limit"),
+                character_offset=options.get("character_offset", 0), sheet=options.get("sheet"),
+            ),
+        }
 
     sample = filesystem_tool._read_binary_sample(path)
     image_result = filesystem_tool._read_image_file_result(path, sample)
@@ -543,6 +605,34 @@ def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
         if results
         else f"No matches for pattern '{pattern}' in {base}"
     }
+
+
+def _fork_attachment(payload: dict[str, Any]) -> dict[str, object]:
+    from opensquilla.attachment_working_files import snapshot_attachment_working_file
+
+    boundary = _filesystem_boundary(payload)
+    source_boundary = boundary.get("forkSourceBoundary")
+    if not isinstance(source_boundary, dict) or not source_boundary.get("workspaceStrict"):
+        raise PermissionError("attachment fork requires its source session boundary")
+    if not boundary.get("workspaceStrict") or not boundary.get("attachmentSessionRoot"):
+        raise PermissionError("attachment fork requires its target session boundary")
+    source_payload = {
+        **payload,
+        "permissions": {"filesystem": {**boundary, **source_boundary}},
+    }
+    source = _enforce_candidate_access(source_payload, _required_path(payload, "sourcePath"))
+    target = _enforce_candidate_access(payload, _required_path(payload, "path"), write=True)
+    sha = snapshot_attachment_working_file(source, target)
+    return {"message": "Copied attachment working file", "sha256": sha, "created": True}
+
+
+def _copy_attachment(payload: dict[str, Any]) -> dict[str, object]:
+    from opensquilla.attachment_working_files import copy_attachment_file
+
+    source = _enforce_candidate_access(payload, _required_path(payload, "sourcePath"))
+    target = _enforce_candidate_access(payload, _required_path(payload, "path"), write=True)
+    sha = copy_attachment_file(source, target, str(payload.get("expectedRevision") or ""))
+    return {"message": f"Created editable attachment at {target}", "sha256": sha, "created": True}
 
 
 def _write_text(payload: dict[str, Any]) -> dict[str, object]:

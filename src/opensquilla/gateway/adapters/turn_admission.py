@@ -165,6 +165,7 @@ class GatewayTurnAdmissionAdapter:
             "surface_id",
             "workspaceId",
             "workspace_id",
+            "workspaceFiles",
             "pageContext",
             "selectedSkills",
             "documentContext",

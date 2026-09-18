@@ -567,6 +567,7 @@ class AdmissionPrimitives(Protocol):
         persist_enabled: bool,
         disk_budget_bytes: int | None,
         page_context: dict[str, Any] | None = None,
+        workspace_files: list[dict[str, Any]] | None = None,
         selected_skills: list[dict[str, str]] | None = None,
     ) -> tuple[str, Sequence[object]]: ...
 

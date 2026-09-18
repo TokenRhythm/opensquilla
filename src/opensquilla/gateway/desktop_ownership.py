@@ -43,6 +43,7 @@ DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION: Final = 1
 DESKTOP_GATEWAY_INSTANCE_NONCE_ENV: Final = (
     "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE"
 )
+DESKTOP_GATEWAY_INSTANCE_ID_ENV: Final = "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID"
 DESKTOP_GATEWAY_AUTH_CONTEXT: Final = b"opensquilla-desktop-gateway-auth-v1"
 
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -371,6 +372,7 @@ class DesktopGatewayOwnership:
     pid: int = field(default_factory=os.getpid)
     start_identity: str = field(default_factory=process_start_identity)
     version: str = __version__
+    instance_id: str = ""
     _active: bool = field(default=False, init=False, repr=False)
     _written_record: dict[str, Any] | None = field(
         default=None, init=False, repr=False
@@ -418,11 +420,13 @@ class DesktopGatewayOwnership:
             profile_fingerprint=profile_fingerprint,
             port=int(port),
             instance_nonce=nonce,
+            instance_id=os.environ.get(DESKTOP_GATEWAY_INSTANCE_ID_ENV, "").strip(),
         )
         # The nonce is process-control authority, not provider/runtime config.
         # Remove both handoff values before service/channel subprocesses inherit
         # the Gateway environment; the active owner object retains what it needs.
         os.environ.pop(DESKTOP_GATEWAY_INSTANCE_NONCE_ENV, None)
+        os.environ.pop(DESKTOP_GATEWAY_INSTANCE_ID_ENV, None)
         os.environ.pop(DESKTOP_GATEWAY_OWNERSHIP_DIR_ENV, None)
         return owner
 

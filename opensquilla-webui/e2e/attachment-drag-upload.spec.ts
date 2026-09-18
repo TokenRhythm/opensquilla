@@ -17,9 +17,10 @@ type CapturedSend = {
   attachments?: Array<Record<string, unknown>>
 }
 
-type HistoryAttachmentFixture = 'send' | 'html' | 'image' | 'staged'
+type HistoryAttachmentFixture = 'send' | 'html' | 'image' | 'staged' | 'workspace'
 
 type MockRpcOptions = {
+  durableDraftIdentity?: boolean
   replayHistoryAfterSend?: boolean
   historyAttachmentFixture?: HistoryAttachmentFixture
   historyRequests?: Array<Record<string, unknown>>
@@ -62,7 +63,10 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
           : {}
         if (method === 'connect') {
           ws.send(helloOkResponse({
-            auth: { principal: { isOwner: true, authenticated: true, authState: 'authenticated' } },
+            auth: { principal: { isOwner: true, authenticated: true, authState: 'authenticated',
+              ...(options.durableDraftIdentity ? { role: 'operator',
+                scopes: ['operator.read', 'operator.write'], capabilities: ['chat.read', 'chat.write'] } : {}),
+            } },
           }))
           return
         }
@@ -126,6 +130,11 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
 
 function historyAttachmentsFromSend(params: CapturedSend, fixture: HistoryAttachmentFixture): Array<Record<string, unknown>> {
   const first = params.attachments?.[0] || {}
+  if (fixture === 'workspace') {
+    return [{ name: 'project-notes.txt', mime: 'text/plain', kind: 'file',
+      workspaceFile: { workspaceId: 'project-fixture', relativePath: 'research/project-notes.txt',
+        name: 'project-notes.txt', mime: 'text/plain' } }]
+  }
   if (fixture === 'html') {
     return [{
       type: 'text/html',
@@ -167,6 +176,16 @@ async function readDownloadBytes(download: Download): Promise<Buffer> {
 async function openMockedChat(page: Page, capturedSends: CapturedSend[], options: MockRpcOptions = {}, url = CONTROL_URL) {
   await mockApprovals(page)
   await mockRpc(page, capturedSends, options)
+  if (process.env.OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI === 'preview') {
+    // The gateway normalizes relative built entry assets against /control.
+    // Raw Vite preview needs the same entry projection on this nested route.
+    await page.route('**/control/chat/new*', async route => {
+      if (!route.request().isNavigationRequest()) return route.fallback()
+      const response = await route.fetch()
+      const body = (await response.text()).replace(/(src|href)="\.\//g, '$1="/control/')
+      await route.fulfill({ response, body })
+    })
+  }
   await page.goto(url)
   await expect(page.locator('.chat-textarea')).toBeVisible()
   await expect(page.locator('.conn-pill.connected')).toBeVisible()
@@ -446,13 +465,26 @@ test.describe('attachment drag upload', () => {
     expect(layout.animationName).toBe('none')
   })
 
-  test('drops and sends a small inline file without leaking local paths', async ({ page }) => {
+  for (const intake of ['picker', 'drop', 'paste'] as const) {
+  test(`attaches and sends a small inline file through ${intake} without leaking local paths`, async ({ page }) => {
     const capturedSends: CapturedSend[] = []
     await openMockedChat(page, capturedSends)
 
-    await dropFiles(page, [
-      { name: 'small.txt', type: 'text/plain', text: 'hello from inline drop' },
-    ])
+    const text = 'hello from ordinary attachment intake'
+    if (intake === 'picker') {
+      await page.locator('input[type="file"]').setInputFiles({
+        name: 'small.txt', mimeType: 'text/plain', buffer: Buffer.from(text),
+      })
+    } else if (intake === 'paste') {
+      await page.locator('.chat-textarea').focus()
+      await page.locator('.chat-textarea').evaluate((element, content) => {
+        const clipboardData = new DataTransfer()
+        clipboardData.items.add(new File([content], 'small.txt', { type: 'text/plain' }))
+        element.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData }))
+      }, text)
+    } else {
+      await dropFiles(page, [{ name: 'small.txt', type: 'text/plain', text }])
+    }
     await expect(page.locator('.attachment-chip')).toContainText('small.txt')
     await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
 
@@ -469,10 +501,81 @@ test.describe('attachment drag upload', () => {
       name: 'small.txt',
       type: 'text/plain',
     })
-    expect(String(attachment.data || '')).toBeTruthy()
+    expect(Buffer.from(String(attachment.data || ''), 'base64').toString()).toBe(text)
     expect(attachment.file_uuid).toBeUndefined()
     expect(JSON.stringify(params)).not.toContain('/Users/')
     expect(JSON.stringify(params)).not.toContain('small.txt/')
+  })
+  }
+
+  for (const { durableDraftIdentity, newTask } of [
+    { durableDraftIdentity: true, newTask: false },
+    { durableDraftIdentity: false, newTask: false },
+    { durableDraftIdentity: true, newTask: true },
+  ]) {
+    test(`recovers attachment bytes after refresh only with a proven draft identity (${durableDraftIdentity}${newTask ? ', new task' : ''})`, async ({ page }) => {
+      const capturedSends: CapturedSend[] = []
+      await openMockedChat(page, capturedSends, { durableDraftIdentity },
+        newTask ? CONTROL_URL : '/control/chat?session=agent%3Amain%3Awebchat%3Afixture-draft-reload')
+      await dropFiles(page, [{ name: 'draft.txt', type: 'text/plain', text: 'recover these attachment bytes' }])
+      await expect(page.locator('.attachment-chip')).toContainText('draft.txt')
+      if (newTask) {
+        await expect(page.locator('.chat-textarea')).toHaveValue('')
+        await expect.poll(() => page.evaluate(() => window.history.state.draftHasAttachments)).toBe(true)
+      }
+      await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+      if (durableDraftIdentity) {
+        await expect.poll(() => page.evaluate(async () => {
+          const databases = await indexedDB.databases()
+          if (!databases.some(db => db.name === 'opensquilla-attachment-drafts')) return false
+          return new Promise<boolean>((resolve, reject) => {
+            const opening = indexedDB.open('opensquilla-attachment-drafts', 1)
+            opening.onerror = () => reject(opening.error)
+            opening.onsuccess = () => {
+              const db = opening.result
+              const request = db.transaction('drafts').objectStore('drafts').getAll()
+              request.onsuccess = () => {
+                resolve(request.result.some(record => record.attachments.some((item: { name: string }) => item.name === 'draft.txt')))
+                db.close()
+              }
+              request.onerror = () => reject(request.error)
+            }
+          })
+        })).toBe(true)
+      }
+      await page.reload()
+      await expect(page.locator('.chat-textarea')).toBeVisible()
+      await expect(page.locator('.conn-pill.connected')).toBeVisible()
+      if (!durableDraftIdentity) {
+        await expect(page.locator('.attachment-chip')).toHaveCount(0)
+        return
+      }
+      await expect(page.locator('.attachment-chip')).toContainText('draft.txt')
+      await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
+      await page.locator('.chat-send-btn[aria-label="Send"]').click()
+      await expect.poll(() => capturedSends.length).toBe(1)
+      expect(Buffer.from(String(capturedSends[0]?.attachments?.[0]?.data), 'base64').toString())
+        .toBe('recover these attachment bytes')
+    })
+  }
+
+  test('shows the live project target after history replay without a snapshot download', async ({ page }) => {
+    const capturedSends: CapturedSend[] = []
+    const historyRequests: Array<Record<string, unknown>> = []
+    await openMockedChat(page, capturedSends, { replayHistoryAfterSend: true,
+      historyAttachmentFixture: 'workspace', historyRequests })
+    await page.locator('.chat-textarea').fill('Inspect the current project file')
+    const previousCalls = historyRequests.length
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => historyRequests.length).toBeGreaterThan(previousCalls)
+    const chip = page.locator('.msg-attachments .msg-file-chip')
+    await expect(chip).toContainText('project-notes.txt')
+    await expect(chip).toContainText('Live project file: research/project-notes.txt')
+    await expect(page.locator('.msg-attachments button')).toHaveCount(0)
+    const download = page.waitForEvent('download', { timeout: 400 }).catch(() => null)
+    await chip.click()
+    expect(await download).toBeNull()
+    await expect(page.locator('.msg-file-chip--failed')).toHaveCount(0)
   })
 
   test('keeps non-image history replay attachments as file chips', async ({ page }) => {
@@ -496,6 +599,7 @@ test.describe('attachment drag upload', () => {
     await expect.poll(() => historyRequests.length).toBeGreaterThan(historyCallsBeforeSend)
 
     await expect(page.locator('.msg-attachments .msg-file-chip')).toContainText('preview.html')
+    await expect(page.locator('.msg-file-chip__target')).toHaveText('Imported file; edits use a working copy')
     await expect(page.locator('.msg-attachments .msg-thumb')).toHaveCount(0)
 
     const downloadPromise = page.waitForEvent('download')

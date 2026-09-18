@@ -229,10 +229,18 @@ def decode_admit_turn(
             "Update the client and send page annotations as ordinary chat input.",
             details={"action": "update_client_and_reopen_page"},
         )
+    from opensquilla.workspace_files import normalize_workspace_files
+
+    workspace_files = normalize_workspace_files(params.get("workspaceFiles"))
     page_context = normalize_page_context(params.get("pageContext"))
     selected_skills = normalize_selected_skills(params.get("selectedSkills"))
     attachments = params.get("attachments", [])
     attachments = attachments if isinstance(attachments, list) else []
+    if workspace_files:
+        from opensquilla.contracts.attachments import MAX_ATTACHMENTS
+
+        if len(workspace_files) + len(attachments) > MAX_ATTACHMENTS:
+            raise ValueError(f"input must contain at most {MAX_ATTACHMENTS} files")
     # The durable receipt identifies original material, not the shared guarded
     # text shown for every large paste. Application normalization runs later.
     fingerprint = dict(fingerprint_params or params)
@@ -248,6 +256,8 @@ def decode_admit_turn(
         fingerprint.pop(snake, None)
         if value is not None:
             fingerprint[camel] = value
+    if workspace_files:
+        fingerprint["workspaceFiles"] = workspace_files
     if page_context is not None:
         fingerprint["pageContext"] = page_context
     if retired_input:
@@ -296,6 +306,7 @@ def decode_admit_turn(
             or _optional_string(source, "surface_id", "surfaceId")
         ),
         attachments=tuple(attachments),
+        workspace_files=tuple(workspace_files),
         selected_skills=selected_skills,
         intent=params.get("intent", "continue"),
         intent_was_provided=params.get("intent") is not None,

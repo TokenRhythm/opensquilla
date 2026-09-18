@@ -207,8 +207,8 @@ class GatewayPendingInputQueueAdapter:
             if field in raw:
                 params[field] = raw[field]
         for field in (
-            "pageContext", "selectedSkills", "promptAnnotationIds", "prompt_annotation_ids",
-            "documentContext", "document_context",
+            "pageContext", "workspaceFiles", "selectedSkills", "promptAnnotationIds",
+            "prompt_annotation_ids", "documentContext", "document_context",
         ):
             if field in raw:
                 params[field] = raw[field]

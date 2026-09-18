@@ -206,7 +206,7 @@
                 :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
                 @activate-goal-mode="emit('armGoal')"
                 @activate-plan-mode="emit('setCollaborationMode', 'plan')"
-                @attach-files="fileInputEl?.click()"
+                @attach-files="onAttachFiles"
                 @close="addMenuOpen = false"
               />
             </div>
@@ -531,6 +531,7 @@ import {
   promptAnnotationBodyWithinLimit,
 } from '@/types/promptAnnotations'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
+import { fileTypeLabel } from '@/utils/fileType'
 
 interface ChatComposerExpose {
   composerElement: () => HTMLElement | null
@@ -543,6 +544,7 @@ interface ChatComposerExpose {
 const props = withDefaults(defineProps<{
   selectedSkills?: readonly SelectedSkillRef[]
   attachments: Attachment[]
+  chooseAttachments?: () => Promise<boolean>
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
   sendPending?: boolean
@@ -697,6 +699,11 @@ function onTextareaInput(event: Event) {
 }
 
 const fileInputEl = ref<HTMLInputElement | null>(null)
+async function onAttachFiles() {
+  if (props.chooseAttachments && await props.chooseAttachments()) return
+  fileInputEl.value?.click()
+}
+
 const addMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const modelRoutingPanelRef = ref<{ element: () => HTMLElement | null } | null>(null)
@@ -933,9 +940,7 @@ function attachmentMeta(att: Attachment): string {
     const failed = t('chat.status.failed')
     return att.error ? `${failed} · ${att.error}` : failed
   }
-  const mime = att.mime || ''
-  const subtype = mime.includes('/') ? mime.split('/')[1] : mime
-  const label = subtype ? subtype.toUpperCase() : t('chat.fileLabel')
+  const label = fileTypeLabel(att, t('chat.fileLabel'))
   const size = typeof att.size === 'number'
     ? `${Math.max(1, Math.round(att.size / 1024))} KB`
     : ''
@@ -943,6 +948,10 @@ function attachmentMeta(att: Attachment): string {
 }
 
 function attachmentTitle(att: Attachment): string {
+  if (att.kind === 'workspace' && att.workspaceFile) {
+    return `${att.name}\n${t('chat.projectFileTarget', { path: att.workspaceFile.relativePath })}`
+  }
+  if (att.kind === 'staged' || att.kind === 'inline') return `${att.name}\n${t('chat.importedFileTarget')}`
   if (att.kind === 'failed') {
     return att.error ? `${att.name}: ${att.error}` : t('chat.toast.uploadFailed', { name: att.name })
   }

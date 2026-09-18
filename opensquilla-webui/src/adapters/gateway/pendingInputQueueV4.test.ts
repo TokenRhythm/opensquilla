@@ -58,6 +58,8 @@ describe('pending input queue v4 adapter', () => {
             confirmedPlainText: true,
             position: 3,
             revision: 7,
+            workspaceFiles: [{ workspaceId: 'project-1', relativePath: 'docs/notes.md', name: 'notes.md', mime: 'text/markdown' }],
+            selectedSkills: [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }],
             attachments: [{
               name: 'notes.txt',
               type: 'text/plain',
@@ -86,6 +88,8 @@ describe('pending input queue v4 adapter', () => {
       confirmedPlainText: true,
       position: 3,
       revision: 7,
+      workspaceFiles: [{ workspaceId: 'project-1', relativePath: 'docs/notes.md', name: 'notes.md', mime: 'text/markdown' }],
+      selectedSkills: [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }],
       attachments: [{ name: 'notes.txt', mime: 'text/plain', size: 12 }],
     }])
   })

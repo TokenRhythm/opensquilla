@@ -46,9 +46,11 @@ export function recentDraftSessionKey(): string {
 }
 
 /** Return a specific recoverable draft without changing the recent pointer. */
-export function recoverableDraftSessionKey(key: string): string {
+export function recoverableDraftSessionKey(key: string, hasAttachmentDraft = false): string {
   try {
-    return validDraftSessionKey(key) && Boolean(localStorage.getItem(draftKey(key)))
+    // The existing per-tab draft history record may point to attachment-only
+    // content. This recovers a key, never storage ownership or file authority.
+    return validDraftSessionKey(key) && (hasAttachmentDraft || Boolean(localStorage.getItem(draftKey(key))))
       ? key
       : ''
   } catch {

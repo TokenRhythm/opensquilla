@@ -35,6 +35,10 @@ from typing import Any
 import httpx
 
 BUCKET_LIMITS_CNY = {"probe": 50, "regular": 200, "extended": 500, "contingency": 250}
+ATTACHMENT_PHASE_CALL_LIMITS = {
+    "connectivity": 4, "baseline": 8, "file_consumption": 18,
+    "files_and_sandbox": 14, "long_history": 12, "targeted_retest": 4,
+}
 _NANOS = Decimal(1_000_000_000)
 _SAFE_ID = re.compile(r"[A-Za-z0-9_.:/+-]{1,128}\Z")
 _MAX_BODY_BYTES = 16 * 1024 * 1024
@@ -369,10 +373,24 @@ class BudgetLedger:
 class FunctionalRequestLog:
     """Physical HTTP metadata for an explicitly selected functional test run."""
 
-    def __init__(self, path: Path, *, enabled: bool = False) -> None:
+    def __init__(
+        self, path: Path, *, enabled: bool = False, max_calls: int = 60,
+        phase_limits: Mapping[str, int] | None = None,
+    ) -> None:
+        if type(max_calls) is not int or not 1 <= max_calls <= 60:
+            raise BudgetRejectedError("invalid_call_limit")
+        self.max_calls = max_calls
         self.path = path.resolve()
         self.enabled = enabled
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        requested_limits = dict(phase_limits) if phase_limits is not None else None
+        if requested_limits is not None:
+            for phase, limit in requested_limits.items():
+                _identifier(phase)
+                if type(limit) is not int or limit < 1:
+                    raise BudgetRejectedError("invalid_phase_call_limit")
+            if sum(requested_limits.values()) > max_calls:
+                raise BudgetRejectedError("phase_limits_exceed_global_limit")
         if self.path.exists():
             # Inspect before any writable connection: a budget ledger is never migrated.
             try:
@@ -393,8 +411,27 @@ class FunctionalRequestLog:
                 "response_headers_at REAL, http_status INTEGER, first_chunk_at REAL, "
                 "first_event_at REAL, request_bytes INTEGER, response_bytes INTEGER)"
             )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(requests)")}
+            if "phase" not in columns:
+                db.execute("ALTER TABLE requests ADD COLUMN phase TEXT")
             db.execute("INSERT OR IGNORE INTO state VALUES ('mode', 'functional')")
             db.execute("INSERT OR IGNORE INTO state VALUES ('schema_version', '1')")
+            previous = db.execute("SELECT value FROM state WHERE key='max_calls'").fetchone()
+            if previous is not None and previous[0] != str(max_calls):
+                raise BudgetRejectedError("call_limit_changed")
+            db.execute("INSERT OR IGNORE INTO state VALUES ('max_calls', ?)", (str(max_calls),))
+            stored_limits = db.execute(
+                "SELECT value FROM state WHERE key='phase_limits'"
+            ).fetchone()
+            self.phase_limits = json.loads(stored_limits[0]) if stored_limits else (
+                requested_limits or {}
+            )
+            if requested_limits is not None and self.phase_limits != requested_limits:
+                raise BudgetRejectedError("phase_call_limits_changed")
+            db.execute(
+                "INSERT OR IGNORE INTO state VALUES ('phase_limits', ?)",
+                (json.dumps(self.phase_limits, sort_keys=True),),
+            )
         self.path.chmod(0o600)
 
     @contextlib.contextmanager
@@ -411,16 +448,21 @@ class FunctionalRequestLog:
         finally:
             db.close()
 
-    def select_phase(self, *, variant: str, case_id: str) -> None:
+    def select_phase(self, *, variant: str, case_id: str, phase: str | None = None) -> None:
         if variant not in {"baseline", "new"}:
             raise BudgetRejectedError("invalid_phase")
         _identifier(case_id)
+        if self.phase_limits and phase not in self.phase_limits:
+            raise BudgetRejectedError("phase_allocation_required")
+        if phase is not None:
+            _identifier(phase)
         with self._transaction() as db:
             if db.execute("SELECT 1 FROM requests WHERE status='in_flight' LIMIT 1").fetchone():
                 raise BudgetRejectedError("requests_still_in_flight")
             db.execute(
                 "INSERT OR REPLACE INTO state VALUES ('phase', ?)",
-                (json.dumps({"variant": variant, "case_id": case_id}),),
+                (json.dumps({"variant": variant, "case_id": case_id,
+                             **({"phase": phase} if phase is not None else {})}),),
             )
 
     def start_request(self, *, model: str, request_bytes: int) -> str:
@@ -428,15 +470,30 @@ class FunctionalRequestLog:
             raise BudgetRejectedError("live_requests_disabled")
         _identifier(model)
         with self._transaction() as db:
+            if db.execute("SELECT COUNT(*) FROM requests").fetchone()[0] >= self.max_calls:
+                raise BudgetRejectedError("model_call_limit_exhausted")
+            if db.execute("SELECT 1 FROM requests WHERE status='in_flight' LIMIT 1").fetchone():
+                raise BudgetRejectedError("request_already_in_flight")
             row = db.execute("SELECT value FROM state WHERE key='phase'").fetchone()
             if row is None:
                 raise BudgetRejectedError("phase_not_selected")
             phase = json.loads(row[0])
+            allocation = phase.get("phase")
+            if self.phase_limits:
+                if allocation not in self.phase_limits:
+                    raise BudgetRejectedError("phase_allocation_required")
+                used = db.execute(
+                    "SELECT COUNT(*) FROM requests WHERE phase=?", (allocation,),
+                ).fetchone()[0]
+                if used >= self.phase_limits[allocation]:
+                    raise BudgetRejectedError("phase_model_call_limit_exhausted")
             request_id = uuid.uuid4().hex
             db.execute(
                 "INSERT INTO requests (id, variant, case_id, model, started, status, "
-                "request_bytes, response_bytes) VALUES (?, ?, ?, ?, ?, 'in_flight', ?, 0)",
-                (request_id, phase["variant"], phase["case_id"], model, time.time(), request_bytes),
+                "request_bytes, response_bytes, phase) "
+                "VALUES (?, ?, ?, ?, ?, 'in_flight', ?, 0, ?)",
+                (request_id, phase["variant"], phase["case_id"], model, time.time(),
+                 request_bytes, allocation),
             )
         return request_id
 
@@ -493,6 +550,12 @@ class FunctionalRequestLog:
             rows = [dict(row) for row in db.execute("SELECT * FROM requests ORDER BY started, id")]
         return {
             "mode": "functional", "schemaVersion": 1,
+            "maxCalls": self.max_calls, "callsRemaining": max(0, self.max_calls - len(rows)),
+            "phaseLimits": dict(self.phase_limits),
+            "phaseCallsRemaining": {
+                name: max(0, limit - sum(row["phase"] == name for row in rows))
+                for name, limit in self.phase_limits.items()
+            },
             "phase": json.loads(phase[0]) if phase else {},
             "pendingRequests": sum(row["status"] == "in_flight" for row in rows),
             "firstEventDefinition": "first complete upstream SSE data line or JSON object; "
@@ -933,6 +996,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=("budget", "functional"), default="budget")
     parser.add_argument("--ledger", type=Path)
     parser.add_argument("--request-log", type=Path)
+    parser.add_argument("--max-calls", type=int, default=60)
+    parser.add_argument("--attachment-phases", action="store_true")
+    parser.add_argument("--phase", choices=ATTACHMENT_PHASE_CALL_LIMITS)
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--reviewed-model", action="append", default=[])
     parser.add_argument("--catalog-valid-until", type=float)
@@ -966,8 +1032,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("TOKENRHYTHM_API_KEY must be injected into the isolated relay process")
     recorder: BudgetLedger | FunctionalRequestLog
     if args.mode == "functional":
-        recorder = FunctionalRequestLog(args.request_log, enabled=True)
-        recorder.select_phase(variant=args.variant, case_id=args.case_id)
+        recorder = FunctionalRequestLog(
+            args.request_log, enabled=True, max_calls=args.max_calls,
+            phase_limits=ATTACHMENT_PHASE_CALL_LIMITS if args.attachment_phases else None,
+        )
+        recorder.select_phase(variant=args.variant, case_id=args.case_id, phase=args.phase)
         relay = BudgetRelay(None, {}, api_key=api_key, request_log=recorder)
     else:
         payload = json.loads(args.catalog.read_text(encoding="utf-8"))
@@ -1000,6 +1069,7 @@ def main(argv: list[str] | None = None) -> int:
                    else {"bucket": args.bucket}),
                 "variant": args.variant,
                 "case_id": args.case_id,
+                "max_calls": args.max_calls,
             },
         )
         while not stopping.wait(0.25):

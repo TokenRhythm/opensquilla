@@ -2037,6 +2037,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--comparison-history-tokens", type=int)
     parser.add_argument("--comparison-history-chars", type=int)
     parser.add_argument("--serve-gateway", action="store_true")
+    parser.add_argument("--max-calls", type=int, default=60)
+    parser.add_argument("--relay-ready", type=Path)
     parser.add_argument("--gateway-read-files", action="store_true")
     parser.add_argument("--gateway-root", type=Path)
     parser.add_argument("--gateway-port", type=int, default=18799)
@@ -2051,6 +2053,28 @@ def main(argv: list[str] | None = None) -> int:
     if not args.live:
         print(json.dumps({"ok": False, "status": "live_opt_in_required"}))
         return 2
+    if not 1 <= args.max_calls <= 60:
+        print(json.dumps({"ok": False, "status": "invalid_physical_call_limit"}))
+        return 2
+    relay_environment: dict[str, str] = {}
+    if args.relay_ready:
+        from scripts.live_tokenrhythm_transport import RelayTarget
+
+        try:
+            ready = json.loads(require_temporary_report_path(args.relay_ready).read_text())
+            _require(args.provider == "tokenrhythm", "relay_requires_tokenrhythm")
+            _require(ready.get("enabled") is True and ready.get("mode") == "functional",
+                     "functional_relay_required")
+            target = RelayTarget(str(ready["base_url"]), str(ready["client_key"]))
+            relay_environment = {
+                "TOKENRHYTHM_API_KEY": target.client_key,
+                "OPENSQUILLA_LIVE_TRANSPORT": "1",
+                "OPENSQUILLA_LIVE_RELAY_URL": str(target.url),
+                "OPENSQUILLA_LIVE_RELAY_CLIENT_KEY": target.client_key,
+            }
+        except Exception:
+            print(json.dumps({"ok": False, "status": "invalid_functional_relay"}))
+            return 2
     if args.report:
         require_temporary_report_path(args.report)
     if args.comparison_snapshot_in:
@@ -2106,7 +2130,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "status": str(exc)}))
         return 2
     spec = get_provider_spec(args.provider)
-    api_key = os.environ.get(spec.env_key, "")
+    api_key = relay_environment.get(spec.env_key) or os.environ.get(spec.env_key, "")
     model = (
         args.model
         or os.environ.get(f"{args.provider.upper()}_MODEL")
@@ -2143,11 +2167,16 @@ def main(argv: list[str] | None = None) -> int:
         "OPENSQUILLA_LIVE_DISABLE_DOTENV": "1",
         "OPENSQUILLA_OPENROUTER_LIVE_PRICING": "0",
         "OPENSQUILLA_COMPACTION_PROMPT_LAYOUT": args.layout,
+        **relay_environment,
     }
     observed_providers = set(args.observe_provider or ()) | {args.provider}
+    if relay_environment and observed_providers != {"tokenrhythm"}:
+        print(json.dumps({"ok": False, "status": "relay_provider_mismatch"}))
+        return 2
     endpoints = {provider: registry_endpoint(provider) for provider in observed_providers}
     keys = {get_provider_spec(provider).env_key:
-            os.environ.get(get_provider_spec(provider).env_key, "")
+            relay_environment.get(get_provider_spec(provider).env_key)
+            or os.environ.get(get_provider_spec(provider).env_key, "")
             for provider in observed_providers}
     env.update({key: value for key, value in keys.items() if value})
     if args.serve_gateway:
@@ -2162,8 +2191,9 @@ def main(argv: list[str] | None = None) -> int:
     observer = WireObserver(
         registry_endpoint(args.provider),
         endpoints=endpoints,
-        max_calls=COMPACTION_CALL_LIMITS[args.compaction_variant] + int(args.native_pressure)
-        if args.scenario == "compaction" and not args.serve_gateway else None,
+        max_calls=min(args.max_calls, COMPACTION_CALL_LIMITS[args.compaction_variant]
+                      + int(args.native_pressure))
+        if args.scenario == "compaction" and not args.serve_gateway else args.max_calls,
         summary_fault=summary_fault if args.serve_gateway else None,
     )
     try:
@@ -2171,7 +2201,12 @@ def main(argv: list[str] | None = None) -> int:
             patch.dict(os.environ, env, clear=True),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
+            contextlib.ExitStack() as live_stack,
         ):
+            if relay_environment:
+                from scripts.live_tokenrhythm_transport import install_from_env
+
+                live_stack.callback(install_from_env())
             logging.disable(logging.CRITICAL)
             if args.serve_gateway:
                 from scripts.live_compaction_gateway import (

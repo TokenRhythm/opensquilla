@@ -8,6 +8,7 @@ import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { NativeAttachmentSelections } from './native-attachments.js'
 import { saveArtifactFile, performSourceFileAction, type SaveArtifactRequest, type SourceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
@@ -9022,6 +9023,7 @@ async function startGateway(): Promise<GatewayState> {
     ...(connection.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
     ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
+    OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID: gatewayConnectionInstanceId,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
     ...browserEnvironment,
     OPENSQUILLA_CONTROL_UI_DIST: desktopRendererDistPath(),
@@ -12191,6 +12193,56 @@ ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileAc
     },
     openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
   })
+})
+// File paths enter this broker only from the native picker or isolated preload's
+// webUtils.getPathForFile(File); renderer-facing calls never accept a path string.
+const nativeAttachmentWindows = new Map<number, {
+  event: Electron.IpcMainInvokeEvent
+  selections: NativeAttachmentSelections
+}>()
+function nativeAttachmentsFor(event: Electron.IpcMainInvokeEvent): NativeAttachmentSelections {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted attachment request')
+  const senderId = event.sender.id
+  let entry = nativeAttachmentWindows.get(senderId)
+  if (!entry) {
+    const selections = new NativeAttachmentSelections({ connection: () => {
+      const current = nativeAttachmentWindows.get(senderId)
+      if (!current || !trustedControlUiIpc(current.event) || gatewayState.status !== 'ready' || !gatewayProcess) return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      const nonce = gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+    } })
+    entry = { event, selections }
+    nativeAttachmentWindows.set(senderId, entry)
+    event.sender.on('did-start-navigation', (_event, _url, inPlace, mainFrame) => {
+      if (mainFrame && !inPlace) selections.cancel(senderId)
+    })
+    event.sender.once('destroyed', () => {
+      selections.cancel(senderId)
+      nativeAttachmentWindows.delete(senderId)
+    })
+  }
+  entry.event = event
+  return entry.selections
+}
+ipcMain.handle('desktop:attachments:choose', (event, request: unknown) => (
+  nativeAttachmentsFor(event).choose(event.sender.id, request, async () => {
+    const choice = await dialog.showOpenDialog(currentMainWindow()!, {
+      properties: ['openFile', 'multiSelections'],
+    })
+    return choice.canceled ? [] : choice.filePaths
+  })
+))
+ipcMain.handle('desktop:attachments:select-file', (event, request: unknown, selectedPath: unknown) => (
+  nativeAttachmentsFor(event).select(event.sender.id, request, selectedPath)
+))
+ipcMain.handle('desktop:attachments:import', (event, request: unknown, token: unknown) => (
+  nativeAttachmentsFor(event).import(event.sender.id, request, token)
+))
+ipcMain.handle('desktop:attachments:cancel', event => {
+  nativeAttachmentsFor(event).cancel(event.sender.id)
 })
 ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) return null

@@ -28,7 +28,10 @@ SandboxOperationDomain = Literal[
 ]
 
 SANDBOX_FILESYSTEM_WRITE_KINDS = frozenset(
-    {"write_text", "edit_text", "create_source", "edit_source", "apply_patch"}
+    {
+        "write_text", "edit_text", "create_source", "edit_source", "apply_patch",
+        "copy_attachment", "fork_attachment",
+    }
 )
 
 
@@ -121,6 +124,8 @@ class FilesystemOperationRequest:
     max_results: int | None = None
     expected_revision: str = ""
     edits: tuple[dict[str, object], ...] = ()
+    source_path: Path | None = None
+    document_options: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -138,6 +143,10 @@ class FilesystemOperationRequest:
             "include": self.include,
             "maxResults": self.max_results,
         }
+        if self.source_path is not None:
+            payload["sourcePath"] = str(self.source_path)
+        if self.document_options is not None:
+            payload["documentOptions"] = self.document_options
         if self.logical_path is not None:
             payload["logicalPath"] = str(self.logical_path)
         if self.expected_revision:
@@ -476,6 +485,8 @@ class SandboxOperation:
         expected_revision: str = "",
         edits: tuple[dict[str, object], ...] = (),
         file_system_profile: FileSystemPermissionProfile | None = None,
+        source_path: Path | None = None,
+        document_options: dict[str, Any] | None = None,
     ) -> SandboxOperation:
         operation_paths = paths or ((path,) if path is not None else ())
         request = FilesystemOperationRequest(
@@ -495,6 +506,8 @@ class SandboxOperation:
             max_results=max_results,
             expected_revision=expected_revision,
             edits=edits,
+            source_path=source_path,
+            document_options=document_options,
         )
         return cls(
             domain="filesystem",

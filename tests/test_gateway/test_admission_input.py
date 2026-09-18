@@ -270,8 +270,17 @@ async def test_invalid_initial_model_pin_never_reaches_application(fields):
     application.admit.assert_not_awaited()
 
 
-def test_initial_model_identity_normalizes_aliases_but_preserves_provider_and_model():
+@pytest.mark.parametrize("with_workspace_file", [False, True])
+def test_initial_model_identity_normalizes_aliases_but_preserves_provider_and_model(
+    with_workspace_file,
+):
     base = {"key": "agent:main:pin", "message": "hello", "intent": "new_chat"}
+    workspace_file = {
+        "workspaceId": "project-one", "relativePath": "notes.txt",
+        "name": "notes.txt", "mime": "text/plain",
+    }
+    if with_workspace_file:
+        base["workspaceFiles"] = [workspace_file]
     original = decode_admit_turn({**base, "initialModel": "a", "initialProvider": "openai"})
     alias = decode_admit_turn({**base, "initial_model": " a ", "initial_provider": " OpenAI "})
     assert original.request_fingerprint == alias.request_fingerprint
@@ -279,6 +288,18 @@ def test_initial_model_identity_normalizes_aliases_but_preserves_provider_and_mo
                    {"initialModel": "a", "initialProvider": "anthropic"}, {}):
         changed = decode_admit_turn({**base, **fields})
         assert changed.request_fingerprint != original.request_fingerprint
+    if with_workspace_file:
+        duplicate = decode_admit_turn({
+            **base, "initial_model": " a ", "initial_provider": " OpenAI ",
+            "workspaceFiles": [workspace_file, dict(workspace_file)],
+        })
+        assert duplicate.request_fingerprint == original.request_fingerprint
+        assert duplicate.workspace_files == (workspace_file,)
+        changed_file = decode_admit_turn({
+            **base, "initialModel": "a", "initialProvider": "openai",
+            "workspaceFiles": [{**workspace_file, "relativePath": "changed.txt"}],
+        })
+        assert changed_file.request_fingerprint != original.request_fingerprint
     assert decode_admit_turn(base).request_fingerprint == decode_admit_turn({
         **base, "initialModel": None, "initialProvider": None,
     }).request_fingerprint

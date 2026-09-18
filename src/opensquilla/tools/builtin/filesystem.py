@@ -405,7 +405,7 @@ def _memory_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def _resolve_path(path: str) -> Path:
+def _resolve_unmapped_path(path: str) -> Path:
     """Resolve *path* against the active workspace when relative.
 
     Reads are always allowed; any workspace enforcement for writes happens in
@@ -425,12 +425,126 @@ def _resolve_path(path: str) -> Path:
     root = _workspace_root()
     reject_foreign_host_path(str(path), platform=os.name, workspace=root)
     alias = resolve_workspace_alias(raw, root)
-    if alias is not None:
-        assert isinstance(alias, Path)
-        return alias.resolve(strict=False)
-    if root is not None and not raw.is_absolute():
-        return (root / raw).resolve(strict=False)
-    return raw.resolve(strict=False) if raw.is_absolute() else raw
+    candidate = alias if alias is not None else (
+        root / raw if root is not None and not raw.is_absolute() else raw
+    )
+    assert isinstance(candidate, Path)
+    resolved = candidate.resolve(strict=False) if candidate.is_absolute() else candidate
+    if root is not None:
+        from opensquilla.attachment_working_files import attachment_original_key
+
+        attachment_path = attachment_original_key(candidate, root) is not None or (
+            candidate.is_relative_to(root / ".opensquilla" / "attachments")
+        )
+        if attachment_path and resolved != candidate:
+            raise SafeToolError("Attachment path is redirected; original was preserved")
+    return resolved
+
+
+def _resolve_path(path: str) -> Path:
+    from opensquilla.attachment_working_files import attachment_original_key, working_path_for_entry
+
+    resolved = _resolve_unmapped_path(path)
+    ctx = current_tool_context.get()
+    root = _workspace_root()
+    if ctx is not None and root is not None:
+        key = attachment_original_key(resolved, root)
+        entry = ctx.attachment_working_files.get(key or "")
+        if entry is None and resolved.is_relative_to(root):
+            relative = resolved.relative_to(root).as_posix()
+            entry = next((record for record in ctx.attachment_working_files.values()
+                          if record.get("path") == relative), None)
+        if entry and entry.get("path"):
+            try:
+                return working_path_for_entry(
+                    entry, workspace=root, session_id=ctx.artifact_session_id or "",
+                )
+            except ValueError as exc:
+                raise SafeToolError(str(exc)) from exc
+    return resolved
+
+
+async def _prepare_attachment_edit_path(
+    path: str, *, tool_name: str, approval_id: str | None = None,
+    sandbox_permissions: str = "use_default", justification: str = "",
+    prefix_rule: list[str] | None = None,
+) -> tuple[Path, str | None]:
+    from opensquilla.attachment_working_files import attachment_original_key, copy_attachment_file
+    from opensquilla.attachment_workspace import _safe_path_segment
+
+    source = _resolve_path(path)
+    root = _workspace_root()
+    ctx = current_tool_context.get()
+    if ctx is not None and root is not None:
+        if (
+            ctx.sandbox_session_manager is not None
+            and source.is_relative_to(root / ".opensquilla" / "attachments")
+            and (ctx.session_epoch is None or ctx.persist_attachment_working_files is None)
+        ):
+            raise SafeToolError(
+                "Attachment edit requires a current durable session; retry after session recovery"
+            )
+        relative = source.relative_to(root).as_posix() if source.is_relative_to(root) else ""
+        if any(entry.get("path") == relative for entry in ctx.attachment_working_files.values()):
+            if ctx.persist_attachment_working_files is not None:
+                await ctx.persist_attachment_working_files()
+            return source, None
+    key = attachment_original_key(source, root) if root is not None else None
+    if key is None:
+        return source, None
+    if ctx is None or root is None or not ctx.artifact_session_id:
+        raise SafeToolError("Editing an immutable attachment requires its active session")
+    scope = _safe_path_segment(ctx.artifact_session_id, fallback="session")
+    if Path(key).parts[2] != scope:
+        raise SafeToolError("Cannot edit another session's immutable attachment")
+    blocked = _sensitive_access_block(tool_name, source, path)
+    blocked = blocked or _sandbox_path_access_envelope(source, write=False)
+    if blocked is not None:
+        return source, json.dumps(blocked)
+    _gate_workspace_strict_read(tool_name, source, path)
+    require_fresh_workspace_file_read(source, tool_name=tool_name, original_path=path)
+    target = source.parent / "working" / source.name
+    if target.parent.resolve() != target.parent:
+        raise SafeToolError("Attachment working directory is redirected")
+    approval, elevated, _ = await _gate_out_of_workspace_write(
+        tool_name, target, str(target), approval_id,
+        sandbox_permissions=sandbox_permissions, justification=justification,
+        prefix_rule=prefix_rule,
+    )
+    if approval is not None:
+        return source, json.dumps(approval)
+    expected_sha = str(ctx.attachment_working_files.get(key, {}).get("sha256") or "")
+
+    async def copy_and_persist() -> None:
+        result = await _run_sandbox_operation_if_required(
+            SandboxOperation.filesystem(
+                kind="copy_attachment", workspace=root, run_mode=_active_filesystem_run_mode(),
+                path=target, paths=(target,), source_path=source, expected_revision=expected_sha,
+            ), host_execution_active=elevated,
+        )
+        if result is None:
+            sha = await asyncio.to_thread(copy_attachment_file, source, target, expected_sha)
+        else:
+            sha = str(getattr(result, "metadata", {}).get("sha256", ""))
+        ctx.attachment_working_files[key] = {
+            "path": target.relative_to(root).as_posix(), "sha256": sha,
+            "session_id": ctx.artifact_session_id, "workspace_root": str(root),
+        }
+        if ctx.persist_attachment_working_files is not None:
+            await ctx.persist_attachment_working_files()
+
+    pending = asyncio.create_task(copy_and_persist())
+    cancelled: asyncio.CancelledError | None = None
+    while not pending.done():
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    pending.result()
+    if cancelled is not None:
+        raise cancelled
+    record_workspace_file_read(target, operation="attachment_working_copy", complete=True)
+    return target, None
 
 
 def _resolve_base(path: str | None) -> Path:
@@ -1685,9 +1799,10 @@ def _backup_receipt_note(
 @tool(
     name="read_file",
     description=(
-        "Read UTF-8 text with line numbers, or load PNG/JPEG/GIF/WebP images from a file path. "
+        "Read text, images, PDF pages, DOCX paragraphs, PPTX slides, "
+        "email messages, or spreadsheet rows. "
         "Images are supplied directly to the model, without a separate analysis call. "
-        "Supports offset and limit for text. "
+        "Supports offset/limit in the format-specific units, with continuation positions. "
         "Before modifying an existing workspace file with edit_file or write_file, "
         "read it once without offset or limit to establish fresh edit context. "
         "Use offset/limit for inspection windows only. For CSV/TSV/Excel workbook "
@@ -1697,9 +1812,17 @@ def _backup_receipt_note(
         "path": {"type": "string", "description": "Absolute path to the file."},
         "offset": {
             "type": "integer",
-            "description": "Line offset to start reading from (1-indexed).",
+            "description": "First line, paragraph, slide, page, message, or row (1-indexed).",
         },
-        "limit": {"type": "integer", "description": "Maximum number of lines to read."},
+        "limit": {
+            "type": "integer",
+            "description": "Maximum units (PDF up to 10; other documents up to 200).",
+        },
+        "character_offset": {
+            "type": "integer",
+            "description": "Continuation character offset within the first unit.",
+        },
+        "sheet": {"type": "string", "description": "Spreadsheet sheet name or 1-based index."},
     },
     required=["path"],
     plan_access=PlanAccess.READ_ONLY,
@@ -1717,6 +1840,8 @@ async def read_file(
     offset: int | None = None,
     limit: int | None = None,
     _tool_use_id: str = "",
+    character_offset: int = 0,
+    sheet: str | int | None = None,
 ) -> str:
     p = _resolve_path(path)
     blocked = _sensitive_access_block("read_file", p, path)
@@ -1742,6 +1867,7 @@ async def read_file(
                 display_path=path,
                 offset=offset,
                 limit=limit,
+                document_options={"character_offset": character_offset, "sheet": sheet},
             )
         )
         if sandbox_result is not None:
@@ -1753,11 +1879,28 @@ async def read_file(
                 operation="read_file",
                 offset=offset,
                 limit=limit,
-                complete=limit is None and (offset is None or offset <= 1),
+                complete=bool(metadata.get(
+                    "complete_read", limit is None and (offset is None or offset <= 1),
+                )),
             )
             return str(getattr(sandbox_result, "message"))
 
     loop = asyncio.get_event_loop()
+    from opensquilla.tools.document_readers import complete_document_read, read_document
+
+    document = await asyncio.to_thread(
+        read_document, p, offset=offset, limit=limit,
+        character_offset=character_offset, sheet=sheet,
+    )
+    if document is not None:
+        record_workspace_file_read(
+            p, operation="read_file", offset=offset, limit=limit,
+            complete=complete_document_read(
+                document, offset=offset, limit=limit,
+                character_offset=character_offset, sheet=sheet,
+            ),
+        )
+        return json.dumps(document, ensure_ascii=False)
     sample: bytes = await loop.run_in_executor(None, _read_binary_sample, p)
     image_result = await loop.run_in_executor(None, _read_image_file_result, p, sample)
     if image_result is not None:
@@ -2149,7 +2292,13 @@ async def write_file(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
-    p = _resolve_path(path)
+    p, attachment_block = await _prepare_attachment_edit_path(
+        path, tool_name="write_file", approval_id=approval_id,
+        sandbox_permissions=sandbox_permissions, justification=justification,
+        prefix_rule=prefix_rule,
+    )
+    if attachment_block is not None:
+        return attachment_block
     if full_host_access_active():
         created = not p.exists()
 
@@ -2717,7 +2866,13 @@ async def edit_file(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
-    p = _resolve_path(path)
+    p, attachment_block = await _prepare_attachment_edit_path(
+        path, tool_name="edit_file", approval_id=approval_id,
+        sandbox_permissions=sandbox_permissions, justification=justification,
+        prefix_rule=prefix_rule,
+    )
+    if attachment_block is not None:
+        return attachment_block
     replacements = _normalize_edit_replacements(
         path=path,
         old_text=old_text,
@@ -2944,7 +3099,13 @@ async def edit_source(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
-    p = _resolve_path(path)
+    p, attachment_block = await _prepare_attachment_edit_path(
+        path, tool_name="edit_source", approval_id=approval_id,
+        sandbox_permissions=sandbox_permissions, justification=justification,
+        prefix_rule=prefix_rule,
+    )
+    if attachment_block is not None:
+        return attachment_block
     edit_digest = hashlib.sha256(
         json.dumps(
             {"expected_revision": expected_revision, "edits": edits},

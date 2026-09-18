@@ -278,6 +278,7 @@ def transcript_entries_to_chat_messages(
         legacy_segments = legacy_projection[1] if legacy_projection else []
         projected_role = "assistant" if legacy_projection else role
         attachments = None
+        workspace_files = []
         artifacts = None
         prompt_annotations = None
         page_context = None
@@ -289,6 +290,15 @@ def transcript_entries_to_chat_messages(
                     display_text = parsed.get("display_text")
                     content = display_text if isinstance(display_text, str) else parsed["text"]
                     attachments = _public_attachment_projection(parsed.get("attachments"))
+                    from opensquilla.workspace_files import normalize_workspace_files
+
+                    workspace_files = normalize_workspace_files(parsed.get("workspace_files"))
+                    if workspace_files:
+                        attachments = [*(attachments or []), *[
+                            {"kind": "file", "name": ref["name"], "mime": ref["mime"],
+                             "size": ref.get("size"), "workspaceFile": ref}
+                            for ref in workspace_files
+                        ]]
                     from opensquilla.contracts.selected_skills import normalize_selected_skills
 
                     try:
@@ -385,6 +395,8 @@ def transcript_entries_to_chat_messages(
         if isinstance(turn_context, dict):
             if public_context := public_turn_context(turn_context):
                 msg["turn_context"] = public_context
+        if workspace_files:
+            msg["workspaceFiles"] = workspace_files
         if attachments:
             msg["attachments"] = attachments
         if artifacts:

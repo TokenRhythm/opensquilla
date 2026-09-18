@@ -735,6 +735,9 @@ def tool_context_from_envelope(
             else None
         ),
     )
+    from opensquilla.workspace_files import normalize_workspace_files
+
+    ctx.workspace_files = normalize_workspace_files(envelope.metadata.get("workspace_files"))
     scopes = envelope.runtime_services.get("workspace_preview_scopes")
     if isinstance(scopes, list):
         ctx.workspace_preview_scopes = [dict(item) for item in scopes if isinstance(item, dict)]

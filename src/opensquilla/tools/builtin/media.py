@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import threading
 import uuid
 from pathlib import Path
 from typing import Any
@@ -77,8 +78,7 @@ from opensquilla.provider.image_generation_policy import (
 )
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import ChatConfig, derive_provider_request_correlation
-from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
-from opensquilla.tools.path_aliases import resolve_workspace_alias
+from opensquilla.sandbox.operation_runtime import SandboxOperation, SandboxToolDescriptor
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active
@@ -267,6 +267,7 @@ async def _retain_downloaded_image(payload: bytes, mime: str) -> dict[str, str]:
         workspace_dir=workspace,
         disk_budget_bytes=workspace_attachment_budget_from_config(config),
         authorize_write=attachment_workspace_write_authorizer(context),
+        working_files=context.attachment_working_files,
     )
     result = await asyncio.to_thread(
         materializer.materialize_bytes, payload,
@@ -310,10 +311,27 @@ async def _read_image_file(path: str) -> tuple[bytes, str]:
 
 
 def _render_pdf_first_page_png(path: Path) -> bytes:
+    return _render_pdf_page_png(path, 1)
+
+
+_PDF_RENDER_LOCK = threading.Lock()
+
+
+def _render_pdf_page_png(path: Path, page_number: int) -> bytes:
+    # PDFium has process-global font/cache state and is not thread-safe, even
+    # across separate documents. Tool calls can render concurrently in the
+    # executor, so hold one lock through allocation, rendering and cleanup.
+    with _PDF_RENDER_LOCK:
+        return _render_pdf_page_png_locked(path, page_number)
+
+
+def _render_pdf_page_png_locked(path: Path, page_number: int) -> bytes:
     try:
         import pypdfium2 as pdfium  # type: ignore[import-untyped]
     except Exception as exc:  # pragma: no cover - dependency is provided by pdfplumber
-        raise ToolError("PDF image analysis requires pypdfium2 to render pages") from exc
+        raise SafeToolError(
+            "PDF page rendering requires the installed pypdfium2 dependency"
+        ) from exc
 
     pdf = None
     page = None
@@ -322,8 +340,15 @@ def _render_pdf_first_page_png(path: Path) -> bytes:
         pdf = pdfium.PdfDocument(str(path))
         if len(pdf) < 1:
             raise ToolError(f"PDF has no pages: {path}")
-        page = pdf[0]
-        bitmap = page.render(scale=_PDF_RENDER_SCALE)
+        if page_number < 1 or page_number > len(pdf):
+            raise SafeToolError(f"PDF page {page_number} is outside 1-{len(pdf)}")
+        page = pdf[page_number - 1]
+        width, height = page.get_size()
+        # Bound raster allocation even for adversarially enormous PDF page dimensions.
+        if width <= 0 or height <= 0:
+            raise SafeToolError("PDF page has invalid dimensions")
+        scale = min(_PDF_RENDER_SCALE, 2048 / max(width, height))
+        bitmap = page.render(scale=scale)
         image = bitmap.to_pil()
         out = io.BytesIO()
         image.save(out, format="PNG")
@@ -331,7 +356,7 @@ def _render_pdf_first_page_png(path: Path) -> bytes:
     except ToolError:
         raise
     except Exception as exc:
-        raise ToolError(f"Failed to render PDF first page: {path}") from exc
+        raise ToolError(f"Failed to render PDF page {page_number}: {path}") from exc
     finally:
         for obj in (bitmap, page, pdf):
             close = getattr(obj, "close", None)
@@ -340,18 +365,9 @@ def _render_pdf_first_page_png(path: Path) -> bytes:
 
 
 def _resolve_media_path(path: str) -> Path:
-    ctx = current_tool_context.get()
-    reject_foreign_host_path(path, platform=os.name)
-    candidate = Path(path).expanduser()
-    workspace = Path(ctx.workspace_dir).expanduser() if ctx and ctx.workspace_dir else None
-    alias = resolve_workspace_alias(candidate, workspace)
-    if alias is not None:
-        return alias
-    if candidate.is_absolute():
-        return candidate.resolve(strict=False)
-    if ctx and ctx.workspace_dir:
-        return (Path(ctx.workspace_dir).expanduser() / candidate).resolve(strict=False)
-    return candidate.resolve(strict=False)
+    from opensquilla.tools.builtin.filesystem import _resolve_path
+
+    return _resolve_path(path)
 
 
 def _sensitive_media_path_block(tool_name: str, resolved: Path, original_path: str) -> dict | None:
@@ -931,7 +947,7 @@ def _resolve_generated_image_path(filename: str | None, output_format: str) -> P
     name="pdf",
     description=(
         "Extract text from a PDF file, optionally filtered by page range. "
-        "If a prompt is supplied, the extracted text is sent to the LLM for analysis."
+        "Reports textless pages and can load selected page images for the current model."
     ),
     params={
         "path": {
@@ -941,98 +957,79 @@ def _resolve_generated_image_path(filename: str | None, output_format: str) -> P
         "pages": {
             "type": "string",
             "description": (
-                'Page range to extract: "1-5", "3", or "1,3,5-10". Omit for all pages.'
+                'Page range to extract: "1-5", "3", or "1,3,5-10". Omit for the first 10 pages.'
             ),
         },
         "prompt": {
             "type": "string",
-            "description": "Optional analysis prompt. Sends extracted text to the LLM.",
+            "description": "Optional question about the returned pages.",
+        },
+        "render": {
+            "type": "boolean",
+            "description": "Load selected page images for the current model (up to 4 per call).",
         },
     },
     required=["path"],
+    runtime_only_arguments={"_tool_use_id"},
     sandbox=SandboxToolDescriptor.media(kind="media.read_pdf"),
 )
 async def pdf(
-    path: str,
-    pages: str | None = None,
-    prompt: str | None = None,
+    path: str, pages: str | None = None, prompt: str | None = None,
+    render: bool = False, _tool_use_id: str = "",
 ) -> str:
-    p = _resolve_media_path(path)
-    path_block = _sensitive_media_path_block("pdf", p, path)
-    if path_block is not None:
-        return json.dumps(path_block)
-    if not p.exists():
-        raise SafeToolError(f"PDF file not found: {path} (resolved={p})")
+    from opensquilla.tools.builtin import filesystem as fs
+    from opensquilla.tools.document_readers import read_pdf_request
 
-    try:
-        import pdfplumber
-    except ImportError as exc:
-        raise SafeToolError("pdfplumber is not installed") from exc
-
-    loop = asyncio.get_event_loop()
-
-    def _extract() -> dict[str, Any]:
-        try:
-            with pdfplumber.open(str(p)) as doc:
-                total_pages = len(doc.pages)
-
-                # Resolve page indices (0-based)
-                if pages:
-                    indices = _parse_page_range(pages, total_pages)
-                else:
-                    indices = list(range(total_pages))
-
-                texts: list[str] = []
-                for idx in indices:
-                    page_text = doc.pages[idx].extract_text() or ""
-                    texts.append(page_text)
-
-                extracted = "\n\n".join(t for t in texts if t)
-                return {"total_pages": total_pages, "text": extracted}
-        except ToolError:
-            raise
-        except Exception as exc:
-            err_msg = str(exc).lower()
-            if "password" in err_msg or "encrypted" in err_msg:
-                raise SafeToolError("PDF is password-protected") from exc
-            raise SafeToolError(f"File is not a valid PDF: {path} (resolved={p})") from exc
-
-    result = await loop.run_in_executor(None, _extract)
-    total_pages: int = result["total_pages"]
-    extracted_text: str = result["text"]
-
-    if not extracted_text.strip():
-        raise SafeToolError("No extractable text found - PDF may be image-only")
-
-    # Truncate
-    truncated = len(extracted_text) > _PDF_TEXT_LIMIT
-    if truncated:
-        extracted_text = extracted_text[:_PDF_TEXT_LIMIT]
-
-    page_desc = pages if pages else f"1-{total_pages}"
-
-    if prompt and prompt.strip():
-        # Send to LLM for analysis
-        analysis = await _call_llm_with_text(extracted_text, prompt)
-        return json.dumps(
-            {
-                "path": path,
-                "pages": page_desc,
-                "total_pages": total_pages,
-                "analysis": analysis,
-                "truncated": truncated,
-            }
-        )
-
-    return json.dumps(
-        {
-            "path": path,
-            "pages": page_desc,
-            "total_pages": total_pages,
-            "text": extracted_text,
-            "truncated": truncated,
-        }
+    context = current_tool_context.get()
+    vision_unavailable = bool(
+        render and context is not None and context.image_analysis_target is not None
+        and context.image_analysis_target() is None
     )
+    effective_render = render and not vision_unavailable
+    p = fs._resolve_path(path)
+    blocked = fs._sensitive_access_block("pdf", p, path)
+    blocked = blocked or fs._sandbox_path_access_envelope(p, write=False)
+    if blocked is not None:
+        return json.dumps(blocked)
+    fs._gate_workspace_strict_read("pdf", p, path)
+    if not p.is_file():
+        raise SafeToolError(f"PDF file not found: {path}")
+    workspace = fs._filesystem_operation_workspace()
+    sandbox_result = None
+    if workspace is not None:
+        sandbox_result = await fs._run_sandbox_operation_if_required(
+            SandboxOperation.filesystem(
+                kind="read_file", workspace=workspace,
+                run_mode=fs._active_filesystem_run_mode(), path=p, paths=(p,),
+                display_path=path,
+                document_options={"pdf_request": True, "pages": pages, "render": effective_render},
+            )
+        )
+    if sandbox_result is None:
+        result = await asyncio.to_thread(read_pdf_request, p, pages=pages, render=effective_render)
+        message = result["message"]
+        images = result.get("images", [])
+    else:
+        message = str(getattr(sandbox_result, "message"))
+        images = getattr(sandbox_result, "metadata", {}).get("images", [])
+    receipt = json.loads(message)
+    receipt["path"] = path
+    if vision_unavailable:
+        receipt["vision_status"] = "unavailable"
+        receipt["note"] = "Current model has no confirmed image capability; only text was read."
+    if images:
+        context = current_tool_context.get()
+        if not _tool_use_id or context is None:
+            receipt["note"] = "Page rendering requires an active model tool call for vision input."
+            receipt["vision_status"] = "unavailable"
+        else:
+            context.tool_result_media[_tool_use_id] = images
+            receipt["vision_status"] = "loaded"
+    if prompt and prompt.strip() and not _tool_use_id:
+        receipt["analysis"] = await _call_llm_with_text(receipt["text"], prompt)
+    elif prompt and prompt.strip():
+        receipt["prompt"] = prompt
+    return json.dumps(receipt)
 
 
 def _parse_page_range(pages: str, total: int) -> list[int]:
@@ -1049,6 +1046,8 @@ def _parse_page_range(pages: str, total: int) -> list[int]:
             start, end = int(parts[0]), int(parts[1])
             if start < 1 or end < start:
                 raise SafeToolError(f"Invalid page range: {pages}")
+            if end > total or end - start + 1 + len(indices) > 10:
+                raise SafeToolError("Read or render at most 10 existing PDF pages per call")
             for n in range(start, end + 1):
                 if n > total:
                     raise SafeToolError(f"Page {n} exceeds document length ({total} pages)")
@@ -1062,7 +1061,9 @@ def _parse_page_range(pages: str, total: int) -> list[int]:
             indices.append(n - 1)
         else:
             raise SafeToolError(f"Invalid page range: {pages}")
-    return indices
+    if len(indices) > 10:
+        raise SafeToolError("Read or render at most 10 PDF pages per call")
+    return list(dict.fromkeys(indices))
 
 
 async def _call_llm_with_text(text: str, prompt: str) -> str:

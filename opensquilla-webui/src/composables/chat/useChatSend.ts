@@ -1,4 +1,5 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
+import type { AttachmentDraftConsumption } from '@/utils/chat/attachmentDrafts'
 import { normalizePageContext, pageContextForAnnotations, pageAnnotationSnapshots, type ChatPageContext } from '@/types/pageContext'
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
@@ -50,7 +51,8 @@ import {
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
   serializeDisplayAttachment,
-  serializeSendableAttachment,
+  serializeChatFiles,
+  snapshotAttachment,
   type SendableAttachment,
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
@@ -174,6 +176,7 @@ interface SendAttempt {
   selectedSkills: SelectedSkillRef[]
   composerSkillRefs?: SelectedSkillRef[]
   unconsumedComposer?: ComposerSnapshot
+  consumeAttachmentDraft?: AttachmentDraftConsumption
   pageContext: ChatPageContext | null
   queueMode?: 'steer'
   text: string
@@ -429,8 +432,8 @@ function sameSendableAttachments(
     const prior = attempt.attachments[index]
     return (
       prior?.local_id === attachment.local_id &&
-      JSON.stringify(serializeSendableAttachment(prior)) ===
-        JSON.stringify(serializeSendableAttachment(attachment))
+      JSON.stringify(serializeChatFiles([prior])) ===
+        JSON.stringify(serializeChatFiles([attachment]))
     )
   })
 }
@@ -485,6 +488,7 @@ export interface UseChatSendOptions {
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
   selectedSkills?: Ref<SelectedSkillRef[]>
+  captureAttachmentDraftConsumption?: (attachments: readonly Attachment[]) => AttachmentDraftConsumption | undefined
   consumeAcceptedDraft?: (
     sessionKey: string,
     snapshot: { text: string; selectedSkills: SelectedSkillRef[] },
@@ -755,7 +759,7 @@ export function useChatSend(options: UseChatSendOptions) {
         options.promptAnnotationSnapshots?.(currentAnnotationDraftIds()) || [],
       ),
       attachmentRefs,
-      payloadAttachments: composerAttachments().map(attachment => ({ ...attachment })),
+      payloadAttachments: composerAttachments().map(snapshotAttachment),
       intent,
       forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       workspaceId: pendingWorkspaceForIntent(intent),
@@ -789,6 +793,14 @@ export function useChatSend(options: UseChatSendOptions) {
       && options.composerRevision
       && options.composerRevision.value !== snapshot.revision
     ) return false
+    return composerValuesMatchSnapshot(snapshot)
+      && options.pendingAttachments.value.length === snapshot.attachmentRefs.length
+      && options.pendingAttachments.value.every(
+        (attachment, index) => attachment === snapshot.attachmentRefs[index],
+      )
+  }
+
+  function composerValuesMatchSnapshot(snapshot: ComposerSnapshot): boolean {
     return (
       options.inputText.value === snapshot.inputText
       && sameSelectedSkills(options.selectedSkills?.value, snapshot.selectedSkills)
@@ -798,10 +810,6 @@ export function useChatSend(options: UseChatSendOptions) {
       && initialProviderForIntent(snapshot.intent) === snapshot.initialProvider
       && options.pendingForkBeforeMessageId.value === snapshot.forkBeforeMessageId
       && pendingWorkspaceForIntent(options.pendingSessionIntent.value) === snapshot.workspaceId
-      && options.pendingAttachments.value.length === snapshot.attachmentRefs.length
-      && options.pendingAttachments.value.every(
-        (attachment, index) => attachment === snapshot.attachmentRefs[index],
-      )
     )
   }
 
@@ -1223,6 +1231,8 @@ export function useChatSend(options: UseChatSendOptions) {
       if (attempt.unconsumedComposer && !attempt.hiddenControl) {
         const snapshot = attempt.unconsumedComposer
         attempt.unconsumedComposer = undefined
+        void attempt.consumeAttachmentDraft?.consume().catch(() => {})
+        attempt.consumeAttachmentDraft = undefined
         void Promise.resolve(options.consumeAcceptedDraft?.(attempt.requestSessionKey, {
           text: snapshot.inputText,
           selectedSkills: copySelectedSkills(snapshot.selectedSkills),
@@ -1231,6 +1241,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
     if (!attempt.hiddenControl && options.selectedSkills && attempt.unconsumedComposer
+      && !attempt.consumeAttachmentDraft
       && options.selectedSkills.value === attempt.composerSkillRefs
       && composerMatchesSnapshot(attempt.unconsumedComposer)) {
       const sentAttachmentIds = new Set(attempt.attachments.map(attachment => attachment.local_id))
@@ -1244,6 +1255,29 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       options.autoResizeTextarea()
       attempt.unconsumedComposer = undefined
+      attempt.consumeAttachmentDraft = undefined
+    } else if (!attempt.hiddenControl && attempt.unconsumedComposer && attempt.consumeAttachmentDraft) {
+      const snapshot = attempt.unconsumedComposer
+      const consumption = attempt.consumeAttachmentDraft
+      const isOriginal = () => options.sessionKey.value === attempt.requestSessionKey
+        && options.selectedSkills?.value === attempt.composerSkillRefs && composerMatchesSnapshot(snapshot)
+      void consumption.consumeCurrent(
+        () => options.sessionKey.value === attempt.requestSessionKey && (
+          isOriginal()
+          || (consumption.isRestoredCurrent() && composerValuesMatchSnapshot(snapshot))
+        ),
+        () => {
+          options.inputText.value = ''
+          if (options.selectedSkills) options.selectedSkills.value = []
+          if (options.pendingForkBeforeMessageId.value === attempt.forkBeforeMessageId) {
+            options.pendingForkBeforeMessageId.value = null
+          }
+          options.autoResizeTextarea()
+          attempt.unconsumedComposer = undefined
+          attempt.consumeAttachmentDraft = undefined
+        },
+        isOriginal,
+      ).catch(() => {})
     }
   }
 
@@ -1319,7 +1353,7 @@ export function useChatSend(options: UseChatSendOptions) {
       clientMessageId: attempt.clientMessageId,
       params: structuredClone(attempt.params),
       composerText: attempt.composerText,
-      recoveryAttachments: attempt.attachments.map(attachment => ({ ...attachment })),
+      recoveryAttachments: attempt.attachments.map(snapshotAttachment),
       ...(attempt.restoreComposerOnHandoffFailure === false
         ? { restoreComposerOnFailure: false }
         : {}),
@@ -1791,7 +1825,7 @@ export function useChatSend(options: UseChatSendOptions) {
     ))
     if (missingAttachments.length > 0) {
       options.pendingAttachments.value = [
-        ...missingAttachments.map(attachment => ({ ...attachment })),
+        ...missingAttachments.map(snapshotAttachment),
         ...options.pendingAttachments.value,
       ]
     }
@@ -1894,7 +1928,7 @@ export function useChatSend(options: UseChatSendOptions) {
                   ...replayRecord,
                   params: {
                     ...replayRecord.params,
-                    attachments: sendable.map(serializeSendableAttachment),
+                    ...serializeChatFiles(sendable),
                   },
                   recoveryAttachments: refreshed,
                   updatedAt: Date.now(),
@@ -3119,7 +3153,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
       if (attachmentsToSend.length > 0 || sendOpts.includeEmptyAttachments) {
         params.displayText = userText
-        params.attachments = attachmentsToSend.map(serializeSendableAttachment)
+        Object.assign(params, serializeChatFiles(attachmentsToSend))
       }
       const localSnapshots = options.promptAnnotationSnapshots?.(attemptAnnotationDraftIds) || []
       const sentSnapshots = pageAnnotationSnapshots(attemptPageContext).map((input, index) => ({
@@ -3141,7 +3175,7 @@ export function useChatSend(options: UseChatSendOptions) {
         selectedSkills: copySelectedSkills(attemptSelectedSkills),
         queueMode: sendOpts?.queueMode,
         text,
-        attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
+        attachments: attachmentsToSend.map(snapshotAttachment),
         intent,
         initialCollaborationMode,
         initialRoutingMode,
@@ -3199,6 +3233,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (preserveComposer) {
       attempt.composerSkillRefs = undefined
       attempt.unconsumedComposer = undefined
+      attempt.consumeAttachmentDraft = undefined
     }
     if (!preserveComposer) options.closeSlashMenu()
     recordSessionNavigationDiag('send.start', {
@@ -3222,6 +3257,8 @@ export function useChatSend(options: UseChatSendOptions) {
         attempt.unconsumedComposer = composerTextBeforeSend === attempt.composerText
           && sameSelectedSkills(options.selectedSkills?.value, attempt.selectedSkills)
           ? captureComposerSnapshot() : undefined
+        attempt.consumeAttachmentDraft = attempt.unconsumedComposer
+          ? options.captureAttachmentDraftConsumption?.(attempt.attachments) : undefined
       } else {
         options.inputText.value = preserveEditedComposer ? composerTextBeforeSend : ''
         options.autoResizeTextarea()

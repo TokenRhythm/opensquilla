@@ -19,6 +19,7 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("message", ("message",)),
     ("display_text", ("displayText", "display_text")),
     ("attachments", ("attachments",)),
+    ("workspace_files", ("workspaceFiles",)),
     ("selected_skills", ("selectedSkills",)),
     ("intent", ("intent",)),
     (

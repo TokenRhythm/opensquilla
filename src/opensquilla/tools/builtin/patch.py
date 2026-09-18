@@ -307,7 +307,21 @@ def _validate_path(
 ) -> Path:
     """Resolve a patch path and enforce the active root unless already authorized."""
     root = root if root is not None else _default_patch_root()
+    from opensquilla.attachment_working_files import attachment_original_key
+
+    raw = Path(path).expanduser()
+    lexical = raw if raw.is_absolute() else root / raw
+    if attachment_original_key(lexical, root) is not None:
+        raise RetryableToolInputError(
+            "apply_patch cannot modify an immutable attachment original. Use edit_file "
+            "to create its editable working file, then patch that working-file path."
+        )
     resolved = _resolve_path(path, root)
+    if attachment_original_key(resolved, root) is not None:
+        raise RetryableToolInputError(
+            "apply_patch cannot modify an immutable attachment original. Use edit_file "
+            "to create its editable working file, then patch that working-file path."
+        )
     if allow_outside_root is None:
         allow_outside_root = full_host_access_active()
     if authorized_paths and resolved not in authorized_paths:

@@ -17,11 +17,21 @@ from opensquilla.attachment_refs import (
     make_attachment_ref,
     read_attachment_ref_bytes,
 )
-from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES, IMAGE_ATTACHMENT_MIMES
+from opensquilla.contracts.attachments import (
+    IMAGE_ATTACHMENT_BYTES,
+    IMAGE_ATTACHMENT_MIMES,
+    attachment_size_limit_for_mime,
+    can_stage_attachment_mime,
+    normalize_attachment_mime,
+)
 from opensquilla.contracts.image_validation import validate_image_bytes
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._@+=, -]+")
 _WHITESPACE = re.compile(r"\s+")
+
+
+class AttachmentWorkspaceConflictError(ValueError):
+    """An immutable input was changed externally; never overwrite it."""
 
 
 class AttachmentWorkspaceBudgetError(ValueError):
@@ -40,6 +50,7 @@ class AttachmentWorkspaceMaterialization:
     size: int
     rel_path: str | None = None
     error: str | None = None
+    working_path: str | None = None
 
 
 def workspace_attachment_budget_from_config(config: Any) -> int | None:
@@ -77,7 +88,10 @@ def render_attachment_material_marker(
     if result.available and result.rel_path:
         return (
             f"[{prefix}: {result.name} ({result.mime}, {result.size} bytes) "
-            f"at {result.rel_path}]"
+            f"at {result.rel_path}; immutable original"
+            + (f"; editable working file at {result.working_path}" if result.working_path else
+               "; file tools create an independent working file on first edit")
+            + "]"
         )
     detail = result.error or "workspace materialization unavailable"
     return f"[{prefix}: {result.name} ({result.mime}): {detail}]"
@@ -94,6 +108,7 @@ class AttachmentWorkspaceMaterializer:
         materializable_mimes: Collection[str] | None = None,
         disk_budget_bytes: int | None = None,
         authorize_write: Callable[[Path], None] | None = None,
+        working_files: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._media_root = Path(media_root)
         self._workspace_root = Path(workspace_dir)
@@ -102,6 +117,7 @@ class AttachmentWorkspaceMaterializer:
         )
         self._disk_budget_bytes = disk_budget_bytes
         self._authorize_write = authorize_write
+        self._working_files = working_files if working_files is not None else {}
         # Lazily-scanned bytes under <workspace>/.opensquilla/attachments,
         # kept current across this instance's writes so a batch of
         # materializations pays for one directory walk.
@@ -151,7 +167,7 @@ class AttachmentWorkspaceMaterializer:
                 payload,
                 name=name,
                 mime=mime,
-                scope=ref["scope"],
+                scope=session_id or ref["scope"],
                 sha=ref["sha256"],
             )
         except Exception as exc:  # noqa: BLE001 - materialization is best-effort
@@ -207,6 +223,52 @@ class AttachmentWorkspaceMaterializer:
                 error=str(exc),
             )
 
+    def materialize_attachment_path(
+        self, attachment: dict[str, Any], session_id: str
+    ) -> str | None:
+        """Resolve retained original bytes to a controlled path for compaction.
+
+        Display metadata and arbitrary envelope paths never grant file access.
+        Native images retain their pixel-validation contract; ordinary files
+        are preserved without decoding or parsing their semantic contents.
+        """
+        mime = normalize_attachment_mime(_attachment_mime(attachment))
+        if mime in IMAGE_ATTACHMENT_MIMES:
+            return self.materialize_image_path(attachment, session_id)
+        if not mime or not session_id or attachment.get("missing_reason"):
+            return None
+        data = attachment.get("data")
+        inline = isinstance(data, str) and bool(data)
+        max_bytes = attachment_size_limit_for_mime(
+            mime, staged=not inline and can_stage_attachment_mime(mime),
+        )
+        try:
+            if isinstance(data, str) and data:
+                if len(data) > ((max_bytes + 2) // 3) * 4:
+                    return None
+                payload = base64.b64decode(data, validate=True)
+            else:
+                ref = _coerce_attachment_ref(attachment, session_id=session_id)
+                scope = ref.get("scope")
+                if (
+                    ref.get("store") != "transcript"
+                    or not isinstance(scope, str)
+                    or not scope
+                    or scope in {".", ".."}
+                    or any(separator in scope for separator in ("/", "\\", "\x00"))
+                    or _attachment_size(ref) > max_bytes
+                ):
+                    return None
+                payload = read_attachment_ref_bytes(ref, media_root=self._media_root)
+            if len(payload) > max_bytes:
+                return None
+            result = self.materialize_bytes(
+                payload, name=_attachment_name(attachment), mime=mime, session_id=session_id,
+            )
+            return result.rel_path if result.available else None
+        except (OSError, ValueError):
+            return None
+
     def materialize_image_path(
         self, attachment: dict[str, Any], session_id: str
     ) -> str | None:
@@ -251,12 +313,14 @@ class AttachmentWorkspaceMaterializer:
         target = self._target_path(scope=scope, sha=sha, name=name)
         self._write_or_reuse(target, payload=payload, sha=sha, size=len(payload))
         rel_path = target.relative_to(self._workspace_root.resolve()).as_posix()
+        self._working_files.setdefault(rel_path, {"sha256": sha, "session_id": scope})
         return AttachmentWorkspaceMaterialization(
             available=True,
             name=name,
             mime=mime,
             size=len(payload),
             rel_path=rel_path,
+            working_path=self._working_files.get(rel_path, {}).get("path"),
         )
 
     def _target_path(self, *, scope: str, sha: str, name: str) -> Path:
@@ -281,21 +345,19 @@ class AttachmentWorkspaceMaterializer:
         sha: str,
         size: int,
     ) -> None:
-        existing_size: int | None = None
+        if target.is_symlink():
+            raise AttachmentWorkspaceConflictError("immutable attachment conflicts with a symlink")
         if target.exists():
-            if target.is_symlink():
-                pass
-            elif not target.is_file():
-                raise ValueError("workspace material target is not a regular file")
-            else:
-                existing = target.read_bytes()
-                if len(existing) == size and hashlib.sha256(existing).hexdigest() == sha:
-                    # Reuse is always free: an already-materialized file must
-                    # never flip to unavailable when the budget fills later.
-                    return
-                existing_size = len(existing)
+            if not target.is_file():
+                raise AttachmentWorkspaceConflictError("immutable attachment is not a regular file")
+            existing = target.read_bytes()
+            if len(existing) == size and hashlib.sha256(existing).hexdigest() == sha:
+                return
+            raise AttachmentWorkspaceConflictError(
+                "immutable attachment content conflict; existing file was preserved"
+            )
         if self._disk_budget_bytes is not None:
-            usage = self._current_usage_bytes() - (existing_size or 0)
+            usage = self._current_usage_bytes()
             if usage + size > self._disk_budget_bytes:
                 raise AttachmentWorkspaceBudgetError(
                     "workspace attachment budget exceeded "
@@ -310,7 +372,18 @@ class AttachmentWorkspaceMaterializer:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, target)
+            # Publish without replacing a file that appeared during materialization.
+            # Hard links are atomic on the supported local filesystems (including NTFS).
+            try:
+                os.link(tmp_path, target)
+            except FileExistsError:
+                if target.is_symlink() or not target.is_file():
+                    raise AttachmentWorkspaceConflictError("immutable attachment target conflict")
+                existing = target.read_bytes()
+                if len(existing) != size or hashlib.sha256(existing).hexdigest() != sha:
+                    raise AttachmentWorkspaceConflictError(
+                        "immutable attachment content conflict; existing file was preserved"
+                    ) from None
         finally:
             try:
                 tmp_path.unlink(missing_ok=True)
@@ -321,7 +394,7 @@ class AttachmentWorkspaceMaterializer:
         if len(written) != size or hashlib.sha256(written).hexdigest() != sha:
             raise ValueError("workspace material hash mismatch")
         if self._usage_bytes is not None:
-            self._usage_bytes += size - (existing_size or 0)
+            self._usage_bytes += size
 
 
 def _coerce_attachment_ref(
