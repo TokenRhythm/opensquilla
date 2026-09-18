@@ -519,10 +519,42 @@ async def test_plain_text_large_context_floor_boundary_respects_token_estimator(
         token_estimation._ENCODING_UNAVAILABLE if tokenizer_fallback else encoding,
     )
     fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    # Pin a compressed-text token estimate below the material heuristic. The
+    # legacy character boundary must not depend on the local tiktoken cache.
+    monkeypatch.setattr(
+        squilla_router_step, "estimate_tokens", lambda text: (len(text) + 7) // 8,
+    )
     ctx = make_context("a" * character_count)
     assert squilla_router_step._material_estimated_tokens(ctx, ctx.message) == expected_tokens
 
     routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routed_tier"] == expected_tier
+    assert routed.metadata.get("large_context_floor_min_tier") == expected_floor
+    assert "large_context_capacity_required" not in routed.metadata
+
+
+@pytest.mark.parametrize(
+    ("character_count", "expected_tier", "expected_floor"),
+    [
+        (49_998, "c0", None),
+        (50_000, "c2", "c2"),
+        (99_996, "c2", "c2"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_plain_text_large_context_floor_uses_conservative_tokenizer_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    character_count: int,
+    expected_tier: str,
+    expected_floor: str | None,
+) -> None:
+    from opensquilla import token_estimation
+
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+
+    routed = await apply_squilla_router(make_context("a" * character_count))
 
     assert routed.metadata["routed_tier"] == expected_tier
     assert routed.metadata.get("large_context_floor_min_tier") == expected_floor

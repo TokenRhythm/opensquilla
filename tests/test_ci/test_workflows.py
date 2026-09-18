@@ -38,6 +38,34 @@ def _workflow_texts() -> list[str]:
     return [path.read_text(encoding="utf-8") for path in WORKFLOW_DIR.glob("*.yml")]
 
 
+def test_release_jobs_cannot_write_shared_caches() -> None:
+    workflow = _workflow("wheelhouse-release.yml")
+    assert workflow["cache-mode"] == "read"
+    assert all("cache-mode" not in job for job in workflow["jobs"].values())
+
+
+def test_release_cache_mode_lint_exception_is_narrow() -> None:
+    config = yaml.safe_load(Path(".github/actionlint.yaml").read_text(encoding="utf-8"))
+    assert set(config) == {"paths"}
+    assert set(config["paths"]) == {".github/workflows/wheelhouse-release.yml"}
+    rule = config["paths"][".github/workflows/wheelhouse-release.yml"]
+    assert set(rule) == {"ignore"}
+    assert len(rule["ignore"]) == 1
+    pattern = re.compile(rule["ignore"][0])
+    message = (
+        'unexpected key "cache-mode" for "workflow" section. expected one of '
+        '"concurrency", "defaults", "env", "jobs", "name", "on", "permissions", "run-name"'
+    )
+    assert pattern.fullmatch(message)
+    for other in (
+        message.replace('"cache-mode"', '"cache-modes"'),
+        message.replace('"workflow"', '"job"'),
+        'invalid value "write" for cache-mode',
+        'shellcheck reported issue in this script: SC2086',
+    ):
+        assert pattern.search(other) is None
+
+
 def test_only_diagnostic_uploads_can_fail_without_failing_ci() -> None:
     expected = {
         "webui-chat-recovery": {"chat-traces"},
@@ -3018,6 +3046,7 @@ def test_desktop_cleanup_flow_allows_windows_helper_release_latency() -> None:
 ])
 def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_name):
     steps = _workflow("ci.yml")["jobs"][job_name]["steps"]
+    faulthandler_timeout = 0 if job_name == "windows-full" else 60
     preflight = next(step for step in steps if step.get("name") == (
         "Preflight offline test environment"
     ))
@@ -3059,7 +3088,7 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         assert f'{selector} == "desktop-installer-contracts"' in preflight["run"]
         assert f'{selector} == "gateway-sqlite"' in preflight["run"]
         assert '"${regression_args[@]}"' in preflight["run"]
-        assert "-o faulthandler_timeout=60" in preflight["run"]
+        assert f"-o faulthandler_timeout={faulthandler_timeout}" in preflight["run"]
     if job_name == "windows-full":
         expected_preflight_files.update({
             "tests/test_ci/test_windows_signatures.py",
@@ -3070,7 +3099,9 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         expected_preflight_files
     )
     assert "-vv --tb=short" in preflight["run"]
-    assert "-o faulthandler_timeout=60" in main["run"]
+    assert f"-o faulthandler_timeout={faulthandler_timeout}" in main["run"]
+    assert "no:faulthandler" not in preflight["run"]
+    assert "no:faulthandler" not in main["run"]
     assert "--showlocals" not in preflight["run"]
     assert "--showlocals" not in main["run"]
 

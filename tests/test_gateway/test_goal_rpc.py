@@ -5685,11 +5685,19 @@ async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_
         wire_lifecycle=True,
     ) as stack:
         await _handle_goals_set(_set_params(), stack.context)
+        # Each turn makes durable SQLite writes. Bound each settlement instead
+        # of requiring all four turns to share one two-second CI deadline.
+        for expected_turns in range(1, 5):
+            await _wait_for_goal(
+                stack.storage,
+                lambda value, expected=expected_turns: value.turns_settled >= expected,
+            )
         goal = await _wait_for_goal(
             stack.storage,
             lambda value: value.status == "paused" and value.active_task_id is None,
         )
         assert goal.pause_reason == "empty_continuations"
+        assert goal.turns_started == goal.turns_settled == 4
         assert len(runs) == 4
         assert [run.goal_context["automatic"] for run in runs] == [False, True, True, True]
 

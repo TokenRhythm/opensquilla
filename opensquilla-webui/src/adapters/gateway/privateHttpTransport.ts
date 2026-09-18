@@ -245,7 +245,7 @@ function binaryFilename(value: string | null): string | undefined {
     }
   }
   if (!candidate) {
-    const plain = /(?:^|;)\s*filename\s*=\s*(?:"((?:\\.|[^"])*)"|([^;]*))/i.exec(value)
+    const plain = /(?:^|;)\s*filename\s*=\s*(?:"((?:\\.|[^"\\])*)"|([^;]*))/i.exec(value)
     candidate = plain
       ? (plain[1] ?? plain[2] ?? '').replace(/\\(["\\])/g, '$1').trim()
       : undefined
