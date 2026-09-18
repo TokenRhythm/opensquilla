@@ -981,6 +981,32 @@ async def test_saved_discovery_environment_rotation_does_not_reuse_catalog(monke
 
 
 @pytest.mark.asyncio
+async def test_saved_discovery_fingerprints_are_process_keyed(monkeypatch):
+    monkeypatch.setattr(probe_module, "_saved_discoveries", {})
+    calls = 0
+
+    async def discover(**kwargs):
+        nonlocal calls
+        calls += 1
+        return ProviderModelsDiscoverResult(
+            ok=True, provider_id="openrouter", source="live", models=[{"id": "model"}],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", discover)
+    kwargs = {"provider_id": "openrouter", "api_key": "synthetic-key",
+              "proxy": "http://user:synthetic-password@proxy.test", "persist_catalog": True}
+    await discover_selectable_provider_models(**kwargs)
+    original_keys = set(probe_module._saved_discoveries)
+    await discover_selectable_provider_models(**kwargs)
+    assert calls == 1
+    monkeypatch.setattr(probe_module, "_SAVED_DISCOVERY_KEY", b"another-process" * 3)
+    await discover_selectable_provider_models(**kwargs)
+    assert calls == 2
+    assert len(set(probe_module._saved_discoveries) - original_keys) == 1
+    assert "synthetic" not in repr(probe_module._saved_discoveries)
+
+
+@pytest.mark.asyncio
 async def test_saved_discovery_retains_transient_lkg_but_auth_failure_revokes_it(monkeypatch):
     monkeypatch.setattr(probe_module, "_saved_discoveries", {})
     results = iter([

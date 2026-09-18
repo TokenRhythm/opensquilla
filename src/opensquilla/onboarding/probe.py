@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
+import hmac
 import inspect
 import os
+import secrets
 import time
 import weakref
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -640,7 +641,9 @@ class _SavedDiscovery:
 
 # Only saved connections enter this cache. Draft discovery remains isolated,
 # and TokenRhythm keeps its existing entitlement-aware persistent coordinator.
-# Keys are one-way connection fingerprints, never credentials or model names.
+# Process-keyed fingerprints cannot be used to cheaply guess credentials from
+# cache keys; this cache has no cross-process persistence requirement.
+_SAVED_DISCOVERY_KEY = secrets.token_bytes(32)
 _saved_discoveries: dict[str, _SavedDiscovery] = {}
 _saved_discovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
@@ -666,10 +669,12 @@ async def _discover_saved_or_draft_models(
         spec.env_key if kwargs.get("allow_default_api_key_env", True) else "",
     )
     kwargs = {**kwargs, "api_key": key, "api_key_env": "", "allow_default_api_key_env": False}
-    fingerprint = hashlib.sha256(repr((
-        spec.provider_id, kwargs.get("base_url") or spec.default_base_url,
-        key, kwargs.get("proxy", ""),
-    )).encode()).hexdigest()
+    fingerprint = hmac.new(
+        _SAVED_DISCOVERY_KEY,
+        repr((spec.provider_id, kwargs.get("base_url") or spec.default_base_url,
+              key, kwargs.get("proxy", ""))).encode(),
+        "sha256",
+    ).hexdigest()
     lock = _saved_discovery_locks.get(fingerprint)
     if lock is None:
         lock = asyncio.Lock()

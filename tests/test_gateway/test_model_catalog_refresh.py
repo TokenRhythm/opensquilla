@@ -1161,6 +1161,7 @@ async def test_snapshot_is_private_normalized_and_hydrates_without_network(
     await coordinator.refresh_active(config)
     path = tmp_path / "model_catalog" / "tokenrhythm-v1.json"
     raw = path.read_text()
+    assert json.loads(raw)["schemaVersion"] == 2
     assert "dummy-tokenrhythm-key" not in raw
     assert "Authorization" not in raw
     assert "proxy" not in raw.lower()
@@ -1172,6 +1173,49 @@ async def test_snapshot_is_private_normalized_and_hydrates_without_network(
     await hydrated.hydrate(config)
     assert [info.model_id for info in hydrated.cached(config)] == ["qwen3.8-max"]
     assert calls == ["published", "declared"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_snapshot_is_rejected_and_refreshed_into_current_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider import tokenrhythm_catalog as catalog_module
+
+    calls: list[str] = []
+    _patch_fetches(monkeypatch, calls)
+    config = _config(tmp_path)
+    original = TokenRhythmCatalogCoordinator(ModelCatalog())
+    await original.refresh_active(config)
+    path = tmp_path / "model_catalog" / "tokenrhythm-v1.json"
+    payload = json.loads(path.read_text())
+    payload["schemaVersion"] = 1
+    path.write_text(json.dumps(payload))
+
+    upgraded = TokenRhythmCatalogCoordinator(ModelCatalog())
+    await upgraded.hydrate(config)
+    assert upgraded.cached(config) == []
+    assert upgraded._entitlements == {}
+    assert calls == ["published", "declared"]
+    await upgraded.refresh_active(config)
+    assert calls == ["published", "declared", "published", "declared"]
+    assert json.loads(path.read_text())["schemaVersion"] == 2
+
+    # Re-derivation with a new memo key must match the persisted v2 identity.
+    monkeypatch.setattr(catalog_module, "_IDENTITY_MEMO_KEY", b"next-process-key" * 2)
+    restarted = TokenRhythmCatalogCoordinator(ModelCatalog())
+    await restarted.hydrate(config)
+    assert [info.model_id for info in restarted.cached(config)] == ["qwen3.8-max"]
+    assert len(calls) == 4
+
+
+def test_lifecycle_fingerprints_are_private_and_process_scoped(monkeypatch) -> None:
+    from opensquilla.gateway import model_catalog_refresh as module
+
+    first = module._digest("lifecycle", "synthetic-private-value")
+    assert first == module._digest("lifecycle", "synthetic-private-value")
+    assert first != module._digest("other-lifecycle", "synthetic-private-value")
+    monkeypatch.setattr(module, "_LIFECYCLE_FINGERPRINT_KEY", b"next-process" * 3)
+    assert first != module._digest("lifecycle", "synthetic-private-value")
 
 
 def stat_mode(path: Path) -> int:
@@ -1228,7 +1272,7 @@ async def test_future_timestamps_are_stale_and_corrupt_or_symlink_files_are_igno
     await corrupt.hydrate(config)
     assert corrupt.cached(config) == []
 
-    path.write_text(json.dumps({"schemaVersion": 2, "published": {}}))
+    path.write_text(json.dumps({"schemaVersion": 3, "published": {}}))
     future_schema = TokenRhythmCatalogCoordinator(ModelCatalog(), clock=clock)
     await future_schema.hydrate(config)
     assert future_schema.cached(config) == []

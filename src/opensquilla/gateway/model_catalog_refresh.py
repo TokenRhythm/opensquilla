@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
+import hmac
 import json
 import math
 import os
+import secrets
 import stat
 import tempfile
 import time
@@ -61,7 +62,8 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
-TOKENRHYTHM_SNAPSHOT_SCHEMA_VERSION = 1
+TOKENRHYTHM_SNAPSHOT_SCHEMA_VERSION = 2
+_LIFECYCLE_FINGERPRINT_KEY = secrets.token_bytes(32)
 TOKENRHYTHM_SUCCESS_TTL_SECONDS = 3600.0
 TOKENRHYTHM_FAILURE_BACKOFF_SECONDS = 300.0
 TOKENRHYTHM_PUBLIC_TIMEOUT_SECONDS = 5.0
@@ -135,12 +137,13 @@ def _canonical_base_url(value: str) -> str:
 
 
 def _digest(domain: str, *parts: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(f"opensquilla:{domain}:v1".encode())
-    for part in parts:
-        digest.update(b"\0")
-        digest.update(part.encode())
-    return digest.hexdigest()
+    # These lifecycle comparisons never leave memory; unlike the persisted
+    # authority identity they need no restart-stable credential derivative.
+    return hmac.new(
+        _LIFECYCLE_FINGERPRINT_KEY,
+        json.dumps((domain, *parts), separators=(",", ":")).encode(),
+        "sha256",
+    ).hexdigest()
 
 
 def _tokenrhythm_request(
