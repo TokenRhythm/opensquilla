@@ -7,6 +7,7 @@ deployments see no behavioral change until the operator opts in.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -778,6 +779,48 @@ def _get_strategy(config: object) -> RouterStrategy:
 
 def preload_strategy(config: object) -> RouterStrategy:
     return _get_strategy(config)
+
+
+async def prepare_model_routing_runtime(
+    config: Any,
+    *,
+    session_key: str = "",
+    initialization_timeout: float = 30.0,
+) -> None:
+    """Load a chosen router before its separate per-message routing budget.
+
+    Per-session routing can be enabled while the global strategy is Direct,
+    which deliberately skips boot preloading. The local model cold start is
+    readiness work, not classification, and must not consume the 5s routing
+    deadline. A failed/slow warmup still leaves routing to the existing bounded
+    pipeline step, whose fallback policy must remain authoritative. No
+    gateway admission/state lock may be held while awaiting this helper.
+    The real routing pipeline owns readiness; generic stream dispatch must
+    not load a classifier for a consumer that never executes routing.
+    """
+    router_config = getattr(config, "squilla_router", None)
+    if (
+        not bool(getattr(router_config, "enabled", False))
+        or not getattr(router_config, "tiers", None)
+        or ":subagent:" in session_key
+    ):
+        return
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(preload_strategy, router_config),
+            timeout=initialization_timeout,
+        )
+    except TimeoutError:
+        log.warning(
+            "squilla_router.preload_deferred", reason="timeout",
+            timeout_seconds=initialization_timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - the routing step owns fail-open policy
+        log.warning(
+            "squilla_router.preload_deferred", reason="initialization_failed",
+            error_type=type(exc).__name__,
+        )
 
 
 def router_runtime_status() -> dict[str, Any]:

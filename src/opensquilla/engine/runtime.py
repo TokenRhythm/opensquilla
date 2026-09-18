@@ -9827,6 +9827,7 @@ class TurnRunner:
         )
         from opensquilla.engine.steps.squilla_router import (
             commit_deferred_router_history,
+            prepare_model_routing_runtime,
         )
 
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
@@ -9866,6 +9867,10 @@ class TurnRunner:
             )
 
         async def _bounded_apply_squilla_router(turn: TurnContext) -> TurnContext:
+            # Cold readiness belongs to the actual routing consumer, before
+            # its classification deadline and using the accepted turn config.
+            await prepare_model_routing_runtime(turn.config, session_key=turn.session_key)
+
             def _run_router_step_sync() -> TurnContext:
                 return asyncio.run(apply_squilla_router(_copy_router_turn(turn)))
 

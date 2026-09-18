@@ -2795,23 +2795,14 @@ async def test_task_runtime_turn_uses_acceptance_time_model_routing_config(
     probe = TurnRunner.__new__(TurnRunner)
     probe._config = live_config
     observed: list[str] = []
-    ready: list[str] = []
-
-    async def prepare(config: Any) -> None:
-        # A recovered/new-chat Router turn must preload even when the live
-        # policy has changed. No provider stream may start before readiness.
-        assert config is accepted_config
-        assert observed == []
-        ready.append(model_routing_snapshot(config)["mode"])
-
+    preloads: list[Any] = []
     monkeypatch.setattr(
-        "opensquilla.gateway.session_model_routing.prepare_model_routing_runtime",
-        prepare,
+        "opensquilla.engine.steps.squilla_router.preload_strategy",
+        lambda config: preloads.append(config),
     )
 
     class RecordingTurnRunner:
         async def run(self, message: str, session_key: str, **kwargs: Any):
-            assert ready == [accepted_mode]
             observed.append(model_routing_snapshot(probe._turn_config())["mode"])
             yield DoneEvent()
 
@@ -2846,6 +2837,7 @@ async def test_task_runtime_turn_uses_acceptance_time_model_routing_config(
     )
 
     assert observed == [accepted_mode]
+    assert preloads == []  # Generic dispatch does not own classifier readiness.
     assert model_routing_snapshot(live_config)["mode"] == "ensemble"
 
 

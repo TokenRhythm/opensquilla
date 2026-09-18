@@ -1436,11 +1436,6 @@ async def dispatch_task_runtime_turn(
         ),
     )
     from opensquilla.engine.runtime import accepted_turn_config_scope
-    from opensquilla.gateway.session_model_routing import prepare_model_routing_runtime
-
-    # New-chat initial routing and recovered tasks bypass the mode setter.
-    # Prepare from the accepted choice, never today's global/session mode.
-    await prepare_model_routing_runtime(getattr(run, "accepted_config", None) or config)
 
     raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)
     stream_idle_timeout: float | None = (
