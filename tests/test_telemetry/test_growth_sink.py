@@ -242,6 +242,8 @@ async def test_shutdown_preserves_growth_observation_blocked_behind_stalled_uplo
         sink = GrowthEventSink(runtime, config=config)
         try:
             assert await sink.record_product_active(surface=ClientSurface.TUI)
+            # Keep unrelated Reliability outbox setup outside the shutdown race watchdog.
+            assert await runtime._scope_runtime(TelemetryScope.RELIABILITY) is not None
             await runtime.start()
             await asyncio.wait_for(entered.wait(), timeout=1)
             sink.observe_metaskill_usage("synthetic-run-before-close")
