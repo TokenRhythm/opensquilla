@@ -1,4 +1,4 @@
-"""Fail-closed parsing for untrusted telemetry wire payloads.
+"""Fail-closed parsing for untrusted metrics wire payloads.
 
 Network and file ingress must call :func:`parse_telemetry_wire` instead of
 passing raw input directly to a Pydantic JSON adapter.  The preflight phase

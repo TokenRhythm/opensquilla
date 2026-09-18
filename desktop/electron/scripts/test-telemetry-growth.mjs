@@ -288,7 +288,7 @@ try {
   rmSync(root, { recursive: true, force: true })
 }
 
-console.log('telemetry growth milestone tests passed')
+console.log('Usage milestone tests passed')
 
 const mainSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8')
 const appSuccess = mainSource.slice(

@@ -263,4 +263,4 @@ try {
   rmSync(root, { recursive: true, force: true })
 }
 
-console.log('telemetry growth lifecycle and restart tests passed')
+console.log('Usage statistics lifecycle and restart tests passed')

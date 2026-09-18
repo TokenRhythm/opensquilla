@@ -1,4 +1,4 @@
-"""Authenticated Starlette application for the isolated telemetry v2 preview."""
+"""Authenticated Starlette application for the isolated metrics v2 preview."""
 
 from __future__ import annotations
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="icon" href="data:,">
-    <title>OpenSquilla · 埋点数据 V2</title>
+    <title>OpenSquilla · 设备统计 V2</title>
     <style nonce="{{ csp_nonce }}">
       :root {
         color-scheme: light;
@@ -177,7 +177,7 @@
     {% set error_code_labels = {'provider_timeout':'模型服务超时','provider_rate_limited':'模型服务限流','provider_auth':'模型服务鉴权失败','provider_unavailable':'模型服务不可用','context_limit':'上下文超限','request_too_large':'请求过大','output_truncated':'输出被截断','budget_exhausted':'预算耗尽','hard_deadline':'达到总时限','cancelled_by_user':'用户取消','cancelled_before_start':'启动前取消','shutdown':'服务关闭','platform_validation':'平台校验失败','safety_blocked':'安全策略拦截','internal_error':'内部错误','unknown':'未知错误'} %}
     <main class="page">
       <header class="topbar">
-        <div class="brand"><span class="brand-mark"></span> OpenSquilla <span class="preview-pill">埋点 V2</span></div>
+        <div class="brand"><span class="brand-mark"></span> OpenSquilla <span class="preview-pill">设备统计 V2</span></div>
         <form method="post" action="{{ base_path }}/logout"><input type="hidden" name="csrf_token" value="{{ logout_csrf }}"><button class="quiet-button" type="submit">退出看板</button></form>
       </header>
       <section class="hero">
@@ -205,10 +205,10 @@
         {% if summary.growth is not none %}<article class="summary-card"><div class="summary-label">首次成功对话</div><div class="summary-value">{{ summary.growth.activation.stages[-1].deduplicatedCount }}</div><p class="summary-note">按设备标识去重</p></article>{% else %}<article class="summary-card"><div class="summary-label">首次成功对话</div><div class="summary-value">—</div><p class="summary-note">增长数据域暂不可用</p></article>{% endif %}
       </section>
 
-      <section class="panel evolution-strip" aria-label="埋点版本演进">
-        <article class="evolution-step"><span class="source-tag">埋点 V1</span><strong>安装历史基线</strong><p>桌面端首次安装去重、版本及系统覆盖</p></article>
-        <article class="evolution-step"><span class="source-tag">埋点 V2</span><strong>标准化安装漏斗</strong><p>安装器事件进入统一信封与独立增长端点</p></article>
-        <article class="evolution-step"><span class="source-tag">埋点 V2</span><strong>激活与稳定性</strong><p>首次可用、首次成功对话和操作结果</p></article>
+      <section class="panel evolution-strip" aria-label="统计版本演进">
+        <article class="evolution-step"><span class="source-tag">安装统计 V1</span><strong>安装历史基线</strong><p>桌面端首次安装去重、版本及系统覆盖</p></article>
+        <article class="evolution-step"><span class="source-tag">产品统计 V2</span><strong>标准化安装漏斗</strong><p>安装开始、完成和首次使用的阶段转化</p></article>
+        <article class="evolution-step"><span class="source-tag">运行统计 V2</span><strong>激活与稳定性</strong><p>首次可用、首次成功对话和操作结果</p></article>
       </section>
 
       {% if summary.legacyInstallation is not none %}

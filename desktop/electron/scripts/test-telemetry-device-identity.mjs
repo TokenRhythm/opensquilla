@@ -89,4 +89,4 @@ for (const invalid of [null, undefined, MACHINE_ID, EXPECTED.macos.toUpperCase()
   assert.throws(() => validateDesktopEarlyTelemetryEvent({ ...legacyEvent, device_id: invalid }))
 }
 assert.throws(() => validateDesktopEarlyTelemetryEvent({ ...legacyEvent, machine_id: MACHINE_ID }))
-console.log('telemetry device identity and legacy payload compatibility passed')
+console.log('Device identity and legacy payload compatibility passed')

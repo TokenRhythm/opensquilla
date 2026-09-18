@@ -322,7 +322,7 @@ export interface DesktopReliabilityTelemetryOptions {
   runtimeGate: DesktopTelemetryRuntimeGate
   /**
    * The plain application version used by updater handoff state and semver
-   * comparisons.  Keep this separate from the telemetry identity below.
+   * comparisons.  Keep this separate from the reported build identity below.
    */
   appVersion: () => string
   /**
@@ -394,7 +394,7 @@ export class DesktopReliabilityTelemetry {
           || this.paths.consentMirrorPath !== nextPaths.consentMirrorPath
         )
       ) {
-        // A profile/state-dir switch closes one telemetry session and starts a
+        // A profile/state-dir switch closes one diagnostics session and starts a
         // fresh one. First make the old aggregate/crash facts independently
         // durable; a full/failed sink may retry when that profile is active
         // again, without ever checkpointing A's in-memory state into B.
@@ -425,7 +425,7 @@ export class DesktopReliabilityTelemetry {
       if (!this.reconcileConsentGrant().enabled) return
       this.ensureSession()
     } catch {
-      // Telemetry must never affect profile startup or consent reconciliation.
+      // Statistics must never affect profile startup or consent reconciliation.
     }
   }
 
@@ -649,7 +649,7 @@ export class DesktopReliabilityTelemetry {
       if (!this.writeSessionMarker(this.currentMarker)) return
       this.flushSessionMarker(SESSION_MARKER_NAME, this.currentMarker, false)
     } catch {
-      // Exit must remain committed even when telemetry storage is unavailable.
+      // Exit must remain committed even when statistics storage is unavailable.
     }
   }
 
@@ -1804,7 +1804,7 @@ function bestEffortChmod(path: string, mode: number): void {
 function requireRealDirectory(path: string): void {
   const metadata = lstatSync(path)
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-    throw new Error('unsafe reliability telemetry directory')
+    throw new Error('unsafe reliability diagnostics directory')
   }
 }
 

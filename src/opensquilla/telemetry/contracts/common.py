@@ -1,4 +1,4 @@
-"""Shared, privacy-bounded telemetry event fields."""
+"""Shared, privacy-bounded metrics event fields."""
 
 from __future__ import annotations
 
@@ -175,7 +175,7 @@ class UtcTimestampModel(StrictTelemetryModel):
 
 
 class EventBase(UtcTimestampModel):
-    """Fields present on every telemetry event."""
+    """Fields present on every metrics event."""
 
     event_name: str
     event_version: Literal[1]

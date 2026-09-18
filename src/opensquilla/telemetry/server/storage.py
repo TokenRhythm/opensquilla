@@ -1,4 +1,4 @@
-"""Transactional, scope-isolated SQLite storage for accepted telemetry batches."""
+"""Transactional, scope-isolated SQLite storage for accepted metrics batches."""
 
 from __future__ import annotations
 
@@ -349,7 +349,7 @@ def _client_launch_daily_key(
 
 
 class TelemetryIngestStorage:
-    """One open connection locked to a single telemetry consent scope."""
+    """One open connection locked to a single metrics consent scope."""
 
     def __init__(
         self,

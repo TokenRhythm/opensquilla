@@ -363,7 +363,7 @@ export function clearDesktopGrowthTelemetryState(telemetryDirectory: string): vo
     if (!existsSync(path)) continue
     const metadata = lstatSync(path)
     if (metadata.isSymbolicLink() || !metadata.isFile()) {
-      throw new Error('Growth telemetry state is not a regular file.')
+      throw new Error('Usage statistics state is not a regular file.')
     }
     unlinkSync(path)
   }

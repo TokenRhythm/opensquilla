@@ -1,4 +1,4 @@
-"""Isolated server-side ingestion for the versioned telemetry protocol."""
+"""Isolated server-side ingestion for the versioned metrics protocol."""
 
 from opensquilla.telemetry.server.collector import create_collector_app
 from opensquilla.telemetry.server.settings import CollectorSettings

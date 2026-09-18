@@ -1,4 +1,4 @@
-"""Fail-closed settings for one scope-specific telemetry collector."""
+"""Fail-closed settings for one scope-specific metrics collector."""
 
 from __future__ import annotations
 

@@ -396,10 +396,10 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-旧遥测退出开关同时关闭 V1 和 V2。旧更新检查退出开关继续按 V1 兼容规则关闭安装／每日
+旧统计退出开关同时关闭 V1 和 V2。旧更新检查退出开关继续按 V1 兼容规则关闭安装／每日
 用量上传，但不关闭 V2。完整的数据处理规则见 [`PRIVACY.md`](PRIVACY.md)。
 
-进阶部署可以使用自己的安装遥测端点:
+进阶部署可以使用自己的安装统计端点:
 
 ```sh
 OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install

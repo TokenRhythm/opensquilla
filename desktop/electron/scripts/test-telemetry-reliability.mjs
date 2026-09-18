@@ -197,13 +197,13 @@ try {
     unknown.finishSession()
   }
 
-  // Telemetry-only filesystem failure closes the local gate but never replaces
+  // Statistics-only filesystem failure closes the local gate but never replaces
   // the surrounding settings/onboarding operation's outcome.
   {
     const gate = openGate()
     let failureObserved = false
     const completed = await runTelemetrySideEffectFailOpen(
-      async () => { throw new Error('synthetic local telemetry I/O failure') },
+      async () => { throw new Error('synthetic local statistics I/O failure') },
       () => {
         failureObserved = true
         gate.close()
@@ -435,7 +435,7 @@ try {
     for (const forbidden of [
       'prompt', 'response', 'message', 'stack', 'path', 'payload_json', 'user_id', 'analytics_user_id',
     ]) {
-      assert.equal(serialized.includes(forbidden), false, `forbidden telemetry field: ${forbidden}`)
+      assert.equal(serialized.includes(forbidden), false, `forbidden event field: ${forbidden}`)
     }
   }
 
@@ -1152,7 +1152,7 @@ try {
         < saveCredential.indexOf('await applyDesktopSettingsPair(')
         && saveCredential.indexOf('await applyDesktopSettingsPair(')
           < saveCredential.indexOf("'post_commit'"),
-      'telemetry I/O must remain fail-open on both sides of the settings transaction',
+      'statistics I/O must remain fail-open on both sides of the settings transaction',
     )
     const saveImported = mainSource.slice(
       mainSource.indexOf('async function saveImportedDesktopCredential'),
@@ -1163,7 +1163,7 @@ try {
         < saveImported.indexOf('const inspection = await preflightDesktopConfigWrite')
         && saveImported.indexOf('const inspection = await preflightDesktopConfigWrite')
           < saveImported.indexOf("'post_commit'"),
-      'import adoption must keep telemetry I/O outside its authoritative outcome',
+      'import adoption must keep statistics I/O outside its authoritative outcome',
     )
     const crashSignatureNormalizer = mainSource.slice(
       mainSource.indexOf('function normalizedCrashFingerprintSignature'),
@@ -1172,7 +1172,7 @@ try {
     assert.doesNotMatch(crashSignatureNormalizer, /\.message|\.stack|String\(error\)/)
   }
 
-  console.log('Desktop reliability telemetry tests passed.')
+  console.log('Desktop reliability statistics tests passed.')
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

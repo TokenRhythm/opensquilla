@@ -1,4 +1,4 @@
-# Telemetry v2 external producer integration
+# V2 usage statistics: external producer integration
 
 The OpenSquilla repository owns the v2 collector, desktop application, Gateway,
 Runtime, and Windows NSIS package. It does **not** contain the public website,
@@ -10,7 +10,7 @@ their results.
 
 For an isolated client verification run, set `OPENSQUILLA_TELEMETRY_BASE_URL`
 in the client process environment to an HTTPS collector base URL, optionally
-including a path prefix (for example `https://telemetry.example.com/test`).
+including a path prefix (for example `https://collector.example.com/test`).
 The Desktop Gateway inherits this setting; both v2 queues append their own
 `/v1/reliability/events` or `/v1/growth/events` path. It does not change the
 legacy v1 destination or the user's upload preference. Unset it to restore the
@@ -21,7 +21,7 @@ encoded path segments and relative path segments are not supported.
 All growth producers send strict v1 batches to:
 
 ```text
-POST https://<telemetry-origin>/v1/growth/events
+POST https://<collector-origin>/v1/growth/events
 Content-Type: application/json
 ```
 
@@ -100,14 +100,14 @@ For Gateway-observed Web/TUI activity the device is the Gateway execution host;
 remote browser machines are not assigned synthetic physical-device identities.
 The local daily ledger is persisted before enqueue; retries retain `event_id`
 and occurrence time. It uses the existing unified reporting control and CI /
-`DO_NOT_TRACK` vetoes, with no new prompt or telemetry preference.
+`DO_NOT_TRACK` vetoes, with no new prompt or statistics preference.
 
 ## Source CLI reporting lifecycle
 
 Local owner connections to a loopback Gateway can record content-free TUI
 launch and activity events in the default `auth.mode = "none"` configuration.
 Remote guests and non-owner connections cannot use those recording methods;
-telemetry preference changes retain their separate authorization requirements.
+statistics preference changes retain their separate authorization requirements.
 
 Source Gateways record `gateway_start_result` after both runtime and listener
 readiness. Startup failures are recorded only after a valid configuration is
@@ -171,7 +171,7 @@ external registration succeeded. The account service owns that result.
 - Reject unknown fields through the shared strict event contract.
 - Do not sample growth events.
 - Keep producer outboxes separate from business payloads and from Reliability
-  telemetry.
+  diagnostics.
 - A `202` receipt is accepted only when its batch ID matches and
   `accepted + duplicates` equals the sent event count.
 - Network ambiguity, `429`, and `5xx` are retryable. Authentication, contract,

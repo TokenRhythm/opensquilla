@@ -46,12 +46,12 @@ corresponding feature is enabled by configuration or user action.
 OpenSquilla uses one **Network reporting** control for V1 installation and daily
 usage statistics, V2 Reliability diagnostics, and V2 Product and growth analytics,
 following the existing opt-out policy.
-Reporting is enabled by default; there are no separate telemetry choices or
+Reporting is enabled by default; there are no separate statistics choices or
 consent popups during onboarding. A notice-version update does not require a
 new choice or create a consent timestamp. An explicit decline saved under either
 of the former per-scope controls is migrated to the unified control being off.
 
-The control below disables all telemetry streams, passive update checks, and
+The control below disables all statistics uploads, passive update checks, and
 automatic desktop update checks:
 
 ```sh
@@ -73,9 +73,9 @@ OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
 `OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for V1 and V2
-telemetry. `OPENSQUILLA_UPDATE_CHECK_DISABLED=true` disables update checks and,
+statistics. `OPENSQUILLA_UPDATE_CHECK_DISABLED=true` disables update checks and,
 for compatibility with V1, installation and daily usage uploads; it does not
-disable V2 telemetry.
+disable V2 statistics.
 
 Manual user-initiated actions may still contact network services after user
 intent, including release downloads and configured providers, search, channels,
@@ -83,7 +83,7 @@ automation, or integrations. Update-availability checks, including
 `opensquilla version --check` and the desktop manual check, do not bypass the
 unified or legacy opt-out controls.
 
-## Optional Telemetry
+## Optional Usage Statistics
 
 ### Reliability diagnostics
 
@@ -105,8 +105,9 @@ readiness, registration, first turn start, and first successful response.
 Product activity is recorded at most once per device, local profile, surface, and
 UTC day. The server calculates daily active devices and rolling 30-day monthly
 active devices by deduplicating the device token across Desktop, Web, TUI, CLI,
-and all profiles on the same OS device. It includes only the surface and common telemetry fields, not activity
-content; merely running a background Gateway does not count as product activity.
+and all profiles on the same OS device. It includes only the surface and common
+event fields, not activity content; merely running a background Gateway does not
+count as product activity.
 Client first-use milestones require fresh-install eligibility; enabling
 reporting on an existing installation does not backfill those milestones.
 Growth uses random, purpose-specific `acquisition_id` and
@@ -149,13 +150,13 @@ to separate bounded local SQLite queues and upload batches to separate routes:
 local collection and again immediately before network upload. Offline retries
 reuse `event_id` for deduplication. Growth events are not sampled.
 
-V2 telemetry payloads never include prompts, responses, provider configuration,
+V2 statistics payloads never include prompts, responses, provider configuration,
 agent configuration, tool arguments, task parameters, file names, file paths,
 file contents, raw exception messages, complete stacks, usernames, hostnames,
 API keys, raw account IDs, order data, IP addresses, MAC addresses, or raw OS
 machine identifiers. The only device token is the purpose-specific digest
 described above. Source IP addresses may be visible to network servers at the
-transport layer, but are not telemetry fields and are never used to join
+transport layer, but are not event fields and are never used to join
 website and client identities.
 
 CI, test, and `DO_NOT_TRACK` environments fail closed for both streams. Disabling
@@ -194,7 +195,7 @@ from V2 identities and is not attached to provider requests; the
 `X-OpenSquilla-Install-Id` provider header remains retired. V1 payloads contain
 no prompts, responses, file contents, tool arguments, credentials, or account IDs.
 
-The unified opt-out, either previously saved scope decline, the legacy telemetry
+The unified opt-out, either previously saved scope decline, the legacy statistics
 opt-out, the product-analytics environment veto, and CI/test/`DO_NOT_TRACK`
 suppression apply before V1 collection and again before upload. Pausing V1 keeps
 existing installation state and pending daily counters. Endpoint overrides remain

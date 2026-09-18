@@ -1,4 +1,4 @@
-"""Stable, language-neutral telemetry protocol manifest and fingerprint."""
+"""Stable, language-neutral metrics protocol manifest and fingerprint."""
 
 from __future__ import annotations
 

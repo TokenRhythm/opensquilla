@@ -239,7 +239,7 @@ async def test_legacy_pending_launch_is_replayed_after_device_key_upgrade(tmp_pa
 
 async def test_disabled_growth_never_resolves_device_identity(tmp_path, monkeypatch) -> None:
     def forbidden():
-        pytest.fail("disabled telemetry must not consult device identity")
+        pytest.fail("disabled statistics must not consult device identity")
 
     monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", forbidden)
     runtime = CapturingRuntime()

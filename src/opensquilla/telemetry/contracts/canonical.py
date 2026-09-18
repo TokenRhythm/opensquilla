@@ -1,4 +1,4 @@
-"""Canonical JSON serialization for already-validated telemetry models."""
+"""Canonical JSON serialization for already-validated metrics models."""
 
 from __future__ import annotations
 

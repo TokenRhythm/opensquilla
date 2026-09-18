@@ -829,7 +829,7 @@ class GrowthEventSink:
     ) -> None:
         """Retry durable pending usage with its original event ID.
 
-        This runs at later telemetry observations, so a crash or a temporarily
+        This runs at later usage observations, so a crash or a temporarily
         full outbox after writing the local ledger does not permanently lose a
         demonstrated feature use.
         """

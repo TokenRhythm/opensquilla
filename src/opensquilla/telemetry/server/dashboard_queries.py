@@ -1,4 +1,4 @@
-"""Read-only, aggregate-only queries for the isolated telemetry preview dashboard."""
+"""Read-only, aggregate-only queries for the isolated metrics preview dashboard."""
 
 from __future__ import annotations
 

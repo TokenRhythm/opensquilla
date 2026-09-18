@@ -1,4 +1,4 @@
-"""Fail-closed local launch configuration for isolated telemetry v2 services.
+"""Fail-closed local launch configuration for isolated metrics v2 services.
 
 Recommended invocation::
 

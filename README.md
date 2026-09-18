@@ -388,11 +388,11 @@ full reference.
 
 ---
 
-## Telemetry Privacy
+## Usage Statistics and Privacy
 
 OpenSquilla uses the existing **Network reporting** switch for V1 statistics and
-both V2 telemetry streams. Reporting is enabled by default and can be turned off in Privacy
-settings, without separate onboarding choices or consent popups:
+both V2 statistics streams. Reporting is enabled by default and can be turned off
+in Privacy settings, without separate onboarding choices or consent popups:
 
 - **Reliability diagnostics** records bounded operation results for app and
   Gateway startup, crashes, turns, tools, file parsing, updates, and session
@@ -414,7 +414,7 @@ activity and feature device counts deduplicate this token across profiles and
 client surfaces. Legacy events without it are excluded from device counts;
 operation totals and success rates still count actual operations.
 
-V2 telemetry never includes prompts, responses, file names, file paths, file
+V2 statistics never include prompts, responses, file names, file paths, file
 contents, tool arguments, task parameters, provider configuration, raw account
 IDs, order data, MAC addresses, IP addresses, or raw OS machine identifiers. Complete
 crash stacks stay local unless the user explicitly prepares and shares a
@@ -442,12 +442,12 @@ or set:
 disable_network_observability = true
 ```
 
-This is a hard veto over V1 and both V2 telemetry scopes, passive update checks, and
+This is a hard veto over V1 and both V2 statistics streams, passive update checks, and
 automatic desktop update checks. Disabling Network reporting pauses pending uploads and
-stops collection without deleting local telemetry state. Previously saved
+stops collection without deleting local statistics state. Previously saved
 per-scope declines are migrated to the unified switch being off; users can
 then change that one setting. CI, test, and `DO_NOT_TRACK` environments
-also fail closed for telemetry. Other user-initiated actions may still contact
+also fail closed for statistics uploads. Other user-initiated actions may still contact
 configured providers, search services, channels, or release hosts.
 Explicit update-availability checks remain disabled while the unified or
 legacy update opt-out controls are active.
@@ -459,7 +459,7 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-The legacy telemetry variable disables V1 and V2 reporting. The legacy update
+The legacy statistics variable disables V1 and V2 reporting. The legacy update
 variable also suppresses V1 uploads for compatibility, but does not disable V2.
 See [`PRIVACY.md`](PRIVACY.md) for the complete data, reporting, deletion, update,
 and external-producer rules.
