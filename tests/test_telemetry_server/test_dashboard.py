@@ -648,8 +648,11 @@ def test_product_activity_cards_chart_and_api_use_product_wide_distinct_users(
     assert "日活与月活（设备去重）" in page.text
     assert "按设备标识统计 · 跨配置与入口去重" in page.text
     assert "按设备标识、UTC 日期统计" in page.text
-    assert "同一设备使用不同配置、桌面端、网页端、TUI 或 CLI 只计 1 台" in page.text
-    assert "同一设备多个配置只计 1 台" in page.text
+    assert "同一设备标识跨配置和入口只计 1 台" in page.text
+    assert "设备标识代表操作系统安装实例／执行主机" in page.text
+    assert "通过 Gateway 使用的 Web/TUI 按 Gateway 主机计数" in page.text
+    assert "系统重装或虚拟机克隆可能改变或复制标识" in page.text
+    assert "同一标识下的多个配置只计 1 台" in page.text
     assert "旧版无设备标识的事件不计入设备数" in page.text
     assert "历史不推算、不回填" in page.text
     assert "月活设备（近 30 天）" in page.text

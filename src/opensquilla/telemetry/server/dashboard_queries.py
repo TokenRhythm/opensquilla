@@ -157,7 +157,7 @@ class DashboardQueries:
             or len(protocol_fingerprint) != 64
             or any(character not in "0123456789abcdef" for character in protocol_fingerprint)
         ):
-            raise ValueError("telemetry protocol fingerprint is invalid")
+            raise ValueError("statistics protocol fingerprint is invalid")
         self._protocol_fingerprint = protocol_fingerprint
         self._compatible_protocol_fingerprints = {protocol_fingerprint}
         if protocol_fingerprint == TELEMETRY_PROTOCOL_FINGERPRINT_SHA256:
@@ -826,14 +826,14 @@ class DashboardQueries:
             uri = f"{resolved.as_uri()}?mode=ro"
             connection = sqlite3.connect(uri, uri=True, timeout=5.0)
         except (OSError, sqlite3.Error):
-            raise DashboardDataError("telemetry preview data is unavailable") from None
+            raise DashboardDataError("statistics preview data is unavailable") from None
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA trusted_schema=OFF")
             query_only = connection.execute("PRAGMA query_only").fetchone()
             if query_only is None or query_only[0] != 1:
-                raise DashboardDataError("telemetry preview database is not read-only")
+                raise DashboardDataError("statistics preview database is not read-only")
             # The first schema SELECT below pins one WAL snapshot for every
             # aggregate issued by this scope query. Reliability and Growth are
             # intentionally separate databases and therefore separate snapshots.
@@ -843,7 +843,7 @@ class DashboardQueries:
         except DashboardDataError:
             raise
         except sqlite3.Error:
-            raise DashboardDataError("telemetry preview data is unavailable") from None
+            raise DashboardDataError("statistics preview data is unavailable") from None
         finally:
             if connection.in_transaction:
                 try:
@@ -861,7 +861,7 @@ class DashboardQueries:
     def _validate_schema(self, connection: sqlite3.Connection, scope: TelemetryScope) -> None:
         version_row = connection.execute("PRAGMA user_version").fetchone()
         if version_row is None or version_row[0] != _SCHEMA_VERSION:
-            raise DashboardDataError("telemetry preview schema is incompatible")
+            raise DashboardDataError("statistics preview schema is incompatible")
         try:
             rows = connection.execute(
                 """
@@ -874,7 +874,7 @@ class DashboardQueries:
                 str(row[1]) for row in connection.execute("PRAGMA table_info(events)").fetchall()
             }
         except sqlite3.Error:
-            raise DashboardDataError("telemetry preview schema is incompatible") from None
+            raise DashboardDataError("statistics preview schema is incompatible") from None
         if (
             len(rows) != 1
             or rows[0]["schema_version"] != _SCHEMA_VERSION
@@ -882,7 +882,7 @@ class DashboardQueries:
             or rows[0]["protocol_fingerprint"] not in self._compatible_protocol_fingerprints
             or not _REQUIRED_EVENT_COLUMNS.issubset(columns)
         ):
-            raise DashboardDataError("telemetry preview schema is incompatible")
+            raise DashboardDataError("statistics preview schema is incompatible")
 
     def _outcome_metric(
         self,

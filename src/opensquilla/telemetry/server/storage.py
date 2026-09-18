@@ -266,28 +266,28 @@ class StorageCompatibilityError(StorageError):
     """The database cannot safely be opened by this schema and scope."""
 
     def __init__(self) -> None:
-        super().__init__("telemetry database metadata is incompatible")
+        super().__init__("statistics database metadata is incompatible")
 
 
 class StorageScopeError(StorageError):
     """A caller passed a batch for the other consent scope."""
 
     def __init__(self) -> None:
-        super().__init__("telemetry batch scope does not match storage scope")
+        super().__init__("statistics batch scope does not match storage scope")
 
 
 class BatchConflictError(StorageError):
     """One batch identifier was reused with different canonical content."""
 
     def __init__(self) -> None:
-        super().__init__("telemetry batch identifier conflict")
+        super().__init__("statistics batch identifier conflict")
 
 
 class EventConflictError(StorageError):
     """One event identifier was reused with different canonical content."""
 
     def __init__(self) -> None:
-        super().__init__("telemetry event identifier conflict")
+        super().__init__("statistics event identifier conflict")
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,7 +327,7 @@ def _canonical_payload(value: StrictTelemetryModel) -> tuple[str, dict[str, Any]
     raw = canonical_json_bytes(value)
     decoded = json.loads(raw)
     if not isinstance(decoded, dict):  # pragma: no cover - contract invariant
-        raise RuntimeError("canonical telemetry payload must be an object")
+        raise RuntimeError("canonical statistics payload must be an object")
     return _sha256(raw), decoded, raw.decode("utf-8")
 
 
@@ -621,7 +621,7 @@ class TelemetryIngestStorage:
 
     async def ingest(self, batch: TelemetryBatch) -> IngestReceipt:
         if self._closed:
-            raise RuntimeError("telemetry storage is closed")
+            raise RuntimeError("statistics storage is closed")
         self._require_batch_scope(batch)
         body_sha256, batch_payload, _batch_json = _canonical_payload(batch)
         batch_id = str(batch.batch_id)
@@ -770,19 +770,19 @@ class TelemetryIngestStorage:
 
     async def stats(self) -> StorageStats:
         if self._closed:
-            raise RuntimeError("telemetry storage is closed")
+            raise RuntimeError("statistics storage is closed")
         cursor = await self._connection.execute(
             "SELECT (SELECT count(*) FROM ingest_batches), (SELECT count(*) FROM events)"
         )
         row = await cursor.fetchone()
         await cursor.close()
         if row is None:  # pragma: no cover - aggregate query invariant
-            raise RuntimeError("telemetry statistics query returned no row")
+            raise RuntimeError("statistics count query returned no row")
         return StorageStats(batch_count=int(row[0]), event_count=int(row[1]))
 
     async def ping(self) -> None:
         if self._closed:
-            raise RuntimeError("telemetry storage is closed")
+            raise RuntimeError("statistics storage is closed")
         cursor = await self._connection.execute("SELECT 1")
         await cursor.fetchone()
         await cursor.close()

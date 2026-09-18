@@ -269,10 +269,10 @@
           <div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>日活设备</span><span class="legend-value">{{ product_activity.dau }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>近 30 天活跃设备</span><span class="legend-value">{{ product_activity.mau }}</span></div></div>
         </div>
         <div class="trend-side">
-          <div class="panel-head"><div><h2>每日设备活跃趋势</h2><p>按设备标识、UTC 日期统计；同一设备使用不同配置、桌面端、网页端、TUI 或 CLI 只计 1 台。</p></div><p>{{ start_date }} → {{ end_date }}</p></div>
+          <div class="panel-head"><div><h2>每日设备活跃趋势</h2><p>按设备标识、UTC 日期统计；同一设备标识跨配置和入口只计 1 台。</p></div><p>{{ start_date }} → {{ end_date }}</p></div>
           <svg id="product-activity-trend" viewBox="0 0 960 285" role="img" aria-label="每日设备日活与滚动三十天月活趋势图"></svg>
           {% if product_activity.dailyTrend | sum(attribute='mau') == 0 %}<p class="chart-empty-note" role="status">当前统计区间暂无产品活跃上报。</p>{% endif %}
-          <p class="summary-note">按设备去重，同一设备多个配置只计 1 台；不同设备分别计数。旧版无设备标识的事件不计入设备数，历史不推算、不回填。月活为截至每个日期、含当日的最近 30 天去重设备数，不累加日活。</p>
+          <p class="summary-note">设备标识代表操作系统安装实例／执行主机；同一标识下的多个配置只计 1 台。通过 Gateway 使用的 Web/TUI 按 Gateway 主机计数。系统重装或虚拟机克隆可能改变或复制标识。旧版无设备标识的事件不计入设备数，历史不推算、不回填。月活为截至每个日期、含当日的最近 30 天去重设备数，不累加日活。</p>
           <div id="product-activity-trend-data" hidden>{% for point in product_activity.dailyTrend %}<span data-date="{{ point.period }}" data-dau="{{ point.dau }}" data-mau="{{ point.mau }}"></span>{% endfor %}</div>
         </div>
       </section>

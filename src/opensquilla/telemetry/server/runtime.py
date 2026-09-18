@@ -383,7 +383,7 @@ def _runtime_for_service(
         return load_growth_runtime(environ)
     if service is TelemetryService.PREVIEW:
         return load_preview_runtime(environ)
-    raise RuntimeEnvironmentError("telemetry service is invalid")
+    raise RuntimeEnvironmentError("statistics service is invalid")
 
 
 def _build_app(settings: RuntimeSettings) -> Starlette:
@@ -465,7 +465,7 @@ def run_service(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m opensquilla.telemetry.server",
-        description="Run one isolated OpenSquilla telemetry v2 service.",
+        description="Run one isolated OpenSquilla device and runtime statistics service.",
     )
     parser.add_argument("service", choices=tuple(service.value for service in TelemetryService))
     arguments = parser.parse_args(argv)

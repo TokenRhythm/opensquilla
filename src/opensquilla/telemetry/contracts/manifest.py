@@ -112,7 +112,7 @@ def telemetry_protocol_manifest() -> dict[str, Any]:
 
     value = json.loads(TELEMETRY_PROTOCOL_MANIFEST_JSON)
     if not isinstance(value, dict):  # pragma: no cover - constant invariant
-        raise RuntimeError("telemetry protocol manifest must be an object")
+        raise RuntimeError("statistics protocol manifest must be an object")
     return value
 
 

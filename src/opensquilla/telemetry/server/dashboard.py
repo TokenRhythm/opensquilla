@@ -84,7 +84,7 @@ def create_dashboard_app(
         ) or _same_site_document_navigation(request)
         if not origin_valid:
             log.warning(
-                "telemetry preview login rejected: origin_present=%s "
+                "statistics preview login rejected: origin_present=%s "
                 "origin_valid=false same_site_navigation=false",
                 request.headers.get("origin") is not None,
             )
@@ -96,7 +96,7 @@ def create_dashboard_app(
         )
         if form is None or not csrf_valid:
             log.warning(
-                "telemetry preview login rejected: origin_valid=true "
+                "statistics preview login rejected: origin_valid=true "
                 "form_valid=%s csrf_cookie_present=%s csrf_valid=%s",
                 form is not None,
                 LOGIN_CSRF_COOKIE_NAME in request.cookies,
