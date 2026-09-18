@@ -67,6 +67,8 @@ def test_functional_rejects_budget_file_without_changing_any_bytes(tmp_path):
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
 
+# Run this HTTP/SQLite integration contract alone to retain its fixed read deadline.
+@pytest.mark.ci_serial
 def test_functional_retry_and_fallback_preserve_actual_http_without_fee_gates(
     tmp_path, monkeypatch,
 ):

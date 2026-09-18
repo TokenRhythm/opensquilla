@@ -1,7 +1,9 @@
 import logging
+from types import SimpleNamespace
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.steps import squilla_router as squilla_router_step
 from opensquilla.engine.steps.squilla_router import (
@@ -490,21 +492,35 @@ async def test_large_material_estimate_floors_low_router_tier(
 
 
 @pytest.mark.parametrize(
-    ("character_count", "expected_tier", "expected_floor"),
+    ("tokenizer_fallback", "character_count", "expected_tokens", "expected_tier", "expected_floor"),
     [
-        (99_996, "c0", None),
-        (100_000, "c2", "c2"),
+        (False, 99_996, 24_999, "c0", None),
+        (False, 100_000, 25_000, "c2", "c2"),
+        (True, 49_998, 24_999, "c0", None),
+        (True, 50_000, 25_000, "c2", "c2"),
+        (True, 99_996, 49_998, "c2", "c2"),
     ],
 )
 @pytest.mark.asyncio
-async def test_plain_text_large_context_floor_boundary_keeps_legacy_parity(
+async def test_plain_text_large_context_floor_boundary_respects_token_estimator(
     monkeypatch: pytest.MonkeyPatch,
+    tokenizer_fallback: bool,
     character_count: int,
+    expected_tokens: int,
     expected_tier: str,
     expected_floor: str | None,
 ) -> None:
+    # Compressible text leaves the legacy character floor in charge when an
+    # encoding is available. Exercise that branch without loading a tokenizer,
+    # and use the real conservative estimator for the unavailable branch.
+    encoding = SimpleNamespace(encode=lambda text, **_kwargs: range((len(text) + 7) // 8))
+    monkeypatch.setattr(
+        token_estimation, "_encoding",
+        token_estimation._ENCODING_UNAVAILABLE if tokenizer_fallback else encoding,
+    )
     fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
     ctx = make_context("a" * character_count)
+    assert squilla_router_step._material_estimated_tokens(ctx, ctx.message) == expected_tokens
 
     routed = await apply_squilla_router(ctx)
 
