@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.engine import runtime as runtime_module
 from opensquilla.engine.history import reconstruct_messages_from_entry
 from opensquilla.engine.runtime import TurnRunner
@@ -258,10 +259,16 @@ async def test_exact_history_fails_closed_after_reset_without_mixing_replacement
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("force_tokenizer_fallback", [False, True], ids=["default", "fallback"])
 async def test_exact_history_discards_retired_owner_emergency_override_after_reset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    force_tokenizer_fallback: bool,
 ) -> None:
+    if force_tokenizer_fallback:
+        monkeypatch.setattr(
+            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
+        )
     storage = SessionStorage(str(tmp_path / "history-emergency-owner.db"))
     await storage.connect()
     manager = SessionManager(storage, inject_time_prefix=False)
@@ -269,10 +276,13 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
     monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
     admitted = await manager.create(key)
     for index in range(8):
+        # The protected final round must fit even without a tokenizer; the old
+        # prefix still exceeds the window and requires an emergency override.
+        old_detail = "x" * 500 if index < 6 else ""
         await manager.append_message(
             key,
             "user" if index % 2 == 0 else "assistant",
-            f"retired owner secret {index} " + ("x" * 500),
+            f"retired owner secret {index} " + old_detail,
         )
     admitted_entries = list(await manager.get_transcript(key))
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
@@ -288,6 +298,8 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
     )
     assert recorded is True
     retired_override = runner._emergency_compaction_overrides[key]
+    assert len(retired_override.kept_entries) < len(admitted_entries)
+    assert any("retired owner secret" in entry.content for entry in retired_override.kept_entries)
     assert retired_override.expected_session_id == admitted.session_id
     assert retired_override.expected_session_epoch == int(admitted.epoch or 0)
     replacement, rotated = await manager.apply_intent(
