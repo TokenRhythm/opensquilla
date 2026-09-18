@@ -204,8 +204,8 @@ class GatewayPendingInputQueueAdapter:
             if value is not None:
                 params[name] = value
         for field in (
-            "pageContext", "selectedSkills", "promptAnnotationIds", "prompt_annotation_ids",
-            "documentContext", "document_context",
+            "pageContext", "workspaceFiles", "selectedSkills", "promptAnnotationIds",
+            "prompt_annotation_ids", "documentContext", "document_context",
         ):
             if field in raw:
                 params[field] = raw[field]

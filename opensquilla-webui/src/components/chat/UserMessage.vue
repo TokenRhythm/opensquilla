@@ -98,7 +98,7 @@
       <div v-if="message.attachments?.length" class="msg-attachments">
         <template v-for="attachment in message.attachments" :key="attachment.renderKey">
           <span
-            v-if="isImageDisplayAttachment(attachment) && (attachment.dataUrl || attachment.data)"
+            v-if="!attachment.workspaceFile && isImageDisplayAttachment(attachment) && (attachment.dataUrl || attachment.data)"
             class="msg-file-resource"
           >
             <button
@@ -128,15 +128,19 @@
               </button>
             </span>
           </span>
-          <span v-else class="msg-file-resource">
-            <button
-              type="button"
+          <span v-else class="msg-file-resource msg-file-resource--file">
+            <component
+              :is="attachment.workspaceFile ? 'span' : 'button'"
+              :type="attachment.workspaceFile ? undefined : 'button'"
               class="msg-file-chip"
-              :class="{ 'msg-file-chip--failed': failedDownloads.has(attachment.renderKey) }"
+              :class="{
+                'msg-file-chip--failed': failedDownloads.has(attachment.renderKey),
+                'msg-file-chip--reference': !!attachment.workspaceFile,
+              }"
               :title="attachmentPrimaryActionLabel(attachment)"
-              :aria-label="attachmentPrimaryActionLabel(attachment)"
-              :aria-busy="downloadingAttachments.has(attachment.renderKey)"
-              :disabled="downloadingAttachments.has(attachment.renderKey)"
+              :aria-label="attachment.workspaceFile ? undefined : attachmentPrimaryActionLabel(attachment)"
+              :aria-busy="attachment.workspaceFile ? undefined : downloadingAttachments.has(attachment.renderKey)"
+              :disabled="attachment.workspaceFile ? undefined : downloadingAttachments.has(attachment.renderKey)"
               @click.stop="activateAttachment(attachment)"
             >
               <span class="msg-file-chip__icon" aria-hidden="true">
@@ -147,10 +151,11 @@
               <span class="msg-file-chip__body">
                 <span class="msg-file-chip__name">{{ attachment.name }}</span>
                 <span class="msg-file-chip__meta">{{ attachmentMeta(attachment) }}</span>
+                <span v-if="attachmentTarget(attachment)" class="msg-file-chip__target">{{ attachmentTarget(attachment) }}</span>
               </span>
-            </button>
+            </component>
             <span
-              v-if="(isImageDisplayAttachment(attachment) || workbenchAttachmentResource(attachment)) && !shareMode"
+              v-if="!attachment.workspaceFile && (isImageDisplayAttachment(attachment) || workbenchAttachmentResource(attachment)) && !shareMode"
               class="msg-file-resource__actions"
             >
               <button
@@ -242,6 +247,7 @@ import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresen
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { isImageDisplayAttachment } from '@/utils/chat/attachments'
+import { fileTypeLabel } from '@/utils/fileType'
 import {
   isProcessRestartOutcome,
   turnOutcomePresentation,
@@ -403,9 +409,7 @@ async function downloadAttachment(attachment: DisplayAttachment) {
 }
 
 function attachmentMeta(attachment: DisplayAttachment): string {
-  const mime = attachment.mime || 'attachment'
-  const subtype = mime.includes('/') ? mime.split('/').pop() || mime : mime
-  const label = (subtype.includes('.') ? subtype.split('.').pop() || subtype : subtype).toUpperCase()
+  const label = fileTypeLabel(attachment, t('chat.fileLabel'))
   // Same meta idiom as artifact file cards: `TYPE · N KB` (utils/chat/artifacts.ts).
   const size = Number(attachment.size)
   if (!Number.isFinite(size) || size <= 0) return label
@@ -443,6 +447,7 @@ function attachmentOpenReason(attachment: DisplayAttachment): string {
 }
 
 function attachmentPrimaryActionLabel(attachment: DisplayAttachment): string {
+  if (attachment.workspaceFile) return attachmentTarget(attachment)
   if (isImageDisplayAttachment(attachment)) return t('chat.openTitle', { title: attachment.name })
   if (!attachmentCanOpen(attachment)) return attachmentDownloadLabel(attachment)
   const label = t('workbench.resources.open', { name: attachment.name })
@@ -450,11 +455,22 @@ function attachmentPrimaryActionLabel(attachment: DisplayAttachment): string {
   return reason ? `${label}. ${reason}` : label
 }
 
+function attachmentTarget(attachment: DisplayAttachment): string {
+  if (attachment.workspaceFile) {
+    return t('chat.projectFileLiveTarget', { path: attachment.workspaceFile.relativePath })
+  }
+  // Inline/staged inputs and opaque attachment identities describe imported
+  // material. A generic file chip alone does not prove where edits will land.
+  return attachment.kind !== 'file' || attachment.attachmentId || attachment.localFile
+    ? t('chat.importedFileWorkingTarget') : ''
+}
+
 function attachmentUnavailableReason(attachment: DisplayAttachment): string {
   return attachmentOpenReason(attachment)
 }
 
 function activateAttachment(attachment: DisplayAttachment) {
+  if (attachment.workspaceFile) return
   if (isImageDisplayAttachment(attachment)) {
     emit('previewImage', attachment)
     return
@@ -990,9 +1006,15 @@ function activateAttachment(attachment: DisplayAttachment) {
 
 .msg-file-resource {
   display: inline-flex;
+  min-width: 0;
   max-width: 100%;
   align-items: center;
   gap: .25rem;
+}
+
+.msg-file-resource--file {
+  /* The minimum belongs to the whole resource, including its download action. */
+  min-width: min(15rem, 100%);
 }
 
 .msg-file-resource__actions {
@@ -1043,9 +1065,10 @@ function activateAttachment(attachment: DisplayAttachment) {
 .msg-file-chip {
   appearance: none;
   display: inline-flex;
+  flex: 1 1 auto;
   align-items: center;
   gap: 0.625rem;
-  min-width: min(15rem, 100%);
+  min-width: 0;
   max-width: min(100%, 24rem);
   padding: 0.4375rem 0.875rem 0.4375rem 0.4375rem;
   border: 1px solid var(--msg-obj-border);
@@ -1061,6 +1084,15 @@ function activateAttachment(attachment: DisplayAttachment) {
 .msg-file-chip:hover:not(:disabled) {
   border-color: var(--border-strong);
   box-shadow: var(--shadow-sm);
+}
+
+.msg-file-chip--reference {
+  cursor: default;
+}
+
+.msg-file-chip--reference:hover:not(:disabled) {
+  border-color: var(--msg-obj-border);
+  box-shadow: none;
 }
 
 .msg-file-chip:focus-visible {
@@ -1104,6 +1136,13 @@ function activateAttachment(attachment: DisplayAttachment) {
   color: var(--text-dim);
   line-height: 1.2;
   text-transform: uppercase;
+}
+
+.msg-file-chip__target {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 640px) {

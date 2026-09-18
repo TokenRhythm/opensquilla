@@ -316,6 +316,14 @@ class ToolContext:
         default=None, repr=False,
     )
 
+    # Durable, session-owned original -> editable file relationships. Append
+    # after every published field, including fields declared below methods.
+    workspace_files: list[dict[str, Any]] = field(default_factory=list)
+    attachment_working_files: dict[str, dict[str, Any]] = field(default_factory=dict)
+    persist_attachment_working_files: Callable[[], Awaitable[None]] | None = field(
+        default=None, repr=False,
+    )
+
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
     """Return whether ``ctx`` carries authority for a top-level Goal turn.

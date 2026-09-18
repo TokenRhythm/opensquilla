@@ -21,7 +21,12 @@ except ImportError:
     async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         return ctx
 
-    async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
+    async def finalize_squilla_router_capacity(
+        ctx: TurnContext,
+        *,
+        allow_compaction_retry: bool = False,
+        retry_after_compaction: bool = False,
+    ) -> TurnContext:
         return ctx
 
 

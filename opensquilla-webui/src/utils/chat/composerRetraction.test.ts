@@ -28,6 +28,22 @@ describe('composer retraction controller', () => {
     expect(controller.snapshot().lastScrollTop).toBe(100)
   })
 
+  it('measures the first reader gesture from the session landing position', () => {
+    const controller = createComposerRetractionController()
+    sample(controller, 0, { intent: null })
+    controller.syncBaseline(22_178)
+    expect(sample(controller, 21_778, { intent: 'up', bottomGap: 400 })).toBe(true)
+  })
+
+  it('reconciles a coalesced programmatic pin without expanding an already collapsed composer', () => {
+    const controller = createComposerRetractionController()
+    controller.syncBaseline(300)
+    expect(sample(controller, 260, { intent: 'up' })).toBe(true)
+    expect(controller.syncBaseline(500)).toBe(true)
+    expect(sample(controller, 500, { intent: null })).toBe(true)
+    expect(sample(controller, 510, { intent: 'down' })).toBe(false)
+  })
+
   it('accumulates slow upward travel instead of requiring one large scroll event', () => {
     const controller = createComposerRetractionController()
     sample(controller, 300, { intent: null })

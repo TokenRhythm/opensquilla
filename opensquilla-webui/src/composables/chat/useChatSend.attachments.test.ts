@@ -11,6 +11,9 @@ import {
 } from './useChatSteerDelivery'
 import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { useChatMessageActions } from './useChatMessageActions'
+import { useChatAttachments } from './useChatAttachments'
+import { useChatDraftPersistence } from './useChatDraftPersistence'
+import { attachmentDraftKey, type AttachmentDraftStore } from '@/utils/chat/attachmentDrafts'
 import type {
   Attachment,
   ChatMessage,
@@ -3074,6 +3077,139 @@ describe('useChatSend attachment payloads', () => {
         _source: { runMode: 'full' },
       }),
     )
+  })
+
+  it.each(['away', 'restored', 'restoring', 'edited-back', 'reselected', 'save-failed', 'consume-failed', 'new-task'])(
+    'consumes only the accepted skill/file draft with a late ACK: %s', async scenario => {
+    vi.stubGlobal('localStorage', memoryStorage())
+    const sessionKey = ref('agent:main:webchat:skill-source')
+    const inputText = ref('edit project notes')
+    const selectedSkills = ref([{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }])
+    const sourceScope = { identity: 'fixture-owner', sessionKey: sessionKey.value }
+    const saved = new Map<string, Attachment[]>()
+    const versions = new Map<string, string | undefined>()
+    let releaseLoad: (() => void) | undefined
+    let delayLoad = false
+    const draftStore: AttachmentDraftStore = {
+      load: async scope => saved.get(attachmentDraftKey(scope)) || [],
+      loadSnapshot: async scope => {
+        const snapshot = { attachments: (saved.get(attachmentDraftKey(scope)) || []).map(item => ({ ...item })),
+          revision: versions.get(attachmentDraftKey(scope)) }
+        if (delayLoad) await new Promise<void>(resolve => { releaseLoad = resolve })
+        return snapshot
+      },
+      save: async (scope, attachments, revision) => {
+        if (scenario === 'save-failed') throw new Error('Storage quota exceeded')
+        saved.set(attachmentDraftKey(scope), [...attachments])
+        versions.set(attachmentDraftKey(scope), revision)
+      },
+      consume: async (scope, revision, indexes) => {
+        if (scenario === 'consume-failed') throw new Error('Storage transaction unavailable')
+        const key = attachmentDraftKey(scope)
+        if (versions.get(key) !== revision) return false
+        saved.set(key, (saved.get(key) || []).filter((_item, index) => !indexes.includes(index)))
+        versions.delete(key)
+        return true
+      },
+    }
+    const scope = effectScope()
+    const attachments = scope.run(() => useChatAttachments(undefined, {
+      draftOwnerState: () => [inputText.value, selectedSkills.value],
+      draftScope: () => ({ ...sourceScope, sessionKey: sessionKey.value }), draftStore,
+    }))!
+    const textDraft = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills }))!
+    await vi.waitFor(() => expect(attachments.attachmentWorkBusy.value).toBe(false))
+    const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
+      name: 'notes.md', mime: 'text/markdown', size: 14 }
+    attachments.pendingAttachments.value = [{ kind: 'workspace', local_id: 1,
+      name: workspaceFile.name, mime: workspaceFile.mime, workspaceFile }]
+    let accept!: (response: { sessionKey: string }) => void
+    const call = vi.fn(() => new Promise<{ sessionKey: string }>(resolve => { accept = resolve }))
+    const composerRevision = ref(0)
+    scope.run(() => watch([inputText, selectedSkills, attachments.pendingAttachments], () => { composerRevision.value += 1 }, { deep: true, flush: 'sync' }))
+    const captureConsumption = vi.fn(attachments.captureDraftConsumption)
+    const { api } = makeOptions({ sessionKey, inputText, selectedSkills, composerRevision,
+      pendingSessionIntent: ref(scenario === 'new-task' ? 'new_chat' : null),
+      pendingAttachments: attachments.pendingAttachments, consumeAcceptedDraft: textDraft.consumeAcceptedDraft,
+      captureAttachmentDraftConsumption: captureConsumption,
+      rpc: { call }, methodAvailability: () => true })
+    try {
+      const sending = api.onSend()
+      await vi.waitFor(() => expect(call).toHaveBeenCalledOnce())
+      expect(call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+        selectedSkills: selectedSkills.value, workspaceFiles: [workspaceFile],
+      }))
+      const navigates = !['save-failed', 'consume-failed', 'new-task'].includes(scenario)
+      if (navigates) {
+        attachments.retireAttachments()
+        sessionKey.value = 'agent:main:webchat:skill-destination'
+        await nextTick()
+        await attachments.flushAttachmentDraft()
+        expect(saved.get(attachmentDraftKey(sourceScope))).toHaveLength(1)
+      }
+      if (navigates && scenario !== 'away') {
+        attachments.retireAttachments()
+        delayLoad = scenario === 'restoring'
+        sessionKey.value = sourceScope.sessionKey
+        await nextTick()
+        if (delayLoad) {
+          await vi.waitFor(() => expect(releaseLoad).toBeTypeOf('function'))
+          expect(attachments.attachmentWorkBusy.value).toBe(true)
+        } else {
+          await vi.waitFor(() => expect(attachments.attachmentWorkBusy.value).toBe(false))
+          expect(attachments.pendingAttachments.value).toHaveLength(1)
+          expect(captureConsumption.mock.results[0]?.value?.isRestoredCurrent()).toBe(true)
+        }
+        expect(inputText.value).toBe('edit project notes')
+        expect(selectedSkills.value[0]?.instanceId).toBe('skill:tables')
+        if (scenario === 'edited-back') {
+          inputText.value = 'an edited draft'
+          inputText.value = 'edit project notes'
+        } else if (scenario === 'reselected') {
+          attachments.pendingAttachments.value = [{ ...attachments.pendingAttachments.value[0]!, local_id: 2 }]
+        }
+      }
+      accept({ sessionKey: sourceScope.sessionKey })
+      await sending
+      if (delayLoad) releaseLoad!()
+      await attachments.flushAttachmentDraft()
+      const modified = scenario === 'edited-back' || scenario === 'reselected'
+      await vi.waitFor(() => expect(attachments.pendingAttachments.value).toHaveLength(modified ? 1 : 0))
+      if (scenario !== 'save-failed' && scenario !== 'consume-failed') {
+        expect(saved.get(attachmentDraftKey(sourceScope))).toHaveLength(modified ? 1 : 0)
+      }
+      if (!modified && scenario !== 'away') {
+        expect(inputText.value).toBe('')
+        expect(selectedSkills.value).toEqual([])
+      }
+      expect(sessionKey.value).toBe(scenario === 'away' ? 'agent:main:webchat:skill-destination' : sourceScope.sessionKey)
+    } finally { scope.stop(); vi.unstubAllGlobals() }
+  })
+
+  it.each([false, true])('sends workspace and imported files together with selected skills: %s', async withSkills => {
+    const selectedSkills = ref(withSkills
+      ? [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }] : [])
+    const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
+      name: 'notes.md', mime: 'text/markdown', size: 14 }
+    const pendingAttachments = ref<Attachment[]>([
+      { kind: 'workspace', local_id: 1, name: workspaceFile.name,
+        mime: workspaceFile.mime, workspaceFile },
+      { kind: 'staged', local_id: 2, name: 'imported.pdf', mime: 'application/pdf',
+        file_uuid: 'fixture-upload-id' },
+    ])
+    const { api, options, rpc } = makeOptions({ pendingAttachments, selectedSkills, methodAvailability: () => true })
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      workspaceFiles: [workspaceFile],
+      ...(withSkills ? { selectedSkills: [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }] } : {}),
+      attachments: [{ type: 'application/pdf', mime: 'application/pdf',
+        name: 'imported.pdf', file_uuid: 'fixture-upload-id' }],
+    }))
+    expect(options.messages.value[0]?.attachments?.[0]).toMatchObject({
+      kind: 'file', name: workspaceFile.name, workspaceFile,
+    })
+    expect(pendingAttachments.value).toEqual([])
+    expect(selectedSkills.value).toEqual([])
   })
 
   it('serializes only sendable attachments and leaves failed attachments in the composer', async () => {

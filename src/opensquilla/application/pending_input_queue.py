@@ -41,6 +41,7 @@ class PendingInputProjection(TypedDict, total=False):
     message: str
     intent: str | None
     attachments: list[PendingInputAttachmentProjection]
+    workspaceFiles: list[dict[str, Any]]
     position: int
     revision: int
     createdAt: int

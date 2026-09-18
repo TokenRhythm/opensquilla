@@ -517,7 +517,7 @@ async def test_current_turn_pdf_is_materialized_to_workspace_path(
     assert workspace_paths[0].read_bytes() == pdf_bytes
 
     sent_text = _all_provider_text(text_provider.calls[-1]["messages"])
-    assert "Machine Learning" in sent_text
+    assert "Machine Learning" not in sent_text
     assert "attachment available: L11 RL.pdf (application/pdf" in sent_text
     assert ".opensquilla/attachments/" in sent_text
     assert workspace_paths[0].name in sent_text
@@ -566,7 +566,7 @@ async def test_current_turn_inline_pdf_is_materialized_to_workspace_path(
     assert workspace_paths[0].read_bytes() == pdf_bytes
 
     sent_text = _all_provider_text(text_provider.calls[-1]["messages"])
-    assert "Machine Learning" in sent_text
+    assert "Machine Learning" not in sent_text
     assert "attachment available: L11 RL.pdf (application/pdf" in sent_text
     assert ".opensquilla/attachments/" in sent_text
     assert workspace_paths[0].name in sent_text

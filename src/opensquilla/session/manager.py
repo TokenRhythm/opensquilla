@@ -90,6 +90,7 @@ from opensquilla.turn_outcome_projection import (
 if TYPE_CHECKING:
     from opensquilla.execution_workspaces import PreparedExecutionWorkspace
     from opensquilla.provider.types import ProviderRequestCorrelation
+    from opensquilla.tools.types import ToolContext
 
 _SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
 _MODEL_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
@@ -737,6 +738,16 @@ def _fork_material_references(
             sha = _valid_sha256(value.get("sha256_ref"))
             if sha is None and value.get("kind") == "attachment_ref":
                 sha = _valid_sha256(value.get("sha256") or value.get("material_id"))
+            if sha is None and isinstance(value.get("data"), str) and (
+                value.get("mime") or value.get("type")
+            ):
+                import base64
+                import hashlib
+
+                try:
+                    sha = hashlib.sha256(base64.b64decode(value["data"], validate=True)).hexdigest()
+                except (ValueError, TypeError):
+                    pass
             if sha is not None:
                 attachment_hashes.add(sha)
 
@@ -806,6 +817,9 @@ class SessionManager:
         checkpoint_workspace_dir: str | Path | None = None,
         media_root: str | Path | None = None,
         model_routing_mode_provider: Callable[[], str] | None = None,
+        attachment_fork_context_resolver: (
+            Callable[[SessionNode], Awaitable[ToolContext]] | None
+        ) = None,
         execution_workspace_factory: (
             Callable[
                 [SessionNode], Awaitable[dict[str, Any] | PreparedExecutionWorkspace | None]
@@ -828,6 +842,7 @@ class SessionManager:
         self._media_root = Path(media_root).expanduser() if media_root is not None else None
         self._model_routing_mode_provider = model_routing_mode_provider
         self._execution_workspace_factory = execution_workspace_factory
+        self._attachment_fork_context_resolver = attachment_fork_context_resolver
         # In-process epoch cache so _emit_to_subscribers can
         # read the current epoch without a DB round-trip on every event.
         # Invalidated (updated) whenever increment_epoch commits a new value.
@@ -1887,6 +1902,7 @@ class SessionManager:
             model_routing_revision=0,
         )
 
+        material_references: tuple[set[str], set[str]] | None = None
         if fork_transcript:
             is_prefix_fork = bool(fork_before_message_id or fork_through_turn_id)
             parent_coverage = await self._storage.get_canonical_transcript_coverage(
@@ -2004,7 +2020,7 @@ class SessionManager:
             if max_fork_tokens is None or parent_tokens <= max_fork_tokens:
                 material_references = (
                     _fork_material_references(parent_entries)
-                    if fork_through_turn_id
+                    if is_prefix_fork
                     else None
                 )
                 if is_prefix_fork:
@@ -2127,6 +2143,11 @@ class SessionManager:
                     material_references=material_references,
                 )
 
+        if child.forked_from_parent:
+            await self._fork_attachment_working_files(
+                parent, child,
+                allowed_hashes=material_references[0] if material_references else None,
+            )
         await self._storage.upsert_session(child)
         return child
 
@@ -2240,6 +2261,9 @@ class SessionManager:
             )
             for entry in prefix_entries
         )
+        self._prepare_fork_working_files(
+            parent, child, allowed_hashes=_fork_material_references(prefix_entries)[0],
+        )
         return PreparedSessionIntent(
             node=child,
             action="fork",
@@ -2248,6 +2272,89 @@ class SessionManager:
             previous_node=parent,
             initial_transcript_entries=copied_entries,
         )
+
+    @staticmethod
+    def _prepare_fork_working_files(
+        parent: SessionNode, child: SessionNode, *, allowed_hashes: set[str],
+    ) -> None:
+        """Reserve metadata only; accepted fork material settlement copies bytes.
+
+        Unavailable copies remain explicit unavailable working targets. Recovery
+        must never silently substitute the original bytes for edited content.
+        """
+        from opensquilla.attachment_workspace import _safe_path_segment
+
+        parent_map = (parent.origin or {}).get("attachment_working_files")
+        if not isinstance(parent_map, dict):
+            return
+        child_map = {}
+        scope = _safe_path_segment(child.session_id, fallback="session")
+        for key, entry in parent_map.items():
+            if not isinstance(entry, dict) or not entry.get("path"):
+                continue
+            if entry.get("sha256") not in allowed_hashes:
+                continue
+            filename = Path(key).name
+            child_key = Path(".opensquilla", "attachments", scope, filename).as_posix()
+            child_map[child_key] = {
+                **entry, "session_id": child.session_id,
+                "path": Path(".opensquilla", "attachments", scope, "working", filename).as_posix(),
+            }
+        if child_map:
+            child.origin = {**(child.origin or {}), "attachment_working_files": child_map}
+
+    async def _fork_attachment_working_files(
+        self, parent: SessionNode, child: SessionNode, *, allowed_hashes: set[str] | None,
+    ) -> None:
+        from opensquilla.attachment_working_files import fork_attachment_working_files
+        from opensquilla.workspace_files import session_workspace_binding
+
+        parent_map = (parent.origin or {}).get("attachment_working_files")
+        if not isinstance(parent_map, dict) or not any(
+            isinstance(entry, dict) and entry.get("path") for entry in parent_map.values()
+        ):
+            return
+        hashes = allowed_hashes if allowed_hashes is not None else {
+            sha for entry in parent_map.values() if isinstance(entry, dict)
+            if isinstance(sha := entry.get("sha256"), str)
+        }
+        self._prepare_fork_working_files(parent, child, allowed_hashes=hashes)
+        resolver = self._attachment_fork_context_resolver
+        if resolver is None:
+            # Embedded managers cannot reconstruct current policy from saved origin.
+            # Retain explicit unavailable targets rather than bypassing authorization.
+            return
+        source_context = await resolver(parent)
+        target_context = await resolver(child)
+        # Re-resolve current authority. A revoked/rebound workspace never turns
+        # an old relative working path into a different project's file.
+        if parent.workspace_id or parent.execution_workspace is not None:
+            _, source_root = await session_workspace_binding(parent, self._storage)
+            _, target_root = await session_workspace_binding(child, self._storage)
+        else:
+            if not source_context.workspace_dir or not target_context.workspace_dir:
+                raise ValueError("attachment working files require a valid fork workspace")
+            source_root = Path(source_context.workspace_dir).resolve(strict=True)
+            target_root = Path(target_context.workspace_dir).resolve(strict=True)
+        if (
+            Path(source_context.workspace_dir or "").resolve() != source_root
+            or Path(target_context.workspace_dir or "").resolve() != target_root
+        ):
+            raise PermissionError("attachment fork workspace authority changed")
+        from opensquilla.attachment_fork import copy_fork_working_file
+
+        async def copy_file(source: Path, target: Path) -> None:
+            await copy_fork_working_file(
+                source, target, source_context=source_context, target_context=target_context,
+            )
+
+        child_map = await fork_attachment_working_files(
+            parent_map, source_workspace=source_root,
+            destination_workspace=target_root, source_session_id=parent.session_id,
+            child_session_id=child.session_id, allowed_hashes=allowed_hashes,
+            copy_file=copy_file,
+        )
+        child.origin = {**(child.origin or {}), "attachment_working_files": child_map}
 
     async def _copy_fork_materials(
         self,
@@ -2325,6 +2432,39 @@ class SessionManager:
                 actor=Actor(ActorKind.SYSTEM, "session-fork"),
             )
             await asyncio.to_thread(_copy_attachments)
+            child = await self._storage.get_session(target_session_key)
+            if child is not None and child.session_id == target_session_id:
+                parent = await self._storage.get_session(child.parent_session_key or "")
+                if parent is not None and parent.session_id == source_session_id:
+                    entries = await self._storage.get_canonical_transcript(target_session_id)
+                    await self._fork_attachment_working_files(
+                        parent, child, allowed_hashes=_fork_material_references(entries)[0],
+                    )
+                    current = await self._storage.get_session(target_session_key)
+                    if current is None:
+                        raise StaleEpochError("Fork target disappeared before material settlement")
+                    _require_compatible_session_owner(
+                        current, expected_session_id=child.session_id,
+                        expected_session_epoch=int(child.epoch or 0),
+                        operation="fork attachment material settlement",
+                    )
+                    origin = dict(current.origin or {})
+                    copied = (child.origin or {}).get("attachment_working_files")
+                    if isinstance(copied, dict):
+                        working_files = dict(origin.get("attachment_working_files") or {})
+                        working_files.update(copied)
+                        origin["attachment_working_files"] = working_files
+                    await self.update(
+                        target_session_key, origin=origin,
+                        expected_session_id=child.session_id,
+                        expected_session_epoch=int(child.epoch or 0),
+                    )
+        except (StaleEpochError, KeyError):
+            _log.info(
+                "session.fork.material_copy_stale",
+                source_session_id=source_session_id,
+                target_session_id=target_session_id,
+            )
         except Exception:
             _log.warning(
                 "session.fork.material_copy_failed",

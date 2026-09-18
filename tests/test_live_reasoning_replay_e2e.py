@@ -319,6 +319,46 @@ def test_live_cli_suppresses_provider_output_and_restores_environment(monkeypatc
     assert roots and not roots[0].exists()
 
 
+def test_shared_relay_is_installed_after_clean_environment_and_uses_only_placeholder(
+    tmp_path, monkeypatch, capsys,
+):
+    import os
+
+    from scripts import live_tokenrhythm_transport
+
+    placeholder = "live-budget-placeholder-synthetic-replay-acceptance"
+    ready = tmp_path / "relay.json"
+    ready.write_text(json.dumps({"enabled": True, "mode": "functional",
+                                "base_url": "http://127.0.0.1:18791/v1",
+                                "client_key": placeholder}))
+    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "synthetic-unavailable-ambient-key")
+    monkeypatch.setenv("UNRELATED_SECRET", "synthetic-unrelated")
+    installed = []
+
+    def install():
+        assert os.environ["TOKENRHYTHM_API_KEY"] == placeholder
+        assert os.environ["OPENSQUILLA_LIVE_TRANSPORT"] == "1"
+        assert "UNRELATED_SECRET" not in os.environ
+        installed.append(True)
+        return lambda: installed.append(False)
+
+    async def run(root, **kwargs):
+        assert installed == [True]
+        assert kwargs["api_key"] == placeholder
+        assert kwargs["observer"].max_calls == 60
+        return {"ok": True, "provider": "tokenrhythm"}
+
+    monkeypatch.setattr(live_tokenrhythm_transport, "install_from_env", install)
+    monkeypatch.setattr(harness, "run_case", run)
+    assert harness.main([
+        "--live", "--provider", "tokenrhythm", "--model", "deepseek-v4-flash-0731",
+        "--relay-ready", str(ready),
+    ]) == 0
+    assert installed == [True, False]
+    assert os.environ["TOKENRHYTHM_API_KEY"] == "synthetic-unavailable-ambient-key"
+    assert placeholder not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("variant", [
     "basic", "tools", "replay_off", "model_switch", "repeated", "truncated", "long_reasoning",
 ])

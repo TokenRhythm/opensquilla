@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.engine.capacity_admission import ModelRequestCapacityAssessment
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.steps.squilla_router import (
@@ -235,8 +236,8 @@ async def test_retired_artifact_metadata_preserves_configured_image_route_and_fa
 ) -> None:
     _catalog_evidence(monkeypatch, supported=tuple(f"configured/c{index}" for index in range(4)))
     monkeypatch.setattr(
-        "opensquilla.engine.steps.squilla_router.model_has_request_capacity",
-        lambda **_: True,
+        "opensquilla.engine.steps.squilla_router.assess_model_request_capacity",
+        lambda **_: ModelRequestCapacityAssessment("fits", 1_000, 100_000),
     )
     ctx = _context(
         {
@@ -282,8 +283,8 @@ async def test_image_shortcut_reselects_active_provider_when_mismatch_is_vetoed(
 ) -> None:
     _catalog_evidence(monkeypatch, supported=("foreign/vision", "configured/vision"))
     monkeypatch.setattr(
-        "opensquilla.engine.steps.squilla_router.model_has_request_capacity",
-        lambda **_: True,
+        "opensquilla.engine.steps.squilla_router.assess_model_request_capacity",
+        lambda **_: ModelRequestCapacityAssessment("fits", 1_000, 100_000),
     )
     ctx = _context(
         {

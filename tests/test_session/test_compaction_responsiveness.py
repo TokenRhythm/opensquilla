@@ -33,7 +33,7 @@ def test_chunk_projection_work_is_bounded(monkeypatch, wire_round_limit):
         measured.append(group)
         return len(group)
 
-    def request_fits(chunk):
+    def request_fits(chunk, _later):
         nonlocal projected_entries
         projected_entries += len(chunk)
         return len(chunk) <= wire_round_limit * 2
@@ -61,7 +61,9 @@ def test_oversized_tool_round_is_preserved_for_send_admission(monkeypatch):
     entries = _rounds(1) + tool_round + _rounds(1)
     monkeypatch.setattr(compaction, "_compaction_input_tokens", lambda group: len(group))
 
-    chunks = compaction._chunk_entries(entries, 2, request_fits=lambda chunk: len(chunk) <= 2)
+    chunks = compaction._chunk_entries(
+        entries, 2, request_fits=lambda chunk, _later: len(chunk) <= 2,
+    )
 
     assert chunks == [entries[:2], tool_round, entries[-2:]]
     assert [entry for chunk in chunks for entry in chunk] == entries

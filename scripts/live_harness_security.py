@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from opensquilla.private_paths import apply_windows_private_dacl
 from opensquilla.provider.registry import get_provider_spec, list_provider_specs
 
 _ASSIGNMENT_RE = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=(?P<value>.*)$")
@@ -409,6 +410,27 @@ def report_contains_secret(
     return any(secret in serialized for secret in _secret_values(secrets))
 
 
+def restrict_private_file_permissions(path: Path, *, descriptor: int | None = None) -> None:
+    """Apply private permissions before an owned output receives sensitive data."""
+
+    metadata = os.fstat(descriptor) if descriptor is not None else path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError("private harness output must be a regular file")
+    if os.name == "nt":
+        if not metadata.st_ino:
+            raise OSError("private harness output identity is unavailable")
+        apply_windows_private_dacl(
+            path,
+            directory=False,
+            expected_device=int(metadata.st_dev),
+            expected_inode=int(metadata.st_ino),
+        )
+    elif descriptor is None:
+        path.chmod(0o600)
+    else:
+        os.fchmod(descriptor, 0o600)
+
+
 def write_safe_report(
     path: Path | str,
     report: Any,
@@ -416,7 +438,7 @@ def write_safe_report(
 ) -> Any:
     """Atomically write a redacted, credential-scanned JSON report.
 
-    The temporary file is mode 0600.  If either the in-memory or on-disk scan
+    The temporary file uses mode 0600 or a private Windows DACL. If the in-memory or on-disk scan
     detects a credential, the temporary artifact is removed and the operation
     fails without replacing the requested report path.
     """
@@ -438,7 +460,7 @@ def write_safe_report(
     )
     temporary = Path(temporary_name)
     try:
-        os.chmod(temporary, 0o600)
+        restrict_private_file_permissions(temporary, descriptor=descriptor)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             descriptor = -1
             stream.write(serialized)

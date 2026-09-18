@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from opensquilla.engine.runtime import TurnRunner
@@ -26,42 +26,32 @@ def _attachment(media_type: str, payload: bytes) -> dict[str, str]:
     }
 
 
-def test_text_success_fact_contains_no_file_content_or_name() -> None:
+def test_unparsed_upload_does_not_claim_parse_success(tmp_path: Path) -> None:
     facts: list[FileParseReliabilityFacts] = []
-
+    payload = b"SYNTHETIC file body"
     TurnRunner._build_attachment_messages(
-        "PRIVATE prompt",
-        [_attachment("text/plain", b"PRIVATE file body")],
+        "Inspect when needed", [_attachment("text/plain", payload)],
+        workspace_dir=tmp_path, session_id="synthetic-session",
         file_parse_fact_sink=facts.append,
     )
-
-    assert len(facts) == 1
-    assert facts[0].file_type is FileType.TEXT
-    assert facts[0].size_bucket is FileSizeBucket.LT_100_KIB
-    assert facts[0].outcome is ResultOutcome.SUCCESS
-    assert facts[0].error_code is None
-    serialized = repr(asdict(facts[0]))
-    assert "PRIVATE" not in serialized
-    assert "name" not in serialized
-    assert "body" not in serialized
+    assert facts == []
+    path = next(tmp_path.rglob("*-PRIVATE-file-name.txt"))
+    assert path.read_bytes() == payload
 
 
-def test_invalid_utf8_and_malformed_pdf_use_closed_error_codes() -> None:
+def test_unparsed_upload_does_not_claim_parser_failure(tmp_path: Path) -> None:
     facts: list[FileParseReliabilityFacts] = []
-
+    payloads = [b"\xff\xfe", b"not a pdf"]
     TurnRunner._build_attachment_messages(
-        "prompt",
-        [
-            _attachment("text/plain", b"\xff\xfe"),
-            _attachment("application/pdf", b"not a pdf"),
-        ],
+        "Inspect when needed", [
+            _attachment("text/plain", payloads[0]),
+            _attachment("application/pdf", payloads[1]),
+        ], workspace_dir=tmp_path, session_id="synthetic-session",
         file_parse_fact_sink=facts.append,
     )
-
-    assert [(fact.file_type, fact.outcome, fact.error_code) for fact in facts] == [
-        (FileType.TEXT, ResultOutcome.FAIL, FileParseErrorCode.INVALID_UTF8),
-        (FileType.PDF, ResultOutcome.FAIL, FileParseErrorCode.MALFORMED_PDF),
-    ]
+    assert facts == []
+    files = [path for path in tmp_path.rglob("*") if path.is_file()]
+    assert sorted(path.read_bytes() for path in files) == sorted(payloads)
 
 
 async def test_attachment_stage_returns_worker_facts_to_event_loop() -> None:

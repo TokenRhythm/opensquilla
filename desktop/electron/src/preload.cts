@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
@@ -22,6 +22,17 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   saveArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:save', payload),
   sourceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:source-file:action', payload),
+  chooseAttachments: (request: unknown) => ipcRenderer.invoke('desktop:attachments:choose', request),
+  selectAttachmentFile: (request: unknown, file: File) => {
+    // Electron validates the actual browser File backing store. Constructed
+    // Files (screenshots/paste blobs) have no path and use ordinary uploads.
+    const path = webUtils.getPathForFile(file)
+    return path ? ipcRenderer.invoke('desktop:attachments:select-file', request, path) : Promise.resolve(null)
+  },
+  importAttachmentSelection: (request: unknown, token: string) => (
+    ipcRenderer.invoke('desktop:attachments:import', request, token)
+  ),
+  cancelAttachmentSelections: () => ipcRenderer.invoke('desktop:attachments:cancel'),
   chooseProjectDirectory: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workspace:choose-directory', payload)
   ),

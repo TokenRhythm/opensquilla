@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -16,6 +16,7 @@ from opensquilla.session.attachment_manifest import build_attachment_manifest
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionIntent
 from opensquilla.session.storage import SessionStorage, StaleEpochError
+from opensquilla.tools.types import ToolContext
 
 
 @pytest_asyncio.fixture
@@ -71,6 +72,127 @@ async def test_attachment_helpers_use_admitted_owner_without_resolving_key(
     states = await manager.get_context_states(node.session_key, **owner)
     assert len(states) == 1
     assert states[0].session_id == node.session_id
+
+
+async def test_attachment_workfile_context_restores_mapping_and_merges_origin(
+    replay_session: Any,
+) -> None:
+    runner, manager, _, node, _, _ = replay_session
+    source = f".opensquilla/attachments/{node.session_id}/original.txt"
+    target = f".opensquilla/attachments/{node.session_id}/working/original.txt"
+    record = {"path": target, "sha256": "a" * 64, "session_id": node.session_id}
+    caller = ToolContext()
+    context = await runner._with_artifact_context(caller, node.session_key)
+    context.attachment_working_files[source] = record
+    await manager.update(node.session_key, origin={"synthetic_other_field": "preserve"})
+    assert context.persist_attachment_working_files is not None
+    await context.persist_attachment_working_files()
+
+    restored = await runner._with_artifact_context(caller, node.session_key)
+    assert restored.attachment_working_files == {source: record}
+    assert restored.attachment_working_files is not context.attachment_working_files
+    assert caller.attachment_working_files == {}
+    saved = await manager.get_session(node.session_key)
+    assert saved.origin["synthetic_other_field"] == "preserve"
+
+
+async def test_attachment_workfile_context_without_owner_drops_caller_bindings() -> None:
+    manager = MagicMock()
+    manager.get_session = AsyncMock(return_value=None)
+    manager.update = AsyncMock()
+    runner = TurnRunner(provider_selector=None, session_manager=manager)
+    stale_files = {"old-source": {"path": "old-working-copy", "session_id": "retired"}}
+    caller = ToolContext(
+        attachment_working_files=stale_files,
+        persist_attachment_working_files=AsyncMock(),
+    )
+
+    context = await runner._with_artifact_context(caller, "agent:main:legacy")
+
+    assert context.session_epoch is None
+    assert context.attachment_working_files == {}
+    assert context.persist_attachment_working_files is None
+    assert caller.attachment_working_files == stale_files
+    manager.update.assert_not_awaited()
+
+
+async def test_attachment_workfile_context_propagates_durable_lookup_failure(
+    replay_session: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, manager, _, node, _, _ = replay_session
+    get_session = manager.get_session
+    identity_resolved = False
+
+    async def fail_after_identity(key: str) -> Any:
+        nonlocal identity_resolved
+        if identity_resolved:
+            raise RuntimeError("synthetic durable lookup failure")
+        identity_resolved = True
+        return await get_session(key)
+
+    monkeypatch.setattr(manager, "get_session", fail_after_identity)
+    with pytest.raises(RuntimeError, match="synthetic durable lookup failure"):
+        await runner._with_artifact_context(ToolContext(), node.session_key)
+
+
+@pytest.mark.parametrize("replacement", ["reset", "epoch"])
+async def test_attachment_workfile_save_rejects_retired_session(
+    replay_session: Any, replacement: str,
+) -> None:
+    runner, manager, other_manager, node, _, _ = replay_session
+    context = await runner._with_artifact_context(ToolContext(), node.session_key)
+    context.attachment_working_files["synthetic-source"] = {
+        "path": "synthetic-working-copy", "sha256": "a" * 64,
+        "session_id": node.session_id,
+    }
+    if replacement == "reset":
+        await other_manager.apply_intent(node.session_key, SessionIntent.RESET_SAME_KEY)
+    else:
+        await other_manager.storage.increment_epoch(node.session_key)
+    assert context.persist_attachment_working_files is not None
+    with pytest.raises(StaleEpochError, match="workfile save"):
+        await context.persist_attachment_working_files()
+    saved = await manager.get_session(node.session_key)
+    assert not (saved.origin or {}).get("attachment_working_files")
+
+
+async def test_workspace_reference_replay_marks_deleted_live_file_unavailable(
+    replay_session: Any, tmp_path: Path,
+) -> None:
+    from opensquilla.execution_workspaces import configured_execution_workspace
+    from opensquilla.session.compaction import _summarize_if_envelope
+
+    runner, manager, _, node, _, _ = replay_session
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    source = workspace / "report.txt"
+    source.write_text("Synthetic current file body.")
+    binding = configured_execution_workspace(workspace)
+    await manager.update(node.session_key, execution_workspace=binding)
+    ref = {
+        "workspaceId": binding["id"], "relativePath": "report.txt",
+        "name": "report.txt", "mime": "text/plain",
+    }
+    envelope = json.dumps({"text": "Edit this report.", "workspace_files": [ref]})
+    entry = await manager.append_message(node.session_key, "user", envelope)
+    context = await runner._with_artifact_context(ToolContext(
+        run_mode="full", workspace_dir=str(workspace), workspace_files=[ref],
+    ), node.session_key)
+    blocks, descriptors = await runner._workspace_file_input_blocks(context)
+    assert descriptors == [{"type": "text/plain", "name": "report.txt"}]
+    assert "live project file" in blocks[0].text
+    assert "Synthetic current file body" not in blocks[0].text
+    source.unlink()
+    with pytest.raises(FileNotFoundError):
+        await runner._workspace_file_input_blocks(context)
+    replay = await runner._workspace_file_history_projection([entry], context, node.session_key)
+    text = runner._maybe_unpack_attachments(replay[0].content)
+    assert "live project file unavailable" in text
+    assert binding["id"] in text
+    assert entry.content == envelope
+    compacted = _summarize_if_envelope(envelope)
+    assert binding["id"] in compacted and "report.txt" in compacted
+    assert "historical contents are not retained" in compacted
 
 
 @pytest.mark.parametrize("operation", ["canonical", "validate", "persist"])

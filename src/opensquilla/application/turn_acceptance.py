@@ -227,6 +227,11 @@ async def _accept_turn_in_scope(
 ) -> AdmitTurnResult:
     key = command.session_key
     message_text = command.message
+    workspace_files = list(command.workspace_files)
+    if workspace_files and (not ports.is_owner or not command.source.is_web):
+        raise AdmissionError(
+            "WORKSPACE_FILES_FORBIDDEN", "Workspace files require an owner Web session.",
+        )
     page_context = command.page_context
     if page_context is not None and (not ports.is_owner or not command.source.is_web):
         raise AdmissionError(
@@ -892,6 +897,8 @@ async def _accept_turn_in_scope(
     )
     agent_id = prepared_route.agent_id
     route_envelope = prepared_route.envelope
+    if workspace_files:
+        route_envelope.metadata["workspace_files"] = workspace_files
     turn_id = prepared_route.turn_id
     mode_resolution = prepared_route.mode_resolution
     guest_profile = prepared_route.guest_profile
@@ -1131,7 +1138,7 @@ async def _accept_turn_in_scope(
     if prepared_acceptance:
         persist_content = message_text
         if (
-            raw_attachments or display_text is not None
+            raw_attachments or workspace_files or display_text is not None
             or page_context is not None or command.selected_skills
         ):
             if raw_attachments and hasattr(ports.sessions, "stamp_user_text"):
@@ -1147,6 +1154,7 @@ async def _accept_turn_in_scope(
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
                 page_context=page_context,
+                **({"workspace_files": workspace_files} if workspace_files else {}),
                 **({"selected_skills": list(command.selected_skills)}
                    if command.selected_skills else {}),
             )
@@ -1161,6 +1169,7 @@ async def _accept_turn_in_scope(
         )
         if (
             not raw_attachments
+            and not workspace_files
             and display_text is None
             and page_context is None
             and not command.selected_skills
@@ -1956,7 +1965,7 @@ async def _accept_turn_in_scope(
         if callable(get_transcript):
             fresh_user_session = not bool(await get_transcript(key))
         if (
-            raw_attachments or display_text is not None
+            raw_attachments or workspace_files or display_text is not None
             or page_context is not None or command.selected_skills
         ):
             # Stamp up-front so both the stored envelope and the LLM path agree.
@@ -1974,6 +1983,7 @@ async def _accept_turn_in_scope(
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
                 page_context=page_context,
+                **({"workspace_files": workspace_files} if workspace_files else {}),
                 **({"selected_skills": list(command.selected_skills)}
                    if command.selected_skills else {}),
             )

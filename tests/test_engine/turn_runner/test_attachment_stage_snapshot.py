@@ -172,10 +172,8 @@ def _text_attachment(name: str, body: str) -> dict[str, str]:
 
 
 def _pdf_attachment() -> dict[str, str]:
-    # A minimal-but-malformed PDF blob. The extractor will fail and the
-    # build path will fold the failure into the "[attachment unavailable:
-    # PDF text could not be extracted: ...]" placeholder text block —
-    # identically in both modes.
+    # A malformed PDF still reaches the provider as metadata. Admission never
+    # imports a PDF parser; explicit tools inspect the retained original.
     return {
         "type": "application/pdf",
         "name": "tiny.pdf",
@@ -249,10 +247,10 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
         expected_extra_is_none=False,
         expected_kinds=("ContentBlockText", "ContentBlockImage", "ContentBlockText"),
     ),
-    # PDF text-extraction failure folds into a ContentBlockText placeholder —
-    # same block kinds tuple in both modes.
+    # Ordinary file metadata is one text block, including an unavailable path
+    # when this harness has no workspace.
     _case(
-        "pdf_attachment_text_extraction",
+        "pdf_attachment_metadata",
         message="summarize",
         attachments=[_pdf_attachment()],
         expected_extra_is_none=False,

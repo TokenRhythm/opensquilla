@@ -1,3 +1,4 @@
+import { normalizeWorkspaceFileReferences } from '@/utils/chat/attachments'
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
 import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
 import { normalizePageContext } from '@/types/pageContext'
@@ -123,6 +124,8 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
     ...(message !== undefined ? { message } : {}),
     ...(displayText !== undefined ? { displayText } : {}),
     ...(attachments !== undefined ? { attachments } : {}),
+    ...(Array.isArray(value.workspaceFiles)
+      ? { workspaceFiles: normalizeWorkspaceFileReferences(value.workspaceFiles) } : {}),
     ...(position !== undefined ? { position } : {}),
     ...(revision !== undefined ? { revision } : {}),
     ...(requestFingerprint !== undefined ? { requestFingerprint } : {}),

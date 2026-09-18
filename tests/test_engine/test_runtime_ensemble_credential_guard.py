@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from opensquilla.engine.capacity_admission import ModelRequestCapacityAssessment
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.gateway.config import GatewayConfig, SquillaRouterConfig
 from opensquilla.provider import (
@@ -424,10 +425,13 @@ async def test_attachment_capacity_bypass_keeps_routed_model_without_building_en
 
     monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", route_to_capable_model)
     capacity_check = Mock(side_effect=lambda deployment, metadata, **kwargs: (
-        deployment.model == routed_model
+        ModelRequestCapacityAssessment(
+            "fits" if deployment.model == routed_model else "known_capacity_request_too_large",
+            200_000, 250_000 if deployment.model == routed_model else 100_000,
+        )
     ))
     monkeypatch.setattr(
-        "opensquilla.engine.selector_override.provider_config_has_request_capacity",
+        "opensquilla.engine.selector_override._provider_config_capacity_assessment",
         capacity_check,
     )
     build_ensemble = Mock(

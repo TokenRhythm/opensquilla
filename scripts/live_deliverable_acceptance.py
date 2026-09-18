@@ -160,7 +160,15 @@ class BoundedRelay(BudgetRelay):
             ):
                 raise BudgetRejectedError("acceptance_output_limit")
             self.calls += 1
-        with super().forward(body, headers) as response:
+        with contextlib.ExitStack() as stack:
+            try:
+                response = stack.enter_context(super().forward(body, headers))
+            except BudgetRejectedError:
+                # The parent can reject a reservation before any upstream dispatch.
+                # Keep the relay counter aligned with requests the ledger accepted.
+                with self._lock:
+                    self.calls -= 1
+                raise
             yield response
 
 

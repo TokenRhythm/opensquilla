@@ -689,6 +689,7 @@
       @expand="expandComposer"
       @composition-change="composing = $event; !$event && handleSlashInput()"
       @beforeinput="onTextareaBeforeInput"
+      :choose-attachments="chooseAttachments"
       @file-change="onFileInputChange"
       @input="onTextareaInput"
       @keydown="onTextareaKeydown"
@@ -1863,11 +1864,58 @@ watch(
   available => setStreamConnectionAvailable(available),
   { immediate: true },
 )
-const chatAttachments = useChatAttachments(artifactWorkbench.content)
+const nativeAttachmentSession = ref<{ key: string; epoch: number } | null>(null)
+watch(sessionKey, () => { nativeAttachmentSession.value = null }, { flush: 'sync' })
+const attachmentDraftIdentity = ref<string | null>(null)
+const attachmentDraftIdentityPending = ref(false)
+watch(() => gatewayAccess.deliveryIdentity, async (identity, _previous, onCleanup) => {
+  let current = true
+  onCleanup(() => { current = false })
+  attachmentDraftIdentity.value = null
+  attachmentDraftIdentityPending.value = false
+  if (!identity) return
+  if (platform.id !== 'desktop') { attachmentDraftIdentity.value = identity; return }
+  attachmentDraftIdentityPending.value = true
+  try {
+    const connection = await platform.gateway.getAttachmentBinding?.()
+    if (!current || !gatewayAccess.isLocalOwner || !connection?.profileFingerprint) return
+    // A verified owned profile remains the same draft owner across desktop
+    // restarts; the per-launch native selection secret never enters IndexedDB.
+    attachmentDraftIdentity.value = JSON.stringify(['desktop-profile-v1', connection.profileFingerprint, 'owner'])
+  } catch { /* Identity remains unproven until the next connection update. */ }
+  finally { if (current) attachmentDraftIdentityPending.value = false }
+}, { immediate: true })
+const chatAttachments = useChatAttachments(artifactWorkbench.content, {
+  draftOwnerState: () => [inputText.value, selectedSkills.value],
+  draftScopePending: () => attachmentDraftIdentityPending.value,
+  draftScope: () => attachmentDraftIdentity.value && sessionKey.value
+    ? { identity: attachmentDraftIdentity.value, sessionKey: sessionKey.value } : null,
+  native: platform.files,
+  nativeIsCurrent: context => context.sessionKey === sessionKey.value
+    && nativeAttachmentSession.value?.epoch === context.sessionEpoch,
+  nativeContext: async () => {
+    const targetSession = sessionKey.value
+    const binding = nativeAttachmentSession.value
+    const identity = gatewayAccess.deliveryIdentity
+    // A new task has no durable session identity yet. Its ordinary file input
+    // and byte upload path remain available without minting native authority.
+    if (!targetSession || !binding || binding.key !== targetSession || !platform.gateway.getAttachmentBinding) return null
+    const connection = await platform.gateway.getAttachmentBinding()
+    if (!connection) return null
+    const resolved = await sessionDirectory.resolve({ key: targetSession })
+    if (sessionKey.value !== targetSession || nativeAttachmentSession.value?.epoch !== binding.epoch
+      || gatewayAccess.deliveryIdentity !== identity || resolved.key !== targetSession) {
+      throw new Error('Session changed; select the file again')
+    }
+    return { gatewayInstanceId: connection.instanceId, sessionKey: targetSession,
+      sessionId: resolved.id, sessionEpoch: binding.epoch }
+  },
+})
 const {
   pendingAttachments,
   attachmentWorkBusy,
   onFileInputChange,
+  chooseAttachments,
   addAttachments,
   removeAttachment,
   retireAttachments,
@@ -2689,6 +2737,10 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSessionMissing: markSessionMissing,
   onSnapshot: snapshot => {
+    if (snapshot.sessionKey === sessionKey.value) {
+      nativeAttachmentSession.value = typeof snapshot.epoch === 'number' && Number.isSafeInteger(snapshot.epoch)
+        && snapshot.epoch >= 0 ? { key: snapshot.sessionKey, epoch: snapshot.epoch } : null
+    }
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
     taskProgress.applySnapshot(snapshot)
@@ -3473,6 +3525,7 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 const chatSend = useChatSend({
   selectedSkills,
   consumeAcceptedDraft: draftPersistence.consumeAcceptedDraft,
+  captureAttachmentDraftConsumption: chatAttachments.captureDraftConsumption,
   metaRunCenter,
   turnCommands: {
     send(request, options) {
@@ -4434,6 +4487,7 @@ let unsubs: (() => void)[] = []
 let chatViewDisposed = false
 let composerDockResizeObserver: ResizeObserver | null = null
 let composerDockPinFrame: number | null = null
+let composerDockSettleFrame: number | null = null
 let lastComposerDockHeight = -1
 let tailResizeObserver: ResizeObserver | null = null
 let tailMutationObserver: MutationObserver | null = null
@@ -6054,6 +6108,9 @@ function onThreadScroll() {
       }
     }
     sessionScrollBaseline = metrics
+    // Landing samples still establish the floating composer's position. The
+    // first reader gesture may arrive before another programmatic event.
+    composerRetraction.syncBaseline(currentScrollTop)
     recordChatScrollDiagnostic(
       scrollMutation?.matched ? 'programmatic' : 'session-switch',
       scrollMutation?.matched ? 'applyProgrammaticScroll' : 'browser-or-user',
@@ -6064,6 +6121,9 @@ function onThreadScroll() {
   }
   const previousScrollTop = scrollMutation?.expectedScrollTop
     ?? lastObservedThreadScrollTop
+  // Chromium may coalesce the application's pin and the first reader scroll.
+  // Use the recorded application position before measuring that gesture.
+  if (scrollMutation) composerRetraction.syncBaseline(scrollMutation.expectedScrollTop)
   lastObservedThreadScrollTop = currentScrollTop
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
   // Native scrollbar drags and middle-button auto-scroll can produce only a
@@ -6612,6 +6672,7 @@ function scopedDraftFromHistoryState(
     sessionKey: state.draftSessionKey,
     agentId: state.draftAgentId,
     projectId: state.draftProjectId,
+    hasAttachments: state.draftHasAttachments === true,
   }
 }
 
@@ -6621,16 +6682,19 @@ function persistDraftHistoryState() {
     const state = window.history.state as Record<string, unknown> | null
     const agentId = draftAgentId()
     const projectId = readProjectFromUrl()
+    const hasAttachments = pendingAttachments.value.length > 0
     if (
       state?.draftSessionKey === sessionKey.value
       && state.draftAgentId === agentId
       && state.draftProjectId === projectId
+      && state.draftHasAttachments === hasAttachments
     ) return
     window.history.replaceState({
       ...state,
       draftSessionKey: sessionKey.value,
       draftAgentId: agentId,
       draftProjectId: projectId,
+      draftHasAttachments: hasAttachments,
     }, '')
   } catch { /* ignore */ }
 }
@@ -7029,9 +7093,10 @@ onMounted(async () => {
   // exactly enough clearance for the floating surface.
   const composerDock = composerRef.value?.composerElement()?.parentElement ?? null
   if (composerDock && typeof ResizeObserver !== 'undefined') {
+    let reservedHeight = -1
     const publishComposerDockHeight = () => {
       const height = Math.ceil(composerDock.getBoundingClientRect().height)
-      if (height === lastComposerDockHeight) return
+      if (height === lastComposerDockHeight && height === reservedHeight) return
       // Chromium applies a ResizeObserver-driven custom property on the next
       // layout cycle. During expansion, reserve one measured growth step ahead
       // so the dock cannot outgrow the viewport clearance before that cycle.
@@ -7040,7 +7105,17 @@ onMounted(async () => {
         ? 0
         : Math.max(0, height - lastComposerDockHeight)
       lastComposerDockHeight = height
-      chatRootRef.value?.style.setProperty('--composer-dock-h', `${height + growth}px`)
+      reservedHeight = height + growth
+      chatRootRef.value?.style.setProperty('--composer-dock-h', `${reservedHeight}px`)
+      // A batch of attachments can grow the dock in a single layout. Recheck
+      // next frame even if ResizeObserver has no further size change to report,
+      // so the temporary expansion guard does not become a permanent gap.
+      if (growth > 0 && composerDockSettleFrame === null) {
+        composerDockSettleFrame = requestAnimationFrame(() => {
+          composerDockSettleFrame = null
+          publishComposerDockHeight()
+        })
+      }
       if (autoScroll.value && composerDockPinFrame === null) {
         const epoch = scrollEpoch.value
         const key = sessionKey.value
@@ -7178,6 +7253,10 @@ onUnmounted(() => {
     cancelAnimationFrame(composerDockPinFrame)
     composerDockPinFrame = null
   }
+  if (composerDockSettleFrame !== null) {
+    cancelAnimationFrame(composerDockSettleFrame)
+    composerDockSettleFrame = null
+  }
   cancelInitialSessionPin()
   cancelTailLayoutPin()
   tailResizeObserver?.disconnect()
@@ -7305,6 +7384,7 @@ watch(inputText, (value) => {
 
 watch(() => pendingAttachments.value.length, (count) => {
   if (count > 0) markProvisionalDraftUsed()
+  persistDraftHistoryState()
 }, { flush: 'sync' })
 
 watch(() => pendingQueue.value.length, (count) => {

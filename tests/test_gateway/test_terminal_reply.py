@@ -235,6 +235,26 @@ def test_image_input_unsupported_reply_is_actionable_and_stable() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("code", "action"),
+    [
+        ("attachment_capacity_too_large", "/compact"),
+        ("attachment_capacity_unknown", "verified context limit"),
+        ("attachment_capacity_unavailable", "model configuration"),
+    ],
+)
+def test_attachment_capacity_failure_preserves_action_without_private_details(
+    code: str, action: str,
+) -> None:
+    reply = build_terminal_reply({
+        "status": "failed", "terminal_reason": "error", "error_class": code,
+        "error_message": "synthetic-private-deployment-detail",
+    })
+    assert action in reply
+    assert "synthetic-private" not in reply
+    assert "task failed" not in reply
+
+
 def test_reasoning_only_output_budget_empty_response_reply_is_actionable_and_stable() -> None:
     reply = build_terminal_reply(
         {

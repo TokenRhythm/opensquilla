@@ -184,7 +184,35 @@ export interface ProjectDirectoryPickerRequest {
   initialPath?: string
 }
 
+export interface NativeAttachmentContext {
+  gatewayInstanceId: string
+  sessionKey: string
+  sessionId: string
+  sessionEpoch: number
+}
+export interface NativeAttachmentSelection {
+  previewDataUrl?: string
+  token: string
+  name: string
+  mime: string
+  size: number
+}
+export interface NativeAttachmentReceipt {
+  previewDataUrl?: string
+  name: string
+  mime: string
+  size: number
+  file_uuid?: string
+  expires_at?: number
+  ttl_seconds?: number
+  workspaceFile?: import('@/types/chat').WorkspaceFileReference
+}
+
 export interface PlatformFilesApi {
+  chooseAttachments?: (request: NativeAttachmentContext) => Promise<NativeAttachmentSelection[]>
+  selectAttachmentFile?: (request: NativeAttachmentContext, file: File) => Promise<NativeAttachmentSelection | null>
+  importAttachmentSelection?: (request: NativeAttachmentContext, token: string) => Promise<NativeAttachmentReceipt>
+  cancelAttachmentSelections?: () => Promise<void>
   saveArtifact?: (payload: ArtifactOpenRequest) => Promise<{ status: 'saved' | 'cancelled' }>
   sourceFileAction?: (payload: {
     gatewayInstanceId: string
@@ -484,6 +512,8 @@ export interface CliInvocation {
 }
 
 export interface PlatformGatewayApi {
+  /** Non-secret binding for local attachment intake and profile-scoped drafts. */
+  getAttachmentBinding?: () => Promise<{ instanceId: string; profileFingerprint: string } | null>
   /** Observation only: never restart the Gateway or reload the renderer. */
   onResume?: (callback: () => void) => () => void
   getStatus(): Promise<GatewayStatus>

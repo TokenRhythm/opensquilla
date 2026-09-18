@@ -1,3 +1,4 @@
+import type { WorkspaceFileReference } from '@/types/chat'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import type { ChatPageContext } from '@/types/pageContext'
 import type { InjectionKey } from 'vue'
@@ -70,8 +71,8 @@ export interface TurnSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
-  /** User-supplied page references and annotations for this turn. */
   selectedSkills?: SelectedSkillRef[]
+  /** User-supplied page references and annotations for this turn. */
   pageContext?: ChatPageContext
   /** Source policy; the v4 Adapter maps this to `_source`. */
   source?: TurnSendSource
@@ -82,6 +83,7 @@ export interface TurnSendParams {
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: TurnSendAttachment[]
+  workspaceFiles?: WorkspaceFileReference[]
   /** Explicit admission mode used by ordinary and queued sends. */
   queueMode?: string
   [key: string]: unknown

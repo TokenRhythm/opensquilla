@@ -281,6 +281,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
         kwargs: dict[str, Any] = {
             "semantic_message": request.semantic_message,
             "routing_hint": request.routing_hint,
+            "additional_request_context_tokens": request.additional_request_context_tokens,
             "ingress_pipeline_steps": request.ingress_pipeline_steps,
             "prev_assistant_text": request.prev_assistant_text,
             "prev_assistant_usage": request.prev_assistant_usage,
@@ -1008,6 +1009,8 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
                 execution_id=execution_id,
                 agent_run_id=execution_id,
                 turn_id=turn_id or None,
+                root_turn_id=getattr(tool_context, "usage_root_turn_id", None) or turn_id or None,
+                parent_turn_id=getattr(tool_context, "parent_task_id", None),
                 session_id=session_id,
                 session_epoch=max(0, int(session_epoch)),
                 agent_id=agent_id,
@@ -1623,8 +1626,11 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         session_id: str | None = None,
         persist_image_material: bool | None = None,
         image_workspace_dir: str | Path | None = None,
+        working_files: dict[str, dict[str, Any]] | None = None,
     ) -> list[Any] | None:
         image_kwargs = self._image_material_kwargs(persist_image_material, image_workspace_dir)
+        if working_files is not None:
+            image_kwargs["working_files"] = working_files
         return self._runner._build_attachment_messages(
             message,
             attachments,
@@ -1668,8 +1674,11 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         file_parse_fact_sink: Callable[[Any], object] | None = None,
         persist_image_material: bool | None = None,
         image_workspace_dir: str | Path | None = None,
+        working_files: dict[str, dict[str, Any]] | None = None,
     ) -> list[Any] | None:
         image_kwargs = self._image_material_kwargs(persist_image_material, image_workspace_dir)
+        if working_files is not None:
+            image_kwargs["working_files"] = working_files
         return self._runner._build_attachment_messages(
             message,
             attachments,

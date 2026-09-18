@@ -74,6 +74,17 @@ describe('model-input image detection', () => {
 })
 
 describe('attachment display normalization', () => {
+  it('preserves the workspace target from history without inventing attachment storage identity', () => {
+    const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
+      name: 'notes.md', mime: 'text/markdown', size: 14 }
+    const projected = normalizeDisplayAttachment({ kind: 'file', name: workspaceFile.name,
+      mime: workspaceFile.mime, workspaceFile }, { messageId: 'fixture-message', index: 0 })
+    expect(projected).toMatchObject({ kind: 'file', workspaceFile, name: 'notes.md' })
+    expect(projected.attachmentId).toBeUndefined()
+    expect(projected.downloadData).toBeUndefined()
+    expect(projected.localFile).toBeUndefined()
+  })
+
   it('preserves the opaque attachment identity used by Workbench actions', () => {
     expect(normalizeDisplayAttachment({
       attachment_id: 'att_opaque_fixture',

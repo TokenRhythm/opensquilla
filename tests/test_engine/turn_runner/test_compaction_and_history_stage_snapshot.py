@@ -18,8 +18,11 @@ contract and the exception-propagation contract.
 
 from __future__ import annotations
 
+import base64
+import json
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
 
@@ -381,7 +384,7 @@ def _setup_runner(case: dict[str, Any]) -> tuple[TurnRunner, dict[str, list]]:
     return runner, call_log
 
 
-async def _drive(runner: TurnRunner, case: dict[str, Any]):
+async def _drive(runner: TurnRunner, case: dict[str, Any], *, tool_context: Any = None):
     captured = None
     raised = None
     yielded: list[Any] = []
@@ -391,7 +394,7 @@ async def _drive(runner: TurnRunner, case: dict[str, Any]):
         agent_id="agent:main",
         model=None,
         attachments=[],
-        tool_context=None,
+        tool_context=tool_context,
         input_mode="user",
         persist_input=False,
         input_provenance=None,
@@ -500,6 +503,92 @@ async def test_unknown_vision_capability_does_not_skip_compaction() -> None:
     assert len(call_log["t3"]) == 1
     assert len(call_log["preflight"]) == 1
     assert len(call_log["history"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_compaction_keeps_file_paths_with_image_retention_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.session.compaction import (
+        CompactionConfig,
+        CompactionRequest,
+        compact_context,
+        compaction_replay_summary,
+    )
+    from opensquilla.tools.types import ToolContext
+    from tests.helpers.image_bytes import image_bytes
+
+    case = dict(_CASE_BASE)
+    runner, _ = _setup_runner(case)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = GatewayConfig()
+    config.workspace_dir = str(workspace)
+    config.attachments.media_root = str(tmp_path / "media")
+    config.attachments.persist_transcripts = False
+    runner._config = config
+    document_bytes = b"%PDF-1.4\nORIGINAL_DOCUMENT_BODY\n%%EOF"
+    document = {
+        "mime": "application/pdf", "name": "document.pdf",
+        "data": base64.b64encode(document_bytes).decode(),
+    }
+    image = {
+        "mime": "image/png", "name": "image.png",
+        "data": base64.b64encode(image_bytes()).decode(),
+    }
+    seen: dict[str, Any] = {}
+
+    async def summarize(**kwargs: Any) -> str:
+        seen["summary_input"] = kwargs["chunk_text"]
+        return "Continue reviewing the original document."
+
+    monkeypatch.setattr("opensquilla.session.compaction.call_compaction_llm", summarize)
+
+    async def preflight(
+        self: TurnRunner, *args: Any, attachment_path_resolver=None, **kwargs: Any,
+    ) -> None:
+        assert callable(attachment_path_resolver)
+        seen["image_path"] = attachment_path_resolver(image, "s1")
+        result = await compact_context(CompactionRequest(
+            session_id="s1", context_window_tokens=4_000,
+            entries=[
+                {
+                    "id": 1, "role": "user", "message_id": "file-message", "token_count": 5,
+                    "content": json.dumps({"text": "Review.", "attachments": [document, image]}),
+                },
+                {"id": 2, "role": "assistant", "content": "Received.", "token_count": 5},
+                {"id": 3, "role": "user", "content": "Continue.", "token_count": 5},
+                {"id": 4, "role": "assistant", "content": "Continuing.", "token_count": 5},
+            ],
+            config=CompactionConfig(
+                model="synthetic-model", api_key="synthetic-key", safety_margin=1.0,
+                protected_recent_messages=2, attachment_path_resolver=attachment_path_resolver,
+            ), forced_prefix_cut=2, trigger="message_count",
+        ))
+        seen["result"] = result
+
+    runner._maybe_preflight_compact = MethodType(preflight, runner)
+    captured, yielded, raised = await _drive(
+        runner, case, tool_context=ToolContext(workspace_dir=str(workspace)),
+    )
+
+    assert raised is None
+    assert captured is not None, yielded
+    assert seen["image_path"] is None
+    result = seen["result"]
+    assert result.removed_count == 2
+    assert result.summary_payload is not None
+    paths = [item["path"] for item in result.summary_payload["files_and_artifacts"]]
+    assert len(paths) == 1
+    path = paths[0]
+    assert path.startswith(".opensquilla/attachments/s1/")
+    assert (workspace / path).read_bytes() == document_bytes
+    assert path in seen["summary_input"]
+    assert path in compaction_replay_summary(result)
+    assert "ORIGINAL_DOCUMENT_BODY" not in seen["summary_input"]
+    assert image["data"] not in seen["summary_input"]
+    assert not list(workspace.rglob("*.png"))
 
 
 @pytest.mark.asyncio

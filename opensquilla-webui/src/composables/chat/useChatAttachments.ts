@@ -1,8 +1,11 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { useAttachmentDraftPersistence } from './useAttachmentDraftPersistence'
+import type { AttachmentDraftScope, AttachmentDraftStore } from '@/utils/chat/attachmentDrafts'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { Attachment } from '@/types/chat'
 import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
+import type { NativeAttachmentContext, NativeAttachmentSelection, PlatformFilesApi } from '@/platform/types'
 
 const INLINE_THRESHOLD_BYTES = 2_000_000
 const ATTACHMENT_TEXT_HARD_CAP_BYTES = INLINE_THRESHOLD_BYTES
@@ -112,15 +115,28 @@ async function fileLooksLikeUtf8Text(file: File): Promise<boolean> {
   }
 }
 
-export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
+interface ChatAttachmentOptions {
+  draftScope?: () => AttachmentDraftScope | null
+  draftScopePending?: () => boolean
+  draftOwnerState?: () => unknown
+  draftStore?: AttachmentDraftStore | null
+  native?: PlatformFilesApi
+  nativeContext?: () => NativeAttachmentContext | null | Promise<NativeAttachmentContext | null>
+  nativeIsCurrent?: (context: NativeAttachmentContext) => boolean
+}
+
+export function useChatAttachments(artifactContent?: ArtifactContentAccess, options: ChatAttachmentOptions = {}) {
   const { pushToast } = useToasts()
   const pendingAttachments = ref<Attachment[]>([])
   const nextAttachmentId = ref(1)
   const refreshInFlightAttachmentIds = new Set<number>()
   const refreshInFlightAttachmentCount = ref(0)
   let attachmentGeneration = 0
+  const intakeInFlightCount = ref(0)
+  let draftPersistence: ReturnType<typeof useAttachmentDraftPersistence> | undefined
   const attachmentWorkBusy = computed(() =>
-    refreshInFlightAttachmentCount.value > 0
+    options.draftScopePending?.() || draftPersistence?.restoring.value ||
+    intakeInFlightCount.value > 0 || refreshInFlightAttachmentCount.value > 0
     || pendingAttachments.value.some(
       attachment => attachment.kind === 'inline_pending' || attachment.kind === 'uploading',
     ),
@@ -139,17 +155,124 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
       generation: attachmentGeneration,
       totalSizeToastShown: false,
     }
-    for (const file of files) {
-      if (!isAttachmentGenerationCurrent(batch.generation)) return
-      // One toast for the whole batch when the count cap is hit — a per-file
-      // repeat would only evict more useful toasts.
-      if (activeAttachmentCount() >= MAX_ATTACHMENTS) {
-        pushToast(i18n.global.t('chat.toast.tooManyAttachments', { max: MAX_ATTACHMENTS }), { tone: 'danger' })
-        return
+    intakeInFlightCount.value += 1
+    try {
+      for (const file of files) {
+        if (!isAttachmentGenerationCurrent(batch.generation)) return
+        if (activeAttachmentCount() >= MAX_ATTACHMENTS) {
+          pushToast(i18n.global.t('chat.toast.tooManyAttachments', { max: MAX_ATTACHMENTS }), { tone: 'danger' })
+          return
+        }
+        await addAttachmentFile(file, batch)
+        if (!isAttachmentGenerationCurrent(batch.generation)) return
       }
-      await addAttachmentFile(file, batch)
-      if (!isAttachmentGenerationCurrent(batch.generation)) return
+    } finally {
+      if (isAttachmentGenerationCurrent(batch.generation)) intakeInFlightCount.value -= 1
     }
+  }
+
+  async function chooseAttachments(): Promise<boolean> {
+    const native = options.native
+    if (!native?.chooseAttachments || !native.importAttachmentSelection || !options.nativeContext) return false
+    const batch = { generation: attachmentGeneration, totalSizeToastShown: false }
+    intakeInFlightCount.value += 1
+    try {
+      const context = await options.nativeContext()
+      if (!isAttachmentGenerationCurrent(batch.generation)) return true
+      if (!context) return false
+      const selections = await native.chooseAttachments(context)
+      if (!isAttachmentGenerationCurrent(batch.generation)) return true
+      if (options.nativeIsCurrent?.(context) === false) throw new Error('Session changed; select the file again')
+      for (const selection of selections) {
+        await addNativeSelection(selection, context, batch)
+        if (!isAttachmentGenerationCurrent(batch.generation)) return true
+      }
+    } catch (error) {
+      if (isAttachmentGenerationCurrent(batch.generation)) pushToast(uploadFailureMessage(error), { tone: 'danger' })
+    } finally {
+      if (isAttachmentGenerationCurrent(batch.generation)) intakeInFlightCount.value -= 1
+    }
+    return true
+  }
+
+  async function addNativeSelection(
+    selection: NativeAttachmentSelection,
+    context: NativeAttachmentContext,
+    batch: AttachmentBatch,
+    file?: File,
+    reservedId?: number,
+  ) {
+    if (!isAttachmentGenerationCurrent(batch.generation)) return
+    if (reservedId !== undefined && !pendingAttachments.value.some(a => a.local_id === reservedId)) return
+    if (reservedId === undefined && !canAcceptAttachment(selection.name, selection.size, batch)) return
+    draftPersistence?.resume()
+    const localId = reservedId ?? nextAttachmentId.value++
+    if (reservedId === undefined) pendingAttachments.value.push({ kind: 'uploading', local_id: localId,
+      name: selection.name, mime: selection.mime, size: selection.size, file })
+    try {
+      if (options.nativeIsCurrent?.(context) === false) throw new Error('Session changed; select the file again')
+      const receipt = await options.native!.importAttachmentSelection!(context, selection.token)
+      if (!isAttachmentGenerationCurrent(batch.generation)) return
+      if (options.nativeIsCurrent?.(context) === false) throw new Error('Session changed; select the file again')
+      const idx = pendingAttachments.value.findIndex(a => a.local_id === localId)
+      if (idx < 0) return
+      if (receipt.size !== selection.size || receipt.name !== selection.name || receipt.mime !== selection.mime) {
+        throw new Error('Attachment import returned different file metadata')
+      }
+      pendingAttachments.value[idx] = {
+        kind: receipt.workspaceFile ? 'workspace' : 'staged', local_id: localId,
+        name: receipt.name, mime: receipt.mime, size: receipt.size,
+        ...(receipt.previewDataUrl ? { dataUrl: receipt.previewDataUrl } : {}),
+        ...(receipt.workspaceFile ? { workspaceFile: receipt.workspaceFile } : {
+          file_uuid: receipt.file_uuid, expires_at: receipt.expires_at, ttl_seconds: receipt.ttl_seconds,
+        }),
+        // A live project reference must never refresh into an uploaded copy.
+        ...(receipt.workspaceFile ? {} : { file }),
+      }
+    } catch (error) {
+      if (!isAttachmentGenerationCurrent(batch.generation)) return
+      const idx = pendingAttachments.value.findIndex(a => a.local_id === localId)
+      if (idx < 0) return
+      const message = uploadFailureMessage(error)
+      pendingAttachments.value[idx] = { kind: 'failed', local_id: localId, name: selection.name,
+        mime: selection.mime, size: selection.size, error: message }
+      pushToast(message, { tone: 'danger' })
+    }
+  }
+
+  async function tryNativeFile(file: File, batch: AttachmentBatch): Promise<boolean> {
+    const native = options.native
+    if (!native?.selectAttachmentFile || !native.importAttachmentSelection || !options.nativeContext) return false
+    if (!canAcceptAttachment(file.name, file.size, batch)) return true
+    draftPersistence?.resume()
+    const localId = nextAttachmentId.value++
+    const mime = resolveAttachmentMime(file)
+    // Pending native authority must not become a persisted Blob before the
+    // import decision. Successful imported receipts retain recovery bytes below.
+    pendingAttachments.value.push({ kind: 'uploading', local_id: localId, name: file.name, mime, size: file.size })
+    try {
+      const context = await options.nativeContext()
+      if (!isAttachmentGenerationCurrent(batch.generation)) return true
+      if (!pendingAttachments.value.some(a => a.local_id === localId)) return true
+      const selection = context ? await native.selectAttachmentFile(context, file) : null
+      if (!isAttachmentGenerationCurrent(batch.generation)) return true
+      if (!pendingAttachments.value.some(a => a.local_id === localId)) return true
+      if (!selection || !context) {
+        pendingAttachments.value = pendingAttachments.value.filter(a => a.local_id !== localId)
+        return false
+      }
+      if (selection.size !== file.size) throw new Error('Selected file changed; select it again')
+      await addNativeSelection(selection, context, batch, file, localId)
+    } catch (error) {
+      if (isAttachmentGenerationCurrent(batch.generation)) {
+        const message = uploadFailureMessage(error)
+        const index = pendingAttachments.value.findIndex(a => a.local_id === localId)
+        if (index >= 0) pendingAttachments.value[index] = { kind: 'failed', local_id: localId,
+          name: file.name, mime, size: file.size, error: message }
+        pushToast(message, { tone: 'danger' })
+      }
+    }
+    return true
   }
 
   async function addAttachment(file: File) {
@@ -163,6 +286,10 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
       pushToast(i18n.global.t('chat.toast.emptyFile', { name: fileName }), { tone: 'danger' })
       return
     }
+
+    if (options.native?.selectAttachmentFile && options.native.importAttachmentSelection
+      && options.nativeContext && await tryNativeFile(file, batch)) return
+    if (!isAttachmentGenerationCurrent(batch.generation)) return
 
     let mime = resolveAttachmentMime(file)
     if (!isAllowedAttachmentMime(mime)) {
@@ -183,6 +310,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
     }
     if (!canAcceptAttachment(fileName, file.size, batch)) return
 
+    draftPersistence?.resume()
     const localId = nextAttachmentId.value++
 
     if (file.size <= INLINE_THRESHOLD_BYTES) {
@@ -255,7 +383,14 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
   }
 
   function retireAttachments() {
+    draftPersistence?.retire()
+    clearAttachmentState()
+  }
+
+  function clearAttachmentState() {
     attachmentGeneration += 1
+    intakeInFlightCount.value = 0
+    void options.native?.cancelAttachmentSelections?.().catch(() => {})
     pendingAttachments.value = []
     refreshInFlightAttachmentIds.clear()
     refreshInFlightAttachmentCount.value = 0
@@ -393,10 +528,47 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
     return generation === attachmentGeneration
   }
 
+  if (options.draftScope) {
+    draftPersistence = useAttachmentDraftPersistence({
+      attachments: pendingAttachments,
+      scope: options.draftScope,
+      ownerState: options.draftOwnerState,
+      store: options.draftStore,
+      beforeScopeChange: clearAttachmentState,
+      onError: message => pushToast(message, { tone: 'danger' }),
+      restore: async restored => {
+        const generation = attachmentGeneration
+        const automatic = restored.filter(attachment => attachment.kind === 'failed'
+          && attachment.file && attachment.error === 'Draft restored; retry to prepare the file')
+        pendingAttachments.value = restored.filter(attachment => !automatic.includes(attachment))
+        nextAttachmentId.value = Math.max(nextAttachmentId.value, ...restored.map(a => a.local_id + 1))
+        if (isAttachmentGenerationCurrent(generation)) await addAttachments(automatic.map(a => a.file!))
+        const automaticFiles = new Set(automatic.map(attachment => attachment.file))
+        const preparing = () => pendingAttachments.value.some(attachment => automaticFiles.has(attachment.file)
+          && (attachment.kind === 'inline_pending' || attachment.kind === 'uploading'))
+        if (preparing()) await new Promise<void>(resolve => {
+          const stop = watch(preparing, pending => { if (!pending) { stop(); resolve() } }, { flush: 'sync' })
+        })
+        if (!isAttachmentGenerationCurrent(generation)) return false
+        // Automatic file preparation may assign new local IDs and finish out
+        // of order. Retain the saved slots so its revision still identifies
+        // exactly the same draft, without comparing file bytes.
+        const position = (attachment: Attachment) => restored.findIndex(original => attachment.file
+          ? original.file === attachment.file : original.local_id === attachment.local_id)
+        const positions = pendingAttachments.value.map(position)
+        if (positions.length !== restored.length || positions.some(index => index < 0)
+          || new Set(positions).size !== restored.length) return false
+        pendingAttachments.value = [...pendingAttachments.value].sort((left, right) => position(left) - position(right))
+        return true
+      },
+    })
+  }
+
   return {
     pendingAttachments,
     attachmentWorkBusy,
     onFileInputChange,
+    chooseAttachments,
     addAttachments,
     addAttachment,
     removeAttachment,
@@ -404,6 +576,8 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
     retryAttachment,
     hasPendingAttachmentWork,
     prepareAttachmentsForSend,
+    captureDraftConsumption: (attachments: readonly Attachment[]) => draftPersistence?.captureConsumption(attachments),
+    flushAttachmentDraft: () => draftPersistence?.flush() ?? Promise.resolve(),
   }
 }
 

@@ -62,6 +62,12 @@ export function createComposerRetractionController(
     return collapsed
   }
 
+  function syncBaseline(scrollTop: number) {
+    lastScrollTop = scrollTop
+    clearTravel()
+    return collapsed
+  }
+
   function snapshot(): ComposerRetractionSnapshot {
     return { collapsed, lastScrollTop, direction, travel }
   }
@@ -134,5 +140,6 @@ export function createComposerRetractionController(
     reset,
     expand,
     snapshot,
+    syncBaseline,
   }
 }
