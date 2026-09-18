@@ -211,6 +211,69 @@ def _load_gateway_config(
         raise typer.Exit(code=1) from None
 
 
+async def _record_gateway_start_failure(
+    config: GatewayConfig,
+    *,
+    started_at: float,
+    failure: BaseException,
+    existing_sink: object | None = None,
+) -> None:
+    """Report failures only after valid configuration provides the privacy policy."""
+
+    if desktop_profile_lifecycle_active():
+        return
+    from opensquilla.telemetry.contracts.common import ResultOutcome
+    from opensquilla.telemetry.contracts.reliability import (
+        GatewayStartErrorCode,
+        GatewayStartFailureStage,
+    )
+    from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
+    from opensquilla.telemetry.runtime import (
+        SHUTDOWN_UPLOAD_TIMEOUT_SECONDS,
+        ScopedTelemetryRuntime,
+    )
+
+    outcome = ResultOutcome.FAIL
+    stage = GatewayStartFailureStage.SPAWN
+    code = GatewayStartErrorCode.INTERNAL_ERROR
+    if isinstance(failure, TimeoutError):
+        outcome = ResultOutcome.TIMEOUT
+        stage = GatewayStartFailureStage.HEALTH
+        code = GatewayStartErrorCode.HEALTH_TIMEOUT
+    elif isinstance(failure, (asyncio.CancelledError, KeyboardInterrupt)):
+        outcome = ResultOutcome.CANCEL
+        code = GatewayStartErrorCode.STARTUP_CANCELLED
+    elif isinstance(failure, (OSError, SystemExit)):
+        code = GatewayStartErrorCode.SPAWN_FAILED
+
+    try:
+        observe = getattr(existing_sink, "observe_gateway_start", None)
+        duration_ms = max(0, round((time.monotonic() - started_at) * 1_000))
+        if callable(observe):
+            observe(
+                outcome=outcome,
+                error_code=code,
+                failure_stage=stage,
+                duration_ms=duration_ms,
+            )
+            return
+        runtime = ScopedTelemetryRuntime(config=config)
+        try:
+            sink = ReliabilityEventSink(runtime)
+            async with asyncio.timeout(SHUTDOWN_UPLOAD_TIMEOUT_SECONDS):
+                await sink.record_gateway_start(
+                    outcome=outcome,
+                    error_code=code,
+                    failure_stage=stage,
+                    duration_ms=duration_ms,
+                )
+                await runtime.close()
+        finally:
+            await runtime.close(flush=False)
+    except Exception:
+        log.debug("gateway.startup_telemetry_unavailable")
+
+
 def run_gateway(
     port: int | None = typer.Option(18791, "--port", "-p", help="Port to bind"),
     bind: str | None = typer.Option("127.0.0.1", "--bind", "-b", help="Host to bind"),
@@ -268,6 +331,13 @@ def run_gateway(
             config.record_runtime_override(field_path, stored, applied)
 
     if not _gateway_bind_available(host, resolved_port):
+        asyncio.run(
+            _record_gateway_start_failure(
+                config,
+                started_at=gateway_startup_started_at,
+                failure=OSError(),
+            )
+        )
         console.print("OPENSQUILLA_GATEWAY_PORT_IN_USE")
         console.print(
             f"[red]Gateway could not start:[/red] {host}:{resolved_port} is already in use."
@@ -315,12 +385,20 @@ def run_gateway(
         # build_services() inside start_gateway_server handles:
         # session_manager, provider_selector, tool_registry, usage_tracker,
         # memory, skills, scheduler, search, MCP discovery.
-        server = await start_gateway_server(
-            config=config,
-            subscription_manager=subscription_mgr,
-            run=True,
-            _startup_started_at=gateway_startup_started_at,
-        )
+        try:
+            server = await start_gateway_server(
+                config=config,
+                subscription_manager=subscription_mgr,
+                run=True,
+                _startup_started_at=gateway_startup_started_at,
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            await _record_gateway_start_failure(
+                config,
+                started_at=gateway_startup_started_at,
+                failure=exc,
+            )
+            raise
         assert server._task is not None
 
         from opensquilla.telemetry.contracts.common import (
@@ -384,6 +462,26 @@ def run_gateway(
         finally:
             waiter.cancel()
             _remove_shutdown_handlers(loop, installed_signals)
+
+        # The serve task binds the listener after start_gateway_server returns.
+        # Startup can still fail here (including uvicorn's SystemExit on a bind
+        # race), before the combined listener/runtime readiness checkpoint.
+        if (
+            getattr(getattr(app, "state", None), "gateway_start_ready", None) is False
+            and server_task.done()
+            and not server_task.cancelled()
+        ):
+            startup_failure = server_task.exception()
+            if startup_failure is not None or not explicit_shutdown:
+                await _record_gateway_start_failure(
+                    config,
+                    started_at=gateway_startup_started_at,
+                    failure=startup_failure or RuntimeError(),
+                    existing_sink=getattr(
+                        getattr(server, "_services", None), "reliability_event_sink", None
+                    ),
+                )
+                explicit_shutdown = False
 
         exit_code = 0 if explicit_shutdown else 1
         watchdog = _GatewayShutdownWatchdog(

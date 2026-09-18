@@ -192,6 +192,7 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
     _flush_current_text_segment,
     _StreamState,
 )
+from opensquilla.engine.turn_runner.turn_finalizer_stage import UsageTelemetryPort
 from opensquilla.engine.types import (
     AgentConfig,
     AgentEvent,
@@ -5191,6 +5192,7 @@ class TurnRunner:
         turn_growth_started_sink: GrowthMilestoneSink | None = None,
         turn_growth_succeeded_sink: GrowthMilestoneSink | None = None,
         growth_event_sink: Any | None = None,
+        usage_telemetry: UsageTelemetryPort | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -5339,7 +5341,11 @@ class TurnRunner:
             turn_memory_capture=_TurnRunnerTurnMemoryCaptureAdapter(self),
             session_totals=_TurnRunnerSessionTotalsAdapter(self),
             turn_error_persist=_TurnRunnerTurnErrorPersistAdapter(self),
-            usage_telemetry=_TurnRunnerUsageTelemetryAdapter(self),
+            usage_telemetry=(
+                usage_telemetry
+                if usage_telemetry is not None
+                else _TurnRunnerUsageTelemetryAdapter(self)
+            ),
         )
 
     def _turn_config(self) -> Any:

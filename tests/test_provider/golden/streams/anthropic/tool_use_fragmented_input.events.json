@@ -68,6 +68,7 @@
     },
     "reasoning_content": null,
     "reasoning_tokens": 0,
+    "refusal": false,
     "stop_reason": "tool_use",
     "terminal_request_input_tokens": null,
     "thinking_signature": null,

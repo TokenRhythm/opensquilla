@@ -37,6 +37,7 @@
     "provider_replay": null,
     "reasoning_content": null,
     "reasoning_tokens": 0,
+    "refusal": false,
     "stop_reason": "stop",
     "terminal_request_input_tokens": null,
     "thinking_signature": null,

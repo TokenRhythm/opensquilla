@@ -15,6 +15,7 @@ import hmac
 import logging
 import os
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from opensquilla import __version__
@@ -24,6 +25,7 @@ log = logging.getLogger(__name__)
 
 DAILY_TELEMETRY_SCHEMA_VERSION = 1
 DAILY_USAGE_UPLOAD_INTERVAL_SECONDS = 60 * 60
+STANDALONE_CLOSE_TIMEOUT_SECONDS = 2.0
 USAGE_TELEMETRY_ENDPOINT_ENV = "OPENSQUILLA_USAGE_TELEMETRY_ENDPOINT"
 DEFAULT_USAGE_TELEMETRY_ENDPOINT = "https://telemetry.opensquilla.ai/v1/usage"
 INTERACTIVE_RUN_KINDS = frozenset(
@@ -79,6 +81,8 @@ async def record_completed_turn(
 ) -> bool:
     """Add an eligible completed turn to today's local aggregate."""
     if install_telemetry._telemetry_skip_reason(config=config) is not None:
+        return False
+    if os.environ.get("OPENSQUILLA_CODETASK_CHILD") == "1":
         return False
     if run_kind not in INTERACTIVE_RUN_KINDS or done_event is None:
         return False
@@ -153,7 +157,7 @@ async def upload_pending_daily_usage(
 
 
 async def run_daily_usage_upload_loop(
-    storage: DailyUsageStorage,
+    storage: DailyUsageStorage | None,
     *,
     config: Any,
     interval_seconds: float = DAILY_USAGE_UPLOAD_INTERVAL_SECONDS,
@@ -161,13 +165,125 @@ async def run_daily_usage_upload_loop(
     """Upload immediately on startup, then retry pending aggregates hourly."""
     interval = max(float(interval_seconds), 0.01)
     while True:
+        await _upload_pending_sources(storage, config=config)
+        await asyncio.sleep(interval)
+
+
+async def _upload_pending_sources(storage: DailyUsageStorage | None, *, config: Any) -> None:
+    # A damaged legacy database must not starve independently durable CLI rows.
+    if storage is not None:
         try:
             await upload_pending_daily_usage(storage, config=config)
-        except asyncio.CancelledError:
-            raise
         except Exception:
-            log.debug("Daily usage telemetry loop failed", exc_info=True)
-        await asyncio.sleep(interval)
+            log.debug("Legacy daily usage telemetry upload failed", exc_info=True)
+    try:
+        await upload_pending_standalone_daily_usage(config=config)
+    except Exception:
+        log.debug("Standalone daily usage telemetry upload failed", exc_info=True)
+
+
+def standalone_daily_usage_path(config: Any) -> Path:
+    from opensquilla.paths import default_opensquilla_home, native_io_path
+
+    root = Path(getattr(config, "state_dir", None) or default_opensquilla_home() / "state")
+    return native_io_path(root / "telemetry" / "standalone-usage.sqlite3")
+
+
+async def upload_pending_standalone_daily_usage(*, config: Any) -> int:
+    """Drain standalone counters from either a CLI process or a later Gateway."""
+    if install_telemetry._telemetry_skip_reason(config=config) is not None:
+        return 0
+    path = standalone_daily_usage_path(config)
+    if not path.is_file():
+        return 0
+    from opensquilla.observability.daily_usage_store import DailyUsageStore
+
+    storage = await DailyUsageStore.open(path)
+    try:
+        return await upload_pending_daily_usage(storage, config=config)
+    finally:
+        await storage.close()
+
+
+class StandaloneUsageTelemetry:
+    """Keep anonymous usage durable independently of ephemeral CLI transcripts."""
+
+    def __init__(self, *, config: Any, legacy_storage: DailyUsageStorage | None) -> None:
+        self._config = config
+        self._legacy_storage = legacy_storage
+        self._storage: Any = None
+        self._storage_lock = asyncio.Lock()
+        self._upload_task: asyncio.Task[None] | None = None
+        self._install_thread: Any = None
+        self._closed = False
+
+    def start(self) -> None:
+        if (
+            self._closed or self._upload_task is not None
+            or os.environ.get("OPENSQUILLA_CODETASK_CHILD") == "1"
+        ):
+            return
+        self._install_thread = install_telemetry.start_background_install_telemetry(
+            config=self._config,
+        )
+        self._upload_task = asyncio.create_task(
+            run_daily_usage_upload_loop(self._legacy_storage, config=self._config),
+            name="standalone-daily-usage-upload",
+        )
+
+    async def record_turn(
+        self, *, run_kind: str, done_event: CompletedTurnUsage | None,
+    ) -> None:
+        if (
+            self._closed
+            or install_telemetry._telemetry_skip_reason(config=self._config) is not None
+            or os.environ.get("OPENSQUILLA_CODETASK_CHILD") == "1"
+            or run_kind not in INTERACTIVE_RUN_KINDS
+            or done_event is None
+        ):
+            return
+        from opensquilla.observability.daily_usage_store import DailyUsageStore
+
+        async with self._storage_lock:
+            if self._storage is None:
+                self._storage = await DailyUsageStore.open(
+                    standalone_daily_usage_path(self._config),
+                )
+            await record_completed_turn(
+                self._storage, config=self._config, run_kind=run_kind, done_event=done_event,
+            )
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        task, self._upload_task = self._upload_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        async def finish_usage() -> None:
+            if os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+                await _upload_pending_sources(self._legacy_storage, config=self._config)
+
+        async def finish_install() -> None:
+            thread, self._install_thread = self._install_thread, None
+            if thread is not None:
+                await asyncio.to_thread(thread.join, STANDALONE_CLOSE_TIMEOUT_SECONDS)
+
+        try:
+            async with asyncio.timeout(STANDALONE_CLOSE_TIMEOUT_SECONDS):
+                await asyncio.gather(finish_usage(), finish_install(), return_exceptions=True)
+        except Exception:
+            log.debug("Standalone telemetry shutdown upload incomplete", exc_info=True)
+        finally:
+            async with self._storage_lock:
+                storage, self._storage = self._storage, None
+                if storage is not None:
+                    await storage.close()
 
 
 def _daily_payload(

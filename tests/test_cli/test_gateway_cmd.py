@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.error import URLError
 
+import httpx
 import pytest
 import typer
 from typer.testing import CliRunner
@@ -209,6 +210,288 @@ def test_gateway_run_reports_invalid_config_without_traceback(
     assert "custom.toml" in compact
     assert "recoveryrecover-config" in compact
     assert "Traceback" not in output
+
+
+@pytest.fixture
+def gateway_start_timeouts(monkeypatch: pytest.MonkeyPatch) -> list[asyncio.Timeout]:
+    from opensquilla.telemetry import runtime as telemetry_runtime
+
+    timeouts: list[asyncio.Timeout] = []
+
+    def timeout_at_checkpoint(delay: float | None) -> asyncio.Timeout:
+        assert delay == telemetry_runtime.SHUTDOWN_UPLOAD_TIMEOUT_SECONDS
+        timeout = asyncio.timeout(None)
+        timeouts.append(timeout)
+        return timeout
+
+    # Functional delivery tests must not race cold SQLite initialization.
+    # Expire the real helper timeout at an observed request boundary instead;
+    # the runtime's separate cleanup budget is only a deadlock backstop here.
+    monkeypatch.setattr(telemetry_runtime, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(
+        gateway_cmd,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"timeout": timeout_at_checkpoint})),
+    )
+    return timeouts
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "disabled", "desktop", "expected_outcome", "expected_code"),
+    [
+        ("bind", False, False, "fail", "spawn_failed"),
+        ("startup", False, False, "fail", "internal_error"),
+        ("timeout", False, False, "timeout", "health_timeout"),
+        ("late_tls", False, False, "fail", "spawn_failed"),
+        ("late_bind", False, False, "fail", "spawn_failed"),
+        ("after_ready", False, False, None, None),
+        ("startup", True, False, None, None),
+        ("startup", False, True, None, None),
+    ],
+)
+def test_gateway_start_failure_reaches_collector_without_exception_content(
+    tmp_path, monkeypatch, gateway_start_timeouts,
+    failure_kind, disabled, desktop, expected_outcome, expected_code,
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.telemetry import runtime as telemetry_runtime
+    from opensquilla.telemetry.consent import resolve_scope_consent
+    from opensquilla.telemetry.contracts.wire import TelemetryWireTarget, parse_telemetry_wire
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+    from opensquilla.telemetry.uploader import TelemetryUploader
+
+    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+    config.privacy.disable_network_observability = disabled
+    real_runtime = telemetry_runtime.ScopedTelemetryRuntime
+
+    def runtime_with_test_consent(*, config):
+        scope_consent_coordinator_for(
+            config,
+            state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+        )
+        return real_runtime(config=config)
+
+    monkeypatch.setattr(telemetry_runtime, "ScopedTelemetryRuntime", runtime_with_test_consent)
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(gateway_cmd, "desktop_config_path_is_profile_local", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "desktop_profile_lifecycle_active", lambda: desktop)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+    monkeypatch.setattr(
+        gateway_cmd, "_gateway_bind_available", lambda *_args: failure_kind != "bind"
+    )
+    received = []
+
+    def collect(request):
+        assert b"synthetic-secret-content" not in request.content
+        batch = parse_telemetry_wire(
+            request.content, target=TelemetryWireTarget.RELIABILITY_BATCH
+        )
+        received.extend(batch.events)
+        return httpx.Response(
+            202,
+            json={
+                "ok": True,
+                "batch_id": str(batch.batch_id),
+                "accepted": len(batch.events),
+                "duplicates": 0,
+            },
+        )
+
+    def uploader(*args, **kwargs):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(collect))
+        result = TelemetryUploader(*args, **kwargs, http_client=client)
+        result._owns_client = True
+        return result
+
+    monkeypatch.setattr(telemetry_runtime, "TelemetryUploader", uploader)
+
+    async def fail_start(**_kwargs):
+        if failure_kind in {"late_tls", "late_bind", "after_ready"}:
+            from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
+
+            existing_runtime = runtime_with_test_consent(config=_kwargs["config"])
+            existing_sink = ReliabilityEventSink(existing_runtime)
+
+            async def serve():
+                await asyncio.sleep(0)
+                if failure_kind == "late_bind":
+                    raise SystemExit(1)
+                raise FileNotFoundError("synthetic-secret-content")
+
+            task = asyncio.create_task(serve())
+
+            async def close(_reason):
+                with contextlib.suppress(BaseException):
+                    await task
+                await existing_runtime.close()
+
+            return SimpleNamespace(
+                app=SimpleNamespace(
+                    state=SimpleNamespace(gateway_start_ready=failure_kind == "after_ready")
+                ),
+                _task=task,
+                _services=SimpleNamespace(reliability_event_sink=existing_sink),
+                close=close,
+            )
+        if failure_kind == "timeout":
+            raise TimeoutError("synthetic-secret-content")
+        raise RuntimeError("synthetic-secret-content")
+
+    monkeypatch.setattr(gateway_cmd, "start_gateway_server", fail_start)
+    result = runner.invoke(app, ["gateway", "run"])
+
+    assert result.exit_code == 1
+    if expected_outcome is None:
+        assert received == []
+    else:
+        assert len(received) == 1
+        event = received[0]
+        assert event.event_name == "gateway_start_result"
+        assert event.source == "gateway"
+        assert event.outcome == expected_outcome
+        assert event.error_code == expected_code
+
+
+@pytest.mark.parametrize("reuse_existing_sink", [False, True])
+async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
+    tmp_path, monkeypatch, reuse_existing_sink
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.telemetry import runtime as telemetry_runtime
+    from opensquilla.telemetry.consent import TelemetryScope, resolve_scope_consent
+    from opensquilla.telemetry.contracts.common import ResultOutcome
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+    from opensquilla.telemetry.outbox import TelemetryOutbox
+    from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
+    from opensquilla.telemetry.uploader import TelemetryUploader
+
+    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={})
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def held_send(_request):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(held_send)) as client:
+        monkeypatch.setattr(
+            telemetry_runtime,
+            "TelemetryUploader",
+            lambda *args, **kwargs: TelemetryUploader(*args, **kwargs, http_client=client),
+        )
+        real_runtime = telemetry_runtime.ScopedTelemetryRuntime
+        original = real_runtime(config=config)
+        sink = ReliabilityEventSink(original)
+        await sink.record_gateway_start(
+            outcome=ResultOutcome.SUCCESS, error_code=None, failure_stage=None, duration_ms=1
+        )
+        await original.start()
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        created = []
+
+        def new_runtime(**kwargs):
+            runtime = real_runtime(**kwargs)
+            created.append(runtime)
+            return runtime
+
+        monkeypatch.setattr(telemetry_runtime, "ScopedTelemetryRuntime", new_runtime)
+        monkeypatch.setattr(telemetry_runtime, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(gateway_cmd, "desktop_profile_lifecycle_active", lambda: False)
+        try:
+            await asyncio.wait_for(
+                gateway_cmd._record_gateway_start_failure(
+                    config,
+                    started_at=gateway_cmd.time.monotonic(),
+                    failure=FileNotFoundError("synthetic-private-path"),
+                    existing_sink=sink if reuse_existing_sink else None,
+                ),
+                timeout=0.5,
+            )
+            assert not cancelled.is_set()
+        finally:
+            await asyncio.wait_for(original.close(), timeout=1)
+
+    assert cancelled.is_set()
+    assert len(created) == (0 if reuse_existing_sink else 1)
+    assert all(runtime._closed and not runtime.opened_scopes for runtime in created)
+    outbox = await TelemetryOutbox.open(config.state_dir, TelemetryScope.RELIABILITY)
+    try:
+        assert (await outbox.stats()).pending_events == (2 if reuse_existing_sink else 1)
+    finally:
+        await outbox.close()
+
+
+async def test_gateway_early_failure_timeout_closes_owned_upload_without_retry(
+    tmp_path, monkeypatch, gateway_start_timeouts
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.telemetry import runtime as telemetry_runtime
+    from opensquilla.telemetry.consent import TelemetryScope, resolve_scope_consent
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+    from opensquilla.telemetry.outbox import TelemetryOutbox
+    from opensquilla.telemetry.uploader import TelemetryUploader
+
+    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={})
+    )
+    requests = []
+    cancelled = asyncio.Event()
+
+    async def stalled(request):
+        requests.append(request)
+        assert len(gateway_start_timeouts) == 1
+        gateway_start_timeouts[0].reschedule(asyncio.get_running_loop().time())
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    runtimes = []
+    uploaders = []
+    real_runtime = telemetry_runtime.ScopedTelemetryRuntime
+
+    def runtime_factory(**kwargs):
+        runtime = real_runtime(**kwargs)
+        runtimes.append(runtime)
+        return runtime
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(stalled)) as client:
+        def uploader_factory(*args, **kwargs):
+            uploader = TelemetryUploader(*args, **kwargs, http_client=client)
+            uploaders.append(uploader)
+            return uploader
+
+        monkeypatch.setattr(telemetry_runtime, "ScopedTelemetryRuntime", runtime_factory)
+        monkeypatch.setattr(telemetry_runtime, "TelemetryUploader", uploader_factory)
+        monkeypatch.setattr(gateway_cmd, "desktop_profile_lifecycle_active", lambda: False)
+        await asyncio.wait_for(
+            gateway_cmd._record_gateway_start_failure(
+                config,
+                started_at=gateway_cmd.time.monotonic(),
+                failure=OSError("synthetic-private-path"),
+            ),
+            timeout=10,
+        )
+
+    assert len(requests) == 1
+    assert gateway_start_timeouts[0].expired()
+    assert cancelled.is_set()
+    assert len(runtimes) == len(uploaders) == 1
+    assert runtimes[0]._closed and not runtimes[0].opened_scopes
+    assert uploaders[0]._closed
+    outbox = await TelemetryOutbox.open(config.state_dir, TelemetryScope.RELIABILITY)
+    try:
+        assert (await outbox.stats()).pending_events == 1
+    finally:
+        await outbox.close()
 
 
 def test_gateway_run_memory_recovery_command_is_bare_on_windows(

@@ -241,6 +241,81 @@ async def test_new_meta_run_notifies_usage_recorder_once(writer_db) -> None:
     assert observed == [row.run_id]
 
 
+async def test_executed_metaskill_uploads_one_content_free_usage_event(
+    writer_db, tmp_path, monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import httpx
+
+    from opensquilla.skills.meta.orchestrator import MetaOrchestrator
+    from opensquilla.telemetry.consent import resolve_scope_consent
+    from opensquilla.telemetry.contracts import TelemetryWireTarget, parse_telemetry_wire
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+    from opensquilla.telemetry.growth_sink import GrowthEventSink
+    from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
+
+    received = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/growth/events"
+        batch = parse_telemetry_wire(request.content, target=TelemetryWireTarget.GROWTH_BATCH)
+        received.extend(batch.events)
+        return httpx.Response(202, json={
+            "ok": True, "batch_id": str(batch.batch_id),
+            "accepted": len(batch.events), "duplicates": 0,
+        })
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(receive), **kwargs),
+    )
+    config = SimpleNamespace(
+        state_dir=str(tmp_path / "telemetry-profile"),
+        privacy=SimpleNamespace(disable_network_observability=False),
+    )
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+    )
+    runtime = ScopedTelemetryRuntime(config=config, base_url="https://telemetry.invalid", env={})
+    sink = GrowthEventSink(runtime, config=config)
+    executed: list[str] = []
+
+    async def llm_chat(system: str, message: str) -> str:
+        executed.append(message)
+        return "synthetic step result"
+
+    plan = MetaPlan(
+        name="synthetic-usage-upload", triggers=("t",), priority=10,
+        steps=(
+            MetaStep(id="s1", skill="alpha", kind="llm_chat", with_args={"task": "first"}),
+            MetaStep(id="s2", skill="beta", kind="llm_chat", with_args={"task": "second"}),
+        ),
+    )
+    orch = MetaOrchestrator(
+        agent_runner=lambda *a, **kw: None,
+        skill_loader=lambda: None,
+        run_writer=writer_db,
+        llm_chat=llm_chat,
+        metaskill_usage_recorder=sink.observe_metaskill_usage,
+    )
+    try:
+        results = [item async for item in orch.iter_events(MetaMatch(plan=plan, inputs={}))]
+        assert any(isinstance(item, MetaResult) and item.ok for item in results)
+    finally:
+        await sink.close()
+        await runtime.close()
+
+    assert executed.count("first") == 1
+    assert executed.count("second") == 1
+    assert [event.event_name for event in received] == ["metaskill_usage"]
+    assert received[0].source == "runtime"
+    assert not {"run_id", "skill", "inputs", "outputs", "prompt"} & set(
+        received[0].model_dump()
+    )
+
+
 @pytest.mark.asyncio
 async def test_metaskill_announcement_without_step_execution_is_not_counted(writer_db) -> None:
     from opensquilla.skills.meta.events import _StepDone

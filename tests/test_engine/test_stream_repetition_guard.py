@@ -460,8 +460,17 @@ async def test_guard_close_is_bounded_when_upstream_ignores_close() -> None:
         async for _ in guard_provider_text_stream(upstream, policy=policy):
             pass
 
-    with pytest.raises(ModelRepetitionLoopError):
-        await asyncio.wait_for(consume(), timeout=0.25)
+    consumer = asyncio.create_task(consume())
+    try:
+        # Detection is setup for this close-budget assertion. Start the original
+        # 250ms bound only after the real iterator enters its blocked aclose.
+        await asyncio.wait_for(upstream.close_started.wait(), timeout=1.0)
+        with pytest.raises(ModelRepetitionLoopError):
+            await asyncio.wait_for(consumer, timeout=0.25)
+    finally:
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
 
     assert upstream.close_started.is_set()
     assert upstream.close_calls == 1

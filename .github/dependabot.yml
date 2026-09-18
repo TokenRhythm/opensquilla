@@ -5,6 +5,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Review current and frozen generators together; security updates stay eligible.
+    ignore:
+      - dependency-name: datamodel-code-generator
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
     groups:
       compatible-updates:
         applies-to: version-updates
@@ -33,6 +40,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Keep the current runtime; review Electron major migrations separately.
+    # Security updates remain eligible.
+    ignore:
+      - dependency-name: electron
+        update-types: [version-update:semver-major]
     groups:
       compatible-updates:
         applies-to: version-updates

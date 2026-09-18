@@ -63,6 +63,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Source clients now report TUI launches and active use through the default
+  local Gateway, and short commands attempt a bounded final V2 upload before
+  exiting. Standalone CLI/TUI V1 installation reporting is enabled and daily
+  counters survive temporary sessions in a dedicated counts-only database;
+  later clients or Gateways can upload completed days. Source Gateway startup
+  results are reported without duplicating Desktop-owned startup events.
+  Existing reporting preferences, queued event identities and historical daily
+  acknowledgements remain in effect.
 - DeepSeek settings now discover official models for the model picker and expose
   refresh, loading, and discovery errors in the provider editor. New configurations
   use `deepseek-flash` with current vision support and peak-rate cost estimates;

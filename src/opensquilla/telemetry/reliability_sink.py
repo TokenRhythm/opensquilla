@@ -20,6 +20,10 @@ from opensquilla.telemetry.contracts.common import (
 from opensquilla.telemetry.contracts.reliability import (
     FileParseResult,
     FileParseResultV2,
+    GatewayStartErrorCode,
+    GatewayStartFailureStage,
+    GatewayStartResult,
+    GatewayStartupMode,
     ToolCallResult,
     ToolCallResultV2,
     ToolCategory,
@@ -78,6 +82,75 @@ class ReliabilityEventSink:
     @property
     def app_session_id(self) -> UUID:
         return self._app_session_id
+
+    def observe_gateway_start(
+        self,
+        *,
+        outcome: ResultOutcome,
+        error_code: GatewayStartErrorCode | None,
+        failure_stage: GatewayStartFailureStage | None,
+        duration_ms: int,
+    ) -> None:
+        """Record a source Gateway's terminal startup result using bounded facts."""
+
+        try:
+            event = self._gateway_start_event(
+                outcome=outcome,
+                error_code=error_code,
+                failure_stage=failure_stage,
+                duration_ms=duration_ms,
+            )
+            self._runtime.record_background(event)
+        except Exception:
+            return
+
+    async def record_gateway_start(
+        self,
+        *,
+        outcome: ResultOutcome,
+        error_code: GatewayStartErrorCode | None,
+        failure_stage: GatewayStartFailureStage | None,
+        duration_ms: int,
+    ) -> None:
+        """Await startup storage directly so an early-failure caller can cancel it."""
+
+        try:
+            event = self._gateway_start_event(
+                outcome=outcome,
+                error_code=error_code,
+                failure_stage=failure_stage,
+                duration_ms=duration_ms,
+            )
+            await self._runtime.record(event)
+        except Exception:
+            return
+
+    def _gateway_start_event(
+        self,
+        *,
+        outcome: ResultOutcome,
+        error_code: GatewayStartErrorCode | None,
+        failure_stage: GatewayStartFailureStage | None,
+        duration_ms: int,
+    ) -> GatewayStartResult:
+        return GatewayStartResult(
+            event_name="gateway_start_result",
+            event_version=1,
+            event_id=new_event_id(),
+            occurred_at_utc=self._clock(),
+            source=EventSource.GATEWAY,
+            app_version=self._app_version,
+            platform=self._platform,
+            outcome=outcome,
+            error_code=error_code,
+            duration_ms=duration_ms,
+            consent_scope=ConsentScope.RELIABILITY,
+            notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"],
+            sample_rate=1.0,
+            app_session_id=self._app_session_id,
+            failure_stage=failure_stage,
+            startup_mode=GatewayStartupMode.SPAWNED,
+        )
 
     def observe_turn(self, facts: TurnFacts) -> None:
         """Build one closed-schema turn event and schedule best-effort storage."""

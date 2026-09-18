@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TELEMETRY_V2_BASE_URL = "https://telemetry.opensquilla.ai"
 DEFAULT_UPLOAD_INTERVAL_SECONDS = 30.0
+SHUTDOWN_UPLOAD_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass
@@ -84,6 +85,9 @@ class ScopedTelemetryRuntime:
         self._scope_locks = {scope: asyncio.Lock() for scope in TelemetryScope}
         self._record_tasks: set[asyncio.Task[object]] = set()
         self._upload_task: asyncio.Task[None] | None = None
+        self._upload_stop = asyncio.Event()
+        self._shutdown_deadline: float | None = None
+        self._shutdown_upload_guard: asyncio.Task[None] | None = None
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._closing = False
         self._closed = False
@@ -100,11 +104,11 @@ class ScopedTelemetryRuntime:
         """Start the wake-up loop without creating files or making requests."""
 
         self._ensure_open()
-        if self._closing:
+        if self._closing or self._upload_stop.is_set():
             return
         self._bind_owner_loop()
         await self._drain_desktop_spool()
-        if self._closing or self._closed:
+        if self._closing or self._closed or self._upload_stop.is_set():
             return
         if self._upload_task is None or self._upload_task.done():
             if self._upload_task is not None and not self._upload_task.cancelled():
@@ -204,38 +208,93 @@ class ScopedTelemetryRuntime:
         except Exception:
             log.debug("telemetry upload attempt failed", exc_info=True)
 
-    async def close(self) -> None:
-        """Stop producers and close queues without forcing shutdown network I/O."""
+    def prepare_shutdown(self) -> None:
+        """Bound active sends before producers drain, while still accepting records."""
+
+        if self._closed or self._shutdown_deadline is not None:
+            return
+        self._bind_owner_loop()
+        self._upload_stop.set()
+        self._shutdown_deadline = (
+            asyncio.get_running_loop().time() + SHUTDOWN_UPLOAD_TIMEOUT_SECONDS
+        )
+        if self._upload_task is not None:
+            self._shutdown_upload_guard = asyncio.create_task(
+                self._finish_upload_loop(self._upload_task, self._shutdown_deadline)
+            )
+
+    async def close(self, *, flush: bool = True) -> None:
+        """Persist accepted records and attempt a bounded final batch per scope."""
 
         if self._closed or self._closing:
             return
         self._closing = True
-
+        self.prepare_shutdown()
         upload_task = self._upload_task
         self._upload_task = None
-        if upload_task is not None:
-            upload_task.cancel()
-            try:
-                await upload_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                log.debug("telemetry upload loop close failed", exc_info=True)
+        upload_guard = self._shutdown_upload_guard
+        self._shutdown_upload_guard = None
+        loop = asyncio.get_running_loop()
+        assert self._shutdown_deadline is not None
+        deadline = self._shutdown_deadline
+        if not flush:
+            deadline = loop.time()
+            if upload_task is not None:
+                upload_task.cancel()
+            if upload_guard is not None:
+                upload_guard.cancel()
+        pending = asyncio.gather(*tuple(self._record_tasks), return_exceptions=True)
+        try:
+            # A send holds the scope's consent lock, which pending records also
+            # need. The guard releases that lock at the network deadline, while
+            # shielding local writes lets them finish durably after cancellation.
+            await asyncio.shield(pending)
+            # Share one deadline across scopes so a stalled endpoint does not
+            # delay the other stream or make short commands wait for an interval.
+            # upload_once retains consent, backoff, and receipt checks; cancelled
+            # requests retain their durable lease for recovery and deduplication.
+            if loop.time() < deadline:
+                async with asyncio.timeout_at(deadline):
+                    await asyncio.gather(
+                        *(() if upload_guard is None else (upload_guard,)),
+                        *(self.upload_once(scope) for scope in self._scopes),
+                        return_exceptions=True,
+                    )
+        except TimeoutError:
+            log.debug("telemetry final upload deadline reached")
+        finally:
+            if upload_guard is not None:
+                upload_guard.cancel()
+                await asyncio.gather(upload_guard, return_exceptions=True)
+            if upload_task is not None and not upload_task.done():
+                upload_task.cancel()
+                await asyncio.gather(upload_task, return_exceptions=True)
+            await pending
+            self._record_tasks.clear()
+            self._closed = True
+            # A cycle already initializing a lazy scope may publish it while
+            # close waits. Capture resources only after that task has stopped.
+            scoped_runtimes = tuple(self._scopes.values())
+            self._scopes.clear()
+            for scoped in scoped_runtimes:
+                try:
+                    await scoped.close()
+                except Exception:
+                    log.debug("telemetry scope close failed", exc_info=True)
+            self._owner_loop = None
 
-        pending = tuple(self._record_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        self._record_tasks.clear()
-        self._closed = True
-
-        scoped_runtimes = tuple(self._scopes.values())
-        self._scopes.clear()
-        for scoped in scoped_runtimes:
-            try:
-                await scoped.close()
-            except Exception:
-                log.debug("telemetry scope close failed", exc_info=True)
-        self._owner_loop = None
+    async def _finish_upload_loop(self, task: asyncio.Task[None], deadline: float) -> None:
+        try:
+            async with asyncio.timeout_at(deadline):
+                await asyncio.shield(task)
+        except TimeoutError:
+            log.debug("telemetry in-flight upload deadline reached")
+        except Exception:
+            log.debug("telemetry upload loop close failed", exc_info=True)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _scope_runtime(self, scope: TelemetryScope) -> _ScopeRuntime | None:
         existing = self._scopes.get(scope)
@@ -272,6 +331,12 @@ class ScopedTelemetryRuntime:
                     )
                     self._scopes[scope] = scoped
                     return scoped
+                except asyncio.CancelledError:
+                    if uploader is not None:
+                        await _ignore_close(uploader.close())
+                    if outbox is not None:
+                        await _ignore_close(outbox.close())
+                    raise
                 except Exception:
                     log.debug("telemetry scope initialization failed", exc_info=True)
                     if uploader is not None:
@@ -305,9 +370,17 @@ class ScopedTelemetryRuntime:
             await self.upload_once(scope)
 
     async def _upload_loop(self) -> None:
-        while True:
+        while not self._upload_stop.is_set():
             await self._run_upload_cycle()
-            await asyncio.sleep(self._upload_interval_seconds)
+            await self._wait_for_upload_interval()
+
+    async def _wait_for_upload_interval(self) -> None:
+        try:
+            await asyncio.wait_for(
+                self._upload_stop.wait(), timeout=self._upload_interval_seconds
+            )
+        except TimeoutError:
+            pass
 
     async def _drain_desktop_spool(self) -> None:
         """Import Electron events without opening an unconsented scope."""

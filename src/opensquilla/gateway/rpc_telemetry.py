@@ -290,10 +290,10 @@ async def _handle_client_launch_record(
             "client launch params must be empty",
             accepted=False,
         )
-    if not ctx.principal.is_owner or not ctx.principal.authenticated:
+    if not ctx.principal.is_owner or ctx.principal.auth_state != "authenticated":
         raise RpcHandlerError(
             "UNAUTHORIZED",
-            "An authenticated owner connection is required.",
+            "A trusted owner connection is required.",
             accepted=False,
         )
     register_tui_connection(ctx.conn_id)
@@ -324,9 +324,9 @@ async def _handle_product_active_record(
         raise RpcHandlerError(
             "INVALID_REQUEST", "params must contain only a valid surface", accepted=False,
         )
-    if not ctx.principal.is_owner or not ctx.principal.authenticated:
+    if not ctx.principal.is_owner or ctx.principal.auth_state != "authenticated":
         raise RpcHandlerError(
-            "UNAUTHORIZED", "An authenticated owner connection is required.", accepted=False,
+            "UNAUTHORIZED", "A trusted owner connection is required.", accepted=False,
         )
     sink = getattr(ctx.turn_runner, "growth_event_sink", None)
     record = getattr(sink, "record_product_active", None)

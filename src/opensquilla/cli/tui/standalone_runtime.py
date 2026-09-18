@@ -259,7 +259,7 @@ async def run_standalone_chat(
     from opensquilla.gateway import build_services, build_turn_runner_from_services
     from opensquilla.gateway.routing import build_cli_route_envelope, tool_context_from_envelope
 
-    svc = await build_services()
+    svc = await build_services(start_standalone_telemetry=True)
     session_manager = svc.session_manager
     if session_manager is None:
         raise RuntimeError("standalone chat requires session manager")

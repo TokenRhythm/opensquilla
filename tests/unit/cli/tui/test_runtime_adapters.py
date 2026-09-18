@@ -115,7 +115,8 @@ def _standalone_deps(
 def _patch_standalone_services(monkeypatch: pytest.MonkeyPatch) -> _FakeServices:
     services = _FakeServices()
 
-    async def fake_build_services() -> _FakeServices:
+    async def fake_build_services(*, start_standalone_telemetry: bool) -> _FakeServices:
+        assert start_standalone_telemetry is True
         return services
 
     monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
@@ -149,7 +150,8 @@ async def test_standalone_start_and_new_keep_the_effective_cli_workspace(
     )
     services = _FakeServices(config=config, session_manager=manager)
 
-    async def fake_build_services() -> _FakeServices:
+    async def fake_build_services(*, start_standalone_telemetry: bool) -> _FakeServices:
+        assert start_standalone_telemetry is True
         return services
 
     monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
@@ -387,7 +389,8 @@ async def test_standalone_dispatch_uses_bound_project_workspace_over_tampered_or
         session_manager=manager,
     )
 
-    async def fake_build_services() -> _FakeServices:
+    async def fake_build_services(*, start_standalone_telemetry: bool) -> _FakeServices:
+        assert start_standalone_telemetry is True
         return services
 
     monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
@@ -469,7 +472,8 @@ async def test_standalone_dispatch_refreshes_unbound_saved_context(
         session_manager=manager,
     )
 
-    async def fake_build_services() -> _FakeServices:
+    async def fake_build_services(*, start_standalone_telemetry: bool) -> _FakeServices:
+        assert start_standalone_telemetry is True
         return services
 
     monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
@@ -560,7 +564,8 @@ async def test_standalone_dispatch_revalidates_project_on_every_input(
         session_manager=manager,
     )
 
-    async def fake_build_services() -> _FakeServices:
+    async def fake_build_services(*, start_standalone_telemetry: bool) -> _FakeServices:
+        assert start_standalone_telemetry is True
         return services
 
     monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
@@ -664,7 +669,8 @@ async def test_standalone_revalidates_session_replaced_by_slash_command_before_e
         session_manager=manager,
     )
 
-    async def fake_build_services() -> _FakeServices:
+    async def fake_build_services(*, start_standalone_telemetry: bool) -> _FakeServices:
+        assert start_standalone_telemetry is True
         return services
 
     monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)

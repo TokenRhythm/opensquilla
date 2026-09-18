@@ -5,6 +5,7 @@ import json
 import os
 import tomllib
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ import pytest
 
 import opensquilla.gateway.rpc_telemetry as rpc_telemetry
 import opensquilla.telemetry.consent_transition as consent_transition
-from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.auth import OpenScopeResolver, Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.rpc_config import (
@@ -213,6 +214,77 @@ async def test_product_active_rpc_requires_authenticated_owner(tmp_path: Path) -
 async def test_product_active_rpc_without_sink_is_noop(tmp_path: Path) -> None:
     context = _context(_config(tmp_path), scopes=("operator.admin",))
     assert await _handle_product_active_record({"surface": "web"}, context) == {"recorded": False}
+
+
+@pytest.mark.parametrize("method,params", [
+    ("telemetry.client_launch.record", {}),
+    ("telemetry.product_active.record", {"surface": "tui"}),
+])
+@pytest.mark.parametrize("host,peer_ip", [("127.0.0.1", "127.0.0.1"), ("::1", "::1")])
+async def test_record_rpc_accepts_transport_proven_local_owner(
+    tmp_path: Path, method: str, params: dict[str, str], host: str, peer_ip: str,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Sink:
+        async def record_client_launch(self, **kwargs: object) -> bool:
+            calls.append(kwargs)
+            return True
+
+        async def record_product_active(self, **kwargs: object) -> bool:
+            calls.append(kwargs)
+            return True
+
+    config = _config(tmp_path)
+    config.host = host
+    assert config.auth.mode == "none"
+    context = _context(config)
+    context.principal = OpenScopeResolver().resolve({}, "operator", config, peer_ip=peer_ip)
+    assert context.principal.is_owner
+    assert not context.principal.authenticated
+    context.turn_runner = type("Runner", (), {"growth_event_sink": Sink()})()
+
+    result = await get_dispatcher().dispatch("local-owner", method, params, context)
+
+    assert result.error is None
+    assert result.payload == {"recorded": True}
+    assert len(calls) == 1
+    assert calls[0]["surface"] == "tui"
+
+
+@pytest.mark.parametrize("method,params", [
+    ("telemetry.client_launch.record", {}),
+    ("telemetry.product_active.record", {"surface": "tui"}),
+])
+@pytest.mark.parametrize("case", [
+    "remote_guest", "wildcard_bind", "unknown_peer", "authenticated_non_owner",
+    "invalid_owner", "read_only_owner",
+])
+async def test_record_rpc_preserves_owner_and_scope_boundaries(
+    tmp_path: Path, method: str, params: dict[str, str], case: str,
+) -> None:
+    config = _config(tmp_path)
+    peer_ip: str | None = "127.0.0.1"
+    if case == "remote_guest":
+        peer_ip = "192.168.1.2"
+    elif case == "wildcard_bind":
+        config.host = "0.0.0.0"
+    elif case == "unknown_peer":
+        peer_ip = None
+    principal = OpenScopeResolver().resolve({}, "operator", config, peer_ip=peer_ip)
+    if case == "authenticated_non_owner":
+        principal = replace(principal, is_owner=False, authenticated=True)
+    elif case == "invalid_owner":
+        principal = replace(principal, auth_state="invalid")
+    elif case == "read_only_owner":
+        principal = replace(principal, scopes=frozenset({"operator.read"}))
+    context = _context(config)
+    context.principal = principal
+
+    result = await get_dispatcher().dispatch("untrusted", method, params, context)
+
+    assert result.error is not None
+    assert result.error.code == "UNAUTHORIZED"
 
 
 @pytest.mark.parametrize(

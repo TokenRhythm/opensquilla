@@ -290,6 +290,7 @@ async def run_agent_once(
         session_db_path=session_db_path,
         extra_agent_ids=extra_agents,
         seed_agent_workspaces=seed_agent_workspaces,
+        start_standalone_telemetry=True,
     )
     assert svc.session_manager is not None
     session_key = canonicalize_session_key(session_id or f"agent:{agent_id}:main")

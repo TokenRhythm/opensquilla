@@ -34,8 +34,8 @@ async def record_current_profile_coding_mode_usage(
 
     The code-task child agent runs with an isolated disposable profile, so the
     observation must be written by its parent process before that isolation is
-    applied. This function performs local queue I/O only; a Gateway uploader
-    sends the event later through the normal batched Growth endpoint.
+    applied. The runtime persists the event and makes a bounded upload attempt
+    when closing; an unavailable collector leaves the event queued for retry.
     """
 
     from opensquilla.telemetry.growth_sink import GrowthEventSink
@@ -64,7 +64,7 @@ def observe_current_profile_coding_mode_usage(
     *,
     config_loader: Callable[[str | None], object],
 ) -> None:
-    """Durably enqueue one actual use without performing network I/O.
+    """Durably record one actual use with a bounded best-effort upload.
 
     The callback runs only after the coding Agent process exists. Capturing the
     timestamp and the effective Coding Mode gate here keeps the event on the

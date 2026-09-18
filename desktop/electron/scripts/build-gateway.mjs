@@ -343,6 +343,11 @@ const args = [
   'lightgbm',
   '--copy-metadata',
   'yoyo-migrations',
+  // Preserve upstream LICENSE/AUTHORS files in the frozen runtime too.
+  '--copy-metadata',
+  'sqlalchemy',
+  '--copy-metadata',
+  'websockets',
   '--hidden-import',
   'joblib',
   '--hidden-import',

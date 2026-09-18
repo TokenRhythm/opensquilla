@@ -177,3 +177,51 @@ async def test_daily_usage_storage_failure_preserves_turn_and_v2_result(
         assert session.output_tokens == 24
     finally:
         await storage.close()
+
+
+async def test_ephemeral_turn_keeps_only_daily_counters_across_restart(tmp_path, monkeypatch):
+    from opensquilla.observability.daily_usage_store import DailyUsageStore
+    from opensquilla.observability.usage_telemetry import (
+        StandaloneUsageTelemetry,
+        standalone_daily_usage_path,
+    )
+
+    _enable_telemetry(monkeypatch)
+    storage = await SessionStorage.open(":memory:")
+    manager = SessionManager(storage)
+    session_key = "agent:main:ephemeral-usage"
+    await manager.create(session_key)
+    config = GatewayConfig(
+        workspace_dir=str(tmp_path / "workspace"), state_dir=str(tmp_path / "state"),
+        squilla_router={"enabled": False},
+    )
+    usage = StandaloneUsageTelemetry(config=config, legacy_storage=storage)
+    runner = TurnRunner(
+        provider_selector=_SingleProviderSelector(), session_manager=manager,
+        config=config, usage_telemetry=usage,
+    )
+    try:
+        events = [event async for event in runner.run(
+            "A synthetic question.", session_key,
+            tool_context=ToolContext(session_key=session_key, caller_kind=CallerKind.CLI),
+            no_memory_capture=True, history_has_persisted_user=False,
+        )]
+        assert not [event for event in events if isinstance(event, ErrorEvent)]
+        assert len([event for event in events if isinstance(event, DoneEvent)]) == 1
+        assert await storage.list_pending_daily_usage(before_day="9999-12-31") == []
+    finally:
+        # The day remains open, so close must not start a usage HTTP request.
+        await usage.close()
+        await storage.close()
+    restored = await DailyUsageStore.open(standalone_daily_usage_path(config))
+    try:
+        rows = await restored.list_pending_daily_usage(before_day="9999-12-31")
+        assert len(rows) == 1
+        assert rows[0]["conversation_turns"] == 1
+        assert rows[0]["input_tokens"] == 120
+        assert rows[0]["output_tokens"] == 24
+        assert rows[0]["cached_tokens"] == 40
+        assert rows[0]["cache_write_tokens"] == 6
+        assert not (tmp_path / "state" / "sessions.db").exists()
+    finally:
+        await restored.close()

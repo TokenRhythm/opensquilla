@@ -353,7 +353,22 @@ def test_dependabot_keeps_major_version_updates_separate_from_weekly_compatible_
     }
     for item in config["updates"]:
         assert item["schedule"] == {"interval": "weekly"}
-        assert "ignore" not in item
+        if item["package-ecosystem"] == "uv":
+            assert item.get("ignore") == [{
+                "dependency-name": "datamodel-code-generator",
+                "update-types": [
+                    "version-update:semver-major",
+                    "version-update:semver-minor",
+                    "version-update:semver-patch",
+                ],
+            }]
+        elif item["directory"] == "/desktop/electron":
+            assert item.get("ignore") == [{
+                "dependency-name": "electron",
+                "update-types": ["version-update:semver-major"],
+            }]
+        else:
+            assert "ignore" not in item
         assert "target-branch" not in item
         groups = item["groups"]
         assert groups["compatible-updates"] == {

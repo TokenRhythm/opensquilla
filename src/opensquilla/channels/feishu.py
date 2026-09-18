@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+from websockets.exceptions import InvalidStatus
 from websockets.protocol import State as WebSocketState
 
 from opensquilla.channels._attachment_io import (
@@ -249,6 +250,59 @@ def _feishu_sdk_websocket_state(ws_client: Any | None) -> WebSocketState | None:
 def _feishu_sdk_websocket_is_open(ws_client: Any | None) -> bool:
     """Return whether lark-oapi has a connection proven to be open."""
     return _feishu_sdk_websocket_state(ws_client) is WebSocketState.OPEN
+
+
+def _feishu_terminal_handshake_code(error: InvalidStatus) -> int | None:
+    """Preserve the SDK's terminal vendor codes for modern handshake errors."""
+    response = error.response
+    try:
+        code = int(response.headers["handshake-status"])
+        # The SDK only recognizes vendor errors with both status and message.
+        response.headers["handshake-msg"]
+        if code == 403:
+            return code
+        if code == 514 and int(response.headers["handshake-autherrcode"]) == 1000040350:
+            return code
+    except (LookupError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _adapt_feishu_sdk_handshake_errors(
+    ws_client: Any, on_terminal_error: Callable[[Exception], None],
+) -> None:
+    """Bridge Lark 1.5's legacy exception catch without altering other clients."""
+    sdk_module = inspect.getmodule(type(ws_client))
+    if sdk_module is None or sdk_module.__name__ != "lark_oapi.ws.client":
+        return
+    connect = ws_client._connect
+
+    async def connect_with_handshake_errors() -> None:
+        try:
+            await connect()
+        except InvalidStatus as exc:
+            code = _feishu_terminal_handshake_code(exc)
+            if code is None:
+                raise
+            # The SDK logs this exception before our diagnostic redactor runs.
+            # Do not copy untrusted response headers into that log message.
+            raise sdk_module.ClientException(
+                code, "Feishu WebSocket handshake was rejected",
+            ) from None
+
+    ws_client._connect = connect_with_handshake_errors
+
+    receive_messages = ws_client._receive_message_loop
+
+    async def receive_with_terminal_errors() -> None:
+        try:
+            await receive_messages()
+        except sdk_module.ClientException as exc:
+            # Reconnect runs in this background task. Without supervision its
+            # terminal error leaves Client.start() waiting in _select forever.
+            on_terminal_error(exc)
+
+    ws_client._receive_message_loop = receive_with_terminal_errors
 
 
 class _FeishuWebSocketRuntimeError(RuntimeError):
@@ -561,6 +615,14 @@ class FeishuWebSocketTransport:
 
         startup_error: list[Exception] = []
 
+        def _terminal_sdk_error(error: Exception) -> None:
+            diagnostic = self._record_error(error)
+            startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
+            log.warning("feishu.websocket_failed", error=diagnostic["message"])
+            self._stop_sdk_event_loop()
+
+        _adapt_feishu_sdk_handshake_errors(ws_client, _terminal_sdk_error)
+
         def _run() -> None:
             worker_loop = asyncio.new_event_loop()
             self._worker_loop = worker_loop
@@ -574,7 +636,7 @@ class FeishuWebSocketTransport:
                     )
                     startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
             except asyncio.CancelledError:
-                if not self._stop_requested.is_set():
+                if not self._stop_requested.is_set() and not startup_error:
                     diagnostic = self._record_error(
                         "Feishu WebSocket client loop was cancelled unexpectedly"
                     )
@@ -788,7 +850,14 @@ class FeishuWebSocketTransport:
             result = disconnect()
             if inspect.iscoroutine(result):
                 sdk_loop = self._sdk_event_loop()
-                if sdk_loop is not None and sdk_loop.is_running():
+                worker_alive = self._thread is not None and self._thread.is_alive()
+                if (
+                    sdk_loop is not None
+                    and not sdk_loop.is_closed()
+                    and (worker_alive or sdk_loop.is_running())
+                ):
+                    # Client.start() pauses this loop between connect/reconnect
+                    # and _select. Its socket and lock still belong to it.
                     future = asyncio.run_coroutine_threadsafe(result, sdk_loop)
                     try:
                         await asyncio.wait_for(
@@ -805,11 +874,10 @@ class FeishuWebSocketTransport:
                         )
                         future.cancel()
                         self._stop_sdk_event_loop()
-                        retry = disconnect()
-                        if inspect.isawaitable(retry):
-                            await retry
-                        elif hasattr(retry, "close"):
-                            retry.close()
+                        # Cancellation/draining stays on the owning loop; a
+                        # caller-loop retry cannot safely close its transport.
+                elif sdk_loop is not None:
+                    result.close()
                 else:
                     await result
             elif inspect.isawaitable(result):

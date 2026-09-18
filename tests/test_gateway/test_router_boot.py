@@ -218,6 +218,52 @@ def test_gateway_server_close_releases_pid_lock_when_shutdown_step_fails() -> No
     asyncio.run(run_case())
 
 
+@pytest.mark.parametrize("listener", ["gateway", "preview"])
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_gateway_server_close_drains_failed_listener_and_closes_services(
+    listener: str, cancelled: bool
+) -> None:
+    from opensquilla.gateway import boot
+
+    events: list[str] = []
+
+    class FakePidLock:
+        def release(self) -> None:
+            events.append("pid_released")
+
+    class FakeServices:
+        task_runtime = None
+        goal_service = None
+
+        async def close(self) -> None:
+            events.append("services_closed")
+
+    async def run_case() -> None:
+        async def fail_listener() -> None:
+            raise FileNotFoundError("synthetic missing TLS certificate")
+
+        task = asyncio.create_task(fail_listener())
+        if cancelled:
+            task.cancel()
+        await asyncio.sleep(0)
+        assert task.done()
+        server = boot.GatewayServer(
+            app=SimpleNamespace(),
+            config=GatewayConfig(),
+            _services=FakeServices(),  # type: ignore[arg-type]
+            _pid_lock=FakePidLock(),
+            _task=task if listener == "gateway" else None,
+            _preview_task=task if listener == "preview" else None,
+        )
+
+        await server.close()
+
+        assert events == ["services_closed", "pid_released"]
+        assert server._pid_lock is None
+
+    asyncio.run(run_case())
+
+
 def test_gateway_server_incomplete_runtime_keeps_services_and_pid_lock_open() -> None:
     from opensquilla.gateway import boot
     from opensquilla.gateway.task_runtime import TaskRuntimeShutdownResult
@@ -446,6 +492,15 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
     app_holder: dict[str, Any] = {}
     services_holder: dict[str, Any] = {}
     usage_started = asyncio.Event()
+    ready_telemetry: list[Any] = []
+
+    def record_ready(services: Any, *, duration_ms: int) -> None:
+        assert app_holder["app"].state.gateway_ready is True
+        assert "listener" in call_order
+        assert duration_ms >= 0
+        ready_telemetry.append(services)
+
+    monkeypatch.setattr(boot, "_record_gateway_ready_telemetry", record_ready)
 
     class FakeLog:
         def debug(self, event: str, **kwargs: Any) -> None:
@@ -618,8 +673,10 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
             if run and not listener_first:
                 assert call_order == ["build_services", "runtime_state"]
                 assert services.daily_usage_telemetry_task is None
+                assert server.app.state.gateway_start_ready is False
             await asyncio.sleep(0)
             assert server.app.state.gateway_ready is True
+            assert server.app.state.gateway_start_ready is True
             telemetry_logs = [
                 kwargs for event, kwargs in debug_logs if event == "gateway.install_telemetry"
             ]
@@ -645,6 +702,7 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
                 if storage_available:
                     expected_order.append("daily_usage")
             assert call_order == expected_order
+            assert ready_telemetry == ([services] if run else [])
             daily_task = services.daily_usage_telemetry_task
             if run and storage_available and failure != "usage":
                 assert isinstance(daily_task, asyncio.Task)

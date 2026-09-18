@@ -41,6 +41,9 @@ async def test_service_container_closes_scoped_telemetry_after_producers() -> No
             calls.append("task_runtime")
 
     class FakeTelemetryRuntime:
+        def prepare_shutdown(self) -> None:
+            calls.append("prepare_telemetry_shutdown")
+
         async def close(self) -> None:
             calls.append("telemetry_runtime")
 
@@ -48,16 +51,25 @@ async def test_service_container_closes_scoped_telemetry_after_producers() -> No
         async def close(self) -> None:
             calls.append("growth_event_sink")
 
+    class FakeStandaloneUsage:
+        async def close(self) -> None:
+            calls.append("standalone_usage")
+
     container = ServiceContainer(
         config=SimpleNamespace(),
         task_runtime=FakeTaskRuntime(),
         growth_event_sink=FakeGrowthSink(),
         telemetry_runtime=FakeTelemetryRuntime(),
+        standalone_usage_telemetry=FakeStandaloneUsage(),
     )
 
     await container.close()
 
-    assert calls == ["task_runtime", "growth_event_sink", "telemetry_runtime"]
+    assert calls == [
+        "task_runtime", "standalone_usage", "prepare_telemetry_shutdown",
+        "growth_event_sink", "telemetry_runtime",
+    ]
+    assert container.standalone_usage_telemetry is None
     assert container.growth_event_sink is None
     assert container.telemetry_runtime is None
 
@@ -134,3 +146,21 @@ async def test_service_boot_starts_growth_replay_and_closes_failed_initializatio
         await services.close()
         reset_runtime()
     assert calls == ["replay_start", "replay_close", "runtime_close"]
+
+
+@pytest.mark.parametrize("desktop", [False, True])
+def test_gateway_start_ready_event_has_one_source_owner(monkeypatch, desktop):
+    from opensquilla.gateway.boot import _record_gateway_ready_telemetry
+    from opensquilla.telemetry.contracts.common import ResultOutcome
+
+    calls = []
+    monkeypatch.setattr("opensquilla.paths.desktop_profile_lifecycle_active", lambda: desktop)
+    services = ServiceContainer(
+        config=SimpleNamespace(),
+        reliability_event_sink=SimpleNamespace(observe_gateway_start=lambda **kw: calls.append(kw)),
+    )
+    _record_gateway_ready_telemetry(services, duration_ms=123)
+    assert calls == ([] if desktop else [{
+        "outcome": ResultOutcome.SUCCESS, "error_code": None, "failure_stage": None,
+        "duration_ms": 123,
+    }])

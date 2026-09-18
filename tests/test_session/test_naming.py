@@ -20,7 +20,13 @@ from opensquilla.compat import aiosqlite
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider.auxiliary_budget import AuxiliaryRequestBudget
 from opensquilla.provider.protocol import ProviderConnectionConfig
-from opensquilla.provider.types import ProviderRequestCorrelation
+from opensquilla.provider.types import (
+    DoneEvent,
+    ErrorEvent,
+    ProviderRequestCorrelation,
+    ReasoningDeltaEvent,
+    TextDeltaEvent,
+)
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
 from opensquilla.session.naming import (
@@ -28,6 +34,7 @@ from opensquilla.session.naming import (
     _sanitize_title,
     _tier_model,
     call_naming_llm,
+    call_naming_provider,
     generate_session_title,
     is_naming_eligible,
     resolve_naming_target,
@@ -75,6 +82,29 @@ class _FakeProvider:
 
     def provider_connection_config(self) -> ProviderConnectionConfig:
         return self._conn
+
+    def chat(self, messages, tools=None, config=None):
+        """Minimal adapter-shaped chat stream.
+
+        The production path consumes this through the provider protocol; a real
+        adapter would yield stream events. Orchestrator tests replace the LLM
+        call entirely, so this is never iterated, but it must exist so the
+        provider looks adapter-shaped.
+        """
+        del messages, tools, config
+        return _EmptyStream()
+
+    accounts_physical_usage = False
+
+
+class _EmptyStream:
+    """Empty async iterator standing in for a provider chat stream."""
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
 
 
 # ── _sanitize_title ─────────────────────────────────────────────────────────
@@ -1014,9 +1044,9 @@ def _patch_provider_and_emit(
         # tokenrhythm provider, and the provider-consistency guard skips tiers
         # aimed at another provider. The explicit model keeps resolution alive
         # via the connection fallback if the default profile ever changes.
-        lambda ctx, session: _FakeProvider(
+        lambda ctx, session, model_override=None: _FakeProvider(
             provider_kind="tokenrhythm",
-            model=provider_model,
+            model=model_override or provider_model,
         ),
     )
 
@@ -1028,7 +1058,7 @@ def _patch_provider_and_emit(
         calls["kwargs"] = kwargs
         return title
 
-    monkeypatch.setattr(naming_mod, "call_naming_llm", fake_llm)
+    monkeypatch.setattr(naming_mod, "call_naming_provider", fake_llm)
 
     emits: list = []
 
@@ -1352,3 +1382,298 @@ async def test_should_auto_title_custom_named_channel_matches_type_named(storage
     assert (
         await _should_auto_title(unmapped_ctx, storage, custom, custom_key, "sid-cn")
     ) is False
+
+# ── call_naming_provider (adapter transport) ────────────────────────────────
+
+
+class _ProviderStream:
+    """Async iterator of provider stream events, recording close."""
+
+    def __init__(self, events):
+        self._events = iter(events)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _AdapterProvider:
+    """Adapter-shaped provider stub exposing connection config + chat()."""
+
+    provider_name = "openai"
+
+    def __init__(self, stream_factory, *, accounts_physical_usage=False):
+        self._stream_factory = stream_factory
+        self.calls = []
+        self.streams = []
+        self.accounts_physical_usage = accounts_physical_usage
+
+    def provider_metadata(self):
+        from opensquilla.provider.protocol import ProviderMetadata
+
+        return ProviderMetadata(
+            provider_name="openai",
+            provider_kind="openrouter",
+            provider_id="openrouter",
+            model="provider/model",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    def provider_connection_config(self):
+        return ProviderConnectionConfig(
+            provider_kind="openrouter",
+            model="provider/model",
+            api_key="KEY",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    def chat(self, messages, tools=None, config=None):
+        self.calls.append((messages, tools, config))
+        stream = self._stream_factory()
+        self.streams.append(stream)
+        return stream
+
+    async def list_models(self):
+        return []
+
+
+def _delta(text):
+    return TextDeltaEvent(text=text)
+
+
+def _done(output_tokens=5):
+    return DoneEvent(output_tokens=output_tokens)
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_returns_sanitized_title(monkeypatch):
+    provider = _AdapterProvider(
+        lambda: _ProviderStream(
+            [_delta("  "), _delta("Reset"), _delta(" Password"), _done(5)]
+        )
+    )
+    title = await call_naming_provider(
+        "Please help me reset my password",
+        provider=provider,
+        model="provider/model",
+    )
+    assert title == "Reset Password"
+    assert provider.calls[0][0][0].role == "user"
+    assert provider.calls[0][0][0].content == "Please help me reset my password"
+    assert provider.calls[0][2].max_tokens == 512
+    assert provider.calls[0][2].temperature == 0
+    assert provider.calls[0][2].thinking is False
+    # The stream is closed by the helper.
+    assert provider.streams[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_error_event_returns_none():
+    provider = _AdapterProvider(
+        lambda: _ProviderStream([ErrorEvent(message="boom", code="401")])
+    )
+    title = await call_naming_provider(
+        "hello", provider=provider, model="provider/model"
+    )
+    assert title is None
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_no_done_event_returns_none():
+    provider = _AdapterProvider(lambda: _ProviderStream([_delta("Partial")]))
+    title = await call_naming_provider(
+        "hello", provider=provider, model="provider/model"
+    )
+    assert title is None
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_empty_result_returns_none():
+    provider = _AdapterProvider(lambda: _ProviderStream([_done(0)]))
+    title = await call_naming_provider(
+        "hello", provider=provider, model="provider/model"
+    )
+    assert title is None
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_reasoning_budget_exceeded_returns_none():
+    # A reasoning-default model streams a long thinking block; the visible
+    # title must still fit the budget, so an oversized thinking block fails.
+    provider = _AdapterProvider(
+        lambda: _ProviderStream([ReasoningDeltaEvent(text="x" * 3000), _done(0)])
+    )
+    title = await call_naming_provider(
+        "hello", provider=provider, model="provider/model"
+    )
+    assert title is None
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_timeout_returns_none():
+    closed = asyncio.Event()
+
+    async def _never():
+        try:
+            yield _delta("stuck")
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    provider = _AdapterProvider(lambda: _never())
+    title = await call_naming_provider(
+        "hello", provider=provider, model="provider/model", timeout=0.01
+    )
+    assert title is None
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_accounts_physical_usage_path():
+    provider = _AdapterProvider(
+        lambda: _ProviderStream([_delta("Account Usage"), _done(2)]),
+        accounts_physical_usage=True,
+    )
+    title = await call_naming_provider(
+        "hello", provider=provider, model="provider/model"
+    )
+    assert title == "Account Usage"
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_no_message_returns_none():
+    empty = _AdapterProvider(lambda: _ProviderStream([]))
+    assert await call_naming_provider("", provider=empty, model="m") is None
+    assert await call_naming_provider("hello", provider=None, model="m") is None
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_with_real_adapter(monkeypatch):
+    """Integration: a real openai adapter drives call_naming_provider."""
+    from opensquilla.provider.selector import (
+        ProviderConfig,
+        build_provider_from_config,
+    )
+
+    built = build_provider_from_config(
+        ProviderConfig(
+            provider="openrouter",
+            model="provider/model",
+            api_key="KEY",
+            base_url="https://openrouter.ai/api/v1",
+        )
+    )
+    # The real adapter's chat() hits the network; replace it with the fake
+    # stream to verify protocol wiring without a live request.
+    monkeypatch.setattr(
+        built,
+        "chat",
+        lambda messages, tools=None, config=None: _ProviderStream(
+            [_delta("Real adapter title"), _done(4)]
+        ),
+    )
+    title = await call_naming_provider(
+        "Please help me reset my password",
+        provider=built,
+        model="provider/model",
+    )
+    assert title == "Real adapter title"
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_cancellation_closes_stream():
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def stream():
+        try:
+            started.set()
+            yield _delta("Partial")
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    provider = _AdapterProvider(stream)
+    task = asyncio.create_task(call_naming_provider(
+        "hello", provider=provider, model="provider/model",
+    ))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_bounds_cancellation_resistant_cleanup(monkeypatch):
+    import opensquilla.session.naming as naming
+
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    class SlowCloseStream(_ProviderStream):
+        async def aclose(self):
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            closed.set()
+
+    provider = _AdapterProvider(
+        lambda: SlowCloseStream([_delta("Useful Topic"), _done(2)]),
+        accounts_physical_usage=True,
+    )
+    monkeypatch.setattr(naming, "_NAMING_STREAM_CLOSE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(naming, "_NAMING_STREAM_CANCEL_GRACE_SECONDS", 0.001)
+    try:
+        title = await asyncio.wait_for(call_naming_provider(
+            "hello", provider=provider, model="provider/model",
+        ), timeout=1)
+        assert title == "Useful Topic"
+        assert not closed.is_set()
+    finally:
+        release.set()
+        await asyncio.wait_for(closed.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [
+    DoneEvent(output_tokens=2, reasoning_tokens=513),
+    DoneEvent(output_tokens=2, reasoning_content="reason " * 600),
+])
+async def test_call_naming_provider_checks_terminal_reasoning_budget(terminal):
+    provider = _AdapterProvider(lambda: _ProviderStream([_delta("Useful Topic"), terminal]))
+    assert await call_naming_provider(
+        "hello", provider=provider, model="provider/model",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_session_title_does_not_send_mismatched_target(storage, mgr, monkeypatch):
+    calls, emits = _patch_provider_and_emit(monkeypatch, title="Incorrect Target")
+    monkeypatch.setattr(
+        "opensquilla.gateway.compaction_target.resolve_selected_compaction_provider",
+        lambda ctx, session, **kwargs: _FakeProvider(
+            provider_kind="tokenrhythm", model="chat-model",
+        ),
+    )
+    key = "agent:main:webchat:unavailable-naming-target"
+    await storage.upsert_session(SessionNode(session_key=key, session_id="synthetic-target"))
+    config = GatewayConfig()
+    config.naming.model = "naming-model"
+    ctx = SimpleNamespace(config=config, session_manager=mgr, provider_selector=None)
+
+    await generate_session_title(ctx, key, "Use the configured naming model")
+
+    assert calls["llm"] == 0
+    assert emits == []
+    assert (await storage.get_session(key)).derived_title is None

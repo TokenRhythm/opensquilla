@@ -23,6 +23,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway import task_runtime
@@ -1400,12 +1401,20 @@ async def test_applied_steer_retries_failed_durable_ack_before_terminal() -> Non
         started.set()
         await release.wait()
         assert provider.drain_pending() == ["change direction"]
-        application = provider.mark_applied(
-            iteration=2,
-            model_call_id="call-retry-applied",
+        # Capture the injected failure without formatting Rich tracebacks on
+        # the event loop while the terminal-settlement watchdog is running.
+        with capture_logs() as failure_logs:
+            application = provider.mark_applied(
+                iteration=2,
+                model_call_id="call-retry-applied",
+            )
+            if inspect.isawaitable(application):
+                await application
+        assert any(
+            event["event"] == "task_runtime.steer_disposition_persist_failed"
+            and event["log_level"] == "warning"
+            for event in failure_logs
         )
-        if inspect.isawaitable(application):
-            await application
 
     storage = _make_storage()
     durable_update = storage.update_transcript_turn_context

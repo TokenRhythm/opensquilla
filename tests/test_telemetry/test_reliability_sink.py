@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
+import pytest
+
 from opensquilla import __version__
 from opensquilla.telemetry.contracts.common import (
     ClientSurface,
@@ -15,12 +17,15 @@ from opensquilla.telemetry.contracts.reliability import (
     FileParseErrorCode,
     FileSizeBucket,
     FileType,
+    GatewayStartErrorCode,
+    GatewayStartFailureStage,
     ToolCategory,
     ToolErrorCode,
     ToolOutcome,
     TurnErrorCode,
     TurnFailureStage,
 )
+from opensquilla.telemetry.contracts.wire import TelemetryWireTarget, parse_telemetry_wire
 from opensquilla.telemetry.file_parse_facts import FileParseReliabilityFacts
 from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
 from opensquilla.telemetry.runtime_facts import (
@@ -64,6 +69,43 @@ def _sink(runtime: CapturingRuntime) -> ReliabilityEventSink:
         app_session_id=UUID("00000000-0000-4000-8000-000000000900"),
         clock=lambda: datetime(2026, 9, 2, 1, 2, 3, tzinfo=UTC),
     )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error_code", "failure_stage"),
+    [
+        (ResultOutcome.SUCCESS, None, None),
+        (ResultOutcome.FAIL, GatewayStartErrorCode.SPAWN_FAILED, GatewayStartFailureStage.SPAWN),
+        (
+            ResultOutcome.TIMEOUT,
+            GatewayStartErrorCode.HEALTH_TIMEOUT,
+            GatewayStartFailureStage.HEALTH,
+        ),
+    ],
+)
+def test_gateway_start_facts_match_collector_wire_contract(
+    outcome, error_code, failure_stage
+) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime)
+    sink.observe_gateway_start(
+        outcome=outcome,
+        error_code=error_code,
+        failure_stage=failure_stage,
+        duration_ms=125,
+    )
+
+    assert len(runtime.events) == 1
+    event = parse_telemetry_wire(
+        runtime.events[0].model_dump_json(), target=TelemetryWireTarget.RELIABILITY_EVENT
+    )
+    assert event.event_name == "gateway_start_result"
+    assert event.source == "gateway"
+    assert event.startup_mode == "spawned"
+    assert event.outcome == outcome
+    assert event.error_code == error_code
+    assert event.failure_stage == failure_stage
+    assert event.app_session_id == sink.app_session_id
 
 
 def test_turn_facts_become_one_closed_contract_event() -> None:

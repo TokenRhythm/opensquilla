@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from opensquilla.telemetry.consent import (
@@ -13,6 +14,7 @@ from opensquilla.telemetry.consent import (
     TelemetryScope,
     resolve_scope_consent,
 )
+from opensquilla.telemetry.contracts import TelemetryWireTarget, parse_telemetry_wire
 from opensquilla.telemetry.contracts.common import (
     ClientEntrypoint,
     ClientSurface,
@@ -40,6 +42,7 @@ from opensquilla.telemetry.identity import (
     load_or_create_identity,
 )
 from opensquilla.telemetry.recorder import RecordResult, RecordStatus
+from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
 
 ANALYTICS_ID = uuid.UUID("123e4567-e89b-42d3-a456-426614174000")
 STARTED_AT = datetime(2026, 9, 2, 1, 2, 3, tzinfo=UTC)
@@ -142,6 +145,129 @@ async def test_product_active_counts_each_surface_daily_without_creating_cohort(
     assert not await resumed.record_product_active(surface=ClientSurface.DESKTOP)
     await resumed.close()
     assert len(runtime.events) == 5
+
+
+async def test_usage_producers_upload_valid_wire_and_keep_durable_deduplication(
+    tmp_path, monkeypatch,
+) -> None:
+    received = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/growth/events"
+        batch = parse_telemetry_wire(request.content, target=TelemetryWireTarget.GROWTH_BATCH)
+        received.extend(batch.events)
+        return httpx.Response(202, json={
+            "ok": True, "batch_id": str(batch.batch_id),
+            "accepted": len(batch.events), "duplicates": 0,
+        })
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(receive), **kwargs),
+    )
+    config = _config(tmp_path, enabled=None)
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+    )
+
+    async def record_and_upload() -> None:
+        runtime = ScopedTelemetryRuntime(
+            config=config, base_url="https://telemetry.invalid", env={},
+        )
+        sink = GrowthEventSink(
+            runtime, config=config, app_version="1.2.3", platform=Platform.MACOS,
+            clock=lambda: STARTED_AT,
+        )
+        try:
+            for surface in ClientSurface:
+                await sink.record_product_active(surface=surface)
+            sink.observe_metaskill_usage("synthetic-meta-run")
+            sink.observe_coding_mode_usage("synthetic-coding-run")
+            await sink.close()
+            await runtime.upload_once(TelemetryScope.GROWTH)
+            outbox = runtime._scopes[TelemetryScope.GROWTH].outbox
+            assert (await outbox.stats()).pending_events == 0
+        finally:
+            await sink.close()
+            await runtime.close()
+
+    await record_and_upload()
+    assert [event.event_name for event in received].count("product_active") == 4
+    assert [event.event_name for event in received].count("metaskill_usage") == 1
+    assert [event.event_name for event in received].count("coding_mode_usage") == 1
+    assert len({event.analytics_user_id for event in received}) == 1
+    assert all(
+        event.source == ("gateway" if event.event_name == "product_active" else "runtime")
+        for event in received
+    )
+    assert not growth_cohort_state_path(config=config).exists()
+    event_ids = [event.event_id for event in received]
+    await record_and_upload()
+    assert [event.event_id for event in received] == event_ids
+
+
+async def test_shutdown_preserves_growth_observation_blocked_behind_stalled_upload(
+    tmp_path, monkeypatch,
+) -> None:
+    from functools import partial
+
+    from opensquilla.telemetry import runtime as runtime_module
+    from opensquilla.telemetry.outbox import TelemetryOutbox
+    from opensquilla.telemetry.uploader import TelemetryUploader
+
+    config = _config(tmp_path, enabled=None)
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    requests = 0
+
+    async def stalled(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        entered.set()
+        await release.wait()
+        return httpx.Response(503)
+
+    monkeypatch.setattr(runtime_module, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(stalled)) as client:
+        monkeypatch.setattr(
+            runtime_module, "TelemetryUploader", partial(TelemetryUploader, http_client=client),
+        )
+        runtime = ScopedTelemetryRuntime(
+            config=config, base_url="https://telemetry.invalid", env={},
+        )
+        sink = GrowthEventSink(runtime, config=config)
+        try:
+            assert await sink.record_product_active(surface=ClientSurface.TUI)
+            await runtime.start()
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            sink.observe_metaskill_usage("synthetic-run-before-close")
+
+            # A pending observation needs the same consent lock as the in-flight
+            # send. Begin the network deadline before draining producer tasks.
+            runtime.prepare_shutdown()
+            await asyncio.wait_for(sink.close(), timeout=1)
+            record = read_metaskill_usage_state(sink.metaskill_usage_path)[
+                "synthetic-run-before-close"
+            ]
+            assert record.status is GrowthMilestoneStatus.ENQUEUED
+            await asyncio.wait_for(runtime.close(), timeout=1)
+            assert requests == 1
+        finally:
+            release.set()
+            await sink.close()
+            await runtime.close(flush=False)
+
+    outbox = await TelemetryOutbox.open(runtime.state_dir, TelemetryScope.GROWTH)
+    try:
+        # Both the unacknowledged activity and the observation admitted during
+        # that send survive normal shutdown for the next uploader to recover.
+        assert (await outbox.stats()).pending_events == 2
+    finally:
+        await outbox.close()
 
 
 @pytest.mark.parametrize("env", [

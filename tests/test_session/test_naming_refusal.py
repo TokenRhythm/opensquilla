@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,6 +14,7 @@ from opensquilla.gateway import session_event_publisher
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc_sessions import _list_transcript_titles, _should_auto_title
 from opensquilla.gateway.session_view import build_session_view_item
+from opensquilla.gateway.usage_ledger_runtime import SessionUsageEventSink
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
@@ -52,15 +54,47 @@ def _context(manager: SessionManager) -> SimpleNamespace:
             )
         )
     )
-    return SimpleNamespace(config=config, session_manager=manager, provider_selector=selector)
+    return SimpleNamespace(
+        config=config,
+        session_manager=manager,
+        provider_selector=selector,
+        usage_event_sink=SessionUsageEventSink(
+            manager.storage, start_retry_delays=(), retry_delays=(),
+        ),
+    )
 
 
 def _mock_http(monkeypatch, handler) -> None:
     # Preserve the real HTTP request construction, decoding and accounting path.
     client_class = httpx.AsyncClient
     monkeypatch.setattr(
-        "opensquilla.session.naming.httpx.AsyncClient",
+        "httpx.AsyncClient",
         lambda **kwargs: client_class(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+
+def _response(request: httpx.Request, payload: dict) -> httpx.Response:
+    if not json.loads(request.content).get("stream"):
+        return httpx.Response(200, json=payload)
+    choice = payload["choices"][0]
+    frames = [
+        {
+            "id": "synthetic-naming-response",
+            "model": payload["model"],
+            "choices": [{"index": 0, "delta": choice["message"], "finish_reason": None}],
+        },
+        {
+            "id": "synthetic-naming-response",
+            "model": payload["model"],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}],
+            "usage": payload["usage"],
+        },
+    ]
+    data = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        text=data + "data: [DONE]\n\n",
     )
 
 
@@ -109,7 +143,7 @@ async def test_refusal_never_persists_or_retries_and_survives_reopen(
 
     async def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json=payload)
+        return _response(request, payload)
 
     _mock_http(monkeypatch, respond)
     emit = AsyncMock(wraps=session_event_publisher.emit_session_event)
@@ -130,6 +164,10 @@ async def test_refusal_never_persists_or_retries_and_survives_reopen(
         assert persisted is not None
         assert persisted.derived_title is None
         assert len(requests) == 1
+        async with storage.conn.execute(
+            "SELECT status, input_tokens, output_tokens FROM usage_events"
+        ) as cursor:
+            assert [tuple(row) for row in await cursor.fetchall()] == [("finalized", 12, 8)]
         emit.assert_not_awaited()
         assert await _display_title(storage) == _FALLBACK_TITLE
         assert not await _should_auto_title(ctx, storage, persisted, _KEY, node.session_id)
@@ -167,7 +205,7 @@ async def test_normal_title_persists_through_real_naming_pipeline(
 
     async def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json=_payload(content))
+        return _response(request, _payload(content))
 
     _mock_http(monkeypatch, respond)
     emit = AsyncMock(wraps=session_event_publisher.emit_session_event)
@@ -202,10 +240,10 @@ async def test_manual_rename_wins_while_naming_http_is_pending(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def respond(_request: httpx.Request) -> httpx.Response:
+    async def respond(request: httpx.Request) -> httpx.Response:
         started.set()
         await release.wait()
-        return httpx.Response(200, json=_payload(content))
+        return _response(request, _payload(content))
 
     _mock_http(monkeypatch, respond)
     emit = AsyncMock(wraps=session_event_publisher.emit_session_event)

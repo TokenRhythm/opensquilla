@@ -98,6 +98,37 @@ The local daily ledger is persisted before enqueue; retries retain `event_id`
 and occurrence time. It uses the existing unified reporting control and CI /
 `DO_NOT_TRACK` vetoes, with no new prompt or telemetry preference.
 
+## Source CLI reporting lifecycle
+
+Local owner connections to a loopback Gateway can record content-free TUI
+launch and activity events in the default `auth.mode = "none"` configuration.
+Remote guests and non-owner connections cannot use those recording methods;
+telemetry preference changes retain their separate authorization requirements.
+
+Source Gateways record `gateway_start_result` after both runtime and listener
+readiness. Startup failures are recorded only after a valid configuration is
+available to enforce its reporting preference. Desktop-owned Gateways leave
+this event to the Desktop lifecycle observer, avoiding duplicate startup counts.
+
+Short CLI processes make a bounded final v2 upload attempt after event producers
+finish. Unacknowledged events remain in the persistent queue for a later run.
+Offline shutdown therefore does not discard accepted events or wait indefinitely.
+
+V1 installation/version and daily usage reporting also run for user-invoked
+`agent` and `chat --standalone` processes. Standalone daily counters live in a
+dedicated counts-only database, independently of `--session-db-path` and
+temporary conversations. A later standalone process or listening Gateway can
+upload these counters. Existing Gateway and explicitly persisted CLI usage
+buckets retain their identities and acknowledgement state; new standalone turns
+are recorded only in the dedicated store. Counts lost by older in-memory clients
+cannot be reconstructed.
+
+Daily usage uploads include only completed UTC days. The current day's counters
+are durable locally and become eligible after midnight UTC. Internal Coding Mode
+child processes do not start V1 reporting or count a second user conversation.
+The existing reporting preference and environment vetoes apply at collection
+and upload boundaries for both versions.
+
 `analytics_user_id` is a random analytics-only UUID. It is not a hash of the
 account ID. On successful registration, the account service stores the mapping
 needed for deletion and emits both the journey's `acquisition_id` and the new

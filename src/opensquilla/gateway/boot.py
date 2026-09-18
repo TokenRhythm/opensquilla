@@ -100,6 +100,24 @@ def _elapsed_monotonic_ms(started_at: float, ended_at: float | None = None) -> i
     return max(0, int((end - started_at) * 1000))
 
 
+def _record_gateway_ready_telemetry(services: ServiceContainer, *, duration_ms: int) -> None:
+    """Record the source Gateway boundary; Desktop owns its process lifecycle."""
+    from opensquilla.paths import desktop_profile_lifecycle_active
+    from opensquilla.telemetry.contracts.common import ResultOutcome
+
+    if desktop_profile_lifecycle_active():
+        return
+    try:
+        observer = getattr(services.reliability_event_sink, "observe_gateway_start", None)
+        if callable(observer):
+            observer(
+                outcome=ResultOutcome.SUCCESS, error_code=None, failure_stage=None,
+                duration_ms=duration_ms,
+            )
+    except Exception:
+        log.debug("gateway.start_telemetry_record_failed", exc_info=True)
+
+
 def _log_gateway_startup_phase(
     phase: str,
     *,
@@ -682,6 +700,7 @@ class ServiceContainer:
     heartbeat_loop: Any = None
     prompt_cache_keepalive_service: Any = None
     daily_usage_telemetry_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    standalone_usage_telemetry: Any = None
     deferred_warmups: list[Callable[[], Any]] = field(default_factory=list)
     deferred_warmup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     _compaction_listener_remove: Callable[[], None] | None = None
@@ -856,8 +875,19 @@ class ServiceContainer:
             except Exception:
                 pass
 
-        # Turn/tool producers are stopped above. Closing scoped telemetry now
-        # preserves any unsent queue without forcing network I/O at shutdown.
+        # Turn/tool producers are stopped above. Finish bounded telemetry
+        # delivery while retaining any unacknowledged events for a later run.
+        if self.standalone_usage_telemetry is not None:
+            try:
+                await self.standalone_usage_telemetry.close()
+            except Exception:
+                log.debug("gateway.standalone_usage_telemetry_close_failed", exc_info=True)
+            self.standalone_usage_telemetry = None
+        # Pending growth observations may need the consent lock currently held
+        # by an upload. Start its deadline before draining those producers.
+        prepare_shutdown = getattr(self.telemetry_runtime, "prepare_shutdown", None)
+        if callable(prepare_shutdown):
+            prepare_shutdown()
         if self.growth_event_sink is not None:
             try:
                 await self.growth_event_sink.close()
@@ -2516,7 +2546,9 @@ class GatewayServer:
                     self._server.should_exit = True
                 if self._task is not None:
                     try:
-                        await asyncio.wait_for(self._task, timeout=5.0)
+                        await asyncio.wait_for(
+                            asyncio.gather(self._task, return_exceptions=True), timeout=5.0
+                        )
                     except TimeoutError:
                         self._task.cancel()
                 preview_server = getattr(self, "_preview_server", None)
@@ -2530,7 +2562,9 @@ class GatewayServer:
                     preview_server.should_exit = True
                 if preview_task is not None:
                     try:
-                        await asyncio.wait_for(preview_task, timeout=5.0)
+                        await asyncio.wait_for(
+                            asyncio.gather(preview_task, return_exceptions=True), timeout=5.0
+                        )
                     except TimeoutError:
                         preview_task.cancel()
                 if preview_socket is not None:
@@ -2708,6 +2742,7 @@ async def build_services(
     extra_agent_ids: list[str] | None = None,
     seed_agent_workspaces: bool = True,
     defer_sandbox_startup: bool = False,
+    start_standalone_telemetry: bool = False,
 ) -> ServiceContainer:
     """Initialize reusable services without any gateway-specific side effects.
 
@@ -3673,6 +3708,9 @@ async def build_services(
         await growth_event_sink.start()
     except Exception:
         log.debug("build_services.telemetry_runtime_unavailable", exc_info=True)
+        prepare_shutdown = getattr(telemetry_runtime, "prepare_shutdown", None)
+        if callable(prepare_shutdown):
+            prepare_shutdown()
         if growth_event_sink is not None:
             try:
                 await growth_event_sink.close()
@@ -3719,6 +3757,16 @@ async def build_services(
         sandbox_setup_task=sandbox_setup_task,
         sandbox_upgrade_report=sandbox_upgrade_report,
     )
+    if start_standalone_telemetry and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+        try:
+            from opensquilla.observability.usage_telemetry import StandaloneUsageTelemetry
+
+            svc.standalone_usage_telemetry = StandaloneUsageTelemetry(
+                config=config, legacy_storage=get_session_storage(session_manager),
+            )
+            svc.standalone_usage_telemetry.start()
+        except Exception:
+            log.debug("build_services.standalone_usage_telemetry_unavailable", exc_info=True)
     if skill_loader is not None:
         try:
             from opensquilla.skills.watcher import SkillCatalogWatcher
@@ -3801,6 +3849,7 @@ def build_turn_runner_from_services(
         skill_loader=svc.skill_loader,
         usage_tracker=svc.usage_tracker,
         usage_event_sink=getattr(svc, "usage_event_sink", None),
+        usage_telemetry=getattr(svc, "standalone_usage_telemetry", None),
         config=resolved_config,
         memory_sync_managers=getattr(svc, "memory_sync_managers", None) or None,
         model_catalog=getattr(svc, "model_catalog", None),
@@ -5033,13 +5082,14 @@ async def start_gateway_server(
     # in-process app readiness is the final startup boundary.
     listener_ready = not run
     runtime_state_ready = False
+    app.state.gateway_start_ready = False
     gateway_ready_phase_emitted = False
     gateway_ready_wait_started_at = startup_phase_started_at
 
     def _start_post_ready_observability() -> None:
-        # Only the listening Gateway owns V1 uploads. Embedded app construction
-        # must not launch workers. The install worker is a daemon; daily usage
-        # belongs to the service container and is cancelled before storage closes.
+        # A listening Gateway starts its V1 workers only after readiness.
+        # Embedded app construction must not launch them. Standalone clients
+        # explicitly own their separate reporting lifecycle in build_services.
         if not run:
             return
         _start_background_install_telemetry(config)
@@ -5061,6 +5111,7 @@ async def start_gateway_server(
         if gateway_ready_phase_emitted or not listener_ready or not runtime_state_ready:
             return
         gateway_ready_phase_emitted = True
+        app.state.gateway_start_ready = True
         ready_at = time.monotonic()
         log.info(
             "gateway.startup_phase",
@@ -5073,6 +5124,10 @@ async def start_gateway_server(
             _ensure_sandbox_setup_on_boot(config)
         )
         _start_post_ready_observability()
+        if run:
+            _record_gateway_ready_telemetry(
+                svc, duration_ms=_elapsed_monotonic_ms(startup_started_at, ready_at),
+            )
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._pid_lock = _pid_lock
