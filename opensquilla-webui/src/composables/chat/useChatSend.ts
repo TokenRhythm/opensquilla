@@ -3132,6 +3132,14 @@ export function useChatSend(options: UseChatSendOptions) {
       const lostFreshStream = !wasStreaming
         && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)
       if (stoppedByUser || lostFreshStream) {
+        if (options.sessionKey.value !== requestSessionKey) {
+          recordSessionNavigationDiag('send.response.stale', {
+            requestSession: requestSessionKey,
+            responseSession: res?.sessionKey,
+            current: options.sessionKey.value,
+            reason: 'current_session_changed',
+          })
+        }
         const acceptedSessionKey = res?.sessionKey || requestSessionKey
         const stoppedTerminalIsCurrent = Boolean(
           stoppedByUser

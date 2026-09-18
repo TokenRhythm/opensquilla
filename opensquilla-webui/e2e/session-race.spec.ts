@@ -137,4 +137,5 @@ test('late chat.send response cannot navigate away from the current session', as
     const diag = await readSessionDiag(page)
     return diag.some(entry => entry.source === 'send.response.stale')
   }).toBe(true)
+  await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
 })

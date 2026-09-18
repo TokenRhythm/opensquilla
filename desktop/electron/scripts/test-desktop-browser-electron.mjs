@@ -18,6 +18,12 @@ if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND
 let revision = 1
 const requests = { working: 0, immutable: 0 }
 const server = createServer((request, response) => {
+  // Commit a real replacement document, but keep its load pending until stop.
+  if (request.url === '/pending-navigation') {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    response.write('<!doctype html><title>Pending navigation</title><body>Still loading')
+    return
+  }
   if (request.url === '/actionability') {
     response.setHeader('content-type', 'text/html; charset=utf-8')
     response.end(`<!doctype html><title>Actionability fixture</title>
@@ -46,16 +52,39 @@ const port = server.address().port
 const origin = `http://p-${'c'.repeat(32)}.localhost:${port}`
 const root = await mkdtemp(join(tmpdir(), 'opensquilla-browser-e2e-'))
 let app
+let processExit
 try {
   app = await electron.launch({ args: [`--user-data-dir=${join(root, 'chromium')}`,
     fileURLToPath(new URL('./fixtures/native-workbench-smoke', import.meta.url))],
     env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: 'true', NO_PROXY: '*', no_proxy: '*' } })
-  const setup = await app.evaluate(async ({ BrowserWindow }, origin) => {
+  processExit = new Promise(resolve => app.process().once('exit', (code, signal) => {
+    console.log('Browser fixture process exit:', JSON.stringify({ code, signal }))
+    resolve({ code, signal })
+  }))
+  const setup = await app.evaluate(async ({ BrowserWindow, ipcMain }, { origin, preload }) => {
     const owner = new BrowserWindow({ show: true, width: 1000, height: 800,
-      webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
+      webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, preload } })
     await owner.loadURL('data:text/html,<title>Browser test host</title>')
     const manager = new globalThis.__opensquillaNativeWorkbenchSurfaceManager({ getWindow: () => owner, emit() {} })
-    globalThis.browserFixture = { manager, owner }
+    const navigationObservations = new Map()
+    globalThis.browserFixture = { manager, owner, navigationObservations }
+    // Use the shipped preload/channel and real parser/manager. Only the isolated
+    // fixture's owner main frame may issue this command; no product boot occurs.
+    ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload) => {
+      if (event.sender !== owner.webContents || event.senderFrame !== owner.webContents.mainFrame) {
+        throw new Error('Unexpected browser fixture IPC sender')
+      }
+      const request = globalThis.__opensquillaParseNativeWorkbenchNavigationRequest(payload)
+      const record = manager.surfaces.get(request.surfaceId)
+      if (request.action === 'stop') {
+        const contents = record.view.webContents
+        navigationObservations.set(record.id, {
+          beforeStop: { loading: contents.isLoading(), ready: record.browserDocumentReady },
+          stopped: new Promise(resolve => contents.once('did-stop-loading', resolve)),
+        })
+      }
+      return await manager.navigateSurface(request)
+    })
     const targets = []
     for (const [surfaceId, sessionKey, path] of [
       ['first', 'session-a', '/'], ['same-url', 'session-a', '/'], ['other-session', 'session-b', '/'],
@@ -71,7 +100,10 @@ try {
     const browser = new globalThis.__opensquillaDesktopBrowserServer((request, signal) => manager.executeBrowser(request, signal))
     globalThis.browserFixture.server = browser
     return { targets, environment: await browser.start() }
-  }, origin)
+  }, { origin, preload: fileURLToPath(new URL('../dist/preload.cjs', import.meta.url)) })
+  const controlPage = (await Promise.all(app.windows().map(async page => ({ page, title: await page.title() }))))
+    .find(({ title }) => title === 'Browser test host')?.page
+  assert.ok(controlPage, 'the fixture owner renderer must expose the shipped preload')
   const [first, sameUrl, other, working] = setup.targets
   const invoke = async (body, deadline) => {
     const response = await fetch(setup.environment.OPENSQUILLA_DESKTOP_BROWSER_URL, {
@@ -239,17 +271,22 @@ try {
     const { manager, owner } = globalThis.browserFixture
     const record = manager.surfaces.get(identity.id)
     const end = Date.now()+3000
+    let lastState
     while(Date.now()<end) {
+      lastState = { ready: record.browserDocumentReady, bounds: record.view.getBounds(),
+        visible: record.view.getVisible(), generation: record.annotationDocumentGeneration,
+        cdpReady: record.cdpReady, debuggerAttached: record.view.webContents.debugger.isAttached() }
       if(record.browserDocumentReady) {
         const viewport=await record.view.webContents.executeJavaScript(
           '({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,count:window.count||0})')
+        lastState.viewport = viewport
         if(viewport.width===960 && viewport.height===720) return {viewport,
           webContentsId:record.view.webContents.id,targetRef:record.targetRef,visible:record.view.getVisible(),
           active:manager.activeSurfaceId,focused:owner.isFocused()}
       }
       await new Promise(resolve=>setTimeout(resolve,20))
     }
-    throw new Error('Hidden browser reload did not retain its renderer viewport')
+    throw new Error(`Hidden browser reload did not retain its renderer viewport: ${JSON.stringify(lastState)}`)
   },{id:hiddenState.id})
   assert.equal(reloadedHidden.webContentsId,hiddenState.webContentsId)
   assert.equal(reloadedHidden.targetRef,opened.targetRef)
@@ -258,6 +295,178 @@ try {
   assert.equal(reloadedHidden.focused,foregroundBeforeOpen.focused)
   assert.equal(reloadedHidden.viewport.count,0)
   await assertOpenedScreenshot(reloadedHidden.viewport)
+
+  // Hold the real document initialization after reload, then exercise UI
+  // adoption and superseding navigation while its completion is still pending.
+  await app.evaluate(() => {
+    const fixture = globalThis.browserFixture
+    const manager = fixture.manager
+    fixture.initializeHiddenViewport = manager.initializeHiddenBrowserViewport
+    fixture.waitForLifecycle = async (work, phase) => {
+      let deadline
+      try {
+        return await Promise.race([work, new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(new Error(`Hidden viewport lifecycle timed out: ${phase}`)), 3000)
+        })])
+      } finally { clearTimeout(deadline) }
+    }
+    fixture.holdReload = async id => {
+      const record = manager.surfaces.get(id)
+      const gate = new Promise(resolve => { fixture.releaseHiddenViewport = resolve })
+      manager.initializeHiddenBrowserViewport = async (candidate, assertCurrent) => {
+        if (candidate === record) await gate
+        return fixture.initializeHiddenViewport.call(manager, candidate, assertCurrent)
+      }
+      const loaded = new Promise(resolve => record.view.webContents.once('did-finish-load', resolve))
+      record.view.webContents.reload()
+      await fixture.waitForLifecycle(loaded, 'held reload document load')
+      fixture.pendingHiddenViewport = record.browserViewportReady
+      return { ready: record.browserDocumentReady, generation: record.annotationDocumentGeneration }
+    }
+    fixture.releaseReload = async () => {
+      fixture.releaseHiddenViewport()
+      const failure = await fixture.pendingHiddenViewport.then(() => null, error => String(error))
+      manager.initializeHiddenBrowserViewport = fixture.initializeHiddenViewport
+      return failure
+    }
+  })
+  assert.equal((await app.evaluate(async ({}, id) =>
+    globalThis.browserFixture.holdReload(id), hiddenState.id)).ready, false)
+  const adoptedWhilePending = await app.evaluate(async ({}, id) => {
+    const { manager, releaseReload, waitForLifecycle } = globalThis.browserFixture
+    const record = manager.surfaces.get(id)
+    const contents = record.view.webContents
+    const generation = record.annotationDocumentGeneration
+    const result = manager.setSurfaceRect({ surfaceId: id, x: 100, y: 80, width: 650, height: 500, visible: true })
+    if (!result.ok) throw new Error(result.message)
+    const failure = await releaseReload()
+    const expected = { width: 650, height: 500 }
+    const assertCurrent = () => {
+      if (manager.surfaces.get(id) !== record || contents.isDestroyed()
+        || record.annotationDocumentGeneration !== generation || !record.browserDocumentReady) {
+        throw new Error('Adopted browser document changed while waiting for its renderer viewport')
+      }
+    }
+    // Native setBounds is synchronous; delivery of that size to the renderer is
+    // not. Keep the existing lifecycle budget and wait for the real viewport,
+    // without emulation or accepting a native-bounds regression as the target.
+    const deadline = Date.now() + 3000
+    let viewport
+    let cancelled = false
+    let pollTimer
+    try {
+      await waitForLifecycle((async () => {
+        while (!cancelled) {
+          assertCurrent()
+          viewport = await contents.executeJavaScript('({width:innerWidth,height:innerHeight})')
+          assertCurrent()
+          if (cancelled || Date.now() >= deadline) throw new Error('Renderer resize deadline expired')
+          if (viewport.width === expected.width && viewport.height === expected.height) return
+          await new Promise(resolve => { pollTimer = setTimeout(resolve, 20) })
+        }
+      })(), 'adopted renderer resize')
+    } catch (error) {
+      throw new Error(`Adopted browser renderer resize failed: ${JSON.stringify({
+        expected, viewport, bounds: record.view.getBounds(), generation,
+      })}`, { cause: error })
+    } finally {
+      cancelled = true
+      clearTimeout(pollTimer)
+    }
+    return { failure, ready: record.browserDocumentReady, viewport, bounds: record.view.getBounds() }
+  }, hiddenState.id)
+  assert.equal(adoptedWhilePending.failure, null)
+  assert.equal(adoptedWhilePending.ready, true)
+  assert.deepEqual(adoptedWhilePending.bounds, { x: 100, y: 80, width: 650, height: 500 })
+  assert.deepEqual(adoptedWhilePending.viewport, {
+    width: adoptedWhilePending.bounds.width, height: adoptedWhilePending.bounds.height,
+  })
+
+  // All three independent cases must pass; these are bounded lifecycle cases,
+  // not retries after a failed stop.
+  for (let stopCase = 0; stopCase < 3; stopCase++) {
+    const retiringPage = await invoke({ operation: 'open', url: origin+'/hidden-open' })
+    assert.equal(retiringPage.status, 200)
+    const retiredInitialization = await app.evaluate(async ({}, { targetRef, origin }) => {
+      const trace = phase => process.stderr.write(`hidden-viewport-lifecycle: ${phase}\n`)
+      const fixture = globalThis.browserFixture
+      const record = [...fixture.manager.surfaces.values()].find(item => item.targetRef === targetRef)
+      const old = await fixture.holdReload(record.id)
+      trace('reload-held')
+      const contents = record.view.webContents
+      const started = new Promise(resolve => contents.once('did-start-navigation', resolve))
+      void contents.loadURL(origin+'/pending-navigation').catch(() => {})
+      await fixture.waitForLifecycle(started, 'replacement navigation start')
+      trace('replacement-navigation-started')
+      fixture.releaseHiddenViewport()
+      const failure = await fixture.pendingHiddenViewport.then(() => null, error => String(error))
+      trace('old-initialization-settled')
+      const afterLateCompletion = { ready: record.browserDocumentReady, generation: record.annotationDocumentGeneration }
+      return { id: record.id, old, failure, afterLateCompletion }
+    }, { targetRef: retiringPage.targetRef, origin })
+    // Stop through the real renderer preload -> ipcRenderer.invoke boundary,
+    // while the replacement document is still loading. This avoids re-entering
+    // Chromium from a private did-start-navigation hook in the same main task.
+    const stop = await controlPage.evaluate(async surfaceId =>
+      window.opensquillaDesktop.navigateWorkbenchSurface({ version: 4, surfaceId, action: 'stop' }),
+    retiredInitialization.id)
+    assert.equal(stop.ok, true, JSON.stringify(stop))
+    const stoppedInitialization = await app.evaluate(async ({}, targetRef) => {
+      const fixture = globalThis.browserFixture
+      const record = [...fixture.manager.surfaces.values()].find(item => item.targetRef === targetRef)
+      const contents = record.view.webContents
+      const { beforeStop, stopped } = fixture.navigationObservations.get(record.id)
+      await fixture.waitForLifecycle(stopped, 'replacement navigation stop')
+      const loadingAfterStop = contents.isLoading()
+      const readyAfterStop = record.browserDocumentReady
+      // An already stopped/closed document cannot be revived by another late
+      // completion of the initializer either.
+      await fixture.manager.destroySurface(record.id)
+      await fixture.releaseReload()
+      return { beforeStop, readyAfterStop, loadingAfterStop,
+        destroyed: contents.isDestroyed(), retained: fixture.manager.surfaces.has(record.id) }
+    }, retiringPage.targetRef)
+    assert.equal(retiredInitialization.old.ready, false)
+    assert.match(retiredInitialization.failure, /browser document changed/)
+    assert.ok(retiredInitialization.afterLateCompletion.generation > retiredInitialization.old.generation)
+    assert.equal(retiredInitialization.afterLateCompletion.ready, false)
+    assert.deepEqual(stoppedInitialization.beforeStop, { loading: true, ready: false })
+    assert.equal(stoppedInitialization.readyAfterStop, false)
+    assert.equal(stoppedInitialization.loadingAfterStop, false)
+    assert.equal(stoppedInitialization.destroyed, true)
+    assert.equal(stoppedInitialization.retained, false)
+    console.log(`Hidden reload renderer IPC stop case ${stopCase + 1}:`, JSON.stringify(stoppedInitialization))
+  }
+  for (const action of ['stop', 'close']) {
+    const pendingPage = await invoke({ operation: 'open', url: origin+'/hidden-open' })
+    assert.equal(pendingPage.status, 200)
+    const cancelled = await app.evaluate(async ({}, { targetRef, action }) => {
+      const fixture = globalThis.browserFixture
+      const record = [...fixture.manager.surfaces.values()].find(item => item.targetRef === targetRef)
+      await fixture.holdReload(record.id)
+      if (action === 'close') await fixture.manager.destroySurface(record.id)
+      else await fixture.manager.navigateSurface({ version: 4, surfaceId: record.id, action: 'stop' })
+      const failure = await fixture.releaseReload()
+      const state = { failure, ready: record.browserDocumentReady,
+        retained: fixture.manager.surfaces.has(record.id), recovered: null }
+      if (action === 'stop') {
+        const loaded = new Promise(resolve => record.view.webContents.once('did-finish-load', resolve))
+        await fixture.manager.navigateSurface({ version: 4, surfaceId: record.id, action: 'reload' })
+        await fixture.waitForLifecycle(loaded, 'stopped document reload recovery')
+        await record.browserViewportReady
+        state.recovered = { ready: record.browserDocumentReady, stopped: record.browserNavigationStopped,
+          viewport: await record.view.webContents.executeJavaScript('({width:innerWidth,height:innerHeight})') }
+        await fixture.manager.destroySurface(record.id)
+      }
+      return state
+    }, { targetRef: pendingPage.targetRef, action })
+    assert.match(cancelled.failure, /browser document changed/)
+    assert.equal(cancelled.ready, false, `${action} must retire the pending document initializer`)
+    assert.equal(cancelled.retained, action === 'stop')
+    if (action === 'stop') assert.deepEqual(cancelled.recovered, {
+      ready: true, stopped: false, viewport: { width: 960, height: 720 },
+    })
+  }
   for(const size of [{width:650,height:500},{width:420,height:600},{width:1200,height:900}]) {
     const adopted = await app.evaluate(async ({}, {id,size}) => {
       const { manager, owner } = globalThis.browserFixture
@@ -349,6 +558,10 @@ try {
   assert.equal((await invoke({ operation: 'snapshot', targetRef: afterCrash.targetRef })).status, 200)
   assert.equal((await invoke({ operation: 'snapshot', targetRef: working.targetRef })).status, 200)
   console.log('Real Electron browser actions, exact targets, cancellation, renderer crash and working-file refresh passed.')
+} catch (error) {
+  // Preserve the failed assertion even if native profile cleanup also fails.
+  console.error('Desktop browser native contract failed:', error)
+  throw error
 } finally {
   if(app) {
     await app.evaluate(async () => {
@@ -356,6 +569,16 @@ try {
       await globalThis.browserFixture?.manager?.destroyAll()
     }).catch(()=>{})
     await app.close()
+    let exitDeadline
+    try {
+      const exit = await Promise.race([processExit, new Promise((_, reject) => {
+        exitDeadline = setTimeout(() => reject(new Error('Browser fixture process did not exit after close')), 5000)
+      })])
+      assert.equal(exit.code, 0, JSON.stringify(exit))
+      assert.equal(exit.signal, null, JSON.stringify(exit))
+    } finally {
+      clearTimeout(exitDeadline)
+    }
   }
   server.closeAllConnections()
   await new Promise(resolve=>server.close(resolve))

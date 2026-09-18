@@ -112,8 +112,12 @@ interface NativeWorkbenchSurfaceRecord {
   annotationFocusTimer: NodeJS.Timeout | null
   annotationPickerActive: boolean
   annotationPickerEpoch: number
-  /** True only after the current preview navigation reaches did-finish-load. */
+  /** True after did-finish-load and any hidden renderer initialization. */
   browserDocumentReady: boolean
+  /** A browser-opened page keeps its initial hidden viewport until UI adoption. */
+  browserOpenedHidden: boolean
+  browserViewportReady: Promise<void>
+  browserNavigationStopped: boolean
   /** Set by CDP Runtime.exceptionThrown until the next successful navigation. */
   browserRuntimeException: boolean
   /** WebRTC guard for an offline preview. */
@@ -855,6 +859,9 @@ export class NativeWorkbenchSurfaceManager {
       annotationPickerActive: false,
       annotationPickerEpoch: 0,
       browserDocumentReady: false,
+      browserOpenedHidden: false,
+      browserViewportReady: Promise.resolve(),
+      browserNavigationStopped: false,
       browserRuntimeException: false,
       offlineRealmGuardInstalled: false,
       offlineRealmGuardScriptId: null,
@@ -1588,28 +1595,8 @@ export class NativeWorkbenchSurfaceManager {
       }
       const assertOpening = () => { check(); assertOpeningRecord() }
       try {
-        await this.queueSurfaceOperation(`operation:${record.targetRef}`, async () => {
-          assertOpening()
-          // A never-shown child view can have a zero-sized renderer despite native
-          // bounds. Initialize that same renderer, then immediately remove emulation
-          // so later UI layout and device scale remain native.
-          let initializationFailed = false
-          try {
-            await this.cdpCommand(record, 'Emulation.setDeviceMetricsOverride', {
-              width: 960, height: 720, deviceScaleFactor: 0, mobile: false,
-            }, assertOpening)
-          } catch (error) {
-            initializationFailed = true
-            throw error
-          } finally {
-            try {
-              await this.cdpCommand(record, 'Emulation.clearDeviceMetricsOverride', undefined, assertOpeningRecord)
-            } catch (error) {
-              if (!initializationFailed) throw error
-            }
-          }
-          assertOpening()
-        })
+        record.browserOpenedHidden = true
+        await this.initializeHiddenBrowserViewport(record, assertOpening)
         assertOpening()
         // The current session's UI adopts the hidden page and supplies its visible layout.
         const target = this.getBrowserTarget(surfaceId)
@@ -2123,6 +2110,52 @@ export class NativeWorkbenchSurfaceManager {
           reason: reason || 'annotation-debugger-detached',
         })
       }
+    })
+  }
+
+  private initializeHiddenBrowserViewport(
+    record: NativeWorkbenchSurfaceRecord,
+    assertCurrent: () => void,
+  ): Promise<void> {
+    return this.queueSurfaceOperation(`operation:${record.targetRef}`, async () => {
+      assertCurrent()
+      // Once adopted, the UI owns native bounds and scale. Never emulate them.
+      if (record.requestedRect !== null) return
+      const { width, height } = record.view.getBounds()
+      // A never-shown renderer may return to 0x0 after navigation. Initialize
+      // each new document, then clear emulation even if navigation supersedes it.
+      let initializationFailed = false
+      let metricsStarted = false
+      const adopted = Symbol('native-layout-adopted')
+      try {
+        await this.cdpCommand(record, 'Emulation.setDeviceMetricsOverride', {
+          width, height, deviceScaleFactor: 0, mobile: false,
+        }, () => {
+          assertCurrent()
+          // CDP has its own queue. The UI may adopt this view while our
+          // command is waiting; that is a normal handoff, not a failed page.
+          if (record.requestedRect !== null) throw adopted
+          metricsStarted = true
+        })
+      } catch (error) {
+        if (error === adopted) return
+        initializationFailed = true
+        throw error
+      } finally {
+        if (metricsStarted) {
+          try {
+            await this.cdpCommand(record, 'Emulation.clearDeviceMetricsOverride', undefined, () => {
+              if (this.surfaces.get(record.id) !== record || record.disposed || record.crashed
+                || record.owner.isDestroyed() || record.view.webContents.isDestroyed()) {
+                throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
+              }
+            })
+          } catch (error) {
+            if (!initializationFailed) throw error
+          }
+        }
+      }
+      assertCurrent()
     })
   }
 
@@ -2745,6 +2778,10 @@ export class NativeWorkbenchSurfaceManager {
           contents.reload()
           break
         case 'stop':
+          if (contents.isLoading() || !record.browserDocumentReady) {
+            record.browserNavigationStopped = true
+            record.browserDocumentReady = false
+          }
           contents.stop()
           break
         case 'open-external':
@@ -3668,6 +3705,7 @@ export class NativeWorkbenchSurfaceManager {
       'did-start-navigation',
       (_event, _targetUrl, _isInPlace, isMainFrame) => {
         if (!isMainFrame || !(record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) return
+        record.browserNavigationStopped = false
         if (
           record.kind !== 'artifact-html'
         ) {
@@ -3761,16 +3799,36 @@ export class NativeWorkbenchSurfaceManager {
       }
       this.emitNavigationState(record)
     })
+    contents.on('dom-ready', () => {
+      record.browserViewportReady = Promise.resolve()
+      if (!record.browserOpenedHidden || record.requestedRect !== null || record.browserNavigationStopped) return
+      const generation = record.annotationDocumentGeneration
+      const isCurrent = () => !record.disposed && !record.crashed
+        && !record.browserNavigationStopped
+        && !contents.isDestroyed() && this.surfaces.get(record.id) === record
+        && record.annotationDocumentGeneration === generation
+      record.browserViewportReady = this.initializeHiddenBrowserViewport(record, () => {
+        if (!isCurrent()) throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser document changed.')
+      })
+      // Observe failures immediately; did-finish-load must not publish readiness
+      // for a failed or superseded initialization.
+      void record.browserViewportReady.catch(error => {
+        if (isCurrent()) this.failRecord(record, 'error', { message: errorMessage(error) })
+      })
+    })
     contents.on('did-finish-load', () => {
-      if (
-        record.kind !== 'artifact-html'
-      ) {
-        record.browserDocumentReady = true
-      }
-      record.initialDocumentCommitted = true
-      record.authenticationAttempts.clear()
-      this.emit(record, 'ready')
-      this.emitNavigationState(record)
+      const generation = record.annotationDocumentGeneration
+      void record.browserViewportReady.then(() => {
+        if (record.disposed || record.crashed || contents.isDestroyed()
+          || record.browserNavigationStopped
+          || this.surfaces.get(record.id) !== record
+          || record.annotationDocumentGeneration !== generation) return
+        if (record.kind !== 'artifact-html') record.browserDocumentReady = true
+        record.initialDocumentCommitted = true
+        record.authenticationAttempts.clear()
+        this.emit(record, 'ready')
+        this.emitNavigationState(record)
+      }, () => { /* The dom-ready observer reports initialization failure. */ })
     })
     contents.on('did-fail-load', (_event, errorCode, errorDescription, _url, isMainFrame) => {
       if (!isMainFrame || record.disposed || errorCode === -3) return

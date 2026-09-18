@@ -2437,6 +2437,26 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     assert upload_step["with"]["retention-days"] == 14
 
 
+def test_native_shell_contracts_require_powershell_on_core_and_partitioned_shards() -> None:
+    steps = _workflow("ci.yml")["jobs"]["windows-full"]["steps"]
+    provision = next(
+        step for step in steps
+        if step.get("name") == "Verify PowerShell 7 for native shell contracts"
+    )
+    assert provision["if"] == (
+        "${{ matrix.shard == 'core' || startsWith(matrix.shard, 'core-') }}"
+    )
+    assert provision["shell"] == "pwsh"
+    assert "$PSVersionTable.PSVersion.Major -lt 7" in provision["run"]
+    assert 'throw "Native shell contracts require PowerShell 7"' in provision["run"]
+    assert "Get-Command pwsh -CommandType Application -ErrorAction Stop" in provision["run"]
+    assert not provision.get("continue-on-error")
+    assert steps.index(provision) < next(
+        index for index, step in enumerate(steps)
+        if step.get("name") == "Test Windows shard"
+    )
+
+
 def test_recovery_windows_shard_uses_and_always_cleans_distinct_real_volumes() -> None:
     windows_full = _workflow("ci.yml")["jobs"]["windows-full"]
     steps = windows_full["steps"]

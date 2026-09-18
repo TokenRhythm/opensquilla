@@ -1,14 +1,18 @@
 import assert from 'node:assert/strict'
 import { request as httpRequest } from 'node:http'
+import { mock } from 'node:test'
 import { DesktopBrowserServer, parseDesktopBrowserRequest, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from '../dist/desktop-browser.js'
 
 const audit = []
 let calls = 0
 let interrupted = false
+let started
+const slowStarted = new Promise(resolve => { started = resolve })
 const server = new DesktopBrowserServer(async (request, signal) => {
   calls++
   if (request.sessionKey === 'slow') return await new Promise(resolve => {
     signal.addEventListener('abort', () => { interrupted = true; resolve({ cancelled: true }) }, { once: true })
+    started()
   })
   return { targets: [{ targetRef: 'synthetic-target', sessionKey: request.sessionKey }] }
 }, entry => audit.push(entry))
@@ -37,10 +41,34 @@ try {
   assert.equal((await invoke('{')).status, 400)
   assert.equal((await invoke({ ...payload, artifactId: 'untrusted' })).status, 400)
   assert.equal((await invoke('x'.repeat(65537))).status, 413)
+  // An expired request must be rejected before reaching the operation.
   assert.equal((await invoke({ sessionKey: 'slow', operation: 'list' }, {
-    'x-opensquilla-deadline-at-ms': String(Date.now() + 40),
+    'x-opensquilla-deadline-at-ms': String(Date.now() - 1),
   })).status, 504)
-  assert.equal(interrupted, true)
+  assert.equal(calls, 1)
+  assert.equal(interrupted, false)
+  // Freeze only clock/timers while real HTTP reaches the handler. Advance the
+  // original 40ms budget after observing entry, not before network scheduling.
+  const realSetTimeout = globalThis.setTimeout
+  let watchdog
+  const handlerEntry = Promise.race([slowStarted, new Promise((_, reject) => {
+    watchdog = realSetTimeout(() => reject(new Error('Browser cancellation fixture did not enter its handler')), 5000)
+  })])
+  mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+  try {
+    const slow = invoke({ sessionKey: 'slow', operation: 'list' }, {
+      'x-opensquilla-deadline-at-ms': String(Date.now() + 40),
+    })
+    await handlerEntry
+    mock.timers.tick(39)
+    assert.equal(interrupted, false, 'the operation must retain its full deadline')
+    mock.timers.tick(1)
+    assert.equal((await slow).status, 504)
+    assert.equal(interrupted, true, 'an admitted operation must receive deadline cancellation')
+  } finally {
+    mock.timers.reset()
+    clearTimeout(watchdog)
+  }
   assert.equal(calls, 2, 'rejected requests must never reach the browser')
   assert.equal(JSON.stringify(audit).includes(token), false)
   assert.equal(JSON.stringify(audit).includes('synthetic-session'), false)

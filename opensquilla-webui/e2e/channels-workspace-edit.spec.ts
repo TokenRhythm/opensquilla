@@ -81,7 +81,10 @@ test.describe.serial('channel workspace compose + edit', () => {
     await expect(bar).toBeVisible()
     await expect(bar).toContainText('Default chat id')
     await bar.getByRole('button', { name: 'Test connection' }).click()
-    await expect(editor.locator('.cfge__transcript-row')).toBeVisible({ timeout: 20000 })
+    await expect(editor.locator('.cfge__transcript-row.is-ok')).toContainText(
+      'Configuration checks passed', { timeout: 20000 },
+    )
+    await expect(editor.locator('.cfge__transcript-row.is-fail')).toHaveCount(0)
 
     // Save: probe → upsert, baseline reset, back to read mode; the secret
     // stays masked and the change persisted (expand Advanced to read it).

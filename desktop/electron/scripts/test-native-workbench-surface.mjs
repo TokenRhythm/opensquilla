@@ -114,8 +114,14 @@ const executeBrowser = new Function(
   'DesktopBrowserError', 'randomUUID', 'parseNativeWorkbenchNavigationUrl', 'NATIVE_WORKBENCH_PROTOCOL_VERSION_V4',
   `return ({${nativeWorkbenchSurfaceRuntime.slice(browserExecutorStart, browserExecutorEnd)}}).executeBrowser`,
 )(DesktopBrowserError, randomUUID, parseNativeWorkbenchNavigationUrl, NATIVE_WORKBENCH_PROTOCOL_VERSION_V4)
+const viewportInitializerStart = nativeWorkbenchSurfaceRuntime.indexOf('    initializeHiddenBrowserViewport(')
+const viewportInitializerEnd = nativeWorkbenchSurfaceRuntime.indexOf('    cdpCommand(', viewportInitializerStart)
+assert.ok(viewportInitializerStart >= 0 && viewportInitializerEnd > viewportInitializerStart)
+const initializeHiddenBrowserViewport = new Function('DesktopBrowserError',
+  `return ({${nativeWorkbenchSurfaceRuntime.slice(viewportInitializerStart, viewportInitializerEnd)}}).initializeHiddenBrowserViewport`,
+)(DesktopBrowserError)
 
-async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpening, failure = null) {
+async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpening, failure = null, adoptBeforeSend = false) {
   const foreground = { id: 'foreground', visible: true, requestedRect: { x: 180, y: 90, width: 700, height: 500 } }
   const switched = { id: 'switched', visible: false, requestedRect: { x: 240, y: 110, width: 620, height: 480 } }
   const events = []
@@ -132,13 +138,16 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
   const manager = {
     surfaces: new Map([[foreground.id, foreground], [switched.id, switched]]),
     activeSurfaceId: foreground.id,
+    initializeHiddenBrowserViewport,
     isPrivilegedGatewayTarget: () => false,
     async createSurface(request) {
       openingRecord = {
         id: request.surfaceId, scopeId: request.payload.scopeId, kind: request.kind,
         url: request.payload.url, targetRef: `target-${request.surfaceId}`, visible: false,
         owner: { isDestroyed: () => ownerDestroyed },
-        view: { webContents: { isDestroyed: () => false } },
+        requestedRect: null,
+        view: { getBounds: () => ({ x: 0, y: 0, width: 960, height: 720 }),
+          webContents: { isDestroyed: () => false } },
       }
       this.surfaces.set(request.surfaceId, openingRecord)
       await opening
@@ -149,6 +158,7 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
       return await operation()
     },
     async cdpCommand(record, method, params, beforeSend) {
+      if (adoptBeforeSend) record.requestedRect = { x: 0, y: 0, width: 620, height: 480 }
       beforeSend?.()
       assert.equal(record, openingRecord)
       assert.deepEqual(events, [], 'the UI must not adopt before viewport initialization completes')
@@ -197,15 +207,19 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
   assert.equal(manager.activeSurfaceId, expectedForeground.id, 'agent open must not replace the user-selected foreground')
   assert.equal(expectedForeground.visible, true)
   assert.deepEqual(rectCalls, [], 'only the adopting UI may assign a visible layout rectangle')
-  assert.deepEqual(commands[0], { method: 'Emulation.setDeviceMetricsOverride',
-    params: { width: 960, height: 720, deviceScaleFactor: 0, mobile: false } })
-  if (failure === 'replace' || failure === 'close' || failure === 'owner-close') {
-    assert.equal(commands.length, 1, 'no cleanup command may target a replaced or closed page')
-    assert.deepEqual(destroyed, failure === 'owner-close' ? [openingRecord] : [])
-    if (failure === 'replace') assert.equal(manager.surfaces.get(openingRecord.id).targetRef, 'replacement-target')
+  if (adoptBeforeSend) {
+    assert.deepEqual(commands, [], 'a queued initializer must not override the UI-adopted viewport')
   } else {
-    assert.deepEqual(commands[1], { method: 'Emulation.clearDeviceMetricsOverride', params: undefined })
-    assert.equal(commands.length, 2)
+    assert.deepEqual(commands[0], { method: 'Emulation.setDeviceMetricsOverride',
+      params: { width: 960, height: 720, deviceScaleFactor: 0, mobile: false } })
+    if (failure === 'replace' || failure === 'close' || failure === 'owner-close') {
+      assert.equal(commands.length, 1, 'no cleanup command may target a replaced or closed page')
+      assert.deepEqual(destroyed, failure === 'owner-close' ? [openingRecord] : [])
+      if (failure === 'replace') assert.equal(manager.surfaces.get(openingRecord.id).targetRef, 'replacement-target')
+    } else {
+      assert.deepEqual(commands[1], { method: 'Emulation.clearDeviceMetricsOverride', params: undefined })
+      assert.equal(commands.length, 2)
+    }
   }
   if (failure) {
     assert.deepEqual(events, [])
@@ -228,6 +242,7 @@ for (const sessionKey of ['foreground-session', 'background-session']) {
 for (const failure of ['set', 'clear', 'both', 'cancel', 'replace', 'close', 'owner-close']) {
   await assertBrowserOpenPreservesForeground('background-session', false, failure)
 }
+await assertBrowserOpenPreservesForeground('background-session', false, null, true)
 
 const annotationHighlightConfig = nativeWorkbenchSurfaceRuntime.match(
   /const NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG = Object\.freeze\(\{([\s\S]*?)\n\}\);/,

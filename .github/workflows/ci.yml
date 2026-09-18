@@ -1366,7 +1366,7 @@ jobs:
           throw "No verified native Git Bash found. Candidates: $($candidates -join '; ')"
 
       - name: Verify PowerShell 7 for native shell contracts
-        if: ${{ matrix.shard == 'core' }}
+        if: ${{ matrix.shard == 'core' || startsWith(matrix.shard, 'core-') }}
         shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.Major -lt 7) {
