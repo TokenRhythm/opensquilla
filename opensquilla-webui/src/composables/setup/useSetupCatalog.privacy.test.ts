@@ -1,10 +1,11 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick } from 'vue'
+import { createApp, nextTick, ref } from 'vue'
 import { localizeImageActionableDetail, useSetupCatalog } from './useSetupCatalog'
 import { LEGACY_OPENROUTER_MODEL_OPTIONS } from './useSetupEnsembleForm'
 import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
 import { SetupWorkflowError } from '@/modules/setupWorkflow'
+import type { GatewayAvailability } from '@/modules/gatewayAccess'
 
 const rpcCall = vi.hoisted(() => vi.fn())
 const ready = vi.hoisted(() => vi.fn(async () => {}))
@@ -68,7 +69,7 @@ async function primaryTransitionScenario(first = false, mutate: (method: string,
   return { ...await mountCatalog(), saved }
 }
 
-async function mountCatalog() {
+async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('available')) {
   let api!: ReturnType<typeof useSetupCatalog>
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -83,10 +84,10 @@ async function mountCatalog() {
   const { PROVIDER_CONFIGURATION_KEY } = await import('@/modules/providerConfiguration')
   const { GATEWAY_ACCESS_KEY } = await import('@/modules/gatewayAccess')
   app.provide(GATEWAY_ACCESS_KEY, {
-    availability: 'available',
+    get availability() { return gatewayAvailability.value },
     connectionError: null,
     requiresCredential: false,
-    isAvailable: true,
+    get isAvailable() { return gatewayAvailability.value === 'available' },
     isLocalOwner: true,
     isAuthenticated: true,
     guestSessionOwnerId: null,
@@ -405,6 +406,95 @@ afterEach(() => {
   confirmChoiceAction.mockReset()
   confirmChoiceAction.mockResolvedValue('cancel')
   document.body.innerHTML = ''
+})
+
+describe('useSetupCatalog initial connection readiness', () => {
+  it('waits for the Gateway before loading a cold settings route', async () => {
+    const availability = ref<GatewayAvailability>('preparing')
+    mockConfigSequence([{ llm: { provider: 'openrouter', model: 'openai/gpt-4.1-mini' } }])
+    const { api, app } = await mountCatalog(availability)
+    try {
+      expect(api.loaded.value).toBe(false)
+      expect(rpcCall).not.toHaveBeenCalled()
+      expect(pushToast).not.toHaveBeenCalled()
+
+      availability.value = 'available'
+      await vi.waitFor(() => expect(api.loaded.value).toBe(true))
+
+      expect(api.config.value.llm?.provider).toBe('openrouter')
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.catalog')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+      expect(pushToast).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it.each([false, true])('retries an interrupted initial load when reconnect precedes the error: %s', async reconnectBeforeError => {
+    const availability = ref<GatewayAvailability>('available')
+    let rejectInitialCatalog!: (reason: Error) => void
+    const initialCatalog = new Promise<unknown>((_resolve, reject) => {
+      rejectInitialCatalog = reject
+    })
+    let catalogRequests = 0
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        catalogRequests += 1
+        return catalogRequests === 1 ? initialCatalog : {}
+      }
+      if (method === 'config.get') return { privacy: { disable_network_observability: false } }
+      if (method === 'config.effective') return { fields: {} }
+      return {}
+    })
+    const { api, app } = await mountCatalog(availability)
+    try {
+      expect(catalogRequests).toBe(1)
+      expect(api.loaded.value).toBe(false)
+      availability.value = 'unavailable'
+      await nextTick()
+      if (reconnectBeforeError) {
+        availability.value = 'available'
+        await nextTick()
+        expect(catalogRequests).toBe(1)
+        expect(api.loaded.value).toBe(false)
+      }
+      rejectInitialCatalog(new Error('Gateway connection closed during initial settings load'))
+      await initialCatalog.catch(() => undefined)
+      for (let turn = 0; turn < 5; turn += 1) await nextTick()
+
+      expect(pushToast).not.toHaveBeenCalled()
+      if (!reconnectBeforeError) {
+        expect(api.loaded.value).toBe(false)
+        availability.value = 'available'
+      }
+      await vi.waitFor(() => expect(api.loaded.value).toBe(true))
+
+      expect(catalogRequests).toBe(2)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(2)
+      expect(api.privacyPanel.value.networkReportingEnabled).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('keeps existing settings drafts when an already loaded Gateway reconnects', async () => {
+    const availability = ref<GatewayAvailability>('available')
+    mockConfigSequence([{ privacy: { disable_network_observability: false } }])
+    const { api, app } = await mountCatalog(availability)
+    try {
+      await vi.waitFor(() => expect(api.loaded.value).toBe(true))
+      api.setNetworkReportingEnabled(false)
+      expect(api.sectionDirty('securityPrivacy')).toBe(true)
+
+      availability.value = 'preparing'
+      await nextTick()
+      availability.value = 'available'
+      for (let turn = 0; turn < 5; turn += 1) await nextTick()
+
+      expect(api.loaded.value).toBe(true)
+      expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+      expect(api.sectionDirty('securityPrivacy')).toBe(true)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'onboarding.catalog')).toHaveLength(1)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(1)
+      expect(pushToast).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
 })
 
 describe('useSetupCatalog privacy settings', () => {

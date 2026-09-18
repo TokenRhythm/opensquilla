@@ -1593,15 +1593,18 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
-  it('marks the newly active row while the primary transition settles', async () => {
+  it('marks the newly active row while it moves to the top and settles', async () => {
     vi.useFakeTimers()
     const { app, el, panelState } = await mountPanel({ configuredProviders: configured })
     try {
       const rows = panelState.configuredProviders as Array<Record<string, unknown>>
       rows[0]!.active = false
       rows[1]!.active = true
+      rows.reverse()
       await nextTick()
 
+      expect(el.querySelector('[data-provider-id]')?.getAttribute('data-provider-id'))
+        .toBe('deepseek')
       expect(el.querySelector('[data-provider-id="deepseek"]')?.classList.contains('is-settling'))
         .toBe(true)
       vi.advanceTimersByTime(700)
@@ -1611,6 +1614,142 @@ describe('SetupProviderPanel — configured provider management', () => {
     } finally {
       app.unmount()
       vi.useRealTimers()
+    }
+  })
+
+  it('lets only the latest primary settle for its complete transition window', async () => {
+    vi.useFakeTimers()
+    const { app, el, panelState } = await mountPanel({ configuredProviders: configured })
+    try {
+      const rows = panelState.configuredProviders as Array<Record<string, unknown>>
+      rows[0]!.active = false
+      rows[1]!.active = true
+      rows.reverse()
+      await nextTick()
+      vi.advanceTimersByTime(300)
+
+      rows[0]!.active = false
+      rows[1]!.active = true
+      rows.reverse()
+      await nextTick()
+
+      expect(Array.from(el.querySelectorAll<HTMLElement>('.is-settling'))
+        .map(row => row.dataset.providerId)).toEqual(['openai'])
+      vi.advanceTimersByTime(400)
+      await nextTick()
+      expect(el.querySelector('[data-provider-id="openai"]')?.classList.contains('is-settling'))
+        .toBe(true)
+      vi.advanceTimersByTime(300)
+      await nextTick()
+      expect(el.querySelector('.is-settling')).toBeNull()
+    } finally {
+      app.unmount()
+      vi.useRealTimers()
+    }
+  })
+
+  it('restores activation focus to the same provider edit action without scrolling', async () => {
+    const ready = configured.map(row => ({
+      ...row,
+      ready: true,
+      primaryEligible: !row.active,
+      primaryBlockReason: row.active ? 'already_active' : '',
+    }))
+    const onActivateProvider = vi.fn()
+    const { app, el, panelState } = await mountPanel({ configuredProviders: ready, busy: false }, {
+      onActivateProvider,
+    })
+    let restoreFocusSpy: (() => void) | undefined
+    try {
+      const activate = el.querySelector<HTMLButtonElement>(
+        '[data-provider-id="deepseek"] .setup-provider-card__activate',
+      )!
+      activate.focus()
+      activate.click()
+      expect(onActivateProvider).toHaveBeenCalledWith('deepseek')
+
+      const mutablePanel = panelState as unknown as {
+        busy: boolean
+        activation: { providerId: string; phase: string }
+        configuredProviders: Array<Record<string, unknown>>
+      }
+      mutablePanel.busy = true
+      mutablePanel.activation.providerId = 'deepseek'
+      mutablePanel.activation.phase = 'activating'
+      await nextTick()
+      mutablePanel.configuredProviders = [...ready].reverse().map(row => ({
+        ...row,
+        active: row.providerId === 'deepseek',
+        primaryEligible: row.providerId !== 'deepseek',
+        primaryBlockReason: row.providerId === 'deepseek' ? 'already_active' : '',
+      }))
+      await nextTick()
+
+      const edit = el.querySelector<HTMLButtonElement>(
+        '[data-provider-id="deepseek"] .setup-provider-card__action',
+      )!
+      const focusSpy = vi.spyOn(edit, 'focus')
+      restoreFocusSpy = () => focusSpy.mockRestore()
+      expect(edit.disabled).toBe(true)
+      mutablePanel.activation.phase = 'idle'
+      mutablePanel.busy = false
+      await nextTick()
+      await nextTick()
+
+      expect(document.activeElement).toBe(edit)
+      expect(focusSpy).toHaveBeenCalledWith({ preventScroll: true })
+      expect(el.querySelector('[data-provider-id]')?.getAttribute('data-provider-id'))
+        .toBe('deepseek')
+    } finally {
+      restoreFocusSpy?.()
+      app.unmount()
+    }
+  })
+
+  it('does not steal focus moved outside the provider list during activation', async () => {
+    const ready = configured.map(row => ({
+      ...row,
+      ready: true,
+      primaryEligible: !row.active,
+      primaryBlockReason: row.active ? 'already_active' : '',
+    }))
+    const { app, el, panelState } = await mountPanel({ configuredProviders: ready, busy: false })
+    const outside = document.createElement('button')
+    outside.textContent = 'Outside provider settings'
+    document.body.appendChild(outside)
+    try {
+      const activate = el.querySelector<HTMLButtonElement>(
+        '[data-provider-id="deepseek"] .setup-provider-card__activate',
+      )!
+      activate.focus()
+      activate.click()
+
+      const mutablePanel = panelState as unknown as {
+        busy: boolean
+        activation: { providerId: string; phase: string }
+        configuredProviders: Array<Record<string, unknown>>
+      }
+      mutablePanel.busy = true
+      mutablePanel.activation.providerId = 'deepseek'
+      mutablePanel.activation.phase = 'activating'
+      await nextTick()
+      outside.focus()
+      mutablePanel.configuredProviders = [...ready].reverse().map(row => ({
+        ...row,
+        active: row.providerId === 'deepseek',
+        primaryEligible: row.providerId !== 'deepseek',
+        primaryBlockReason: row.providerId === 'deepseek' ? 'already_active' : '',
+      }))
+      await nextTick()
+      mutablePanel.activation.phase = 'idle'
+      mutablePanel.busy = false
+      await nextTick()
+      await nextTick()
+
+      expect(document.activeElement).toBe(outside)
+    } finally {
+      outside.remove()
+      app.unmount()
     }
   })
 

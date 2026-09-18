@@ -144,6 +144,7 @@ const sectionRef = ref<HTMLElement | null>(null)
 const pendingRemoval = ref<{ providerId: string; index: number } | null>(null)
 const recentlyActivatedProviderId = ref('')
 let recentlyActivatedTimer: ReturnType<typeof setTimeout> | null = null
+let activationFocus: { providerId: string; invoker: HTMLElement } | null = null
 const dialogInvoker = ref<HTMLElement | null>(null)
 
 const selectedProviderLabel = computed(() => (
@@ -279,6 +280,11 @@ function testConfigured(providerId: string) {
 
 function activateConfigured(providerId: string) {
   if (providerBusy.value) return
+  const invoker = document.activeElement
+  activationFocus = invoker instanceof HTMLElement
+    && invoker.closest<HTMLElement>('[data-provider-id]')?.dataset.providerId === providerId
+    ? { providerId, invoker }
+    : null
   emit('activateProvider', providerId)
 }
 
@@ -406,6 +412,7 @@ watch(activeConfiguredProviderId, (providerId, previousProviderId) => {
 
 onBeforeUnmount(() => {
   if (recentlyActivatedTimer) clearTimeout(recentlyActivatedTimer)
+  activationFocus = null
 })
 
 function probeFor(providerId: string): ConnectionState {
@@ -451,6 +458,20 @@ const providerBusy = computed(() => (
   props.panel.busy || activationBusy.value || props.panel.credentialRemovalPending || props.saving
 ))
 watch(providerBusy, busy => { if (busy) openProviderMenuId.value = '' }, { flush: 'sync' })
+
+watch([activeConfiguredProviderId, providerBusy], async ([providerId, busy]) => {
+  if (busy || !activationFocus) return
+  const pending = activationFocus
+  activationFocus = null
+  if (pending.providerId !== providerId) return
+  await nextTick()
+  // The activation button is replaced by Edit. Preserve keyboard position,
+  // but never take focus back from somewhere the user chose while saving.
+  if (document.activeElement !== pending.invoker && document.activeElement !== document.body) return
+  const row = Array.from(sectionRef.value?.querySelectorAll<HTMLElement>('[data-provider-id]') || [])
+    .find(element => element.dataset.providerId === providerId)
+  row?.querySelector<HTMLButtonElement>('.setup-provider-card__action')?.focus({ preventScroll: true })
+})
 
 watch(() => props.panel.credentialRemovalPending, (pending, wasPending) => {
   if (pending || !wasPending) return
@@ -848,83 +869,86 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         }"
         :data-provider-id="provider.providerId"
       >
-        <button
-          type="button"
-          class="setup-provider-card__identity setup-provider-card__select"
-          :aria-label="providerIdentityLabel(provider)"
-          :aria-current="editorOpen && isEditingProvider(provider.providerId) ? 'true' : undefined"
-          :disabled="providerBusy"
-          @click="selectConfigured(provider.providerId)"
-        >
-          <span class="setup-provider-card__name-row">
-            <span class="setup-provider-card__name">{{ provider.label }}</span>
-            <span
-              v-if="provider.active"
-              class="setup-provider-card__primary-status"
-              data-testid="provider-primary-badge"
-              role="status"
-              :aria-label="`${t('setup.provider.currentPrimary')} — ${provider.label}`"
-            >
-              <Icon name="check" :size="14" aria-hidden="true" />
-              {{ t('setup.provider.currentPrimary') }}
-            </span>
-          </span>
-          <span v-if="!showConfiguredProbeStatus(provider.providerId)" class="setup-provider-card__readiness">
-            {{ configuredStatus(provider) }}
-          </span>
-          <span
-            v-if="showConfiguredProbeStatus(provider.providerId)"
-            class="setup-provider-card__probe"
-            :class="probeToneClass(provider.providerId)"
-            aria-live="polite"
-          >
-            <span>{{ probeStatus(provider.providerId) }}</span>
-            <span
-              v-if="probeTiming(provider.providerId, 'firstResponseMs')"
-              class="setup-provider-card__probe-timing setup-provider-card__probe-timing--primary"
-            > · {{ probeTiming(provider.providerId, 'firstResponseMs') }}</span>
-            <span
-              v-if="probeTiming(provider.providerId, 'totalMs')"
-              class="setup-provider-card__probe-timing"
-            > · {{ probeTiming(provider.providerId, 'totalMs') }}</span>
-          </span>
-        </button>
-        <div class="setup-provider-card__actions">
-          <div v-if="!provider.active" class="setup-provider-card__activation">
-            <button
-              type="button"
-              class="btn setup-provider-card__activate"
-              :class="{ 'is-pending': activationInProgress(provider.providerId) }"
-              :disabled="providerBusy || Boolean(activationDisabledReason(provider))"
-              :title="activationDisabledReason(provider) || undefined"
-              :aria-label="activationActionLabel(provider)"
-              :aria-busy="activationInProgress(provider.providerId) ? 'true' : undefined"
-              @click="activateConfigured(provider.providerId)"
-            >
-              <span v-if="activationInProgress(provider.providerId)" class="setup-connection__spinner" aria-hidden="true"></span>
-              {{ activationInProgress(provider.providerId) ? t('setup.provider.activating') : t('setup.provider.makeActive') }}
-            </button>
-            <small v-if="activationDisabledReason(provider)" class="setup-provider-card__activation-reason">{{ activationDisabledReason(provider) }}</small>
-          </div>
+        <div class="setup-provider-card__surface">
           <button
-            v-else
             type="button"
-            class="btn btn--ghost setup-provider-card__action"
+            class="setup-provider-card__identity setup-provider-card__select"
+            :aria-label="providerIdentityLabel(provider)"
+            :aria-current="editorOpen && isEditingProvider(provider.providerId) ? 'true' : undefined"
             :disabled="providerBusy"
-            :aria-label="t('setup.provider.editProvider', { provider: provider.label })"
             @click="selectConfigured(provider.providerId)"
           >
-            <Icon name="edit" :size="14" aria-hidden="true" />
-            {{ t('common.edit') }}
+            <span class="setup-provider-card__name-row">
+              <span class="setup-provider-card__name">{{ provider.label }}</span>
+              <span
+                class="setup-provider-card__primary-status"
+                :class="{ 'is-placeholder': !provider.active }"
+                :data-testid="provider.active ? 'provider-primary-badge' : undefined"
+                :role="provider.active ? 'status' : undefined"
+                :aria-hidden="!provider.active ? 'true' : undefined"
+                :aria-label="provider.active ? `${t('setup.provider.currentPrimary')} — ${provider.label}` : undefined"
+              >
+                <Icon name="check" :size="14" aria-hidden="true" />
+                {{ t('setup.provider.currentPrimary') }}
+              </span>
+            </span>
+            <span v-if="!showConfiguredProbeStatus(provider.providerId)" class="setup-provider-card__readiness">
+              {{ configuredStatus(provider) }}
+            </span>
+            <span
+              v-if="showConfiguredProbeStatus(provider.providerId)"
+              class="setup-provider-card__probe"
+              :class="probeToneClass(provider.providerId)"
+              aria-live="polite"
+            >
+              <span>{{ probeStatus(provider.providerId) }}</span>
+              <span
+                v-if="probeTiming(provider.providerId, 'firstResponseMs')"
+                class="setup-provider-card__probe-timing setup-provider-card__probe-timing--primary"
+              > · {{ probeTiming(provider.providerId, 'firstResponseMs') }}</span>
+              <span
+                v-if="probeTiming(provider.providerId, 'totalMs')"
+                class="setup-provider-card__probe-timing"
+              > · {{ probeTiming(provider.providerId, 'totalMs') }}</span>
+            </span>
           </button>
-          <SetupProviderMenu
-            :label="t('setup.provider.moreActions', { provider: provider.label })"
-            :open="openProviderMenuId === provider.providerId"
-            :disabled="providerBusy"
-            :items="configuredMenuItems(provider)"
-            @update:open="openProviderMenuId = $event ? provider.providerId : ''"
-            @action="onProviderMenuAction(provider.providerId, $event)"
-          />
+          <div class="setup-provider-card__actions">
+            <div v-if="!provider.active" class="setup-provider-card__activation">
+              <button
+                type="button"
+                class="btn setup-provider-card__activate"
+                :class="{ 'is-pending': activationInProgress(provider.providerId) }"
+                :disabled="providerBusy || Boolean(activationDisabledReason(provider))"
+                :title="activationDisabledReason(provider) || undefined"
+                :aria-label="activationActionLabel(provider)"
+                :aria-busy="activationInProgress(provider.providerId) ? 'true' : undefined"
+                @click="activateConfigured(provider.providerId)"
+              >
+                <span v-if="activationInProgress(provider.providerId)" class="setup-connection__spinner" aria-hidden="true"></span>
+                {{ activationInProgress(provider.providerId) ? t('setup.provider.activating') : t('setup.provider.makeActive') }}
+              </button>
+              <small v-if="activationDisabledReason(provider)" class="setup-provider-card__activation-reason">{{ activationDisabledReason(provider) }}</small>
+            </div>
+            <button
+              v-else
+              type="button"
+              class="btn btn--ghost setup-provider-card__action"
+              :disabled="providerBusy"
+              :aria-label="t('setup.provider.editProvider', { provider: provider.label })"
+              @click="selectConfigured(provider.providerId)"
+            >
+              <Icon name="edit" :size="14" aria-hidden="true" />
+              {{ t('common.edit') }}
+            </button>
+            <SetupProviderMenu
+              :label="t('setup.provider.moreActions', { provider: provider.label })"
+              :open="openProviderMenuId === provider.providerId"
+              :disabled="providerBusy"
+              :items="configuredMenuItems(provider)"
+              @update:open="openProviderMenuId = $event ? provider.providerId : ''"
+              @action="onProviderMenuAction(provider.providerId, $event)"
+            />
+          </div>
         </div>
       </li>
     </TransitionGroup>
@@ -1469,23 +1493,26 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-list {
-  background: color-mix(in srgb, var(--bg-surface-2) 76%, transparent);
+  --provider-switch-duration: 360ms;
+  --provider-switch-ease: cubic-bezier(.22, 1, .36, 1);
+  --provider-row-background: color-mix(in srgb, var(--bg-surface-2) 76%, var(--bg-surface));
+  background: var(--provider-row-background);
   border: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
   border-radius: var(--radius-card);
   display: grid;
-  gap: 0;
+  gap: var(--sp-1);
+  isolation: isolate;
   list-style: none;
   margin: var(--sp-3) 0 0;
   overflow: hidden;
-  padding: 0;
+  padding: var(--sp-1);
   position: relative;
 }
 
-/* Primary changes reorder the saved list. Keep the transition quiet and
-   directional so the new primary feels like it moved into place instead of
-   the whole list flashing or jumping. */
-.provider-list-move {
-  transition: transform var(--dur-base) var(--ease-out);
+/* The list item owns FLIP; its surface owns elevation and color. A separate
+   transform keeps the lift from replacing the row's actual travel path. */
+.setup-provider-card.provider-list-move {
+  transition: transform var(--provider-switch-duration) var(--provider-switch-ease);
 }
 
 .provider-list-enter-active,
@@ -1578,72 +1605,117 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-card {
+  min-width: 0;
+  position: relative;
+}
+
+.setup-provider-card.is-settling {
+  z-index: 2;
+}
+
+.setup-provider-card__surface {
   align-items: center;
-  background: transparent;
-  border-radius: 0;
-  border: 0;
-  border-top: 1px solid var(--border);
+  background: var(--provider-row-background);
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
   box-shadow: none;
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
-  min-height: 58px;
+  min-height: 72px;
   padding: var(--sp-2) var(--sp-3);
-  transition: background var(--dur-base) var(--ease-out);
+  position: relative;
+  transition:
+    background var(--dur-base) var(--ease-out),
+    box-shadow var(--dur-base) var(--ease-out);
 }
 
-.setup-provider-card:first-child {
-  border-top: 0;
+/* A single quiet marker communicates the new primary state without changing
+   the row's layout or producing the old thick orange flash. */
+.setup-provider-card__surface::before {
+  background: var(--accent);
+  border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
+  content: '';
+  inset-block: 10px;
+  inset-inline-start: 0;
+  opacity: 0;
+  pointer-events: none;
+  position: absolute;
+  transform: scaleY(.45);
+  transform-origin: center;
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+  width: 2px;
 }
 
-.setup-provider-card:hover {
-  background: color-mix(in srgb, var(--accent) 4%, transparent);
+.setup-provider-card:hover .setup-provider-card__surface {
+  background: color-mix(in srgb, var(--accent) 4%, var(--provider-row-background));
   box-shadow: none;
 }
 
-.setup-provider-card.is-selected {
-  background: color-mix(in srgb, var(--accent) 7%, transparent);
+.setup-provider-card.is-selected .setup-provider-card__surface {
+  background: color-mix(in srgb, var(--accent) 7%, var(--provider-row-background));
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.setup-provider-card.is-primary {
-  background: color-mix(in srgb, var(--accent) 5%, transparent);
-  box-shadow: inset 2px 0 0 var(--accent);
+.setup-provider-card.is-primary .setup-provider-card__surface {
+  background: color-mix(in srgb, var(--accent) 5%, var(--provider-row-background));
+  box-shadow: none;
+}
+
+.setup-provider-card.is-primary .setup-provider-card__surface::before {
+  opacity: 1;
+  transform: scaleY(1);
 }
 
 /* Keep the saved-primary marker and the editor selection legible together. */
-.setup-provider-card.is-primary.is-selected {
-  background: color-mix(in srgb, var(--accent) 9%, transparent);
-  box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+.setup-provider-card.is-primary.is-selected .setup-provider-card__surface {
+  background: color-mix(in srgb, var(--accent) 9%, var(--provider-row-background));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
-.setup-provider-card.is-activating {
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
+.setup-provider-card.is-activating .setup-provider-card__surface {
+  background: color-mix(in srgb, var(--accent) 8%, var(--provider-row-background));
+  box-shadow: none;
 }
 
-.setup-provider-card.is-settling {
-  animation: provider-primary-settle var(--dur-enter) var(--ease-out) both;
+.setup-provider-card.is-activating .setup-provider-card__surface::before {
+  opacity: .72;
+  transform: scaleY(.72);
 }
 
 .setup-provider-card.is-settling .setup-provider-card__primary-status {
-  animation: provider-primary-badge-settle var(--dur-base) var(--ease-spring) both;
+  animation: provider-primary-badge-reveal var(--dur-base) var(--ease-out) both;
+  animation-delay: 80ms;
 }
 
-@keyframes provider-primary-settle {
+.setup-provider-card.is-settling .setup-provider-card__surface {
+  animation: provider-primary-lift var(--provider-switch-duration) var(--ease-standard) both;
+}
+
+@keyframes provider-primary-lift {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: none;
+    border-color: transparent;
+  }
+  20%, 76% {
+    transform: scale(1.008);
+    box-shadow: var(--shadow-lg);
+    border-color: color-mix(in srgb, var(--accent) 24%, var(--provider-row-background));
+  }
+}
+
+@keyframes provider-primary-badge-reveal {
   from {
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
-    box-shadow: inset 4px 0 0 var(--accent), inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, transparent);
+    opacity: 0;
+    transform: translateY(2px);
   }
   to {
-    background: color-mix(in srgb, var(--accent) 5%, transparent);
-    box-shadow: inset 2px 0 0 var(--accent);
+    opacity: 1;
+    transform: translateY(0);
   }
-}
-
-@keyframes provider-primary-badge-settle {
-  from { opacity: 0; transform: translateX(-4px) scale(.96); }
-  to { opacity: 1; transform: translateX(0) scale(1); }
 }
 
 .setup-provider-card__identity {
@@ -1674,6 +1746,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   flex: 0 0 auto;
   flex-wrap: nowrap;
   gap: var(--sp-2);
+  min-inline-size: 9rem;
   justify-content: flex-end;
 }
 
@@ -1693,6 +1766,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-card__action {
+  justify-content: center;
   min-height: 32px;
   padding: var(--sp-1) var(--sp-2);
 }
@@ -1702,6 +1776,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   color: var(--accent);
   display: inline-flex;
   gap: var(--sp-2);
+  justify-content: center;
 }
 
 .setup-provider-card__activate.is-pending {
@@ -1725,6 +1800,12 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   gap: var(--sp-1);
   padding: var(--sp-1) var(--sp-2);
   white-space: nowrap;
+}
+
+/* Reserve the badge's width/height even when it is not the primary. All rows
+   keep their geometry during the exchange, including wrapped narrow layouts. */
+.setup-provider-card__primary-status.is-placeholder {
+  visibility: hidden;
 }
 
 .setup-provider-card__readiness {
@@ -2261,14 +2342,16 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
     transition: none;
   }
 
-  .provider-list-move,
+  .setup-provider-card.provider-list-move,
   .provider-list-enter-active,
   .provider-list-leave-active,
   .setup-provider-card.is-settling,
+  .setup-provider-card.is-settling .setup-provider-card__surface,
   .setup-provider-card.is-settling .setup-provider-card__primary-status {
     transition: none;
     animation: none;
   }
+
 }
 
 @container provider-panel (max-width: 720px) {
@@ -2315,7 +2398,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 @container provider-panel (max-width: 640px) {
-  .setup-provider-card {
+  .setup-provider-card__surface {
     align-items: stretch;
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -2324,6 +2407,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   .setup-provider-card__actions {
     align-self: start;
     flex-wrap: wrap;
+    min-inline-size: 0;
     justify-content: flex-start;
   }
 

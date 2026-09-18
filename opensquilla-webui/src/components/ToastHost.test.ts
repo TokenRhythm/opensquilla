@@ -46,4 +46,20 @@ describe('ToastHost actions', () => {
     expect(onClick).toHaveBeenCalledOnce()
     expect(useToasts().toasts.value).toHaveLength(0)
   })
+
+  it('refreshes a keyed notification instead of stacking a duplicate', () => {
+    const { pushToast, toasts } = useToasts()
+
+    pushToast('Router recommendations updated', {
+      tone: 'ok',
+      dedupeKey: 'provider-router-outcome',
+    })
+    pushToast('Router recommendations updated', {
+      tone: 'ok',
+      dedupeKey: 'provider-router-outcome',
+    })
+
+    expect(toasts.value).toHaveLength(1)
+    expect(toasts.value[0]?.dedupeKey).toBe('provider-router-outcome')
+  })
 })

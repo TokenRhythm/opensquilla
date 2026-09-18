@@ -805,12 +805,48 @@ watch(section, value => {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-onMounted(async () => {
-  await loadData()
-  loaded.value = true
+let catalogMounted = false
+let initialLoadPending = false
+let initialLoadRetryPending = false
+
+async function loadInitialData() {
+  if (!catalogMounted || loaded.value || !gatewayAccess.isAvailable) return
+  if (initialLoadPending) {
+    // A reconnect can finish before the previous connection's reads reject.
+    initialLoadRetryPending = true
+    return
+  }
+  initialLoadPending = true
+  try {
+    await loadData({ throwOnError: true })
+    if (catalogMounted) loaded.value = true
+  } catch (err) {
+    // Connection recovery will retry. A failed read must not render the empty
+    // provider state or turn a normal startup connection into an error toast.
+    if (catalogMounted && gatewayAccess.isAvailable && !initialLoadRetryPending) {
+      pushToast(t('setup.toast.loadFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
+    }
+  } finally {
+    initialLoadPending = false
+    if (initialLoadRetryPending) {
+      initialLoadRetryPending = false
+      void loadInitialData()
+    }
+  }
+}
+
+onMounted(() => {
+  catalogMounted = true
+  void loadInitialData()
+})
+
+watch(() => gatewayAccess.isAvailable, available => {
+  // Only recover initial loading; reconnecting must not overwrite form drafts.
+  if (available) void loadInitialData()
 })
 
 onUnmounted(() => {
+  catalogMounted = false
   providerForm.cancelProbe()
   for (const run of configuredProviderProbeRuns.values()) run.controller.abort()
   configuredProviderProbeRuns.clear()
@@ -2759,9 +2795,18 @@ function acceptPrimaryRouterAction(action?: string) {
 }
 
 function pushPrimaryRouterOutcome(action: string | undefined, previousBinding: string) {
-  pushToast(t(action === 'disable' ? 'setup.provider.routerOutcomeDisabled'
-    : action === 'use_recommended' || previousBinding === 'follow_primary' ? 'setup.provider.routerOutcomeSynchronized'
-      : 'setup.provider.routerOutcomePreserved'))
+  const synchronized = action === 'use_recommended' || previousBinding === 'follow_primary'
+  const message = t(action === 'disable' ? 'setup.provider.routerOutcomeDisabled'
+    : synchronized ? 'setup.provider.routerOutcomeSynchronized'
+      : 'setup.provider.routerOutcomePreserved')
+  // The synchronized outcome is emitted by both the direct activation and the
+  // save-and-activate paths. Keep that completion feedback to one visible card
+  // when a user moves between the two controls quickly.
+  if (synchronized) {
+    pushToast(message, { dedupeKey: 'setup.provider.router-outcome' })
+  } else {
+    pushToast(message)
+  }
 }
 
 function cancelConfiguredProviderProbe(value: string) {

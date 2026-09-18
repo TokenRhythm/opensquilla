@@ -12,6 +12,12 @@ export interface ToastItem {
   message: string
   tone: ToastTone
   action?: ToastAction
+  /**
+   * Optional logical identity for notifications that can be emitted by more
+   * than one completion path. Matching notifications are refreshed in place
+   * instead of stacking two copies on top of each other.
+   */
+  dedupeKey?: string
 }
 
 const TOAST_DURATION_MS = 5000
@@ -32,9 +38,28 @@ function dismissToast(id: number) {
   toasts.value = toasts.value.filter(toast => toast.id !== id)
 }
 
-function pushToast(message: string, options: { tone?: ToastTone; duration?: number; action?: ToastAction } = {}) {
+function pushToast(message: string, options: {
+  tone?: ToastTone
+  duration?: number
+  action?: ToastAction
+  dedupeKey?: string
+} = {}) {
   const text = message.trim()
   if (!text) return
+  const tone = options.tone ?? 'info'
+  const dedupeKey = options.dedupeKey?.trim()
+  if (dedupeKey) {
+    const existing = toasts.value.find(toast => toast.dedupeKey === dedupeKey)
+    if (existing) {
+      const timer = timers.get(existing.id)
+      if (timer) clearTimeout(timer)
+      toasts.value = toasts.value.map(toast => toast.id === existing.id
+        ? { ...toast, message: text, tone, action: options.action, dedupeKey }
+        : toast)
+      timers.set(existing.id, setTimeout(() => dismissToast(existing.id), options.duration ?? TOAST_DURATION_MS))
+      return
+    }
+  }
   while (toasts.value.length >= MAX_TOASTS) {
     dismissToast(toasts.value[0].id)
   }
@@ -42,8 +67,9 @@ function pushToast(message: string, options: { tone?: ToastTone; duration?: numb
   toasts.value = [...toasts.value, {
     id,
     message: text,
-    tone: options.tone ?? 'info',
+    tone,
     action: options.action,
+    dedupeKey,
   }]
   timers.set(id, setTimeout(() => dismissToast(id), options.duration ?? TOAST_DURATION_MS))
 }
