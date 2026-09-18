@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from opensquilla.endpoint_identity import base_url_hostname
+
 ANTHROPIC_COMPACTION_STATE_KIND = "anthropic_compaction_block"
 OPENAI_RESPONSES_COMPACTED_WINDOW_STATE_KIND = "openai_responses_compacted_window"
 
@@ -208,8 +210,6 @@ def provider_context_capabilities(
 ) -> ProviderContextCapabilities:
     provider = provider_kind.strip().lower()
     model_l = model.strip().lower()
-    base_l = base_url.strip().lower()
-
     profile = _registered_context_profile(provider)
     if profile is not None:
         return _capabilities_from_profile(
@@ -219,7 +219,8 @@ def provider_context_capabilities(
     # The two branches below stay code, not spec profiles: each is gated on
     # the request host, and keying them on the provider id alone would grant
     # cache behavior to custom-base-url deployments that do not serve it.
-    if provider == "gemini" or "generativelanguage.googleapis.com" in base_l:
+    hostname = base_url_hostname(base_url)
+    if provider == "gemini" or hostname == "generativelanguage.googleapis.com":
         return ProviderContextCapabilities(
             provider=provider,
             model=model,
@@ -229,7 +230,7 @@ def provider_context_capabilities(
             state_portable_across_providers=False,
         )
 
-    if provider == "openai" and "api.openai.com" in base_l:
+    if provider == "openai" and hostname == "api.openai.com":
         return ProviderContextCapabilities(
             provider=provider,
             model=model,

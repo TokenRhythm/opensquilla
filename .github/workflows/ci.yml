@@ -1533,13 +1533,16 @@ jobs:
               tests/test_tools/test_shell_runtime_preflight.py
             )
           fi
+          # Windows workers hit access violations during timed stack dumps.
+          # Related frame-race report: python/cpython#140815. Disable only
+          # this diagnostic timer; keep fatal-error handling enabled.
           uv run pytest \
             tests/test_sandbox/test_trusted_sandbox_execution.py \
             tests/test_tools/test_approval_unification.py \
             tests/test_live_multi_provider_matrix.py \
             tests/test_live_provider_profile_smoke.py \
             "${regression_args[@]}" \
-            -vv --tb=short -o faulthandler_timeout=60 --maxfail=3 \
+            -vv --tb=short -o faulthandler_timeout=0 --maxfail=3 \
             2>&1 | tee "${CI_REPORT_DIR}/preflight.log"
 
       - name: Test Windows shard
@@ -1570,6 +1573,7 @@ jobs:
             fi
           fi
 
+          # Pass the same timer override to both parallel and serial phases.
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
@@ -1577,7 +1581,7 @@ jobs:
             --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
             "${worker_args[@]}" \
             -- \
-            -vv --tb=short -o faulthandler_timeout=60 \
+            -vv --tb=short -o faulthandler_timeout=0 \
             -m "${markers}" \
             --durations=50 \
             "${maxfail_args[@]}" \

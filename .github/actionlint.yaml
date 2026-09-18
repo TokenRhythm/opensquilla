@@ -1,0 +1,6 @@
+# actionlint 1.7.12 predates GitHub's cache-mode key. The release workflow's
+# read-only value and absence of job overrides are enforced in test_workflows.py.
+paths:
+  .github/workflows/wheelhouse-release.yml:
+    ignore:
+      - '^unexpected key "cache-mode" for "workflow" section\. expected one of "concurrency", "defaults", "env", "jobs", "name", "on", "permissions", "run-name"$'

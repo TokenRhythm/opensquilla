@@ -16,6 +16,9 @@ on:
         type: boolean
         default: false
 
+# Dispatched source builds must not populate the default branch's cache scope.
+cache-mode: read
+
 permissions:
   contents: read
 

@@ -20,10 +20,12 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
 
+from opensquilla.endpoint_identity import base_url_hostname
 from opensquilla.env import trust_env as _trust_env
 
 from .candidate_artifact import CandidateArtifactBuilder, CandidateArtifactLimitError
@@ -150,12 +152,10 @@ class OpenAICodexProvider:
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
         base = (base_url or _CODEX_BACKEND_BASE).rstrip("/")
-        host_only = base.lower()
-        if (
-            ("chatgpt.com" in host_only or "chat.openai.com" in host_only)
-            and "/backend-api" not in host_only
-        ):
-            base = f"{base}/backend-api"
+        if base_url_hostname(base) in {"chatgpt.com", "chat.openai.com"}:
+            parsed = urlsplit(base)
+            if not parsed.path and "?" not in base and "#" not in base:
+                base = f"{base}/backend-api"
         return base
 
     @property

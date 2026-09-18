@@ -67,6 +67,22 @@ def base_url_allows_credential_reuse(
     return stored_origin is not None and candidate_origin == stored_origin
 
 
+def base_url_hostname(base_url: str) -> str:
+    """Return an unambiguous HTTP hostname for provider classification.
+
+    This is not a credential-reuse decision: API paths and valid ports remain
+    the caller's concern. Malformed URLs and embedded credentials do not gain
+    provider-specific defaults.
+    """
+    origin = _http_origin(base_url)
+    if origin is None:
+        return ""
+    parsed = urlsplit(str(base_url).strip())
+    if parsed.username is not None or parsed.password is not None:
+        return ""
+    return origin[1]
+
+
 def base_url_matches_official_api(
     official_base_url: str,
     candidate_base_url: str | None,
@@ -139,6 +155,7 @@ def credential_env_for_endpoint(
 
 __all__ = [
     "base_url_allows_credential_reuse",
+    "base_url_hostname",
     "base_url_matches_official_api",
     "credential_env_for_endpoint",
     "endpoint_replay_source",

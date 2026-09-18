@@ -225,6 +225,11 @@ async def _run_executor_mutation[ExecutorResult](
     return result  # type: ignore[return-value]
 
 
+_SOURCE_C_FAMILY_EXTENSIONS = frozenset(
+    {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}
+)
+_SOURCE_C_RETURN_TYPE = re.compile(r"[A-Za-z_][\w:<>,~*&\s]+")
+_SOURCE_C_FUNCTION_TAIL = re.compile(r"\([^;{}]*\)\s*(?:const\s*)?(?:\{|$)")
 _SOURCE_SYMBOL_REGEXES: tuple[tuple[frozenset[str], str, re.Pattern[str]], ...] = (
     (
         frozenset({".py", ".pyi"}),
@@ -313,17 +318,9 @@ _SOURCE_SYMBOL_REGEXES: tuple[tuple[frozenset[str], str, re.Pattern[str]], ...] 
         ),
     ),
     (
-        frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}),
+        _SOURCE_C_FAMILY_EXTENSIONS,
         "class",
         re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    ),
-    (
-        frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}),
-        "function",
-        re.compile(
-            r"^\s*(?:[A-Za-z_][\w:<>,~*&\s]+\s+)+([A-Za-z_][A-Za-z0-9_]*)\s*"
-            r"\([^;{}]*\)\s*(?:const\s*)?(?:\{|$)"
-        ),
     ),
 )
 _SOURCE_SYMBOL_IGNORED_NAMES = frozenset(
@@ -4058,6 +4055,34 @@ def _source_symbol_files(
     return files
 
 
+def _source_c_function_name(line: str) -> str | None:
+    # Split the return type from the name before validating either. A repeated
+    # regex group containing whitespace can backtrack exponentially on even a
+    # short non-function line. Each scan here is bounded by the line length.
+    prefix, opening, tail = line.lstrip().partition("(")
+    if not opening:
+        return None
+    prefix = prefix.rstrip()
+    name_start = len(prefix)
+    while name_start and (
+        prefix[name_start - 1].isascii()
+        and (prefix[name_start - 1].isalnum() or prefix[name_start - 1] == "_")
+    ):
+        name_start -= 1
+    name = prefix[name_start:]
+    if not name or not (name[0].isalpha() or name[0] == "_"):
+        return None
+    return_type = prefix[:name_start]
+    if not return_type or not return_type[-1].isspace():
+        return None
+    # Reserve the separator, preserving the previous return-type grammar.
+    if _SOURCE_C_RETURN_TYPE.fullmatch(return_type[:-1]) is None:
+        return None
+    if _SOURCE_C_FUNCTION_TAIL.match(opening + tail) is None:
+        return None
+    return name
+
+
 def _source_symbol_matches_line(path: Path, line: str) -> list[tuple[str, str]]:
     extension = path.suffix.casefold()
     matches: list[tuple[str, str]] = []
@@ -4076,6 +4101,10 @@ def _source_symbol_matches_line(path: Path, line: str) -> list[tuple[str, str]]:
             continue
         matches.append(key)
         seen.add(key)
+    if extension in _SOURCE_C_FAMILY_EXTENSIONS:
+        name = _source_c_function_name(line)
+        if name is not None and name not in _SOURCE_SYMBOL_IGNORED_NAMES:
+            matches.append(("function", name))
     return matches
 
 

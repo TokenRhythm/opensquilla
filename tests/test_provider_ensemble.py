@@ -2227,6 +2227,9 @@ async def test_no_fallback_error_preserves_completed_proposer_and_primary_usage(
 async def test_ensemble_runs_proposers_concurrently_and_tools_only_reach_aggregator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    proposer_gate = asyncio.Event()
+    proposer_started = [asyncio.Event(), asyncio.Event()]
+    proposer_closed = [asyncio.Event(), asyncio.Event()]
     registry = _FakeRegistry(
         {
             "p1": _FakePlan(
@@ -2234,14 +2237,18 @@ async def test_ensemble_runs_proposers_concurrently_and_tools_only_reach_aggrega
                     TextDeltaEvent(text="draft one"),
                     DoneEvent(input_tokens=1, output_tokens=2, model="p1"),
                 ],
-                delay=0.1,
+                gate=proposer_gate,
+                started=proposer_started[0],
+                closed=proposer_closed[0],
             ),
             "p2": _FakePlan(
                 [
                     TextDeltaEvent(text="draft two"),
                     DoneEvent(input_tokens=3, output_tokens=4, model="p2"),
                 ],
-                delay=0.1,
+                gate=proposer_gate,
+                started=proposer_started[1],
+                closed=proposer_closed[1],
             ),
             "agg": _FakePlan(
                 [
@@ -2273,24 +2280,39 @@ async def test_ensemble_runs_proposers_concurrently_and_tools_only_reach_aggrega
         execution_id="execution-1",
         call_kind="agent.chat",
     )
-    started = time.monotonic()
-    events = [
-        event
-        async for event in provider.chat(
-            [Message(role="user", content="answer this")],
-            tools=[_tool()],
-            config=ChatConfig(
-                max_tokens=99,
-                thinking=False,
-                provider_request_correlation=correlation,
-            ),
-        )
-    ]
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 0.18
+    async def collect() -> list[StreamEvent]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="answer this")],
+                tools=[_tool()],
+                config=ChatConfig(
+                    max_tokens=99,
+                    thinking=False,
+                    provider_request_correlation=correlation,
+                ),
+            )
+        ]
+
+    task = asyncio.create_task(collect())
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(started.wait() for started in proposer_started)),
+            timeout=1,
+        )
+        # Both proposers must be active before either is allowed to finish.
+        assert not any(closed.is_set() for closed in proposer_closed)
+        assert [call["model"] for call in registry.calls] == ["p1", "p2"]
+        proposer_gate.set()
+        events = await asyncio.wait_for(task, timeout=1)
+    finally:
+        proposer_gate.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
+
     assert [call["model"] for call in registry.calls] == ["p1", "p2", "agg"]
-    assert abs(registry.calls[0]["started_at"] - registry.calls[1]["started_at"]) < 0.05
     assert registry.calls[0]["tools"] is None
     assert registry.calls[1]["tools"] is None
     assert registry.calls[2]["tools"] is not None
@@ -2325,9 +2347,9 @@ async def test_ensemble_runs_proposers_concurrently_and_tools_only_reach_aggrega
     assert done.billed_cost == 0.25
     assert done.model == "agg"
     assert done.model_usage_breakdown is not None
-    elapsed_rows = [int(row.get("elapsed_ms") or 0) for row in done.model_usage_breakdown]
-    assert elapsed_rows[0] > 0
-    assert elapsed_rows[1] > 0
+    elapsed_rows = [int(row["elapsed_ms"]) for row in done.model_usage_breakdown]
+    assert elapsed_rows[0] >= 0
+    assert elapsed_rows[1] >= 0
     assert elapsed_rows[2] >= 0
     rows_without_elapsed = [
         {key: value for key, value in row.items() if key != "elapsed_ms"}

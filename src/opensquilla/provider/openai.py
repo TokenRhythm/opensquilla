@@ -21,7 +21,7 @@ from uuid import uuid4
 import httpx
 import structlog
 
-from opensquilla.endpoint_identity import endpoint_replay_source
+from opensquilla.endpoint_identity import base_url_hostname, endpoint_replay_source
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import compact_provider_status, derive_is_error
 from opensquilla.safety.secret_redaction import redact_secret_text
@@ -397,14 +397,14 @@ def _model_listing_supports_vision(row: Mapping[str, Any]) -> bool:
 
 
 def _dashscope_endpoint_family(base_url: str) -> str:
-    url = base_url.strip().lower()
-    if "coding-intl.dashscope.aliyuncs.com" in url:
+    hostname = base_url_hostname(base_url)
+    if hostname == "coding-intl.dashscope.aliyuncs.com":
         return "coding_global"
-    if "coding.dashscope.aliyuncs.com" in url:
+    if hostname == "coding.dashscope.aliyuncs.com":
         return "coding_cn"
-    if "dashscope-intl.aliyuncs.com" in url:
+    if hostname == "dashscope-intl.aliyuncs.com":
         return "standard_global"
-    if "dashscope.aliyuncs.com" in url:
+    if hostname == "dashscope.aliyuncs.com":
         return "standard_cn"
     return "custom"
 

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
@@ -409,6 +414,91 @@ async def test_source_symbols_has_no_required_arguments(
     assert payload["status"] == "success"
     assert payload["results"][0]["path"] == "src/app.go"
     assert payload["results"][0]["name"] == "Run"
+
+
+@pytest.mark.parametrize(
+    "extension", [".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"],
+)
+@pytest.mark.parametrize(
+    ("line", "name"),
+    [
+        ("int run() {}", "run"),
+        ("  static unsigned long run(int n) {", "run"),
+        ("std::vector<int> collect() const {", "collect"),
+        ("const Widget* lookup(const char *key)\n", "lookup"),
+        ("Widget & lookup() const\n", "lookup"),
+        ("int call(int (*callback)(int)) {", "call"),
+        ("int spaced \t (int n) {", "spaced"),
+        ("int declared();", None),
+        ("int value = call();", None),
+        ("if (ready) {", None),
+        ("int if() {", None),
+        ("int no_body() const;", None),
+        ("int bad(int n; int m) {", None),
+        ("int bad({}) {", None),
+        ("int missing(", None),
+        ("int 123() {", None),
+    ],
+)
+def test_source_symbols_c_family_functions(extension: str, line: str, name: str | None) -> None:
+    expected = [("function", name)] if name is not None else []
+    assert filesystem._source_symbol_matches_line(Path(f"sample{extension}"), line) == expected
+
+
+def test_source_symbols_handles_adversarial_c_lines_in_bounded_time(tmp_path: Path) -> None:
+    target = tmp_path / "sample.cpp"
+    target.write_text(
+        "int " * 24 + "!\n"
+        + "int " * 75_000 + "!\n"
+        + "int " * 75_000 + "(\n"
+        + "int after_attack() {}\n",
+        encoding="utf-8",
+    )
+    script = textwrap.dedent("""
+        import asyncio
+        import json
+        import sys
+        from pathlib import Path
+        from opensquilla.tools.builtin.filesystem import source_symbols
+        from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+
+        token = current_tool_context.set(ToolContext(
+            is_owner=True, caller_kind=CallerKind.AGENT,
+            workspace_dir=sys.argv[1], session_key="agent:main:test",
+        ))
+        try:
+            Path(sys.argv[2]).touch()
+            result = json.loads(asyncio.run(source_symbols(path="sample.cpp")))
+            assert result["status"] == "success", result
+            assert [(row["name"], row["line"]) for row in result["results"]] == [
+                ("after_attack", 4)
+            ], result
+        finally:
+            current_tool_context.reset(token)
+    """)
+    # Start the parsing deadline after imports: full CI also runs other Python
+    # workers compiling cold dependencies. Keep a separate bounded startup phase.
+    # Both deadlines are enforced by the parent, outside the regex engine's GIL.
+    source_root = Path(filesystem.__file__).resolve().parents[3]
+    ready = tmp_path / "parser-ready"
+    with subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path), str(ready)],
+        env={**os.environ, "PYTHONPATH": str(source_root)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as child:
+        try:
+            startup_deadline = time.monotonic() + 30
+            while not ready.exists() and child.poll() is None:
+                assert time.monotonic() < startup_deadline, "parser child did not finish importing"
+                time.sleep(0.05)
+            stdout, stderr = child.communicate(timeout=15)
+            assert child.returncode == 0, stdout + stderr
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
 
 
 @pytest.mark.asyncio
