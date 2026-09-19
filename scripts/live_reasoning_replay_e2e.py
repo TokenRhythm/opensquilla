@@ -1630,12 +1630,19 @@ async def _run_compaction_case(
                     "compaction_source_entry_missing",
                 )
                 source_entry_marker_counts.append(len(source_entry_markers))
+                # A generated label that remains in the protected active suffix
+                # is intentionally absent from the compaction source. Only
+                # labels belonging to removed history need source coverage.
+                removed_text = "\n".join(
+                    str(entry.content or "") for entry in before_entries
+                    if entry.message_id in removed_ids
+                )
                 _require(
-                    all(label in compact_history for label in labels),
+                    all(label not in removed_text or label in compact_history for label in labels),
                     "compaction_source_not_covered",
                 )
                 _require(
-                    all(label in summary_text for label in labels),
+                    all(label not in removed_text or label in summary_text for label in labels),
                     "summary_generated_fact_missing",
                 )
                 if turn == 1:
