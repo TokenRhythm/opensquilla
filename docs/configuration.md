@@ -71,7 +71,9 @@ reports.
 
 ## External MCP Servers
 
-OpenSquilla includes an MCP client for external tools. Enable it and configure
+The current source includes an MCP client for external tools. For SDK 2.x,
+follow the [source installation requirements](mcp-server.md#requirements);
+the published v0.5.4 wheel predates this migration. Enable it and configure
 each server in `config.toml`. Supported transports are `stdio` and the legacy
 HTTP/SSE transport named `sse`.
 MCP is disabled by default. With no enabled, configured servers, the gateway

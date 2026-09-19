@@ -363,7 +363,9 @@ Read:
 
 ## MCP Server Bridge
 
-MCP support is included in the standard installation. Start the gateway before
+MCP support is included in the current source's base installation. For SDK 2.x,
+follow the [source installation requirements](mcp-server.md#requirements);
+the published v0.5.4 wheel predates this migration. Start the gateway before
 launching the stdio bridge from an MCP-capable client:
 
 ```sh
