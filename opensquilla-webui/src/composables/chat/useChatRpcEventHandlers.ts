@@ -429,9 +429,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (recoveryFenced) {
       if (!recoveryOverflow && recoveryEvents.length < MAX_PENDING_STREAM_EVENTS_PER_TASK) {
         recoveryEvents.push(message)
+        // This bounded buffer owns the event until the snapshot and its tail
+        // are installed. Ordinary progress must not invalidate that snapshot.
+        return 'applied'
       } else {
         recoveryEvents.length = 0
         recoveryOverflow = true
+        markRecoveryDirty()
       }
       return 'dirty'
     }

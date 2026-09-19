@@ -64,13 +64,14 @@ for (const halfOpen of [false, true]) {
           'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION),
           'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION),
           'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION),
-          'sessions.messages.unsubscribe': { subscribed: false },
+          'sessions.messages.unsubscribe': null,
           'sessions.subscribe': { subscribed: true },
           'usage.status': { sessions: [] },
           'chat.send': { accepted: true, session: SESSION, task_id: 'idle-follow-up' },
         }
         socket.send(JSON.stringify({
-          type: 'res', id: frame.id, ok: true, payload: payloads[frame.method] ?? {},
+          type: 'res', id: frame.id, ok: true,
+          payload: Object.hasOwn(payloads, frame.method) ? payloads[frame.method] : {},
         }))
       })
     })

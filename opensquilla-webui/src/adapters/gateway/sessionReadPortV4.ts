@@ -56,14 +56,16 @@ import {
 import { mapSessionReadError } from './sessionReadErrorMapping'
 import { SESSIONS_MESSAGES_SNAPSHOT_READ_METHOD } from '@/contracts/generated/v4/sessionsMessagesSnapshotRead'
 import {
-  readV4SessionSnapshot,
+  createV4SessionSnapshotTransfer,
+  supportsSnapshotRecovery,
+  type SessionSnapshotTransfer,
   type StagedSessionSnapshot,
   type SnapshotDeliveryReceipt,
   type SnapshotInstalledReceipt,
 } from './sessionSnapshotReadV4'
 
-const READY_TIMEOUT_MS = 15_000
-const READ_TIMEOUT_MS = 15_000
+const READY_TIMEOUT_MS = 7_000
+const READ_TIMEOUT_MS = 7_000
 const SNAPSHOT_TIMEOUT_MS = 3_000
 const INITIAL_HISTORY_LIMIT = 100
 
@@ -83,6 +85,9 @@ interface SessionReadV4Transport {
   supports?(method: string): boolean
   acknowledgeDelivery?(receipt: SnapshotDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: SnapshotInstalledReceipt): Promise<void> | void
+  recoveryVersion?(key: string): string
+  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
+  failProtocol?(generation: number): void
 }
 
 export interface SessionReadV4AdapterOptions {
@@ -149,6 +154,7 @@ function callOptions(
     timeoutMs,
     timeoutAction: 'reject',
     abortAction: 'reject',
+    cancelOnAbort: true,
     expectedGeneration,
     ...(onSent ? { onSent } : {}),
   }
@@ -467,6 +473,7 @@ export function createV4SessionReadPort(
   rpc: SessionReadV4Transport,
   options: SessionReadV4AdapterOptions = {},
 ): SessionReadPort {
+  const owners = new Map<string, object>()
   const historyPolicy: SessionHistoryV4Policy = {
     concurrentHistoryReads: options.concurrentHistoryReads ?? (() => true),
     ...(options.now ? { now: options.now } : {}),
@@ -474,9 +481,14 @@ export function createV4SessionReadPort(
   return Object.freeze({
     open(request: SessionReadPortOpenRequest): SessionReadPortLease {
       let closed = false
+      const owner = {}
+      owners.set(request.sessionKey, owner)
+      let transfer: SessionSnapshotTransfer | null = null
+      let terminalSnapshotError: unknown = null
       let subscribedGeneration: number | null = null
 
       async function createContext(): Promise<OpenContext> {
+        const admissionDeadline = performance.now() + READ_TIMEOUT_MS
         await rpc.ready?.({
           timeoutMs: READY_TIMEOUT_MS,
           signal: request.signal,
@@ -512,15 +524,27 @@ export function createV4SessionReadPort(
           if (!rpc.supports?.(SESSIONS_MESSAGES_SNAPSHOT_READ_METHOD)) {
             return optionalSnapshot(rpc, snapshotParams, request.signal, expectedGeneration, latch)
           }
+          if (transfer?.budgetExhausted) terminalSnapshotError = new SessionReadFailure(
+            'budget-exhausted', 'Snapshot recovery budget exhausted. Retry explicitly or use paginated history.', false,
+          )
+          if (terminalSnapshotError) throw terminalSnapshotError
           try {
-            const staged = await readV4SessionSnapshot(
-              rpc, request.sessionKey, request.signal, expectedGeneration, latch.sent,
-            )
+            if (!transfer || transfer.retired || transfer.installed) {
+              transfer?.release()
+              transfer = createV4SessionSnapshotTransfer(rpc, request.sessionKey, request.signal, expectedGeneration)
+            }
+            const staged = await transfer.read(latch.sent)
             stagedSnapshot = staged
             return staged.value
           } catch (error) {
             latch.failed(error)
-            throw mapSessionReadError(error)
+            const projected = mapSessionReadError(error)
+            if (projected instanceof SessionReadFailure && !projected.retryable
+              && projected.kind !== 'aborted') {
+              terminalSnapshotError = projected
+              transfer?.release()
+            }
+            throw projected
           }
         }
         function assertSnapshotIdentity(metadata: SessionReadMetadata) {
@@ -537,7 +561,7 @@ export function createV4SessionReadPort(
           subscribeParams,
           callOptions(
             request.signal,
-            READ_TIMEOUT_MS,
+            Math.max(1, admissionDeadline - performance.now()),
             expectedGeneration,
             generation => {
               subscribedGeneration = generation
@@ -559,7 +583,7 @@ export function createV4SessionReadPort(
           subscribeSent.failed(projected)
           throw projected
         })
-        const snapshotPromise = readSnapshot(snapshotSent).then(result => {
+        const snapshotPromise = subscribeSent.promise.then(() => readSnapshot(snapshotSent)).then(result => {
           if (result && result.key !== request.sessionKey) {
             throw invalidContract(SESSIONS_MESSAGES_SNAPSHOT_METHOD)
           }
@@ -618,6 +642,7 @@ export function createV4SessionReadPort(
           initialMetadata: projectMetadata(subscription),
           snapshot: snapshot ? projectSnapshot(snapshot) : null,
           confirmInstalled: stagedSnapshot?.confirmInstalled,
+          assertInstalledCurrent: stagedSnapshot?.assertInstalledCurrent,
           cursor: Object.freeze({
             sessionKey: request.sessionKey,
             sessionEpoch: subscription.epoch,
@@ -691,9 +716,9 @@ export function createV4SessionReadPort(
             // known lower bound. Reusing only the initial subscribe cursor could
             // keep old questions actionable forever after a missed terminal.
             // Legacy Gateways without snapshots retain the conservative bound.
-            const metadata = await hydrate(
-              rpc, request.sessionKey, request.signal, expectedGeneration, snapshot ?? subscription,
-            )
+            const metadata = supportsSnapshotRecovery(rpc)
+              ? projectMetadata(subscription)
+              : await hydrate(rpc, request.sessionKey, request.signal, expectedGeneration, snapshot ?? subscription)
             assertSnapshotIdentity(metadata)
             if (closed || request.signal.aborted || rpc.generation !== expectedGeneration) throw abortError()
             initialHistoryAvailable = false
@@ -705,6 +730,7 @@ export function createV4SessionReadPort(
               initialMetadata: metadata,
               snapshot: snapshot ? projectSnapshot(snapshot) : null,
               confirmInstalled: stagedSnapshot?.confirmInstalled,
+          assertInstalledCurrent: stagedSnapshot?.assertInstalledCurrent,
               cursor: Object.freeze({
                 sessionKey: request.sessionKey,
                 sessionEpoch: metadata.epoch,
@@ -812,29 +838,27 @@ export function createV4SessionReadPort(
       async function close(): Promise<void> {
         if (closed) return
         closed = true
-        try {
-          await setup
-        } catch {
-          // A physical subscribe send can precede a synchronous setup/ACK
-          // failure. Release that generation below when it is still current.
-        }
+        transfer?.release()
+        // No await before the ownership/send decision: a pending ready wait
+        // cannot later send subscribe after this local close.
+        if (owners.get(request.sessionKey) !== owner) return
+        owners.delete(request.sessionKey)
         const generation = subscribedGeneration
         if (generation === null || rpc.generation !== generation) return
         const params: SessionsMessagesUnsubscribeParams = { key: request.sessionKey }
-        requireParams(
-          SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD,
-          params,
-          validateSessionsMessagesUnsubscribeParams,
-        )
+        requireParams(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, params, validateSessionsMessagesUnsubscribeParams)
+        const sent = sentLatch()
         try {
-          const result = await rpc.request(
-            SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD,
-            params,
-            releaseOptions(generation),
-          )
-          if (!validateSessionsMessagesUnsubscribeResult(result)) {
-            throw invalidContract(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)
-          }
+          const result = rpc.request(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, params, {
+            ...releaseOptions(generation), onSent: sent.sent,
+          })
+          void result.then(value => {
+            // In-memory ports may not implement onSent. A completed response
+            // also proves that its frame was admitted.
+            requireResult(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, value, validateSessionsMessagesUnsubscribeResult)
+            sent.sent(generation)
+          }).catch(error => { sent.failed(error) })
+          await sent.promise
         } catch (error) {
           if (!isMissingMethod(error)) throw error
         }

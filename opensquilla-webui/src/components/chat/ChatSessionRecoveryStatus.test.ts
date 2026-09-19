@@ -105,4 +105,12 @@ describe('ChatSessionRecoveryStatus', () => {
     const reconnecting = await mountState('live-connecting', vi.fn(), 'connecting')
     expect(reconnecting.host.textContent).toContain('Reconnecting to the Gateway')
   })
+
+  it.each(['history-loading', 'history-retrying', 'live-connecting'] as const)(
+    'keeps %s passive even when the parent provides its eventual retry action', async state => {
+      const { host } = await mountState(state, vi.fn(), 'connected', 'retry-live')
+      expect(host.querySelector('button')).toBeNull()
+      expect(host.querySelector('[role="status"]')).not.toBeNull()
+    },
+  )
 })

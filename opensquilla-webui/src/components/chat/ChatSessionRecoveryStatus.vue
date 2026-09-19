@@ -26,13 +26,18 @@
       <span v-if="description">{{ description }}</span>
     </span>
     <button
-      v-if="actionKey"
+      v-if="isFailure && actionKey"
       type="button"
       class="chat-session-recovery-status__retry btn btn--ghost"
       data-testid="chat-session-recovery-retry"
+      :disabled="busy"
+      :aria-busy="busy || undefined"
       @click="requestRetry"
     >
       {{ action }}
+    </button>
+    <button v-if="isFailure" type="button" class="btn btn--icon btn--ghost" data-testid="chat-session-recovery-dismiss" :aria-label="t('common.close')" @click="emit('dismiss')">
+      <Icon name="x" :size="14" />
     </button>
   </div>
 </template>
@@ -48,10 +53,12 @@ const props = defineProps<{
   state: ChatSessionRecoveryState
   transportState?: 'disconnected' | 'connecting' | 'connected'
   action?: 'retry-history' | 'retry-live'
+  busy?: boolean
 }>()
 
 const emit = defineEmits<{
   retry: []
+  dismiss: []
 }>()
 
 const { t } = useI18n()

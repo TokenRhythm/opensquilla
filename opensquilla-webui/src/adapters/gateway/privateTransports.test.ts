@@ -70,6 +70,47 @@ describe('private Gateway transports', () => {
     expect(rpcSource.rememberUnsupportedMethod).toHaveBeenCalledWith('legacy.method')
   })
 
+  it('retains the source receiver for fallback delivery control', async () => {
+    const rpcSource = { ...source(), acknowledgeDelivery: vi.fn(), resumeFlow: vi.fn() }
+    const { rpc } = createPrivateGatewayTransports(rpcSource)
+    await rpc.acknowledgeDelivery?.({ delivery_epoch: 'epoch', delivery_id: 1 })
+    await rpc.resumeFlow?.({
+      key: 'alpha', snapshot_id: 'snapshot', sync_revision: 'revision',
+      stream_generation: 'stream', stream_seq: 1,
+    })
+    expect(rpcSource.acknowledgeDelivery.mock.contexts).toEqual([rpcSource])
+    expect(rpcSource.resumeFlow.mock.contexts).toEqual([rpcSource])
+  })
+
+  it('requires negotiated flow before exposing advertised snapshot recovery methods', () => {
+    const handlers = new Map<string, RpcEventHandler>()
+    const rpcSource = {
+      ...source(),
+      hasRpcMethod: vi.fn(() => true),
+      on: vi.fn((event: string, handler: RpcEventHandler) => {
+        handlers.set(event, handler)
+        return vi.fn()
+      }),
+      enableConsumptionFlow: vi.fn(),
+      consumeEvent: vi.fn(async () => 'applied' as const),
+      recoverGap: vi.fn(async () => true),
+    }
+    const { rpc } = createPrivateGatewayTransports(rpcSource)
+    const recoveryMethods = ['sessions.messages.resume', 'sessions.messages.snapshot.release']
+    // Both server kill switches omit the flow policy while methods remain advertised.
+    for (const transport_flow of [undefined, null]) {
+      handlers.get('_hello')?.({ policy: { transport_flow } })
+      for (const method of recoveryMethods) expect(rpc.supports(method)).toBe(false)
+      expect(rpc.supports('sessions.messages.snapshot.read')).toBe(true)
+    }
+    handlers.get('_hello')?.({ policy: { transport_flow: {
+      delivery_epoch: 'current', window_frames: 128, window_bytes: 4 * 1024 * 1024,
+    } } })
+    for (const method of recoveryMethods) expect(rpc.supports(method)).toBe(true)
+    handlers.get('_state')?.('disconnected')
+    for (const method of recoveryMethods) expect(rpc.supports(method)).toBe(false)
+  })
+
   it('projects the negotiated provider probe modes into the setup workflow capability', () => {
     const transports = createPrivateGatewayTransports(source())
     const workflow = createV4SetupWorkflow(transports.rpc)

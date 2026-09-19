@@ -86,7 +86,7 @@ describe('bounded session snapshot staging', () => {
       await expect(readV4SessionSnapshot(h.rpc, 'alpha', new AbortController().signal, 7))
         .rejects.toBeInstanceOf(SessionReadContractError)
       expect(h.resumeFlow).not.toHaveBeenCalled()
-      expect(h.acknowledgeDelivery).toHaveBeenCalledTimes(1)
+      expect(h.acknowledgeDelivery).toHaveBeenCalledTimes(2)
     },
   )
 

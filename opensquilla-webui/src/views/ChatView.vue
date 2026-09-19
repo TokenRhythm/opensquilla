@@ -139,9 +139,12 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState"
+          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState && !chatSessionBootstrap.noticeDismissed.value"
           :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
+          :action="recoveryNoticeState.startsWith('live-') ? 'retry-live' : 'retry-history'"
+          :busy="chatSessionBootstrap.retryBusy.value"
+          @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
         <div
@@ -2868,6 +2871,8 @@ const chatSessionBootstrap = useChatSessionBootstrap({
   reconcileSession,
   connectionState: gatewayConnectionState,
   metadataRecoveryError: chatSessionSubscription.metadataRecoveryError,
+  retryMetadata: () => retrySessionMetadata(),
+  incidentScope: () => deliveryIdentity.value ?? '',
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
 })
@@ -3004,8 +3009,8 @@ function retryHistory() {
   return retryHistoryCoordinator()
 }
 
-function retryLive() {
-  return retryLiveCoordinator()
+function retryLive(explicit = true) {
+  return retryLiveCoordinator(explicit)
 }
 
 function cancelSessionBootstrap(unsubscribe = true) {
@@ -4466,26 +4471,22 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
   runtime: conversationSessionRuntime,
 })
 
-let currentSessionRecovery: Promise<boolean> | null = null
+const sessionRecoveries = new WeakMap<NonNullable<ReturnType<typeof sessionReadLifecycle.current>>, Promise<boolean>>()
 function recoverCurrentSession(scope?: { readonly keys: readonly string[], readonly global: boolean }): Promise<boolean> {
   if (scope && (scope.global || scope.keys.length === 0 || scope.keys.some(key => key !== sessionKey.value))) {
     return Promise.resolve(false)
   }
-  if (currentSessionRecovery) return currentSessionRecovery
   const key = sessionKey.value
   const lease = sessionReadLifecycle.current()
-  const pending = retryLive().then(result => key === sessionKey.value && (
-    result.authoritative
-    // The current owner remains fenced and owns bounded automatic retries (or
-    // a truthful local stale state for an oversized snapshot). A read failure
-    // is not evidence that the shared transport must be recycled.
-    || (lease !== null && sessionReadLifecycle.current() === lease && !result.sessionMissing)
-  ))
-    .catch(() => false)
+  if (!lease) return Promise.resolve(false)
+  const prior = sessionRecoveries.get(lease)
+  if (prior) return prior
+  const pending = retryLive(false).then(result => key === sessionKey.value
+    && sessionReadLifecycle.current() === lease && result.authoritative).catch(() => false)
   const observed = pending.finally(() => {
-    if (currentSessionRecovery === observed) currentSessionRecovery = null
+    if (sessionRecoveries.get(lease) === observed) sessionRecoveries.delete(lease)
   })
-  currentSessionRecovery = observed
+  sessionRecoveries.set(lease, observed)
   return observed
 }
 

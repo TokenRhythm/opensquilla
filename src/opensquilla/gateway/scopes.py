@@ -148,6 +148,8 @@ METHOD_SCOPES: dict[str, str] = {
     "workspaces.references.read": READ_SCOPE,
     "sessions.messages.snapshot": READ_SCOPE,
     "sessions.messages.snapshot.read": READ_SCOPE,
+    "sessions.messages.resume": READ_SCOPE,
+    "sessions.messages.snapshot.release": READ_SCOPE,
     "transport.flow.update": READ_SCOPE,
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.hydrate": READ_SCOPE,

@@ -21,6 +21,8 @@ interface FlowSource {
   enableConsumptionFlow(): void
   consumeEvent: (event: string, ...args: Parameters<TransportConsumptionHandler>) => Promise<'applied' | 'dirty'>
   recoverGap(detail: unknown): Promise<boolean>
+  supportsRecovery?(): boolean
+  failProtocol?(generation: number): void
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -48,7 +50,7 @@ export class TransportFlowV4 {
     promise: Promise<void>; resolve: () => void; reject: (error: Error) => void
   }>()
   private observations = new Map<number, ReturnType<typeof setTimeout>>()
-  private dirty = new Set<string>()
+  private dirty = new Map<string, number>()
   private resumes = new Map<string, {
     receipt: TransportInstalledReceipt; promise: Promise<void>
     resolve: () => void; reject: (error: Error) => void
@@ -56,8 +58,14 @@ export class TransportFlowV4 {
   private timer: ReturnType<typeof setTimeout> | null = null
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null
   private inFlight = false
+  private preferDirty = false
   private recovery: Promise<boolean> | null = null
   private recoveryKeys = new Set<string>()
+  private recoveryJobs = new Map<string, Promise<boolean>>()
+  private invalidations = new Map<string, number>()
+  private globalInvalidation = 0
+  private consumedCursors = new Map<string, { generation: string; sequence: number }>()
+  private consumers = new Map<number, { key: string | null; work: Promise<void> }>()
   private recoveryGlobal = false
   private subscriptions: (() => void)[] = []
 
@@ -85,7 +93,7 @@ export class TransportFlowV4 {
       pendingInstallations: this.resumes.size,
       unownedFrames: this.unowned.size,
       queuedRecoveryKeys: this.recoveryKeys.size,
-      recoveryInFlight: this.recovery !== null,
+      recoveryInFlight: this.recoveryJobs.size > 0 || this.recovery !== null,
       controlInFlight: this.inFlight,
       observedConsumers: this.observations.size,
       completedRanges: this.completed.length,
@@ -123,8 +131,14 @@ export class TransportFlowV4 {
     this.timer = null
     this.recoveryTimer = null
     this.inFlight = false
+    this.preferDirty = false
     this.recovery = null
     this.recoveryKeys.clear()
+    this.recoveryJobs.clear()
+    this.invalidations.clear()
+    this.globalInvalidation = 0
+    this.consumers.clear()
+    this.consumedCursors.clear()
     this.recoveryGlobal = false
   }
 
@@ -154,7 +168,11 @@ export class TransportFlowV4 {
         // An explicitly invalidated reservation carries no business event.
         // Owning its dirty notification is sufficient to retire that receipt.
         const invalidated = this.receipt(meta.flow)
-        if (invalidated) this.markComplete(invalidated)
+        if (invalidated) {
+          if (!notice.global_dirty && notice.dirty_keys.length === 0) {
+            void this.acknowledgeDelivery(invalidated).catch(() => {})
+          } else this.markComplete(invalidated)
+        }
       }
       return
     }
@@ -182,13 +200,26 @@ export class TransportFlowV4 {
       this.unowned.set(receipt.delivery_id, { receipt, key })
       this.requireRecovery(key ? [key] : [], !key)
     }, 100))
-    void this.source.consumeEvent(event, payload, meta).then(result => {
+    const work = this.source.consumeEvent(event, payload, meta).then(result => {
       if (!this.current(revision) || recoveryRequired) return
       if (result === 'dirty') {
         const key = sessionKey(payload)
-        if (key) this.dirty.add(key)
+        if (key) this.dirty.set(key, (this.dirty.get(key) ?? 0) + 1)
         // The consumer has already registered/fenced its recovery ownership.
         this.requireRecovery(key ? [key] : [], !key)
+      }
+      if (result === 'applied') {
+        const data = record(payload)
+        const key = sessionKey(payload)
+        if (key && typeof data?.stream_generation === 'string' && Number.isSafeInteger(data.stream_seq)) {
+          const previous = this.consumedCursors.get(key)
+          if (this.consumedCursors.size >= 256 && !previous) this.consumedCursors.delete(this.consumedCursors.keys().next().value!)
+          this.consumedCursors.set(key, {
+            generation: data.stream_generation,
+            sequence: previous?.generation === data.stream_generation
+              ? Math.max(previous.sequence, data.stream_seq as number) : data.stream_seq as number,
+          })
+        }
       }
       this.markComplete(receipt)
     }, () => {
@@ -201,7 +232,12 @@ export class TransportFlowV4 {
       const key = sessionKey(payload)
       this.unowned.set(receipt.delivery_id, { receipt, key })
       this.requireRecovery(key ? [key] : [], !key)
+    }).finally(() => {
+      if (this.consumers.get(receipt.delivery_id)?.work === work) {
+        this.consumers.delete(receipt.delivery_id)
+      }
     })
+    this.consumers.set(receipt.delivery_id, { key: sessionKey(payload), work })
   }
 
   private markComplete(value: TransportDeliveryReceipt): void {
@@ -262,7 +298,82 @@ export class TransportFlowV4 {
     return promise
   }
 
-  private requireRecovery(keys: string[], global: boolean): Promise<boolean> | null {
+  recoveryVersion(key: string): string {
+    return `${this.generation}:${this.globalInvalidation}:${this.invalidations.get(key) ?? 0}`
+  }
+
+  async waitForConsumption(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void> {
+    // The FIFO proof follows its tail events. Capture the consumers already
+    // dispatched at that point, never an unrelated session's pending consumer.
+    await Promise.all([...this.consumers.entries()]
+      .filter(([id, item]) => item.key === key && !this.unowned.has(id))
+      .map(([, item]) => item.work))
+    if (cursor && cursor.toSeq > cursor.fromSeq) {
+      const consumed = this.consumedCursors.get(key)
+      if (!consumed || consumed.generation !== cursor.streamGeneration || consumed.sequence < cursor.toSeq) {
+        throw Object.assign(new Error('Snapshot replay tail was not consumed.'), { code: 'SNAPSHOT_STALE' })
+      }
+    }
+  }
+
+  private requireRecovery(keys: string[], global: boolean, invalidate = true): Promise<boolean> | null {
+    if (!this.enabled) return null
+    if (invalidate) {
+      if (global) this.globalInvalidation++
+      for (const key of keys) {
+        if (this.invalidations.size >= 256 && !this.invalidations.has(key)) {
+          this.globalInvalidation++
+          this.invalidations.clear()
+        }
+        this.invalidations.set(key, (this.invalidations.get(key) ?? 0) + 1)
+      }
+    }
+    if (!this.source.supportsRecovery?.()) return this.legacyRequireRecovery(keys, global)
+    for (const key of keys) {
+      if (this.recoveryKeys.size < 256 || this.recoveryKeys.has(key)) this.recoveryKeys.add(key)
+      else this.recoveryGlobal = true
+    }
+    this.recoveryGlobal ||= global
+    const revision = this.revision
+    const launch = (key: string, scopeGlobal: boolean) => {
+      const owned = [...this.unowned.values()].filter(entry => entry.key === key)
+      const capturedVersion = this.recoveryVersion(key)
+      const work = Promise.resolve().then(() => this.source.recoverGap({
+        reason: 'transport_flow_dirty', keys: scopeGlobal ? [] : [key], global: scopeGlobal,
+      })).catch(() => false).then(ok => {
+        if (!this.current(revision)) return false
+        if (ok && capturedVersion === this.recoveryVersion(key)) {
+          if (!scopeGlobal) for (const entry of owned) this.markComplete(entry.receipt)
+          return true
+        }
+        if (scopeGlobal) this.recoveryGlobal = true
+        else this.recoveryKeys.add(key)
+        return false
+      }).finally(() => {
+        if (!this.current(revision) || this.recoveryJobs.get(key) !== work) return
+        this.recoveryJobs.delete(key)
+        if (this.recoveryGlobal || this.recoveryKeys.size) this.scheduleRecovery()
+      })
+      this.recoveryJobs.set(key, work)
+    }
+    if (this.recoveryGlobal && this.recoveryJobs.size < 2 && !this.recoveryJobs.has('')) {
+      this.recoveryGlobal = false
+      // Tagged receipts still need an exact session proof, even after a global
+      // owner accepts responsibility for its active read admissions.
+      for (const entry of this.unowned.values()) if (entry.key) this.recoveryKeys.add(entry.key)
+      launch('', true)
+    }
+    for (const key of this.recoveryKeys) {
+      if (this.recoveryJobs.size >= 2) break
+      if (this.recoveryJobs.has(key)) continue
+      this.recoveryKeys.delete(key)
+      launch(key, false)
+    }
+    return this.recoveryJobs.size
+      ? Promise.all(this.recoveryJobs.values()).then(results => results.every(Boolean)) : null
+  }
+
+  private legacyRequireRecovery(keys: string[], global: boolean): Promise<boolean> | null {
     if (!this.enabled) return null
     for (const key of keys) {
       if (this.recoveryKeys.size < 256 || this.recoveryKeys.has(key)) this.recoveryKeys.add(key)
@@ -341,7 +452,7 @@ export class TransportFlowV4 {
     // Keep automatic read recovery alive without a tight snapshot/BUSY loop.
     this.recoveryTimer = setTimeout(() => {
       this.recoveryTimer = null
-      if (this.current(revision)) this.requireRecovery([], false)
+      if (this.current(revision)) this.requireRecovery([], false, false)
     }, 1000)
   }
 
@@ -354,33 +465,41 @@ export class TransportFlowV4 {
     if (!this.enabled || this.inFlight) return
     if (this.ack === this.sentAck && !this.dirty.size && !this.resumes.size && !this.staged.size) return
     const revision = this.revision
-    const keys = [...this.dirty].slice(0, 128)
+    const modern = this.source.supportsRecovery?.() === true
+    const hasCredit = this.ack !== this.sentAck || this.staged.size > 0
+    // Give pending invalidation a turn after one credit batch even while
+    // tokens keep arriving. Its stale ACK cannot consume any new credit.
+    const dirtyOnly = modern && this.dirty.size > 0 && (!hasCredit || this.preferDirty)
+    const keys = modern && !dirtyOnly ? [] : [...this.dirty.keys()].slice(0, 128)
+    const dirtyVersions = new Map(keys.map(key => [key, this.dirty.get(key)]))
     // The server validates and applies one snapshot identity atomically.
     // Keep the per-key queue, but never batch multiple resume authorities.
-    const resumes = [...this.resumes.values()].slice(0, 1).map(waiter => waiter.receipt)
-    const staged = [...this.staged.keys()].slice(0, 1)
+    const resumes = dirtyOnly ? [] : [...this.resumes.values()].slice(0, 1).map(waiter => waiter.receipt)
+    const staged = dirtyOnly ? [] : [...this.staged.keys()].slice(0, 1)
     const params: TransportFlowUpdateParams = {
-      delivery_epoch: this.epoch!, ack_delivery_id: this.ack,
+      delivery_epoch: this.epoch!, ack_delivery_id: dirtyOnly ? this.sentAck : this.ack,
       ...(keys.length ? { dirty_keys: keys } : {}),
       ...(resumes.length ? { resume: [resumes[0]] as [TransportInstalledReceipt] } : {}),
       ...(staged.length ? { staged_delivery_ids: [staged[0]] as [number] } : {}),
     }
     if (!validateTransportFlowUpdateParams(params)) return
     this.inFlight = true
+    if (modern) this.preferDirty = !dirtyOnly
     try {
       const result = await this.source.request<TransportFlowUpdateResult>(TRANSPORT_FLOW_UPDATE_METHOD, { ...params }, {
-        expectedGeneration: this.generation, timeoutMs: 10_000,
+        expectedGeneration: this.generation, timeoutMs: modern ? 7_000 : 10_000,
         timeoutAction: 'reject', abortAction: 'reject',
       })
       if (!this.current(revision)) return
       if (!validateTransportFlowUpdateResult(result) || result.delivery_epoch !== this.epoch
-        || result.ack_delivery_id !== params.ack_delivery_id) throw new Error('Invalid flow reply')
-      this.sentAck = params.ack_delivery_id
+        || result.ack_delivery_id > this.ack || result.ack_delivery_id < params.ack_delivery_id
+        || (!modern && result.ack_delivery_id !== params.ack_delivery_id)) throw new Error('Invalid flow reply')
+      this.sentAck = Math.max(this.sentAck, result.ack_delivery_id)
       for (const id of staged) {
         this.staged.get(id)?.resolve()
         this.staged.delete(id)
       }
-      for (const key of keys) this.dirty.delete(key)
+      for (const key of keys) if (this.dirty.get(key) === dirtyVersions.get(key)) this.dirty.delete(key)
       for (const receipt of resumes) {
         const waiter = this.resumes.get(receipt.key)
         if (waiter?.receipt !== receipt) continue
@@ -389,10 +508,26 @@ export class TransportFlowV4 {
           waiter.reject(new Error('Snapshot installation requires reconciliation'))
         } else waiter.resolve()
       }
-      if (result.dirty_keys.length || result.global_dirty) {
+      if (!modern && (result.dirty_keys.length || result.global_dirty)) {
         this.requireRecovery(result.dirty_keys, result.global_dirty)
       }
-    } catch {
+    } catch (error) {
+      const failure = record(error)
+      const code = failure?.code ?? record(failure?.data)?.code
+      if (modern && (code === 'INVALID_REQUEST' || code === 'UNAUTHORIZED' || code === 'NOT_FOUND')) {
+        for (const key of keys) if (this.dirty.get(key) === dirtyVersions.get(key)) this.dirty.delete(key)
+        for (const id of staged) {
+          this.staged.get(id)?.reject(error instanceof Error ? error : new Error(String(code)))
+          this.staged.delete(id)
+        }
+        // Invalid credit is a connection protocol failure; do not hide it in
+        // an unbounded retry loop. Future receipts may still be independent.
+        if (!keys.length) {
+          this.source.failProtocol?.(this.generation)
+          this.reset()
+        }
+        return
+      }
       // Credit updates are idempotent; retry only this connection-local RPC.
       // Never replay a business mutation or recycle the shared socket here.
       if (this.current(revision)) this.schedule(1000)

@@ -25,7 +25,7 @@ import {
 import { mapSessionReadError } from './sessionReadErrorMapping'
 import { projectConversationRoutingSnapshot } from './conversationContentV4'
 
-const DEFAULT_HISTORY_BUDGET_MS = 15_000
+const DEFAULT_HISTORY_BUDGET_MS = 7_000
 
 export interface SessionHistoryV4Transport {
   request<T = unknown>(
@@ -358,6 +358,7 @@ export async function requestV4SessionHistory(
   }
   const callOptions: RpcCallOptions = {
     signal: request.signal,
+    cancelOnAbort: true,
     timeoutMs: timeoutMs(request, options.policy),
     timeoutAction: options.policy.concurrentHistoryReads() ? 'reject' : 'reconnect',
     abortAction: 'reject',
